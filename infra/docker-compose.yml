@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  alloydb-omni:
+    image: google/alloydbomni
+    container_name: blueprint-alloydb
+    environment:
+      - POSTGRES_PASSWORD=supersecret_blueprint_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - alloydb-data:/var/lib/postgresql/data
+
+volumes:
+  alloydb-data:
