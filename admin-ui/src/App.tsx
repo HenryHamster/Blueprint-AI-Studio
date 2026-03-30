@@ -655,8 +655,8 @@ export default function App() {
             </h3>
             <span className="text-[10px] font-medium bg-neutral-800 px-2 py-0.5 rounded-full border border-neutral-700">{actionRequiredTasks.length}</span>
           </div>
-          <div className="flex-1 flex flex-col gap-2 overflow-hidden">
-            {actionRequiredTasks.slice(0, 2).map(t => (
+          <div className="flex-1 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
+            {actionRequiredTasks.map(t => (
               <div key={t.id} className="text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded flex justify-between items-center">
                 <span className="truncate pr-2 text-neutral-300">{t.title}</span>
                 <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${t.requires_approval ? 'bg-amber-500/10 text-amber-500' : 'bg-red-500/10 text-red-500'}`}>
@@ -665,7 +665,6 @@ export default function App() {
               </div>
             ))}
             {actionRequiredTasks.length === 0 && <div className="text-xs text-neutral-600 m-auto flex items-center gap-1.5"><CheckCircle className="w-3.5 h-3.5" /> All clear</div>}
-            {actionRequiredTasks.length > 2 && <div className="text-[10px] text-neutral-500 text-center mt-auto pt-1">+{actionRequiredTasks.length - 2} more</div>}
           </div>
         </div>
 
@@ -676,8 +675,8 @@ export default function App() {
             </h3>
             <span className="text-[10px] font-medium bg-neutral-800 px-2 py-0.5 rounded-full border border-neutral-700">{runningTasks.length} active / {queuedTasks.length} queued</span>
           </div>
-          <div className="flex-1 flex flex-col gap-2 overflow-hidden">
-            {runningTasks.slice(0, 2).map(t => (
+          <div className="flex-1 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
+            {runningTasks.map(t => (
               <div key={t.id} className="text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded flex justify-between items-center">
                 <span className="truncate pr-2 text-neutral-300">{t.title}</span>
                 <span className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">
@@ -686,7 +685,6 @@ export default function App() {
               </div>
             ))}
             {runningTasks.length === 0 && <div className="text-xs text-neutral-600 m-auto">No active tasks</div>}
-            {runningTasks.length > 2 && <div className="text-[10px] text-neutral-500 text-center mt-auto pt-1">+{runningTasks.length - 2} more</div>}
           </div>
         </div>
 
@@ -697,8 +695,8 @@ export default function App() {
             </h3>
             <span className="text-[10px] font-medium bg-neutral-800 px-2 py-0.5 rounded-full border border-neutral-700">{completedRecently.length}</span>
           </div>
-          <div className="flex-1 flex flex-col gap-2 overflow-hidden">
-            {completedRecently.slice(0, 2).map(t => (
+          <div className="flex-1 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
+            {completedRecently.map(t => (
               <div key={t.id} className="text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded flex justify-between items-center">
                 <span className="truncate pr-2 text-neutral-400">{t.title}</span>
                 {t.pr_url ? (
@@ -711,7 +709,6 @@ export default function App() {
               </div>
             ))}
             {completedRecently.length === 0 && <div className="text-xs text-neutral-600 m-auto">No recent completions</div>}
-            {completedRecently.length > 2 && <div className="text-[10px] text-neutral-500 text-center mt-auto pt-1">+{completedRecently.length - 2} more</div>}
           </div>
         </div>
       </div>
