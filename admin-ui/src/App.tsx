@@ -33,6 +33,17 @@ export default function App() {
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
 
+  // GitHub repo/branch dropdown state
+  interface RepoOption { full_name: string; default_branch: string; }
+  const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
+  const [repoLoading, setRepoLoading] = useState(false);
+  const [repoError, setRepoError] = useState<string | null>(null);
+  const [useManualRepo, setUseManualRepo] = useState(false);
+  const [branchOptions, setBranchOptions] = useState<string[]>([]);
+  const [branchLoading, setBranchLoading] = useState(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
+  const [useManualBranch, setUseManualBranch] = useState(false);
+
   // Log viewer state
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -42,6 +53,8 @@ export default function App() {
   // Settings state
   const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
+  const [maxRetries, setMaxRetries] = useState(3);
+  const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
 
   // Max plan pool state
@@ -57,6 +70,27 @@ export default function App() {
   useEffect(() => {
     const unsub = onAuthChange((u) => { setUser(u); setAuthLoading(false); });
     return unsub;
+  }, []);
+
+  // Handle OAuth redirect query params
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const connected = params.get('github_connected');
+    const ghError = params.get('github_error');
+    if (connected) {
+      setError(null);
+      setGithubAccount(connected);
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (ghError) {
+      const messages: Record<string, string> = {
+        state_expired: 'GitHub OAuth expired — try again',
+        invalid_state: 'GitHub OAuth failed — invalid state',
+        no_installations: 'No GitHub App installations found — install the app on your repos first',
+        failed: 'GitHub connection failed — try again',
+      };
+      setError(messages[ghError] || `GitHub error: ${ghError}`);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   }, []);
 
   useEffect(() => {
@@ -132,7 +166,7 @@ export default function App() {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify({ status: 'CANCELLED' }),
+        body: JSON.stringify({ status: 'FAILED' }),
       });
       fetchTasks();
     } catch (error) {
@@ -153,12 +187,40 @@ export default function App() {
     }
   };
 
+  const handleEditPrompt = async (taskId: string, newPrompt: string) => {
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ payloads: [{ prompt: newPrompt }] }),
+      });
+      fetchTasks();
+    } catch (error) {
+      console.error('Failed to edit task:', error);
+    }
+  };
+
+  const handleDismiss = async (taskId: string) => {
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ status: 'CANCELLED' }),
+      });
+      fetchTasks();
+    } catch (error) {
+      console.error('Failed to dismiss task:', error);
+    }
+  };
+
   const fetchSettings = async () => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/settings`);
       if (res.ok) {
         const data = await res.json();
         setMaxConcurrentVMs(data.max_concurrent_vms);
+        setMaxRetries(data.max_retries ?? 3);
+        setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
       }
@@ -222,6 +284,85 @@ export default function App() {
       });
     } catch (err) {
       console.error('Failed to update settings:', err);
+    }
+  };
+
+  const fetchRepoOptions = async () => {
+    setRepoLoading(true);
+    setRepoError(null);
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/github/repos`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        setRepoError(errData?.detail || 'Failed to load repositories');
+        setUseManualRepo(true);
+        return;
+      }
+      const data = await res.json();
+      setRepoOptions(data.repositories || []);
+      if (data.repositories?.length === 0) {
+        setRepoError('No repositories found for this GitHub installation');
+        setUseManualRepo(true);
+      }
+    } catch {
+      setRepoError('Failed to connect to server');
+      setUseManualRepo(true);
+    } finally {
+      setRepoLoading(false);
+    }
+  };
+
+  const fetchBranchOptions = async (repo: string) => {
+    setBranchOptions([]);
+    setBranchError(null);
+    setUseManualBranch(false);
+    if (!repo) return;
+    setBranchLoading(true);
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/github/branches?repo=${encodeURIComponent(repo)}`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        setBranchError(errData?.detail || 'Failed to load branches');
+        setUseManualBranch(true);
+        return;
+      }
+      const data = await res.json();
+      setBranchOptions(data.branches || []);
+      if (data.branches?.length === 0) {
+        setBranchError('No branches found');
+        setUseManualBranch(true);
+      }
+    } catch {
+      setBranchError('Failed to connect to server');
+      setUseManualBranch(true);
+    } finally {
+      setBranchLoading(false);
+    }
+  };
+
+  const openNewTaskModal = () => {
+    setShowNewTaskModal(true);
+    setUseManualRepo(false);
+    setUseManualBranch(false);
+    setBranchOptions([]);
+    setBranchError(null);
+    fetchRepoOptions();
+  };
+
+  const handleRepoChange = (value: string) => {
+    setNewTaskRepo(value);
+    // Auto-set default branch from repo metadata if available
+    const repoMeta = repoOptions.find(r => r.full_name === value);
+    if (repoMeta) {
+      setNewTaskBranch(repoMeta.default_branch || 'main');
+    } else {
+      setNewTaskBranch('main');
+    }
+    // Fetch branches for selected repo
+    if (value && value.includes('/')) {
+      fetchBranchOptions(value);
+    } else {
+      setBranchOptions([]);
     }
   };
 
@@ -326,7 +467,6 @@ export default function App() {
   const columns: { id: TaskStatus; label: string }[] = [
     { id: 'QUEUED', label: 'Queued' },
     { id: 'IN_PROGRESS', label: 'In Progress' },
-    { id: 'EVALUATING', label: 'Evaluating' },
     { id: 'FAILED', label: 'Failed' },
     { id: 'COMPLETED', label: 'Completed' },
   ];
@@ -388,8 +528,9 @@ export default function App() {
           <div className="flex flex-col items-center">
             <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Est. Cost</span>
             <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
-              ${(runningTasks.length * 0.14).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
+              ${(runningTasks.length * (usingMaxPlan ? 0.07 : 1.07)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
             </span>
+            <span className="text-[9px] text-neutral-600 mt-0.5">{usingMaxPlan ? 'VM only (Max plan)' : 'VM + API tokens'}</span>
           </div>
           <div className="w-px h-8 bg-neutral-800"></div>
           <div className="flex flex-col items-center">
@@ -418,6 +559,24 @@ export default function App() {
                     max={30}
                     value={maxConcurrentVMs}
                     onChange={e => updateMaxVMs(parseInt(e.target.value) || 1)}
+                    className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  />
+                </div>
+                <div className="mb-4">
+                  <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Retries (0-10)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={maxRetries}
+                    onChange={e => {
+                      const v = Math.max(0, Math.min(10, parseInt(e.target.value) || 0));
+                      setMaxRetries(v);
+                      authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
+                        method: 'PATCH', headers: h,
+                        body: JSON.stringify({ max_retries: v }),
+                      })).catch(() => {});
+                    }}
                     className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                   />
                 </div>
@@ -471,7 +630,7 @@ export default function App() {
             )}
           </div>
           <button
-            onClick={() => setShowNewTaskModal(true)}
+            onClick={openNewTaskModal}
             className="bg-white hover:bg-neutral-200 text-neutral-950 px-4 py-2 rounded text-xs font-semibold transition-colors shadow-sm flex items-center gap-2 h-fit"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -586,6 +745,8 @@ export default function App() {
                     onApprove={handleApprove}
                     onCancel={handleCancel}
                     onRetry={handleRetry}
+                    onEditPrompt={handleEditPrompt}
+                    onDismiss={handleDismiss}
                     onViewLogs={handleViewLogs}
                   />
                 ))}
@@ -598,30 +759,32 @@ export default function App() {
           </div>
         ))}
 
-        <div className="flex items-center justify-between px-6 py-4 border-t border-neutral-800 mt-4">
-          <div className="text-xs text-neutral-500">
-            {tasks.length > 0
-              ? `Showing tasks ${(page - 1) * limit + 1} to ${(page - 1) * limit + tasks.length}`
-              : 'No tasks found'}
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={() => setPage(p => Math.max(1, p - 1))}
-              disabled={page === 1}
-              className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              Previous
-            </button>
-            <button
-              onClick={() => setPage(p => p + 1)}
-              disabled={tasks.length < limit}
-              className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              Next
-            </button>
-          </div>
-        </div>
       </main>
+
+      {/* Pagination — only show when needed */}
+      {(page > 1 || tasks.length >= limit) && <div className="flex items-center justify-between px-6 py-2 border-t border-neutral-800 shrink-0">
+        <div className="text-xs text-neutral-500">
+          {tasks.length > 0
+            ? `Showing ${(page - 1) * limit + 1}–${(page - 1) * limit + tasks.length}`
+            : 'No tasks'}
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setPage(p => Math.max(1, p - 1))}
+            disabled={page === 1}
+            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            Previous
+          </button>
+          <button
+            onClick={() => setPage(p => p + 1)}
+            disabled={tasks.length < limit}
+            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            Next
+          </button>
+        </div>
+      </div>}
 
       {/* New Task Modal */}
       {showNewTaskModal && (
@@ -639,25 +802,87 @@ export default function App() {
             <form onSubmit={handleCreateTask} className="p-5">
               <div className="grid grid-cols-2 gap-4 mb-4">
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Repository</label>
-                  <input
-                    type="text"
-                    required
-                    value={newTaskRepo}
-                    onChange={e => setNewTaskRepo(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
-                    placeholder="owner/repo"
-                  />
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Repository</label>
+                    {!repoLoading && (
+                      <button
+                        type="button"
+                        onClick={() => { setUseManualRepo(m => !m); if (!useManualRepo) { setNewTaskRepo(''); setBranchOptions([]); } }}
+                        className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                      >
+                        {useManualRepo ? 'Use dropdown' : 'Type manually'}
+                      </button>
+                    )}
+                  </div>
+                  {repoLoading ? (
+                    <div className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
+                      Loading repos...
+                    </div>
+                  ) : useManualRepo ? (
+                    <>
+                      <input
+                        type="text"
+                        required
+                        value={newTaskRepo}
+                        onChange={e => handleRepoChange(e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
+                        placeholder="owner/repo"
+                      />
+                      {repoError && <p className="text-[10px] text-amber-500 mt-1">{repoError}</p>}
+                    </>
+                  ) : (
+                    <select
+                      required
+                      value={newTaskRepo}
+                      onChange={e => handleRepoChange(e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer"
+                    >
+                      <option value="" disabled>Select a repository</option>
+                      {repoOptions.map(r => (
+                        <option key={r.full_name} value={r.full_name}>{r.full_name}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
                 <div>
-                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Base Branch</label>
-                  <input
-                    type="text"
-                    value={newTaskBranch}
-                    onChange={e => setNewTaskBranch(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
-                    placeholder="main"
-                  />
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Base Branch</label>
+                    {!branchLoading && branchOptions.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setUseManualBranch(m => !m)}
+                        className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                      >
+                        {useManualBranch ? 'Use dropdown' : 'Type manually'}
+                      </button>
+                    )}
+                  </div>
+                  {branchLoading ? (
+                    <div className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500 font-mono">
+                      Loading branches...
+                    </div>
+                  ) : useManualBranch || branchOptions.length === 0 ? (
+                    <>
+                      <input
+                        type="text"
+                        value={newTaskBranch}
+                        onChange={e => setNewTaskBranch(e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
+                        placeholder="main"
+                      />
+                      {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
+                    </>
+                  ) : (
+                    <select
+                      value={newTaskBranch}
+                      onChange={e => setNewTaskBranch(e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer"
+                    >
+                      {branchOptions.map(b => (
+                        <option key={b} value={b}>{b}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
               </div>
               <div className="mb-4">

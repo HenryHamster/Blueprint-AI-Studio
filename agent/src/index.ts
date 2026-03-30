@@ -130,10 +130,10 @@ async function main() {
   if (process.env.CLAUDE_CREDENTIALS_FILE) {
     const fs = await import('fs');
     const path = await import('path');
-    const claudeDir = path.join(process.env.HOME || '/root', '.claude');
+    const claudeDir = path.join(process.env.HOME || '/home/agent', '.claude');
     fs.mkdirSync(claudeDir, { recursive: true });
-    fs.copyFileSync(process.env.CLAUDE_CREDENTIALS_FILE, path.join(claudeDir, 'credentials.json'));
-    fs.chmodSync(path.join(claudeDir, 'credentials.json'), 0o600);
+    fs.copyFileSync(process.env.CLAUDE_CREDENTIALS_FILE, path.join(claudeDir, '.credentials.json'));
+    fs.chmodSync(path.join(claudeDir, '.credentials.json'), 0o600);
     // Scrub the temp file — credentials now only exist at ~/.claude/
     fs.unlinkSync(process.env.CLAUDE_CREDENTIALS_FILE);
     delete process.env.CLAUDE_CREDENTIALS_FILE;
@@ -214,7 +214,7 @@ async function main() {
     const exitCode = await new Promise<number>((resolve) => {
       const claudeEnv: Record<string, string> = {
         ...process.env as Record<string, string>,
-        HOME: process.env.HOME || '/root',
+        HOME: process.env.HOME || '/home/agent',
       };
       // Only pass API key if no Max plan credentials were installed (API key is fallback)
       if (process.env.ANTHROPIC_API_KEY) {
@@ -224,6 +224,7 @@ async function main() {
       const claude = spawn('claude', [
         '-p', prompt,
         '--output-format', 'stream-json',
+        '--verbose',
         '--dangerously-skip-permissions',
       ], {
         cwd: WORKSPACE,

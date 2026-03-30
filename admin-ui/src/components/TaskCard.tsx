@@ -1,4 +1,5 @@
-import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw } from 'lucide-react';
+import { useState } from 'react';
+import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X } from 'lucide-react';
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
@@ -26,6 +27,8 @@ interface TaskCardProps {
   onApprove: (id: string) => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
+  onEditPrompt: (id: string, newPrompt: string) => void;
+  onDismiss: (id: string) => void;
   onViewLogs: (task: Task) => void;
 }
 
@@ -38,7 +41,9 @@ function getHeartbeatStatus(lastHeartbeat?: string) {
   return { color: 'bg-red-500', text: 'Stale (> 5m)' };
 }
 
-export function TaskCard({ task, onApprove, onCancel, onRetry, onViewLogs }: TaskCardProps) {
+export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
+  const [editing, setEditing] = useState(false);
+  const [editPrompt, setEditPrompt] = useState(task.description || '');
   const isChild = !!task.parent_task_id;
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
@@ -154,10 +159,38 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onViewLogs }: Tas
       )}
 
       {task.status === 'FAILED' && (
-        <div className="mt-3 flex gap-2">
-          <button onClick={() => onRetry(task.id)} className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
-            <RotateCcw className="w-3.5 h-3.5" /> Retry
-          </button>
+        <div className="mt-3 space-y-2">
+          {editing ? (
+            <div className="space-y-2">
+              <textarea
+                value={editPrompt}
+                onChange={e => setEditPrompt(e.target.value)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/50 h-20 font-mono"
+              />
+              <div className="flex gap-2">
+                <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
+                  className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors">
+                  Save
+                </button>
+                <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
+                  className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={() => onRetry(task.id)} className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
+                <RotateCcw className="w-3.5 h-3.5" /> Retry
+              </button>
+              <button onClick={() => setEditing(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
+                <Pencil className="w-3.5 h-3.5" /> Edit
+              </button>
+              <button onClick={() => onDismiss(task.id)} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border border-neutral-700 py-1.5 px-2.5 rounded text-xs transition-colors flex items-center justify-center" title="Dismiss">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

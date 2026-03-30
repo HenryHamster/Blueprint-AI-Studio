@@ -73,9 +73,9 @@ run_phase2() {
   read -p "GitHub Client ID: " GITHUB_CLIENT_ID
   read -s -p "GitHub Client Secret: " GITHUB_CLIENT_SECRET
   echo ""
-  read -p "GitHub App private key .pem file path: " GITHUB_KEY_FILE
+  read -r -p "GitHub App private key .pem file path: " GITHUB_KEY_FILE
   # Normalize Windows backslashes to forward slashes and strip quotes
-  GITHUB_KEY_FILE=$(echo "$GITHUB_KEY_FILE" | sed 's|\\|/|g' | sed 's/"//g')
+  GITHUB_KEY_FILE=$(echo "$GITHUB_KEY_FILE" | tr '\\' '/' | tr -d '"')
   [ -f "$GITHUB_KEY_FILE" ] || fail "File not found: $GITHUB_KEY_FILE"
   read -p "GitHub webhook secret: " GITHUB_WEBHOOK_SECRET
 

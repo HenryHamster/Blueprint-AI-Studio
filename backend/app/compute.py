@@ -236,9 +236,10 @@ EOF
     # GCS cleanup is handled by the orchestrator on first heartbeat (agent SA lacks delete permission)
     if [ -n "{claude_creds_uri}" ]; then
         echo "Downloading Max plan credentials from GCS..."
-        mkdir -p /root/.claude
-        gsutil cp "{claude_creds_uri}" /root/.claude/credentials.json
-        chmod 600 /root/.claude/credentials.json
+        mkdir -p /home/agent/.claude
+        gsutil cp "{claude_creds_uri}" /home/agent/.claude/.credentials.json
+        chown -R agent:agent /home/agent/.claude
+        chmod 600 /home/agent/.claude/.credentials.json
         echo "Max plan credentials installed."
     fi
 

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column
+from sqlalchemy import Column, String
 from sqlalchemy.dialects.postgresql import JSONB
 import uuid
 from datetime import datetime
@@ -51,7 +51,7 @@ class Project(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
     user_id: Optional[str] = Field(default=None, index=True)
-    status: ProjectStatus = Field(default=ProjectStatus.DRAFT)
+    status: ProjectStatus = Field(default=ProjectStatus.DRAFT, sa_column=Column(String, default=ProjectStatus.DRAFT))
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -77,7 +77,7 @@ class Task(SQLModel, table=True):
     created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
     requires_approval: bool = Field(default=False)
     
-    status: TaskStatus = Field(default=TaskStatus.QUEUED)
+    status: TaskStatus = Field(default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED))
     
     # Push Model: Orchestrator assigns this task to a specific VM
     vm_instance_id: Optional[str] = Field(default=None, index=True)
@@ -123,7 +123,7 @@ class Artifact(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id")
     
-    artifact_type: ArtifactType
+    artifact_type: ArtifactType = Field(sa_column=Column(String, nullable=False))
     
     # Git-based outputs
     commit_hash: Optional[str] = None

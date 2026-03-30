@@ -1,12 +1,16 @@
 {
   "projects": {
-    "default": "blueprint-orchestrator"
+    "default": "friction-logging-489102"
   },
   "targets": {
-    "blueprint-orchestrator": {
+    "friction-logging-489102": {
       "hosting": {
-        "launcher": ["blueprint-orchestrator"],
-        "admin": ["blueprint-admin"]
+        "launcher": [
+          "friction-logging-489102"
+        ],
+        "admin": [
+          "blueprint-admin-9c6b7"
+        ]
       }
     }
   }

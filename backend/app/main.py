@@ -1,7 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,6 +55,7 @@ limiter = Limiter(key_func=get_remote_address)
 # --- Runtime Config (adjustable via admin API) ---
 _runtime_config = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
+    "max_retries": int(os.getenv("MAX_RETRIES", "3")),
 }
 
 # --- Max Plan Account Pool ---
@@ -179,7 +180,7 @@ async def reaper_service():
                         # Fire and forget the delete API call
                         asyncio.create_task(delete_agent_vm(task.vm_instance_id))
                     
-                    if task.attempt_count < 3:
+                    if task.attempt_count < _runtime_config["max_retries"]:
                         print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
                         task.attempt_count += 1
                         task.status = TaskStatus.QUEUED
@@ -416,22 +417,17 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # In production, set ALLOWED_ORIGINS to the specific frontend domain (e.g., "https://my-app.com")
 # Multiple origins can be comma-separated.
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-if allowed_origins_env and allowed_origins_env != "*":
+if allowed_origins_env == "*":
+    allowed_origins = ["*"]
+elif allowed_origins_env:
     allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
 else:
-    # Default to local development ports and AI Studio URLs if not specified
     allowed_origins = [
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
     ]
-    app_url = os.getenv("APP_URL")
-    if app_url:
-        allowed_origins.append(app_url.rstrip("/"))
-    shared_app_url = os.getenv("SHARED_APP_URL")
-    if shared_app_url:
-        allowed_origins.append(shared_app_url.rstrip("/"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -1094,7 +1090,7 @@ async def update_agent_status(
             background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
             
         # Retry logic for failed tasks
-        if payload.status == TaskStatus.FAILED and task.attempt_count < 3:
+        if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
@@ -1501,8 +1497,9 @@ async def github_oauth_authorize(
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)")
 
     # Sign a state token so the callback can verify which user initiated the flow
+    import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
-    state = jwt.encode(
+    state = pyjwt.encode(
         {"sub": current_user["user_id"], "exp": datetime.utcnow() + timedelta(minutes=10), "type": "github_oauth"},
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
@@ -1511,6 +1508,7 @@ async def github_oauth_authorize(
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&state={state}"
+        f"&allow_signup=false"
     )
     return {"url": url}
 
@@ -1528,69 +1526,63 @@ async def github_oauth_callback(
     installations, and auto-registers them. This proves the user actually owns the
     GitHub account — no spoofing possible.
     """
+    admin_url = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+
     # Verify the state token to identify the Firebase user who started the flow
+    import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     try:
-        state_payload = jwt.decode(state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+        state_payload = pyjwt.decode(state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
         if state_payload.get("type") != "github_oauth":
-            raise HTTPException(status_code=400, detail="Invalid state token")
+            return RedirectResponse(url=f"{admin_url}?github_error=invalid_state")
         firebase_user_id = state_payload["sub"]
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=400, detail="OAuth state expired — please try again")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    except pyjwt.ExpiredSignatureError:
+        return RedirectResponse(url=f"{admin_url}?github_error=state_expired")
+    except pyjwt.PyJWTError:
+        return RedirectResponse(url=f"{admin_url}?github_error=invalid_state")
 
-    # Exchange code for GitHub user access token
-    token_data = await exchange_oauth_code(code)
-    user_token = token_data["access_token"]
+    try:
+        # Exchange code for GitHub user access token
+        token_data = await exchange_oauth_code(code)
+        user_token = token_data["access_token"]
 
-    # Get the GitHub user's profile to confirm identity
-    gh_user = await get_github_user(user_token)
-    gh_login = gh_user["login"]
+        # Get the GitHub user's profile to confirm identity
+        gh_user = await get_github_user(user_token)
+        gh_login = gh_user["login"]
 
-    # Discover which of this App's installations the user can access
-    installations = await get_user_installations(user_token)
-    if not installations:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No Blueprint App installations found for GitHub user '{gh_login}'. Install the app first at https://github.com/apps"
-        )
+        # Discover which of this App's installations the user can access
+        installations = await get_user_installations(user_token)
+        if not installations:
+            return RedirectResponse(url=f"{admin_url}?github_error=no_installations")
 
-    # Use the first installation (most users have one)
-    installation = installations[0]
-    installation_id = str(installation["id"])
-    account_name = installation["account"]["login"]
+        # Use the first installation (most users have one)
+        installation = installations[0]
+        installation_id = str(installation["id"])
+        account_name = installation["account"]["login"]
 
-    # Save to UserIntegration
-    stmt = select(UserIntegration).where(UserIntegration.user_id == firebase_user_id)
-    integration = (await session.execute(stmt)).scalars().first()
+        # Save to UserIntegration
+        stmt = select(UserIntegration).where(UserIntegration.user_id == firebase_user_id)
+        integration = (await session.execute(stmt)).scalars().first()
 
-    if integration:
-        integration.github_installation_id = installation_id
-        integration.github_account_name = account_name
-        integration.updated_at = datetime.utcnow()
-    else:
-        integration = UserIntegration(
-            user_id=firebase_user_id,
-            github_installation_id=installation_id,
-            github_account_name=account_name
-        )
+        if integration:
+            integration.github_installation_id = installation_id
+            integration.github_account_name = account_name
+            integration.updated_at = datetime.utcnow()
+        else:
+            integration = UserIntegration(
+                user_id=firebase_user_id,
+                github_installation_id=installation_id,
+                github_account_name=account_name
+            )
 
-    session.add(integration)
-    await session.commit()
+        session.add(integration)
+        await session.commit()
 
-    # Redirect to the admin UI with success
-    admin_url = os.getenv("ADMIN_UI_URL", "/")
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "github_user": gh_login,
-            "account_name": account_name,
-            "installation_id": installation_id,
-            "installations_count": len(installations),
-        }
-    )
+        return RedirectResponse(url=f"{admin_url}?github_connected={account_name}")
+
+    except Exception as e:
+        print(f"[GITHUB OAUTH] Error: {e}")
+        return RedirectResponse(url=f"{admin_url}?github_error=failed")
 
 @app.post("/api/github/webhook")
 async def github_webhook(
@@ -1625,7 +1617,12 @@ async def github_webhook(
         branch = data.get("ref", "").replace("refs/heads/", "")
         
         print(f"[WEBHOOK] Received push event for {repo_name} on branch {branch}")
-        
+
+        # Ignore pushes from the agent itself (blueprint/* branches)
+        if branch.startswith("blueprint/"):
+            print(f"[WEBHOOK] Ignoring agent branch push: {branch}")
+            return {"status": "ignored"}
+
         if repo_name:
             owner, repo = repo_name.split("/", 1)
             # Find projects associated with this repo

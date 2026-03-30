@@ -6,6 +6,7 @@ __pycache__/
 .terraform/
 terraform.tfstate*
 .setup-config
+.firebase/
 build/
 dist/
 coverage/

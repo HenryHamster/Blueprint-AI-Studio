@@ -32,7 +32,7 @@ build {
   provisioner "shell" {
     inline = [
       "sudo apt-get update",
-      "sudo apt-get install -y curl git python3 python3-pip python3-venv wget gnupg",
+      "sudo apt-get install -y curl git wget gnupg",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
       "sudo apt-get install -y nodejs",
       "sudo npm install -g @anthropic-ai/claude-code",
@@ -55,17 +55,18 @@ build {
 
   provisioner "shell" {
     inline = [
-      "cd /opt/agent",
-      "npm install",
-      "sudo chown -R root:root /opt/agent",
+      "sudo useradd -m -s /bin/bash agent",
+      "cd /opt/agent && npm install",
+      "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",
+      "sudo chmod 644 /etc/agent.env",
       "echo '[Unit]' | sudo tee /etc/systemd/system/blueprint-agent.service",
       "echo 'Description=Blueprint Agent Service' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'After=network.target' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo '' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo '[Service]' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'Type=simple' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
-      "echo 'User=root' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
+      "echo 'User=agent' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'WorkingDirectory=/opt/agent' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'EnvironmentFile=/etc/agent.env' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'ExecStart=/usr/bin/npm start' | sudo tee -a /etc/systemd/system/blueprint-agent.service",

@@ -4,11 +4,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any
 import uuid
+import httpx
+import logging
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration
 from app.auth import get_current_user, require_admin
 from app.compute import delete_agent_vm
+from app.github import generate_installation_access_token
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -240,7 +245,9 @@ async def get_settings(
 
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
+        "max_retries": _runtime_config["max_retries"],
         "github_account": github_account,
+        "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
              "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"]}
@@ -263,6 +270,14 @@ async def update_settings(
         if not (1 <= val <= 30):
             raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 1 and 30")
         _runtime_config["max_concurrent_vms"] = val
+    if "max_retries" in payload:
+        try:
+            val = int(payload["max_retries"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_retries must be a number")
+        if not (0 <= val <= 10):
+            raise HTTPException(status_code=400, detail="max_retries must be between 0 and 10")
+        _runtime_config["max_retries"] = val
     return _runtime_config
 
 
@@ -333,3 +348,123 @@ async def update_max_plan_account(
             raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
         account["credentials_json"] = payload["credentials_json"]
     return {"id": account["id"], "name": account["name"], "enabled": account["enabled"]}
+
+
+# --- GitHub Repository & Branch Discovery ---
+
+async def _get_installation_token_for_user(user_id: str, session: AsyncSession) -> str:
+    """
+    Retrieves a GitHub installation access token for the given user.
+    Raises HTTPException if no integration or installation is found.
+    """
+    stmt = select(UserIntegration).where(UserIntegration.user_id == user_id)
+    integration = (await session.execute(stmt)).scalars().first()
+
+    if not integration:
+        raise HTTPException(
+            status_code=400,
+            detail="No GitHub integration found. Please connect your GitHub account first."
+        )
+
+    if integration.github_installation_id:
+        try:
+            token = await generate_installation_access_token(integration.github_installation_id)
+            return token
+        except HTTPException:
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to generate GitHub installation token. The installation may have been removed."
+            )
+
+    raise HTTPException(
+        status_code=400,
+        detail="No GitHub App installation found for your account. Please install the GitHub App first."
+    )
+
+
+@router.get("/github/repos")
+async def list_github_repos(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Lists repositories accessible via the current user's GitHub App installation.
+    Returns a sorted list of {full_name, default_branch} objects.
+    """
+    token = await _get_installation_token_for_user(current_user["user_id"], session)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    repos = []
+    url = "https://api.github.com/installation/repositories?per_page=100"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"GitHub API error listing repos: {resp.status_code} {resp.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Failed to fetch repositories from GitHub."
+                )
+            data = resp.json()
+            for r in data.get("repositories", []):
+                repos.append({
+                    "full_name": r["full_name"],
+                    "default_branch": r.get("default_branch", "main"),
+                })
+            # Follow pagination
+            url = resp.links.get("next", {}).get("url")
+
+    repos.sort(key=lambda r: r["full_name"].lower())
+    return {"repositories": repos}
+
+
+@router.get("/github/branches")
+async def list_github_branches(
+    repo: str = Query(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Lists branches for a specific repository accessible via the user's GitHub App installation.
+    Query param: repo=owner/repo
+    Returns a sorted list of branch names.
+    """
+    token = await _get_installation_token_for_user(current_user["user_id"], session)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    branches = []
+    url = f"https://api.github.com/repos/{repo}/branches?per_page=100"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while url:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Repository '{repo}' not found or not accessible."
+                )
+            if resp.status_code != 200:
+                logger.error(f"GitHub API error listing branches for {repo}: {resp.status_code} {resp.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Failed to fetch branches from GitHub."
+                )
+            data = resp.json()
+            for b in data:
+                branches.append(b["name"])
+            # Follow pagination
+            url = resp.links.get("next", {}).get("url")
+
+    branches.sort(key=str.lower)
+    return {"branches": branches}
