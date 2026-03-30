@@ -85,6 +85,13 @@ resource "google_project_iam_member" "github_actions_firebase_hosting" {
   member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
 
+resource "google_project_iam_member" "github_actions_firebase_admin" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/firebase.admin"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
 # Execute Cloud Run jobs (database migrations)
 resource "google_project_iam_member" "github_actions_run_invoker" {
   count   = var.enable_cicd ? 1 : 0
