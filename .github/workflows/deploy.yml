@@ -1,0 +1,74 @@
+name: Deploy Backend to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: # Allow manual triggers
+
+# SECURITY: Define environment variables for GCP configuration
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE_NAME: blueprint-orchestrator
+  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
+  IMAGE_NAME: blueprint-orchestrator
+
+jobs:
+  deploy:
+    name: Build and Deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    # SECURITY VULNERABILITY MITIGATION:
+    # We DO NOT use long-lived JSON Service Account Keys stored in GitHub Secrets.
+    # Instead, we use Google Cloud Workload Identity Federation (WIF).
+    # This requires granting the GitHub Actions runner permission to request an OIDC token.
+    permissions:
+      contents: 'read'
+      id-token: 'write' # Required for requesting the JWT for Workload Identity Federation
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # SECURITY: Authenticate to Google Cloud using an ephemeral OIDC token
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          # The Workload Identity Provider name (e.g., projects/123456789/locations/global/workloadIdentityPools/github-actions/providers/github)
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
+          # The Service Account email that the GitHub Actions runner will impersonate
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
+
+      - name: Build Docker Image
+        working-directory: ./backend
+        run: |
+          docker build -t ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:latest
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:latest
+
+      # SECURITY: Deploy to Cloud Run without passing raw secrets in the command line.
+      # Secrets like DATABASE_URL should be mounted directly from Google Secret Manager in the Cloud Run configuration.
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Do not allow unauthenticated access by default for backend APIs unless explicitly required
+          # no_allow_unauthenticated: true 

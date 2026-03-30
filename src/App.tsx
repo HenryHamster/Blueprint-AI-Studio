@@ -19,31 +19,38 @@ export default function App() {
     }, 2000);
   };
 
+  const handleMount = (editor: any) => {
+    editor.user.updateUserPreferences({ colorScheme: 'dark' });
+  };
+
   return (
-    <div className="flex flex-col h-screen w-screen bg-gray-50">
-      <header className="flex items-center justify-between px-6 py-3 bg-white border-b border-gray-200 shadow-sm z-10">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 bg-blue-600 rounded-md flex items-center justify-center text-white font-bold">
-            B
+    <div className="flex flex-col h-screen w-screen bg-neutral-950 text-neutral-200 font-sans">
+      <header className="flex items-center justify-between px-4 py-2 border-b border-neutral-800 bg-neutral-900 z-10">
+        <div className="flex items-center gap-3">
+          <div className="w-5 h-5 bg-white rounded-sm flex items-center justify-center text-neutral-950 text-[10px] font-bold font-mono">
+            BP
           </div>
-          <h1 className="text-xl font-semibold text-gray-800">Blueprint</h1>
-          <span className="ml-2 px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 rounded-full">
-            MVP Sandbox
+          <h1 className="text-xs font-semibold tracking-tight text-neutral-100">Blueprint</h1>
+          <div className="h-3 w-px bg-neutral-700 mx-1"></div>
+          <span className="text-[10px] uppercase tracking-wider font-medium text-neutral-400">
+            Sandbox Environment
           </span>
         </div>
         <button 
           onClick={handleDeploy}
           disabled={isDeploying}
-          className={`px-4 py-2 rounded-md font-medium text-white transition-colors ${
-            isDeploying ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+          className={`px-3 py-1 text-[11px] font-medium rounded-sm transition-colors border ${
+            isDeploying 
+              ? 'bg-neutral-800 text-neutral-500 border-neutral-700 cursor-not-allowed' 
+              : 'bg-neutral-800 text-neutral-200 border-neutral-700 hover:bg-neutral-700 hover:text-white shadow-sm'
           }`}
         >
-          {isDeploying ? 'Compiling Vision...' : 'Deploy Blueprint'}
+          {isDeploying ? 'Deploying...' : 'Deploy'}
         </button>
       </header>
       
       <main className="flex-1 relative">
-        <Tldraw persistenceKey="blueprint-canvas" />
+        <Tldraw persistenceKey="blueprint-canvas" onMount={handleMount} />
       </main>
     </div>
   );

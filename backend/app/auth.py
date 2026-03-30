@@ -1,0 +1,126 @@
+from fastapi import Security, HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import os
+import jwt
+import secrets
+from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
+
+# Initialize Firebase Admin SDK
+# In GCP Cloud Run, this automatically uses the default service account credentials.
+# Locally, it uses the GOOGLE_APPLICATION_CREDENTIALS environment variable.
+try:
+    firebase_admin.initialize_app()
+except (ValueError, Exception) as e:
+    # App already initialized, or Firebase not configured yet (placeholder secrets)
+    import logging
+    logging.getLogger(__name__).warning(f"Firebase Admin SDK init: {e}")
+
+# We use HTTPBearer to automatically extract the "Authorization: Bearer <token>" header
+security = HTTPBearer()
+
+# Secret key for signing Agent JWTs
+AGENT_JWT_SECRET = os.getenv("AGENT_JWT_SECRET")
+if not AGENT_JWT_SECRET:
+    raise ValueError("AGENT_JWT_SECRET environment variable is required")
+AGENT_JWT_ALGORITHM = "HS256"
+
+# Secret key for signing WebSocket tickets
+WS_TICKET_SECRET = os.getenv("WS_TICKET_SECRET")
+if not WS_TICKET_SECRET:
+    raise ValueError("WS_TICKET_SECRET environment variable is required")
+
+def create_ws_ticket(user_id: str, project_id: str) -> str:
+    """
+    Generate a short-lived ticket for WebSocket authentication.
+    """
+    expire = datetime.utcnow() + timedelta(minutes=1) # Valid for 1 minute
+    to_encode = {
+        "sub": user_id,
+        "project_id": project_id,
+        "exp": expire,
+        "type": "ws_ticket"
+    }
+    return jwt.encode(to_encode, WS_TICKET_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+
+def verify_ws_ticket(ticket: str) -> dict:
+    """
+    Verify a WebSocket ticket.
+    """
+    try:
+        payload = jwt.decode(ticket, WS_TICKET_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+        if payload.get("type") != "ws_ticket":
+            raise HTTPException(status_code=401, detail="Invalid ticket type")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Ticket expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid ticket")
+
+def create_agent_token(task_id: str, vm_instance_id: str) -> str:
+    """
+    Generate a short-lived JWT for a specific agent VM.
+    """
+    expire = datetime.utcnow() + timedelta(hours=2) # Token valid for 2 hours
+    to_encode = {
+        "sub": str(task_id),
+        "vm_instance_id": vm_instance_id,
+        "exp": expire
+    }
+    encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_agent_jwt(token: str) -> dict:
+    """
+    Verify an agent's JWT.
+    """
+    try:
+        payload = jwt.decode(token, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Agent token expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """
+    FastAPI Dependency to verify the frontend user's JWT using Firebase Auth,
+    or allow programmatic access via ADMIN_API_KEY.
+    """
+    token = credentials.credentials
+    
+    admin_api_key = os.getenv("ADMIN_API_KEY")
+    if admin_api_key and secrets.compare_digest(token, admin_api_key):
+        return {"user_id": "admin-api-key", "email": "admin@system.local", "role": "admin"}
+        
+    try:
+        # Verify the ID token using Firebase Admin SDK
+        decoded_token = firebase_auth.verify_id_token(token)
+        # Check for admin custom claim (set via Firebase Admin SDK: auth.set_custom_user_claims)
+        custom_claims = decoded_token.get("custom_claims", {}) or {}
+        role = "admin" if (decoded_token.get("admin") or custom_claims.get("admin")) else "user"
+        return {
+            "user_id": decoded_token.get("uid"),
+            "email": decoded_token.get("email"),
+            "email_verified": decoded_token.get("email_verified", False),
+            "role": role,
+        }
+    except Exception as e:
+        print(f"Auth Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+def require_admin(current_user: dict = Depends(get_current_user)):
+    """
+    Dependency to ensure the current user has admin privileges.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required"
+        )
+    return current_user

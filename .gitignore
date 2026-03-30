@@ -1,4 +1,11 @@
 node_modules/
+*.exe
+*.pem
+__pycache__/
+*.pyc
+.terraform/
+terraform.tfstate*
+.setup-config
 build/
 dist/
 coverage/
@@ -6,3 +13,4 @@ coverage/
 *.log
 .env*
 !.env.example
+database.sqlite

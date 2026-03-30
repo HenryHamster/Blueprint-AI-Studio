@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/admin.py''\\).read\\(\\)\\); print\\(''OK: admin.py''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/compute.py''\\).read\\(\\)\\); print\\(''OK: compute.py''\\)\")",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}

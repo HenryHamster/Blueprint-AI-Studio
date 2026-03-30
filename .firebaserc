@@ -1,0 +1,13 @@
+{
+  "projects": {
+    "default": "blueprint-orchestrator"
+  },
+  "targets": {
+    "blueprint-orchestrator": {
+      "hosting": {
+        "launcher": ["blueprint-orchestrator"],
+        "admin": ["blueprint-admin"]
+      }
+    }
+  }
+}

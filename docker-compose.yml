@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: supersecret_blueprint_pass
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:supersecret_blueprint_pass@db:5432/postgres
+      - AGENT_JWT_SECRET=local_dev_agent_secret
+      - WS_TICKET_SECRET=local_dev_ws_secret
+      - GITHUB_APP_ID=123456
+      - GITHUB_PRIVATE_KEY=dummy_key
+      - GITHUB_WEBHOOK_SECRET=dummy_secret
+      - ORCHESTRATOR_URL=http://app:8080
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - LOCAL_MODE=${LOCAL_MODE:-false}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-dev-admin-key}
+      - MAX_CONCURRENT_VMS=${MAX_CONCURRENT_VMS:-5}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
