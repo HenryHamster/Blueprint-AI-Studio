@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X } from 'lucide-react';
+import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight } from 'lucide-react';
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
@@ -44,6 +44,7 @@ function getHeartbeatStatus(lastHeartbeat?: string) {
 export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
+  const [statusExpanded, setStatusExpanded] = useState(false);
   const isChild = !!task.parent_task_id;
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
@@ -85,9 +86,22 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
       <p className="text-xs text-neutral-400 line-clamp-2 mb-3">{task.description}</p>
 
       {task.latest_status_message && (
-        <div className="bg-neutral-950 text-neutral-400 text-[11px] p-2.5 rounded-lg mb-3 border border-neutral-800/50 font-mono">
-          <span className="font-semibold block mb-1 text-neutral-500 font-sans">Agent Status:</span>
-          &gt; {task.latest_status_message}
+        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
+          <button
+            onClick={() => setStatusExpanded(!statusExpanded)}
+            className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
+          >
+            <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${statusExpanded ? 'rotate-90' : ''}`} />
+            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Agent Status:</span>
+            {!statusExpanded && (
+              <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 80)}</span>
+            )}
+          </button>
+          {statusExpanded && (
+            <div className="px-2.5 pb-2.5 whitespace-pre-wrap break-words">
+              &gt; {task.latest_status_message}
+            </div>
+          )}
         </div>
       )}
 
