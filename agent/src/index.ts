@@ -1,4 +1,4 @@
-import { spawn, execSync, execFileSync } from 'child_process';
+import { spawn, execFileSync, type ChildProcess } from 'child_process';
 import WebSocket from 'ws';
 
 // ── Environment ─────────────────────────────────────────────────────────────
@@ -7,7 +7,7 @@ const AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 const WORKSPACE = '/tmp/workspace';
 
-const headers: Record<string, string> = {
+const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
   'X-Agent-Token': AGENT_TOKEN,
 };
@@ -15,9 +15,7 @@ const headers: Record<string, string> = {
 // ── API Helpers ─────────────────────────────────────────────────────────────
 async function apiPost(path: string, body: Record<string, unknown> = {}) {
   const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
+    method: 'POST', headers: apiHeaders, body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -27,7 +25,7 @@ async function apiPost(path: string, body: Record<string, unknown> = {}) {
 }
 
 async function apiGet(path: string) {
-  const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers });
+  const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`GET ${path} failed (${res.status}): ${text}`);
@@ -36,8 +34,7 @@ async function apiGet(path: string) {
 }
 
 function log(msg: string) {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${msg}`);
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -46,21 +43,13 @@ let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 function startHeartbeat(taskId: string, getMessage: () => string) {
   heartbeatTimer = setInterval(async () => {
     try {
-      await apiPost('/api/agent/heartbeat', {
-        task_id: taskId,
-        status_message: getMessage(),
-      });
-    } catch (e) {
-      log(`Heartbeat failed: ${e}`);
-    }
+      await apiPost('/api/agent/heartbeat', { task_id: taskId, status_message: getMessage() });
+    } catch (e) { log(`Heartbeat failed: ${e}`); }
   }, 30_000);
 }
 
 function stopHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
 }
 
 // ── WebSocket Log Stream ────────────────────────────────────────────────────
@@ -69,32 +58,13 @@ function connectLogStream(taskId: string): Promise<WebSocket | null> {
     try {
       const wsUrl = ORCHESTRATOR_URL.replace(/^http/, 'ws');
       const ws = new WebSocket(`${wsUrl}/api/agent/ws/${taskId}`);
-
-      const timeout = setTimeout(() => {
-        log('WebSocket connection timeout, continuing without log streaming');
-        resolve(null);
-      }, 5000);
-
-      ws.on('open', () => {
-        clearTimeout(timeout);
-        ws.send(JSON.stringify({ token: AGENT_TOKEN }));
-        log('WebSocket log stream connected');
-        resolve(ws);
-      });
-
-      ws.on('error', (err) => {
-        clearTimeout(timeout);
-        log(`WebSocket error: ${err.message}, continuing without log streaming`);
-        resolve(null);
-      });
-    } catch {
-      log('Failed to create WebSocket, continuing without log streaming');
-      resolve(null);
-    }
+      const timeout = setTimeout(() => { resolve(null); }, 5000);
+      ws.on('open', () => { clearTimeout(timeout); ws.send(JSON.stringify({ token: AGENT_TOKEN })); resolve(ws); });
+      ws.on('error', () => { clearTimeout(timeout); resolve(null); });
+    } catch { resolve(null); }
   });
 }
 
-// Strip credentials from any output before logging or transmitting
 function sanitize(text: string): string {
   return text
     .replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:***@')
@@ -105,11 +75,7 @@ function sanitize(text: string): string {
 
 function sendLog(ws: WebSocket | null, content: string) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify({ type: 'log', content: sanitize(content) }));
-    } catch {
-      // Ignore send failures
-    }
+    try { ws.send(JSON.stringify({ type: 'log', content: sanitize(content) })); } catch {}
   }
 }
 
@@ -118,15 +84,275 @@ function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+// ── Claude Code Runner (shared by all handlers) ─────────────────────────────
+async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }): Promise<{
+  exitCode: number; allOutput: string; lastResultText: string;
+}> {
+  let allOutput = '';
+  let lastResultText = '';
+
+  sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
+  log('Spawning Claude Code CLI...');
+
+  const exitCode = await new Promise<number>((resolve) => {
+    const claudeEnv: Record<string, string> = {
+      ...process.env as Record<string, string>,
+      HOME: process.env.HOME || '/home/agent',
+    };
+    if (process.env.ANTHROPIC_API_KEY) {
+      claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    }
+
+    const claude = spawn('claude', [
+      '-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions',
+    ], { cwd: WORKSPACE, env: claudeEnv });
+
+    claude.stdout.on('data', (data: Buffer) => {
+      const text = data.toString();
+      allOutput += text;
+      for (const line of text.split('\n').filter(Boolean)) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type === 'assistant' && obj.message?.content) {
+            for (const block of obj.message.content) {
+              if (block.type === 'text') {
+                sendLog(ws, block.text + '\n');
+                statusRef.value = block.text.slice(0, 100);
+              } else if (block.type === 'tool_use') {
+                sendLog(ws, `[tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
+                statusRef.value = `Using tool: ${block.name}`;
+              }
+            }
+          } else if (obj.type === 'result') {
+            lastResultText = obj.result || '';
+            sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+          }
+        } catch { sendLog(ws, text); }
+      }
+    });
+
+    claude.stderr.on('data', (data: Buffer) => {
+      const text = sanitize(data.toString());
+      allOutput += text;
+      sendLog(ws, `[stderr] ${text}`);
+    });
+
+    claude.on('error', (err) => { sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
+    claude.on('close', (code) => { log(`Claude Code exited with code ${code}`); resolve(code ?? 1); });
+  });
+
+  sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
+  return { exitCode, allOutput, lastResultText };
+}
+
+// ── Handler: Create (default — make changes, push, open PR) ─────────────────
+async function handleCreate(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) {
+  const prompt = String(payload.prompt || payload.description || task.description || '');
+  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawTitle = String(task.title || payload.title || 'automated changes');
+
+  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
+  const baseBranch = rawBaseBranch;
+  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
+  if (!prompt) throw new Error('No prompt found in task payloads');
+
+  // Clone
+  statusRef.value = `Cloning ${owner}/${repo}...`;
+  sendLog(ws, `Cloning ${owner}/${repo}...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', 'Blueprint Agent']);
+
+  const shortId = taskId.replace(/-/g, '').slice(0, 8);
+  const workBranch = `blueprint/task-${shortId}`;
+  git(['checkout', '-b', workBranch]);
+  sendLog(ws, `Working branch: ${workBranch}\n`);
+
+  // Run Claude
+  statusRef.value = 'Running Claude Code...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(prompt, ws, statusRef);
+
+  const diff = git(['status', '--porcelain']);
+  const hasChanges = diff.length > 0;
+
+  if (hasChanges && exitCode === 0) {
+    statusRef.value = 'Pushing changes...';
+    sendLog(ws, '\nCommitting and pushing changes...\n');
+    git(['add', '-A']);
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const commitHash = git(['rev-parse', 'HEAD']);
+
+    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
+    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+    git(['push', 'origin', workBranch]);
+    sendLog(ws, `Pushed to branch: ${workBranch}\n`);
+
+    statusRef.value = 'Creating pull request...';
+    let prUrl = '';
+    try {
+      const prBody = lastResultText
+        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
+        : `Automated changes for: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
+      const prRes = await apiPost('/api/agent/github/pull-requests', {
+        task_id: taskId, owner, repo, title: `[Blueprint] ${taskTitle}`,
+        head: workBranch, base: baseBranch, body: prBody,
+      });
+      prUrl = prRes.data?.html_url || '';
+      sendLog(ws, `PR created: ${prUrl}\n`);
+    } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
+
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
+      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else if (exitCode === 0) {
+    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No file changes.' });
+  } else {
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+    });
+  }
+}
+
+// ── Handler: Review (review a PR, output verdict) ───────────────────────────
+async function handleReview(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) {
+  const prNumber = payload.pr_number as number;
+  const branch = String(payload.branch || '');
+  const baseBranch = String(payload.base_branch || 'main');
+  const originalPrompt = String(payload.original_prompt || '');
+
+  if (!branch || !prNumber) throw new Error('Review task missing branch or pr_number');
+
+  // Clone the full repo so Claude can explore everything, then checkout the PR branch
+  statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
+  sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch}\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  git(['checkout', branch]);
+
+  // Get a summary of changed files for context
+  let changedFiles = '';
+  try {
+    changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
+  } catch { changedFiles = '(could not generate file list)'; }
+
+  // Build review prompt — Claude has full repo access, not just a diff blob
+  const reviewPrompt = `You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
+
+${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}Files changed in this PR:
+${changedFiles}
+
+You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
+
+Review the changes thoroughly:
+- Read the changed files and their surrounding context
+- Check for correctness, bugs, and security issues
+- Verify the changes accomplish the original task
+- Check that nothing is broken by the changes
+
+After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
+
+If the changes look good and should be merged:
+{"verdict": "APPROVE", "feedback": "Brief summary of why it's approved"}
+
+If changes are needed before merging:
+{"verdict": "REQUEST_CHANGES", "feedback": "Detailed description of what needs to be fixed"}`;
+
+  statusRef.value = 'Running code review...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef);
+
+  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  await apiPost('/api/agent/status', {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
+    logs,
+  });
+}
+
+// ── Handler: Fix (address review feedback on existing PR branch) ─────────────
+async function handleFix(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) {
+  const branch = String(payload.branch || '');
+  const baseBranch = String(payload.base_branch || 'main');
+  const prompt = String(payload.prompt || '');
+  const prNumber = payload.pr_number as number;
+
+  if (!branch || !prompt) throw new Error('Fix task missing branch or prompt');
+
+  // Clone the existing PR branch (don't create a new one)
+  statusRef.value = `Cloning ${owner}/${repo} (fixing PR #${prNumber})...`;
+  sendLog(ws, `Fixing PR #${prNumber} on branch ${branch}\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  git(['checkout', branch]);
+
+  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', 'Blueprint Agent']);
+
+  // Run Claude with the review feedback as the prompt
+  statusRef.value = 'Addressing review feedback...';
+  const { exitCode, allOutput } = await runClaudeCode(prompt, ws, statusRef);
+
+  const diff = git(['status', '--porcelain']);
+  if (diff.length > 0 && exitCode === 0) {
+    statusRef.value = 'Pushing fixes...';
+    git(['add', '-A']);
+    const shortId = taskId.replace(/-/g, '').slice(0, 8);
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const commitHash = git(['rev-parse', 'HEAD']);
+
+    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
+    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+    git(['push', 'origin', branch]);
+    sendLog(ws, `Pushed fixes to ${branch}\n`);
+
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
+      commit_hash: commitHash, repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else if (exitCode === 0) {
+    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
+  } else {
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+    });
+  }
+}
+
+// ── Handler Registry ────────────────────────────────────────────────────────
+type Handler = (
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) => Promise<void>;
+
+const handlers: Record<string, Handler> = {
+  create: handleCreate,
+  review: handleReview,
+  fix: handleFix,
+};
+
 // ── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
+  if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
-  if (!AGENT_TOKEN) {
-    throw new Error('AGENT_SECRET_TOKEN is required');
-  }
-
-  // Install Max plan credentials if provided by orchestrator (local mode via temp file)
+  // Install Max plan credentials if provided (local mode)
   if (process.env.CLAUDE_CREDENTIALS_FILE) {
     const fs = await import('fs');
     const path = await import('path');
@@ -134,250 +360,51 @@ async function main() {
     fs.mkdirSync(claudeDir, { recursive: true });
     fs.copyFileSync(process.env.CLAUDE_CREDENTIALS_FILE, path.join(claudeDir, '.credentials.json'));
     fs.chmodSync(path.join(claudeDir, '.credentials.json'), 0o600);
-    // Scrub the temp file — credentials now only exist at ~/.claude/
     fs.unlinkSync(process.env.CLAUDE_CREDENTIALS_FILE);
     delete process.env.CLAUDE_CREDENTIALS_FILE;
-    log('Max plan credentials installed (temp file scrubbed)');
+    log('Max plan credentials installed');
   } else if (process.env.ANTHROPIC_API_KEY) {
     log('Using ANTHROPIC_API_KEY as fallback auth');
   }
 
-  // 1. Claim task
-  log('Claiming task from orchestrator...');
+  // Claim task
   const task = await apiPost('/api/agent/claim');
   const taskId = String(task.task_id);
   const payloads = task.payloads || [];
   const payload = payloads[0] || {};
-  const prompt = payload.prompt || payload.description || task.description || '';
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const rawTaskTitle = String(task.title || payload.title || 'automated changes');
+  const taskType = String(payload.type || 'create');
+  log(`Claimed task ${taskId} (type: ${taskType}): "${task.title}"`);
 
-  // Validate inputs to prevent injection (defense in depth — server should also validate)
-  const SAFE_BRANCH = /^[a-zA-Z0-9_./-]+$/;
-  if (!SAFE_BRANCH.test(rawBaseBranch)) {
-    throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  }
-  const baseBranch = rawBaseBranch;
-  // Sanitize task title for use in commit messages (strip shell metacharacters)
-  const taskTitle = rawTaskTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
-  log(`Claimed task ${taskId}: "${taskTitle}"`);
-
-  if (!prompt) {
-    throw new Error('No prompt found in task payloads');
-  }
-
-  // 2. Start heartbeat
-  let statusMessage = 'Initializing...';
-  startHeartbeat(taskId, () => statusMessage);
-
-  // 3. Connect log stream
+  // Start heartbeat & log stream
+  const statusRef = { value: 'Initializing...' };
+  startHeartbeat(taskId, () => statusRef.value);
   const ws = await connectLogStream(taskId);
-  sendLog(ws, `Agent started on VM ${VM_INSTANCE_ID}\nTask: ${taskTitle}\n`);
-
-  let allOutput = '';
-  let lastResultText = '';
+  sendLog(ws, `Agent started (VM: ${VM_INSTANCE_ID}, type: ${taskType})\n`);
 
   try {
-    // 4. Get GitHub credentials
-    statusMessage = 'Fetching GitHub credentials...';
-    sendLog(ws, 'Fetching GitHub credentials...\n');
+    // Get GitHub credentials
+    statusRef.value = 'Fetching GitHub credentials...';
     const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
-    // 5. Clone repository (shallow for speed)
-    statusMessage = `Cloning ${owner}/${repo}...`;
-    sendLog(ws, `Cloning ${owner}/${repo}...\n`);
-    execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
-    const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-    execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], {
-      encoding: 'utf-8',
-      timeout: 300_000,
-    });
-
-    // Configure git identity for commits
-    git(['config', 'user.email', 'blueprint-agent@automated.dev']);
-    git(['config', 'user.name', 'Blueprint Agent']);
-
-    // 6. Create working branch
-    const shortId = taskId.replace(/-/g, '').slice(0, 8);
-    const workBranch = `blueprint/task-${shortId}`;
-    git(['checkout', '-b', workBranch]);
-    log(`Created branch: ${workBranch}`);
-    sendLog(ws, `Working branch: ${workBranch}\n`);
-
-    // 7. Run Claude Code
-    statusMessage = 'Running Claude Code...';
-    sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
-    log('Spawning Claude Code CLI...');
-
-    const exitCode = await new Promise<number>((resolve) => {
-      const claudeEnv: Record<string, string> = {
-        ...process.env as Record<string, string>,
-        HOME: process.env.HOME || '/home/agent',
-      };
-      // Only pass API key if no Max plan credentials were installed (API key is fallback)
-      if (process.env.ANTHROPIC_API_KEY) {
-        claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-      }
-
-      const claude = spawn('claude', [
-        '-p', prompt,
-        '--output-format', 'stream-json',
-        '--verbose',
-        '--dangerously-skip-permissions',
-      ], {
-        cwd: WORKSPACE,
-        env: claudeEnv,
-      });
-
-      claude.stdout.on('data', (data: Buffer) => {
-        const text = data.toString();
-        allOutput += text;
-
-        // Parse stream-json lines for display
-        for (const line of text.split('\n').filter(Boolean)) {
-          try {
-            const obj = JSON.parse(line);
-            if (obj.type === 'assistant' && obj.message?.content) {
-              for (const block of obj.message.content) {
-                if (block.type === 'text') {
-                  sendLog(ws, block.text + '\n');
-                  statusMessage = block.text.slice(0, 100);
-                } else if (block.type === 'tool_use') {
-                  sendLog(ws, `[tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
-                  statusMessage = `Using tool: ${block.name}`;
-                }
-              }
-            } else if (obj.type === 'result') {
-              lastResultText = obj.result || '';
-              sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
-            }
-          } catch {
-            // Non-JSON line, forward raw
-            sendLog(ws, text);
-          }
-        }
-      });
-
-      claude.stderr.on('data', (data: Buffer) => {
-        const text = sanitize(data.toString());
-        allOutput += text;
-        sendLog(ws, `[stderr] ${text}`);
-      });
-
-      claude.on('error', (err) => {
-        log(`Claude Code process error: ${err.message}`);
-        sendLog(ws, `[error] ${err.message}\n`);
-        resolve(1);
-      });
-
-      claude.on('close', (code) => {
-        log(`Claude Code exited with code ${code}`);
-        resolve(code ?? 1);
-      });
-    });
-
-    sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
-
-    // 8. Check for changes
-    const diff = git(['status', '--porcelain']);
-    const hasChanges = diff.length > 0;
-    log(`Changes detected: ${hasChanges} (${diff.split('\n').filter(Boolean).length} files)`);
-
-    if (hasChanges && exitCode === 0) {
-      // 9. Commit and push
-      statusMessage = 'Pushing changes...';
-      sendLog(ws, '\nCommitting and pushing changes...\n');
-
-      git(['add', '-A']);
-      const commitMsg = `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`;
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', commitMsg], { encoding: 'utf-8' });
-      const commitHash = git(['rev-parse', 'HEAD']);
-
-      // Fetch fresh GitHub token for push (original may have expired)
-      log('Fetching fresh GitHub token for push...');
-      const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
-      const freshToken = freshGhRes.data.token;
-      const pushUrl = `https://x-access-token:${freshToken}@github.com/${owner}/${repo}.git`;
-      execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-      git(['push', 'origin', workBranch]);
-      log(`Pushed to ${workBranch}`);
-      sendLog(ws, `Pushed to branch: ${workBranch}\n`);
-
-      // 10. Create PR
-      statusMessage = 'Creating pull request...';
-      sendLog(ws, 'Creating pull request...\n');
-      let prUrl = '';
-      try {
-        const prBody = lastResultText
-          ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-          : `Automated changes for: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
-
-        const prRes = await apiPost('/api/agent/github/pull-requests', {
-          task_id: taskId,
-          owner,
-          repo,
-          title: `[Blueprint] ${taskTitle}`,
-          head: workBranch,
-          base: baseBranch,
-          body: prBody,
-        });
-        prUrl = prRes.data?.html_url || '';
-        log(`PR created: ${prUrl}`);
-        sendLog(ws, `PR created: ${prUrl}\n`);
-      } catch (e) {
-        log(`Failed to create PR: ${e}`);
-        sendLog(ws, `Failed to create PR: ${e}\n`);
-      }
-
-      // 11. Report success
-      await apiPost('/api/agent/status', {
-        task_id: taskId,
-        status: 'COMPLETED',
-        artifact_type: 'PULL_REQUEST',
-        commit_hash: commitHash,
-        pr_url: prUrl,
-        repo_url: `https://github.com/${owner}/${repo}`,
-      });
-      sendLog(ws, '\nTask completed successfully.\n');
-
-    } else if (exitCode === 0) {
-      // Claude succeeded but made no changes
-      sendLog(ws, '\nClaude Code completed with no file changes.\n');
-      await apiPost('/api/agent/status', {
-        task_id: taskId,
-        status: 'COMPLETED',
-        logs: 'Claude Code completed successfully but made no file changes.',
-      });
-
-    } else {
-      // Claude failed
-      sendLog(ws, '\nClaude Code failed.\n');
-      await apiPost('/api/agent/status', {
-        task_id: taskId,
-        status: 'FAILED',
-        artifact_type: 'ERROR_LOG',
-        logs: sanitize(allOutput.slice(-10_000)),
-      });
-    }
+    // Dispatch to handler
+    const handler = handlers[taskType];
+    if (!handler) throw new Error(`Unknown task type: ${taskType}`);
+    await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef);
+    sendLog(ws, '\nTask completed.\n');
 
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     const safeErr = sanitize(errMsg);
     log(`Fatal error: ${safeErr}`);
     sendLog(ws, `\nFatal error: ${safeErr}\n`);
-
     try {
       await apiPost('/api/agent/status', {
-        task_id: taskId,
-        status: 'FAILED',
-        artifact_type: 'ERROR_LOG',
-        logs: sanitize(`Fatal error: ${errMsg}\n\n${allOutput.slice(-5_000)}`),
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: sanitize(`Fatal error: ${errMsg}`),
       });
-    } catch (e) {
-      log(`Failed to report error: ${e}`);
-    }
+    } catch (e) { log(`Failed to report error: ${e}`); }
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
@@ -385,7 +412,4 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error('Agent failed to start:', err);
-  process.exit(1);
-});
+main().catch((err) => { console.error('Agent failed to start:', err); process.exit(1); });

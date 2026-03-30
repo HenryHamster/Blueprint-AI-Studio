@@ -38,7 +38,8 @@ from app.github import (
     create_issue,
     get_issues,
     create_branch,
-    create_pull_request
+    create_pull_request,
+    merge_pull_request,
 )
 import hmac
 import hashlib
@@ -1016,6 +1017,48 @@ async def spawn_subtask(
         "requires_approval": req.requires_approval
     }
 
+async def _spawn_pipeline_task(
+    source_task: Task, task_type: str, session: AsyncSession,
+    pr_number: int, branch: str, base_branch: str,
+    original_prompt: str = "", fix_prompt: str = "", original_task_id: str = ""
+) -> Task:
+    """Spawn a review or fix task as part of the automated review pipeline."""
+    vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+
+    if task_type == "review":
+        title = f"Review PR #{pr_number}"
+        payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
+                        "base_branch": base_branch, "original_prompt": original_prompt}
+    else:
+        title = f"Fix PR #{pr_number}"
+        payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
+                        "base_branch": base_branch, "prompt": fix_prompt}
+
+    new_task = Task(
+        project_id=source_task.project_id,
+        title=title,
+        description=fix_prompt or f"Automated {task_type} for PR #{pr_number}",
+        payloads=[payload_data],
+        context={"review_loop": {"pr_number": pr_number, "branch": branch,
+                                  "base_branch": base_branch, "original_task_id": original_task_id or str(source_task.id)}},
+        vm_instance_id=vm_name,
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    history = TaskHistory(task_id=new_task.id, action="SPAWNED",
+                          details={"spawned_by": "REVIEW_PIPELINE", "type": task_type, "pr_number": pr_number})
+    session.add(history)
+    await session.commit()
+
+    await broadcast_to_project(str(source_task.project_id), "task_updated",
+                               {"task_id": str(new_task.id), "status": TaskStatus.QUEUED})
+    return new_task
+
+
 @app.post("/api/agent/status")
 async def update_agent_status(
     payload: AgentStatusPayload, 
@@ -1105,8 +1148,86 @@ async def update_agent_status(
                 {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
-            
-        # 5. Project State Aggregation
+
+        # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
+        if payload.status == TaskStatus.COMPLETED:
+            task_payload = (task.payloads or [{}])[0]
+            task_type = task_payload.get("type", "create")
+            review_loop = (task.context or {}).get("review_loop", {})
+
+            # Create task completed with PR → spawn review
+            if task_type in ("create", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
+                pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
+                branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
+                base_branch = task_payload.get("base_branch", "main")
+                original_prompt = task_payload.get("prompt", task.description or "")
+
+                review_task = await _spawn_pipeline_task(
+                    task, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(task.id)
+                )
+                print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+
+            # Review task completed → parse verdict
+            elif task_type == "review":
+                pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
+                branch = review_loop.get("branch") or task_payload.get("branch")
+                base_branch = review_loop.get("base_branch", "main")
+                original_task_id = review_loop.get("original_task_id", "")
+                original_prompt = task_payload.get("original_prompt", "")
+
+                verdict_text = payload.logs or task.latest_status_message or ""
+                verdict = "REQUEST_CHANGES"
+                feedback = verdict_text
+                try:
+                    import re
+                    json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', verdict_text)
+                    if json_match:
+                        verdict_data = json.loads(json_match.group())
+                        verdict = verdict_data.get("verdict", "REQUEST_CHANGES")
+                        feedback = verdict_data.get("feedback", verdict_text)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+                # Post the review to the PR as a comment
+                try:
+                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                    review_comment = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
+                    await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
+                except Exception as e:
+                    print(f"[REVIEW PIPELINE] Failed to post review comment: {e}")
+
+                if verdict == "APPROVE":
+                    try:
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        await merge_pull_request(gh_token, owner, repo, pr_number)
+                        await create_pr_comment(gh_token, owner, repo, pr_number,
+                            "**Blueprint Review Pipeline**: PR auto-merged.")
+                        print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                    except Exception as e:
+                        print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
+                else:
+                    fix_task = await _spawn_pipeline_task(
+                        task, "fix", session, pr_number, branch, base_branch,
+                        fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}",
+                        original_task_id=original_task_id
+                    )
+                    print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+
+            # Fix task completed → spawn new review
+            elif task_type == "fix":
+                pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
+                branch = review_loop.get("branch") or task_payload.get("branch")
+                base_branch = review_loop.get("base_branch", "main")
+                original_task_id = review_loop.get("original_task_id", "")
+
+                review_task = await _spawn_pipeline_task(
+                    task, "review", session, pr_number, branch, base_branch,
+                    original_task_id=original_task_id
+                )
+                print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+
+        # 6. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
         # Parent/logical tasks are updated to match the project outcome.
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
@@ -1610,76 +1731,9 @@ async def github_webhook(
     event_type = request.headers.get("x-github-event")
     data = json.loads(payload)
     
-    # Handle specific events
-    if event_type == "push":
-        # Extract repo and branch
-        repo_name = data.get("repository", {}).get("full_name")
-        branch = data.get("ref", "").replace("refs/heads/", "")
-        
-        print(f"[WEBHOOK] Received push event for {repo_name} on branch {branch}")
+    # Log events but don't create tasks — webhook-triggered tasks have no prompt
+    print(f"[WEBHOOK] Received {event_type} event, logged for future use")
 
-        # Ignore pushes from the agent itself (blueprint/* branches)
-        if branch.startswith("blueprint/"):
-            print(f"[WEBHOOK] Ignoring agent branch push: {branch}")
-            return {"status": "ignored"}
-
-        if repo_name:
-            owner, repo = repo_name.split("/", 1)
-            # Find projects associated with this repo
-            stmt = select(Project).where(
-                Project.github_owner == owner,
-                Project.github_repo == repo
-            )
-            projects = (await session.execute(stmt)).scalars().all()
-            
-            for project in projects:
-                # Create a task for each project
-                vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
-                task = Task(
-                    project_id=project.id,
-                    title=f"Push to {branch} on {repo_name}",
-                    payloads=[{"type": "github_push", "branch": branch}],
-                    vm_instance_id=vm_name,
-                    status=TaskStatus.QUEUED,
-                    created_by="WEBHOOK"
-                )
-                session.add(task)
-                await session.commit()
-                await session.refresh(task)
-                
-                print(f"[WEBHOOK] Triggered task {task.id} for project {project.id}")
-        
-    elif event_type == "pull_request":
-        action = data.get("action")
-        pr_number = data.get("pull_request", {}).get("number")
-        repo_name = data.get("repository", {}).get("full_name")
-        
-        print(f"[WEBHOOK] Received PR event '{action}' for {repo_name}#{pr_number}")
-        
-        if repo_name and action in ["opened", "synchronize", "reopened"]:
-            owner, repo = repo_name.split("/", 1)
-            stmt = select(Project).where(
-                Project.github_owner == owner,
-                Project.github_repo == repo
-            )
-            projects = (await session.execute(stmt)).scalars().all()
-            
-            for project in projects:
-                vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
-                task = Task(
-                    project_id=project.id,
-                    title=f"PR #{pr_number} ({action}) on {repo_name}",
-                    payloads=[{"type": "github_pr", "pr_number": pr_number, "action": action}],
-                    vm_instance_id=vm_name,
-                    status=TaskStatus.QUEUED,
-                    created_by="WEBHOOK"
-                )
-                session.add(task)
-                await session.commit()
-                await session.refresh(task)
-                
-                print(f"[WEBHOOK] Triggered task {task.id} for project {project.id} (PR #{pr_number})")
-        
     return {"status": "received"}
 
 # --- Static Files for Frontend (One-Line Deploy) ---

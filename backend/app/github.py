@@ -473,12 +473,73 @@ async def create_pull_request(
             headers=headers,
             json=payload
         )
-        
+
         if response.status_code != 201:
             logger.error(f"Failed to create pull request: {response.text}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create pull request on GitHub."
             )
-            
+
+        return response.json()
+
+
+async def get_pull_request(
+    token: str, owner: str, repo: str, pr_number: int
+) -> dict:
+    """Fetches PR details."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get PR #{pr_number}: {response.text}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get PR #{pr_number}")
+        return response.json()
+
+
+async def get_pull_request_diff(
+    token: str, owner: str, repo: str, pr_number: int
+) -> str:
+    """Fetches the raw diff for a PR."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3.diff",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get PR diff #{pr_number}: {response.text}")
+            return ""
+        return response.text
+
+
+async def merge_pull_request(
+    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash"
+) -> dict:
+    """Merges a PR. merge_method can be 'merge', 'squash', or 'rebase'."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+            headers=headers,
+            json={"merge_method": merge_method}
+        )
+        if response.status_code not in (200, 405, 409):
+            logger.error(f"Failed to merge PR #{pr_number}: {response.text}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")
         return response.json()
