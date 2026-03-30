@@ -158,5 +158,6 @@ jobs:
       - name: Deploy to Firebase Hosting
         run: |
           npm install -g firebase-tools
+          firebase target:clear hosting admin --project ${{ env.PROJECT_ID }}
           firebase target:apply hosting admin blueprint-admin --project ${{ env.PROJECT_ID }}
           firebase deploy --only hosting:admin --project ${{ env.PROJECT_ID }}
