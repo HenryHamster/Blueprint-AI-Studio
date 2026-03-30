@@ -1,74 +1,161 @@
-name: Deploy Backend to Cloud Run
+name: Deploy Blueprint
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'backend/**'
-      - '.github/workflows/deploy.yml'
-  workflow_dispatch: # Allow manual triggers
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_backend:
+        description: 'Deploy backend'
+        type: boolean
+        default: true
+      deploy_frontend:
+        description: 'Deploy frontend'
+        type: boolean
+        default: true
+      run_migrations:
+        description: 'Run database migrations'
+        type: boolean
+        default: false
 
-# SECURITY: Define environment variables for GCP configuration
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   REGION: us-central1
-  SERVICE_NAME: blueprint-orchestrator
-  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
-  IMAGE_NAME: blueprint-orchestrator
+  AR_REGISTRY: us-central1-docker.pkg.dev
+  IMAGE: blueprint-orchestrator
 
 jobs:
-  deploy:
-    name: Build and Deploy to Cloud Run
+  detect:
+    name: Detect changes
     runs-on: ubuntu-latest
-
-    # SECURITY VULNERABILITY MITIGATION:
-    # We DO NOT use long-lived JSON Service Account Keys stored in GitHub Secrets.
-    # Instead, we use Google Cloud Workload Identity Federation (WIF).
-    # This requires granting the GitHub Actions runner permission to request an OIDC token.
-    permissions:
-      contents: 'read'
-      id-token: 'write' # Required for requesting the JWT for Workload Identity Federation
-
+    outputs:
+      backend: ${{ steps.result.outputs.backend }}
+      frontend: ${{ steps.result.outputs.frontend }}
+      migrations: ${{ steps.result.outputs.migrations }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'push'
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'admin-ui/**'
+            migrations:
+              - 'backend/alembic/**'
+      - id: result
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "backend=${{ inputs.deploy_backend }}" >> $GITHUB_OUTPUT
+            echo "frontend=${{ inputs.deploy_frontend }}" >> $GITHUB_OUTPUT
+            echo "migrations=${{ inputs.run_migrations }}" >> $GITHUB_OUTPUT
+          else
+            echo "backend=${{ steps.filter.outputs.backend }}" >> $GITHUB_OUTPUT
+            echo "frontend=${{ steps.filter.outputs.frontend }}" >> $GITHUB_OUTPUT
+            echo "migrations=${{ steps.filter.outputs.migrations }}" >> $GITHUB_OUTPUT
+          fi
 
-      # SECURITY: Authenticate to Google Cloud using an ephemeral OIDC token
+  deploy-backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.backend == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
-        id: auth
         uses: google-github-actions/auth@v2
         with:
-          # The Workload Identity Provider name (e.g., projects/123456789/locations/global/workloadIdentityPools/github-actions/providers/github)
           workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
-          # The Service Account email that the GitHub Actions runner will impersonate
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.AR_REGISTRY }} --quiet
 
-      - name: Build Docker Image
+      - name: Build and push
         working-directory: ./backend
         run: |
-          docker build -t ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }} .
-          docker tag ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:latest
+          IMAGE_URI="${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}"
+          docker build -t "${IMAGE_URI}:${{ github.sha }}" -t "${IMAGE_URI}:latest" .
+          docker push "${IMAGE_URI}" --all-tags
 
-      - name: Push Docker Image
-        run: |
-          docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:latest
-
-      # SECURITY: Deploy to Cloud Run without passing raw secrets in the command line.
-      # Secrets like DATABASE_URL should be mounted directly from Google Secret Manager in the Cloud Run configuration.
+      # Only update the image — all env vars, secrets, VPC config are already
+      # set on the service from the initial deploy via setup.sh
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
+        run: |
+          gcloud run deploy blueprint-orchestrator \
+            --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
+            --region ${{ env.REGION }}
+
+  run-migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    needs: [detect, deploy-backend]
+    # Run if migrations requested AND backend finished (or was skipped)
+    if: |
+      always() &&
+      needs.detect.outputs.migrations == 'true' &&
+      (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          service: ${{ env.SERVICE_NAME }}
-          region: ${{ env.REGION }}
-          image: ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          # Do not allow unauthenticated access by default for backend APIs unless explicitly required
-          # no_allow_unauthenticated: true 
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run migrations job
+        run: |
+          gcloud run jobs execute blueprint-migrate \
+            --region ${{ env.REGION }} \
+            --wait
+
+  deploy-frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Build frontend
+        working-directory: ./admin-ui
+        env:
+          VITE_API_URL: ${{ secrets.ORCHESTRATOR_URL }}
+          VITE_FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy to Firebase Hosting
+        run: |
+          npm install -g firebase-tools
+          firebase deploy --only hosting --project ${{ env.PROJECT_ID }}

@@ -16,7 +16,7 @@ import httpx
 from datetime import datetime, timedelta
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration
+from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -60,9 +60,26 @@ _runtime_config = {
 }
 
 # --- Max Plan Account Pool ---
-# Each account: {id, name, credentials_json, active_tasks, total_tasks}
-# credentials_json is the raw content of ~/.claude/credentials.json from `claude login`
+# In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
+# Each entry: {id (str), name, credentials_json, enabled, active_tasks, total_tasks}
 _max_plan_pool: List[Dict[str, Any]] = []
+
+async def load_max_plan_pool():
+    """Load Max plan accounts from database into in-memory pool on startup."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(MaxPlanAccount))
+        accounts = result.scalars().all()
+        _max_plan_pool.clear()
+        for acct in accounts:
+            _max_plan_pool.append({
+                "id": str(acct.id),
+                "name": acct.name,
+                "credentials_json": acct.credentials_json,
+                "enabled": acct.enabled,
+                "active_tasks": 0,  # Runtime only — resets on restart
+                "total_tasks": acct.total_tasks,
+            })
+        print(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts from database")
 
 def select_max_plan_account() -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count."""
@@ -293,6 +310,15 @@ async def orchestrator_worker():
                         account_id = account["id"]
                         claude_credentials = account.get("credentials_json")
                         print(f"[ORCHESTRATOR] Using Max plan account '{account['name']}' (active: {account['active_tasks']})")
+
+                        # Persist total_tasks to DB
+                        try:
+                            db_acct = await session.get(MaxPlanAccount, uuid.UUID(account_id))
+                            if db_acct:
+                                db_acct.total_tasks = account["total_tasks"]
+                                session.add(db_acct)
+                        except Exception as e:
+                            print(f"[ORCHESTRATOR] Failed to update account total_tasks: {e}")
                     else:
                         print(f"[ORCHESTRATOR] No Max plan accounts available, falling back to API key")
 
@@ -361,6 +387,9 @@ async def orchestrator_worker():
 async def lifespan(app: FastAPI):
     # Startup: Initialize DB tables
     await init_db()
+
+    # Load persisted Max plan accounts into in-memory pool
+    await load_max_plan_pool()
 
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
@@ -1200,10 +1229,23 @@ async def update_agent_status(
                 if verdict == "APPROVE":
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                        await merge_pull_request(gh_token, owner, repo, pr_number)
-                        await create_pr_comment(gh_token, owner, repo, pr_number,
-                            "**Blueprint Review Pipeline**: PR auto-merged.")
-                        print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+
+                        if merge_result.get("merged"):
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                "**Blueprint Review Pipeline**: PR auto-merged.")
+                            print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                        else:
+                            # Merge blocked — spawn fix task to rebase and resolve conflicts
+                            merge_msg = merge_result.get("message", "unknown")
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Spawning fix task to rebase and resolve conflicts.")
+                            fix_task = await _spawn_pipeline_task(
+                                task, "fix", session, pr_number, branch, base_branch,
+                                fix_prompt=f"This PR was approved but could not be merged due to: {merge_msg}\n\nRebase this branch onto the latest {base_branch} and resolve any merge conflicts. Preserve the intent of the existing changes. Do not alter logic unless necessary to resolve conflicts.",
+                                original_task_id=original_task_id
+                            )
+                            print(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
                     except Exception as e:
                         print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
                 else:

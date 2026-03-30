@@ -527,7 +527,7 @@ async def get_pull_request_diff(
 async def merge_pull_request(
     token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash"
 ) -> dict:
-    """Merges a PR. merge_method can be 'merge', 'squash', or 'rebase'."""
+    """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -539,7 +539,13 @@ async def merge_pull_request(
             headers=headers,
             json={"merge_method": merge_method}
         )
-        if response.status_code not in (200, 405, 409):
-            logger.error(f"Failed to merge PR #{pr_number}: {response.text}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")
-        return response.json()
+        data = response.json()
+        if response.status_code == 200:
+            return {"merged": True, "message": data.get("message", "Merged")}
+        if response.status_code in (405, 409):
+            # 405 = not mergeable (checks/reviews), 409 = merge conflict
+            msg = data.get("message", "Merge failed")
+            logger.warning(f"PR #{pr_number} merge blocked ({response.status_code}): {msg}")
+            return {"merged": False, "conflict": response.status_code == 409, "message": msg}
+        logger.error(f"Failed to merge PR #{pr_number}: {response.text}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")

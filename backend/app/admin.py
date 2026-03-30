@@ -6,9 +6,10 @@ from typing import Optional, Dict, Any
 import uuid
 import httpx
 import logging
+from datetime import datetime
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount
 from app.auth import get_current_user, require_admin
 from app.compute import delete_agent_vm
 from app.github import generate_installation_access_token
@@ -286,6 +287,7 @@ async def update_settings(
 @router.post("/max-plan-accounts")
 async def add_max_plan_account(
     payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     """Add a Max plan account to the pool. Provide 'name' and 'credentials_json' (contents of ~/.claude/credentials.json)."""
@@ -295,34 +297,53 @@ async def add_max_plan_account(
     credentials_json = payload.get("credentials_json")
     if not name or not credentials_json:
         raise HTTPException(status_code=400, detail="'name' and 'credentials_json' are required")
-    # Validate JSON format to prevent injection and ensure it's real credentials
     try:
         _json.loads(credentials_json)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
 
-    account = {
-        "id": uuid.uuid4().hex[:8],
-        "name": name,
-        "credentials_json": credentials_json,
-        "enabled": True,
+    # Persist to database
+    db_account = MaxPlanAccount(
+        name=name,
+        credentials_json=credentials_json,
+    )
+    session.add(db_account)
+    await session.commit()
+    await session.refresh(db_account)
+
+    # Sync to in-memory pool
+    _max_plan_pool.append({
+        "id": str(db_account.id),
+        "name": db_account.name,
+        "credentials_json": db_account.credentials_json,
+        "enabled": db_account.enabled,
         "active_tasks": 0,
-        "total_tasks": 0,
-    }
-    _max_plan_pool.append(account)
-    return {"id": account["id"], "name": account["name"], "message": "Account added to pool"}
+        "total_tasks": db_account.total_tasks,
+    })
+    return {"id": str(db_account.id), "name": db_account.name, "message": "Account added to pool"}
 
 
 @router.delete("/max-plan-accounts/{account_id}")
 async def remove_max_plan_account(
     account_id: str,
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     from app.main import _max_plan_pool
-    before = len(_max_plan_pool)
-    _max_plan_pool[:] = [a for a in _max_plan_pool if a["id"] != account_id]
-    if len(_max_plan_pool) == before:
+
+    # Delete from database
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
+    await session.delete(db_account)
+    await session.commit()
+
+    # Remove from in-memory pool
+    _max_plan_pool[:] = [a for a in _max_plan_pool if a["id"] != account_id]
     return {"message": "Account removed"}
 
 
@@ -330,24 +351,46 @@ async def remove_max_plan_account(
 async def update_max_plan_account(
     account_id: str,
     payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     from app.main import _max_plan_pool
-    account = next((a for a in _max_plan_pool if a["id"] == account_id), None)
-    if not account:
+
+    # Update in database
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
+
     if "enabled" in payload:
-        account["enabled"] = bool(payload["enabled"])
+        db_account.enabled = bool(payload["enabled"])
     if "name" in payload:
-        account["name"] = payload["name"]
+        db_account.name = payload["name"]
     if "credentials_json" in payload:
         import json as _json
         try:
             _json.loads(payload["credentials_json"])
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
-        account["credentials_json"] = payload["credentials_json"]
-    return {"id": account["id"], "name": account["name"], "enabled": account["enabled"]}
+        db_account.credentials_json = payload["credentials_json"]
+    db_account.updated_at = datetime.utcnow()
+    session.add(db_account)
+    await session.commit()
+
+    # Sync to in-memory pool
+    mem_account = next((a for a in _max_plan_pool if a["id"] == account_id), None)
+    if mem_account:
+        if "enabled" in payload:
+            mem_account["enabled"] = db_account.enabled
+        if "name" in payload:
+            mem_account["name"] = db_account.name
+        if "credentials_json" in payload:
+            mem_account["credentials_json"] = db_account.credentials_json
+
+    return {"id": account_id, "name": db_account.name, "enabled": db_account.enabled}
 
 
 # --- GitHub Repository & Branch Discovery ---

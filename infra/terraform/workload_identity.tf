@@ -68,3 +68,27 @@ resource "google_service_account_iam_member" "github_actions_act_as_orchestrator
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
+
+# Access secrets so Cloud Run can mount them at deploy time
+resource "google_project_iam_member" "github_actions_secret_accessor" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+# Deploy to Firebase Hosting
+resource "google_project_iam_member" "github_actions_firebase_hosting" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/firebasehosting.admin"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+# Execute Cloud Run jobs (database migrations)
+resource "google_project_iam_member" "github_actions_run_invoker" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}

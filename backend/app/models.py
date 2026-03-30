@@ -119,6 +119,20 @@ class TaskHistory(SQLModel, table=True):
     
     task: Task = Relationship(back_populates="history")
 
+class MaxPlanAccount(SQLModel, table=True):
+    """
+    Persisted Max plan account for Claude Code credential pooling.
+    Credentials survive restarts/deploys. Active task counts are tracked in-memory.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    name: str
+    credentials_json: str  # Raw content of ~/.claude/credentials.json
+    enabled: bool = Field(default=True)
+    total_tasks: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Artifact(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id")
