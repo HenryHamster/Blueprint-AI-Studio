@@ -304,30 +304,58 @@ async function handleFix(
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
 
+  // Always rebase onto target branch to resolve merge conflicts
+  statusRef.value = `Rebasing onto ${baseBranch}...`;
+  sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
+  try {
+    git(['fetch', 'origin', baseBranch]);
+    git(['rebase', `origin/${baseBranch}`]);
+    sendLog(ws, `Rebase successful\n`);
+  } catch (e) {
+    sendLog(ws, `Rebase had conflicts — Claude will resolve them\n`);
+    // Abort the failed rebase so Claude can handle it with a merge strategy
+    try { git(['rebase', '--abort']); } catch {}
+    // Try merge instead so Claude sees conflict markers
+    try {
+      git(['merge', `origin/${baseBranch}`, '--no-edit']);
+    } catch {
+      sendLog(ws, `Merge conflicts present — Claude will resolve\n`);
+    }
+  }
+
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
   const { exitCode, allOutput } = await runClaudeCode(prompt, ws, statusRef);
 
+  // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);
   if (diff.length > 0 && exitCode === 0) {
-    statusRef.value = 'Pushing fixes...';
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
-    const commitHash = git(['rev-parse', 'HEAD']);
+  }
 
-    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
-    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    git(['push', 'origin', branch]);
-    sendLog(ws, `Pushed fixes to ${branch}\n`);
+  // Always push if the branch has diverged from origin (rebase or new commits)
+  if (exitCode === 0) {
+    statusRef.value = 'Pushing fixes...';
+    const localHead = git(['rev-parse', 'HEAD']);
+    let remoteHead = '';
+    try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch {}
 
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
-      commit_hash: commitHash, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
+    if (localHead !== remoteHead) {
+      const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+      const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
+      execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+      git(['push', '--force-with-lease', 'origin', branch]);
+      sendLog(ws, `Pushed fixes to ${branch}\n`);
+
+      await apiPost('/api/agent/status', {
+        task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
+        commit_hash: localHead, repo_url: `https://github.com/${owner}/${repo}`,
+      });
+    } else {
+      await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
+    }
   } else {
     await apiPost('/api/agent/status', {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
