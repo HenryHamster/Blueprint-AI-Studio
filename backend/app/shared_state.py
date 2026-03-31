@@ -5,7 +5,8 @@ endpoints need to read or mutate autonomous-loop / runtime-config state.
 """
 
 import os
-from typing import Dict
+from datetime import datetime
+from typing import Dict, Optional
 
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
@@ -16,3 +17,4 @@ runtime_config: Dict = {
 
 # --- Autonomous Loop State ---
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
+last_idle_check: Optional[datetime] = None

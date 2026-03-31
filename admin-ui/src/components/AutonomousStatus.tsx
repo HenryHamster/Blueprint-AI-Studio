@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
 import { Zap, ZapOff, AlertTriangle, RefreshCw } from 'lucide-react';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+import { API_BASE_URL, authHeaders } from '../api';
 
 interface ProjectAutonomousStatus {
   project_id: string;
@@ -14,22 +13,21 @@ interface ProjectAutonomousStatus {
 }
 
 interface AutonomousStatusProps {
-  getAuthHeaders: () => Promise<Record<string, string>>;
   onRefreshTasks?: () => void;
   wsRef?: RefObject<WebSocket | null>;
 }
 
-export function AutonomousStatus({ getAuthHeaders, onRefreshTasks, wsRef }: AutonomousStatusProps) {
+export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProps) {
   const [projects, setProjects] = useState<ProjectAutonomousStatus[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- getAuthHeaders is a stable module-level
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- authHeaders is a stable module-level
   // function; including it would cause a re-render loop if a caller ever inlined it.
   const fetchStatus = useCallback(async () => {
     try {
-      const headers = await getAuthHeaders();
+      const headers = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/autonomous-status`, {
         headers: { Authorization: headers.Authorization },
       });
@@ -104,7 +102,7 @@ export function AutonomousStatus({ getAuthHeaders, onRefreshTasks, wsRef }: Auto
   const toggleAutonomy = async (projectId: string, enabled: boolean) => {
     setToggling(projectId);
     try {
-      const headers = await getAuthHeaders();
+      const headers = await authHeaders();
       await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}/autonomous`, {
         method: 'PATCH',
         headers: { ...headers, 'Content-Type': 'application/json' },

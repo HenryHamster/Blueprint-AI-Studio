@@ -53,16 +53,30 @@ function stopHeartbeat() {
 }
 
 // ── WebSocket Log Stream ────────────────────────────────────────────────────
-function connectLogStream(taskId: string): Promise<WebSocket | null> {
-  return new Promise((resolve) => {
+async function connectLogStream(taskId: string): Promise<WebSocket | null> {
+  const wsUrl = ORCHESTRATOR_URL.replace(/^http/, 'ws');
+  const maxRetries = 3;
+  const baseDelay = 2000;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const wsUrl = ORCHESTRATOR_URL.replace(/^http/, 'ws');
-      const ws = new WebSocket(`${wsUrl}/api/agent/ws/${taskId}`);
-      const timeout = setTimeout(() => { resolve(null); }, 5000);
-      ws.on('open', () => { clearTimeout(timeout); ws.send(JSON.stringify({ token: AGENT_TOKEN })); resolve(ws); });
-      ws.on('error', () => { clearTimeout(timeout); resolve(null); });
-    } catch { resolve(null); }
-  });
+      const ws = await new Promise<WebSocket | null>((resolve) => {
+        const conn = new WebSocket(`${wsUrl}/api/agent/ws/${taskId}`);
+        const timeout = setTimeout(() => { resolve(null); }, 5000);
+        conn.on('open', () => {
+          clearTimeout(timeout);
+          conn.send(JSON.stringify({ token: AGENT_TOKEN }));
+          resolve(conn);
+        });
+        conn.on('error', () => { clearTimeout(timeout); resolve(null); });
+      });
+      if (ws) return ws;
+    } catch {}
+    if (attempt < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt)));
+    }
+  }
+  return null;
 }
 
 function sanitize(text: string): string {
@@ -414,18 +428,31 @@ Rules:
 - Keep prompts concise — describe what to achieve, not step-by-step how
 - Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
 - Aim for 2-6 subtasks. If the task is simple enough for 1 PR, output a single subtask with no dependencies
-- Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline`;
+- Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
+- IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running Claude Code for planning...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef);
 
-  // Plan output JSON can be large — extract the subtasks JSON from full output
+  // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
-  if (lastResultText && lastResultText.includes('"subtasks"')) {
-    logs = sanitize(lastResultText);
-  } else {
-    const jsonMatch = allOutput.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
-    logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+  const fs = await import('fs');
+  const planPath = '/tmp/plan_output.json';
+  try {
+    if (fs.existsSync(planPath)) {
+      logs = sanitize(fs.readFileSync(planPath, 'utf-8'));
+      sendLog(ws, 'Read plan output from /tmp/plan_output.json\n');
+    }
+  } catch (e) {
+    sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
+  }
+  if (!logs) {
+    if (lastResultText && lastResultText.includes('"subtasks"')) {
+      logs = sanitize(lastResultText);
+    } else {
+      const jsonMatch = allOutput.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
+      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+    }
   }
 
   await apiPost('/api/agent/status', {
@@ -492,20 +519,31 @@ Rules:
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - Do NOT include findings that require human architectural decisions
 - Limit to 10 findings maximum, prioritized by impact
-- For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition`;
+- For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
+- IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.`;
 
   statusRef.value = 'Running codebase research...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef);
 
-  // Research findings JSON can be large — prefer lastResultText, fall back to
-  // scanning allOutput for the JSON array, then truncate allOutput as last resort
+  // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
-  if (lastResultText && lastResultText.includes('"prompt"')) {
-    logs = sanitize(lastResultText);
-  } else {
-    // Extract JSON array from full output (it may be spread across stream chunks)
-    const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"prompt"[\s\S]*\}\s*\]/);
-    logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+  const fs = await import('fs');
+  const findingsPath = '/tmp/research_findings.json';
+  try {
+    if (fs.existsSync(findingsPath)) {
+      logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
+      sendLog(ws, 'Read research findings from /tmp/research_findings.json\n');
+    }
+  } catch (e) {
+    sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
+  }
+  if (!logs) {
+    if (lastResultText && lastResultText.includes('"prompt"')) {
+      logs = sanitize(lastResultText);
+    } else {
+      const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"prompt"[\s\S]*\}\s*\]/);
+      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+    }
   }
 
   await apiPost('/api/agent/status', {

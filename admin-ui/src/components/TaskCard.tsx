@@ -67,18 +67,37 @@ function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
 }
 
 function ResearchFindings({ findings }: { findings: string }) {
+  const [expanded, setExpanded] = useState(false);
   try {
     const parsed = JSON.parse(findings) as Record<string, string>[];
     if (Array.isArray(parsed)) {
-      return (<>{parsed.slice(0, 5).map((f, i) => (
-        <div key={i} className="mb-1 text-neutral-300">
-          <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
-          {f.title}
+      const items = expanded ? parsed : parsed.slice(0, 5);
+      return (
+        <div>
+          <div className={`space-y-1 ${expanded ? 'max-h-64 overflow-y-auto custom-scrollbar' : ''}`}>
+            {items.map((f, i) => (
+              <div key={i} className="text-neutral-300">
+                <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+                {f.title}
+                {expanded && f.description ? (
+                  <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+          {parsed.length > 5 ? (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="text-[10px] text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
+            >
+              {expanded ? 'Show less' : `Show all ${parsed.length} findings`}
+            </button>
+          ) : null}
         </div>
-      ))}</>);
+      );
     }
   } catch { /* fall through */ }
-  return <span className="text-neutral-400">{findings.slice(0, 500)}</span>;
+  return <span className="text-neutral-400">{findings.slice(0, 2000)}</span>;
 }
 
 function StatusBadge({ status }: { status: TaskStatus }) {

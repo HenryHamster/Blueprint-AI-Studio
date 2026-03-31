@@ -8,20 +8,9 @@ import { AutonomousStatus } from './components/AutonomousStatus';
 import type { Task, TaskStatus } from './components/TaskCard';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import type { Project } from './components/ProjectDashboard';
-import { auth, signInWithGoogle, getIdToken, onAuthChange, signOut } from './firebase';
+import { auth, signInWithGoogle, onAuthChange, signOut } from './firebase';
 import type { User } from 'firebase/auth';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
-
-async function authHeaders(): Promise<Record<string, string>> {
-  const token = await getIdToken();
-  return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
-}
-
-async function authGet(url: string) {
-  const token = await getIdToken();
-  return fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
-}
+import { API_BASE_URL, authHeaders, authGet } from './api';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -38,7 +27,9 @@ export default function App() {
   const [newTaskBranch, setNewTaskBranch] = useState('main');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
-  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research'>('create');
+  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research' | 'review' | 'fix'>('create');
+  const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
+  const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
 
   // GitHub repo/branch dropdown state
   interface RepoOption { full_name: string; default_branch: string; }
@@ -403,6 +394,17 @@ export default function App() {
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (newTaskType === 'review' || newTaskType === 'fix') {
+      const prNum = parseInt(newTaskPrNumber, 10);
+      if (!newTaskPrNumber || isNaN(prNum) || prNum < 1) {
+        alert('PR number must be a positive integer');
+        return;
+      }
+      if (newTaskType === 'fix' && !newTaskPrBranch) {
+        alert('PR branch is required for fix tasks');
+        return;
+      }
+    }
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
         method: 'POST',
@@ -413,6 +415,10 @@ export default function App() {
           prompt: newTaskPrompt,
           base_branch: newTaskBranch,
           task_type: newTaskType,
+          ...(newTaskType === 'review' || newTaskType === 'fix' ? {
+            pr_number: parseInt(newTaskPrNumber, 10),
+            branch: newTaskPrBranch || undefined,
+          } : {}),
         }),
       });
       if (!res.ok) {
@@ -423,6 +429,8 @@ export default function App() {
       setShowNewTaskModal(false);
       setNewTaskTitle('');
       setNewTaskPrompt('');
+      setNewTaskPrNumber('');
+      setNewTaskPrBranch('');
       // Keep repo and branch for rapid re-use
       fetchTasks();
     } catch (error) {
@@ -581,7 +589,7 @@ export default function App() {
             <span className="text-xl font-bold text-neutral-200 font-mono leading-none">{queuedTasks.length}</span>
           </div>
           <div className="w-px h-8 bg-neutral-800"></div>
-          <AutonomousStatus getAuthHeaders={authHeaders} onRefreshTasks={fetchTasks} wsRef={wsRef} />
+          <AutonomousStatus onRefreshTasks={fetchTasks} wsRef={wsRef} />
         </div>
 
         <div className="flex items-center gap-2">
@@ -974,10 +982,12 @@ export default function App() {
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
                 <div className="flex gap-2">
                   {([
-                    { value: 'create', label: 'Create', desc: 'Write code, open PR', icon: Plus },
-                    { value: 'plan', label: 'Plan', desc: 'Decompose into subtasks', icon: GitFork },
-                    { value: 'research', label: 'Research', desc: 'Analyze codebase', icon: Microscope },
-                  ] as const).map(opt => (
+                    { value: 'create' as const, label: 'Create', desc: 'Write code, open PR', icon: Plus },
+                    { value: 'plan' as const, label: 'Plan', desc: 'Decompose into subtasks', icon: GitFork },
+                    { value: 'research' as const, label: 'Research', desc: 'Analyze codebase', icon: Microscope },
+                    { value: 'review' as const, label: 'Review', desc: 'Review existing PR', icon: CheckCircle },
+                    { value: 'fix' as const, label: 'Fix', desc: 'Fix PR from feedback', icon: AlertCircle },
+                  ]).map(opt => (
                     <button
                       key={opt.value}
                       type="button"
@@ -997,6 +1007,30 @@ export default function App() {
                   ))}
                 </div>
               </div>
+              {(newTaskType === 'review' || newTaskType === 'fix') ? (
+                <div className="mb-4 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
+                    <input
+                      type="number"
+                      value={newTaskPrNumber}
+                      onChange={e => setNewTaskPrNumber(e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      placeholder="e.g., 15"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Branch</label>
+                    <input
+                      type="text"
+                      value={newTaskPrBranch}
+                      onChange={e => setNewTaskPrBranch(e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      placeholder="e.g., blueprint/task-abc123"
+                    />
+                  </div>
+                </div>
+              ) : null}
               <div className="mb-4">
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Title</label>
                 <input

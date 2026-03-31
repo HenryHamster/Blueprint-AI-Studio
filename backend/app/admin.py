@@ -269,6 +269,25 @@ async def modify_task(
         await session.commit()
         await session.refresh(task)
 
+        # Trigger rollup check if child status/context changed
+        from app.main import _check_and_trigger_rollup, _cleanup_branches
+        should_check_rollup = False
+        if "status" in payload and task.parent_task_id:
+            new_status = TaskStatus(payload["status"])
+            if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                should_check_rollup = True
+            # Clean up staging branches when parent task is cancelled/failed
+            if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
+                ctx = task.context or {}
+                if ctx.get("plan_branch") or ctx.get("research_branch"):
+                    await _cleanup_branches(task, session)
+        if "context" in payload and task.parent_task_id:
+            # pr_merged was set via admin → trigger rollup
+            if isinstance(payload["context"], dict) and payload["context"].get("pr_merged"):
+                should_check_rollup = True
+        if should_check_rollup:
+            await _check_and_trigger_rollup(task, session)
+
     return {
         "id": str(task.id),
         "project_id": str(task.project_id),

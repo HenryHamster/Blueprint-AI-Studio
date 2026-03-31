@@ -43,6 +43,7 @@ from app.github import (
     delete_branch,
     create_pull_request,
     merge_pull_request,
+    get_pull_request,
 )
 import hmac
 import hashlib
@@ -58,7 +59,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 # --- Runtime Config & Autonomous State (shared with admin.py) ---
 from app.shared_state import runtime_config as _runtime_config, autonomous_failure_counts as _autonomous_failure_counts
-_last_idle_check: Optional[datetime] = None
+import app.shared_state as _shared_state
 
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
@@ -95,6 +96,132 @@ def release_max_plan_account(account_id: str):
         if account["id"] == account_id:
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
             break
+
+
+# --- Max Plan Credential Refresh ---
+_credential_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def _do_oauth_refresh(refresh_token: str) -> Optional[dict]:
+    """Exchange single-use refresh token for new access + refresh tokens."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://claude.ai/v1/oauth/token",
+                json={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Validate response contains at least an access token
+                has_token = any(k in data for k in ("accessToken", "access_token"))
+                if not has_token:
+                    print(f"[CREDENTIALS] Refresh response missing access token: {list(data.keys())}")
+                    return None
+                return data
+            print(f"[CREDENTIALS] Refresh returned {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[CREDENTIALS] Refresh request failed: {e}")
+    return None
+
+
+async def _update_account_credentials(account: dict, creds: dict, new_tokens: dict):
+    """Update credentials in DB and memory pool after successful refresh."""
+    oauth = creds.get("claudeAiOauth", {})
+    # Map snake_case OAuth response fields to camelCase credential format
+    field_map = {
+        "access_token": "accessToken",
+        "refresh_token": "refreshToken",
+        "expires_at": "expiresAt",
+    }
+    for resp_key, cred_key in field_map.items():
+        if resp_key in new_tokens:
+            oauth[cred_key] = new_tokens[resp_key]
+    # Also accept camelCase directly (some endpoints return this format)
+    for key in ("accessToken", "refreshToken", "expiresAt"):
+        if key in new_tokens:
+            oauth[key] = new_tokens[key]
+
+    creds["claudeAiOauth"] = oauth
+    updated_json = json.dumps(creds)
+    account["credentials_json"] = updated_json
+
+    async with AsyncSessionLocal() as session:
+        db_acct = await session.get(MaxPlanAccount, uuid.UUID(account["id"]))
+        if db_acct:
+            db_acct.credentials_json = updated_json
+            db_acct.updated_at = datetime.now(timezone.utc)
+            session.add(db_acct)
+            await session.commit()
+
+
+async def _disable_account(account: dict, reason: str):
+    """Disable a Max Plan account and persist to DB."""
+    account["enabled"] = False
+    async with AsyncSessionLocal() as session:
+        db_acct = await session.get(MaxPlanAccount, uuid.UUID(account["id"]))
+        if db_acct:
+            db_acct.enabled = False
+            session.add(db_acct)
+            await session.commit()
+    print(f"[CREDENTIALS] DISABLED account '{account.get('name')}': {reason}")
+
+
+async def _ensure_credentials_fresh(account: dict) -> bool:
+    """Check if account credentials are within 1 hour of expiry, refresh if needed.
+    Returns True if credentials are usable, False if account was disabled."""
+    try:
+        creds = json.loads(account["credentials_json"])
+        oauth = creds.get("claudeAiOauth", {})
+        expires_at_ms = oauth.get("expiresAt")
+        refresh_token = oauth.get("refreshToken")
+
+        if not expires_at_ms or not refresh_token:
+            return True  # Can't determine expiry — assume OK
+
+        expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
+        remaining = expires_at - datetime.now(timezone.utc)
+        if remaining > timedelta(hours=1):
+            return True
+
+        # Refresh needed — acquire per-account lock
+        lock = _credential_locks.setdefault(account["id"], asyncio.Lock())
+        async with lock:
+            # Re-check after acquiring lock
+            creds = json.loads(account["credentials_json"])
+            oauth = creds.get("claudeAiOauth", {})
+            expires_at_ms = oauth.get("expiresAt", 0)
+            expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
+            remaining = expires_at - datetime.now(timezone.utc)
+            if remaining > timedelta(hours=1):
+                return True
+
+            print(f"[CREDENTIALS] Refreshing '{account['name']}' (expires in {remaining})")
+            new_tokens = await _do_oauth_refresh(oauth.get("refreshToken", ""))
+            if new_tokens:
+                await _update_account_credentials(account, creds, new_tokens)
+                print(f"[CREDENTIALS] Refreshed '{account['name']}' successfully")
+                return True
+            else:
+                await _disable_account(account, "refresh failed — re-login needed")
+                return False
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        # Credential JSON is malformed — log but don't disable (admin can fix via UI)
+        print(f"[CREDENTIALS] Credential parse error for '{account.get('name')}': {e}")
+        return True
+    except Exception as e:
+        print(f"[CREDENTIALS] Unexpected freshness check error for '{account.get('name')}': {e}")
+        return True
+
+
+async def _credential_health_check():
+    """Proactively refresh Max Plan credentials before they expire. Runs hourly."""
+    while True:
+        await asyncio.sleep(3600)
+        for account in _max_plan_pool:
+            if not account.get("enabled", True):
+                continue
+            await _ensure_credentials_fresh(account)
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -192,11 +319,10 @@ async def _check_autonomous_research(owner: str, repo: str):
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
-    global _last_idle_check
     now = datetime.now(timezone.utc)
-    if _last_idle_check and (now - _last_idle_check) < timedelta(minutes=30):
+    if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=30):
         return
-    _last_idle_check = now
+    _shared_state.last_idle_check = now
 
     try:
         async with AsyncSessionLocal() as session:
@@ -344,16 +470,24 @@ async def reaper_service():
                         print(f"[REAPER] Task {task.id} failed after 3 attempts.")
                         task.status = TaskStatus.FAILED
                         session.add(task)
-                        
+
                         # Broadcast failure to frontend
                         await broadcast_to_project(
-                            str(task.project_id), 
-                            "task_updated", 
+                            str(task.project_id),
+                            "task_updated",
                             {"task_id": str(task.id), "status": TaskStatus.FAILED}
                         )
-                
+
                 if orphaned_tasks:
                     await session.commit()
+
+                    # Trigger rollup checks for failed tasks with parents (after commit)
+                    for task in orphaned_tasks:
+                        if task.status == TaskStatus.FAILED and task.parent_task_id:
+                            try:
+                                await _check_and_trigger_rollup(task, session)
+                            except Exception as e:
+                                print(f"[REAPER] Rollup check failed for task {task.id}: {e}")
                     
         except asyncio.CancelledError:
             print("[REAPER] Service shutting down.")
@@ -450,7 +584,7 @@ async def orchestrator_worker():
                             continue
                         # For create tasks, also require PR to be merged
                         dt_type = ((dt.payloads or [{}])[0]).get("type", "create")
-                        if dt_type in ("create", "") and not (dt.context or {}).get("pr_merged"):
+                        if dt_type in ("create", "") and not await _verify_pr_merged(dt, session):
                             all_met = False
 
                     if any_failed:
@@ -474,6 +608,12 @@ async def orchestrator_worker():
                     account = select_max_plan_account()
                     claude_credentials = None
                     account_id = None
+                    if account:
+                        # Ensure credentials are fresh before dispatching
+                        if not await _ensure_credentials_fresh(account):
+                            # Account disabled — try next available
+                            account = select_max_plan_account()
+
                     if account:
                         account["active_tasks"] += 1
                         account["total_tasks"] += 1
@@ -571,12 +711,16 @@ async def lifespan(app: FastAPI):
     
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
-    
+
+    # Start the Credential Health Check background task
+    credential_task = asyncio.create_task(_credential_health_check())
+
     yield
     # Shutdown: Clean up resources if needed
     reaper_task.cancel()
     gcp_cleanup_task.cancel()
     orchestrator_task.cancel()
+    credential_task.cancel()
 
 app = FastAPI(
     title="Blueprint Orchestrator",
@@ -1218,12 +1362,35 @@ async def spawn_subtask(
         "requires_approval": req.requires_approval
     }
 
+MAX_REVIEW_FIX_ITERATIONS = 30
+
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = ""
-) -> Task:
-    """Spawn a review or fix task as part of the automated review pipeline."""
+) -> Optional[Task]:
+    """Spawn a review or fix task as part of the automated review pipeline.
+    Returns None if the review-fix cycle limit has been reached."""
+    # Track review-fix iteration count to prevent infinite loops
+    source_loop = (source_task.context or {}).get("review_loop", {})
+    iteration = source_loop.get("iteration", 0) + 1
+
+    if iteration > MAX_REVIEW_FIX_ITERATIONS:
+        # Cap reached — require manual intervention
+        orig_id = original_task_id or source_loop.get("original_task_id", "")
+        if orig_id:
+            try:
+                orig = await session.get(Task, uuid.UUID(orig_id))
+                if orig:
+                    orig.requires_approval = True
+                    orig.latest_status_message = f"Review-fix cycle reached limit ({MAX_REVIEW_FIX_ITERATIONS} iterations) — manual review required"
+                    session.add(orig)
+                    await session.commit()
+            except Exception:
+                pass
+        print(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
+        return None
+
     vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
 
     if task_type == "review":
@@ -1241,7 +1408,9 @@ async def _spawn_pipeline_task(
         description=fix_prompt or f"Automated {task_type} for PR #{pr_number}",
         payloads=[payload_data],
         context={"review_loop": {"pr_number": pr_number, "branch": branch,
-                                  "base_branch": base_branch, "original_task_id": original_task_id or str(source_task.id)}},
+                                  "base_branch": base_branch,
+                                  "original_task_id": original_task_id or str(source_task.id),
+                                  "iteration": iteration}},
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -1509,6 +1678,194 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     print(f"[RESEARCH] Created {created_count} tasks from research {task.id}")
 
 
+# --- Rollup & Branch Cleanup Helpers ---
+# Extracted so both update_agent_status and admin PATCH can trigger rollup.
+
+async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
+    """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API."""
+    if (task.context or {}).get("pr_merged"):
+        return True
+    # Look for PR artifact to verify via API
+    art_result = await session.execute(
+        select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+    )
+    artifact = art_result.scalars().first()
+    if artifact and artifact.pr_url:
+        try:
+            pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+            pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            if pr_data.get("merged"):
+                task.context = {**(task.context or {}), "pr_merged": True}
+                session.add(task)
+                await session.commit()
+                return True
+        except Exception as e:
+            print(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}")
+    return False
+
+
+async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
+    """Delete staging and feature branches that are no longer needed."""
+    ctx = task.context or {}
+    gh_token = owner = repo = None
+
+    async def _ensure_token():
+        nonlocal gh_token, owner, repo
+        if not gh_token:
+            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+
+    branches_to_delete = []
+
+    # Staging branches (research/*, plan/*) owned by parent tasks
+    staging = ctx.get("plan_branch") or ctx.get("research_branch")
+    if staging:
+        branches_to_delete.append(staging)
+
+    # Feature branches after PR merge
+    if ctx.get("pr_merged"):
+        for payload in (task.payloads or []):
+            branch = payload.get("branch")
+            if branch and branch.startswith("blueprint/"):
+                branches_to_delete.append(branch)
+
+    for branch in branches_to_delete:
+        try:
+            await _ensure_token()
+            deleted = await delete_branch(gh_token, owner, repo, branch)
+            if deleted:
+                print(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
+        except Exception as e:
+            print(f"[CLEANUP] Failed to delete {branch}: {e}")
+
+
+async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> None:
+    """Check if all siblings are done and trigger rollup PR for the parent.
+
+    Called after a child task completes, fails, or is cancelled.
+    Also called from admin PATCH when status/context changes.
+    """
+    if not child_task.parent_task_id:
+        return
+
+    parent = await session.get(Task, child_task.parent_task_id)
+    if not parent or parent.status != TaskStatus.EVALUATING:
+        return
+
+    children = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id)
+    )).scalars().all()
+
+    # Check all non-cancelled children are done with PRs merged
+    all_done = True
+    cancelled_count = 0
+    active_count = 0
+    for c in children:
+        if c.status == TaskStatus.CANCELLED:
+            cancelled_count += 1
+            continue
+        if c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+            active_count += 1
+            all_done = False
+            continue
+        if c.status == TaskStatus.FAILED:
+            all_done = False
+            continue
+        # COMPLETED — check pr_merged for create tasks
+        c_type = ((c.payloads or [{}])[0]).get("type", "create")
+        if c_type in ("create", "") and not await _verify_pr_merged(c, session):
+            all_done = False
+
+    # Don't rollup if there are still active tasks
+    if active_count > 0:
+        return
+
+    child_statuses = [c.status for c in children]
+
+    # Edge case: all children cancelled — nothing to rollup, mark parent cancelled
+    if cancelled_count == len(children):
+        parent.status = TaskStatus.CANCELLED
+        parent.latest_status_message = f"All {len(children)} subtasks were cancelled"
+        session.add(parent)
+        await session.commit()
+        await _cleanup_branches(parent, session)
+        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                   {"task_id": str(parent.id), "status": TaskStatus.CANCELLED})
+        print(f"[ROLLUP] Parent {parent.id} cancelled — all children cancelled")
+        return
+
+    if all_done and (len(children) - cancelled_count) > 0:
+        # All non-cancelled children merged — create rollup PR
+        parent_ctx = parent.context or {}
+        staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
+        target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
+
+        completed_count = len(children) - cancelled_count
+        rollup_note = ""
+        if cancelled_count > 0:
+            rollup_note = f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
+
+        if staging_branch and target_branch and staging_branch != target_branch:
+            try:
+                gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
+                is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
+                pr_title = f"[Blueprint] Rollup: {parent.title}"
+                pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
+
+                pr_result = await create_pull_request(gh_token, owner, repo,
+                    title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+                rollup_pr_url = pr_result.get("html_url", "")
+                rollup_pr_number = pr_result.get("number")
+                print(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+
+                if is_target_intermediate:
+                    merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+                    if merge_result.get("merged"):
+                        parent.status = TaskStatus.COMPLETED
+                        parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
+                        parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
+                        await delete_branch(gh_token, owner, repo, staging_branch)
+                        print(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
+                    else:
+                        parent.status = TaskStatus.FAILED
+                        parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge failed: {merge_result.get('message')} — resolve conflicts and retry via admin"
+                else:
+                    parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
+                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                    review_task = await _spawn_pipeline_task(
+                        parent, "review", session, rollup_pr_number, staging_branch, target_branch,
+                        original_prompt=parent.description or parent.title,
+                        original_task_id=str(parent.id)
+                    )
+                    if review_task:
+                        print(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
+            except Exception as e:
+                print(f"[ROLLUP] Failed to create rollup PR: {e}")
+                parent.status = TaskStatus.COMPLETED
+                parent.latest_status_message = f"All {completed_count} subtasks done, rollup failed: {e}"
+        else:
+            parent.status = TaskStatus.COMPLETED
+            parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
+
+        session.add(parent)
+        await session.commit()
+        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                   {"task_id": str(parent.id), "status": parent.status})
+        print(f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})")
+
+    elif any(s == TaskStatus.FAILED for s in child_statuses) and active_count == 0:
+        # All done but some failed — mark parent as failed, clean up staging branch
+        parent.status = TaskStatus.FAILED
+        failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
+        parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
+        session.add(parent)
+        await session.commit()
+        await _cleanup_branches(parent, session)
+        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                   {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+        print(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
+
+
 @app.post("/api/agent/status")
 async def update_agent_status(
     payload: AgentStatusPayload, 
@@ -1615,7 +1972,30 @@ async def update_agent_status(
                         print(f"[AUTONOMOUS] Paused project {project_key} after 3 consecutive failures")
                 except Exception as e:
                     print(f"[AUTONOMOUS] Error in circuit breaker: {e}")
-        elif payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
+        # When review/fix fails permanently, cancel the original create task so rollup
+        # skips it (via cancelled-child logic) instead of hanging forever.
+        # Other children's work is preserved — only this PR is excluded from the rollup.
+        if payload.status == TaskStatus.FAILED:
+            task_payload = (task.payloads or [{}])[0]
+            task_type = task_payload.get("type", "")
+            if task_type in ("review", "fix"):
+                original_task_id = (task.context or {}).get("review_loop", {}).get("original_task_id", "")
+                if original_task_id:
+                    try:
+                        orig = await session.get(Task, uuid.UUID(original_task_id))
+                        if orig and orig.status == TaskStatus.COMPLETED:
+                            orig.status = TaskStatus.CANCELLED
+                            orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
+                            session.add(orig)
+                            await session.commit()
+                            # Trigger rollup check so parent can proceed with remaining children
+                            if orig.parent_task_id:
+                                await _check_and_trigger_rollup(orig, session)
+                            print(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
+                    except Exception as e:
+                        print(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}")
+
+        if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
             # Reset failure counter on success
             _autonomous_failure_counts.pop(str(task.project_id), None)
 
@@ -1643,16 +2023,25 @@ async def update_agent_status(
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
                             await session.commit()
+                            await _cleanup_branches(task, session)
                             print(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
                         else:
                             print(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
                             # Fall through to review pipeline for conflict resolution
-                            review_task = await _spawn_pipeline_task(
+                            await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
                     except Exception as e:
                         print(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}")
+                        # Fallback: spawn review so the pipeline doesn't die
+                        try:
+                            await _spawn_pipeline_task(
+                                task, "review", session, pr_number, branch, base_branch,
+                                original_prompt=original_prompt, original_task_id=str(task.id)
+                            )
+                        except Exception:
+                            pass
                 else:
                     # Full pipeline: security scan → review (for main targets or medium+ scope)
                     try:
@@ -1677,7 +2066,8 @@ async def update_agent_status(
                             task, "review", session, pr_number, branch, base_branch,
                             original_prompt=original_prompt, original_task_id=str(task.id)
                         )
-                        print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                        if review_task:
+                            print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -1726,16 +2116,10 @@ async def update_agent_status(
                                         if orig.status == TaskStatus.EVALUATING:
                                             orig.status = TaskStatus.COMPLETED
                                             orig.latest_status_message = "Rollup PR merged"
-                                            # Clean up staging branch
-                                            staging = (orig.context or {}).get("plan_branch") or (orig.context or {}).get("research_branch")
-                                            if staging:
-                                                try:
-                                                    await delete_branch(gh_token, owner, repo, staging)
-                                                    print(f"[ROLLUP] Deleted staging branch {staging}")
-                                                except Exception:
-                                                    pass
                                         session.add(orig)
                                         await session.commit()
+                                        # Clean up branches (staging + feature)
+                                        await _cleanup_branches(orig, session)
                                 except Exception as e:
                                     print(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}")
                             print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
@@ -1749,7 +2133,8 @@ async def update_agent_status(
                                 fix_prompt=f"This PR was approved but could not be merged due to: {merge_msg}\n\nRebase this branch onto the latest {base_branch} and resolve any merge conflicts. Preserve the intent of the existing changes. Do not alter logic unless necessary to resolve conflicts.",
                                 original_task_id=original_task_id
                             )
-                            print(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
+                            if fix_task:
+                                print(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
                     except Exception as e:
                         print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
                 else:
@@ -1758,7 +2143,8 @@ async def update_agent_status(
                         fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}",
                         original_task_id=original_task_id
                     )
-                    print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                    if fix_task:
+                        print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
 
             # Fix task completed → security scan → spawn new review
             elif task_type == "fix":
@@ -1791,7 +2177,8 @@ async def update_agent_status(
                         task, "review", session, pr_number, branch, base_branch,
                         original_task_id=original_task_id
                     )
-                    print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+                    if review_task:
+                        print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
 
             # Plan task completed → decompose into subtasks
             elif task_type == "plan":
@@ -1803,95 +2190,9 @@ async def update_agent_status(
                 research_logs = payload.logs or task.latest_status_message or ""
                 await _handle_research_completion(task, research_logs, session)
 
-        # 6. Parent task rollup — check if all siblings of a plan are done
-        # Note: COMPLETED alone is not enough for create tasks — PR must also be merged
+        # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-            parent = await session.get(Task, task.parent_task_id)
-            if parent and parent.status == TaskStatus.EVALUATING:
-                children = (await session.execute(
-                    select(Task).where(Task.parent_task_id == parent.id)
-                )).scalars().all()
-                child_statuses = [c.status for c in children]
-
-                # For create tasks, also require pr_merged (COMPLETED only means PR opened)
-                all_done = True
-                for c in children:
-                    if c.status != TaskStatus.COMPLETED:
-                        all_done = False
-                        break
-                    c_type = ((c.payloads or [{}])[0]).get("type", "create")
-                    if c_type in ("create", "") and not (c.context or {}).get("pr_merged"):
-                        all_done = False
-                        break
-
-                if all_done:
-                    # All children merged — create rollup PR from staging branch to target
-                    parent_ctx = parent.context or {}
-                    staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
-                    target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
-
-                    if staging_branch and target_branch and staging_branch != target_branch:
-                        try:
-                            gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
-                            is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
-                            parent_type = ((parent.payloads or [{}])[0]).get("type", "")
-                            pr_title = f"[Blueprint] Rollup: {parent.title}"
-                            pr_body = f"Rollup of {len(children)} subtasks from `{staging_branch}`\n\n---\n*Automated by Blueprint Pipeline*"
-
-                            pr_result = await create_pull_request(gh_token, owner, repo,
-                                title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
-                            rollup_pr_url = pr_result.get("html_url", "")
-                            rollup_pr_number = pr_result.get("number")
-                            print(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
-
-                            if is_target_intermediate:
-                                # Plan rolling up into research branch → auto-merge
-                                merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
-                                if merge_result.get("merged"):
-                                    parent.status = TaskStatus.COMPLETED
-                                    parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
-                                    parent.latest_status_message = f"All {len(children)} subtasks merged, rollup PR auto-merged"
-                                    await delete_branch(gh_token, owner, repo, staging_branch)
-                                    print(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
-                                else:
-                                    parent.latest_status_message = f"Rollup PR created but merge failed: {merge_result.get('message')}"
-                            else:
-                                # Rolling up into main → spawn review for the rollup PR
-                                parent.latest_status_message = f"All {len(children)} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
-                                parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                                # Spawn review task for the rollup
-                                review_task = await _spawn_pipeline_task(
-                                    parent, "review", session, rollup_pr_number, staging_branch, target_branch,
-                                    original_prompt=parent.description or parent.title,
-                                    original_task_id=str(parent.id)
-                                )
-                                print(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
-                        except Exception as e:
-                            print(f"[ROLLUP] Failed to create rollup PR: {e}")
-                            parent.status = TaskStatus.COMPLETED
-                            parent.latest_status_message = f"All {len(children)} subtasks done, rollup failed: {e}"
-                    else:
-                        # No staging branch (fallback mode) — just mark complete
-                        parent.status = TaskStatus.COMPLETED
-                        parent.latest_status_message = f"All {len(children)} subtasks completed and merged"
-
-                    session.add(parent)
-                    await session.commit()
-                    await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": parent.status})
-                    print(f"[PLAN] Parent {parent.id} — all {len(children)} children done")
-                elif any(s == TaskStatus.FAILED for s in child_statuses) and not any(
-                    s in [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
-                    for s in child_statuses
-                ):
-                    parent.status = TaskStatus.FAILED
-                    failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
-                    parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
-                    session.add(parent)
-                    await session.commit()
-                    await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": TaskStatus.FAILED})
-                    print(f"[PLAN] Parent plan {parent.id} failed — {failed_count} children failed")
+            await _check_and_trigger_rollup(task, session)
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.

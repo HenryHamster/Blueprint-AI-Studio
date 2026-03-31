@@ -1,13 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight } from 'lucide-react';
-import { getIdToken } from '../firebase';
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
-
-async function authHeaders(): Promise<Record<string, string>> {
-  const token = await getIdToken();
-  return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
-}
+import { API_BASE_URL, authHeaders } from '../api';
 
 interface Project {
   id: string;
