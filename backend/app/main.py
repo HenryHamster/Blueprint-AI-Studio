@@ -1946,8 +1946,33 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         await delete_branch(gh_token, owner, repo, staging_branch)
                         print(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
                     else:
-                        parent.status = TaskStatus.FAILED
-                        parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge failed: {merge_result.get('message')} — resolve conflicts and retry via admin"
+                        # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
+                        merge_msg = merge_result.get("message", "unknown")
+                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked: {merge_msg} — spawning fix task"
+                        try:
+                            pr_files = await get_pr_files(gh_token, owner, repo, rollup_pr_number)
+                            files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
+                        except Exception:
+                            files_list = "  (could not fetch file list)"
+                        fix_prompt = (
+                            f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
+                            f"Error: {merge_msg}\n\n"
+                            f"Files in this PR:\n{files_list}\n\n"
+                            f"Steps to resolve:\n"
+                            f"1. Run: git fetch origin {target_branch}\n"
+                            f"2. Run: git rebase origin/{target_branch}\n"
+                            f"3. Resolve any conflicts — keep the intent of the subtask changes while incorporating upstream updates\n"
+                            f"4. Run: git rebase --continue after resolving each file\n\n"
+                            f"Preserve the intent of the existing changes."
+                        )
+                        fix_task = await _spawn_pipeline_task(
+                            parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
+                            fix_prompt=fix_prompt,
+                            original_task_id=str(parent.id)
+                        )
+                        if fix_task:
+                            print(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
@@ -2189,21 +2214,47 @@ async def update_agent_status(
             elif task_type == "review":
                 pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch", "main")
+                base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
                 original_task_id = review_loop.get("original_task_id", "")
                 original_prompt = task_payload.get("original_prompt", "")
+
+                if not pr_number or not branch:
+                    print(f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
+                    task.latest_status_message = f"Review pipeline error: missing pr_number or branch"
+                    session.add(task)
+                    await session.commit()
+                    continue
 
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
                 try:
                     import re
-                    json_match = re.search(r'\{[^{}]*"verdict"[^{}]*\}', verdict_text)
-                    if json_match:
-                        verdict_data = json.loads(json_match.group())
+                    # Find ALL JSON objects containing "verdict" — use bracket-counting
+                    # to handle nested braces in feedback strings
+                    verdict_candidates = []
+                    for m in re.finditer(r'\{[^"]*"verdict"', verdict_text):
+                        start = m.start()
+                        depth = 0
+                        for i in range(start, len(verdict_text)):
+                            if verdict_text[i] == '{':
+                                depth += 1
+                            elif verdict_text[i] == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    try:
+                                        candidate = json.loads(verdict_text[start:i+1])
+                                        if "verdict" in candidate:
+                                            verdict_candidates.append(candidate)
+                                    except json.JSONDecodeError:
+                                        pass
+                                    break
+                    # Use the LAST valid verdict (most recent in output)
+                    if verdict_candidates:
+                        verdict_data = verdict_candidates[-1]
                         verdict = verdict_data.get("verdict", "REQUEST_CHANGES")
                         feedback = verdict_data.get("feedback", verdict_text)
-                except (json.JSONDecodeError, AttributeError):
+                except Exception:
                     pass
 
                 # Post the review to the PR as a comment
@@ -2217,6 +2268,17 @@ async def update_agent_status(
                 if verdict == "APPROVE":
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        # Validate PR head branch matches before merging
+                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                        pr_head = pr_data.get("head", {}).get("ref", "")
+                        if pr_head and pr_head != branch:
+                            print(f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge")
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                f"**Blueprint Review Pipeline**: Merge aborted — reviewed branch `{branch}` does not match PR head `{pr_head}`.")
+                            task.latest_status_message = f"Branch mismatch: reviewed {branch}, PR head is {pr_head}"
+                            session.add(task)
+                            await session.commit()
+                            continue
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
 
                         if merge_result.get("merged"):
@@ -2284,8 +2346,15 @@ async def update_agent_status(
             elif task_type == "fix":
                 pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch", "main")
+                base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
                 original_task_id = review_loop.get("original_task_id", "")
+
+                if not pr_number or not branch:
+                    print(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
+                    task.latest_status_message = f"Fix pipeline error: missing pr_number or branch"
+                    session.add(task)
+                    await session.commit()
+                    continue
 
                 # Security scan fix output before re-review
                 scan_blocked = False

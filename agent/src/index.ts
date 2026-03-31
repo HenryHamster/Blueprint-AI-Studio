@@ -228,6 +228,15 @@ async function handleCreate(
       try { git(['rebase', '--abort']); } catch {}
     }
 
+    // Verify no conflict markers before pushing
+    try {
+      const markers = execFileSync('grep', ['-rl', '<<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.jsx', '--include=*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      if (markers) {
+        sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
+        try { git(['rebase', '--abort']); } catch {}
+      }
+    } catch { /* no markers found */ }
+
     const commitHash = git(['rev-parse', 'HEAD']);
 
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
@@ -410,6 +419,17 @@ async function handleFix(
       sendLog(ws, `Final rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
       try { git(['rebase', '--abort']); } catch {}
     }
+  }
+
+  // Check for remaining conflict markers — warn but don't block push
+  // The review/fix loop will continue trying if markers remain
+  if (exitCode === 0) {
+    try {
+      const remainingMarkers = execFileSync('grep', ['-rl', '<<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.jsx', '--include=*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      if (remainingMarkers) {
+        sendLog(ws, `WARNING: Conflict markers still present in:\n${remainingMarkers}\nPushing anyway — review pipeline will continue resolving.\n`);
+      }
+    } catch { /* grep found nothing — no markers, good */ }
   }
 
   // Always push if the branch has diverged from origin (rebase or new commits)

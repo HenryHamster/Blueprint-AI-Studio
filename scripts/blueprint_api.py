@@ -89,23 +89,43 @@ def list_tasks(limit: int = 10, status: str | None = None) -> dict:
 # ── CLI entrypoint ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python blueprint_api.py <command> [args...]")
-        print("  create_task <title> <prompt> [task_type]")
-        print("  list_tasks  [status_filter]")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Blueprint orchestrator API helper")
+    sub = parser.add_subparsers(dest="command")
+
+    ct = sub.add_parser("create_task", help="Submit a new task")
+    ct.add_argument("title", help="Short task title")
+    ct.add_argument("prompt", help="Instructions for the agent")
+    ct.add_argument("--type", dest="task_type", default="create",
+                    choices=["create", "plan", "research", "review", "fix"],
+                    help="Task type (default: create)")
+    ct.add_argument("--base-branch", dest="base_branch", default=None,
+                    help="Target branch (default: config's default_base_branch)")
+    ct.add_argument("--pr-number", dest="pr_number", type=int, default=None,
+                    help="PR number (required for review/fix)")
+    ct.add_argument("--branch", dest="branch", default=None,
+                    help="PR head branch (required for fix, optional for review)")
+
+    lt = sub.add_parser("list_tasks", help="Fetch recent tasks")
+    lt.add_argument("--status", default=None, help="Filter by status")
+    lt.add_argument("--limit", type=int, default=10, help="Max tasks to return")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
         sys.exit(1)
 
-    cmd = sys.argv[1]
-    if cmd == "create_task":
+    if args.command == "create_task":
         result = create_task(
-            title=sys.argv[2] if len(sys.argv) > 2 else "Untitled task",
-            prompt=sys.argv[3] if len(sys.argv) > 3 else "",
-            task_type=sys.argv[4] if len(sys.argv) > 4 else "create",
+            title=args.title,
+            prompt=args.prompt,
+            task_type=args.task_type,
+            base_branch=args.base_branch,
+            pr_number=args.pr_number,
+            branch=args.branch,
         )
-    elif cmd == "list_tasks":
-        result = list_tasks(status=sys.argv[2] if len(sys.argv) > 2 else None)
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
+    elif args.command == "list_tasks":
+        result = list_tasks(limit=args.limit, status=args.status)
 
     print(json.dumps(result, indent=2))
