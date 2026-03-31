@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Plus, Activity, X, AlertCircle, AlertTriangle, CheckCircle, Terminal, GitBranch, Settings, LogOut } from 'lucide-react';
+import { Plus, Activity, X, AlertCircle, AlertTriangle, CheckCircle, Terminal, GitBranch, Settings, LogOut, GitFork, Microscope } from 'lucide-react';
 import { TaskCard } from './components/TaskCard';
 import type { Task, TaskStatus } from './components/TaskCard';
 import { auth, signInWithGoogle, getIdToken, onAuthChange, signOut } from './firebase';
@@ -32,6 +32,7 @@ export default function App() {
   const [newTaskBranch, setNewTaskBranch] = useState('main');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
+  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research'>('create');
 
   // GitHub repo/branch dropdown state
   interface RepoOption { full_name: string; default_branch: string; }
@@ -377,6 +378,7 @@ export default function App() {
           title: newTaskTitle,
           prompt: newTaskPrompt,
           base_branch: newTaskBranch,
+          task_type: newTaskType,
         }),
       });
       if (!res.ok) {
@@ -880,6 +882,33 @@ export default function App() {
                       ))}
                     </select>
                   )}
+                </div>
+              </div>
+              <div className="mb-4">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
+                <div className="flex gap-2">
+                  {([
+                    { value: 'create', label: 'Create', desc: 'Write code, open PR', icon: Plus },
+                    { value: 'plan', label: 'Plan', desc: 'Decompose into subtasks', icon: GitFork },
+                    { value: 'research', label: 'Research', desc: 'Analyze codebase', icon: Microscope },
+                  ] as const).map(opt => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setNewTaskType(opt.value)}
+                      className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
+                        newTaskType === opt.value
+                          ? 'bg-white/5 border-neutral-600 text-neutral-100'
+                          : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
+                      }`}
+                    >
+                      <opt.icon className="w-3.5 h-3.5" />
+                      <div className="text-left">
+                        <div>{opt.label}</div>
+                        <div className="text-[10px] text-neutral-500 font-normal">{opt.desc}</div>
+                      </div>
+                    </button>
+                  ))}
                 </div>
               </div>
               <div className="mb-4">

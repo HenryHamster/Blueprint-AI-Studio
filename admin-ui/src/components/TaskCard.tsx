@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight } from 'lucide-react';
+import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, Search, GitFork, Microscope, Shield } from 'lucide-react';
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix';
 
 export interface Task {
   id: string;
@@ -9,18 +10,29 @@ export interface Task {
   title: string;
   description: string;
   status: TaskStatus;
+  task_type?: TaskType;
   vm_instance_id?: string;
   latest_status_message?: string;
   created_by: string;
   requires_approval: boolean;
   parent_task_id?: string;
+  depends_on?: string[];
+  plan_output?: Record<string, unknown>;
   created_at: string;
   last_heartbeat?: string;
   attempt_count?: number;
   payloads?: Record<string, unknown>[];
   pr_url?: string;
   error_logs?: string;
+  research_findings?: string;
 }
+
+const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {
+  plan: { bg: 'bg-purple-500/10 border-purple-500/20', text: 'text-purple-400', icon: GitFork, label: 'Plan' },
+  research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-400', icon: Microscope, label: 'Research' },
+  review: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Search, label: 'Review' },
+  fix: { bg: 'bg-orange-500/10 border-orange-500/20', text: 'text-orange-400', icon: RotateCcw, label: 'Fix' },
+};
 
 interface TaskCardProps {
   task: Task;
@@ -57,9 +69,18 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
           <h3 className="font-medium text-sm text-neutral-100 truncate" title={task.title}>{task.title}</h3>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {task.task_type && TASK_TYPE_STYLES[task.task_type] && (() => {
+            const style = TASK_TYPE_STYLES[task.task_type!];
+            const Icon = style.icon;
+            return (
+              <span className={`${style.bg} ${style.text} border text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1`}>
+                <Icon className="w-3 h-3" />{style.label}
+              </span>
+            );
+          })()}
           {task.requires_approval && (
-            <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
-              Approval
+            <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
+              <Shield className="w-3 h-3" />Approval
             </span>
           )}
           {task.attempt_count && task.attempt_count > 0 && (
@@ -123,6 +144,47 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
         <div className="bg-red-950/30 text-red-400 text-[11px] p-2.5 rounded-lg mb-3 border border-red-900/30 font-mono max-h-24 overflow-y-auto">
           <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
           {task.error_logs.slice(0, 500)}
+        </div>
+      )}
+
+      {/* Research findings preview */}
+      {task.research_findings && (
+        <div className="bg-cyan-950/20 text-cyan-300 text-[11px] p-2.5 rounded-lg mb-3 border border-cyan-900/30 font-mono max-h-32 overflow-y-auto">
+          <span className="font-semibold block mb-1 text-cyan-400 font-sans">Research Findings:</span>
+          {(() => {
+            try {
+              const findings = JSON.parse(task.research_findings);
+              if (Array.isArray(findings)) {
+                return findings.slice(0, 5).map((f: Record<string, string>, i: number) => (
+                  <div key={i} className="mb-1 text-neutral-300">
+                    <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+                    {f.title}
+                  </div>
+                ));
+              }
+            } catch { /* raw text fallback */ }
+            return <span className="text-neutral-400">{task.research_findings.slice(0, 500)}</span>;
+          })()}
+        </div>
+      )}
+
+      {/* Plan subtasks preview */}
+      {task.plan_output && (task.plan_output as Record<string, unknown>).subtasks && (
+        <div className="bg-purple-950/20 text-purple-300 text-[11px] p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
+          <span className="font-semibold block mb-1 text-purple-400 font-sans">Plan ({((task.plan_output as Record<string, unknown>).subtasks as unknown[]).length} subtasks):</span>
+          {((task.plan_output as Record<string, unknown>).subtasks as Record<string, unknown>[]).map((s, i) => (
+            <div key={i} className="mb-0.5 text-neutral-300 font-mono">
+              {(s.depends_on_indices as number[] || []).length > 0 ? '  └─ ' : ''}{String(s.title)}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Dependency info */}
+      {task.depends_on && task.depends_on.length > 0 && (
+        <div className="text-[10px] text-neutral-500 mb-3 font-mono flex items-center gap-1">
+          <GitFork className="w-3 h-3" />
+          Waiting on {task.depends_on.length} task{task.depends_on.length > 1 ? 's' : ''}
         </div>
       )}
 

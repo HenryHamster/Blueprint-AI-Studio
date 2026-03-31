@@ -47,10 +47,11 @@ async def get_all_tasks(
     result = await session.execute(query)
     tasks = result.scalars().all()
 
-    # Join artifacts to include PR URLs and error logs
+    # Join artifacts to include PR URLs, error logs, and research findings
     task_ids = [t.id for t in tasks]
     pr_map = {}
     logs_map = {}
+    research_map = {}
     if task_ids:
         artifact_stmt = select(Artifact).where(Artifact.task_id.in_(task_ids))
         artifacts = (await session.execute(artifact_stmt)).scalars().all()
@@ -59,27 +60,34 @@ async def get_all_tasks(
                 pr_map[str(a.task_id)] = a.pr_url
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[str(a.task_id)] = a.logs[:2000]
+            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+                research_map[str(a.task_id)] = a.logs[:10000]
 
     # Return tasks with artifact data attached
     result_list = []
     for t in tasks:
+        task_type = ((t.payloads or [{}])[0]).get("type", "create")
         task_dict = {
             "id": str(t.id),
             "project_id": str(t.project_id),
             "title": t.title,
             "description": t.description,
             "status": t.status,
+            "task_type": task_type,
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
             "created_by": t.created_by,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
+            "depends_on": t.depends_on or [],
+            "plan_output": t.plan_output,
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "last_heartbeat": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
             "attempt_count": t.attempt_count,
             "payloads": t.payloads,
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
+            "research_findings": research_map.get(str(t.id)),
         }
         result_list.append(task_dict)
 
@@ -91,6 +99,7 @@ class CreateTaskPayload(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1)
     base_branch: str = Field(default="main", pattern=r"^[a-zA-Z0-9_./-]+$")
+    task_type: str = Field(default="create", pattern=r"^(create|plan|research)$")
 
 
 @router.post("/tasks")
@@ -126,14 +135,22 @@ async def create_task_manually(
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
 
+    # Build payload based on task type
+    task_payload = {
+        "type": payload.task_type,
+        "prompt": payload.prompt,
+        "base_branch": payload.base_branch,
+    }
+    # Research tasks auto-include project directions
+    if payload.task_type == "research":
+        active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+        task_payload["directions"] = active_directions
+
     new_task = Task(
         project_id=project.id,
         title=payload.title,
         description=payload.prompt,
-        payloads=[{
-            "prompt": payload.prompt,
-            "base_branch": payload.base_branch,
-        }],
+        payloads=[task_payload],
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="USER",
