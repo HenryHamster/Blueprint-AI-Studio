@@ -1438,8 +1438,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if not prompt:
             continue
 
-        # Determine task type: medium/large scope → plan task for decomposition
-        task_type = "plan" if scope in ("medium", "large") else "create"
+        # Only large scope needs decomposition — medium is still single-PR work
+        task_type = "plan" if scope == "large" else "create"
         needs_approval = risk == "high"
 
         new_task = Task(
