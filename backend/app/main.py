@@ -217,8 +217,14 @@ async def _ensure_credentials_fresh(account: dict) -> bool:
                 print(f"[CREDENTIALS] Refreshed '{account['name']}' successfully")
                 return True
             else:
-                await _disable_account(account, "refresh failed — re-login needed")
-                return False
+                # Refresh failed — still dispatch with current credentials.
+                # Claude Code CLI may be able to refresh on the VM itself.
+                # Only disable if the token is completely dead (>24h expired).
+                if remaining < timedelta(hours=-24):
+                    await _disable_account(account, "credentials expired >24h and refresh failed — re-login needed")
+                    return False
+                print(f"[CREDENTIALS] Refresh failed for '{account['name']}', dispatching with current credentials (CLI may refresh)")
+                return True
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         # Credential JSON is malformed — log but don't disable (admin can fix via UI)
         print(f"[CREDENTIALS] Credential parse error for '{account.get('name')}': {e}")
@@ -636,8 +642,11 @@ async def orchestrator_worker():
                     claude_credentials = None
                     account_id = None
                     if account:
-                        # Ensure credentials are fresh before dispatching
-                        if not await _ensure_credentials_fresh(account):
+                        # Try to refresh credentials proactively (best-effort, non-blocking)
+                        # If refresh fails, dispatch anyway — Claude Code CLI can refresh on the VM
+                        await _ensure_credentials_fresh(account)
+                        # Re-select if the account was disabled (only happens if >24h expired)
+                        if not account.get("enabled", True):
                             account = select_max_plan_account()
 
                     if account:
