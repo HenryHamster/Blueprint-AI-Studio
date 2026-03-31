@@ -231,9 +231,13 @@ async def modify_task(
             task.status = new_status
             changes["status"] = new_status.value
 
-            # Delete VM when cancelling an active task
+            # Delete VM and release account when cancelling an active task
             if new_status == TaskStatus.CANCELLED and task.vm_instance_id:
                 background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
+                acct_id = (task.context or {}).get("max_plan_account_id")
+                if acct_id:
+                    from app.main import release_max_plan_account
+                    release_max_plan_account(acct_id)
 
             # Reset retry state when manually re-queuing a task
             if new_status == TaskStatus.QUEUED:

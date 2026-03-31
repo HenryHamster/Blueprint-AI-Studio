@@ -462,11 +462,15 @@ async def reaper_service():
                 
                 for task in orphaned_tasks:
                     print(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id})")
-                    
+
                     if task.vm_instance_id:
-                        # Fire and forget the delete API call
                         asyncio.create_task(delete_agent_vm(task.vm_instance_id))
-                    
+
+                    # Release Max Plan account slot
+                    acct_id = (task.context or {}).get("max_plan_account_id")
+                    if acct_id:
+                        release_max_plan_account(acct_id)
+
                     if task.attempt_count < _runtime_config["max_retries"]:
                         print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
                         task.attempt_count += 1
@@ -555,17 +559,26 @@ async def orchestrator_worker():
         queued_tasks = []
         try:
             async with AsyncSessionLocal() as session:
-                # Enforce concurrency limit before picking up new tasks
-                from sqlalchemy import func
-                active_count = (await session.execute(
-                    select(func.count()).select_from(Task).where(
-                        Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-                    )
-                )).scalar() or 0
+                # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
+                active_tasks_result = (await session.execute(
+                    select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                )).scalars().all()
+
+                # Enforce concurrency limit
+                active_count = len(active_tasks_result)
                 slots_available = max(0, _runtime_config["max_concurrent_vms"] - active_count)
                 if slots_available == 0:
                     await asyncio.sleep(5)
                     continue
+
+                # Reconcile Max Plan active_tasks counters from DB each cycle
+                active_per_account: Dict[str, int] = {}
+                for t in active_tasks_result:
+                    acct_id = (t.context or {}).get("max_plan_account_id")
+                    if acct_id:
+                        active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+                for acct in _max_plan_pool:
+                    acct["active_tasks"] = active_per_account.get(acct["id"], 0)
 
                 # Find tasks that are QUEUED, not awaiting approval, and haven't been picked up yet
                 stmt = select(Task).where(
@@ -625,7 +638,6 @@ async def orchestrator_worker():
                     if account:
                         # Ensure credentials are fresh before dispatching
                         if not await _ensure_credentials_fresh(account):
-                            # Account disabled — try next available
                             account = select_max_plan_account()
 
                     if account:
@@ -644,7 +656,16 @@ async def orchestrator_worker():
                         except Exception as e:
                             print(f"[ORCHESTRATOR] Failed to update account total_tasks: {e}")
                     else:
-                        print(f"[ORCHESTRATOR] No Max plan accounts available, falling back to API key")
+                        # No Max plan account — check for API key fallback
+                        if os.getenv("ANTHROPIC_API_KEY"):
+                            print(f"[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
+                        else:
+                            # No credentials at all — skip this task, don't waste a VM
+                            print(f"[ORCHESTRATOR] No credentials available (no Max plan accounts, no ANTHROPIC_API_KEY) — skipping task {task.id}")
+                            task.latest_status_message = "Waiting for credentials — no Max plan accounts or API key configured"
+                            session.add(task)
+                            await session.commit()
+                            continue
 
                     # Store which account this task uses for cleanup on completion
                     task.context = {**(task.context or {}), "max_plan_account_id": account_id}
@@ -656,7 +677,9 @@ async def orchestrator_worker():
                     await session.commit()
 
                     # Trigger GCP Compute Engine provisioning in the background
-                    async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID, payloads: list, creds: str = None):
+                    # All values passed as args to avoid stale closure captures across loop iterations
+                    async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
+                                                    payloads: list, creds: str, acct_id_for_release: str):
                         payload_uri = None
                         if payloads:
                             try:
@@ -668,8 +691,8 @@ async def orchestrator_worker():
                         if not success:
                             print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             # Release the Max Plan account slot
-                            if account_id:
-                                release_max_plan_account(account_id)
+                            if acct_id_for_release:
+                                release_max_plan_account(acct_id_for_release)
                             # Mark as failed immediately to avoid 10 min wait
                             try:
                                 async with AsyncSessionLocal() as inner_session:
@@ -685,8 +708,11 @@ async def orchestrator_worker():
                                         )
                             except Exception as e:
                                 print(f"[ORCHESTRATOR] Error marking task {t_id} as failed: {e}")
-                            
-                    asyncio.create_task(_provision_and_handle(task.vm_instance_id, task.id, task.project_id, task.payloads, claude_credentials))
+
+                    asyncio.create_task(_provision_and_handle(
+                        task.vm_instance_id, task.id, task.project_id,
+                        task.payloads, claude_credentials, account_id
+                    ))
                     
                     await broadcast_to_project(
                         str(task.project_id), 
