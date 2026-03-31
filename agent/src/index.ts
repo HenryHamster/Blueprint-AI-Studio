@@ -391,7 +391,15 @@ Rules:
   statusRef.value = 'Running Claude Code for planning...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef);
 
-  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  // Plan output JSON can be large — extract the subtasks JSON from full output
+  let logs = '';
+  if (lastResultText && lastResultText.includes('"subtasks"')) {
+    logs = sanitize(lastResultText);
+  } else {
+    const jsonMatch = allOutput.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
+    logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+  }
+
   await apiPost('/api/agent/status', {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
@@ -407,6 +415,7 @@ async function handleResearch(
 ) {
   const directions = payload.directions as Array<Record<string, unknown>> || [];
   const baseBranch = String(payload.base_branch || 'main');
+  const userPrompt = String(payload.prompt || payload.description || task.description || '');
 
   // Full clone — research needs history context
   statusRef.value = `Cloning ${owner}/${repo} for research...`;
@@ -421,7 +430,7 @@ async function handleResearch(
 
   const researchPrompt = `You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
-Current project directions from the user:
+${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
 ${directionsText}
 
 Instructions:
@@ -460,7 +469,17 @@ Rules:
   statusRef.value = 'Running codebase research...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef);
 
-  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  // Research findings JSON can be large — prefer lastResultText, fall back to
+  // scanning allOutput for the JSON array, then truncate allOutput as last resort
+  let logs = '';
+  if (lastResultText && lastResultText.includes('"prompt"')) {
+    logs = sanitize(lastResultText);
+  } else {
+    // Extract JSON array from full output (it may be spread across stream chunks)
+    const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"prompt"[\s\S]*\}\s*\]/);
+    logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+  }
+
   await apiPost('/api/agent/status', {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
