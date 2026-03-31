@@ -13,24 +13,40 @@ const apiHeaders: Record<string, string> = {
 };
 
 // ── API Helpers ─────────────────────────────────────────────────────────────
-async function apiPost(path: string, body: Record<string, unknown> = {}) {
-  const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
-    method: 'POST', headers: apiHeaders, body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
+        method: 'POST', headers: apiHeaders, body: JSON.stringify(body),
+      });
+      if (res.ok) return res.json();
+      if (res.status < 500 || attempt === retries - 1) {
+        const text = await res.text();
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
+    } catch (e) {
+      if (attempt === retries - 1) throw e;
+    }
+    await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
   }
-  return res.json();
+  throw new Error(`POST ${path} failed after ${retries} retries`);
 }
 
-async function apiGet(path: string) {
-  const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GET ${path} failed (${res.status}): ${text}`);
+async function apiGet(path: string, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders });
+      if (res.ok) return res.json();
+      if (res.status < 500 || attempt === retries - 1) {
+        const text = await res.text();
+        throw new Error(`GET ${path} failed (${res.status}): ${text}`);
+      }
+    } catch (e) {
+      if (attempt === retries - 1) throw e;
+    }
+    await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
   }
-  return res.json();
+  throw new Error(`GET ${path} failed after ${retries} retries`);
 }
 
 function log(msg: string) {

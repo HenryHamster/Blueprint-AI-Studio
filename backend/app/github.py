@@ -130,20 +130,27 @@ async def generate_installation_access_token(installation_id: str, repositories:
     if repositories:
         payload["repositories"] = repositories
         
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-            headers=headers,
-            json=payload
-        )
-        
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.post(
+                f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+                headers=headers,
+                json=payload
+            )
+        except httpx.HTTPError as e:
+            logger.error(f"Network error generating installation token: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to reach GitHub API: {e}"
+            )
+
         if response.status_code != 201:
             logger.error(f"Failed to generate installation access token: {response.text}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to authenticate with GitHub App."
+                detail=f"Failed to authenticate with GitHub App ({response.status_code}): {response.text[:200]}"
             )
-            
+
         return response.json().get("token")
 
 async def validate_fine_grained_pat(token: str, target_repo: str = None) -> dict:
