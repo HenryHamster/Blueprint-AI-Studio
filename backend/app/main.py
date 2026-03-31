@@ -557,6 +557,9 @@ async def orchestrator_worker():
     while True:
         queued_tasks = []
         try:
+            global _orchestrator_last_cycle
+            _orchestrator_last_cycle = datetime.now(timezone.utc)
+
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
                 active_tasks_result = (await session.execute(
@@ -757,6 +760,23 @@ async def lifespan(app: FastAPI):
     # Start the Credential Health Check background task
     credential_task = asyncio.create_task(_credential_health_check())
 
+    # Monitor background tasks for silent crashes
+    async def _monitor_background_tasks():
+        tasks = {"orchestrator": orchestrator_task, "reaper": reaper_task,
+                 "gcp_cleanup": gcp_cleanup_task, "credential": credential_task}
+        while True:
+            await asyncio.sleep(30)
+            for name, t in tasks.items():
+                if t.done():
+                    exc = t.exception() if not t.cancelled() else None
+                    print(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
+                    # Restart the orchestrator if it died
+                    if name == "orchestrator" and not t.cancelled():
+                        print("[MONITOR] Restarting orchestrator worker...")
+                        tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
+                        orchestrator_task = tasks["orchestrator"]
+    monitor_task = asyncio.create_task(_monitor_background_tasks())
+
     yield
     # Shutdown: Clean up resources if needed
     reaper_task.cancel()
@@ -774,6 +794,32 @@ app = FastAPI(
 setup_telemetry(app, engine)
 
 app.include_router(admin_router)
+
+# Timestamp updated each orchestrator cycle — used by /debug endpoint
+_orchestrator_last_cycle: Optional[datetime] = None
+
+@app.get("/api/debug/orchestrator")
+async def debug_orchestrator(session: AsyncSession = Depends(get_session)):
+    """Diagnostic endpoint: check if the orchestrator loop is alive."""
+    from sqlalchemy import func
+    queued = (await session.execute(
+        select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+    )).scalar() or 0
+    active = (await session.execute(
+        select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+    )).scalar() or 0
+    ago = None
+    if _orchestrator_last_cycle:
+        ago = (datetime.now(timezone.utc) - _orchestrator_last_cycle).total_seconds()
+    return {
+        "orchestrator_alive": _orchestrator_last_cycle is not None,
+        "last_cycle_seconds_ago": ago,
+        "queued_tasks": queued,
+        "active_tasks": active,
+        "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
+        "pool_size": len(_max_plan_pool),
+        "pool_accounts": [{"name": a["name"], "enabled": a.get("enabled"), "active": a["active_tasks"]} for a in _max_plan_pool],
+    }
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
