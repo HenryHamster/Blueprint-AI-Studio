@@ -45,6 +45,7 @@ from app.github import (
     merge_pull_request,
     get_pull_request,
     get_pr_files,
+    get_check_runs,
 )
 import hmac
 import hashlib
@@ -723,11 +724,118 @@ async def orchestrator_worker():
                     ))
                     
                     await broadcast_to_project(
-                        str(task.project_id), 
-                        "task_updated", 
+                        str(task.project_id),
+                        "task_updated",
                         {"task_id": str(task.id), "status": TaskStatus.PROVISIONING}
                     )
-                    
+
+                # Check tasks waiting on CI (review approved, CI pending)
+                CI_WAIT_TIMEOUT_MINUTES = 30
+                ci_waiting_tasks = (await session.execute(
+                    select(Task).where(Task.status == TaskStatus.EVALUATING)
+                )).scalars().all()
+                for ci_task in ci_waiting_tasks:
+                    ci_loop = (ci_task.context or {}).get("review_loop", {})
+                    if not ci_loop.get("ci_waiting"):
+                        continue
+                    ci_pr_number = ci_loop.get("pr_number")
+                    if not ci_pr_number:
+                        continue
+
+                    # Timeout: if CI has been pending too long, proceed to merge anyway
+                    ci_wait_started = ci_loop.get("ci_wait_started")
+                    if ci_wait_started:
+                        try:
+                            started = datetime.fromisoformat(ci_wait_started)
+                            if (datetime.utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
+                                print(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min — proceeding to merge")
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"CI wait timed out, proceeding"
+                                session.add(ci_task)
+                                await session.commit()
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+
+                    try:
+                        ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
+
+                        # Re-fetch current PR head to handle force-pushes
+                        pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                        pr_state = pr_data.get("state", "open")
+
+                        # Check if PR was already merged (prevents double merge)
+                        if pr_state == "closed" or pr_data.get("merged"):
+                            ci_task.status = TaskStatus.COMPLETED
+                            ci_task.latest_status_message = f"PR #{ci_pr_number} already merged/closed"
+                            session.add(ci_task)
+                            await session.commit()
+                            print(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
+                            continue
+
+                        ci_head_sha = pr_data.get("head", {}).get("sha", "")
+                        if not ci_head_sha:
+                            continue
+
+                        ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha)
+                        if ci_result["status"] != "completed":
+                            continue  # Still running
+
+                        ci_branch = ci_loop.get("branch", "")
+                        ci_base = ci_loop.get("base_branch", "main")
+                        ci_orig_id = ci_loop.get("original_task_id", "")
+
+                        if ci_result["conclusion"] == "success":
+                            # CI passed — merge
+                            merge_result = await merge_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                            if merge_result.get("merged"):
+                                await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                    "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"CI passed, PR #{ci_pr_number} merged"
+                                if ci_orig_id:
+                                    try:
+                                        orig = await session.get(Task, uuid.UUID(ci_orig_id))
+                                        if orig:
+                                            orig.context = {**(orig.context or {}), "pr_merged": True}
+                                            if orig.status == TaskStatus.EVALUATING and not (orig.context or {}).get("review_loop", {}).get("ci_waiting"):
+                                                orig.status = TaskStatus.COMPLETED
+                                                orig.latest_status_message = "Rollup PR merged"
+                                            session.add(orig)
+                                    except Exception as e:
+                                        print(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}")
+                                print(f"[CI] PR #{ci_pr_number} CI passed, merged")
+                            else:
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"CI passed but merge blocked: {merge_result.get('message', 'unknown')}"
+                                print(f"[CI] PR #{ci_pr_number} CI passed but merge blocked")
+                        else:
+                            # CI failed — spawn fix
+                            ci_errors = ci_result.get("failed_logs", "CI checks failed")
+                            await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```")
+                            ci_fix_prompt = (
+                                f"CI checks failed on PR #{ci_pr_number} (code review already approved).\n\n"
+                                f"CI errors:\n{ci_errors}\n\n"
+                                f"Fix only the build/lint/test errors — the review is already approved."
+                            )
+                            fix_task = await _spawn_pipeline_task(
+                                ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
+                                fix_prompt=ci_fix_prompt,
+                                original_task_id=ci_orig_id
+                            )
+                            ci_task.status = TaskStatus.COMPLETED
+                            ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix"
+                            if fix_task:
+                                print(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")
+
+                        session.add(ci_task)
+                        await session.commit()
+                        await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                   {"task_id": str(ci_task.id), "status": ci_task.status})
+                    except Exception as e:
+                        print(f"[CI] Error checking CI for task {ci_task.id}: {e}")
+
         except asyncio.CancelledError:
             print("[ORCHESTRATOR] Worker shutting down.")
             break
@@ -1487,17 +1595,6 @@ async def _spawn_pipeline_task(
 
     vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
 
-    if task_type == "review":
-        title = f"Review PR #{pr_number}"
-        payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "original_prompt": original_prompt,
-                        "original_task_id": resolved_original_id}
-    else:
-        title = f"Fix PR #{pr_number}"
-        payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "prompt": fix_prompt,
-                        "original_task_id": resolved_original_id}
-
     # Determine parent: use the original task's parent (so review/fix are siblings of the
     # create task under the plan/research parent), falling back to original task itself
     resolved_original_id = original_task_id or str(source_task.id)
@@ -1510,6 +1607,17 @@ async def _spawn_pipeline_task(
             parent_id = orig.id
     except Exception:
         pass
+
+    if task_type == "review":
+        title = f"Review PR #{pr_number}"
+        payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
+                        "base_branch": base_branch, "original_prompt": original_prompt,
+                        "original_task_id": resolved_original_id}
+    else:
+        title = f"Fix PR #{pr_number}"
+        payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
+                        "base_branch": base_branch, "prompt": fix_prompt,
+                        "original_task_id": resolved_original_id}
 
     new_task = Task(
         project_id=source_task.project_id,
@@ -2315,6 +2423,52 @@ async def update_agent_status(
                             session.add(task)
                             await session.commit()
                             raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
+
+                        # Check CI status before merging
+                        head_sha = pr_data.get("head", {}).get("sha", "")
+                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha) if head_sha else None
+
+                        if ci_status and ci_status["status"] != "completed":
+                            # CI still running — park task in EVALUATING (no VM consumed)
+                            task.status = TaskStatus.EVALUATING
+                            task.latest_status_message = f"Review approved, waiting for CI on PR #{pr_number}..."
+                            task.context = {**(task.context or {}), "review_loop": {
+                                **review_loop, "ci_waiting": True, "verdict": "APPROVE",
+                                "head_sha": head_sha, "pr_number": pr_number,
+                                "branch": branch, "base_branch": base_branch,
+                                "original_task_id": original_task_id,
+                                "ci_wait_started": datetime.utcnow().isoformat()}}
+                            session.add(task)
+                            await session.commit()
+                            print(f"[CI] PR #{pr_number} approved, CI pending — waiting")
+                            # Skip merge — orchestrator cycle will pick this up
+                            return {"status": "accepted"}
+
+                        if ci_status and ci_status["conclusion"] == "failure":
+                            # CI failed — spawn fix with CI errors
+                            ci_errors = ci_status["failed_logs"] or "CI checks failed (no details available)"
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                f"**Blueprint CI**: Checks failed — spawning fix task.\n\n```\n{ci_errors[:2000]}\n```")
+                            ci_fix_prompt = (
+                                f"CI checks failed on PR #{pr_number} (code review already approved).\n\n"
+                                f"CI errors:\n{ci_errors}\n\n"
+                                f"Fix only the build/lint/test errors. The code review is already "
+                                f"approved — don't change logic, just fix CI failures."
+                            )
+                            fix_task = await _spawn_pipeline_task(
+                                task, "fix", session, pr_number, branch, base_branch,
+                                fix_prompt=ci_fix_prompt,
+                                original_task_id=original_task_id
+                            )
+                            if fix_task:
+                                print(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
+                            # Skip merge
+                            return {"status": "accepted"}
+
+                        # CI passed (or no CI checks exist) — proceed to merge
+                        if ci_status and ci_status["conclusion"] == "success":
+                            print(f"[CI] PR #{pr_number} CI passed")
+
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
 
                         if merge_result.get("merged"):
@@ -2370,9 +2524,21 @@ async def update_agent_status(
                     except Exception as e:
                         print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
                 else:
+                    # REQUEST_CHANGES — include CI errors if available (don't wait)
+                    ci_errors_text = ""
+                    try:
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                        head_sha = pr_data.get("head", {}).get("sha", "")
+                        if head_sha:
+                            ci_check = await get_check_runs(gh_token, owner, repo, head_sha)
+                            if ci_check.get("conclusion") == "failure" and ci_check.get("failed_logs"):
+                                ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
+                    except Exception:
+                        pass
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
-                        fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}",
+                        fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}",
                         original_task_id=original_task_id
                     )
                     if fix_task:

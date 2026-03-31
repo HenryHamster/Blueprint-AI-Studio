@@ -655,3 +655,103 @@ async def get_pr_files(
             logger.error(f"Failed to get PR files #{pr_number}: {response.text}")
             return []
         return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
+
+
+async def get_check_runs(
+    token: str, owner: str, repo: str, ref: str
+) -> dict:
+    """Get CI check run results for a commit SHA.
+
+    Returns:
+        {"status": "completed"|"in_progress"|"pending",
+         "conclusion": "success"|"failure"|None,
+         "details": [{"name": str, "status": str, "conclusion": str|None}],
+         "failed_logs": str}
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get check runs for {ref}: {response.text}")
+            return {"status": "pending", "conclusion": None, "details": [], "failed_logs": ""}
+
+        data = response.json()
+        check_runs = data.get("check_runs", [])
+
+        if not check_runs:
+            return {"status": "pending", "conclusion": None, "details": [], "failed_logs": ""}
+
+        details = []
+        failed_names = []
+        for cr in check_runs:
+            details.append({
+                "name": cr.get("name", ""),
+                "status": cr.get("status", ""),
+                "conclusion": cr.get("conclusion"),
+            })
+            if cr.get("conclusion") == "failure":
+                failed_names.append(cr.get("name", "unknown"))
+
+        # Aggregate status
+        statuses = [cr.get("status", "") for cr in check_runs]
+        if any(s in ("queued", "in_progress") for s in statuses):
+            agg_status = "in_progress"
+        else:
+            agg_status = "completed"
+
+        # Aggregate conclusion
+        conclusions = [cr.get("conclusion") for cr in check_runs if cr.get("status") == "completed"]
+        if not conclusions:
+            agg_conclusion = None
+        elif all(c == "success" for c in conclusions):
+            agg_conclusion = "success"
+        else:
+            agg_conclusion = "failure"
+
+        # Collect failure details from annotations
+        failed_logs = ""
+        if failed_names:
+            annotation_lines = []
+            for cr in check_runs:
+                if cr.get("conclusion") != "failure":
+                    continue
+                cr_id = cr.get("id")
+                name = cr.get("name", "unknown")
+                # Fetch annotations for failed check runs
+                try:
+                    ann_response = await client.get(
+                        f"https://api.github.com/repos/{owner}/{repo}/check-runs/{cr_id}/annotations",
+                        headers=headers
+                    )
+                    if ann_response.status_code == 200:
+                        for ann in ann_response.json():
+                            msg = ann.get("message", "")
+                            path = ann.get("path", "")
+                            line = ann.get("start_line", "")
+                            annotation_lines.append(f"  [{name}] {path}:{line} — {msg}")
+                except Exception:
+                    pass
+                # Also include output summary if available
+                output = cr.get("output", {})
+                summary = output.get("summary", "") if output else ""
+                if summary:
+                    annotation_lines.append(f"  [{name}] {summary[:500]}")
+
+            if annotation_lines:
+                failed_logs = "\n".join(annotation_lines)
+            else:
+                failed_logs = "CI checks failed: " + ", ".join(failed_names)
+
+        return {
+            "status": agg_status,
+            "conclusion": agg_conclusion,
+            "details": details,
+            "failed_logs": failed_logs,
+        }
