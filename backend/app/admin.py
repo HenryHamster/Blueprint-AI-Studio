@@ -803,7 +803,7 @@ async def get_autonomous_status(
         select(Project).order_by(Project.created_at.desc())
     )).scalars().all()
 
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
 
     # Batch query: count autonomous tasks per project in the last hour
     tasks_per_project = dict((await session.execute(
