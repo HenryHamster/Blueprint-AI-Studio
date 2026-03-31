@@ -444,12 +444,14 @@ export default function App() {
           }
         };
 
-        ws.onerror = () => {
-          setLogLines(prev => [...prev, '[WebSocket error]']);
+        ws.onerror = (e) => {
+          console.error('[WS] error:', e);
+          setLogLines(prev => [...prev, `[WebSocket error — check browser console (F12)]`]);
         };
 
-        ws.onclose = () => {
-          setLogLines(prev => [...prev, '[Stream disconnected]']);
+        ws.onclose = (e) => {
+          console.log('[WS] closed:', e.code, e.reason);
+          setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
         };
       } catch (err) {
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
