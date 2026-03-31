@@ -53,6 +53,47 @@ function getHeartbeatStatus(lastHeartbeat?: string) {
   return { color: 'bg-red-500', text: 'Stale (> 5m)' };
 }
 
+function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
+  if (!taskType || !(taskType in TASK_TYPE_STYLES)) return null;
+  const style = TASK_TYPE_STYLES[taskType];
+  const Icon = style.icon;
+  return (
+    <span className={`${style.bg} ${style.text} border text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1`}>
+      <Icon className="w-3 h-3" />{style.label}
+    </span>
+  );
+}
+
+function ResearchFindings({ findings }: { findings: string }) {
+  try {
+    const parsed = JSON.parse(findings) as Record<string, string>[];
+    if (Array.isArray(parsed)) {
+      return (<>{parsed.slice(0, 5).map((f, i) => (
+        <div key={i} className="mb-1 text-neutral-300">
+          <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+          {f.title}
+        </div>
+      ))}</>);
+    }
+  } catch { /* fall through */ }
+  return <span className="text-neutral-400">{findings.slice(0, 500)}</span>;
+}
+
+function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
+  const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
+  if (!subtasks) return null;
+  return (
+    <div className="bg-purple-950/20 text-purple-300 text-[11px] p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
+      <span className="font-semibold block mb-1 text-purple-400 font-sans">Plan ({subtasks.length} subtasks):</span>
+      {subtasks.map((s, i) => (
+        <div key={i} className="mb-0.5 text-neutral-300 font-mono">
+          {(s.depends_on_indices as number[] || []).length > 0 ? '  \u2514\u2500 ' : ''}{String(s.title)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
@@ -69,23 +110,15 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
           <h3 className="font-medium text-sm text-neutral-100 truncate" title={task.title}>{task.title}</h3>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          {task.task_type && TASK_TYPE_STYLES[task.task_type] && (() => {
-            const style = TASK_TYPE_STYLES[task.task_type!];
-            const Icon = style.icon;
-            return (
-              <span className={`${style.bg} ${style.text} border text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1`}>
-                <Icon className="w-3 h-3" />{style.label}
-              </span>
-            );
-          })()}
+          <TaskTypeBadge taskType={task.task_type} />
           {task.requires_approval && (
             <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
               <Shield className="w-3 h-3" />Approval
             </span>
           )}
-          {task.attempt_count && task.attempt_count > 0 && (
+          {(task.attempt_count ?? 0) > 0 && (
             <span className="bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded font-mono">
-              #{task.attempt_count + 1}
+              #{(task.attempt_count ?? 0) + 1}
             </span>
           )}
         </div>
@@ -96,17 +129,17 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
           <Hash className="w-3 h-3" />
           <span className="truncate">{task.id}</span>
         </div>
-        {task.vm_instance_id && (
+        {task.vm_instance_id ? (
           <div className="flex items-center gap-1.5" title="VM Instance ID">
             <Server className="w-3 h-3" />
             <span className="truncate">{task.vm_instance_id}</span>
           </div>
-        )}
+        ) : null}
       </div>
 
       <p className="text-xs text-neutral-400 line-clamp-2 mb-3">{task.description}</p>
 
-      {task.latest_status_message && (
+      {task.latest_status_message ? (
         <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
           <button
             onClick={() => setStatusExpanded(!statusExpanded)}
@@ -124,10 +157,9 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
             </div>
           )}
         </div>
-      )}
+      ) : null}
 
-      {/* PR link for completed tasks */}
-      {task.status === 'COMPLETED' && task.pr_url && (
+      {task.status === 'COMPLETED' && task.pr_url ? (
         <a
           href={task.pr_url}
           target="_blank"
@@ -137,56 +169,30 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
           <ExternalLink className="w-3.5 h-3.5" />
           View Pull Request
         </a>
-      )}
+      ) : null}
 
-      {/* Error log preview for failed tasks */}
-      {task.status === 'FAILED' && task.error_logs && (
+      {task.status === 'FAILED' && task.error_logs ? (
         <div className="bg-red-950/30 text-red-400 text-[11px] p-2.5 rounded-lg mb-3 border border-red-900/30 font-mono max-h-24 overflow-y-auto">
           <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
           {task.error_logs.slice(0, 500)}
         </div>
-      )}
+      ) : null}
 
-      {/* Research findings preview */}
-      {task.research_findings && (
+      {task.research_findings ? (
         <div className="bg-cyan-950/20 text-cyan-300 text-[11px] p-2.5 rounded-lg mb-3 border border-cyan-900/30 font-mono max-h-32 overflow-y-auto">
           <span className="font-semibold block mb-1 text-cyan-400 font-sans">Research Findings:</span>
-          {(() => {
-            try {
-              const findings = JSON.parse(task.research_findings);
-              if (Array.isArray(findings)) {
-                return findings.slice(0, 5).map((f: Record<string, string>, i: number) => (
-                  <div key={i} className="mb-1 text-neutral-300">
-                    <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
-                    {f.title}
-                  </div>
-                ));
-              }
-            } catch { /* raw text fallback */ }
-            return <span className="text-neutral-400">{task.research_findings.slice(0, 500)}</span>;
-          })()}
+          <ResearchFindings findings={task.research_findings} />
         </div>
-      )}
+      ) : null}
 
-      {/* Plan subtasks preview */}
-      {task.plan_output && (task.plan_output as Record<string, unknown>).subtasks && (
-        <div className="bg-purple-950/20 text-purple-300 text-[11px] p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
-          <span className="font-semibold block mb-1 text-purple-400 font-sans">Plan ({((task.plan_output as Record<string, unknown>).subtasks as unknown[]).length} subtasks):</span>
-          {((task.plan_output as Record<string, unknown>).subtasks as Record<string, unknown>[]).map((s, i) => (
-            <div key={i} className="mb-0.5 text-neutral-300 font-mono">
-              {(s.depends_on_indices as number[] || []).length > 0 ? '  └─ ' : ''}{String(s.title)}
-            </div>
-          ))}
-        </div>
-      )}
+      {task.plan_output ? <PlanPreview planOutput={task.plan_output} /> : null}
 
-      {/* Dependency info */}
-      {task.depends_on && task.depends_on.length > 0 && (
+      {task.depends_on && task.depends_on.length > 0 ? (
         <div className="text-[10px] text-neutral-500 mb-3 font-mono flex items-center gap-1">
           <GitFork className="w-3 h-3" />
           Waiting on {task.depends_on.length} task{task.depends_on.length > 1 ? 's' : ''}
         </div>
-      )}
+      ) : null}
 
       <div className="flex items-center justify-between text-[11px] text-neutral-500 mt-auto pt-3 border-t border-neutral-800">
         <div className="flex items-center gap-1.5">
@@ -195,15 +201,14 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
         </div>
 
         <div className="flex items-center gap-2">
-          {isActive && (
+          {isActive ? (
             <div className="flex items-center gap-1.5" title={heartbeat.text}>
               <Activity className="w-3 h-3" />
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
             </div>
-          )}
+          ) : null}
 
-          {/* View logs button for active/completed/failed tasks */}
-          {task.status !== 'QUEUED' && (
+          {task.status !== 'QUEUED' ? (
             <button
               onClick={() => onViewLogs(task)}
               className="flex items-center gap-1 text-neutral-400 hover:text-neutral-200 transition-colors"
@@ -211,11 +216,11 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
             >
               <Terminal className="w-3 h-3" />
             </button>
-          )}
+          ) : null}
         </div>
       </div>
 
-      {task.requires_approval && (
+      {task.requires_approval ? (
         <div className="mt-3 flex gap-2">
           <button onClick={() => onApprove(task.id)} className="flex-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
             <CheckCircle className="w-3.5 h-3.5" /> Approve
@@ -224,17 +229,17 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
             <AlertCircle className="w-3.5 h-3.5" /> Reject
           </button>
         </div>
-      )}
+      ) : null}
 
-      {!task.requires_approval && isActive && (
+      {!task.requires_approval && isActive ? (
         <div className="mt-3 flex gap-2">
           <button onClick={() => onCancel(task.id)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
             <Square className="w-3.5 h-3.5" /> Cancel
           </button>
         </div>
-      )}
+      ) : null}
 
-      {task.status === 'FAILED' && (
+      {task.status === 'FAILED' ? (
         <div className="mt-3 space-y-2">
           {editing ? (
             <div className="space-y-2">
@@ -268,7 +273,7 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
             </div>
           )}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
