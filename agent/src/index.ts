@@ -367,16 +367,25 @@ async function handleFix(
     }
   }
 
-  // If there are conflict markers, tell Claude exactly which files are conflicting
+  // Always check for conflict markers — even if rebase/merge appeared to succeed
   let enrichedPrompt = prompt;
-  if (hasConflicts) {
+  try {
+    const conflictFiles = git(['diff', '--name-only', '--diff-filter=U']);
+    if (conflictFiles.trim()) {
+      hasConflicts = true;
+      enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nThis is the PRIMARY task — resolve ALL conflict markers (<<<<<<< ======= >>>>>>>) in each file listed above. Keep the intent of this PR's changes (HEAD) while incorporating upstream updates from ${baseBranch}.\n\nAfter resolving conflicts, stage the files with git add and ensure no conflict markers remain.\n\n${prompt}`;
+      sendLog(ws, `Conflicting files:\n${conflictFiles}\n`);
+    }
+  } catch { /* no unmerged files */ }
+  // Also check for conflict markers in tracked files via grep
+  if (!hasConflicts) {
     try {
-      const conflictFiles = git(['diff', '--name-only', '--diff-filter=U']);
-      if (conflictFiles.trim()) {
-        enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nResolve the conflict markers (<<<<<<< ======= >>>>>>>) in each file. Keep the intent of the PR changes (HEAD) while incorporating upstream updates (origin/${baseBranch}).\n\n${prompt}`;
-        sendLog(ws, `Conflicting files:\n${conflictFiles}\n`);
+      const markerCheck = execFileSync('grep', ['-rl', '<<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      if (markerCheck) {
+        enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}\n\nThis is the PRIMARY task — resolve ALL conflict markers (<<<<<<< ======= >>>>>>>) in each file. Keep the intent of this PR's changes while incorporating upstream updates from ${baseBranch}.\n\n${prompt}`;
+        sendLog(ws, `Files with conflict markers:\n${markerCheck}\n`);
       }
-    } catch { /* diff failed, fall through with original prompt */ }
+    } catch { /* no markers found, good */ }
   }
 
   // Run Claude with the review feedback as the prompt
