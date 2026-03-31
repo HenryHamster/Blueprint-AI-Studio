@@ -258,6 +258,76 @@ async def modify_task(
     }
 
 
+@router.post("/tasks/{task_id}/rollup")
+async def trigger_rollup(
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Manually trigger rollup PR for an EVALUATING parent task."""
+    from app.main import get_github_token_for_task, _spawn_pipeline_task, broadcast_to_project
+    from app.github import create_pull_request, merge_pull_request, delete_branch
+
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status != TaskStatus.EVALUATING:
+        raise HTTPException(status_code=400, detail=f"Task is {task.status}, not EVALUATING")
+
+    ctx = task.context or {}
+    staging_branch = ctx.get("plan_branch") or ctx.get("research_branch")
+    target_branch = ctx.get("parent_base") or ctx.get("original_base")
+
+    if not staging_branch or not target_branch:
+        raise HTTPException(status_code=400, detail="Task has no staging/target branch info in context")
+
+    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+
+    # Count children
+    from sqlmodel import select
+    children = (await session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )).scalars().all()
+
+    pr_title = f"[Blueprint] Rollup: {task.title}"
+    pr_body = f"Rollup of {len(children)} subtasks from `{staging_branch}`\n\n---\n*Automated by Blueprint Pipeline*"
+
+    pr_result = await create_pull_request(gh_token, owner, repo,
+        title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+    rollup_pr_url = pr_result.get("html_url", "")
+    rollup_pr_number = pr_result.get("number")
+
+    is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
+
+    if is_target_intermediate:
+        merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+        if merge_result.get("merged"):
+            task.status = TaskStatus.COMPLETED
+            task.context = {**ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
+            task.latest_status_message = f"Rollup PR auto-merged into {target_branch}"
+            await delete_branch(gh_token, owner, repo, staging_branch)
+        else:
+            task.latest_status_message = f"Rollup merge failed: {merge_result.get('message')}"
+    else:
+        task.context = {**ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+        task.latest_status_message = f"Rollup PR #{rollup_pr_number} created, spawning review"
+        review_task = await _spawn_pipeline_task(
+            task, "review", session, rollup_pr_number, staging_branch, target_branch,
+            original_prompt=task.description or task.title,
+            original_task_id=str(task.id)
+        )
+
+    session.add(task)
+    await session.commit()
+
+    return {
+        "rollup_pr_url": rollup_pr_url,
+        "rollup_pr_number": rollup_pr_number,
+        "target": target_branch,
+        "status": task.status,
+    }
+
+
 @router.get("/settings")
 async def get_settings(
     session: AsyncSession = Depends(get_session),
