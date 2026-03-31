@@ -1,5 +1,6 @@
 import { X, Search, ExternalLink, Eye, Loader2, Archive, ChevronLeft, ChevronRight } from 'lucide-react';
-import { Task, TaskStatus, TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
+import type { Task } from './TaskCard';
+import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
 
 interface ArchiveViewProps {
   archiveTasks: Task[];
