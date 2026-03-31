@@ -614,10 +614,14 @@ async def orchestrator_worker():
                             all_met = False
 
                     if any_failed:
-                        task.status = TaskStatus.CANCELLED
-                        task.latest_status_message = "Cancelled: dependency task failed"
-                        session.add(task)
-                        await session.commit()
+                        # Use separate session to avoid polluting the main dispatch session
+                        async with AsyncSessionLocal() as cancel_session:
+                            cancel_task = await cancel_session.get(Task, task.id)
+                            if cancel_task:
+                                cancel_task.status = TaskStatus.CANCELLED
+                                cancel_task.latest_status_message = "Cancelled: dependency task failed"
+                                cancel_session.add(cancel_task)
+                                await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
                         print(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
@@ -639,30 +643,22 @@ async def orchestrator_worker():
                         await _ensure_credentials_fresh(account)
 
                     if account:
-                        account["active_tasks"] += 1
-                        account["total_tasks"] += 1
                         account_id = account["id"]
                         claude_credentials = account.get("credentials_json")
-                        print(f"[ORCHESTRATOR] Using Max plan account '{account['name']}' (active: {account['active_tasks']})")
-
-                        # Persist total_tasks to DB
-                        try:
-                            db_acct = await session.get(MaxPlanAccount, uuid.UUID(account_id))
-                            if db_acct:
-                                db_acct.total_tasks = account["total_tasks"]
-                                session.add(db_acct)
-                        except Exception as e:
-                            print(f"[ORCHESTRATOR] Failed to update account total_tasks: {e}")
+                        print(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
                     else:
                         # No Max plan account — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
                             print(f"[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
                         else:
                             # No credentials at all — skip this task, don't waste a VM
-                            print(f"[ORCHESTRATOR] No credentials available (no Max plan accounts, no ANTHROPIC_API_KEY) — skipping task {task.id}")
-                            task.latest_status_message = "Waiting for credentials — no Max plan accounts or API key configured"
-                            session.add(task)
-                            await session.commit()
+                            print(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
+                            async with AsyncSessionLocal() as msg_session:
+                                msg_task = await msg_session.get(Task, task.id)
+                                if msg_task:
+                                    msg_task.latest_status_message = "Waiting for credentials — add a Max plan account or set ANTHROPIC_API_KEY"
+                                    msg_session.add(msg_task)
+                                    await msg_session.commit()
                             continue
 
                     # Store which account this task uses for cleanup on completion
@@ -672,7 +668,12 @@ async def orchestrator_worker():
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = datetime.now(timezone.utc)
                     session.add(task)
-                    await session.commit()
+                    try:
+                        await session.commit()
+                    except Exception as e:
+                        print(f"[ORCHESTRATOR] Failed to commit PROVISIONING for task {task.id}: {e}")
+                        await session.rollback()
+                        continue
 
                     # Trigger GCP Compute Engine provisioning in the background
                     # All values passed as args to avoid stale closure captures across loop iterations
@@ -1723,7 +1724,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 # Extracted so both update_agent_status and admin PATCH can trigger rollup.
 
 async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
-    """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API."""
+    """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API.
+
+    Uses its own session for DB writes to avoid polluting the caller's session state.
+    The passed session is only used for reads (artifact lookup).
+    """
     if (task.context or {}).get("pr_merged"):
         return True
     # Look for PR artifact to verify via API
@@ -1737,9 +1742,15 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
             pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
+                # Use separate session to persist — don't pollute caller's session
+                async with AsyncSessionLocal() as write_session:
+                    db_task = await write_session.get(Task, task.id)
+                    if db_task:
+                        db_task.context = {**(db_task.context or {}), "pr_merged": True}
+                        write_session.add(db_task)
+                        await write_session.commit()
+                # Also update the in-memory object so caller sees the change
                 task.context = {**(task.context or {}), "pr_merged": True}
-                session.add(task)
-                await session.commit()
                 return True
         except Exception as e:
             print(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}")
