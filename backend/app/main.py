@@ -2165,17 +2165,14 @@ async def update_agent_status(
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                        if not scan_result["clean"]:
-                            high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
-                            if high_findings:
-                                task.requires_approval = True
-                                task.latest_status_message = f"Security scan blocked: {len(high_findings)} suspicious pattern(s) detected"
-                                session.add(task)
-                                await session.commit()
-                                await create_pr_comment(gh_token, owner, repo, pr_number,
-                                    f"**Blueprint Security Scan**: Blocked — {len(high_findings)} suspicious pattern(s) detected. Requires manual review.\n\n"
-                                    + "\n".join(f"- **{f.get('category', 'unknown')}** in `{f.get('source', '?')}`: `{f.get('matched_text', '')[:100]}`" for f in high_findings[:10]))
-                                print(f"[SECURITY] Blocked PR #{pr_number} — {len(high_findings)} high-severity findings")
+                        print(f"[SECURITY] {scan_result['summary']}")
+                        if scan_result["blocked"]:
+                            task.requires_approval = True
+                            task.latest_status_message = scan_result["summary"]
+                            session.add(task)
+                            await session.commit()
+                        if scan_result["findings"]:
+                            await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                     except Exception as e:
                         print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
 
@@ -2276,17 +2273,15 @@ async def update_agent_status(
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                     scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                    if not scan_result["clean"]:
-                        high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
-                        if high_findings:
-                            scan_blocked = True
-                            task.requires_approval = True
-                            task.latest_status_message = f"Security scan blocked fix: {len(high_findings)} suspicious pattern(s)"
-                            session.add(task)
-                            await session.commit()
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint Security Scan**: Fix blocked — {len(high_findings)} suspicious pattern(s). Requires manual review.")
-                            print(f"[SECURITY] Blocked fix on PR #{pr_number}")
+                    print(f"[SECURITY] {scan_result['summary']}")
+                    if scan_result["blocked"]:
+                        scan_blocked = True
+                        task.requires_approval = True
+                        task.latest_status_message = scan_result["summary"]
+                        session.add(task)
+                        await session.commit()
+                    if scan_result["findings"]:
+                        await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                 except Exception as e:
                     print(f"[SECURITY] Scan failed for fix PR #{pr_number}, proceeding: {e}")
 

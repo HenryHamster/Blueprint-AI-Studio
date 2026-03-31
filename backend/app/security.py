@@ -11,7 +11,8 @@ Scans:
 import re
 import base64
 from typing import List, Dict, Any, Optional
-from app.github import get_pull_request_diff, get_pull_request, get_pull_request_commits
+# GitHub imports are deferred to scan_pr_for_injection() so pure functions
+# (scan_diff_text, evaluate_findings, etc.) can be used without app.github.
 
 # ── Pattern Definitions ─────────────────────────────────────────────────────
 # severity: high = blocks review (requires human), medium = flags but proceeds
@@ -28,7 +29,7 @@ _RAW_PATTERNS: List[Dict[str, Any]] = [
     {"pattern": r"do\s+not\s+follow\s+(your|the|any|previous)\s+(instructions|rules|guidelines)", "severity": "high", "cat": "instruction_override"},
     {"pattern": r"stop\s+being\s+(a|an)\s+(ai|assistant|language\s+model|helpful)", "severity": "high", "cat": "instruction_override"},
     {"pattern": r"(from|starting)\s+now\s+(on\s+)?(you|your)\s+(are|will|must|should)", "severity": "high", "cat": "instruction_override"},
-    {"pattern": r"new\s+(system\s+)?(prompt|instructions|rules|persona|role|directive)", "severity": "high", "cat": "instruction_override"},
+    {"pattern": r"new\s+(system\s+)?(prompt|instructions|rules|persona|role|directive)", "severity": "medium", "cat": "instruction_override"},
     {"pattern": r"(here|these)\s+are\s+your\s+new\s+(instructions|rules|directives)", "severity": "high", "cat": "instruction_override"},
     {"pattern": r"act\s+as\s+(if|though)\s+you\s+(have\s+)?(no|don.t\s+have)\s+(restrictions|rules|guidelines)", "severity": "high", "cat": "instruction_override"},
 
@@ -71,7 +72,7 @@ _RAW_PATTERNS: List[Dict[str, Any]] = [
     {"pattern": r"^(SYSTEM|USER|ASSISTANT)\s*:", "severity": "medium", "cat": "turn_marker"},
 
     # ── 4. Prompt leaking / exfiltration ─────────────────────────────────
-    {"pattern": r"(output|print|show|display|reveal|repeat|echo|give\s+me)\s+.{0,30}(system\s+)?(prompt|instructions|rules|context|directives)", "severity": "high", "cat": "prompt_leak"},
+    {"pattern": r"(output|print|show|display|reveal|repeat|echo|give\s+me)\s+.{0,30}(system\s+)?(prompt|instructions|rules|context|directives)", "severity": "medium", "cat": "prompt_leak"},
     {"pattern": r"what\s+(are|is|were)\s+your\s+.{0,20}(system\s+)?(prompt|instructions|rules|directives)", "severity": "medium", "cat": "prompt_leak"},
     {"pattern": r"(send|post|upload|transmit|exfiltrate)\s+.{0,40}(to|at|via)\s+(https?://|ftp://|wss?://)", "severity": "high", "cat": "exfiltration"},
     {"pattern": r"curl\s+.{0,60}(https?://|ftp://)\S+\s+.{0,40}(-d|--data|--upload)", "severity": "high", "cat": "exfiltration"},
@@ -125,6 +126,9 @@ DOCS_EXTENSIONS = {".md", ".txt", ".rst", ".adoc", ".html", ".htm"}
 BINARY_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
                      ".ttf", ".eot", ".pdf", ".zip", ".tar", ".gz", ".bin", ".exe",
                      ".dll", ".so", ".dylib", ".pyc", ".class"}
+# Auto-generated lock files — huge, full of hashes, never contain injections
+SKIP_FILENAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                  "Cargo.lock", "poetry.lock", "composer.lock"}
 
 # ── Fuzzy matching for evasion detection ─────────────────────────────────────
 # Key phrases that attackers try to obfuscate via leet-speak, spacing, misspellings
@@ -285,6 +289,10 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
             current_file = line[6:] if line.startswith("+++ b/") else current_file
 
         elif line.startswith("+") and not line.startswith("+++"):
+            # Skip auto-generated lock files
+            basename = current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
+            if basename in SKIP_FILENAMES:
+                continue
             # Scan added lines
             added_content = line[1:]
             ext = _get_extension(current_file)
@@ -342,6 +350,92 @@ def _deduplicate_findings(findings: List[Dict[str, str]]) -> List[Dict[str, str]
     return deduped
 
 
+def evaluate_findings(findings: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Evaluate findings and decide whether to block the pipeline.
+
+    Block rule:
+      - 5+ high-severity findings (isolated matches are common in normal code)
+      - 20+ medium-severity findings (sustained signal suggests coordinated evasion)
+      - Any encoded_injection (base64-hidden payload is never accidental)
+    """
+    high = [f for f in findings if f["severity"] == "high"]
+    medium = [f for f in findings if f["severity"] == "medium"]
+    high_categories = sorted(set(f["category"] for f in high))
+
+    has_encoded_injection = any(f["category"] == "encoded_injection" for f in findings)
+    medium_escalation = len(medium) >= 20  # sustained medium signals suggest coordinated evasion
+    blocked = has_encoded_injection or len(high) >= 5 or medium_escalation
+
+    if blocked:
+        if has_encoded_injection:
+            reason = "encoded injection detected (base64-hidden payload)"
+        elif medium_escalation:
+            reason = f"{len(medium)} medium-severity findings — possible evasion of high-severity patterns"
+        else:
+            reason = f"{len(high)} high-severity findings across {', '.join(high_categories)}"
+    elif high:
+        reason = f"{len(high)} high finding(s) — below blocking threshold"
+    elif findings:
+        reason = f"{len(medium)} medium finding(s) — informational only"
+    else:
+        reason = "clean"
+
+    verdict = "BLOCKED" if blocked else "PASSED"
+
+    if findings:
+        summary = f"{len(findings)} finding(s) ({len(high)} high, {len(medium)} medium) — {verdict}"
+    else:
+        summary = "clean — no findings"
+
+    return {
+        "blocked": blocked,
+        "high_count": len(high),
+        "medium_count": len(medium),
+        "categories": high_categories,
+        "reason": reason,
+        "summary": summary,
+        "verdict": verdict,
+    }
+
+
+def format_findings_report(findings: List[Dict[str, str]], evaluation: Dict[str, Any], context: str = "") -> str:
+    """
+    Format findings into a markdown report for PR comments and logs.
+    Always shows every finding with its location, even when not blocking.
+    """
+    ctx = f" ({context})" if context else ""
+
+    if not findings:
+        return f"**Blueprint Security Scan**{ctx} — No issues found."
+
+    lines = []
+    if evaluation["blocked"]:
+        lines.append(f"**Blueprint Security Scan**{ctx} — **BLOCKED**: {evaluation['reason']}")
+        lines.append("")
+        lines.append("> This PR requires manual approval before the pipeline can proceed.")
+    else:
+        lines.append(f"**Blueprint Security Scan**{ctx} — Passed with {len(findings)} finding(s)")
+        lines.append("")
+        lines.append("> Below blocking threshold. Isolated matches are common in normal code.")
+
+    lines.append("")
+    lines.append("| # | Severity | Category | Source | Matched |")
+    lines.append("|---|----------|----------|--------|---------|")
+
+    for i, f in enumerate(findings, 1):
+        sev = f.get("severity", "?").upper()
+        cat = f.get("category", "?")
+        src = f.get("source", "?")
+        matched = f.get("matched_text", "")[:80].replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| {i} | {sev} | {cat} | `{src}` | `{matched}` |")
+
+    lines.append("")
+    lines.append("*Blocking threshold: 5+ high-severity, 20+ medium-severity, or any encoded injection.*")
+
+    return "\n".join(lines)
+
+
 async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
     """
     Comprehensive PR security scan. Fetches and scans:
@@ -349,8 +443,10 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
       2. Commit messages
       3. PR title and body
 
-    Returns {"clean": bool, "findings": [...], "scanned": [...]}
+    Returns {"clean": bool, "blocked": bool, "findings": [...], "report": str, "summary": str, "scanned": [...]}
     """
+    from app.github import get_pull_request_diff, get_pull_request, get_pull_request_commits
+
     all_findings: List[Dict[str, str]] = []
     scanned: List[str] = []
 
@@ -385,15 +481,24 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
     if not scanned:
         return {
             "clean": True,
+            "blocked": False,
             "findings": [],
+            "report": "**Blueprint Security Scan** — Could not fetch any PR data for scanning.",
+            "summary": f"PR #{pr_number} — scan skipped (no data fetched)",
             "scanned": [],
             "error": "Could not fetch any PR data for scanning",
         }
 
     all_findings = _deduplicate_findings(all_findings)
+    evaluation = evaluate_findings(all_findings)
+    context = f"PR #{pr_number}"
+    report = format_findings_report(all_findings, evaluation, context)
 
     return {
         "clean": len(all_findings) == 0,
+        "blocked": evaluation["blocked"],
         "findings": all_findings,
+        "report": report,
+        "summary": f"PR #{pr_number} — {evaluation['summary']}",
         "scanned": scanned,
     }
