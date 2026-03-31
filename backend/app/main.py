@@ -634,6 +634,8 @@ async def orchestrator_worker():
                 # Respect slot limit after filtering
                 queued_tasks = queued_tasks[:slots_available]
 
+                print(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
+
                 for task in queued_tasks:
                     print(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
@@ -673,8 +675,11 @@ async def orchestrator_worker():
                     session.add(task)
                     try:
                         await session.commit()
+                        print(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
                     except Exception as e:
-                        print(f"[ORCHESTRATOR] Failed to commit PROVISIONING for task {task.id}: {e}")
+                        import traceback
+                        print(f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}")
+                        traceback.print_exc()
                         await session.rollback()
                         continue
 
