@@ -23,6 +23,7 @@ curl -s "${api_url}/api/admin/tasks?limit=10&status=IN_PROGRESS" \
 ```
 
 ### 3. Display
+The API returns `{"tasks": [...], "total": N}`. Extract the `tasks` array.
 Show a clean summary table with: status icon, title, status, time, and PR URL if available.
 
 Status icons: QUEUED=waiting, PROVISIONING=starting, IN_PROGRESS=running, COMPLETED=done, FAILED=error, CANCELLED=stopped.

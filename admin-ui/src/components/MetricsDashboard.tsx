@@ -175,7 +175,7 @@ export default function MetricsDashboard({
   return (
     <div className="grid grid-cols-2 gap-4 mb-6">
       {/* Cost Over Time chart */}
-      <div>
+      <div className={cardClass}>
         <div className="text-xs text-neutral-400 mb-1">Cost / Hour</div>
         <ChartSvg
           points={metricsHistory}
@@ -185,7 +185,7 @@ export default function MetricsDashboard({
       </div>
 
       {/* VM Utilization chart */}
-      <div>
+      <div className={cardClass}>
         <div className="text-xs text-neutral-400 mb-1">VM Utilization</div>
         <ChartSvg
           points={metricsHistory}

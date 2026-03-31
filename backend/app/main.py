@@ -1490,20 +1490,36 @@ async def _spawn_pipeline_task(
     if task_type == "review":
         title = f"Review PR #{pr_number}"
         payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "original_prompt": original_prompt}
+                        "base_branch": base_branch, "original_prompt": original_prompt,
+                        "original_task_id": resolved_original_id}
     else:
         title = f"Fix PR #{pr_number}"
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "prompt": fix_prompt}
+                        "base_branch": base_branch, "prompt": fix_prompt,
+                        "original_task_id": resolved_original_id}
+
+    # Determine parent: use the original task's parent (so review/fix are siblings of the
+    # create task under the plan/research parent), falling back to original task itself
+    resolved_original_id = original_task_id or str(source_task.id)
+    parent_id = None
+    try:
+        orig = await session.get(Task, uuid.UUID(resolved_original_id))
+        if orig and orig.parent_task_id:
+            parent_id = orig.parent_task_id
+        elif orig:
+            parent_id = orig.id
+    except Exception:
+        pass
 
     new_task = Task(
         project_id=source_task.project_id,
         title=title,
         description=fix_prompt or f"Automated {task_type} for PR #{pr_number}",
+        parent_task_id=parent_id,
         payloads=[payload_data],
         context={"review_loop": {"pr_number": pr_number, "branch": branch,
                                   "base_branch": base_branch,
-                                  "original_task_id": original_task_id or str(source_task.id),
+                                  "original_task_id": resolved_original_id,
                                   "iteration": iteration}},
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
@@ -1871,11 +1887,24 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if not parent or parent.status != TaskStatus.EVALUATING:
         return
 
-    children = (await session.execute(
+    all_children = (await session.execute(
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
 
-    # Check all non-cancelled children are done with PRs merged
+    # Only consider create tasks for rollup decisions — review/fix tasks are
+    # pipeline helpers that operate on the same PR as the create task
+    children = [c for c in all_children
+                if ((c.payloads or [{}])[0]).get("type", "create") in ("create", "")]
+
+    # Also check if any review/fix pipeline tasks are still active — don't rollup
+    # while a review/fix cycle is in progress
+    pipeline_active = any(
+        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+        for c in all_children
+        if ((c.payloads or [{}])[0]).get("type") in ("review", "fix")
+    )
+
+    # Check all non-cancelled create children are done with PRs merged
     all_done = True
     cancelled_count = 0
     active_count = 0
@@ -1891,12 +1920,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             all_done = False
             continue
         # COMPLETED — check pr_merged for create tasks
-        c_type = ((c.payloads or [{}])[0]).get("type", "create")
-        if c_type in ("create", "") and not await _verify_pr_merged(c, session):
+        if not await _verify_pr_merged(c, session):
             all_done = False
 
-    # Don't rollup if there are still active tasks
-    if active_count > 0:
+    # Don't rollup if there are still active tasks or active review/fix pipeline
+    if active_count > 0 or pipeline_active:
         return
 
     child_statuses = [c.status for c in children]
@@ -2224,7 +2252,7 @@ async def update_agent_status(
                 pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
                 branch = review_loop.get("branch") or task_payload.get("branch")
                 base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
-                original_task_id = review_loop.get("original_task_id", "")
+                original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
                 original_prompt = task_payload.get("original_prompt", "")
 
                 if not pr_number or not branch:
@@ -2355,7 +2383,7 @@ async def update_agent_status(
                 pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
                 branch = review_loop.get("branch") or task_payload.get("branch")
                 base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
-                original_task_id = review_loop.get("original_task_id", "")
+                original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
 
                 if not pr_number or not branch:
                     print(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")

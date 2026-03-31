@@ -78,12 +78,14 @@ def create_task(
     return _api_request("POST", "/api/admin/tasks", payload)
 
 
-def list_tasks(limit: int = 10, status: str | None = None) -> dict:
+def list_tasks(limit: int = 10, status: str | None = None) -> list:
     """Fetch recent tasks, optionally filtered by status."""
     path = f"/api/admin/tasks?limit={limit}"
     if status:
         path += f"&status={status}"
-    return _api_request("GET", path)
+    data = _api_request("GET", path)
+    # Backend returns {"tasks": [...], "total": N}
+    return data.get("tasks", data) if isinstance(data, dict) else data
 
 
 # ── CLI entrypoint ───────────────────────────────────────────────────────────

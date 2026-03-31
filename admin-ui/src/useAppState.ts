@@ -4,7 +4,7 @@ import type { Project } from './components/ProjectDashboard';
 import type { MaxPlanAccount } from './components/SettingsDropdown';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet, apiFetch } from './api';
+import { API_BASE_URL, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -99,8 +99,6 @@ export function useAppState() {
 
   // Metrics dashboard state
   const [showMetrics, setShowMetrics] = useState(false);
-  const showMetricsRef = useRef(showMetrics);
-  useEffect(() => { showMetricsRef.current = showMetrics; }, [showMetrics]);
   const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
   const [cumulativeCost, setCumulativeCost] = useState(0);
   const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
@@ -732,7 +730,7 @@ export function useAppState() {
       const search = searchOverride ?? archiveSearchQuery;
       const dateRange = dateRangeOverride ?? archiveDateRange;
       const offset = (p - 1) * ps;
-      let url = `/api/admin/tasks?limit=${ps}&offset=${offset}`;
+      let url = `${API_BASE_URL}/api/admin/tasks?limit=${ps}&offset=${offset}`;
       if (status !== 'all') {
         url += `&status=${status}`;
       } else {
@@ -749,7 +747,7 @@ export function useAppState() {
           url += `&created_after=${encodeURIComponent(after.toISOString())}`;
         }
       }
-      const res = await apiFetch(url);
+      const res = await authGet(url);
       if (res.ok) {
         const data = await res.json();
         setArchiveTasks(data.tasks || []);

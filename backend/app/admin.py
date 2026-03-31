@@ -132,6 +132,7 @@ async def get_all_tasks(
             "last_heartbeat": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
             "attempt_count": t.attempt_count,
             "payloads": t.payloads,
+            "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
             "research_findings": research_map.get(str(t.id)),
