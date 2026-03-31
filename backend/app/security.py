@@ -129,6 +129,8 @@ BINARY_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
 # Auto-generated lock files — huge, full of hashes, never contain injections
 SKIP_FILENAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
                   "Cargo.lock", "poetry.lock", "composer.lock"}
+# Test files that contain injection patterns by definition (they test the scanner)
+SKIP_PATHS_CONTAINING = {"test_security", "testing/test_security"}
 
 # ── Fuzzy matching for evasion detection ─────────────────────────────────────
 # Key phrases that attackers try to obfuscate via leet-speak, spacing, misspellings
@@ -289,9 +291,11 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
             current_file = line[6:] if line.startswith("+++ b/") else current_file
 
         elif line.startswith("+") and not line.startswith("+++"):
-            # Skip auto-generated lock files
+            # Skip auto-generated lock files and security test files
             basename = current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
             if basename in SKIP_FILENAMES:
+                continue
+            if any(skip in current_file for skip in SKIP_PATHS_CONTAINING):
                 continue
             # Scan added lines
             added_content = line[1:]

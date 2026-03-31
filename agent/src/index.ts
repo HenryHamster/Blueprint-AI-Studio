@@ -216,6 +216,18 @@ async function handleCreate(
     sendLog(ws, '\nCommitting and pushing changes...\n');
     git(['add', '-A']);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+
+    // Rebase onto latest base branch before push to avoid merge conflicts in the PR
+    statusRef.value = `Rebasing onto ${baseBranch}...`;
+    try {
+      git(['fetch', 'origin', baseBranch]);
+      git(['rebase', `origin/${baseBranch}`]);
+      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
+    } catch {
+      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is, review pipeline will handle\n`);
+      try { git(['rebase', '--abort']); } catch {}
+    }
+
     const commitHash = git(['rev-parse', 'HEAD']);
 
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
@@ -337,6 +349,7 @@ async function handleFix(
   // Always rebase onto target branch to resolve merge conflicts
   statusRef.value = `Rebasing onto ${baseBranch}...`;
   sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
+  let hasConflicts = false;
   try {
     git(['fetch', 'origin', baseBranch]);
     git(['rebase', `origin/${baseBranch}`]);
@@ -349,13 +362,26 @@ async function handleFix(
     try {
       git(['merge', `origin/${baseBranch}`, '--no-edit']);
     } catch {
+      hasConflicts = true;
       sendLog(ws, `Merge conflicts present — Claude will resolve\n`);
     }
   }
 
+  // If there are conflict markers, tell Claude exactly which files are conflicting
+  let enrichedPrompt = prompt;
+  if (hasConflicts) {
+    try {
+      const conflictFiles = git(['diff', '--name-only', '--diff-filter=U']);
+      if (conflictFiles.trim()) {
+        enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nResolve the conflict markers (<<<<<<< ======= >>>>>>>) in each file. Keep the intent of the PR changes (HEAD) while incorporating upstream updates (origin/${baseBranch}).\n\n${prompt}`;
+        sendLog(ws, `Conflicting files:\n${conflictFiles}\n`);
+      }
+    } catch { /* diff failed, fall through with original prompt */ }
+  }
+
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
-  const { exitCode, allOutput } = await runClaudeCode(prompt, ws, statusRef);
+  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef);
 
   // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);
@@ -363,6 +389,18 @@ async function handleFix(
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+  }
+
+  // Final rebase onto base branch to ensure no conflicts remain before push
+  if (exitCode === 0) {
+    try {
+      git(['fetch', 'origin', baseBranch]);
+      git(['rebase', `origin/${baseBranch}`]);
+      sendLog(ws, `Final rebase onto ${baseBranch} successful\n`);
+    } catch {
+      sendLog(ws, `Final rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
+      try { git(['rebase', '--abort']); } catch {}
+    }
   }
 
   // Always push if the branch has diverged from origin (rebase or new commits)

@@ -44,6 +44,7 @@ from app.github import (
     create_pull_request,
     merge_pull_request,
     get_pull_request,
+    get_pr_files,
 )
 import hmac
 import hashlib
@@ -2241,11 +2242,29 @@ async def update_agent_status(
                         else:
                             # Merge blocked — spawn fix task to rebase and resolve conflicts
                             merge_msg = merge_result.get("message", "unknown")
+                            # Fetch PR file list for conflict context
+                            try:
+                                pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                                files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
+                            except Exception:
+                                files_list = "  (could not fetch file list)"
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Spawning fix task to rebase and resolve conflicts.")
+                            fix_prompt = (
+                                f"This PR (#{pr_number}) was approved but could not be merged.\n"
+                                f"Error: {merge_msg}\n\n"
+                                f"Files changed in this PR:\n{files_list}\n\n"
+                                f"Steps to resolve:\n"
+                                f"1. Run: git fetch origin {base_branch}\n"
+                                f"2. Run: git rebase origin/{base_branch}\n"
+                                f"3. If rebase conflicts occur, resolve them in each file — keep the intent of the PR changes while incorporating upstream updates\n"
+                                f"4. Run: git rebase --continue after resolving each conflicting file\n"
+                                f"5. If rebase is too complex, abort with git rebase --abort, then use git merge origin/{base_branch} and resolve conflict markers\n\n"
+                                f"Preserve the intent of the existing PR changes. Do not alter logic unless necessary to resolve conflicts."
+                            )
                             fix_task = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
-                                fix_prompt=f"This PR was approved but could not be merged due to: {merge_msg}\n\nRebase this branch onto the latest {base_branch} and resolve any merge conflicts. Preserve the intent of the existing changes. Do not alter logic unless necessary to resolve conflicts.",
+                                fix_prompt=fix_prompt,
                                 original_task_id=original_task_id
                             )
                             if fix_task:

@@ -635,3 +635,23 @@ async def merge_pull_request(
             return {"merged": False, "conflict": response.status_code == 409, "message": msg}
         logger.error(f"Failed to merge PR #{pr_number}: {response.text}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")
+
+
+async def get_pr_files(
+    token: str, owner: str, repo: str, pr_number: int
+) -> list[dict]:
+    """Fetches the list of files changed in a PR with their status (added/modified/removed)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get PR files #{pr_number}: {response.text}")
+            return []
+        return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
