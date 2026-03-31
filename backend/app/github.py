@@ -518,14 +518,29 @@ async def create_pull_request(
             json=payload
         )
 
-        if response.status_code != 201:
-            logger.error(f"Failed to create pull request: {response.text}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create pull request on GitHub."
-            )
+        if response.status_code == 201:
+            return response.json()
 
-        return response.json()
+        # 422 often means a PR already exists for this head→base
+        if response.status_code == 422:
+            data = response.json()
+            errors = data.get("errors", [])
+            for err in errors:
+                if "pull request already exists" in str(err.get("message", "")).lower():
+                    # Return the existing PR instead of failing
+                    logger.info(f"PR already exists for {head} → {base}, fetching existing PR")
+                    list_resp = await client.get(
+                        f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{head}&base={base}&state=open",
+                        headers=headers
+                    )
+                    if list_resp.status_code == 200 and list_resp.json():
+                        return list_resp.json()[0]
+
+        logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create pull request: {response.text[:500]}"
+        )
 
 
 async def get_pull_request(

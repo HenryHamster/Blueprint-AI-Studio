@@ -259,7 +259,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         if ((t.payloads or [{}])[0]).get("type") == "research":
             return
     # Guard: rate limit autonomous tasks
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
     recent_auto = (await session.execute(
         select(func.count()).select_from(Task).where(
             Task.project_id == project.id,
@@ -441,7 +441,7 @@ async def reaper_service():
                 active_tasks = (await session.execute(stmt)).scalars().all()
                 
                 orphaned_tasks = []
-                now = datetime.now(timezone.utc)
+                now = datetime.utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
                 
@@ -1526,12 +1526,23 @@ def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
     """Extract structured plan JSON from agent output text."""
     import re
     try:
-        # Find JSON block containing "subtasks"
-        json_match = re.search(r'\{[^{}]*"subtasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-    except (json.JSONDecodeError, AttributeError):
-        pass
+        # Find the start of the JSON block containing "subtasks"
+        match = re.search(r'\{\s*"subtasks"\s*:\s*\[', text)
+        if not match:
+            return None
+        start = match.start()
+        # Walk forward to find the matching closing brace using bracket counting
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    return json.loads(candidate)
+    except (json.JSONDecodeError, AttributeError) as e:
+        print(f"[PLAN] Failed to parse plan JSON: {e}")
     return None
 
 
@@ -1820,10 +1831,14 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
 
     branches_to_delete = []
 
-    # Staging branches (research/*, plan/*) owned by parent tasks
-    staging = ctx.get("plan_branch") or ctx.get("research_branch")
-    if staging:
-        branches_to_delete.append(staging)
+    # Staging branches (research/*, plan/*) are shared by ALL sibling tasks.
+    # Only delete when the PARENT task completes (rollup), not on individual child completion.
+    # Check if this task IS the parent (has plan_output or is a research task).
+    is_parent = task.plan_output is not None or ((task.payloads or [{}])[0]).get("type") in ("research", "plan")
+    if is_parent:
+        staging = ctx.get("plan_branch") or ctx.get("research_branch")
+        if staging:
+            branches_to_delete.append(staging)
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
