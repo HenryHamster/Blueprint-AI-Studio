@@ -99,7 +99,9 @@ class CreateTaskPayload(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1)
     base_branch: str = Field(default="main", pattern=r"^[a-zA-Z0-9_./-]+$")
-    task_type: str = Field(default="create", pattern=r"^(create|plan|research)$")
+    task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix)$")
+    pr_number: Optional[int] = None
+    branch: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -141,6 +143,12 @@ async def create_task_manually(
         "prompt": payload.prompt,
         "base_branch": payload.base_branch,
     }
+    # Review/fix tasks need pr_number and branch
+    if payload.task_type in ("review", "fix") and payload.pr_number:
+        task_payload["pr_number"] = payload.pr_number
+        task_payload["branch"] = payload.branch or ""
+        if payload.task_type == "review":
+            task_payload["original_prompt"] = payload.prompt
     # Research tasks auto-include project directions
     if payload.task_type == "research":
         active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
