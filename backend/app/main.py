@@ -23,6 +23,7 @@ from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_ws_ticket, verify_ws_ticket
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
+from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
     generate_installation_access_token,
@@ -57,7 +58,12 @@ limiter = Limiter(key_func=get_remote_address)
 _runtime_config = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
+    "max_autonomous_tasks_per_hour": 5,
 }
+
+# --- Autonomous Loop State ---
+_autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
+_last_idle_check: Optional[datetime] = None
 
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
@@ -94,6 +100,134 @@ def release_max_plan_account(account_id: str):
         if account["id"] == account_id:
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
             break
+
+
+async def _spawn_research_task(project: Project, session: AsyncSession):
+    """Spawn a research task for a project if conditions are met."""
+    from sqlalchemy import func
+
+    # Guard: autonomous must be enabled
+    if not project.autonomous_enabled:
+        return
+    # Guard: must have active directions
+    active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    if not active_directions:
+        return
+    # Guard: no existing research task already running/queued
+    active_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active_tasks:
+        if ((t.payloads or [{}])[0]).get("type") == "research":
+            return
+    # Guard: rate limit autonomous tasks
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    recent_auto = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.project_id == project.id,
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        )
+    )).scalar() or 0
+    if recent_auto >= _runtime_config["max_autonomous_tasks_per_hour"]:
+        return
+
+    # Infer base_branch from the most recent task in this project, or default to main
+    recent_task = (await session.execute(
+        select(Task).where(Task.project_id == project.id)
+        .order_by(Task.created_at.desc()).limit(1)
+    )).scalars().first()
+    base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
+
+    new_task = Task(
+        project_id=project.id,
+        title="Research: autonomous improvement scan",
+        description="Automated research task triggered by autonomous loop",
+        payloads=[{
+            "type": "research",
+            "directions": active_directions,
+            "base_branch": base_branch,
+        }],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}
+    )
+    session.add(history)
+    await session.commit()
+    await session.refresh(new_task)
+    print(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
+
+
+async def _check_autonomous_research(owner: str, repo: str):
+    """Post-merge hook: check if we should spawn a research task."""
+    try:
+        async with AsyncSessionLocal() as session:
+            project = (await session.execute(
+                select(Project).where(
+                    Project.github_owner == owner,
+                    Project.github_repo == repo,
+                    Project.autonomous_enabled == True,
+                )
+            )).scalars().first()
+            if not project:
+                return
+
+            # Check if queue is empty for this project
+            from sqlalchemy import func
+            queued = (await session.execute(
+                select(func.count()).select_from(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                )
+            )).scalar() or 0
+
+            if queued == 0:
+                await _spawn_research_task(project, session)
+    except Exception as e:
+        print(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}")
+
+
+async def _check_idle_research():
+    """Periodic check: spawn research if projects are idle with active directions."""
+    global _last_idle_check
+    now = datetime.utcnow()
+    if _last_idle_check and (now - _last_idle_check) < timedelta(minutes=30):
+        return
+    _last_idle_check = now
+
+    try:
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import func
+
+            projects = (await session.execute(
+                select(Project).where(Project.autonomous_enabled == True)
+            )).scalars().all()
+
+            for project in projects:
+                active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+                if not active_directions:
+                    continue
+
+                queued = (await session.execute(
+                    select(func.count()).select_from(Task).where(
+                        Task.project_id == project.id,
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                    )
+                )).scalar() or 0
+
+                if queued == 0:
+                    await _spawn_research_task(project, session)
+    except Exception as e:
+        print(f"[AUTONOMOUS] Error in idle research check: {e}")
+
 
 # --- In-Memory Event Bus for WebSockets ---
 class ConnectionManager:
@@ -294,9 +428,50 @@ async def orchestrator_worker():
                 stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).limit(min(slots_available, 10))
-                queued_tasks = (await session.execute(stmt)).scalars().all()
-                
+                ).limit(min(slots_available, 20))  # Fetch extra to filter deps
+                candidate_tasks = (await session.execute(stmt)).scalars().all()
+
+                # Filter out tasks with unmet dependencies
+                queued_tasks = []
+                for task in candidate_tasks:
+                    deps = task.depends_on or []
+                    if not deps:
+                        queued_tasks.append(task)
+                        continue
+
+                    # Check all dependencies are COMPLETED with PR merged
+                    dep_uuids = [uuid.UUID(d) for d in deps]
+                    dep_result = await session.execute(select(Task).where(Task.id.in_(dep_uuids)))
+                    dep_tasks = dep_result.scalars().all()
+
+                    all_met = True
+                    any_failed = False
+                    for dt in dep_tasks:
+                        if dt.status in [TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                            any_failed = True
+                            break
+                        if dt.status != TaskStatus.COMPLETED:
+                            all_met = False
+                            continue
+                        # For create tasks, also require PR to be merged
+                        dt_type = ((dt.payloads or [{}])[0]).get("type", "create")
+                        if dt_type in ("create", "") and not (dt.context or {}).get("pr_merged"):
+                            all_met = False
+
+                    if any_failed:
+                        task.status = TaskStatus.CANCELLED
+                        task.latest_status_message = "Cancelled: dependency task failed"
+                        session.add(task)
+                        await session.commit()
+                        await broadcast_to_project(str(task.project_id), "task_updated",
+                                                   {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
+                        print(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
+                    elif all_met:
+                        queued_tasks.append(task)
+
+                # Respect slot limit after filtering
+                queued_tasks = queued_tasks[:slots_available]
+
                 for task in queued_tasks:
                     print(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
@@ -379,6 +554,8 @@ async def orchestrator_worker():
                 await asyncio.sleep(0.5) # Yield control briefly if we are processing a backlog
             else:
                 await asyncio.sleep(5) # Sleep longer if queue is empty
+                # Check for idle autonomous research when nothing is queued
+                await _check_idle_research()
         except asyncio.CancelledError:
             print("[ORCHESTRATOR] Worker shutting down.")
             break
@@ -1088,6 +1265,200 @@ async def _spawn_pipeline_task(
     return new_task
 
 
+def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
+    """Extract structured plan JSON from agent output text."""
+    import re
+    try:
+        # Find JSON block containing "subtasks"
+        json_match = re.search(r'\{[^{}]*"subtasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
+    """Extract structured research findings JSON array from agent output text."""
+    import re
+    try:
+        # Find JSON array containing objects with "title" and "prompt"
+        json_match = re.search(r'\[[\s\S]*?"title"[\s\S]*?"prompt"[\s\S]*?\]', text, re.DOTALL)
+        if json_match:
+            findings = json.loads(json_match.group())
+            if isinstance(findings, list):
+                return findings
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+def _validate_plan_dependencies(subtasks: List[Dict]) -> bool:
+    """Validate that plan dependencies are acyclic (topological sort check)."""
+    n = len(subtasks)
+    visited = set()
+    in_stack = set()
+
+    def has_cycle(node: int) -> bool:
+        if node in in_stack:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        in_stack.add(node)
+        for dep in subtasks[node].get("depends_on_indices", []):
+            if 0 <= dep < n and has_cycle(dep):
+                return True
+        in_stack.discard(node)
+        return False
+
+    return not any(has_cycle(i) for i in range(n) if i not in visited)
+
+
+async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
+    """Parse plan output and create child tasks with dependency tracking."""
+    plan_data = _parse_plan_output(logs)
+    if not plan_data or not plan_data.get("subtasks"):
+        task.latest_status_message = "Plan agent produced no valid subtasks"
+        task.status = TaskStatus.FAILED
+        session.add(task)
+        await session.commit()
+        return
+
+    subtasks = plan_data["subtasks"]
+
+    # Cap subtask count to prevent runaway VM provisioning
+    if len(subtasks) > 10:
+        subtasks = subtasks[:10]
+        print(f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10")
+
+    if not _validate_plan_dependencies(subtasks):
+        task.latest_status_message = "Plan has circular dependencies"
+        task.status = TaskStatus.FAILED
+        session.add(task)
+        await session.commit()
+        return
+
+    # Store parsed plan and set parent to EVALUATING (children executing)
+    task.plan_output = plan_data
+    task.status = TaskStatus.EVALUATING
+    session.add(task)
+
+    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+
+    # First pass: create all child tasks
+    child_tasks = []
+    for subtask_def in subtasks:
+        child = Task(
+            project_id=task.project_id,
+            title=subtask_def.get("title", "Untitled subtask"),
+            description=subtask_def.get("prompt", ""),
+            parent_task_id=task.id,
+            payloads=[{
+                "type": "create",
+                "prompt": subtask_def.get("prompt", ""),
+                "base_branch": base_branch,
+            }],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            depends_on=[],
+        )
+        session.add(child)
+        child_tasks.append(child)
+
+    await session.commit()
+    for ct in child_tasks:
+        await session.refresh(ct)
+
+    # Second pass: resolve depends_on_indices to actual UUIDs
+    for i, subtask_def in enumerate(subtasks):
+        dep_indices = subtask_def.get("depends_on_indices", [])
+        child_tasks[i].depends_on = [
+            str(child_tasks[j].id)
+            for j in dep_indices
+            if 0 <= j < len(child_tasks)
+        ]
+        session.add(child_tasks[i])
+
+    await session.commit()
+
+    # Record history
+    for ct in child_tasks:
+        history = TaskHistory(
+            task_id=ct.id, action="SPAWNED",
+            details={"spawned_by": "PLAN_DECOMPOSITION", "parent_plan_id": str(task.id)}
+        )
+        session.add(history)
+        await broadcast_to_project(str(task.project_id), "task_updated",
+                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+
+    await session.commit()
+    print(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
+
+
+async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
+    """Parse research findings and create tasks from them."""
+    findings = _parse_research_findings(logs)
+    if not findings:
+        task.latest_status_message = "Research completed with no actionable findings"
+        session.add(task)
+        await session.commit()
+        return
+
+    # Cap findings to prevent runaway task creation
+    if len(findings) > 10:
+        findings = findings[:10]
+
+    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    created_count = 0
+
+    for i, finding in enumerate(findings):
+        scope = finding.get("scope", "small")
+        risk = finding.get("risk", "low")
+        title = finding.get("title", f"Research finding #{i+1}")
+        prompt = finding.get("prompt", finding.get("description", ""))
+
+        if not prompt:
+            continue
+
+        # Determine task type: medium/large scope → plan task for decomposition
+        task_type = "plan" if scope in ("medium", "large") else "create"
+        needs_approval = risk == "high"
+
+        new_task = Task(
+            project_id=task.project_id,
+            title=title,
+            description=finding.get("description", prompt[:200]),
+            payloads=[{
+                "type": task_type,
+                "prompt": prompt,
+                "base_branch": base_branch,
+            }],
+            context={
+                "research_task_id": str(task.id),
+                "finding_index": i,
+                "scope": scope,
+                "risk": risk,
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            requires_approval=needs_approval,
+        )
+        session.add(new_task)
+        created_count += 1
+
+    await session.commit()
+    task.latest_status_message = f"Research created {created_count} tasks from {len(findings)} findings"
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(str(task.project_id), "autonomous_activity",
+                               {"research_task_id": str(task.id), "tasks_created": created_count})
+    print(f"[RESEARCH] Created {created_count} tasks from research {task.id}")
+
+
 @app.post("/api/agent/status")
 async def update_agent_status(
     payload: AgentStatusPayload, 
@@ -1178,24 +1549,70 @@ async def update_agent_status(
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
 
+        # Circuit breaker for autonomous tasks: pause autonomy after consecutive failures
+        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
+            project_key = str(task.project_id)
+            _autonomous_failure_counts[project_key] = _autonomous_failure_counts.get(project_key, 0) + 1
+            if _autonomous_failure_counts[project_key] >= 3:
+                try:
+                    project = await session.get(Project, task.project_id)
+                    if project and project.autonomous_enabled:
+                        project.autonomous_enabled = False
+                        session.add(project)
+                        await session.commit()
+                        await broadcast_to_project(project_key, "autonomous_paused",
+                                                   {"reason": "3 consecutive autonomous task failures"})
+                        print(f"[AUTONOMOUS] Paused project {project_key} after 3 consecutive failures")
+                except Exception as e:
+                    print(f"[AUTONOMOUS] Error in circuit breaker: {e}")
+        elif payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
+            # Reset failure counter on success
+            _autonomous_failure_counts.pop(str(task.project_id), None)
+
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
             task_payload = (task.payloads or [{}])[0]
             task_type = task_payload.get("type", "create")
             review_loop = (task.context or {}).get("review_loop", {})
 
-            # Create task completed with PR → spawn review
+            # Create task completed with PR → security scan → spawn review
             if task_type in ("create", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
                 branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
 
-                review_task = await _spawn_pipeline_task(
-                    task, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(task.id)
-                )
-                print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                # Security scan BEFORE spawning review — runs in orchestrator, not VM
+                try:
+                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                    if not scan_result["clean"]:
+                        high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
+                        if high_findings:
+                            task.requires_approval = True
+                            task.latest_status_message = f"Security scan blocked: {len(high_findings)} suspicious pattern(s) detected"
+                            session.add(task)
+                            await session.commit()
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                f"**Blueprint Security Scan**: Blocked — {len(high_findings)} suspicious pattern(s) detected. Requires manual review.\n\n"
+                                + "\n".join(f"- **{f.get('category', 'unknown')}** in `{f.get('source', '?')}`: `{f.get('matched_text', '')[:100]}`" for f in high_findings[:10]))
+                            print(f"[SECURITY] Blocked PR #{pr_number} — {len(high_findings)} high-severity findings")
+                            # Skip review — human must approve
+                        else:
+                            medium_findings = [f for f in scan_result["findings"] if f["severity"] == "medium"]
+                            if medium_findings:
+                                await create_pr_comment(gh_token, owner, repo, pr_number,
+                                    f"**Blueprint Security Scan**: {len(medium_findings)} pattern(s) flagged (informational, proceeding with review)")
+                            # Proceed to review below
+                except Exception as e:
+                    print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
+
+                if not task.requires_approval:
+                    review_task = await _spawn_pipeline_task(
+                        task, "review", session, pr_number, branch, base_branch,
+                        original_prompt=original_prompt, original_task_id=str(task.id)
+                    )
+                    print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -1234,6 +1651,16 @@ async def update_agent_status(
                         if merge_result.get("merged"):
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 "**Blueprint Review Pipeline**: PR auto-merged.")
+                            # Mark original create task so dependents can proceed
+                            if original_task_id:
+                                try:
+                                    orig = await session.get(Task, uuid.UUID(original_task_id))
+                                    if orig:
+                                        orig.context = {**(orig.context or {}), "pr_merged": True}
+                                        session.add(orig)
+                                        await session.commit()
+                                except Exception as e:
+                                    print(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}")
                             print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
                         else:
                             # Merge blocked — spawn fix task to rebase and resolve conflicts
@@ -1256,20 +1683,92 @@ async def update_agent_status(
                     )
                     print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
 
-            # Fix task completed → spawn new review
+            # Fix task completed → security scan → spawn new review
             elif task_type == "fix":
                 pr_number = review_loop.get("pr_number") or task_payload.get("pr_number")
                 branch = review_loop.get("branch") or task_payload.get("branch")
                 base_branch = review_loop.get("base_branch", "main")
                 original_task_id = review_loop.get("original_task_id", "")
 
-                review_task = await _spawn_pipeline_task(
-                    task, "review", session, pr_number, branch, base_branch,
-                    original_task_id=original_task_id
-                )
-                print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+                # Security scan fix output before re-review
+                scan_blocked = False
+                try:
+                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                    if not scan_result["clean"]:
+                        high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
+                        if high_findings:
+                            scan_blocked = True
+                            task.requires_approval = True
+                            task.latest_status_message = f"Security scan blocked fix: {len(high_findings)} suspicious pattern(s)"
+                            session.add(task)
+                            await session.commit()
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                f"**Blueprint Security Scan**: Fix blocked — {len(high_findings)} suspicious pattern(s). Requires manual review.")
+                            print(f"[SECURITY] Blocked fix on PR #{pr_number}")
+                except Exception as e:
+                    print(f"[SECURITY] Scan failed for fix PR #{pr_number}, proceeding: {e}")
 
-        # 6. Project State Aggregation
+                if not scan_blocked:
+                    review_task = await _spawn_pipeline_task(
+                        task, "review", session, pr_number, branch, base_branch,
+                        original_task_id=original_task_id
+                    )
+                    print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+
+            # Plan task completed → decompose into subtasks
+            elif task_type == "plan":
+                plan_logs = payload.logs or task.latest_status_message or ""
+                await _handle_plan_completion(task, plan_logs, session)
+
+            # Research task completed → create tasks from findings
+            elif task_type == "research":
+                research_logs = payload.logs or task.latest_status_message or ""
+                await _handle_research_completion(task, research_logs, session)
+
+        # 6. Parent task rollup — check if all siblings of a plan are done
+        # Note: COMPLETED alone is not enough for create tasks — PR must also be merged
+        if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            parent = await session.get(Task, task.parent_task_id)
+            if parent and parent.status == TaskStatus.EVALUATING:
+                children = (await session.execute(
+                    select(Task).where(Task.parent_task_id == parent.id)
+                )).scalars().all()
+                child_statuses = [c.status for c in children]
+
+                # For create tasks, also require pr_merged (COMPLETED only means PR opened)
+                all_done = True
+                for c in children:
+                    if c.status != TaskStatus.COMPLETED:
+                        all_done = False
+                        break
+                    c_type = ((c.payloads or [{}])[0]).get("type", "create")
+                    if c_type in ("create", "") and not (c.context or {}).get("pr_merged"):
+                        all_done = False
+                        break
+
+                if all_done:
+                    parent.status = TaskStatus.COMPLETED
+                    parent.latest_status_message = f"All {len(children)} subtasks completed and merged"
+                    session.add(parent)
+                    await session.commit()
+                    await broadcast_to_project(str(parent.project_id), "task_updated",
+                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                    print(f"[PLAN] Parent plan {parent.id} completed — all {len(children)} children done")
+                elif any(s == TaskStatus.FAILED for s in child_statuses) and not any(
+                    s in [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
+                    for s in child_statuses
+                ):
+                    parent.status = TaskStatus.FAILED
+                    failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
+                    parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
+                    session.add(parent)
+                    await session.commit()
+                    await broadcast_to_project(str(parent.project_id), "task_updated",
+                                               {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+                    print(f"[PLAN] Parent plan {parent.id} failed — {failed_count} children failed")
+
+        # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
         # Parent/logical tasks are updated to match the project outcome.
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
@@ -1773,8 +2272,18 @@ async def github_webhook(
     event_type = request.headers.get("x-github-event")
     data = json.loads(payload)
     
-    # Log events but don't create tasks — webhook-triggered tasks have no prompt
-    print(f"[WEBHOOK] Received {event_type} event, logged for future use")
+    print(f"[WEBHOOK] Received {event_type} event")
+
+    # Post-merge trigger: check if we should spawn autonomous research
+    if event_type == "pull_request":
+        action = data.get("action")
+        merged = data.get("pull_request", {}).get("merged", False)
+
+        if action == "closed" and merged:
+            repo_full = data.get("repository", {}).get("full_name", "")
+            if "/" in repo_full:
+                owner, repo = repo_full.split("/", 1)
+                background_tasks.add_task(_check_autonomous_research, owner, repo)
 
     return {"status": "received"}
 

@@ -335,6 +335,140 @@ async function handleFix(
   }
 }
 
+// ── Handler: Plan (decompose complex task into subtasks) ───────────────────
+async function handlePlan(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) {
+  const prompt = String(payload.prompt || payload.description || task.description || '');
+  const baseBranch = String(payload.base_branch || 'main');
+
+  if (!prompt) throw new Error('Plan task missing prompt');
+
+  // Clone repo — planner needs codebase context for good decomposition
+  statusRef.value = `Cloning ${owner}/${repo} for planning...`;
+  sendLog(ws, `Planning task decomposition for: ${prompt.slice(0, 200)}\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  const planPrompt = `You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+
+Task to decompose:
+${prompt}
+
+Instructions:
+1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.
+2. Break the task into the smallest meaningful units of work. Each subtask should be one PR-sized change.
+3. Identify dependencies between subtasks — which must complete before others can start.
+4. Write clear, self-contained prompts for each subtask. The implementing agent knows nothing about this planning session.
+
+Output EXACTLY one JSON block as the VERY LAST thing in your response:
+
+{
+  "subtasks": [
+    {
+      "title": "Short title (under 60 chars, conventional commit style: feat:, fix:, refactor:, etc.)",
+      "prompt": "Self-contained implementation prompt. Describe WHAT to achieve and key constraints. The agent has full repo access and will figure out implementation details.",
+      "depends_on_indices": []
+    },
+    {
+      "title": "feat: second subtask",
+      "prompt": "...",
+      "depends_on_indices": [0]
+    }
+  ]
+}
+
+Rules:
+- depends_on_indices uses 0-based array positions (e.g., [0, 1] means this subtask depends on the first and second subtasks)
+- Each subtask prompt must be self-contained — don't reference other subtasks by index
+- Keep prompts concise — describe what to achieve, not step-by-step how
+- Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
+- Aim for 2-6 subtasks. If the task is simple enough for 1 PR, output a single subtask with no dependencies
+- Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline`;
+
+  statusRef.value = 'Running Claude Code for planning...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef);
+
+  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  await apiPost('/api/agent/status', {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
+    logs,
+  });
+}
+
+// ── Handler: Research (analyze codebase, output improvement findings) ──────
+async function handleResearch(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+) {
+  const directions = payload.directions as Array<Record<string, unknown>> || [];
+  const baseBranch = String(payload.base_branch || 'main');
+
+  // Full clone — research needs history context
+  statusRef.value = `Cloning ${owner}/${repo} for research...`;
+  sendLog(ws, `Starting codebase research...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  const directionsText = directions.length > 0
+    ? directions.map((d, i) => `${i + 1}. [${d.priority || 'medium'}] ${d.text} (id: ${d.id})`).join('\n')
+    : 'No specific directions provided. Identify general improvements.';
+
+  const researchPrompt = `You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
+
+Current project directions from the user:
+${directionsText}
+
+Instructions:
+1. Explore the codebase thoroughly. Read key files, understand the architecture, find patterns.
+2. Based on the user's directions, identify specific, actionable improvements.
+3. For each finding, assess scope and risk.
+4. Output your findings as a JSON array as the VERY LAST thing in your response:
+
+[
+  {
+    "type": "improvement",
+    "title": "Short title (under 60 chars, conventional commit style)",
+    "description": "1-3 sentence description of the change",
+    "prompt": "The exact prompt to give to an implementing agent. Must be self-contained.",
+    "scope": "small",
+    "risk": "low",
+    "priority": "high",
+    "related_files": ["path/to/file1.py"],
+    "direction_id": "d-1 or null if self-discovered"
+  }
+]
+
+Valid values:
+- type: improvement, bug, refactor, feature, test
+- scope: small (under 50 lines), medium (50-200 lines), large (200+ lines)
+- risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
+- priority: high, medium, low
+
+Rules:
+- Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
+- The prompt field must be self-contained — the implementing agent knows nothing about this research
+- Do NOT include findings that require human architectural decisions
+- Limit to 10 findings maximum, prioritized by impact
+- For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition`;
+
+  statusRef.value = 'Running codebase research...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef);
+
+  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  await apiPost('/api/agent/status', {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
+    logs,
+  });
+}
+
 // ── Handler Registry ────────────────────────────────────────────────────────
 type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -345,6 +479,8 @@ const handlers: Record<string, Handler> = {
   create: handleCreate,
   review: handleReview,
   fix: handleFix,
+  plan: handlePlan,
+  research: handleResearch,
 };
 
 // ── Main ────────────────────────────────────────────────────────────────────

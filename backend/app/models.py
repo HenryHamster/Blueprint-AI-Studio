@@ -27,6 +27,7 @@ class ArtifactType(str, Enum):
     PULL_REQUEST = "PULL_REQUEST"
     SCREENSHOT = "SCREENSHOT"
     ERROR_LOG = "ERROR_LOG"
+    RESEARCH_FINDINGS = "RESEARCH_FINDINGS"
 
 # --- Models ---
 
@@ -55,7 +56,12 @@ class Project(SQLModel, table=True):
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    
+
+    # Autonomous improvement: user-defined high-level directions for research agents
+    directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
+    # Toggle autonomous research/task generation
+    autonomous_enabled: bool = Field(default=True)
+
     tasks: List["Task"] = Relationship(
         back_populates="project", 
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
@@ -82,12 +88,18 @@ class Task(SQLModel, table=True):
     # Push Model: Orchestrator assigns this task to a specific VM
     vm_instance_id: Optional[str] = Field(default=None, index=True)
     
+    # Task dependency DAG: list of task UUIDs that must be COMPLETED+merged before dispatch
+    depends_on: List[str] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
+
     # Flexible Payloads: A list of structured dictionaries defining the work.
     # E.g., [{"interface": "ui_component_v1", "data": {...}}]
     payloads: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB))
-    
+
     # Shared memory/context for the agent during execution
     context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
+
+    # Stores parsed plan output from plan-type tasks (for debugging/admin visibility)
+    plan_output: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     
     # Agent Heartbeat mechanism
     last_heartbeat: Optional[datetime] = Field(default=None)

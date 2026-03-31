@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uuid
 import httpx
 import logging
@@ -511,3 +511,133 @@ async def list_github_branches(
 
     branches.sort(key=str.lower)
     return {"branches": branches}
+
+
+# --- Project Directions (autonomous improvement steering) ---
+
+class DirectionPayload(BaseModel):
+    text: str = Field(..., min_length=1, max_length=500)
+    priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
+
+
+@router.get("/projects/{project_id}/directions")
+async def get_directions(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"directions": project.directions or [], "autonomous_enabled": project.autonomous_enabled}
+
+
+@router.post("/projects/{project_id}/directions")
+async def add_direction(
+    project_id: uuid.UUID,
+    payload: DirectionPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    direction = {
+        "id": f"d-{uuid.uuid4().hex[:8]}",
+        "text": payload.text,
+        "priority": payload.priority,
+        "added_at": datetime.utcnow().isoformat(),
+        "status": "active",
+    }
+    directions = list(project.directions or [])
+    directions.append(direction)
+    project.directions = directions
+    session.add(project)
+    await session.commit()
+
+    return {"direction": direction}
+
+
+@router.delete("/projects/{project_id}/directions/{direction_id}")
+async def remove_direction(
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    directions = [d for d in (project.directions or []) if d.get("id") != direction_id]
+    if len(directions) == len(project.directions or []):
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    project.directions = directions
+    session.add(project)
+    await session.commit()
+    return {"message": "Direction removed"}
+
+
+@router.patch("/projects/{project_id}/directions/{direction_id}")
+async def update_direction(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Validate inputs
+    if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
+        raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
+    if "status" in payload and payload["status"] not in ("active", "completed", "paused"):
+        raise HTTPException(status_code=400, detail="status must be active, completed, or paused")
+    if "text" in payload:
+        if not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1:
+            raise HTTPException(status_code=400, detail="text must be 1-500 characters")
+
+    directions = list(project.directions or [])
+    updated = False
+    for d in directions:
+        if d.get("id") == direction_id:
+            if "priority" in payload:
+                d["priority"] = payload["priority"]
+            if "status" in payload:
+                d["status"] = payload["status"]
+            if "text" in payload:
+                d["text"] = payload["text"]
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    project.directions = directions
+    session.add(project)
+    await session.commit()
+    return {"direction": next(d for d in directions if d.get("id") == direction_id)}
+
+
+@router.patch("/projects/{project_id}/autonomous")
+async def toggle_autonomous(
+    project_id: uuid.UUID,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if "enabled" not in payload:
+        raise HTTPException(status_code=400, detail="'enabled' field required")
+
+    project.autonomous_enabled = bool(payload["enabled"])
+    session.add(project)
+    await session.commit()
+    return {"autonomous_enabled": project.autonomous_enabled}

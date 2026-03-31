@@ -524,6 +524,26 @@ async def get_pull_request_diff(
         return response.text
 
 
+async def get_pull_request_commits(
+    token: str, owner: str, repo: str, pr_number: int
+) -> list:
+    """Fetches commit data for a PR (messages, SHAs)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get PR commits #{pr_number}: {response.text}")
+            return []
+        return response.json()
+
+
 async def merge_pull_request(
     token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash"
 ) -> dict:
