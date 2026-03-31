@@ -164,7 +164,7 @@ async def _update_account_credentials(account: dict, creds: dict, new_tokens: di
         db_acct = await session.get(MaxPlanAccount, uuid.UUID(account["id"]))
         if db_acct:
             db_acct.credentials_json = updated_json
-            db_acct.updated_at = datetime.now(timezone.utc)
+            db_acct.updated_at = datetime.utcnow()
             session.add(db_acct)
             await session.commit()
 
@@ -671,7 +671,7 @@ async def orchestrator_worker():
 
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
-                    task.started_at = datetime.now(timezone.utc)
+                    task.started_at = datetime.utcnow()
                     session.add(task)
                     try:
                         await session.commit()
@@ -1388,7 +1388,7 @@ async def agent_heartbeat(
         from app.compute import delete_credentials_from_gcs
         asyncio.create_task(delete_credentials_from_gcs(str(task.id)))
 
-    task.last_heartbeat = datetime.now(timezone.utc)
+    task.last_heartbeat = datetime.utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
 
@@ -2662,7 +2662,7 @@ async def register_github_pat(
     
     if integration:
         integration.github_pat = secret_name
-        integration.updated_at = datetime.now(timezone.utc)
+        integration.updated_at = datetime.utcnow()
     else:
         integration = UserIntegration(
             user_id=current_user["user_id"],
@@ -2758,7 +2758,7 @@ async def github_oauth_callback(
         if integration:
             integration.github_installation_id = installation_id
             integration.github_account_name = account_name
-            integration.updated_at = datetime.now(timezone.utc)
+            integration.updated_at = datetime.utcnow()
         else:
             integration = UserIntegration(
                 user_id=firebase_user_id,

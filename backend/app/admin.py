@@ -521,7 +521,7 @@ async def update_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
         db_account.credentials_json = payload["credentials_json"]
-    db_account.updated_at = datetime.now(timezone.utc)
+    db_account.updated_at = datetime.utcnow()
     session.add(db_account)
     await session.commit()
 
