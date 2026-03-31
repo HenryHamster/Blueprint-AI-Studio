@@ -1937,7 +1937,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 rollup_pr_number = pr_result.get("number")
                 print(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
 
-                if is_target_intermediate:
+                # Auto-merge small rollups on intermediate branches; review large ones
+                # Measure by total lines changed (additions + deletions)
+                try:
+                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number)
+                    lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
+                except Exception:
+                    lines_changed = 999  # assume large if we can't check
+                is_small_rollup = lines_changed <= 100
+                print(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
+                if is_target_intermediate and is_small_rollup:
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
                     if merge_result.get("merged"):
                         parent.status = TaskStatus.COMPLETED
