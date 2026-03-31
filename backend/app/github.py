@@ -442,6 +442,50 @@ async def create_branch(
             
         return response.json()
 
+
+async def get_branch_sha(
+    token: str, owner: str, repo: str, branch: str
+) -> str:
+    """Gets the latest commit SHA of a branch."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+            headers=headers
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get SHA for branch {branch}: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to get branch '{branch}' SHA."
+            )
+        return response.json()["object"]["sha"]
+
+
+async def delete_branch(
+    token: str, owner: str, repo: str, branch: str
+) -> bool:
+    """Deletes a branch (git reference). Returns True if deleted."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.delete(
+            f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
+            headers=headers
+        )
+        if response.status_code == 204:
+            return True
+        logger.warning(f"Failed to delete branch {branch}: {response.status_code}")
+        return False
+
+
 async def create_pull_request(
     token: str,
     owner: str,

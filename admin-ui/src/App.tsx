@@ -503,7 +503,7 @@ export default function App() {
   }
 
   const actionRequiredTasks = tasks.filter(t => t.requires_approval || t.status === 'FAILED');
-  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING');
+  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING');
   const queuedTasks = tasks.filter(t => t.status === 'QUEUED');
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const completedRecently = tasks.filter(t => t.status === 'COMPLETED' && new Date(t.created_at) > oneDayAgo);
@@ -684,7 +684,7 @@ export default function App() {
               <div key={t.id} className="text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded flex justify-between items-center">
                 <span className="truncate pr-2 text-neutral-300">{t.title}</span>
                 <span className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500">
-                  {t.status === 'PROVISIONING' ? 'Prov' : 'Running'}
+                  {t.status === 'PROVISIONING' ? 'Prov' : t.status === 'EVALUATING' ? 'Evaluating' : 'Running'}
                 </span>
               </div>
             ))}
@@ -738,7 +738,7 @@ export default function App() {
             <div className="flex-1 overflow-y-auto space-y-3 pr-1 custom-scrollbar">
               {/* Also show PROVISIONING tasks in the IN_PROGRESS column */}
               {tasks
-                .filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING'))
+                .filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && (t.status === 'PROVISIONING' || t.status === 'EVALUATING')))
                 .map(task => (
                   <TaskCard
                     key={task.id}
@@ -751,7 +751,7 @@ export default function App() {
                     onViewLogs={handleViewLogs}
                   />
                 ))}
-              {tasks.filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING')).length === 0 && !loading && (
+              {tasks.filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && (t.status === 'PROVISIONING' || t.status === 'EVALUATING'))).length === 0 && !loading && (
                 <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
                   No tasks
                 </div>

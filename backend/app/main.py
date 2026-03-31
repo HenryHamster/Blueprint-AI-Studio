@@ -39,6 +39,8 @@ from app.github import (
     create_issue,
     get_issues,
     create_branch,
+    get_branch_sha,
+    delete_branch,
     create_pull_request,
     merge_pull_request,
 )
@@ -1360,7 +1362,23 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     task.status = TaskStatus.EVALUATING
     session.add(task)
 
-    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    parent_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    short_id = str(task.id).replace("-", "")[:8]
+    plan_branch = f"plan/{short_id}"
+
+    # Create staging branch for this plan's subtasks
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        sha = await get_branch_sha(gh_token, owner, repo, parent_base)
+        await create_branch(gh_token, owner, repo, plan_branch, sha)
+        print(f"[PLAN] Created branch {plan_branch} from {parent_base}")
+    except Exception as e:
+        print(f"[PLAN] Failed to create staging branch, falling back to {parent_base}: {e}")
+        plan_branch = parent_base
+
+    # Store branch info on the plan task for rollup later
+    task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
+    session.add(task)
 
     # First pass: create all child tasks
     child_tasks = []
@@ -1373,8 +1391,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             payloads=[{
                 "type": "create",
                 "prompt": subtask_def.get("prompt", ""),
-                "base_branch": base_branch,
+                "base_branch": plan_branch,
             }],
+            context={
+                "plan_branch": plan_branch,
+                "parent_base": parent_base,
+                "scope": "small",  # Plan subtasks are pre-decomposed
+            },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
@@ -1426,7 +1449,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if len(findings) > 10:
         findings = findings[:10]
 
-    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    original_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    short_id = str(task.id).replace("-", "")[:8]
+    research_branch = f"research/{short_id}"
+
+    # Create staging branch for this research batch
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        sha = await get_branch_sha(gh_token, owner, repo, original_base)
+        await create_branch(gh_token, owner, repo, research_branch, sha)
+        print(f"[RESEARCH] Created branch {research_branch} from {original_base}")
+    except Exception as e:
+        print(f"[RESEARCH] Failed to create staging branch, falling back to {original_base}: {e}")
+        research_branch = original_base  # Fallback: PR directly into base
+
     created_count = 0
 
     for i, finding in enumerate(findings):
@@ -1446,16 +1482,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             project_id=task.project_id,
             title=title,
             description=finding.get("description", prompt[:200]),
+            parent_task_id=task.id,
             payloads=[{
                 "type": task_type,
                 "prompt": prompt,
-                "base_branch": base_branch,
+                "base_branch": research_branch,
             }],
             context={
                 "research_task_id": str(task.id),
                 "finding_index": i,
                 "scope": scope,
                 "risk": risk,
+                "research_branch": research_branch,
+                "original_base": original_base,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
@@ -1466,7 +1505,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         created_count += 1
 
     await session.commit()
+    task.status = TaskStatus.EVALUATING  # Children executing — rollup will fire when all done
     task.latest_status_message = f"Research created {created_count} tasks from {len(findings)} findings"
+    task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
     session.add(task)
     await session.commit()
 
@@ -1591,44 +1632,59 @@ async def update_agent_status(
             task_type = task_payload.get("type", "create")
             review_loop = (task.context or {}).get("review_loop", {})
 
-            # Create task completed with PR → security scan → spawn review
+            # Create task completed with PR → route based on target branch
             if task_type in ("create", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
                 branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
+                is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
+                scope = (task.context or {}).get("scope", "unknown")
 
-                # Security scan BEFORE spawning review — runs in orchestrator, not VM
-                try:
-                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                    if not scan_result["clean"]:
-                        high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
-                        if high_findings:
-                            task.requires_approval = True
-                            task.latest_status_message = f"Security scan blocked: {len(high_findings)} suspicious pattern(s) detected"
+                if is_intermediate and scope == "small":
+                    # Small scope on intermediate branch → auto-merge, skip review
+                    try:
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+                        if merge_result.get("merged"):
+                            task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
                             await session.commit()
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint Security Scan**: Blocked — {len(high_findings)} suspicious pattern(s) detected. Requires manual review.\n\n"
-                                + "\n".join(f"- **{f.get('category', 'unknown')}** in `{f.get('source', '?')}`: `{f.get('matched_text', '')[:100]}`" for f in high_findings[:10]))
-                            print(f"[SECURITY] Blocked PR #{pr_number} — {len(high_findings)} high-severity findings")
-                            # Skip review — human must approve
+                            print(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
                         else:
-                            medium_findings = [f for f in scan_result["findings"] if f["severity"] == "medium"]
-                            if medium_findings:
+                            print(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
+                            # Fall through to review pipeline for conflict resolution
+                            review_task = await _spawn_pipeline_task(
+                                task, "review", session, pr_number, branch, base_branch,
+                                original_prompt=original_prompt, original_task_id=str(task.id)
+                            )
+                    except Exception as e:
+                        print(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}")
+                else:
+                    # Full pipeline: security scan → review (for main targets or medium+ scope)
+                    try:
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                        if not scan_result["clean"]:
+                            high_findings = [f for f in scan_result["findings"] if f["severity"] == "high"]
+                            if high_findings:
+                                task.requires_approval = True
+                                task.latest_status_message = f"Security scan blocked: {len(high_findings)} suspicious pattern(s) detected"
+                                session.add(task)
+                                await session.commit()
                                 await create_pr_comment(gh_token, owner, repo, pr_number,
-                                    f"**Blueprint Security Scan**: {len(medium_findings)} pattern(s) flagged (informational, proceeding with review)")
-                            # Proceed to review below
-                except Exception as e:
-                    print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
+                                    f"**Blueprint Security Scan**: Blocked — {len(high_findings)} suspicious pattern(s) detected. Requires manual review.\n\n"
+                                    + "\n".join(f"- **{f.get('category', 'unknown')}** in `{f.get('source', '?')}`: `{f.get('matched_text', '')[:100]}`" for f in high_findings[:10]))
+                                print(f"[SECURITY] Blocked PR #{pr_number} — {len(high_findings)} high-severity findings")
+                    except Exception as e:
+                        print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
 
-                if not task.requires_approval:
-                    review_task = await _spawn_pipeline_task(
-                        task, "review", session, pr_number, branch, base_branch,
-                        original_prompt=original_prompt, original_task_id=str(task.id)
-                    )
-                    print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                    if not task.requires_approval:
+                        review_task = await _spawn_pipeline_task(
+                            task, "review", session, pr_number, branch, base_branch,
+                            original_prompt=original_prompt, original_task_id=str(task.id)
+                        )
+                        print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -1673,6 +1729,18 @@ async def update_agent_status(
                                     orig = await session.get(Task, uuid.UUID(original_task_id))
                                     if orig:
                                         orig.context = {**(orig.context or {}), "pr_merged": True}
+                                        # If this was a rollup PR review, mark the parent as COMPLETED
+                                        if orig.status == TaskStatus.EVALUATING:
+                                            orig.status = TaskStatus.COMPLETED
+                                            orig.latest_status_message = "Rollup PR merged"
+                                            # Clean up staging branch
+                                            staging = (orig.context or {}).get("plan_branch") or (orig.context or {}).get("research_branch")
+                                            if staging:
+                                                try:
+                                                    await delete_branch(gh_token, owner, repo, staging)
+                                                    print(f"[ROLLUP] Deleted staging branch {staging}")
+                                                except Exception:
+                                                    pass
                                         session.add(orig)
                                         await session.commit()
                                 except Exception as e:
@@ -1764,13 +1832,61 @@ async def update_agent_status(
                         break
 
                 if all_done:
-                    parent.status = TaskStatus.COMPLETED
-                    parent.latest_status_message = f"All {len(children)} subtasks completed and merged"
+                    # All children merged — create rollup PR from staging branch to target
+                    parent_ctx = parent.context or {}
+                    staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
+                    target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
+
+                    if staging_branch and target_branch and staging_branch != target_branch:
+                        try:
+                            gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
+                            is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
+                            parent_type = ((parent.payloads or [{}])[0]).get("type", "")
+                            pr_title = f"[Blueprint] Rollup: {parent.title}"
+                            pr_body = f"Rollup of {len(children)} subtasks from `{staging_branch}`\n\n---\n*Automated by Blueprint Pipeline*"
+
+                            pr_result = await create_pull_request(gh_token, owner, repo,
+                                title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+                            rollup_pr_url = pr_result.get("html_url", "")
+                            rollup_pr_number = pr_result.get("number")
+                            print(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+
+                            if is_target_intermediate:
+                                # Plan rolling up into research branch → auto-merge
+                                merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+                                if merge_result.get("merged"):
+                                    parent.status = TaskStatus.COMPLETED
+                                    parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
+                                    parent.latest_status_message = f"All {len(children)} subtasks merged, rollup PR auto-merged"
+                                    await delete_branch(gh_token, owner, repo, staging_branch)
+                                    print(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
+                                else:
+                                    parent.latest_status_message = f"Rollup PR created but merge failed: {merge_result.get('message')}"
+                            else:
+                                # Rolling up into main → spawn review for the rollup PR
+                                parent.latest_status_message = f"All {len(children)} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
+                                parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                # Spawn review task for the rollup
+                                review_task = await _spawn_pipeline_task(
+                                    parent, "review", session, rollup_pr_number, staging_branch, target_branch,
+                                    original_prompt=parent.description or parent.title,
+                                    original_task_id=str(parent.id)
+                                )
+                                print(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
+                        except Exception as e:
+                            print(f"[ROLLUP] Failed to create rollup PR: {e}")
+                            parent.status = TaskStatus.COMPLETED
+                            parent.latest_status_message = f"All {len(children)} subtasks done, rollup failed: {e}"
+                    else:
+                        # No staging branch (fallback mode) — just mark complete
+                        parent.status = TaskStatus.COMPLETED
+                        parent.latest_status_message = f"All {len(children)} subtasks completed and merged"
+
                     session.add(parent)
                     await session.commit()
                     await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
-                    print(f"[PLAN] Parent plan {parent.id} completed — all {len(children)} children done")
+                                               {"task_id": str(parent.id), "status": parent.status})
+                    print(f"[PLAN] Parent {parent.id} — all {len(children)} children done")
                 elif any(s == TaskStatus.FAILED for s in child_statuses) and not any(
                     s in [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
                     for s in child_statuses
