@@ -471,6 +471,7 @@ export default function App() {
   const columns: { id: TaskStatus; label: string }[] = [
     { id: 'QUEUED', label: 'Queued' },
     { id: 'IN_PROGRESS', label: 'In Progress' },
+    { id: 'EVALUATING', label: 'Evaluating' },
     { id: 'FAILED', label: 'Failed' },
     { id: 'COMPLETED', label: 'Completed' },
   ];
@@ -503,7 +504,7 @@ export default function App() {
   }
 
   const actionRequiredTasks = tasks.filter(t => t.requires_approval || t.status === 'FAILED');
-  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING');
+  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING');
   const queuedTasks = tasks.filter(t => t.status === 'QUEUED');
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const completedRecently = tasks.filter(t => t.status === 'COMPLETED' && new Date(t.created_at) > oneDayAgo);
@@ -738,7 +739,7 @@ export default function App() {
             <div className="flex-1 overflow-y-auto space-y-3 pr-1 custom-scrollbar">
               {/* Also show PROVISIONING tasks in the IN_PROGRESS column */}
               {tasks
-                .filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && (t.status === 'PROVISIONING' || t.status === 'EVALUATING')))
+                .filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING'))
                 .map(task => (
                   <TaskCard
                     key={task.id}
@@ -751,7 +752,7 @@ export default function App() {
                     onViewLogs={handleViewLogs}
                   />
                 ))}
-              {tasks.filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && (t.status === 'PROVISIONING' || t.status === 'EVALUATING'))).length === 0 && !loading && (
+              {tasks.filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING')).length === 0 && !loading && (
                 <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
                   No tasks
                 </div>
