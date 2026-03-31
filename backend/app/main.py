@@ -658,7 +658,7 @@ class AgentStatusPayload(BaseModel):
     repo_url: Optional[str] = None
     pr_url: Optional[str] = None
     storage_uri: Optional[str] = None
-    logs: Optional[str] = Field(None, max_length=100000)
+    logs: Optional[str] = Field(None, max_length=500000)
 
 class UploadUrlRequest(BaseModel):
     task_id: uuid.UUID
@@ -1283,12 +1283,28 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
     import re
     try:
         # Find JSON array containing objects with "title" and "prompt"
-        json_match = re.search(r'\[[\s\S]*?"title"[\s\S]*?"prompt"[\s\S]*?\]', text, re.DOTALL)
+        json_match = re.search(r'\[\s*\{[\s\S]*"title"[\s\S]*"prompt"[\s\S]*\]', text, re.DOTALL)
         if json_match:
             findings = json.loads(json_match.group())
             if isinstance(findings, list):
                 return findings
-    except (json.JSONDecodeError, AttributeError):
+    except json.JSONDecodeError:
+        # JSON may be truncated — try to recover complete objects
+        try:
+            json_match = re.search(r'\[\s*\{[\s\S]*"title"[\s\S]*"prompt"', text, re.DOTALL)
+            if json_match:
+                raw = json_match.group()
+                # Find last complete object (ends with })
+                last_brace = raw.rfind('}')
+                if last_brace > 0:
+                    truncated = raw[:last_brace + 1] + ']'
+                    findings = json.loads(truncated)
+                    if isinstance(findings, list):
+                        print(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
+                        return findings
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    except AttributeError:
         pass
     return None
 
@@ -2297,10 +2313,12 @@ if os.path.exists(static_dir):
     
     # Serve index.html for all other non-API routes (SPA fallback)
     @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        # Don't intercept API routes
+    async def serve_spa(full_path: str, request: Request = None):
+        # Don't intercept API routes or WebSocket upgrade requests
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="API route not found")
+        if request and request.headers.get("upgrade", "").lower() == "websocket":
+            raise HTTPException(status_code=404, detail="WebSocket route")
             
         # Check if the requested file exists (e.g., favicon.ico, robots.txt)
         file_path = os.path.abspath(os.path.join(static_dir, full_path))

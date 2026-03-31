@@ -61,7 +61,7 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[str(a.task_id)] = a.logs[:2000]
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                research_map[str(a.task_id)] = a.logs[:10000]
+                research_map[str(a.task_id)] = a.logs[:100000]
 
     # Return tasks with artifact data attached
     result_list = []
