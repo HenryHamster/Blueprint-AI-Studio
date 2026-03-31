@@ -210,21 +210,14 @@ async def _ensure_credentials_fresh(account: dict) -> bool:
             if remaining > timedelta(hours=1):
                 return True
 
-            print(f"[CREDENTIALS] Refreshing '{account['name']}' (expires in {remaining})")
+            print(f"[CREDENTIALS] Token near expiry for '{account['name']}' (expires in {remaining}), attempting refresh...")
             new_tokens = await _do_oauth_refresh(oauth.get("refreshToken", ""))
             if new_tokens:
                 await _update_account_credentials(account, creds, new_tokens)
                 print(f"[CREDENTIALS] Refreshed '{account['name']}' successfully")
-                return True
             else:
-                # Refresh failed — still dispatch with current credentials.
-                # Claude Code CLI may be able to refresh on the VM itself.
-                # Only disable if the token is completely dead (>24h expired).
-                if remaining < timedelta(hours=-24):
-                    await _disable_account(account, "credentials expired >24h and refresh failed — re-login needed")
-                    return False
-                print(f"[CREDENTIALS] Refresh failed for '{account['name']}', dispatching with current credentials (CLI may refresh)")
-                return True
+                print(f"[CREDENTIALS] Refresh failed for '{account['name']}' — dispatching anyway, CLI will attempt refresh on VM")
+            return True  # Always dispatch — never block on credential refresh failure
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         # Credential JSON is malformed — log but don't disable (admin can fix via UI)
         print(f"[CREDENTIALS] Credential parse error for '{account.get('name')}': {e}")
@@ -642,12 +635,8 @@ async def orchestrator_worker():
                     claude_credentials = None
                     account_id = None
                     if account:
-                        # Try to refresh credentials proactively (best-effort, non-blocking)
-                        # If refresh fails, dispatch anyway — Claude Code CLI can refresh on the VM
+                        # Best-effort refresh — never blocks dispatch
                         await _ensure_credentials_fresh(account)
-                        # Re-select if the account was disabled (only happens if >24h expired)
-                        if not account.get("enabled", True):
-                            account = select_max_plan_account()
 
                     if account:
                         account["active_tasks"] += 1
