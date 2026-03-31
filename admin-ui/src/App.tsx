@@ -1,7 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Plus, Activity, X, AlertCircle, AlertTriangle, CheckCircle, Terminal, GitBranch, Settings, LogOut, GitFork, Microscope } from 'lucide-react';
+import { Plus, Activity, X, AlertCircle, AlertTriangle, CheckCircle, Terminal, GitBranch, Settings, LogOut, GitFork, Microscope, Network, Compass } from 'lucide-react';
+import { DirectionsPanel } from './components/DirectionsPanel';
 import { TaskCard } from './components/TaskCard';
+import { ResearchBrowser } from './components/ResearchBrowser';
+import { PipelineView } from './components/PipelineView';
+import { AutonomousStatus } from './components/AutonomousStatus';
 import type { Task, TaskStatus } from './components/TaskCard';
+import { ProjectDashboard } from './components/ProjectDashboard';
+import type { Project } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, getIdToken, onAuthChange, signOut } from './firebase';
 import type { User } from 'firebase/auth';
 
@@ -51,12 +57,16 @@ export default function App() {
   const logEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Research browser state
+  const [showResearchBrowser, setShowResearchBrowser] = useState(false);
+
   // Settings state
   const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
   const [maxRetries, setMaxRetries] = useState(3);
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
+  const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Max plan pool state
   interface MaxPlanAccount { id: string; name: string; enabled: boolean; active_tasks: number; total_tasks: number; }
@@ -66,6 +76,16 @@ export default function App() {
 
   // GitHub connection state
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
+
+  // View toggle state
+  const [viewMode, setViewMode] = useState<'kanban' | 'pipeline'>('kanban');
+
+  // Project dashboard state
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+
+  // Directions panel state
+  const [showDirections, setShowDirections] = useState(false);
 
   // Firebase auth state
   useEffect(() => {
@@ -98,8 +118,10 @@ export default function App() {
     if (!user) return;
     fetchTasks();
     fetchSettings();
-    const interval = setInterval(fetchTasks, 5000);
-    return () => clearInterval(interval);
+    fetchProjects();
+    const interval = setInterval(fetchTasks, 30000);
+    const projectInterval = setInterval(fetchProjects, 60000);
+    return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, user]);
 
@@ -149,6 +171,18 @@ export default function App() {
     }
   };
 
+  const fetchProjects = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/projects`);
+      if (res.ok) {
+        const data = await res.json();
+        setProjects(data || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch projects:', err);
+    }
+  };
+
   const handleApprove = async (taskId: string) => {
     try {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -167,7 +201,7 @@ export default function App() {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify({ status: 'FAILED' }),
+        body: JSON.stringify({ status: 'CANCELLED' }),
       });
       fetchTasks();
     } catch (error) {
@@ -439,6 +473,10 @@ export default function App() {
             } else if (msg.event === 'task_updated' && msg.data?.task_id === task.id) {
               setLogLines(prev => [...prev, `[Status: ${msg.data.status}]`]);
             }
+            if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
+              if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
+              fetchTasksDebounceRef.current = setTimeout(() => { fetchTasks(); }, 500);
+            }
           } catch {
             // ignore parse errors
           }
@@ -468,12 +506,12 @@ export default function App() {
     setLogLines([]);
   };
 
-  const columns: { id: TaskStatus; label: string }[] = [
-    { id: 'QUEUED', label: 'Queued' },
-    { id: 'IN_PROGRESS', label: 'In Progress' },
-    { id: 'EVALUATING', label: 'Evaluating' },
-    { id: 'FAILED', label: 'Failed' },
-    { id: 'COMPLETED', label: 'Completed' },
+  const columns: { id: TaskStatus; label: string; includes: TaskStatus[] }[] = [
+    { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
+    { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'EVALUATING'] },
+    { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
+    { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
+    { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
   ];
 
   // Auth gate — show login screen if not authenticated
@@ -504,10 +542,10 @@ export default function App() {
   }
 
   const actionRequiredTasks = tasks.filter(t => t.requires_approval || t.status === 'FAILED');
-  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING');
+  const runningTasks = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING');
   const queuedTasks = tasks.filter(t => t.status === 'QUEUED');
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const completedRecently = tasks.filter(t => t.status === 'COMPLETED' && new Date(t.created_at) > oneDayAgo);
+  const completedRecently = tasks.filter(t => (t.status === 'COMPLETED' || t.status === 'CANCELLED') && new Date(t.created_at) > oneDayAgo);
 
   return (
     <div className="h-screen overflow-hidden flex flex-col bg-neutral-950 text-neutral-200 font-sans p-6">
@@ -542,9 +580,25 @@ export default function App() {
             <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Queue</span>
             <span className="text-xl font-bold text-neutral-200 font-mono leading-none">{queuedTasks.length}</span>
           </div>
+          <div className="w-px h-8 bg-neutral-800"></div>
+          <AutonomousStatus getAuthHeaders={authHeaders} onRefreshTasks={fetchTasks} wsRef={wsRef} />
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setViewMode(v => v === 'kanban' ? 'pipeline' : 'kanban')}
+            className={`p-2 rounded text-xs transition-colors border ${viewMode === 'pipeline' ? 'bg-neutral-700 text-neutral-100 border-neutral-600' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'}`}
+            title={viewMode === 'kanban' ? 'Switch to Pipeline view' : 'Switch to Kanban view'}
+          >
+            <Network className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => setShowDirections(true)}
+            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700"
+            title="Directions"
+          >
+            <Compass className="w-4 h-4" />
+          </button>
           <div className="relative" ref={settingsRef}>
             <button
               onClick={() => { setShowSettings(!showSettings); if (!showSettings) fetchSettings(); }}
@@ -634,6 +688,17 @@ export default function App() {
               </div>
             )}
           </div>
+          <button
+            onClick={() => setShowResearchBrowser(!showResearchBrowser)}
+            className={`p-2 rounded text-xs transition-colors border ${
+              showResearchBrowser
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            }`}
+            title="Research Findings"
+          >
+            <Microscope className="w-4 h-4" />
+          </button>
           <button
             onClick={openNewTaskModal}
             className="bg-white hover:bg-neutral-200 text-neutral-950 px-4 py-2 rounded text-xs font-semibold transition-colors shadow-sm flex items-center gap-2 h-fit"
@@ -725,25 +790,38 @@ export default function App() {
         </div>
       )}
 
-      {/* Kanban Board */}
-      <main className="flex gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
-        {columns.map(col => (
-          <div key={col.id} className="flex-1 min-w-[300px] flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 p-3">
-            <div className="flex items-center justify-between mb-3 px-1">
-              <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">{col.label}</h2>
-              <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
-                {tasks.filter(t => t.status === col.id).length}
-              </span>
-            </div>
+      {/* Project Dashboard */}
+      <ProjectDashboard
+        projects={projects}
+        tasks={tasks}
+        selectedProjectId={selectedProjectId}
+        onSelectProject={setSelectedProjectId}
+      />
 
-            <div className="flex-1 overflow-y-auto space-y-3 pr-1 custom-scrollbar">
-              {/* Also show PROVISIONING tasks in the IN_PROGRESS column */}
-              {tasks
-                .filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING'))
-                .map(task => (
+      {/* Kanban Board / Pipeline View */}
+      {viewMode === 'kanban' ? (
+        <main className="flex gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
+          {columns.map(col => {
+            const filteredTasks = tasks.filter(t => {
+              const statusMatch = col.includes.includes(t.status);
+              const projectMatch = selectedProjectId === null || t.project_id === selectedProjectId;
+              return statusMatch && projectMatch;
+            });
+            return (
+            <div key={col.id} className="flex-1 min-w-[300px] flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 p-3">
+              <div className="flex items-center justify-between mb-3 px-1">
+                <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">{col.label}</h2>
+                <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                  {filteredTasks.length}
+                </span>
+              </div>
+
+              <div className="flex-1 overflow-y-auto space-y-3 pr-1 custom-scrollbar">
+                {filteredTasks.map(task => (
                   <TaskCard
                     key={task.id}
                     task={task}
+                    maxRetries={maxRetries}
                     onApprove={handleApprove}
                     onCancel={handleCancel}
                     onRetry={handleRetry}
@@ -752,16 +830,21 @@ export default function App() {
                     onViewLogs={handleViewLogs}
                   />
                 ))}
-              {tasks.filter(t => t.status === col.id || (col.id === 'IN_PROGRESS' && t.status === 'PROVISIONING')).length === 0 && !loading && (
-                <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
-                  No tasks
-                </div>
-              )}
+                {filteredTasks.length === 0 && !loading && (
+                  <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+                    No tasks
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
-
-      </main>
+          );
+        })}
+        </main>
+      ) : (
+        <main className="flex-1 overflow-hidden flex flex-col">
+          <PipelineView tasks={selectedProjectId === null ? tasks : tasks.filter(t => t.project_id === selectedProjectId)} onViewLogs={handleViewLogs} />
+        </main>
+      )}
 
       {/* Pagination — only show when needed */}
       {(page > 1 || tasks.length >= limit) && <div className="flex items-center justify-between px-6 py-2 border-t border-neutral-800 shrink-0">
@@ -955,6 +1038,21 @@ export default function App() {
         </div>
       )}
 
+      {/* Research Browser Slide-out */}
+      {showResearchBrowser && (
+        <ResearchBrowser
+          tasks={tasks}
+          onClose={() => setShowResearchBrowser(false)}
+          onLaunch={(finding) => {
+            setShowResearchBrowser(false);
+            setNewTaskPrompt(finding.prompt);
+            setNewTaskTitle(finding.title);
+            setNewTaskType(finding.scope === 'large' ? 'plan' : 'create');
+            openNewTaskModal();
+          }}
+        />
+      )}
+
       {/* Log Viewer Slide-out */}
       {logTask && (
         <div className="fixed inset-0 z-50 flex">
@@ -996,6 +1094,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {showDirections && <DirectionsPanel onClose={() => setShowDirections(false)} />}
     </div>
   );
 }

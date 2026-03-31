@@ -25,9 +25,10 @@ export interface Task {
   pr_url?: string;
   error_logs?: string;
   research_findings?: string;
+  history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
 }
 
-const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {
+export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {
   plan: { bg: 'bg-purple-500/10 border-purple-500/20', text: 'text-purple-400', icon: GitFork, label: 'Plan' },
   research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-400', icon: Microscope, label: 'Research' },
   review: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Search, label: 'Review' },
@@ -36,6 +37,7 @@ const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof 
 
 interface TaskCardProps {
   task: Task;
+  maxRetries?: number;
   onApprove: (id: string) => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
@@ -79,6 +81,31 @@ function ResearchFindings({ findings }: { findings: string }) {
   return <span className="text-neutral-400">{findings.slice(0, 500)}</span>;
 }
 
+function StatusBadge({ status }: { status: TaskStatus }) {
+  if (status === 'PROVISIONING') {
+    return (
+      <span className="inline-flex items-center gap-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
+        <Activity className="w-3 h-3 animate-spin" />Provisioning…
+      </span>
+    );
+  }
+  if (status === 'EVALUATING') {
+    return (
+      <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
+        <Clock className="w-3 h-3" />Evaluating subtasks
+      </span>
+    );
+  }
+  if (status === 'CANCELLED') {
+    return (
+      <span className="inline-flex items-center gap-1 bg-neutral-500/10 text-neutral-500 border border-neutral-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
+        <X className="w-3 h-3" />Cancelled
+      </span>
+    );
+  }
+  return null;
+}
+
 function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
   if (!subtasks) return null;
@@ -94,22 +121,24 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
+export function TaskCard({ task, maxRetries, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [statusExpanded, setStatusExpanded] = useState(false);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const isChild = !!task.parent_task_id;
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
 
   return (
-    <div className={`bg-neutral-900 p-4 rounded-xl border transition-shadow ${isChild ? 'border-l-4 border-l-neutral-500 border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-neutral-800 shadow-sm hover:shadow-md hover:border-neutral-700'}`}>
+    <div className={`bg-neutral-900 p-4 rounded-xl border transition-shadow ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-l-4 border-l-neutral-500 border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-neutral-800 shadow-sm hover:shadow-md hover:border-neutral-700'}`}>
       <div className="flex justify-between items-start mb-3">
         <div className="flex items-center gap-2 pr-2 overflow-hidden">
           {isChild && <span title="Child Task" className="shrink-0 flex items-center"><SplitSquareHorizontal className="w-4 h-4 text-neutral-500" /></span>}
-          <h3 className="font-medium text-sm text-neutral-100 truncate" title={task.title}>{task.title}</h3>
+          <h3 className={`font-medium text-sm truncate ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`} title={task.title}>{task.title}</h3>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          <StatusBadge status={task.status} />
           <TaskTypeBadge taskType={task.task_type} />
           {task.requires_approval && (
             <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
@@ -193,6 +222,43 @@ export function TaskCard({ task, onApprove, onCancel, onRetry, onEditPrompt, onD
           Waiting on {task.depends_on.length} task{task.depends_on.length > 1 ? 's' : ''}
         </div>
       ) : null}
+
+      {/* History Section */}
+      {((task.attempt_count ?? 0) > 0 || (task.history && task.history.length > 0)) && (
+        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
+          <button
+            onClick={() => setHistoryExpanded(!historyExpanded)}
+            className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
+          >
+            <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${historyExpanded ? 'rotate-90' : ''}`} />
+            <span className="font-semibold text-neutral-500 font-sans text-[11px]">History</span>
+            {(task.attempt_count ?? 0) > 0 && (
+              <span className="ml-auto text-[10px] text-neutral-500 font-sans">
+                Attempt {(task.attempt_count ?? 0) + 1}{maxRetries != null ? ` of ${maxRetries + 1}` : ''}
+              </span>
+            )}
+          </button>
+          {historyExpanded && (
+            <div className="px-2.5 pb-2.5 space-y-1.5">
+              {task.history && task.history.length > 0 ? (
+                task.history.map((entry, i) => (
+                  <div key={i} className="flex gap-2 text-[10px]">
+                    <span className="text-neutral-600 shrink-0 tabular-nums">
+                      {new Date(entry.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                    <span className="text-neutral-400 font-semibold shrink-0">{entry.action}</span>
+                    <span className="text-neutral-500 truncate">
+                      {entry.details ? Object.entries(entry.details).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(', ').slice(0, 120) : ''}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <span className="text-neutral-600 text-[10px]">No history entries</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="flex items-center justify-between text-[11px] text-neutral-500 mt-auto pt-3 border-t border-neutral-800">
         <div className="flex items-center gap-1.5">

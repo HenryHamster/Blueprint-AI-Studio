@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import jwt
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
@@ -35,7 +35,7 @@ def create_ws_ticket(user_id: str, project_id: str) -> str:
     """
     Generate a short-lived ticket for WebSocket authentication.
     """
-    expire = datetime.utcnow() + timedelta(minutes=1) # Valid for 1 minute
+    expire = datetime.now(timezone.utc) + timedelta(minutes=1) # Valid for 1 minute
     to_encode = {
         "sub": user_id,
         "project_id": project_id,
@@ -62,7 +62,7 @@ def create_agent_token(task_id: str, vm_instance_id: str) -> str:
     """
     Generate a short-lived JWT for a specific agent VM.
     """
-    expire = datetime.utcnow() + timedelta(hours=2) # Token valid for 2 hours
+    expire = datetime.now(timezone.utc) + timedelta(hours=2) # Token valid for 2 hours
     to_encode = {
         "sub": str(task_id),
         "vm_instance_id": vm_instance_id,

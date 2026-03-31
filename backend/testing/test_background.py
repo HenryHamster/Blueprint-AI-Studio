@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.models import Project, Task, TaskStatus
 from app.main import reaper_service, broadcast_to_project, project_subscribers
 
@@ -28,7 +28,7 @@ async def test_reaper_service(db_session, mocker):
         payloads=[], 
         vm_instance_id="orphan-vm", 
         status=TaskStatus.IN_PROGRESS,
-        created_at=datetime.utcnow() - timedelta(hours=2)
+        created_at=datetime.now(timezone.utc) - timedelta(hours=2)
     )
     db_session.add(task)
     await db_session.commit()

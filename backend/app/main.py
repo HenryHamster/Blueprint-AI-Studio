@@ -13,7 +13,7 @@ import uuid
 import asyncio
 import json
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount
@@ -56,15 +56,8 @@ from slowapi.errors import RateLimitExceeded
 # For now, we use the default in-memory storage.
 limiter = Limiter(key_func=get_remote_address)
 
-# --- Runtime Config (adjustable via admin API) ---
-_runtime_config = {
-    "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
-    "max_retries": int(os.getenv("MAX_RETRIES", "3")),
-    "max_autonomous_tasks_per_hour": 5,
-}
-
-# --- Autonomous Loop State ---
-_autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
+# --- Runtime Config & Autonomous State (shared with admin.py) ---
+from app.shared_state import runtime_config as _runtime_config, autonomous_failure_counts as _autonomous_failure_counts
 _last_idle_check: Optional[datetime] = None
 
 # --- Max Plan Account Pool ---
@@ -126,7 +119,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         if ((t.payloads or [{}])[0]).get("type") == "research":
             return
     # Guard: rate limit autonomous tasks
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
     recent_auto = (await session.execute(
         select(func.count()).select_from(Task).where(
             Task.project_id == project.id,
@@ -200,7 +193,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     global _last_idle_check
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if _last_idle_check and (now - _last_idle_check) < timedelta(minutes=30):
         return
     _last_idle_check = now
@@ -309,7 +302,7 @@ async def reaper_service():
                 active_tasks = (await session.execute(stmt)).scalars().all()
                 
                 orphaned_tasks = []
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
                 
@@ -504,7 +497,7 @@ async def orchestrator_worker():
 
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
-                    task.started_at = datetime.utcnow()
+                    task.started_at = datetime.now(timezone.utc)
                     session.add(task)
                     await session.commit()
 
@@ -1158,7 +1151,7 @@ async def agent_heartbeat(
         from app.compute import delete_credentials_from_gcs
         asyncio.create_task(delete_credentials_from_gcs(str(task.id)))
 
-    task.last_heartbeat = datetime.utcnow()
+    task.last_heartbeat = datetime.now(timezone.utc)
     if req.status_message:
         task.latest_status_message = req.status_message
 
@@ -2265,7 +2258,7 @@ async def register_github_pat(
     
     if integration:
         integration.github_pat = secret_name
-        integration.updated_at = datetime.utcnow()
+        integration.updated_at = datetime.now(timezone.utc)
     else:
         integration = UserIntegration(
             user_id=current_user["user_id"],
@@ -2294,7 +2287,7 @@ async def github_oauth_authorize(
     import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     state = pyjwt.encode(
-        {"sub": current_user["user_id"], "exp": datetime.utcnow() + timedelta(minutes=10), "type": "github_oauth"},
+        {"sub": current_user["user_id"], "exp": datetime.now(timezone.utc) + timedelta(minutes=10), "type": "github_oauth"},
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
@@ -2361,7 +2354,7 @@ async def github_oauth_callback(
         if integration:
             integration.github_installation_id = installation_id
             integration.github_account_name = account_name
-            integration.updated_at = datetime.utcnow()
+            integration.updated_at = datetime.now(timezone.utc)
         else:
             integration = UserIntegration(
                 user_id=firebase_user_id,

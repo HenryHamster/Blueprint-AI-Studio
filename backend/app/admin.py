@@ -6,7 +6,8 @@ from typing import Optional, Dict, Any, List
 import uuid
 import httpx
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import func
 
 from app.database import get_session
 from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount
@@ -63,6 +64,26 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                 research_map[str(a.task_id)] = a.logs[:100000]
 
+    # Fetch task history (last 10 entries per task)
+    history_map: Dict[str, List[Dict[str, Any]]] = {}
+    if task_ids:
+        history_stmt = (
+            select(TaskHistory)
+            .where(TaskHistory.task_id.in_(task_ids))
+            .order_by(TaskHistory.timestamp.desc())
+        )
+        all_history = (await session.execute(history_stmt)).scalars().all()
+        for h in all_history:
+            tid = str(h.task_id)
+            if tid not in history_map:
+                history_map[tid] = []
+            if len(history_map[tid]) < 10:
+                history_map[tid].append({
+                    "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+                    "action": h.action,
+                    "details": h.details,
+                })
+
     # Return tasks with artifact data attached
     result_list = []
     for t in tasks:
@@ -88,6 +109,7 @@ async def get_all_tasks(
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
             "research_findings": research_map.get(str(t.id)),
+            "history": history_map.get(str(t.id), []),
         }
         result_list.append(task_dict)
 
@@ -333,7 +355,8 @@ async def get_settings(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _runtime_config, _max_plan_pool
+    from app.shared_state import runtime_config as _runtime_config
+    from app.main import _max_plan_pool
     from app.models import UserIntegration
 
     # Check if the user has a GitHub integration
@@ -361,7 +384,7 @@ async def update_settings(
     payload: Dict[str, Any],
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _runtime_config
+    from app.shared_state import runtime_config as _runtime_config
     if "max_concurrent_vms" in payload:
         try:
             val = int(payload["max_concurrent_vms"])
@@ -475,7 +498,7 @@ async def update_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
         db_account.credentials_json = payload["credentials_json"]
-    db_account.updated_at = datetime.utcnow()
+    db_account.updated_at = datetime.now(timezone.utc)
     session.add(db_account)
     await session.commit()
 
@@ -646,7 +669,7 @@ async def add_direction(
         "id": f"d-{uuid.uuid4().hex[:8]}",
         "text": payload.text,
         "priority": payload.priority,
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
     }
     directions = list(project.directions or [])
@@ -737,6 +760,61 @@ async def toggle_autonomous(
         raise HTTPException(status_code=400, detail="'enabled' field required")
 
     project.autonomous_enabled = bool(payload["enabled"])
+    # Reset failure counter when re-enabling
+    if project.autonomous_enabled:
+        from app.shared_state import autonomous_failure_counts
+        autonomous_failure_counts.pop(str(project_id), None)
     session.add(project)
     await session.commit()
     return {"autonomous_enabled": project.autonomous_enabled}
+
+
+@router.get("/autonomous-status")
+async def get_autonomous_status(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    from app.shared_state import autonomous_failure_counts, runtime_config
+
+    projects = (await session.execute(
+        select(Project).order_by(Project.created_at.desc())
+    )).scalars().all()
+
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    # Batch query: count autonomous tasks per project in the last hour
+    tasks_per_project = dict((await session.execute(
+        select(Task.project_id, func.count()).where(
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        ).group_by(Task.project_id)
+    )).all())
+
+    # Batch query: most recent autonomous task per project
+    last_research_subq = (
+        select(
+            Task.project_id,
+            func.max(Task.created_at).label("max_created_at"),
+        ).where(Task.created_by == "ORCHESTRATOR")
+        .group_by(Task.project_id)
+        .subquery()
+    )
+    last_research_rows = (await session.execute(
+        select(last_research_subq.c.project_id, last_research_subq.c.max_created_at)
+    )).all()
+    last_research_map = {row.project_id: row.max_created_at for row in last_research_rows}
+
+    result = []
+    for project in projects:
+        project_id_str = str(project.id)
+        result.append({
+            "project_id": project_id_str,
+            "project_name": project.name,
+            "autonomous_enabled": project.autonomous_enabled,
+            "consecutive_failures": autonomous_failure_counts.get(project_id_str, 0),
+            "last_research_at": last_research_map[project.id].isoformat() if last_research_map.get(project.id) else None,
+            "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
+            "rate_limit": runtime_config["max_autonomous_tasks_per_hour"],
+        })
+
+    return {"projects": result}
