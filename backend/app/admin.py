@@ -231,6 +231,10 @@ async def modify_task(
         task.payloads = payload["payloads"]
         changes["payloads"] = "updated"
 
+    if "context" in payload and isinstance(payload["context"], dict):
+        task.context = {**(task.context or {}), **payload["context"]}
+        changes["context"] = "updated"
+
     if changes:
         session.add(task)
 
