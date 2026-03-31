@@ -2220,10 +2220,9 @@ async def update_agent_status(
 
                 if not pr_number or not branch:
                     print(f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
-                    task.latest_status_message = f"Review pipeline error: missing pr_number or branch"
+                    task.latest_status_message = "Review pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
-                    continue
 
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
@@ -2278,7 +2277,7 @@ async def update_agent_status(
                             task.latest_status_message = f"Branch mismatch: reviewed {branch}, PR head is {pr_head}"
                             session.add(task)
                             await session.commit()
-                            continue
+                            raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
 
                         if merge_result.get("merged"):
@@ -2351,10 +2350,9 @@ async def update_agent_status(
 
                 if not pr_number or not branch:
                     print(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
-                    task.latest_status_message = f"Fix pipeline error: missing pr_number or branch"
+                    task.latest_status_message = "Fix pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
-                    continue
 
                 # Security scan fix output before re-review
                 scan_blocked = False
