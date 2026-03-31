@@ -67,21 +67,35 @@ import app.shared_state as _shared_state
 _max_plan_pool: List[Dict[str, Any]] = []
 
 async def load_max_plan_pool():
-    """Load Max plan accounts from database into in-memory pool on startup."""
+    """Load Max plan accounts from database into in-memory pool on startup.
+    Reconciles active_tasks from DB by counting tasks currently PROVISIONING/IN_PROGRESS."""
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(MaxPlanAccount))
         accounts = result.scalars().all()
+
+        # Count actually active tasks per account to reconcile after restarts
+        active_tasks = (await session.execute(
+            select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+        )).scalars().all()
+        active_per_account: Dict[str, int] = {}
+        for t in active_tasks:
+            acct_id = (t.context or {}).get("max_plan_account_id")
+            if acct_id:
+                active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+
         _max_plan_pool.clear()
         for acct in accounts:
+            acct_id = str(acct.id)
             _max_plan_pool.append({
-                "id": str(acct.id),
+                "id": acct_id,
                 "name": acct.name,
                 "credentials_json": acct.credentials_json,
                 "enabled": acct.enabled,
-                "active_tasks": 0,  # Runtime only — resets on restart
+                "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
             })
-        print(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts from database")
+        total_active = sum(active_per_account.values())
+        print(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
 
 def select_max_plan_account() -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count."""
@@ -653,6 +667,9 @@ async def orchestrator_worker():
                         success = await provision_agent_vm(vm_id, t_id, payload_uri, claude_credentials=creds)
                         if not success:
                             print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
+                            # Release the Max Plan account slot
+                            if account_id:
+                                release_max_plan_account(account_id)
                             # Mark as failed immediately to avoid 10 min wait
                             try:
                                 async with AsyncSessionLocal() as inner_session:
@@ -662,8 +679,8 @@ async def orchestrator_worker():
                                         inner_session.add(failed_task)
                                         await inner_session.commit()
                                         await broadcast_to_project(
-                                            str(p_id), 
-                                            "task_updated", 
+                                            str(p_id),
+                                            "task_updated",
                                             {"task_id": str(t_id), "status": TaskStatus.FAILED}
                                         )
                             except Exception as e:
