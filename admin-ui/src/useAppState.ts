@@ -4,7 +4,7 @@ import type { Project } from './components/ProjectDashboard';
 import type { MaxPlanAccount } from './components/SettingsDropdown';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet } from './api';
+import { API_BASE_URL, authHeaders, authGet, apiFetch } from './api';
 import { useToasts } from './components/Toasts';
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -24,10 +24,12 @@ export function useAppState() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [totalTasks, setTotalTasks] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
-  const limit = 50;
+  const [limit, setLimit] = usePersistedState<number>('pageSize', 50);
+  const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
 
   // New Task modal state
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
@@ -67,6 +69,8 @@ export function useAppState() {
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const usingMaxPlanRef = useRef(usingMaxPlan);
+  useEffect(() => { usingMaxPlanRef.current = usingMaxPlan; }, [usingMaxPlan]);
 
   // Max plan pool state
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
@@ -75,6 +79,13 @@ export function useAppState() {
 
   // GitHub connection state
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
+
+  // Defaults
+  const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix'>('defaultTaskType', 'create');
+  const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
+  const prevTasksRef = useRef<Task[]>([]);
+  const notifyRef = useRef(notifyOnComplete);
+  useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
 
   // View toggle state
   const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline'>('viewMode', 'kanban');
@@ -86,16 +97,39 @@ export function useAppState() {
   // Directions panel state
   const [showDirections, setShowDirections] = useState(false);
 
+  // Metrics dashboard state
+  const [showMetrics, setShowMetrics] = useState(false);
+  const showMetricsRef = useRef(showMetrics);
+  useEffect(() => { showMetricsRef.current = showMetrics; }, [showMetrics]);
+  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
+  const [cumulativeCost, setCumulativeCost] = useState(0);
+  const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
+
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState('');
   const [taskTypeFilter, setTaskTypeFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState<string | null>(null);
+
+  // Reset page when status filter changes
+  useEffect(() => { setPage(1); }, [statusFilter]);
 
   // Keyboard shortcut help state
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const shortcutHelpRef = useRef<HTMLDivElement>(null);
+
+  // Archive view state
+  const [showArchive, setShowArchiveState] = useState(false);
+  const [archiveTasks, setArchiveTasks] = useState<Task[]>([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archivePage, setArchivePageState] = useState(1);
+  const [archivePageSize, setArchivePageSizeState] = usePersistedState<number>('archivePageSize', 50);
+  const [archiveStatusFilter, setArchiveStatusFilterState] = useState<string>('all');
+  const [archiveSearchQuery, setArchiveSearchQueryState] = useState('');
+  const [archiveDateRange, setArchiveDateRangeState] = useState<string>('all');
+  const [archiveTotalTasks, setArchiveTotalTasks] = useState(0);
 
   // Firebase auth state
   useEffect(() => {
@@ -129,11 +163,14 @@ export function useAppState() {
     fetchTasks();
     fetchSettings();
     fetchProjects();
-    const interval = setInterval(fetchTasks, 30000);
     const projectInterval = setInterval(fetchProjects, 60000);
+    if (refreshInterval === 0) {
+      return () => { clearInterval(projectInterval); };
+    }
+    const interval = setInterval(fetchTasks, refreshInterval);
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, user]);
+  }, [page, limit, user, statusFilter, refreshInterval]);
 
   // Clean up WebSocket on close
   useEffect(() => {
@@ -173,13 +210,17 @@ export function useAppState() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const tag = document.activeElement?.tagName;
-      const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      const targetTag = (e.target as HTMLElement)?.tagName;
+      const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT';
 
       if (e.key === 'Escape') {
         if (showNewTaskModal) { setShowNewTaskModal(false); return; }
         if (logTask) { closeLogViewer(); return; }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
+        if (showArchive) { setShowArchiveState(false); return; }
         if (showDirections) { setShowDirections(false); return; }
+        if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
         if (showShortcutHelp) { setShowShortcutHelp(false); return; }
         return;
@@ -210,24 +251,78 @@ export function useAppState() {
         case 's':
           setShowSettings(prev => !prev);
           break;
+        case 'm':
+          setShowMetrics(prev => !prev);
+          break;
         case '?':
           setShowShortcutHelp(prev => !prev);
+          break;
+        case 'a':
+        case 'A':
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings && !showShortcutHelp) {
+            setShowArchive(!showArchive);
+          }
           break;
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [showNewTaskModal, logTask, showResearchBrowser, showDirections, showSettings, showShortcutHelp]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
 
   const fetchTasks = async () => {
     try {
       const offset = (page - 1) * limit;
-      const res = await authGet(`${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}`);
+      let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}`;
+      if (statusFilter) url += `&status=${statusFilter}`;
+      const res = await authGet(url);
       if (res.ok) {
         const data = await res.json();
-        setTasks(data || []);
+        let newTasks: Task[];
+        if (Array.isArray(data)) {
+          newTasks = data;
+          setTotalTasks(data.length);
+        } else {
+          newTasks = data.tasks || [];
+          setTotalTasks(data.total ?? newTasks.length);
+        }
+
+        // Browser notifications for completed/failed tasks
+        if (notifyRef.current && prevTasksRef.current.length > 0) {
+          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          for (const t of newTasks) {
+            const prev = prevMap.get(t.id);
+            if (prev && prev !== t.status && (t.status === 'COMPLETED' || t.status === 'FAILED')) {
+              if (Notification.permission === 'granted') {
+                new Notification(`Task ${t.status.toLowerCase()}`, {
+                  body: t.title || t.id,
+                });
+              }
+            }
+          }
+        }
+        prevTasksRef.current = newTasks;
+
+        setTasks(newTasks);
         setLastRefresh(new Date());
         setError(null);
+
+        // Always record metrics data points (rendering depends on showMetrics, not collection)
+        const now = Date.now();
+        const activeVMs = newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING').length;
+        const costPerHr = activeVMs * (usingMaxPlanRef.current ? 0.07 : 1.07);
+
+        // Compute cumulative cost using the rate from the *previous* interval
+        const prevHistory = metricsHistoryRef.current;
+        const lastPoint = prevHistory[prevHistory.length - 1];
+        if (lastPoint) {
+          const intervalMs = now - lastPoint.timestamp;
+          setCumulativeCost(c => c + lastPoint.costPerHr * (intervalMs / 3600000));
+        }
+
+        const filtered = prevHistory.filter(p => now - p.timestamp <= 7200000);
+        const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr }];
+        metricsHistoryRef.current = newHistory;
+        setMetricsHistory(newHistory);
       } else {
         setError(`Failed to fetch tasks: ${res.statusText}`);
       }
@@ -481,6 +576,7 @@ export function useAppState() {
 
   const openNewTaskModal = () => {
     setShowNewTaskModal(true);
+    setNewTaskType(defaultTaskType);
     setUseManualRepo(false);
     setUseManualBranch(false);
     setBranchOptions([]);
@@ -621,11 +717,99 @@ export function useAppState() {
     setLogLines([]);
   };
 
+  const fetchArchiveTasks = async (
+    pageOverride?: number,
+    pageSizeOverride?: number,
+    statusOverride?: string,
+    searchOverride?: string,
+    dateRangeOverride?: string,
+  ) => {
+    setArchiveLoading(true);
+    try {
+      const p = pageOverride ?? archivePage;
+      const ps = pageSizeOverride ?? archivePageSize;
+      const status = statusOverride ?? archiveStatusFilter;
+      const search = searchOverride ?? archiveSearchQuery;
+      const dateRange = dateRangeOverride ?? archiveDateRange;
+      const offset = (p - 1) * ps;
+      let url = `/api/admin/tasks?limit=${ps}&offset=${offset}`;
+      if (status !== 'all') {
+        url += `&status=${status}`;
+      } else {
+        url += `&terminal_only=true`;
+      }
+      if (search.trim()) {
+        url += `&search=${encodeURIComponent(search.trim())}`;
+      }
+      if (dateRange !== 'all') {
+        const now = new Date();
+        const hours = dateRange === '24h' ? 24 : dateRange === '7d' ? 24 * 7 : dateRange === '30d' ? 24 * 30 : 0;
+        if (hours > 0) {
+          const after = new Date(now.getTime() - hours * 60 * 60 * 1000);
+          url += `&created_after=${encodeURIComponent(after.toISOString())}`;
+        }
+      }
+      const res = await apiFetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setArchiveTasks(data.tasks || []);
+        setArchiveTotalTasks(data.total || 0);
+      }
+    } catch (err) {
+      console.error('Failed to fetch archive tasks:', err);
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  const setShowArchive = (show: boolean) => {
+    setShowArchiveState(show);
+    if (show) {
+      fetchArchiveTasks();
+    }
+  };
+
+  const setArchivePage = (page: number) => {
+    setArchivePageState(page);
+    fetchArchiveTasks(page);
+  };
+
+  const setArchivePageSize = (size: number) => {
+    setArchivePageSizeState(size);
+    setArchivePageState(1);
+    fetchArchiveTasks(1, size);
+  };
+
+  const setArchiveStatusFilter = (status: string) => {
+    setArchiveStatusFilterState(status);
+    setArchivePageState(1);
+    fetchArchiveTasks(1, undefined, status);
+  };
+
+  const archiveSearchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setArchiveSearchQuery = (query: string) => {
+    setArchiveSearchQueryState(query);
+    if (archiveSearchDebounceRef.current) {
+      clearTimeout(archiveSearchDebounceRef.current);
+    }
+    archiveSearchDebounceRef.current = setTimeout(() => {
+      setArchivePageState(1);
+      fetchArchiveTasks(1, undefined, undefined, query);
+    }, 300);
+  };
+
+  const setArchiveDateRange = (range: string) => {
+    setArchiveDateRangeState(range);
+    setArchivePageState(1);
+    fetchArchiveTasks(1, undefined, undefined, undefined, range);
+  };
+
   return {
     // Auth
     user, authLoading, error, setError,
     // Tasks
-    tasks, loading, page, setPage, limit,
+    tasks, totalTasks, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss,
     // Toasts
@@ -633,7 +817,7 @@ export function useAppState() {
     // View
     viewMode, setViewMode,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
     // Projects
     projects, selectedProjectId, setSelectedProjectId,
     // Log viewer
@@ -649,6 +833,9 @@ export function useAppState() {
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     openNewTaskModal, handleRepoChange, handleCreateTask,
+    // Defaults
+    defaultTaskType, setDefaultTaskType,
+    notifyOnComplete, setNotifyOnComplete,
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, usingMaxPlan,
@@ -660,6 +847,15 @@ export function useAppState() {
     githubAccount, connectGitHub,
     // Directions
     showDirections, setShowDirections,
+    // Metrics
+    showMetrics, setShowMetrics, metricsHistory, cumulativeCost,
+    // Archive
+    showArchive, setShowArchive, archiveTasks, archiveLoading,
+    archivePage, setArchivePage, archivePageSize, setArchivePageSize,
+    archiveStatusFilter, setArchiveStatusFilter,
+    archiveSearchQuery, setArchiveSearchQuery,
+    archiveDateRange, setArchiveDateRange,
+    archiveTotalTasks, fetchArchiveTasks,
     // Misc
     lastRefresh, wsRef,
     showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,

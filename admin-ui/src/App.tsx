@@ -11,10 +11,12 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
+import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
+import ArchiveView from './components/ArchiveView';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -85,9 +87,15 @@ export default function App() {
         lastRefresh={s.lastRefresh}
         onRefresh={s.fetchTasks}
         viewMode={s.viewMode}
+        defaultTaskType={s.defaultTaskType}
+        onUpdateDefaultTaskType={s.setDefaultTaskType}
+        notifyOnComplete={s.notifyOnComplete}
+        onUpdateNotifyOnComplete={s.setNotifyOnComplete}
         onToggleViewMode={() => s.setViewMode(v => v === 'kanban' ? 'pipeline' : 'kanban')}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
+        showArchive={s.showArchive}
+        onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
         onSignOut={() => signOut(auth)}
@@ -112,7 +120,23 @@ export default function App() {
         newAccountCreds={s.newAccountCreds}
         setNewAccountCreds={s.setNewAccountCreds}
         onAddAccount={s.addMaxPlanAccount}
+        showMetrics={s.showMetrics}
+        onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
+        refreshInterval={s.refreshInterval}
+        onUpdateRefreshInterval={s.setRefreshInterval}
       />
+
+      <div
+        className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
+        style={{ maxHeight: s.showMetrics ? '500px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
+      >
+        <MetricsDashboard
+          metricsHistory={s.metricsHistory}
+          cumulativeCost={s.cumulativeCost}
+          maxConcurrentVMs={s.maxConcurrentVMs}
+          tasks={s.tasks}
+        />
+      </div>
 
       <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} />
 
@@ -130,37 +154,61 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
       />
 
-      <SearchFilterBar
-        searchQuery={s.searchQuery}
-        onSearchChange={s.setSearchQuery}
-        taskTypeFilter={s.taskTypeFilter}
-        onTypeFilterChange={s.setTaskTypeFilter}
-        filteredCount={filteredTasks.length}
-        totalCount={s.tasks.length}
-      />
-
-      {s.viewMode === 'kanban' ? (
-        <KanbanBoard
-          tasks={filteredTasks}
-          columns={COLUMNS}
-          selectedProjectId={s.selectedProjectId}
-          loading={s.loading}
-          maxRetries={s.maxRetries}
-          actionLoadingMap={s.actionLoadingMap}
-          onApprove={s.handleApprove}
-          onCancel={s.handleCancel}
-          onRetry={s.handleRetry}
-          onEditPrompt={s.handleEditPrompt}
-          onDismiss={s.handleDismiss}
-          onViewLogs={s.handleViewLogs}
+      {s.showArchive ? (
+        <ArchiveView
+          archiveTasks={s.archiveTasks}
+          archiveLoading={s.archiveLoading}
+          archivePage={s.archivePage}
+          archivePageSize={s.archivePageSize}
+          archiveStatusFilter={s.archiveStatusFilter}
+          archiveSearchQuery={s.archiveSearchQuery}
+          archiveDateRange={s.archiveDateRange}
+          archiveTotalTasks={s.archiveTotalTasks}
+          setShowArchive={s.setShowArchive}
+          setArchivePage={s.setArchivePage}
+          setArchivePageSize={s.setArchivePageSize}
+          setArchiveStatusFilter={s.setArchiveStatusFilter}
+          setArchiveSearchQuery={s.setArchiveSearchQuery}
+          setArchiveDateRange={s.setArchiveDateRange}
+          handleViewLogs={s.handleViewLogs}
         />
       ) : (
-        <main className="flex-1 overflow-hidden flex flex-col">
-          <PipelineView tasks={s.selectedProjectId === null ? filteredTasks : filteredTasks.filter(t => t.project_id === s.selectedProjectId)} onViewLogs={s.handleViewLogs} />
-        </main>
-      )}
+        <>
+          <SearchFilterBar
+            searchQuery={s.searchQuery}
+            onSearchChange={s.setSearchQuery}
+            taskTypeFilter={s.taskTypeFilter}
+            onTypeFilterChange={s.setTaskTypeFilter}
+            statusFilter={s.statusFilter}
+            onStatusFilterChange={s.setStatusFilter}
+            filteredCount={filteredTasks.length}
+            totalCount={s.tasks.length}
+          />
 
-      <Pagination page={s.page} onPageChange={s.setPage} taskCount={s.tasks.length} limit={s.limit} />
+          {s.viewMode === 'kanban' ? (
+            <KanbanBoard
+              tasks={filteredTasks}
+              columns={COLUMNS}
+              selectedProjectId={s.selectedProjectId}
+              loading={s.loading}
+              maxRetries={s.maxRetries}
+              actionLoadingMap={s.actionLoadingMap}
+              onApprove={s.handleApprove}
+              onCancel={s.handleCancel}
+              onRetry={s.handleRetry}
+              onEditPrompt={s.handleEditPrompt}
+              onDismiss={s.handleDismiss}
+              onViewLogs={s.handleViewLogs}
+            />
+          ) : (
+            <main className="flex-1 overflow-hidden flex flex-col">
+              <PipelineView tasks={s.selectedProjectId === null ? filteredTasks : filteredTasks.filter(t => t.project_id === s.selectedProjectId)} onViewLogs={s.handleViewLogs} />
+            </main>
+          )}
+
+          <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
+        </>
+      )}
 
       {s.showNewTaskModal && (
         <NewTaskModal

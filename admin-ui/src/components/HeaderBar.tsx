@@ -1,5 +1,5 @@
 import type { RefObject } from 'react';
-import { Activity, RefreshCw, Network, Compass, Microscope, Plus, LogOut } from 'lucide-react';
+import { Activity, RefreshCw, Network, Compass, Microscope, Archive, Plus, LogOut } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { Task } from './TaskCard';
@@ -15,6 +15,8 @@ export interface HeaderBarProps {
   onToggleViewMode: () => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
+  showArchive: boolean;
+  onToggleArchive: () => void;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -27,6 +29,10 @@ export interface HeaderBarProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: RefObject<HTMLDivElement | null>;
+  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix';
+  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
+  notifyOnComplete: boolean;
+  onUpdateNotifyOnComplete: (value: boolean) => void;
   maxRetries: number;
   onUpdateMaxVMs: (value: number) => void;
   onUpdateMaxRetries: (value: number) => void;
@@ -40,6 +46,10 @@ export interface HeaderBarProps {
   newAccountCreds: string;
   setNewAccountCreds: (value: string) => void;
   onAddAccount: () => void;
+  showMetrics: boolean;
+  onToggleMetrics: () => void;
+  refreshInterval: number;
+  onUpdateRefreshInterval: (value: number) => void;
 }
 
 function formatTimeAgo(date: Date): string {
@@ -63,6 +73,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleViewMode,
     showResearchBrowser,
     onToggleResearchBrowser,
+    showArchive,
+    onToggleArchive,
     onOpenNewTaskModal,
     onShowDirections,
     onSignOut,
@@ -74,6 +86,10 @@ export function HeaderBar(props: HeaderBarProps) {
     showSettings,
     onToggleSettings,
     settingsRef,
+    defaultTaskType,
+    onUpdateDefaultTaskType,
+    notifyOnComplete,
+    onUpdateNotifyOnComplete,
     maxRetries,
     onUpdateMaxVMs,
     onUpdateMaxRetries,
@@ -87,6 +103,10 @@ export function HeaderBar(props: HeaderBarProps) {
     newAccountCreds,
     setNewAccountCreds,
     onAddAccount,
+    showMetrics,
+    onToggleMetrics,
+    refreshInterval,
+    onUpdateRefreshInterval,
   } = props;
 
   return (
@@ -99,7 +119,15 @@ export function HeaderBar(props: HeaderBarProps) {
         <p className="text-xs text-neutral-500 mt-1 font-mono uppercase tracking-wider">Claude Code PVM Orchestrator</p>
       </div>
 
-      <div className="flex items-center gap-8 px-6 py-2 bg-neutral-900/30 rounded-lg border border-neutral-800/50">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={onToggleMetrics}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggleMetrics(); } }}
+        aria-expanded={showMetrics}
+        className="flex items-center gap-8 px-6 py-2 bg-neutral-900/30 rounded-lg border border-neutral-800/50 cursor-pointer hover:bg-neutral-900/50 transition-colors"
+        title="Toggle metrics dashboard"
+      >
         <div className="flex flex-col items-center">
           <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Active VMs</span>
           <span className="text-xl font-bold text-emerald-400 font-mono leading-none flex items-center gap-1.5">
@@ -121,7 +149,7 @@ export function HeaderBar(props: HeaderBarProps) {
           <span className="text-xl font-bold text-neutral-200 font-mono leading-none">{queuedTasks.length}</span>
         </div>
         <div className="w-px h-8 bg-neutral-800"></div>
-        <button onClick={onRefresh} className="flex flex-col items-center group cursor-pointer" title="Click to refresh">
+        <button className="flex flex-col items-center group" onClick={(e) => { e.stopPropagation(); onRefresh(); }} title="Click to refresh">
           <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Refreshed</span>
           <span className="text-xs font-medium text-neutral-400 font-mono group-hover:text-neutral-200 transition-colors flex items-center gap-1.5">
             <RefreshCw className="w-3 h-3" />
@@ -129,7 +157,11 @@ export function HeaderBar(props: HeaderBarProps) {
           </span>
         </button>
         <div className="w-px h-8 bg-neutral-800"></div>
-        <AutonomousStatus onRefreshTasks={onRefresh} wsRef={wsRef} />
+        <span onClick={(e) => e.stopPropagation()}>
+          <AutonomousStatus onRefreshTasks={onRefresh} wsRef={wsRef} />
+        </span>
+        <div className="w-px h-8 bg-neutral-800"></div>
+        <span className="text-neutral-500 text-xs transition-transform" style={{ transform: showMetrics ? 'rotate(180deg)' : 'rotate(0deg)' }}>▾</span>
       </div>
 
       <div className="flex items-center gap-2">
@@ -152,6 +184,8 @@ export function HeaderBar(props: HeaderBarProps) {
                   ['2', 'Pipeline view'],
                   ['D', 'Toggle directions'],
                   ['S', 'Toggle settings'],
+                  ['M', 'Toggle metrics'],
+                  ['A', 'Toggle archive'],
                   ['?', 'This help'],
                   ['Esc', 'Close panel/modal'],
                 ].map(([key, desc]) => (
@@ -182,6 +216,12 @@ export function HeaderBar(props: HeaderBarProps) {
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}
+          defaultTaskType={defaultTaskType}
+          onUpdateDefaultTaskType={onUpdateDefaultTaskType}
+          viewMode={viewMode}
+          onToggleViewMode={onToggleViewMode}
+          notifyOnComplete={notifyOnComplete}
+          onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
           maxConcurrentVMs={maxConcurrentVMs}
           onUpdateMaxVMs={onUpdateMaxVMs}
           maxRetries={maxRetries}
@@ -196,7 +236,20 @@ export function HeaderBar(props: HeaderBarProps) {
           newAccountCreds={newAccountCreds}
           setNewAccountCreds={setNewAccountCreds}
           onAddAccount={onAddAccount}
+          refreshInterval={refreshInterval}
+          onUpdateRefreshInterval={onUpdateRefreshInterval}
         />
+        <button
+          onClick={onToggleArchive}
+          className={`p-2 rounded text-xs transition-colors border ${
+            showArchive
+              ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+              : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+          }`}
+          title="Archive"
+        >
+          <Archive className="w-4 h-4" />
+        </button>
         <button
           onClick={onToggleResearchBrowser}
           className={`p-2 rounded text-xs transition-colors border ${

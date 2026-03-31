@@ -15,6 +15,8 @@ const STATUS_COLORS: Record<string, string> = {
 interface TreeNode {
   task: Task;
   children: TreeNode[];
+  isSyntheticParent?: boolean;
+  isOrphan?: boolean;
 }
 
 interface PipelineViewProps {
@@ -30,13 +32,44 @@ function buildForest(tasks: Task[]): TreeNode[] {
   for (const t of tasks) nodeMap.set(t.id, { task: t, children: [] });
 
   const roots: TreeNode[] = [];
+  // Group orphans (tasks whose parent is not on this page) by parent_task_id
+  const orphanGroups = new Map<string, TreeNode[]>();
+
   for (const t of tasks) {
     const node = nodeMap.get(t.id)!;
     if (t.parent_task_id && nodeMap.has(t.parent_task_id)) {
       nodeMap.get(t.parent_task_id)!.children.push(node);
+    } else if (t.parent_task_id && !nodeMap.has(t.parent_task_id)) {
+      // Orphan: parent exists but is not on this page
+      node.isOrphan = true;
+      const group = orphanGroups.get(t.parent_task_id) || [];
+      group.push(node);
+      orphanGroups.set(t.parent_task_id, group);
     } else {
       roots.push(node);
     }
+  }
+
+  // Create synthetic parent nodes for orphan groups
+  const syntheticRoots: TreeNode[] = [];
+  for (const [parentId, orphans] of orphanGroups) {
+    const shortId = parentId.slice(0, 8);
+    const syntheticParent: TreeNode = {
+      task: {
+        id: `synthetic-${parentId}`,
+        title: `Task group (parent: ${shortId})`,
+        description: '',
+        status: 'QUEUED',
+        created_by: '',
+        requires_approval: false,
+        parent_task_id: parentId,
+        created_at: orphans[0].task.created_at,
+        history: [],
+      } as Task,
+      children: orphans,
+      isSyntheticParent: true,
+    };
+    syntheticRoots.push(syntheticParent);
   }
 
   // Sort children by pipeline order: research → plan → create → review → fix
@@ -46,14 +79,17 @@ function buildForest(tasks: Task[]): TreeNode[] {
     node.children.forEach(sortChildren);
   };
   roots.forEach(sortChildren);
+  syntheticRoots.forEach(sortChildren);
 
   // Sort roots by creation time (newest first)
   roots.sort((a, b) => new Date(b.task.created_at).getTime() - new Date(a.task.created_at).getTime());
+  syntheticRoots.sort((a, b) => new Date(b.task.created_at).getTime() - new Date(a.task.created_at).getTime());
 
-  return roots;
+  // Synthetic groups appear first so users see incomplete groups at the top
+  return [...syntheticRoots, ...roots];
 }
 
-function TaskNode({ task, onViewLogs }: { task: Task; onViewLogs: (task: Task) => void }) {
+function TaskNode({ task, onViewLogs, isOrphan }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
@@ -68,11 +104,18 @@ function TaskNode({ task, onViewLogs }: { task: Task; onViewLogs: (task: Task) =
   return (
     <button
       onClick={() => onViewLogs(task)}
-      className="flex items-center gap-2.5 bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group"
+      className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}\nClick to view logs`}
     >
       {/* Status dot */}
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor}`} />
+
+      {/* Orphan indicator */}
+      {isOrphan && (
+        <span className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0">
+          ↑ Parent on another page
+        </span>
+      )}
 
       {/* Type badge */}
       {style && Icon && (
@@ -98,6 +141,7 @@ function TreeBranch({
   node,
   taskMap,
   allTaskIds,
+  prChainMap,
   onViewLogs,
   isLast,
   depth,
@@ -105,14 +149,34 @@ function TreeBranch({
   node: TreeNode;
   taskMap: Map<string, Task>;
   allTaskIds: Set<string>;
+  prChainMap: Map<number, Task>;
   onViewLogs: (task: Task) => void;
   isLast: boolean;
   depth: number;
 }) {
-  const depTasks = (node.task.depends_on || [])
+  const depIds = node.task.depends_on || [];
+  const depTasks = depIds
     .filter(id => allTaskIds.has(id))
     .map(id => taskMap.get(id)!)
     .filter(Boolean);
+  const offPageDepIds = depIds.filter(id => !allTaskIds.has(id));
+
+  // Find linked create task for review/fix tasks via PR number
+  const linkedCreateTask = useMemo(() => {
+    const tt = node.task.task_type;
+    if (tt !== 'review' && tt !== 'fix') return null;
+    const prNumber = (node.task.payloads?.[0] as Record<string, unknown> | undefined)?.pr_number;
+    if (typeof prNumber !== 'number') return null;
+    const createTask = prChainMap.get(prNumber);
+    if (!createTask) return null;
+    // Only show connector if the create task is not already a direct parent
+    if (node.task.parent_task_id === createTask.id) return null;
+    return createTask;
+  }, [node.task, prChainMap]);
+
+  const chainColor = node.task.task_type === 'fix' ? 'border-orange-500/50' : 'border-amber-500/50';
+  const chainBadgeBg = node.task.task_type === 'fix' ? 'bg-orange-500/10 border-orange-500/30 text-orange-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400';
+  const chainLabel = node.task.task_type === 'fix' ? 'Fix' : 'Review';
 
   return (
     <div className="relative">
@@ -128,7 +192,7 @@ function TreeBranch({
 
       <div style={{ paddingLeft: depth > 0 ? 20 : 0 }}>
         {/* depends_on connectors: dotted lines to each dependency target */}
-        {depTasks.length > 0 && (
+        {(depTasks.length > 0 || offPageDepIds.length > 0) && (
           <div className="mb-1 ml-1 space-y-0.5">
             {depTasks.map(dep => {
               const depStyle = dep.task_type ? TASK_TYPE_STYLES[dep.task_type] : null;
@@ -141,10 +205,31 @@ function TreeBranch({
                 </div>
               );
             })}
+            {offPageDepIds.map(id => (
+              <div key={id} className="flex items-center gap-1.5">
+                <div className="w-4 border-t-2 border-dashed border-amber-500/40" />
+                <span className="text-[9px] text-amber-500/70 font-mono truncate max-w-[200px]" title={`Depends on task ${id} (not on this page)`}>
+                  &#8594; depends on task not on this page ({id.slice(0, 8)})
+                </span>
+              </div>
+            ))}
           </div>
         )}
 
-        <TaskNode task={node.task} onViewLogs={onViewLogs} />
+        {/* PR chain connector: dotted arrow to originating create task */}
+        {linkedCreateTask && (
+          <div className="mb-1 ml-1 flex items-center gap-1.5">
+            <div className={`w-4 border-t-2 border-dashed ${chainColor}`} />
+            <span className={`text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${chainBadgeBg}`}>
+              {chainLabel}
+            </span>
+            <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[200px]" title={`${node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: ${linkedCreateTask.title}`}>
+              ↳ {node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: {linkedCreateTask.title}
+            </span>
+          </div>
+        )}
+
+        <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} />
 
         {/* Children */}
         {node.children.length > 0 && (
@@ -155,6 +240,7 @@ function TreeBranch({
                 node={child}
                 taskMap={taskMap}
                 allTaskIds={allTaskIds}
+                prChainMap={prChainMap}
                 onViewLogs={onViewLogs}
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
@@ -167,10 +253,29 @@ function TreeBranch({
   );
 }
 
+/** Extract PR number from a pr_url like https://github.com/owner/repo/pull/123 */
+function prNumberFromUrl(url: string): number | null {
+  const m = url.match(/\/pull\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+/** Build a map from PR number → create task that produced the PR */
+function buildPrChainMap(tasks: Task[]): Map<number, Task> {
+  const map = new Map<number, Task>();
+  for (const t of tasks) {
+    if (t.task_type === 'create' && t.pr_url) {
+      const num = prNumberFromUrl(t.pr_url);
+      if (num != null) map.set(num, t);
+    }
+  }
+  return map;
+}
+
 export function PipelineView({ tasks, onViewLogs }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
+  const prChainMap = useMemo(() => buildPrChainMap(tasks), [tasks]);
 
   if (tasks.length === 0) {
     return (
@@ -184,19 +289,33 @@ export function PipelineView({ tasks, onViewLogs }: PipelineViewProps) {
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
       <div className="space-y-4 min-w-[400px]">
         {forest.map(root => {
-          const totalInGroup = countNodes(root);
-          const completedInGroup = countByStatus(root, 'COMPLETED');
+          const isSynthetic = root.isSyntheticParent;
+          const totalInGroup = isSynthetic
+            ? root.children.reduce((sum, c) => sum + countNodes(c), 0)
+            : countNodes(root);
+          const completedInGroup = isSynthetic
+            ? root.children.reduce((sum, c) => sum + countByStatus(c, 'COMPLETED'), 0)
+            : countByStatus(root, 'COMPLETED');
 
           return (
             <div
               key={root.task.id}
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4"
+              className={isSynthetic
+                ? 'bg-neutral-900/30 border border-dashed border-neutral-700/60 rounded-xl p-4'
+                : 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4'}
             >
               {/* Group header */}
               <div className="flex items-center justify-between mb-3 px-1">
-                <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest truncate pr-4">
-                  {root.task.title}
-                </h3>
+                <div className="flex items-center gap-2 truncate pr-4">
+                  <h3 className={`text-[11px] font-bold uppercase tracking-widest truncate ${isSynthetic ? 'text-neutral-500' : 'text-neutral-400'}`}>
+                    {root.task.title}
+                  </h3>
+                  {isSynthetic && (
+                    <span className="text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0">
+                      ↑ Parent on another page
+                    </span>
+                  )}
+                </div>
                 <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700 shrink-0">
                   {completedInGroup}/{totalInGroup} done
                 </span>
@@ -204,14 +323,31 @@ export function PipelineView({ tasks, onViewLogs }: PipelineViewProps) {
 
               {/* Tree */}
               <div className="space-y-1">
-                <TreeBranch
-                  node={root}
-                  taskMap={taskMap}
-                  allTaskIds={allTaskIds}
-                  onViewLogs={onViewLogs}
-                  isLast={true}
-                  depth={0}
-                />
+                {isSynthetic ? (
+                  // Render orphan children directly (no synthetic task node)
+                  root.children.map((child, i) => (
+                    <TreeBranch
+                      key={child.task.id}
+                      node={child}
+                      taskMap={taskMap}
+                      allTaskIds={allTaskIds}
+                      prChainMap={prChainMap}
+                      onViewLogs={onViewLogs}
+                      isLast={i === root.children.length - 1}
+                      depth={0}
+                    />
+                  ))
+                ) : (
+                  <TreeBranch
+                    node={root}
+                    taskMap={taskMap}
+                    allTaskIds={allTaskIds}
+                    prChainMap={prChainMap}
+                    onViewLogs={onViewLogs}
+                    isLast={true}
+                    depth={0}
+                  />
+                )}
               </div>
             </div>
           );

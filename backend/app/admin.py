@@ -33,17 +33,43 @@ async def get_all_projects(
     projects = result.scalars().all()
     return projects
 
+TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+
+
 @router.get("/tasks")
 async def get_all_tasks(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     status: Optional[TaskStatus] = None,
+    terminal_only: bool = Query(False),
+    search: Optional[str] = Query(None, max_length=200),
+    created_after: Optional[datetime] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
+    # Build shared filter conditions
+    filters = []
     if status:
-        query = query.where(Task.status == status)
+        filters.append(Task.status == status)
+    elif terminal_only:
+        filters.append(Task.status.in_(TERMINAL_STATUSES))
+    if search:
+        escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        search_pattern = f"%{escaped}%"
+        filters.append(
+            (Task.title.ilike(search_pattern, escape="\\")) | (Task.description.ilike(search_pattern, escape="\\"))
+        )
+    if created_after:
+        filters.append(Task.created_at >= created_after)
+
+    count_query = select(func.count()).select_from(Task)
+    for f in filters:
+        count_query = count_query.where(f)
+    total = (await session.execute(count_query)).scalar() or 0
+
+    query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
+    for f in filters:
+        query = query.where(f)
 
     result = await session.execute(query)
     tasks = result.scalars().all()
@@ -113,7 +139,7 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    return result_list
+    return {"tasks": result_list, "total": total}
 
 
 class CreateTaskPayload(BaseModel):

@@ -5,13 +5,24 @@ interface SearchFilterBarProps {
   onSearchChange: (query: string) => void;
   taskTypeFilter: string;
   onTypeFilterChange: (filter: string) => void;
+  statusFilter: string | null;
+  onStatusFilterChange: (status: string | null) => void;
   filteredCount: number;
   totalCount: number;
 }
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
+const STATUS_OPTIONS: { label: string; value: string | null }[] = [
+  { label: 'All', value: null },
+  { label: 'Queued', value: 'QUEUED' },
+  { label: 'In Progress', value: 'IN_PROGRESS' },
+  { label: 'Failed', value: 'FAILED' },
+  { label: 'Cancelled', value: 'CANCELLED' },
+  { label: 'Completed', value: 'COMPLETED' },
+];
+
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
   return (
-    <div className="flex items-center gap-3 mb-4 shrink-0">
+    <div className="flex items-center gap-3 mb-4 shrink-0 flex-wrap">
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500" />
         <input
@@ -35,6 +46,21 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
             }`}
           >
             {opt.charAt(0).toUpperCase() + opt.slice(1)}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center gap-1">
+        {STATUS_OPTIONS.map(opt => (
+          <button
+            key={opt.label}
+            onClick={() => onStatusFilterChange(opt.value)}
+            className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
+              statusFilter === opt.value
+                ? 'bg-neutral-800/60 border-neutral-500 text-neutral-200'
+                : 'bg-neutral-950 border-neutral-800/60 text-neutral-500 hover:border-neutral-700'
+            }`}
+          >
+            {opt.label}
           </button>
         ))}
       </div>

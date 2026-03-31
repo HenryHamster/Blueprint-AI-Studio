@@ -12,6 +12,15 @@ interface SettingsDropdownProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: React.RefObject<HTMLDivElement | null>;
+  // Defaults
+  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix';
+  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
+  viewMode: 'kanban' | 'pipeline';
+  onToggleViewMode: () => void;
+  // Notifications
+  notifyOnComplete: boolean;
+  onUpdateNotifyOnComplete: (value: boolean) => void;
+  // Existing
   maxConcurrentVMs: number;
   onUpdateMaxVMs: (value: number) => void;
   maxRetries: number;
@@ -26,12 +35,20 @@ interface SettingsDropdownProps {
   newAccountCreds: string;
   setNewAccountCreds: (value: string) => void;
   onAddAccount: () => void;
+  refreshInterval: number;
+  onUpdateRefreshInterval: (value: number) => void;
 }
 
 export function SettingsDropdown({
   showSettings,
   onToggleSettings,
   settingsRef,
+  defaultTaskType,
+  onUpdateDefaultTaskType,
+  viewMode,
+  onToggleViewMode,
+  notifyOnComplete,
+  onUpdateNotifyOnComplete,
   maxConcurrentVMs,
   onUpdateMaxVMs,
   maxRetries,
@@ -46,6 +63,8 @@ export function SettingsDropdown({
   newAccountCreds,
   setNewAccountCreds,
   onAddAccount,
+  refreshInterval,
+  onUpdateRefreshInterval,
 }: SettingsDropdownProps) {
   return (
     <div className="relative" ref={settingsRef}>
@@ -58,7 +77,35 @@ export function SettingsDropdown({
       </button>
       {showSettings && (
         <div className="absolute right-0 top-full mt-2 w-80 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
-          <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-3">Settings</h3>
+          <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-3">Defaults</h3>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default Task Type</label>
+            <select
+              value={defaultTaskType}
+              onChange={e => onUpdateDefaultTaskType(e.target.value as 'create' | 'plan' | 'research' | 'review' | 'fix')}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="create">Create</option>
+              <option value="plan">Plan</option>
+              <option value="research">Research</option>
+              <option value="review">Review</option>
+              <option value="fix">Fix</option>
+            </select>
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default View Mode</label>
+            <button
+              onClick={onToggleViewMode}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 flex items-center justify-between"
+            >
+              <span>{viewMode === 'kanban' ? 'Kanban' : 'Pipeline'}</span>
+              <span className="text-neutral-500 text-xs">Click to toggle</span>
+            </button>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-4">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Settings</h4>
+          </div>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (1-30)</label>
             <input
@@ -80,6 +127,39 @@ export function SettingsDropdown({
               onChange={e => onUpdateMaxRetries(parseInt(e.target.value) || 0)}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
+            <select
+              value={refreshInterval}
+              onChange={e => onUpdateRefreshInterval(Number(e.target.value))}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value={10000}>10s</option>
+              <option value={30000}>30s</option>
+              <option value={60000}>60s</option>
+              <option value={0}>Manual only</option>
+            </select>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-4">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Notifications</h4>
+            <label className="flex items-center justify-between cursor-pointer">
+              <span className="text-[11px] font-medium text-neutral-400">Show browser notifications on task completion</span>
+              <button
+                onClick={() => {
+                  const next = !notifyOnComplete;
+                  if (next && 'Notification' in window && Notification.permission === 'default') {
+                    Notification.requestPermission();
+                  }
+                  onUpdateNotifyOnComplete(next);
+                }}
+                className={`relative w-8 h-4 rounded-full transition-colors ${notifyOnComplete ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${notifyOnComplete ? 'translate-x-4' : ''}`} />
+              </button>
+            </label>
           </div>
 
           <div className="border-t border-neutral-800 pt-3 mb-4">
