@@ -301,6 +301,14 @@ EOF
 
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
+        # Delete any existing VM with this name first (stale from retries)
+        try:
+            instance_client.get(project=GCP_PROJECT_ID, zone=GCP_ZONE, instance=vm_instance_id)
+            logger.info(f"Deleting stale VM {vm_instance_id} before re-provisioning")
+            del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=GCP_ZONE, instance=vm_instance_id)
+            del_op.result()
+        except Exception:
+            pass  # VM doesn't exist — expected case
         operation = instance_client.insert(
             project=GCP_PROJECT_ID,
             zone=GCP_ZONE,
