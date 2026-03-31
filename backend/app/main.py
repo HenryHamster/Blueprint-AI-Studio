@@ -2007,13 +2007,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         print(f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})")
 
     elif any(s == TaskStatus.FAILED for s in child_statuses) and active_count == 0:
-        # All done but some failed — mark parent as failed, clean up staging branch
+        # All done but some failed — mark parent as failed but keep staging branch
+        # (it may contain merged work from successful children that can be salvaged)
         parent.status = TaskStatus.FAILED
         failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
         parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
         session.add(parent)
         await session.commit()
-        await _cleanup_branches(parent, session)
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.FAILED})
         print(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
