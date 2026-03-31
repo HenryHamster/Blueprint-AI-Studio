@@ -16,3 +16,4 @@ coverage/
 !.env.example
 database.sqlite
 .blueprint-config.json
+*.tsbuildinfo

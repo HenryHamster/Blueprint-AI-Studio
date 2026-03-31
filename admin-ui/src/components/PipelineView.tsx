@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import type { Task } from './TaskCard';
-import { TASK_TYPE_STYLES } from './TaskCard';
+import { TASK_TYPE_STYLES, useElapsedTime } from './TaskCard';
 
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
@@ -58,6 +58,13 @@ function TaskNode({ task, onViewLogs }: { task: Task; onViewLogs: (task: Task) =
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
 
+  const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING' || task.status === 'EVALUATING';
+  const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
+  const endTime = isTerminal && task.history && task.history.length > 0
+    ? task.history[task.history.length - 1].timestamp
+    : isTerminal ? task.created_at : undefined;
+  const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
+
   return (
     <button
       onClick={() => onViewLogs(task)}
@@ -77,6 +84,11 @@ function TaskNode({ task, onViewLogs }: { task: Task; onViewLogs: (task: Task) =
       {/* Title */}
       <span className="text-xs text-neutral-200 truncate flex-1 group-hover:text-neutral-100">
         {task.title}
+      </span>
+
+      {/* Duration */}
+      <span className="text-[10px] text-neutral-500 font-mono shrink-0">
+        {task.status === 'QUEUED' ? 'Waiting' : duration}
       </span>
     </button>
   );
