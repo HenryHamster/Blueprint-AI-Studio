@@ -665,7 +665,11 @@ async def orchestrator_worker():
 
                         ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha)
                         if ci_result["status"] != "completed":
-                            continue  # Still running
+                            details = [d["name"] for d in ci_result.get("details", []) if d.get("status") in ("queued", "in_progress")]
+                            ci_task.latest_status_message = f"CI in progress on PR #{ci_pr_number}: {', '.join(details) or 'waiting for checks'}..."
+                            session.add(ci_task)
+                            await session.commit()
+                            continue
 
                         ci_payload = (ci_task.payloads or [{}])[0]
                         ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
@@ -1521,8 +1525,8 @@ async def _spawn_pipeline_task(
                     orig.latest_status_message = f"Review-fix cycle reached limit ({MAX_REVIEW_FIX_ITERATIONS} iterations) — manual review required"
                     session.add(orig)
                     await session.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[PIPELINE] Failed to mark iteration cap on {orig_id}: {e}")
         print(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
         return None
 
@@ -2017,6 +2021,22 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if active_count > 0 or pipeline_active:
         return
 
+    # Surface what's blocking if children are done but not all merged
+    if not all_done and active_count == 0 and not pipeline_active:
+        unmerged = [c for c in children
+                    if c.status == TaskStatus.COMPLETED and not (c.context or {}).get("pr_merged")]
+        failed = [c for c in children if c.status == TaskStatus.FAILED]
+        if unmerged:
+            titles = [c.title[:40] for c in unmerged]
+            parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
+            print(f"[ROLLUP] Parent {parent.id} blocked — {len(unmerged)} children completed but unmerged")
+        elif failed:
+            parent.latest_status_message = f"{len(failed)} subtask(s) failed — requeue parent to retry"
+            print(f"[ROLLUP] Parent {parent.id} blocked — {len(failed)} children failed")
+        session.add(parent)
+        await session.commit()
+        return
+
     child_statuses = [c.status for c in children]
 
     # Edge case: all children cancelled — nothing to rollup, mark parent cancelled
@@ -2360,6 +2380,7 @@ async def update_agent_status(
                     task.latest_status_message = "Review pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
+                    return {"status": "accepted"}
 
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
@@ -2401,6 +2422,7 @@ async def update_agent_status(
                 except Exception as e:
                     print(f"[REVIEW PIPELINE] Failed to post review comment: {e}")
 
+                action_taken = False
                 if verdict == "APPROVE":
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -2433,7 +2455,7 @@ async def update_agent_status(
                             session.add(task)
                             await session.commit()
                             print(f"[CI] PR #{pr_number} approved, CI pending — waiting")
-                            # Skip merge — orchestrator cycle will pick this up
+                            action_taken = True
                             return {"status": "accepted"}
 
                         if ci_status and ci_status["conclusion"] == "failure":
@@ -2454,7 +2476,7 @@ async def update_agent_status(
                             )
                             if fix_task:
                                 print(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
-                            # Skip merge
+                            action_taken = True
                             return {"status": "accepted"}
 
                         # CI passed (or no CI checks exist) — proceed to merge
@@ -2483,6 +2505,7 @@ async def update_agent_status(
                                 except Exception as e:
                                     print(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}")
                             print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                            action_taken = True
                         else:
                             # Merge blocked — spawn fix task to rebase and resolve conflicts
                             merge_msg = merge_result.get("message", "unknown")
@@ -2513,6 +2536,7 @@ async def update_agent_status(
                             )
                             if fix_task:
                                 print(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
+                            action_taken = True
                     except Exception as e:
                         print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
                 else:
@@ -2535,6 +2559,13 @@ async def update_agent_status(
                     )
                     if fix_task:
                         print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                    action_taken = True
+
+                if not action_taken:
+                    task.latest_status_message = f"Review completed but no action taken (verdict={verdict}) — check orchestrator logs"
+                    session.add(task)
+                    await session.commit()
+                    print(f"[REVIEW PIPELINE] WARNING: Review {task.id} for PR #{pr_number} completed with no downstream action (verdict={verdict})")
 
             # Fix task completed → security scan → spawn new review
             elif task_type == "fix":
@@ -2548,6 +2579,7 @@ async def update_agent_status(
                     task.latest_status_message = "Fix pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
+                    return {"status": "accepted"}
 
                 # Security scan fix output before re-review
                 scan_blocked = False
