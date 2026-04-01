@@ -221,6 +221,37 @@ async function handleCreate(
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing changes...\n');
+    // Run lint/build checks before committing — catch errors before CI does
+    statusRef.value = 'Running pre-commit checks...';
+    try {
+      const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+      const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
+      const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
+      if (touchesFrontend) {
+        sendLog(ws, 'Running frontend lint + build...\n');
+        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
+        execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
+        execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
+        sendLog(ws, 'Frontend checks passed.\n');
+      }
+      if (touchesAgent) {
+        sendLog(ws, 'Running agent type check...\n');
+        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
+        execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
+        sendLog(ws, 'Agent type check passed.\n');
+      }
+    } catch (lintErr: unknown) {
+      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+      sendLog(ws, `Pre-commit check failed:\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      // Let Claude try to fix the lint errors
+      const lintFixResult = await runClaudeCode(
+        `The following lint/build errors were found in the code you just wrote. Fix them.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef
+      );
+      // Re-stage after fixes
+      git(['add', '-A']);
+    }
+
     git(['add', '-A']);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
 
@@ -325,12 +356,35 @@ If the changes look good and should be merged:
 {"verdict": "APPROVE", "feedback": "Brief summary of why it's approved"}
 
 If changes are needed before merging:
-{"verdict": "REQUEST_CHANGES", "feedback": "Detailed description of what needs to be fixed"}`;
+{"verdict": "REQUEST_CHANGES", "feedback": "Detailed description of what needs to be fixed"}
+
+IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running code review...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef);
 
-  const logs = sanitize(lastResultText || allOutput.slice(-10_000));
+  // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
+  const fs = await import('fs');
+  let logs = '';
+  const verdictPath = `${WORKSPACE}/../review_verdict.json`;
+  try {
+    if (fs.existsSync('/tmp/review_verdict.json')) {
+      const verdictJson = fs.readFileSync('/tmp/review_verdict.json', 'utf-8').trim();
+      // Validate it's actual verdict JSON
+      const parsed = JSON.parse(verdictJson);
+      if (parsed.verdict) {
+        // Prepend the full review text, append the verdict JSON at the end (where the parser expects it)
+        const reviewText = sanitize(lastResultText || allOutput.slice(-50_000));
+        logs = reviewText + '\n\n' + verdictJson;
+        sendLog(ws, `Verdict read from file: ${parsed.verdict}\n`);
+      }
+    }
+  } catch { /* fall through to output parsing */ }
+
+  if (!logs) {
+    logs = sanitize(lastResultText || allOutput.slice(-50_000));
+  }
+
   await apiPost('/api/agent/status', {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
@@ -389,7 +443,7 @@ async function handleFix(
     const conflictFiles = git(['diff', '--name-only', '--diff-filter=U']);
     if (conflictFiles.trim()) {
       hasConflicts = true;
-      enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nThis is the PRIMARY task — resolve ALL conflict markers (<<<<<<< ======= >>>>>>>) in each file listed above. Keep the intent of this PR's changes (HEAD) while incorporating upstream updates from ${baseBranch}.\n\nAfter resolving conflicts, stage the files with git add and ensure no conflict markers remain.\n\n${prompt}`;
+      enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nThis is the PRIMARY task — resolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file listed above. Keep the intent of this PR's changes (HEAD) while incorporating upstream updates from ${baseBranch}.\n\nAfter resolving conflicts, stage the files with git add and ensure no conflict markers remain.\n\n${prompt}`;
       sendLog(ws, `Conflicting files:\n${conflictFiles}\n`);
     }
   } catch { /* no unmerged files */ }
@@ -398,7 +452,7 @@ async function handleFix(
     try {
       const markerCheck = execFileSync('grep', ['-rl', '<' + '<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.json', '--exclude-dir=node_modules'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (markerCheck) {
-        enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}\n\nThis is the PRIMARY task — resolve ALL conflict markers (<<<<<<< ======= >>>>>>>) in each file. Keep the intent of this PR's changes while incorporating upstream updates from ${baseBranch}.\n\n${prompt}`;
+        enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}\n\nThis is the PRIMARY task — resolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file. Keep the intent of this PR's changes while incorporating upstream updates from ${baseBranch}.\n\n${prompt}`;
         sendLog(ws, `Files with conflict markers:\n${markerCheck}\n`);
       }
     } catch { /* no markers found, good */ }
@@ -411,6 +465,35 @@ async function handleFix(
   // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);
   if (diff.length > 0 && exitCode === 0) {
+    // Run lint/build checks before committing
+    statusRef.value = 'Running pre-commit checks...';
+    try {
+      const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+      const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
+      const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
+      if (touchesFrontend) {
+        sendLog(ws, 'Running frontend lint + build...\n');
+        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
+        execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
+        execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
+        sendLog(ws, 'Frontend checks passed.\n');
+      }
+      if (touchesAgent) {
+        sendLog(ws, 'Running agent type check...\n');
+        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
+        execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
+        sendLog(ws, 'Agent type check passed.\n');
+      }
+    } catch (lintErr: unknown) {
+      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+      sendLog(ws, `Pre-commit check failed:\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      await runClaudeCode(
+        `The following lint/build errors were found. Fix them.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef
+      );
+      git(['add', '-A']);
+    }
+
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
