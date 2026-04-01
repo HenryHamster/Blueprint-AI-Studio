@@ -1657,6 +1657,23 @@ def _validate_plan_dependencies(subtasks: List[Dict]) -> bool:
     return not any(has_cycle(i) for i in range(n) if i not in visited)
 
 
+def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN"):
+    """Log warnings when subtasks share related_files (for observability)."""
+    for i, a in enumerate(subtasks):
+        a_files = set(a.get("related_files", []))
+        if not a_files:
+            continue
+        for j, b in enumerate(subtasks):
+            if j <= i:
+                continue
+            b_files = set(b.get("related_files", []))
+            overlap = a_files & b_files
+            if overlap:
+                a_title = a.get("title", f"#{i}")
+                b_title = b.get("title", f"#{j}")
+                print(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     plan_data = _parse_plan_output(logs)
@@ -1744,6 +1761,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         ]
         session.add(child_tasks[i])
 
+    # Log file overlap warnings for observability
+    _log_file_overlaps(subtasks, "PLAN")
+
     await session.commit()
 
     # Record history
@@ -1787,8 +1807,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Branch may already exist from a previous run — reuse it
         print(f"[RESEARCH] Branch {research_branch} already exists or creation failed: {e} — reusing")
 
-    created_count = 0
+    # Validate dependencies if present
+    if not _validate_plan_dependencies(findings):
+        print(f"[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
+        for f in findings:
+            f.pop("depends_on_indices", None)
 
+    # First pass: create all child tasks
+    child_tasks = []
+    finding_indices = []  # Track which finding index maps to which child
     for i, finding in enumerate(findings):
         scope = finding.get("scope", "small")
         risk = finding.get("risk", "low")
@@ -1824,20 +1851,42 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=needs_approval,
+            depends_on=[],
         )
         session.add(new_task)
-        created_count += 1
+        child_tasks.append(new_task)
+        finding_indices.append(i)
 
     await session.commit()
-    task.status = TaskStatus.EVALUATING  # Children executing — rollup will fire when all done
-    task.latest_status_message = f"Research created {created_count} tasks from {len(findings)} findings"
+    for ct in child_tasks:
+        await session.refresh(ct)
+
+    # Second pass: resolve depends_on_indices to actual UUIDs
+    # finding_indices maps child_tasks position → findings array position
+    finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}
+    for ci, fi in enumerate(finding_indices):
+        dep_indices = findings[fi].get("depends_on_indices", [])
+        child_tasks[ci].depends_on = [
+            str(child_tasks[finding_to_child[j]].id)
+            for j in dep_indices
+            if j in finding_to_child
+        ]
+        if child_tasks[ci].depends_on:
+            session.add(child_tasks[ci])
+
+    # Log file overlap warnings for observability
+    _log_file_overlaps(findings, "RESEARCH")
+
+    await session.commit()
+    task.status = TaskStatus.EVALUATING
+    task.latest_status_message = f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
     task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
     session.add(task)
     await session.commit()
 
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
-                               {"research_task_id": str(task.id), "tasks_created": created_count})
-    print(f"[RESEARCH] Created {created_count} tasks from research {task.id}")
+                               {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
+    print(f"[RESEARCH] Created {len(child_tasks)} tasks from research {task.id}")
 
 
 # --- Rollup & Branch Cleanup Helpers ---

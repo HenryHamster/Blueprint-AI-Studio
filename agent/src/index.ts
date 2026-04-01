@@ -502,21 +502,25 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
     {
       "title": "Short title (under 60 chars, conventional commit style: feat:, fix:, refactor:, etc.)",
       "prompt": "Self-contained implementation prompt. Describe WHAT to achieve and key constraints. The agent has full repo access and will figure out implementation details.",
-      "depends_on_indices": []
+      "depends_on_indices": [],
+      "related_files": ["src/main.py", "src/utils.py"]
     },
     {
       "title": "feat: second subtask",
       "prompt": "...",
-      "depends_on_indices": [0]
+      "depends_on_indices": [0],
+      "related_files": ["src/main.py"]
     }
   ]
 }
 
 Rules:
 - depends_on_indices uses 0-based array positions (e.g., [0, 1] means this subtask depends on the first and second subtasks)
+- related_files: list the key files each subtask will create or modify
 - Each subtask prompt must be self-contained — don't reference other subtasks by index
 - Keep prompts concise — describe what to achieve, not step-by-step how
 - Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
+- If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
 - Aim for 2-6 subtasks. If the task is simple enough for 1 PR, output a single subtask with no dependencies
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
 - IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
@@ -594,6 +598,7 @@ Instructions:
     "risk": "low",
     "priority": "high",
     "related_files": ["path/to/file1.py"],
+    "depends_on_indices": [],
     "direction_id": "d-1 or null if self-discovered"
   }
 ]
@@ -607,6 +612,7 @@ Valid values:
 Rules:
 - Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
+- depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
 - Do NOT include findings that require human architectural decisions
 - Limit to 10 findings maximum, prioritized by impact
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
