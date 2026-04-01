@@ -60,6 +60,13 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
 
 
+_last_provision_error: dict[str, str] = {}
+
+def get_provision_error(vm_instance_id: str) -> str:
+    """Get and clear the last provisioning error for a VM."""
+    return _last_provision_error.pop(vm_instance_id, "")
+
+
 async def delete_agent_vm(vm_instance_id: str):
     """
     Terminates an agent. In LOCAL_MODE, kills the subprocess.
@@ -284,6 +291,8 @@ EOF
         return True
     except Exception as e:
         logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
+        # Store error for the orchestrator to surface in status_log
+        _last_provision_error[vm_instance_id] = str(e)[:300]
         return False
 
 

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount
-from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms
+from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_ws_ticket, verify_ws_ticket
@@ -608,6 +608,8 @@ async def orchestrator_worker():
                                     failed_task = await inner_session.get(Task, t_id)
                                     if failed_task:
                                         failed_task.status = TaskStatus.FAILED
+                                        provision_err = get_provision_error(vm_id)
+                                        failed_task.latest_status_message = f"VM provisioning failed ({vm_id}): {provision_err or 'unknown error'}"
                                         inner_session.add(failed_task)
                                         await inner_session.commit()
                                         await broadcast_to_project(
