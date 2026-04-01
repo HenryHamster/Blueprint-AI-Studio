@@ -45,6 +45,7 @@ from app.github import (
     get_pull_request,
     get_pr_files,
     get_check_runs,
+    close_github_client,
 )
 import hmac
 import hashlib
@@ -794,10 +795,12 @@ async def lifespan(app: FastAPI):
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
-    # Shutdown: Clean up resources if needed
+    # Shutdown: Clean up resources
     reaper_task.cancel()
     gcp_cleanup_task.cancel()
     orchestrator_task.cancel()
+    monitor_task.cancel()
+    await close_github_client()
 
 app = FastAPI(
     title="Blueprint Orchestrator",

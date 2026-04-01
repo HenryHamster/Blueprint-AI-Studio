@@ -268,7 +268,7 @@ async function handleCreate(
 
     // Verify no conflict markers before pushing
     try {
-      const markers = execFileSync('grep', ['-rl', '<' + '<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.jsx', '--include=*.json', '--exclude-dir=node_modules'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (markers) {
         sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
         try { git(['rebase', '--abort']); } catch {}
@@ -450,7 +450,7 @@ async function handleFix(
   // Also check for conflict markers in tracked files via grep
   if (!hasConflicts) {
     try {
-      const markerCheck = execFileSync('grep', ['-rl', '<' + '<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.json', '--exclude-dir=node_modules'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      const markerCheck = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (markerCheck) {
         enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}\n\nThis is the PRIMARY task — resolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file. Keep the intent of this PR's changes while incorporating upstream updates from ${baseBranch}.\n\n${prompt}`;
         sendLog(ws, `Files with conflict markers:\n${markerCheck}\n`);
@@ -515,7 +515,7 @@ async function handleFix(
   // The review/fix loop will continue trying if markers remain
   if (exitCode === 0) {
     try {
-      const remainingMarkers = execFileSync('grep', ['-rl', '<' + '<<<<<<', WORKSPACE, '--include=*.ts', '--include=*.tsx', '--include=*.py', '--include=*.js', '--include=*.jsx', '--include=*.json', '--exclude-dir=node_modules'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      const remainingMarkers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (remainingMarkers) {
         sendLog(ws, `WARNING: Conflict markers still present in:\n${remainingMarkers}\nPushing anyway — review pipeline will continue resolving.\n`);
       }
