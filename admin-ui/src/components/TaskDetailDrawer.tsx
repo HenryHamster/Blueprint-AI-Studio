@@ -1,11 +1,13 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
-import { Terminal, X, Copy, Check, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2 } from 'lucide-react';
+import { Terminal, X, Copy, Check, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl } from './TaskCard';
 import type { Task } from './TaskCard';
 
 interface TaskDetailDrawerProps {
   task: Task;
   logLines: string[];
+  logsConnecting?: boolean;
+  wsDisconnected?: boolean;
   actionLoading?: string;
   onClose: () => void;
   onApprove: (id: string) => void;
@@ -221,12 +223,14 @@ function LogsTab({
   logFilter,
   setLogFilter,
   showLineNumbers,
+  logsConnecting,
 }: {
   logLines: string[];
   task: Task;
   logFilter: string;
   setLogFilter: (v: string) => void;
   showLineNumbers: boolean;
+  logsConnecting: boolean;
 }) {
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -243,6 +247,14 @@ function LogsTab({
     : indexedLines;
 
   if (logLines.length === 0) {
+    if (logsConnecting) {
+      return (
+        <div className="flex-1 flex items-center justify-center gap-2 text-neutral-500 text-sm">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Connecting to log stream...
+        </div>
+      );
+    }
     return (
       <div className="flex-1 flex items-center justify-center text-neutral-500 text-sm">
         {isActive ? 'Waiting for logs...' : 'No logs available'}
@@ -304,6 +316,8 @@ function LogsTab({
 export function TaskDetailDrawer({
   task,
   logLines,
+  logsConnecting = false,
+  wsDisconnected = false,
   actionLoading,
   onClose,
   onApprove,
@@ -315,6 +329,7 @@ export function TaskDetailDrawer({
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
   const [showLineNumbers, setShowLineNumbers] = useState(false);
+  const [copiedLogs, setCopiedLogs] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState(false);
   const [editPromptValue, setEditPromptValue] = useState(task.description);
@@ -365,6 +380,26 @@ export function TaskDetailDrawer({
     dragCleanupRef.current = cleanup;
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', cleanup);
+  };
+
+  const filteredLogLines = logFilter
+    ? logLines.filter(line => line.toLowerCase().includes(logFilter.toLowerCase()))
+    : logLines;
+
+  const handleCopyLogs = () => {
+    navigator.clipboard.writeText(filteredLogLines.join('\n'));
+    setCopiedLogs(true);
+    setTimeout(() => setCopiedLogs(false), 2000);
+  };
+
+  const handleDownloadLogs = () => {
+    const blob = new Blob([logLines.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `task-${task.id}-logs.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
@@ -444,17 +479,35 @@ export function TaskDetailDrawer({
             )}
           </button>
           {activeTab === 'logs' && (
-            <button
-              onClick={() => setShowLineNumbers(v => !v)}
-              title="Toggle line numbers"
-              className={`ml-auto mr-2 p-1.5 rounded transition-colors ${
-                showLineNumbers
-                  ? 'text-blue-400 bg-blue-500/10'
-                  : 'text-neutral-500 hover:text-neutral-300'
-              }`}
-            >
-              <Hash className="w-3.5 h-3.5" />
-            </button>
+            <div className="ml-auto mr-2 flex items-center gap-1">
+              <button
+                onClick={() => setShowLineNumbers(v => !v)}
+                title="Toggle line numbers"
+                className={`p-1.5 rounded transition-colors ${
+                  showLineNumbers
+                    ? 'text-blue-400 bg-blue-500/10'
+                    : 'text-neutral-500 hover:text-neutral-300'
+                }`}
+              >
+                <Hash className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={handleCopyLogs}
+                disabled={logLines.length === 0}
+                title="Copy logs"
+                className="p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed"
+              >
+                {copiedLogs ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
+              <button
+                onClick={handleDownloadLogs}
+                disabled={logLines.length === 0}
+                title="Download logs"
+                className="p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed"
+              >
+                <Download className="w-3.5 h-3.5" />
+              </button>
+            </div>
           )}
         </div>
 
@@ -462,13 +515,22 @@ export function TaskDetailDrawer({
         {activeTab === 'details' ? (
           <DetailsTab task={task} />
         ) : (
-          <LogsTab
-            logLines={logLines}
-            task={task}
-            logFilter={logFilter}
-            setLogFilter={setLogFilter}
-            showLineNumbers={showLineNumbers}
-          />
+          <>
+            {wsDisconnected && (
+              <div className="flex items-center gap-2 px-4 py-2 bg-amber-950/40 border-b border-amber-800/50 text-amber-400 text-xs shrink-0">
+                <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                Log stream disconnected
+              </div>
+            )}
+            <LogsTab
+              logLines={logLines}
+              task={task}
+              logFilter={logFilter}
+              setLogFilter={setLogFilter}
+              showLineNumbers={showLineNumbers}
+              logsConnecting={logsConnecting}
+            />
+          </>
         )}
 
         {/* Action Footer */}
@@ -479,16 +541,16 @@ export function TaskDetailDrawer({
                 <button
                   onClick={() => onApprove(task.id)}
                   disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  Approve
+                  {actionLoading === 'approve' && <Loader2 className="w-3 h-3 animate-spin" />}Approve
                 </button>
                 <button
                   onClick={() => onCancel(task.id)}
                   disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  Reject
+                  {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Reject
                 </button>
               </>
             )}
@@ -507,9 +569,9 @@ export function TaskDetailDrawer({
                 <button
                   onClick={() => { onCancel(task.id); setConfirmCancel(false); }}
                   disabled={!!actionLoading}
-                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  Confirm
+                  {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Confirm
                 </button>
                 <button
                   onClick={() => setConfirmCancel(false)}
@@ -525,9 +587,9 @@ export function TaskDetailDrawer({
                 <button
                   onClick={() => onRetry(task.id)}
                   disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  Retry
+                  {actionLoading === 'retry' && <Loader2 className="w-3 h-3 animate-spin" />}Retry
                 </button>
                 {!editingPrompt ? (
                   <button
@@ -547,9 +609,9 @@ export function TaskDetailDrawer({
                     <button
                       onClick={() => { onEditPrompt(task.id, editPromptValue); setEditingPrompt(false); }}
                       disabled={!!actionLoading}
-                      className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                      className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                     >
-                      Save
+                      {actionLoading === 'edit' && <Loader2 className="w-3 h-3 animate-spin" />}Save
                     </button>
                     <button
                       onClick={() => { setEditingPrompt(false); setEditPromptValue(task.description); }}
@@ -562,9 +624,9 @@ export function TaskDetailDrawer({
                 <button
                   onClick={() => onDismiss(task.id)}
                   disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-400 text-sm font-medium transition-colors"
+                  className="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-400 text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
-                  Dismiss
+                  {actionLoading === 'dismiss' && <Loader2 className="w-3 h-3 animate-spin" />}Dismiss
                 </button>
               </>
             )}

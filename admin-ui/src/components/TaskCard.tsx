@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect, useRef } from 'react';
-import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, Search, GitFork, Microscope, Shield } from 'lucide-react';
+import { Square, CheckCircle, AlertCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield } from 'lucide-react';
 
 export function isSafeUrl(url: string): boolean {
   try {
@@ -185,26 +185,43 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
 export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
+  const [descExpanded, setDescExpanded] = useState(false);
   const [statusExpanded, setStatusExpanded] = useState(false);
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [confirmAction, setConfirmAction] = useState<'cancel' | 'dismiss' | null>(null);
+  const [confirmCountdown, setConfirmCountdown] = useState(3);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const confirmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     return () => {
       if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
+      if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
     };
   }, []);
 
   const handleDestructiveClick = (action: 'cancel' | 'dismiss', callback: () => void) => {
     if (confirmAction === action) {
       if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
+      if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
       setConfirmAction(null);
+      setConfirmCountdown(3);
       callback();
     } else {
       if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
+      if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
       setConfirmAction(action);
-      confirmTimeoutRef.current = setTimeout(() => setConfirmAction(null), 3000);
+      setConfirmCountdown(3);
+      let remaining = 3;
+      confirmIntervalRef.current = setInterval(() => {
+        remaining -= 1;
+        setConfirmCountdown(remaining);
+        if (remaining <= 0) clearInterval(confirmIntervalRef.current!);
+      }, 1000);
+      confirmTimeoutRef.current = setTimeout(() => {
+        setConfirmAction(null);
+        setConfirmCountdown(3);
+      }, 3000);
     }
   };
   const isChild = !!task.parent_task_id;
@@ -256,7 +273,24 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
         ) : null}
       </div>
 
-      <p className="text-xs text-neutral-400 line-clamp-2 mb-3">{task.description}</p>
+      {isActive && heartbeat.text.startsWith('Stale') && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-700 rounded px-2 py-1 text-xs flex items-center gap-1.5 mb-3">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
+          No heartbeat for 5+ minutes — task may be stuck
+        </div>
+      )}
+
+      <div className="mb-3">
+        <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-2'}`}>{task.description}</p>
+        {task.description.length > 120 && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}
+            className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5"
+          >
+            {descExpanded ? <>Show less <ChevronUp className="w-3 h-3" /></> : <>Show more <ChevronDown className="w-3 h-3" /></>}
+          </button>
+        )}
+      </div>
 
       {task.latest_status_message ? (
         <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
@@ -384,16 +418,16 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
           <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`flex-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'approve' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />} Approve
           </button>
-          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-red-500/10 hover:bg-red-500/20 text-red-500 border-red-500/20'} ${actionLoading && actionLoading !== 'cancel' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <AlertCircle className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? 'Confirm Reject' : 'Reject'}
+          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-red-500/10 hover:bg-red-500/20 text-red-500 border-red-500/20'} ${actionLoading && actionLoading !== 'cancel' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <AlertCircle className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to reject (${confirmCountdown}s)` : 'Reject'}
           </button>
         </div>
       ) : null}
 
       {!task.requires_approval && isActive ? (
         <div className="mt-3 flex gap-2">
-          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? 'Confirm Cancel' : 'Cancel'}
+          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to cancel (${confirmCountdown}s)` : 'Cancel'}
           </button>
         </div>
       ) : null}
@@ -405,12 +439,14 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
               <textarea
                 value={editPrompt}
                 onChange={e => setEditPrompt(e.target.value)}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs resize-none focus:outline-none focus:ring-1 focus:ring-blue-500/50 h-20 font-mono"
+                className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
               />
+              <div className="text-[10px] text-neutral-500">{editPrompt.length} characters</div>
               <div className="flex gap-2">
                 <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
-                  className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors">
-                  Save
+                  disabled={!!actionLoading || editPrompt.trim() === ''}
+                  className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'edit' && <Activity className="w-3.5 h-3.5 animate-spin" />}Save
                 </button>
                 <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
                   className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
@@ -426,8 +462,8 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
               <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
                 <Pencil className="w-3.5 h-3.5" /> Edit
               </button>
-              <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-colors flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-red-500/20 text-red-400 border-red-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
-                {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ' Confirm?' : ''}
+              <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
               </button>
             </div>
           )}

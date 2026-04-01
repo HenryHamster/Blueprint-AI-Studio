@@ -302,6 +302,8 @@ export default function App() {
         <TaskDetailDrawer
           task={s.logTask}
           logLines={s.logLines}
+          logsConnecting={s.logsConnecting}
+          wsDisconnected={s.wsDisconnected}
           actionLoading={s.actionLoadingMap[s.logTask.id]}
           onClose={s.closeLogViewer}
           onApprove={s.handleApprove}

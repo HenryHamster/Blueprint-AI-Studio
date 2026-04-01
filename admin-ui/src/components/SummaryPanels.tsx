@@ -26,7 +26,7 @@ export function SummaryPanels({ actionRequiredTasks, runningTasks, completedRece
             <div key={t.id} title={t.title} onClick={() => onSelectTask(t)} className="text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded flex justify-between items-center cursor-pointer hover:bg-neutral-800/50">
               <span className="truncate pr-2 text-neutral-300">{t.title}</span>
               <div className="shrink-0 flex items-center gap-1.5">
-                {t.requires_approval && (t.status === 'IN_PROGRESS' || t.status === 'EVALUATING') && (
+                {t.requires_approval && (t.status === 'IN_PROGRESS' || t.status === 'EVALUATING' || t.status === 'QUEUED') && (
                   <button
                     onClick={e => { e.stopPropagation(); onApproveTask(t.id); }}
                     className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border border-emerald-500/20"

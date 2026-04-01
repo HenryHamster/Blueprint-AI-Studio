@@ -60,6 +60,8 @@ export function useAppState() {
   // Log viewer state
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
+  const [logsConnecting, setLogsConnecting] = useState(false);
+  const [wsDisconnected, setWsDisconnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Research browser state
@@ -180,6 +182,13 @@ export function useAppState() {
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, limit, user, statusFilter, refreshInterval]);
+
+  // Clear wsDisconnected banner when task reaches a terminal state
+  useEffect(() => {
+    if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
+      setWsDisconnected(false);
+    }
+  }, [logTask?.status]);
 
   // Clean up WebSocket on close
   useEffect(() => {
@@ -386,6 +395,7 @@ export function useAppState() {
         body: JSON.stringify({ requires_approval: false }),
       });
       fetchTasks();
+      addToast('Task approved', 'success');
     } catch (error) {
       console.error('Failed to approve task:', error);
       addToast('Failed to approve task', 'error');
@@ -403,6 +413,7 @@ export function useAppState() {
         body: JSON.stringify({ status: 'CANCELLED' }),
       });
       fetchTasks();
+      addToast('Task cancelled', 'success');
     } catch (error) {
       console.error('Failed to cancel task:', error);
       addToast('Failed to cancel task', 'error');
@@ -421,6 +432,7 @@ export function useAppState() {
       });
       fetchTasks();
       fetchArchiveTasks();
+      addToast('Task queued for retry', 'success');
     } catch (error) {
       console.error('Failed to retry task:', error);
       addToast('Failed to retry task', 'error');
@@ -438,6 +450,7 @@ export function useAppState() {
         body: JSON.stringify({ payloads: [{ prompt: newPrompt }] }),
       });
       fetchTasks();
+      addToast('Prompt updated', 'success');
     } catch (error) {
       console.error('Failed to edit task:', error);
       addToast('Failed to edit task', 'error');
@@ -455,6 +468,7 @@ export function useAppState() {
         body: JSON.stringify({ status: 'CANCELLED' }),
       });
       fetchTasks();
+      addToast('Task dismissed', 'success');
     } catch (error) {
       console.error('Failed to dismiss task:', error);
       addToast('Failed to dismiss task', 'error');
@@ -670,6 +684,7 @@ export function useAppState() {
       setNewTaskPrompt('');
       setNewTaskPrNumber('');
       setNewTaskPrBranch('');
+      addToast('Task created successfully', 'success');
       fetchTasks();
     } catch (error) {
       console.error('Failed to create task:', error);
@@ -683,9 +698,12 @@ export function useAppState() {
     }
     setLogTask(task);
     setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
+    setWsDisconnected(false);
 
     if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;
     if (!task.project_id) return;
+
+    setLogsConnecting(true);
 
     (async () => {
       try {
@@ -694,6 +712,7 @@ export function useAppState() {
           headers: await authHeaders(),
         });
         if (!ticketRes.ok) {
+          setLogsConnecting(false);
           setLogLines(prev => [...prev, '[Failed to get WebSocket ticket]']);
           return;
         }
@@ -702,11 +721,14 @@ export function useAppState() {
         const wsUrl = (API_BASE_URL || window.location.origin).replace(/^http/, 'ws');
         const ws = new WebSocket(`${wsUrl}/api/projects/${task.project_id}/ws`);
         wsRef.current = ws;
+        let wasConnected = false;
 
         ws.onopen = () => {
           ws.send(JSON.stringify({ ticket }));
           setLogLines(prev => [...prev, '[Connected to live log stream]']);
           setWsConnected(true);
+          setLogsConnecting(false);
+          wasConnected = true;
         };
 
         ws.onmessage = (event) => {
@@ -729,14 +751,19 @@ export function useAppState() {
         ws.onerror = (e) => {
           console.error('[WS] error:', e);
           setLogLines(prev => [...prev, `[WebSocket error — check browser console (F12)]`]);
+          setLogsConnecting(false);
+          if (wasConnected) setWsDisconnected(true);
         };
 
         ws.onclose = (e) => {
           console.log('[WS] closed:', e.code, e.reason);
           setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
           setWsConnected(false);
+          setLogsConnecting(false);
+          if (wasConnected) setWsDisconnected(true);
         };
       } catch (err) {
+        setLogsConnecting(false);
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
       }
     })();
@@ -749,6 +776,8 @@ export function useAppState() {
       wsRef.current = null;
     }
     setWsConnected(false);
+    setLogsConnecting(false);
+    setWsDisconnected(false);
     setLogTask(null);
     setLogLines([]);
   };
@@ -873,7 +902,7 @@ export function useAppState() {
     // Projects
     projects, selectedProjectId, setSelectedProjectId,
     // Log viewer
-    logTask, logLines, handleViewLogs, closeLogViewer,
+    logTask, logLines, logsConnecting, wsDisconnected, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     // New task modal

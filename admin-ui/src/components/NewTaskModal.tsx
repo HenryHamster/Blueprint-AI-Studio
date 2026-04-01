@@ -1,4 +1,5 @@
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle } from 'lucide-react';
+import { useState, useRef } from 'react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 
 interface NewTaskModalProps {
   newTaskRepo: string;
@@ -27,7 +28,7 @@ interface NewTaskModalProps {
   setUseManualBranch: React.Dispatch<React.SetStateAction<boolean>>;
   setBranchOptions: React.Dispatch<React.SetStateAction<string[]>>;
   onRepoChange: (value: string) => void;
-  onSubmit: (e: React.FormEvent) => void;
+  onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
 }
 
@@ -61,6 +62,30 @@ export function NewTaskModal({
   onSubmit,
   onClose,
 }: NewTaskModalProps) {
+  const [submitting, setSubmitting] = useState(false);
+  const [submitAttempted, setSubmitAttempted] = useState(false);
+  const [prNumberError, setPrNumberError] = useState(false);
+  const prNumberRef = useRef<HTMLInputElement>(null);
+
+  const isPrNumberValid = (value: string) => /^[1-9]\d*$/.test(value);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitAttempted(true);
+    if (repoError || branchError) return;
+    if ((newTaskType === 'review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
+      setPrNumberError(true);
+      prNumberRef.current?.focus();
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await onSubmit(e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
       <div className="bg-neutral-900 rounded-xl shadow-2xl w-full max-w-lg overflow-hidden border border-neutral-800">
@@ -73,7 +98,7 @@ export function NewTaskModal({
             <X className="w-4 h-4" />
           </button>
         </div>
-        <form onSubmit={onSubmit} className="p-5">
+        <form onSubmit={handleSubmit} className="p-5">
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -99,7 +124,7 @@ export function NewTaskModal({
                     required
                     value={newTaskRepo}
                     onChange={e => onRepoChange(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="owner/repo"
                   />
                   {repoError && <p className="text-[10px] text-amber-500 mt-1">{repoError}</p>}
@@ -109,7 +134,7 @@ export function NewTaskModal({
                   required
                   value={newTaskRepo}
                   onChange={e => onRepoChange(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer"
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
                 >
                   <option value="" disabled>Select a repository</option>
                   {repoOptions.map(r => (
@@ -141,7 +166,7 @@ export function NewTaskModal({
                     type="text"
                     value={newTaskBranch}
                     onChange={e => setNewTaskBranch(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono"
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="main"
                   />
                   {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
@@ -150,7 +175,7 @@ export function NewTaskModal({
                 <select
                   value={newTaskBranch}
                   onChange={e => setNewTaskBranch(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer"
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
                 >
                   {branchOptions.map(b => (
                     <option key={b} value={b}>{b}</option>
@@ -193,12 +218,16 @@ export function NewTaskModal({
               <div>
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
                 <input
+                  ref={prNumberRef}
                   type="number"
+                  min="1"
                   value={newTaskPrNumber}
-                  onChange={e => setNewTaskPrNumber(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  onChange={e => { setNewTaskPrNumber(e.target.value); if (prNumberError) setPrNumberError(false); }}
+                  onBlur={() => setPrNumberError(!isPrNumberValid(newTaskPrNumber))}
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'}`}
                   placeholder="e.g., 15"
                 />
+                {prNumberError && <p className="text-[10px] text-red-500 mt-1">PR number must be a positive integer.</p>}
               </div>
               <div>
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Branch</label>
@@ -237,7 +266,10 @@ export function NewTaskModal({
               <span className="text-[10px] text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
             </div>
           </div>
-          <div className="flex justify-end gap-2">
+          <div className="flex justify-end gap-2 items-center">
+            {submitAttempted && (repoError || branchError) && (
+              <span className="text-[11px] text-red-400 mr-auto">Fix errors above before launching.</span>
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -247,8 +279,10 @@ export function NewTaskModal({
             </button>
             <button
               type="submit"
-              className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors"
+              disabled={submitting}
+              className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
+              {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}
               Launch
             </button>
           </div>
