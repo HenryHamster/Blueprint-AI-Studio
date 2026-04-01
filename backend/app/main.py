@@ -659,9 +659,10 @@ async def orchestrator_worker():
                         if ci_result["status"] != "completed":
                             continue  # Still running
 
-                        ci_branch = ci_loop.get("branch", "")
-                        ci_base = ci_loop.get("base_branch", "main")
-                        ci_orig_id = ci_loop.get("original_task_id", "")
+                        ci_payload = (ci_task.payloads or [{}])[0]
+                        ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
+                        ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+                        ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
 
                         if ci_result["conclusion"] == "success":
                             # CI passed — merge
@@ -787,7 +788,7 @@ app.include_router(admin_router)
 _orchestrator_last_cycle: Optional[datetime] = None
 
 @app.get("/api/debug/orchestrator")
-async def debug_orchestrator(session: AsyncSession = Depends(get_session)):
+async def debug_orchestrator(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
     """Diagnostic endpoint: check if the orchestrator loop is alive."""
     from sqlalchemy import func
     queued = (await session.execute(
@@ -1444,11 +1445,12 @@ async def _spawn_pipeline_task(
     Returns None if the review-fix cycle limit has been reached."""
     # Track review-fix iteration count to prevent infinite loops
     source_loop = (source_task.context or {}).get("review_loop", {})
+    source_payload = (source_task.payloads or [{}])[0]
     iteration = source_loop.get("iteration", 0) + 1
 
     if iteration > MAX_REVIEW_FIX_ITERATIONS:
         # Cap reached — require manual intervention
-        orig_id = original_task_id or source_loop.get("original_task_id", "")
+        orig_id = original_task_id or source_loop.get("original_task_id", "") or source_payload.get("original_task_id", "")
         if orig_id:
             try:
                 orig = await session.get(Task, uuid.UUID(orig_id))
@@ -2137,7 +2139,8 @@ async def update_agent_status(
             task_payload = (task.payloads or [{}])[0]
             task_type = task_payload.get("type", "")
             if task_type in ("review", "fix"):
-                original_task_id = (task.context or {}).get("review_loop", {}).get("original_task_id", "")
+                original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
+                                    or task_payload.get("original_task_id", ""))
                 if original_task_id:
                     try:
                         orig = await session.get(Task, uuid.UUID(original_task_id))

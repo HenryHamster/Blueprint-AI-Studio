@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String
+from sqlalchemy import Column, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 import uuid
 from datetime import datetime
@@ -96,7 +96,7 @@ class Task(SQLModel, table=True):
     payloads: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB))
 
     # Shared memory/context for the agent during execution
-    context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
+    context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")))
 
     # Stores parsed plan output from plan-type tasks (for debugging/admin visibility)
     plan_output: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))

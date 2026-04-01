@@ -100,7 +100,9 @@ function sanitize(text: string): string {
     .replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:***@')
     .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_***')
     .replace(/ghs_[A-Za-z0-9_]+/g, 'ghs_***')
-    .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***');
+    .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
+    .replace(/sk-ant-[A-Za-z0-9_\-]+/g, 'sk-ant-***')
+    .replace(/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, 'eyJ***');
 }
 
 function sendLog(ws: WebSocket | null, content: string) {
@@ -126,9 +128,14 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
 
   const exitCode = await new Promise<number>((resolve) => {
     const claudeEnv: Record<string, string> = {
-      ...process.env as Record<string, string>,
       HOME: process.env.HOME || '/home/agent',
+      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      TERM: process.env.TERM || 'xterm-256color',
     };
+    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+      claudeEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    }
     if (process.env.ANTHROPIC_API_KEY) {
       claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
     }
