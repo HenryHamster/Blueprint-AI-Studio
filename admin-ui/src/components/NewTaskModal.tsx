@@ -82,7 +82,7 @@ export function NewTaskModal({
                   <button
                     type="button"
                     onClick={() => { setUseManualRepo(m => !m); if (!useManualRepo) { setNewTaskRepo(''); setBranchOptions([]); } }}
-                    className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {useManualRepo ? 'Use dropdown' : 'Type manually'}
                   </button>
@@ -125,7 +125,7 @@ export function NewTaskModal({
                   <button
                     type="button"
                     onClick={() => setUseManualBranch(m => !m)}
-                    className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
                   >
                     {useManualBranch ? 'Use dropdown' : 'Type manually'}
                   </button>
@@ -188,8 +188,8 @@ export function NewTaskModal({
               ))}
             </div>
           </div>
-          {(newTaskType === 'review' || newTaskType === 'fix') ? (
-            <div className="mb-4 grid grid-cols-2 gap-3">
+          <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>
+            <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">PR Number</label>
                 <input
@@ -211,12 +211,13 @@ export function NewTaskModal({
                 />
               </div>
             </div>
-          ) : null}
+          </div>
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Title</label>
             <input
               type="text"
               required
+              autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
               className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
@@ -225,13 +226,16 @@ export function NewTaskModal({
           </div>
           <div className="mb-6">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Prompt / Instructions</label>
-            <textarea
-              required
-              value={newTaskPrompt}
-              onChange={e => setNewTaskPrompt(e.target.value)}
-              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 h-40 resize-none transition-all placeholder:text-neutral-600"
-              placeholder="Describe what Claude Code should do in this repository. Be specific about files, patterns, and expected outcomes..."
-            />
+            <div className="relative">
+              <textarea
+                required
+                value={newTaskPrompt}
+                onChange={e => setNewTaskPrompt(e.target.value)}
+                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"
+                placeholder="Describe what Claude Code should do in this repository. Be specific about files, patterns, and expected outcomes..."
+              />
+              <span className="text-[10px] text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
+            </div>
           </div>
           <div className="flex justify-end gap-2">
             <button

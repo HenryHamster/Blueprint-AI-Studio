@@ -11,6 +11,7 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
+import { StatusBar } from './components/StatusBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
@@ -128,6 +129,12 @@ export default function App() {
         onUpdateRefreshInterval={s.setRefreshInterval}
       />
 
+      <StatusBar
+        apiHealthy={s.apiHealthy}
+        wsConnected={s.wsConnected}
+        lastFetchTime={s.lastFetchTime}
+      />
+
       <div
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
         style={{ maxHeight: s.showMetrics ? '500px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
@@ -140,7 +147,7 @@ export default function App() {
         />
       </div>
 
-      <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} />
+      <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} onSelectTask={s.handleViewLogs} onApproveTask={s.handleApprove} />
 
       {s.error && (
         <div className="mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
@@ -173,6 +180,9 @@ export default function App() {
           setArchiveSearchQuery={s.setArchiveSearchQuery}
           setArchiveDateRange={s.setArchiveDateRange}
           handleViewLogs={s.handleViewLogs}
+          onRetryTask={s.handleRetry}
+          archiveSortOrder={s.archiveSortOrder}
+          setArchiveSortOrder={s.setArchiveSortOrder}
         />
       ) : (
         <>

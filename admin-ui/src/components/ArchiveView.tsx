@@ -1,4 +1,4 @@
-import { X, Search, ExternalLink, Eye, Loader2, Archive, ChevronLeft, ChevronRight } from 'lucide-react';
+import { X, Search, ExternalLink, Eye, Loader2, Archive, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
 
@@ -18,6 +18,9 @@ interface ArchiveViewProps {
   setArchiveSearchQuery: (query: string) => void;
   setArchiveDateRange: (range: string) => void;
   handleViewLogs: (task: Task) => void;
+  onRetryTask?: (taskId: string) => void;
+  archiveSortOrder: 'desc' | 'asc';
+  setArchiveSortOrder: (order: 'desc' | 'asc') => void;
 }
 
 const STATUS_FILTERS: { value: string; label: string }[] = [
@@ -78,6 +81,9 @@ export default function ArchiveView({
   setArchiveSearchQuery,
   setArchiveDateRange,
   handleViewLogs,
+  onRetryTask,
+  archiveSortOrder,
+  setArchiveSortOrder,
 }: ArchiveViewProps) {
   const showingFrom = (archivePage - 1) * archivePageSize + 1;
   const showingTo = showingFrom + archiveTasks.length - 1;
@@ -150,6 +156,16 @@ export default function ArchiveView({
             </button>
           ))}
         </div>
+
+        {/* Sort order */}
+        <select
+          value={archiveSortOrder}
+          onChange={(e) => setArchiveSortOrder(e.target.value as 'desc' | 'asc')}
+          className="bg-neutral-900 border border-neutral-800 text-neutral-400 text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:ring-1 focus:ring-neutral-700"
+        >
+          <option value="desc">Newest first</option>
+          <option value="asc">Oldest first</option>
+        </select>
       </div>
 
       {/* Results list */}
@@ -158,6 +174,16 @@ export default function ArchiveView({
           <div className="flex flex-col items-center justify-center h-full text-neutral-500">
             <Archive className="w-10 h-10 mb-3 text-neutral-700" />
             <p className="text-sm">No archived tasks match your filters.</p>
+            <button
+              onClick={() => {
+                setArchiveStatusFilter('all');
+                setArchiveSearchQuery('');
+                setArchiveDateRange('all');
+              }}
+              className="mt-3 px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 transition-colors border border-neutral-700"
+            >
+              Clear filters
+            </button>
           </div>
         ) : (
           <div className="flex flex-col gap-2">
@@ -169,7 +195,7 @@ export default function ArchiveView({
               return (
                 <div
                   key={task.id}
-                  className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 hover:bg-neutral-800/50 transition-colors flex items-center gap-4"
+                  className={`bg-neutral-900 border border-neutral-800 border-l-2 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} rounded-lg px-4 py-3 hover:bg-neutral-800/50 transition-colors flex items-center gap-4`}
                 >
                   {/* Title & description */}
                   <div className="flex-1 min-w-0">
@@ -225,6 +251,18 @@ export default function ArchiveView({
                     <Eye className="w-3.5 h-3.5" />
                     View Details
                   </button>
+
+                  {/* Retry (FAILED only) */}
+                  {task.status === 'FAILED' && onRetryTask && (
+                    <button
+                      onClick={() => onRetryTask(task.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-neutral-800 text-blue-400 hover:bg-neutral-700 transition-colors shrink-0"
+                      title="Retry task"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      Retry
+                    </button>
+                  )}
                 </div>
               );
             })}

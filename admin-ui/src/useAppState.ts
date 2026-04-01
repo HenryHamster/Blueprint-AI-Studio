@@ -101,12 +101,17 @@ export function useAppState() {
 
   // Metrics dashboard state
   const [showMetrics, setShowMetrics] = useState(false);
-  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
+  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
   const [cumulativeCost, setCumulativeCost] = useState(0);
-  const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number }[]>([]);
+  const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+
+  // Status bar state
+  const [apiHealthy, setApiHealthy] = useState(true);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [lastFetchTime, setLastFetchTime] = useState<number>(0);
 
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState('');
@@ -130,6 +135,7 @@ export function useAppState() {
   const [archiveSearchQuery, setArchiveSearchQueryState] = useState('');
   const [archiveDateRange, setArchiveDateRangeState] = useState<string>('all');
   const [archiveTotalTasks, setArchiveTotalTasks] = useState(0);
+  const [archiveSortOrder, setArchiveSortOrderState] = useState<'desc' | 'asc'>('desc');
 
   // Firebase auth state
   useEffect(() => {
@@ -303,11 +309,27 @@ export function useAppState() {
             }
           }
         }
+        // Count incremental completed/failed transitions since last snapshot
+        let completedCount = 0;
+        let failedCount = 0;
+        if (prevTasksRef.current.length > 0) {
+          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          for (const t of newTasks) {
+            const prev = prevMap.get(t.id);
+            if (prev && prev !== t.status) {
+              if (t.status === 'COMPLETED') completedCount++;
+              else if (t.status === 'FAILED') failedCount++;
+            }
+          }
+        }
+
         prevTasksRef.current = newTasks;
 
         setTasks(newTasks);
         setLastRefresh(new Date());
         setError(null);
+        setApiHealthy(true);
+        setLastFetchTime(Date.now());
 
         // Always record metrics data points (rendering depends on showMetrics, not collection)
         const now = Date.now();
@@ -323,15 +345,17 @@ export function useAppState() {
         }
 
         const filtered = prevHistory.filter(p => now - p.timestamp <= 7200000);
-        const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr }];
+        const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr, completedCount, failedCount }];
         metricsHistoryRef.current = newHistory;
         setMetricsHistory(newHistory);
       } else {
         setError(`Failed to fetch tasks: ${res.statusText}`);
+        setApiHealthy(false);
       }
     } catch (err) {
       console.error('Failed to fetch tasks:', err);
       setError('Failed to connect to backend server.');
+      setApiHealthy(false);
     } finally {
       setLoading(false);
     }
@@ -392,6 +416,7 @@ export function useAppState() {
         body: JSON.stringify({ status: 'QUEUED' }),
       });
       fetchTasks();
+      fetchArchiveTasks();
     } catch (error) {
       console.error('Failed to retry task:', error);
       addToast('Failed to retry task', 'error');
@@ -677,6 +702,7 @@ export function useAppState() {
         ws.onopen = () => {
           ws.send(JSON.stringify({ ticket }));
           setLogLines(prev => [...prev, '[Connected to live log stream]']);
+          setWsConnected(true);
         };
 
         ws.onmessage = (event) => {
@@ -704,6 +730,7 @@ export function useAppState() {
         ws.onclose = (e) => {
           console.log('[WS] closed:', e.code, e.reason);
           setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
+          setWsConnected(false);
         };
       } catch (err) {
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
@@ -717,6 +744,7 @@ export function useAppState() {
       wsRef.current.close();
       wsRef.current = null;
     }
+    setWsConnected(false);
     setLogTask(null);
     setLogLines([]);
   };
@@ -727,6 +755,7 @@ export function useAppState() {
     statusOverride?: string,
     searchOverride?: string,
     dateRangeOverride?: string,
+    sortOrderOverride?: 'desc' | 'asc',
   ) => {
     setArchiveLoading(true);
     try {
@@ -735,6 +764,7 @@ export function useAppState() {
       const status = statusOverride ?? archiveStatusFilter;
       const search = searchOverride ?? archiveSearchQuery;
       const dateRange = dateRangeOverride ?? archiveDateRange;
+      const sortOrder = sortOrderOverride ?? archiveSortOrder;
       const offset = (p - 1) * ps;
       let url = `${API_BASE_URL}/api/admin/tasks?limit=${ps}&offset=${offset}`;
       if (status !== 'all') {
@@ -753,10 +783,17 @@ export function useAppState() {
           url += `&created_after=${encodeURIComponent(after.toISOString())}`;
         }
       }
+      url += `&sort_order=${sortOrder}`;
       const res = await authGet(url);
       if (res.ok) {
         const data = await res.json();
-        setArchiveTasks(data.tasks || []);
+        let tasks: Task[] = data.tasks || [];
+        // Frontend fallback sort in case the backend ignores the sort_order param
+        tasks = [...tasks].sort((a, b) => {
+          const diff = new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+          return sortOrder === 'asc' ? -diff : diff;
+        });
+        setArchiveTasks(tasks);
         setArchiveTotalTasks(data.total || 0);
       }
     } catch (err) {
@@ -807,6 +844,12 @@ export function useAppState() {
     setArchiveDateRangeState(range);
     setArchivePageState(1);
     fetchArchiveTasks(1, undefined, undefined, undefined, range);
+  };
+
+  const setArchiveSortOrder = (order: 'desc' | 'asc') => {
+    setArchiveSortOrderState(order);
+    setArchivePageState(1);
+    fetchArchiveTasks(1, undefined, undefined, undefined, undefined, order);
   };
 
   return {
@@ -860,8 +903,11 @@ export function useAppState() {
     archiveSearchQuery, setArchiveSearchQuery,
     archiveDateRange, setArchiveDateRange,
     archiveTotalTasks, fetchArchiveTasks,
+    archiveSortOrder, setArchiveSortOrder,
     // Misc
     lastRefresh, wsRef,
     showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,
+    // Status bar
+    apiHealthy, wsConnected, lastFetchTime,
   };
 }

@@ -60,6 +60,27 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
       </button>
 
       {!collapsed && (
+        <div className="flex gap-4 px-1 pb-2">
+          <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+            {projects.filter(p => p.status === 'active').length} active
+          </span>
+          <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
+            {projects.filter(p => p.status === 'paused').length} paused
+          </span>
+          <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" />
+            {projects.filter(p => p.autonomous_enabled).length} autonomous
+          </span>
+          <span className="bg-neutral-800 rounded px-2 py-0.5 text-xs text-neutral-400 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0" />
+            {projects.length} total
+          </span>
+        </div>
+      )}
+
+      {!collapsed && (
         <div className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar">
           {/* All Projects option */}
           <button
@@ -83,16 +104,19 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
               <button
                 key={project.id}
                 onClick={() => onSelectProject(isSelected ? null : project.id)}
-                className={`shrink-0 rounded-xl border p-3 min-w-[220px] max-w-[280px] text-left transition-all ${
+                className={`relative shrink-0 rounded-xl border p-3 min-w-[220px] max-w-[280px] text-left transition-all ${
                   isSelected
                     ? 'bg-neutral-800/80 border-neutral-600 ring-1 ring-neutral-600'
                     : 'bg-neutral-900/50 border-neutral-800/50 hover:border-neutral-700'
                 }`}
               >
+                {counts.failed > 0 && (
+                  <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-500" />
+                )}
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs font-semibold text-neutral-200 truncate pr-2">{project.name}</span>
                   <span className={`shrink-0 w-2 h-2 rounded-full ${project.autonomous_enabled ? 'bg-emerald-500' : 'bg-red-500'}`}
-                    title={project.autonomous_enabled ? 'Autonomous enabled' : 'Autonomous disabled'} />
+                    title={project.autonomous_enabled ? 'Autonomous mode enabled' : 'Autonomous mode disabled'} />
                 </div>
 
                 <div className="flex items-center gap-1.5 mb-2">
