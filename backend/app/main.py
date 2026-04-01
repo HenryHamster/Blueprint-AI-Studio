@@ -351,17 +351,25 @@ async def reaper_service():
                         release_max_plan_account(acct_id)
 
                     if task.attempt_count < _runtime_config["max_retries"]:
-                        print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
-                        task.attempt_count += 1
-                        task.status = TaskStatus.QUEUED
-                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
-                        task.last_heartbeat = None
-                        session.add(task)
-                        
+                        # Check if this is a parent with children — re-evaluate instead of re-run
+                        children = (await session.execute(
+                            select(Task).where(Task.parent_task_id == task.id)
+                        )).scalars().all()
+                        if children:
+                            print(f"[REAPER] Re-evaluating parent task {task.id}")
+                            await _requeue_parent_task(task, session)
+                        else:
+                            print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
+                            task.attempt_count += 1
+                            task.status = TaskStatus.QUEUED
+                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
+                            task.last_heartbeat = None
+                            session.add(task)
+
                         await broadcast_to_project(
-                            str(task.project_id), 
-                            "task_updated", 
-                            {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": task.status, "attempt_count": task.attempt_count}
                         )
                     else:
                         print(f"[REAPER] Task {task.id} failed after 3 attempts.")
@@ -1434,6 +1442,60 @@ async def spawn_subtask(
         "requires_approval": req.requires_approval
     }
 
+async def _requeue_parent_task(parent: Task, session: AsyncSession):
+    """Re-evaluate a parent task by retrying its failed children.
+    Cancels FAILED children and clones them as new QUEUED tasks.
+    Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
+    Sets parent back to EVALUATING — no VM needed."""
+    children = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id)
+    )).scalars().all()
+
+    retried_count = 0
+    for child in children:
+        if child.status != TaskStatus.FAILED:
+            continue
+        # Cancel the failed child so rollup skips it
+        child.status = TaskStatus.CANCELLED
+        child.latest_status_message = "Parent requeued — replaced by retry"
+        session.add(child)
+
+        # Clone as a new task with fresh VM assignment
+        new_child = Task(
+            project_id=child.project_id,
+            title=child.title,
+            description=child.description,
+            parent_task_id=parent.id,
+            payloads=child.payloads,
+            context={k: v for k, v in (child.context or {}).items()
+                     if k != "max_plan_account_id"},  # Strip runtime-only fields
+            depends_on=child.depends_on,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            requires_approval=child.requires_approval,
+        )
+        session.add(new_child)
+        retried_count += 1
+
+        history = TaskHistory(task_id=new_child.id, action="SPAWNED",
+                              details={"spawned_by": "REQUEUE", "retrying": str(child.id)})
+        session.add(history)
+
+    parent.status = TaskStatus.EVALUATING
+    parent.latest_status_message = f"Requeued — retrying {retried_count} failed subtask(s)"
+    parent.attempt_count = 0
+    session.add(parent)
+    await session.commit()
+
+    for child in children:
+        await session.refresh(child)
+    await broadcast_to_project(str(parent.project_id), "task_updated",
+                               {"task_id": str(parent.id), "status": TaskStatus.EVALUATING})
+    print(f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried")
+    return retried_count
+
+
 MAX_REVIEW_FIX_ITERATIONS = 30
 
 async def _spawn_pipeline_task(
@@ -1635,8 +1697,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         await create_branch(gh_token, owner, repo, plan_branch, sha)
         print(f"[PLAN] Created branch {plan_branch} from {parent_base}")
     except Exception as e:
-        print(f"[PLAN] Failed to create staging branch, falling back to {parent_base}: {e}")
-        plan_branch = parent_base
+        # Branch may already exist from a previous run — reuse it
+        print(f"[PLAN] Branch {plan_branch} already exists or creation failed: {e} — reusing")
 
     # Store branch info on the plan task for rollup later
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
@@ -1722,8 +1784,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await create_branch(gh_token, owner, repo, research_branch, sha)
         print(f"[RESEARCH] Created branch {research_branch} from {original_base}")
     except Exception as e:
-        print(f"[RESEARCH] Failed to create staging branch, falling back to {original_base}: {e}")
-        research_branch = original_base  # Fallback: PR directly into base
+        # Branch may already exist from a previous run — reuse it
+        print(f"[RESEARCH] Branch {research_branch} already exists or creation failed: {e} — reusing")
 
     created_count = 0
 

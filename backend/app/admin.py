@@ -268,11 +268,21 @@ async def modify_task(
 
             # Reset retry state when manually re-queuing a task
             if new_status == TaskStatus.QUEUED:
-                task.attempt_count = 0
-                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
-                task.last_heartbeat = None
-                changes["attempt_count"] = 0
-                changes["vm_instance_id"] = task.vm_instance_id
+                # Check if this is a parent with children — re-evaluate instead of re-run
+                from app.main import _requeue_parent_task
+                children = (await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )).scalars().all()
+                if children:
+                    retried = await _requeue_parent_task(task, session)
+                    changes["status"] = TaskStatus.EVALUATING
+                    changes["retried_children"] = retried
+                else:
+                    task.attempt_count = 0
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
+                    task.last_heartbeat = None
+                    changes["attempt_count"] = 0
+                    changes["vm_instance_id"] = task.vm_instance_id
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status")
 
