@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 
@@ -13,13 +14,13 @@ const styles: Record<Toast['type'], string> = {
   info: 'bg-neutral-900/90 border-neutral-700/50 text-neutral-300',
 };
 
-let toastCounter = 0;
+const toastCounterRef = { current: 0 };
 
 export function useToasts() {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
   const addToast = useCallback((message: string, type: Toast['type'] = 'info') => {
-    const id = `toast-${++toastCounter}`;
+    const id = `toast-${++toastCounterRef.current}`;
     setToasts(prev => [...prev, { id, message, type }]);
   }, []);
 

@@ -23,8 +23,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
   const [toggling, setToggling] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- authHeaders is a stable module-level
-  // function; including it would cause a re-render loop if a caller ever inlined it.
+  // authHeaders is stable; fetchStatus is intentionally run only on mount
   const fetchStatus = useCallback(async () => {
     try {
       const headers = await authHeaders();

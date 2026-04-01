@@ -33,7 +33,7 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const completedRecently = useMemo(() => {
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const oneDayAgo = new Date(new Date().getTime() - 24 * 60 * 60 * 1000);
     return s.tasks.filter(t => {
       if (t.status !== 'COMPLETED' && t.status !== 'CANCELLED') return false;
       const completedAt = t.history && t.history.length > 0

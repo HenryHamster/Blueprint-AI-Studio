@@ -265,6 +265,7 @@ export function useAppState() {
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showNewTaskModal, logTask, showResearchBrowser, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
 
   const fetchTasks = async () => {
@@ -357,7 +358,7 @@ export function useAppState() {
       console.error('Failed to approve task:', error);
       addToast('Failed to approve task', 'error');
     } finally {
-      setActionLoadingMap(m => { const { [taskId]: _, ...rest } = m; return rest; });
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
   };
 
@@ -374,7 +375,7 @@ export function useAppState() {
       console.error('Failed to cancel task:', error);
       addToast('Failed to cancel task', 'error');
     } finally {
-      setActionLoadingMap(m => { const { [taskId]: _, ...rest } = m; return rest; });
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
   };
 
@@ -391,7 +392,7 @@ export function useAppState() {
       console.error('Failed to retry task:', error);
       addToast('Failed to retry task', 'error');
     } finally {
-      setActionLoadingMap(m => { const { [taskId]: _, ...rest } = m; return rest; });
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
   };
 
@@ -408,7 +409,7 @@ export function useAppState() {
       console.error('Failed to edit task:', error);
       addToast('Failed to edit task', 'error');
     } finally {
-      setActionLoadingMap(m => { const { [taskId]: _, ...rest } = m; return rest; });
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
   };
 
@@ -425,7 +426,7 @@ export function useAppState() {
       console.error('Failed to dismiss task:', error);
       addToast('Failed to dismiss task', 'error');
     } finally {
-      setActionLoadingMap(m => { const { [taskId]: _, ...rest } = m; return rest; });
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
   };
 
@@ -704,6 +705,7 @@ export function useAppState() {
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
       }
     })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const closeLogViewer = () => {

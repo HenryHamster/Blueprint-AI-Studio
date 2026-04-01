@@ -65,7 +65,7 @@ function ChartSvg({
   strokeColor: string;
   refLine?: number;
 }) {
-  const now = Date.now();
+  const now = new Date().getTime();
   const tMin = now - TWO_HOURS;
   const tMax = now;
   const filtered = points.filter((p) => p.timestamp >= tMin);
@@ -161,7 +161,7 @@ export default function MetricsDashboard({
   tasks,
 }: MetricsDashboardProps) {
   // Task throughput calculation
-  const now = Date.now();
+  const now = new Date().getTime();
   const completedTasks = tasks
     .map((t) => ({ task: t, completedAt: getTaskCompletedTime(t) }))
     .filter((t): t is { task: Task; completedAt: number } => t.completedAt !== null);

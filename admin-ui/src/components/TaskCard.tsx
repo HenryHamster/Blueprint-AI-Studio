@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect, useRef } from 'react';
 import { Square, CheckCircle, AlertCircle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, Search, GitFork, Microscope, Shield } from 'lucide-react';
 
@@ -103,36 +104,41 @@ export function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
 
 function ResearchFindings({ findings }: { findings: string }) {
   const [expanded, setExpanded] = useState(false);
+
+  let parsed: Record<string, string>[] | null = null;
   try {
-    const parsed = JSON.parse(findings) as Record<string, string>[];
-    if (Array.isArray(parsed)) {
-      const items = expanded ? parsed : parsed.slice(0, 5);
-      return (
-        <div>
-          <div className={`space-y-1 ${expanded ? 'max-h-64 overflow-y-auto custom-scrollbar' : ''}`}>
-            {items.map((f, i) => (
-              <div key={i} className="text-neutral-300">
-                <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
-                {f.title}
-                {expanded && f.description ? (
-                  <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>
-                ) : null}
-              </div>
-            ))}
-          </div>
-          {parsed.length > 5 ? (
-            <button
-              onClick={() => setExpanded(!expanded)}
-              className="text-[10px] text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
-            >
-              {expanded ? 'Show less' : `Show all ${parsed.length} findings`}
-            </button>
-          ) : null}
-        </div>
-      );
-    }
+    const result = JSON.parse(findings);
+    if (Array.isArray(result)) parsed = result;
   } catch { /* fall through */ }
-  return <span className="text-neutral-400">{findings.slice(0, 2000)}</span>;
+
+  if (!parsed) {
+    return <span className="text-neutral-400">{findings.slice(0, 2000)}</span>;
+  }
+
+  const items = expanded ? parsed : parsed.slice(0, 5);
+  return (
+    <div>
+      <div className={`space-y-1 ${expanded ? 'max-h-64 overflow-y-auto custom-scrollbar' : ''}`}>
+        {items.map((f, i) => (
+          <div key={i} className="text-neutral-300">
+            <span className={`inline-block text-[9px] uppercase px-1 rounded mr-1 ${f.risk === 'high' ? 'bg-red-900/40 text-red-400' : f.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{f.scope}/{f.risk}</span>
+            {f.title}
+            {expanded && f.description ? (
+              <div className="text-[10px] text-neutral-500 ml-1 mt-0.5">{f.description}</div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {parsed.length > 5 ? (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="text-[10px] text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
+        >
+          {expanded ? 'Show less' : `Show all ${parsed.length} findings`}
+        </button>
+      ) : null}
+    </div>
+  );
 }
 
 export function StatusBadge({ status }: { status: TaskStatus }) {

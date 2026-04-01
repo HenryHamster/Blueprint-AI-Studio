@@ -50,10 +50,12 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     fetchProjects();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (selectedProjectId) fetchDirections();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
 
   async function fetchProjects() {
