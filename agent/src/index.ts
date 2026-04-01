@@ -656,17 +656,9 @@ async function main() {
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
-  // Install Max plan credentials if provided (local mode)
-  if (process.env.CLAUDE_CREDENTIALS_FILE) {
-    const fs = await import('fs');
-    const path = await import('path');
-    const claudeDir = path.join(process.env.HOME || '/home/agent', '.claude');
-    fs.mkdirSync(claudeDir, { recursive: true });
-    fs.copyFileSync(process.env.CLAUDE_CREDENTIALS_FILE, path.join(claudeDir, '.credentials.json'));
-    fs.chmodSync(path.join(claudeDir, '.credentials.json'), 0o600);
-    fs.unlinkSync(process.env.CLAUDE_CREDENTIALS_FILE);
-    delete process.env.CLAUDE_CREDENTIALS_FILE;
-    log('Max plan credentials installed');
+  // Auth: CLAUDE_CODE_OAUTH_TOKEN env var is read directly by Claude Code CLI (no file needed)
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    log('Using OAuth token for Claude Code auth');
   } else if (process.env.ANTHROPIC_API_KEY) {
     log('Using ANTHROPIC_API_KEY as fallback auth');
   }

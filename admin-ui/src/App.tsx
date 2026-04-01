@@ -117,8 +117,8 @@ export default function App() {
         onRemoveAccount={s.removeMaxPlanAccount}
         newAccountName={s.newAccountName}
         setNewAccountName={s.setNewAccountName}
-        newAccountCreds={s.newAccountCreds}
-        setNewAccountCreds={s.setNewAccountCreds}
+        newAccountToken={s.newAccountToken}
+        setNewAccountToken={s.setNewAccountToken}
         onAddAccount={s.addMaxPlanAccount}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}

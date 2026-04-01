@@ -27,7 +27,7 @@ AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
 
 # Anthropic API Key — optional fallback for Claude Code CLI.
-# Primary auth is Max plan (OAuth credentials baked into the agent VM image).
+# Primary auth is a long-lived OAuth token (sk-ant-oat01-...) from `claude setup-token`.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # The "Naked" Service Account with minimal GCP permissions.
@@ -43,55 +43,21 @@ from app.auth import create_agent_token
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
-async def delete_credentials_from_gcs(task_id: str):
-    """Delete the temporary credential object from GCS after the agent has downloaded it."""
-    object_name = f"tasks/{task_id}/.claude_credentials"
-
-    def _delete():
-        from google.cloud import storage as gcs_storage
-        client = gcs_storage.Client(project=GCP_PROJECT_ID)
-        bucket = client.bucket(ARTIFACT_BUCKET_NAME)
-        blob = bucket.blob(object_name)
-        if blob.exists():
-            blob.delete()
-            logger.info(f"Deleted GCS credential object: {object_name}")
-
-    try:
-        await asyncio.to_thread(_delete)
-    except Exception as e:
-        logger.error(f"Failed to delete GCS credential object {object_name}: {e}")
-
-
-async def _upload_credentials_to_gcs(task_id: str, credentials_json: str) -> str:
-    """Upload credentials to a short-lived GCS object. Returns gs:// URI."""
-    from google.cloud import storage as gcs_storage
-    import json
-
-    object_name = f"tasks/{task_id}/.claude_credentials"
-
-    def _upload():
-        client = gcs_storage.Client(project=GCP_PROJECT_ID)
-        bucket = client.bucket(ARTIFACT_BUCKET_NAME)
-        blob = bucket.blob(object_name)
-        blob.upload_from_string(data=credentials_json, content_type="application/json")
-        return f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
-
-    return await asyncio.to_thread(_upload)
-
-
 # --- Local Mode: Track subprocesses ---
 _local_processes: dict[str, subprocess.Popen] = {}
 
 
-async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None, claude_credentials: str = None):
+async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None,
+                              oauth_token: str = None, claude_config_json: str = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
-    claude_credentials: JSON string of Max plan OAuth credentials to write to the VM.
+    oauth_token: Long-lived OAuth token (sk-ant-oat01-...) for Claude Code CLI.
+    claude_config_json: Content of ~/.claude.json for onboarding bypass.
     """
     if LOCAL_MODE:
-        return await _provision_local(vm_instance_id, task_id, payload_uri, claude_credentials)
-    return await _provision_gcp(vm_instance_id, task_id, payload_uri, claude_credentials)
+        return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token)
+    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
 
 
 async def delete_agent_vm(vm_instance_id: str):
@@ -115,7 +81,7 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
 
 # ─── Local Mode Implementation ──────────────────────────────────────────────
 
-async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None, claude_credentials: str = None):
+async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None, oauth_token: str = None):
     logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
 
     agent_jwt = create_agent_token(str(task_id), vm_instance_id)
@@ -127,17 +93,10 @@ async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri:
         "AGENT_SECRET_TOKEN": agent_jwt,
         "PAYLOAD_URI": payload_uri or "",
     }
-    # Max plan credentials (primary) — written to a temp file, only path passed in env
-    if claude_credentials:
-        import tempfile
-        creds_file = tempfile.NamedTemporaryFile(
-            mode='w', suffix='.json', prefix='claude_creds_', delete=False
-        )
-        creds_file.write(claude_credentials)
-        creds_file.close()
-        os.chmod(creds_file.name, 0o600)
-        env["CLAUDE_CREDENTIALS_FILE"] = creds_file.name
-    # API key (fallback) — only if no Max plan credentials
+    # OAuth token (primary) — passed as env var, Claude Code CLI reads it directly
+    if oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    # API key (fallback) — only if no OAuth token
     elif ANTHROPIC_API_KEY:
         env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 
@@ -198,24 +157,27 @@ async def _cleanup_local(active_vm_ids: list[str]):
 
 # ─── GCP Mode Implementation ────────────────────────────────────────────────
 
-async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None, claude_credentials: str = None):
+async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None,
+                         oauth_token: str = None, claude_config_json: str = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
 
     agent_jwt = create_agent_token(str(task_id), vm_instance_id)
 
-    # Upload credentials to GCS (never embedded in instance metadata)
-    claude_creds_uri = ""
-    if claude_credentials:
-        from app.storage import upload_json_payload, ARTIFACT_BUCKET_NAME
-        claude_creds_uri = await _upload_credentials_to_gcs(str(task_id), claude_credentials)
-        logger.info(f"Uploaded Max plan credentials to GCS for task {task_id}")
+    # Claude Code auth: OAuth token passed as env var (no GCS upload needed)
+    oauth_token_block = ""
+    if oauth_token:
+        oauth_token_block = f'CLAUDE_CODE_OAUTH_TOKEN="{oauth_token}"'
 
-    # API key fallback: passed as env var only (still in metadata, but less sensitive than OAuth tokens)
+    # API key fallback: only if no OAuth token
     api_key_block = ""
-    if not claude_creds_uri and ANTHROPIC_API_KEY:
+    if not oauth_token and ANTHROPIC_API_KEY:
         api_key_block = f'ANTHROPIC_API_KEY="{ANTHROPIC_API_KEY}"'
+
+    # Base64-encode the claude config to avoid heredoc injection
+    import base64
+    config_b64 = base64.b64encode((claude_config_json or "").encode()).decode() if claude_config_json else ""
 
     startup_script = f"""#!/bin/bash
     echo "Starting Agent VM Initialization..."
@@ -224,23 +186,21 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     (sleep 3600 && echo "Maximum TTL reached. Self-terminating..." && poweroff) &
 
     # 2. Export environment variables needed by the agent
-    cat <<EOF > /etc/agent.env
+    # Quoted heredoc (<<'EOF') prevents shell expansion of embedded values
+    cat <<'EOF' > /etc/agent.env
 VM_INSTANCE_ID="{vm_instance_id}"
 ORCHESTRATOR_URL="{ORCHESTRATOR_URL}"
 AGENT_SECRET_TOKEN="{agent_jwt}"
 PAYLOAD_URI="{payload_uri or ''}"
+{oauth_token_block}
 {api_key_block}
 EOF
 
-    # 3. Claude Code authentication — download from GCS, write to disk
-    # GCS cleanup is handled by the orchestrator on first heartbeat (agent SA lacks delete permission)
-    if [ -n "{claude_creds_uri}" ]; then
-        echo "Downloading Max plan credentials from GCS..."
-        mkdir -p /home/agent/.claude
-        gsutil cp "{claude_creds_uri}" /home/agent/.claude/.credentials.json
-        chown -R agent:agent /home/agent/.claude
-        chmod 600 /home/agent/.claude/.credentials.json
-        echo "Max plan credentials installed."
+    # 3. Claude Code onboarding bypass — write ~/.claude.json from base64-encoded blob
+    if [ -n "{config_b64}" ]; then
+        echo "{config_b64}" | base64 -d > /home/agent/.claude.json
+        chown agent:agent /home/agent/.claude.json
+        echo "Claude Code config installed."
     fi
 
     # 4. Download payload if provided

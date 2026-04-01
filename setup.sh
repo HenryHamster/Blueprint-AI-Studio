@@ -152,7 +152,7 @@ EOF
   echo -e "  ${YELLOW}Final steps:${NC}"
   echo -e "  1. Grant yourself admin: firebase auth:set-custom-user-claims <UID> '{\"admin\":true}'"
   echo -e "  2. Open the admin UI → sign in → Settings → Connect GitHub"
-  echo -e "  3. Settings → Add Max plan accounts (paste ~/.claude/credentials.json)"
+  echo -e "  3. Settings → Add Max plan accounts (paste OAuth token from 'claude setup-token')"
   echo -e "  4. Launch your first task!"
   echo ""
 }

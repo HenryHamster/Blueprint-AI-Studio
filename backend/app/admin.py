@@ -423,7 +423,8 @@ async def get_settings(
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
-             "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"]}
+             "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
+             "token_created_at": a.get("token_created_at")}
             for a in _max_plan_pool
         ],
     }
@@ -462,22 +463,33 @@ async def add_max_plan_account(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    """Add a Max plan account to the pool. Provide 'name' and 'credentials_json' (contents of ~/.claude/credentials.json)."""
-    import json as _json
+    """Add a Max plan account. Provide 'name' and 'oauth_token' (sk-ant-oat01-... from `claude setup-token`).
+    Optionally provide 'claude_config_json' (content of ~/.claude.json for onboarding bypass)."""
     from app.main import _max_plan_pool
     name = payload.get("name")
-    credentials_json = payload.get("credentials_json")
-    if not name or not credentials_json:
-        raise HTTPException(status_code=400, detail="'name' and 'credentials_json' are required")
-    try:
-        _json.loads(credentials_json)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
+    oauth_token = payload.get("oauth_token")
+    if not name or not oauth_token:
+        raise HTTPException(status_code=400, detail="'name' and 'oauth_token' are required")
+    if not oauth_token.startswith("sk-ant-"):
+        raise HTTPException(status_code=400, detail="oauth_token should be a token starting with 'sk-ant-' from `claude setup-token`")
+    import re
+    if not re.fullmatch(r'sk-ant-[A-Za-z0-9_\-]+', oauth_token):
+        raise HTTPException(status_code=400, detail="oauth_token contains invalid characters")
 
-    # Persist to database
+    claude_config_json = payload.get("claude_config_json")
+    if claude_config_json is not None:
+        import json as _json
+        try:
+            _json.loads(claude_config_json)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
+
+    now = datetime.utcnow()
     db_account = MaxPlanAccount(
         name=name,
-        credentials_json=credentials_json,
+        oauth_token=oauth_token,
+        claude_config_json=claude_config_json,
+        token_created_at=now,
     )
     session.add(db_account)
     await session.commit()
@@ -487,10 +499,12 @@ async def add_max_plan_account(
     _max_plan_pool.append({
         "id": str(db_account.id),
         "name": db_account.name,
-        "credentials_json": db_account.credentials_json,
+        "oauth_token": db_account.oauth_token,
+        "claude_config_json": db_account.claude_config_json,
         "enabled": db_account.enabled,
         "active_tasks": 0,
         "total_tasks": db_account.total_tasks,
+        "token_created_at": now.isoformat(),
     })
     return {"id": str(db_account.id), "name": db_account.name, "message": "Account added to pool"}
 
@@ -541,13 +555,22 @@ async def update_max_plan_account(
         db_account.enabled = bool(payload["enabled"])
     if "name" in payload:
         db_account.name = payload["name"]
-    if "credentials_json" in payload:
+    if "oauth_token" in payload:
+        new_token = payload["oauth_token"]
+        if not new_token.startswith("sk-ant-"):
+            raise HTTPException(status_code=400, detail="oauth_token should start with 'sk-ant-'")
+        import re
+        if not re.fullmatch(r'sk-ant-[A-Za-z0-9_\-]+', new_token):
+            raise HTTPException(status_code=400, detail="oauth_token contains invalid characters")
+        db_account.oauth_token = new_token
+        db_account.token_created_at = datetime.utcnow()
+    if "claude_config_json" in payload:
         import json as _json
         try:
-            _json.loads(payload["credentials_json"])
+            _json.loads(payload["claude_config_json"])
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="credentials_json must be valid JSON")
-        db_account.credentials_json = payload["credentials_json"]
+            raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
+        db_account.claude_config_json = payload["claude_config_json"]
     db_account.updated_at = datetime.utcnow()
     session.add(db_account)
     await session.commit()
@@ -559,8 +582,11 @@ async def update_max_plan_account(
             mem_account["enabled"] = db_account.enabled
         if "name" in payload:
             mem_account["name"] = db_account.name
-        if "credentials_json" in payload:
-            mem_account["credentials_json"] = db_account.credentials_json
+        if "oauth_token" in payload:
+            mem_account["oauth_token"] = db_account.oauth_token
+            mem_account["token_created_at"] = db_account.token_created_at.isoformat() if db_account.token_created_at else None
+        if "claude_config_json" in payload:
+            mem_account["claude_config_json"] = db_account.claude_config_json
 
     return {"id": account_id, "name": db_account.name, "enabled": db_account.enabled}
 

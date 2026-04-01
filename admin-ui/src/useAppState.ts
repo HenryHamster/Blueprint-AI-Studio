@@ -75,7 +75,7 @@ export function useAppState() {
   // Max plan pool state
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
   const [newAccountName, setNewAccountName] = useState('');
-  const [newAccountCreds, setNewAccountCreds] = useState('');
+  const [newAccountToken, setNewAccountToken] = useState('');
 
   // GitHub connection state
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
@@ -446,15 +446,15 @@ export function useAppState() {
   };
 
   const addMaxPlanAccount = async () => {
-    if (!newAccountName || !newAccountCreds) return;
+    if (!newAccountName || !newAccountToken) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts`, {
         method: 'POST', headers: await authHeaders(),
-        body: JSON.stringify({ name: newAccountName, credentials_json: newAccountCreds }),
+        body: JSON.stringify({ name: newAccountName, oauth_token: newAccountToken }),
       });
       if (res.ok) {
         setNewAccountName('');
-        setNewAccountCreds('');
+        setNewAccountToken('');
         fetchSettings();
       }
     } catch (err) { console.error('Failed to add account:', err); }
@@ -839,7 +839,7 @@ export function useAppState() {
     maxConcurrentVMs, maxRetries, usingMaxPlan,
     updateMaxVMs, updateMaxRetries,
     // Max plan accounts
-    maxPlanAccounts, newAccountName, setNewAccountName, newAccountCreds, setNewAccountCreds,
+    maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,
     // GitHub
     githubAccount, connectGitHub,

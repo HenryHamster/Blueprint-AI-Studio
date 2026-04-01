@@ -58,7 +58,7 @@ After creating, grab: App ID, Client ID, Client Secret, private key .pem file.
 
 3. **Connect GitHub** — Settings gear > "Connect GitHub" (one-time OAuth)
 
-4. **Add Max plan accounts** — Settings gear > paste `~/.claude/credentials.json` from each `claude login`
+4. **Add Max plan accounts** — Settings gear > paste OAuth token (`sk-ant-oat01-...`) from `claude setup-token`
 
 5. **Launch a task**
 

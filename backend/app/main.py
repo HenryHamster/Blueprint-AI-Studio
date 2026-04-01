@@ -12,7 +12,6 @@ from sqlmodel import select
 import uuid
 import asyncio
 import json
-import httpx
 from datetime import datetime, timedelta, timezone
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
@@ -65,7 +64,7 @@ import app.shared_state as _shared_state
 
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
-# Each entry: {id (str), name, credentials_json, enabled, active_tasks, total_tasks}
+# Each entry: {id, name, oauth_token, claude_config_json, enabled, active_tasks, total_tasks, token_created_at}
 _max_plan_pool: List[Dict[str, Any]] = []
 
 async def load_max_plan_pool():
@@ -91,10 +90,12 @@ async def load_max_plan_pool():
             _max_plan_pool.append({
                 "id": acct_id,
                 "name": acct.name,
-                "credentials_json": acct.credentials_json,
+                "oauth_token": acct.oauth_token,
+                "claude_config_json": acct.claude_config_json,
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
+                "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
             })
         total_active = sum(active_per_account.values())
         print(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
@@ -114,129 +115,6 @@ def release_max_plan_account(account_id: str):
             break
 
 
-# --- Max Plan Credential Refresh ---
-_credential_locks: Dict[str, asyncio.Lock] = {}
-
-
-async def _do_oauth_refresh(refresh_token: str) -> Optional[dict]:
-    """Exchange single-use refresh token for new access + refresh tokens."""
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://claude.ai/v1/oauth/token",
-                json={"grant_type": "refresh_token", "refresh_token": refresh_token},
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                # Validate response contains at least an access token
-                has_token = any(k in data for k in ("accessToken", "access_token"))
-                if not has_token:
-                    print(f"[CREDENTIALS] Refresh response missing access token: {list(data.keys())}")
-                    return None
-                return data
-            print(f"[CREDENTIALS] Refresh returned {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[CREDENTIALS] Refresh request failed: {e}")
-    return None
-
-
-async def _update_account_credentials(account: dict, creds: dict, new_tokens: dict):
-    """Update credentials in DB and memory pool after successful refresh."""
-    oauth = creds.get("claudeAiOauth", {})
-    # Map snake_case OAuth response fields to camelCase credential format
-    field_map = {
-        "access_token": "accessToken",
-        "refresh_token": "refreshToken",
-        "expires_at": "expiresAt",
-    }
-    for resp_key, cred_key in field_map.items():
-        if resp_key in new_tokens:
-            oauth[cred_key] = new_tokens[resp_key]
-    # Also accept camelCase directly (some endpoints return this format)
-    for key in ("accessToken", "refreshToken", "expiresAt"):
-        if key in new_tokens:
-            oauth[key] = new_tokens[key]
-
-    creds["claudeAiOauth"] = oauth
-    updated_json = json.dumps(creds)
-    account["credentials_json"] = updated_json
-
-    async with AsyncSessionLocal() as session:
-        db_acct = await session.get(MaxPlanAccount, uuid.UUID(account["id"]))
-        if db_acct:
-            db_acct.credentials_json = updated_json
-            db_acct.updated_at = datetime.utcnow()
-            session.add(db_acct)
-            await session.commit()
-
-
-async def _disable_account(account: dict, reason: str):
-    """Disable a Max Plan account and persist to DB."""
-    account["enabled"] = False
-    async with AsyncSessionLocal() as session:
-        db_acct = await session.get(MaxPlanAccount, uuid.UUID(account["id"]))
-        if db_acct:
-            db_acct.enabled = False
-            session.add(db_acct)
-            await session.commit()
-    print(f"[CREDENTIALS] DISABLED account '{account.get('name')}': {reason}")
-
-
-async def _ensure_credentials_fresh(account: dict) -> bool:
-    """Check if account credentials are within 1 hour of expiry, refresh if needed.
-    Returns True if credentials are usable, False if account was disabled."""
-    try:
-        creds = json.loads(account["credentials_json"])
-        oauth = creds.get("claudeAiOauth", {})
-        expires_at_ms = oauth.get("expiresAt")
-        refresh_token = oauth.get("refreshToken")
-
-        if not expires_at_ms or not refresh_token:
-            return True  # Can't determine expiry — assume OK
-
-        expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
-        remaining = expires_at - datetime.now(timezone.utc)
-        if remaining > timedelta(hours=1):
-            return True
-
-        # Refresh needed — acquire per-account lock
-        lock = _credential_locks.setdefault(account["id"], asyncio.Lock())
-        async with lock:
-            # Re-check after acquiring lock
-            creds = json.loads(account["credentials_json"])
-            oauth = creds.get("claudeAiOauth", {})
-            expires_at_ms = oauth.get("expiresAt", 0)
-            expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
-            remaining = expires_at - datetime.now(timezone.utc)
-            if remaining > timedelta(hours=1):
-                return True
-
-            print(f"[CREDENTIALS] Token near expiry for '{account['name']}' (expires in {remaining}), attempting refresh...")
-            new_tokens = await _do_oauth_refresh(oauth.get("refreshToken", ""))
-            if new_tokens:
-                await _update_account_credentials(account, creds, new_tokens)
-                print(f"[CREDENTIALS] Refreshed '{account['name']}' successfully")
-            else:
-                print(f"[CREDENTIALS] Refresh failed for '{account['name']}' — dispatching anyway, CLI will attempt refresh on VM")
-            return True  # Always dispatch — never block on credential refresh failure
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        # Credential JSON is malformed — log but don't disable (admin can fix via UI)
-        print(f"[CREDENTIALS] Credential parse error for '{account.get('name')}': {e}")
-        return True
-    except Exception as e:
-        print(f"[CREDENTIALS] Unexpected freshness check error for '{account.get('name')}': {e}")
-        return True
-
-
-async def _credential_health_check():
-    """Proactively refresh Max Plan credentials before they expire. Runs hourly."""
-    while True:
-        await asyncio.sleep(3600)
-        for account in _max_plan_pool:
-            if not account.get("enabled", True):
-                continue
-            await _ensure_credentials_fresh(account)
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -643,15 +521,13 @@ async def orchestrator_worker():
 
                     # Select Max plan account (primary) or fall back to API key
                     account = select_max_plan_account()
-                    claude_credentials = None
+                    oauth_token = None
+                    claude_config_json = None
                     account_id = None
                     if account:
-                        # Best-effort refresh — never blocks dispatch
-                        await _ensure_credentials_fresh(account)
-
-                    if account:
                         account_id = account["id"]
-                        claude_credentials = account.get("credentials_json")
+                        oauth_token = account.get("oauth_token")
+                        claude_config_json = account.get("claude_config_json")
                         print(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
                     else:
                         # No Max plan account — check for API key fallback
@@ -688,7 +564,8 @@ async def orchestrator_worker():
                     # Trigger GCP Compute Engine provisioning in the background
                     # All values passed as args to avoid stale closure captures across loop iterations
                     async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
-                                                    payloads: list, creds: str, acct_id_for_release: str):
+                                                    payloads: list, token: str, config_json: str,
+                                                    acct_id_for_release: str):
                         payload_uri = None
                         if payloads:
                             try:
@@ -696,7 +573,8 @@ async def orchestrator_worker():
                             except Exception as e:
                                 print(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}")
 
-                        success = await provision_agent_vm(vm_id, t_id, payload_uri, claude_credentials=creds)
+                        success = await provision_agent_vm(vm_id, t_id, payload_uri,
+                                                           oauth_token=token, claude_config_json=config_json)
                         if not success:
                             print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             # Release the Max Plan account slot
@@ -720,7 +598,7 @@ async def orchestrator_worker():
 
                     asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
-                        task.payloads, claude_credentials, account_id
+                        task.payloads, oauth_token, claude_config_json, account_id
                     ))
                     
                     await broadcast_to_project(
@@ -871,13 +749,10 @@ async def lifespan(app: FastAPI):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
-    # Start the Credential Health Check background task
-    credential_task = asyncio.create_task(_credential_health_check())
-
     # Monitor background tasks for silent crashes
     async def _monitor_background_tasks():
         tasks = {"orchestrator": orchestrator_task, "reaper": reaper_task,
-                 "gcp_cleanup": gcp_cleanup_task, "credential": credential_task}
+                 "gcp_cleanup": gcp_cleanup_task}
         while True:
             await asyncio.sleep(30)
             for name, t in tasks.items():
@@ -896,7 +771,6 @@ async def lifespan(app: FastAPI):
     reaper_task.cancel()
     gcp_cleanup_task.cancel()
     orchestrator_task.cancel()
-    credential_task.cancel()
 
 app = FastAPI(
     title="Blueprint Orchestrator",
@@ -1492,11 +1366,6 @@ async def agent_heartbeat(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
         
-    # On first heartbeat, clean up temporary GCS credentials (agent has downloaded them)
-    if task.last_heartbeat is None:
-        from app.compute import delete_credentials_from_gcs
-        asyncio.create_task(delete_credentials_from_gcs(str(task.id)))
-
     task.last_heartbeat = datetime.utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message

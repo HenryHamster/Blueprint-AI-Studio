@@ -133,14 +133,17 @@ class TaskHistory(SQLModel, table=True):
 
 class MaxPlanAccount(SQLModel, table=True):
     """
-    Persisted Max plan account for Claude Code credential pooling.
-    Credentials survive restarts/deploys. Active task counts are tracked in-memory.
+    Persisted Max plan account for Claude Code OAuth token pooling.
+    Each account holds a long-lived OAuth token (sk-ant-oat01-...) generated via `claude setup-token`.
+    Active task counts are tracked in-memory only.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
-    credentials_json: str  # Raw content of ~/.claude/credentials.json
+    oauth_token: str  # Long-lived OAuth token from `claude setup-token` (sk-ant-oat01-...)
+    claude_config_json: Optional[str] = Field(default=None)  # ~/.claude.json content for onboarding bypass
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
+    token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

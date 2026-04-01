@@ -43,8 +43,8 @@ export interface HeaderBarProps {
   onRemoveAccount: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
-  newAccountCreds: string;
-  setNewAccountCreds: (value: string) => void;
+  newAccountToken: string;
+  setNewAccountToken: (value: string) => void;
   onAddAccount: () => void;
   showMetrics: boolean;
   onToggleMetrics: () => void;
@@ -100,8 +100,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onRemoveAccount,
     newAccountName,
     setNewAccountName,
-    newAccountCreds,
-    setNewAccountCreds,
+    newAccountToken,
+    setNewAccountToken,
     onAddAccount,
     showMetrics,
     onToggleMetrics,
@@ -233,8 +233,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onRemoveAccount={onRemoveAccount}
           newAccountName={newAccountName}
           setNewAccountName={setNewAccountName}
-          newAccountCreds={newAccountCreds}
-          setNewAccountCreds={setNewAccountCreds}
+          newAccountToken={newAccountToken}
+          setNewAccountToken={setNewAccountToken}
           onAddAccount={onAddAccount}
           refreshInterval={refreshInterval}
           onUpdateRefreshInterval={onUpdateRefreshInterval}

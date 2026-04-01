@@ -6,6 +6,7 @@ export interface MaxPlanAccount {
   enabled: boolean;
   active_tasks: number;
   total_tasks: number;
+  token_created_at: string | null;
 }
 
 interface SettingsDropdownProps {
@@ -32,8 +33,8 @@ interface SettingsDropdownProps {
   onRemoveAccount: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
-  newAccountCreds: string;
-  setNewAccountCreds: (value: string) => void;
+  newAccountToken: string;
+  setNewAccountToken: (value: string) => void;
   onAddAccount: () => void;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
@@ -60,8 +61,8 @@ export function SettingsDropdown({
   onRemoveAccount,
   newAccountName,
   setNewAccountName,
-  newAccountCreds,
-  setNewAccountCreds,
+  newAccountToken,
+  setNewAccountToken,
   onAddAccount,
   refreshInterval,
   onUpdateRefreshInterval,
@@ -182,26 +183,42 @@ export function SettingsDropdown({
             {maxPlanAccounts.length === 0 && (
               <p className="text-[11px] text-neutral-600 mb-2">No accounts — using API key fallback</p>
             )}
-            {maxPlanAccounts.map(a => (
-              <div key={a.id} className="flex items-center gap-2 mb-2 bg-neutral-950 rounded p-2 border border-neutral-800">
-                <button onClick={() => onToggleAccount(a.id, !a.enabled)}
-                  className={`w-2 h-2 rounded-full shrink-0 ${a.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
-                  title={a.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'} />
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs text-neutral-200 truncate">{a.name}</div>
-                  <div className="text-[10px] text-neutral-500 font-mono">{a.active_tasks} active / {a.total_tasks} total</div>
+            {maxPlanAccounts.map(a => {
+              let tokenAge: string | null = null;
+              let isExpiring = false;
+              if (a.token_created_at) {
+                const created = new Date(a.token_created_at);
+                const diffMs = new Date().getTime() - created.getTime();
+                const days = Math.floor(diffMs / 86400000);
+                isExpiring = days > 300; // warn at ~10 months
+                if (days < 1) tokenAge = 'today';
+                else if (days < 30) tokenAge = `${days}d old`;
+                else tokenAge = `${Math.floor(days / 30)}mo old`;
+              }
+              return (
+                <div key={a.id} className="flex items-center gap-2 mb-2 bg-neutral-950 rounded p-2 border border-neutral-800">
+                  <button onClick={() => onToggleAccount(a.id, !a.enabled)}
+                    className={`w-2 h-2 rounded-full shrink-0 ${a.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
+                    title={a.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-neutral-200 truncate">{a.name}</div>
+                    <div className="text-[10px] text-neutral-500 font-mono">
+                      {a.active_tasks} active / {a.total_tasks} total
+                      {tokenAge && <span className={`ml-1.5 ${isExpiring ? 'text-amber-400' : ''}`}>· token {tokenAge}</span>}
+                    </div>
+                  </div>
+                  <button onClick={() => onRemoveAccount(a.id)}
+                    className="text-neutral-600 hover:text-red-400 text-xs transition-colors shrink-0">&times;</button>
                 </div>
-                <button onClick={() => onRemoveAccount(a.id)}
-                  className="text-neutral-600 hover:text-red-400 text-xs transition-colors shrink-0">&times;</button>
-              </div>
-            ))}
+              );
+            })}
             <div className="mt-2 space-y-1.5">
               <input value={newAccountName} onChange={e => setNewAccountName(e.target.value)}
                 placeholder="Account name" className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600" />
-              <textarea value={newAccountCreds} onChange={e => setNewAccountCreds(e.target.value)}
-                placeholder="Paste credentials.json contents" rows={2}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs resize-none focus:outline-none focus:ring-1 focus:ring-neutral-600 font-mono" />
-              <button onClick={onAddAccount} disabled={!newAccountName || !newAccountCreds}
+              <input value={newAccountToken} onChange={e => setNewAccountToken(e.target.value)}
+                placeholder="sk-ant-oat01-... (from claude setup-token)" type="password"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 font-mono" />
+              <button onClick={onAddAccount} disabled={!newAccountName || !newAccountToken}
                 className="w-full bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 text-xs py-1 rounded transition-colors border border-neutral-700">
                 Add Account
               </button>
