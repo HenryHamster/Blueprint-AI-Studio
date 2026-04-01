@@ -341,7 +341,18 @@ async def reaper_service():
                         orphaned_tasks.append(task)
                 
                 for task in orphaned_tasks:
-                    print(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id})")
+                    # Determine why the reaper flagged this task
+                    if task.last_heartbeat:
+                        age = int((now - task.last_heartbeat).total_seconds())
+                        reap_reason = f"No heartbeat for {age}s (last: {task.last_heartbeat.isoformat()})"
+                    elif task.started_at:
+                        age = int((now - task.started_at).total_seconds())
+                        reap_reason = f"No heartbeat received after {age}s since provisioning"
+                    else:
+                        age = int((now - task.created_at).total_seconds())
+                        reap_reason = f"Never started — {age}s since creation, no heartbeat"
+
+                    print(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id}) — {reap_reason}")
 
                     if task.vm_instance_id:
                         asyncio.create_task(delete_agent_vm(task.vm_instance_id))
@@ -361,6 +372,7 @@ async def reaper_service():
                             await _requeue_parent_task(task, session)
                         else:
                             print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
+                            task.latest_status_message = f"Reaped (attempt {task.attempt_count + 1}/{_runtime_config['max_retries']}): {reap_reason}"
                             task.attempt_count += 1
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
@@ -373,8 +385,9 @@ async def reaper_service():
                             {"task_id": str(task.id), "status": task.status, "attempt_count": task.attempt_count}
                         )
                     else:
-                        print(f"[REAPER] Task {task.id} failed after 3 attempts.")
+                        print(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
                         task.status = TaskStatus.FAILED
+                        task.latest_status_message = f"Failed after {_runtime_config['max_retries']} attempts — last reap: {reap_reason}"
                         session.add(task)
 
                         # Broadcast failure to frontend
