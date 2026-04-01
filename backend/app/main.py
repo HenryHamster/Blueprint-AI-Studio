@@ -640,8 +640,8 @@ async def orchestrator_worker():
                                 session.add(ci_task)
                                 await session.commit()
                                 continue
-                        except (ValueError, TypeError):
-                            pass
+                        except (ValueError, TypeError) as e:
+                            print(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})")
 
                     try:
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
@@ -661,6 +661,10 @@ async def orchestrator_worker():
 
                         ci_head_sha = pr_data.get("head", {}).get("sha", "")
                         if not ci_head_sha:
+                            ci_task.latest_status_message = f"CI waiting on PR #{ci_pr_number} — HEAD SHA unavailable"
+                            session.add(ci_task)
+                            await session.commit()
+                            print(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
                         ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha)
@@ -715,10 +719,14 @@ async def orchestrator_worker():
                                 fix_prompt=ci_fix_prompt,
                                 original_task_id=ci_orig_id
                             )
-                            ci_task.status = TaskStatus.COMPLETED
-                            ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix"
                             if fix_task:
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
                                 print(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")
+                            else:
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
+                                print(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None")
 
                         session.add(ci_task)
                         await session.commit()
@@ -726,6 +734,12 @@ async def orchestrator_worker():
                                                    {"task_id": str(ci_task.id), "status": ci_task.status})
                     except Exception as e:
                         print(f"[CI] Error checking CI for task {ci_task.id}: {e}")
+                        try:
+                            ci_task.latest_status_message = f"CI check error: {str(e)[:200]}"
+                            session.add(ci_task)
+                            await session.commit()
+                        except Exception:
+                            pass
 
         except asyncio.CancelledError:
             print("[ORCHESTRATOR] Worker shutting down.")
@@ -1909,6 +1923,10 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
     )
     artifact = art_result.scalars().first()
+    if not artifact or not artifact.pr_url:
+        # No PR artifact — task completed without creating a PR (e.g., no changes needed).
+        # Treat as "done" so it doesn't block rollup.
+        return True
     if artifact and artifact.pr_url:
         try:
             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
@@ -2129,6 +2147,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         )
                         if fix_task:
                             print(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
+                        else:
+                            parent.status = TaskStatus.FAILED
+                            parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
+                            print(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
@@ -2139,10 +2161,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     )
                     if review_task:
                         print(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
+                    else:
+                        parent.status = TaskStatus.FAILED
+                        parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
+                        print(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
             except Exception as e:
                 print(f"[ROLLUP] Failed to create rollup PR: {e}")
-                parent.status = TaskStatus.COMPLETED
-                parent.latest_status_message = f"All {completed_count} subtasks done, rollup failed: {e}"
+                parent.status = TaskStatus.FAILED
+                parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {str(e)[:200]}"
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
@@ -2329,20 +2355,35 @@ async def update_agent_status(
                         else:
                             print(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
                             # Fall through to review pipeline for conflict resolution
-                            await _spawn_pipeline_task(
+                            review_task = await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
+                            if not review_task:
+                                task.latest_status_message = f"Auto-merge failed and review not spawned for PR #{pr_number} — iteration cap"
+                                task.requires_approval = True
+                                session.add(task)
+                                await session.commit()
+                                print(f"[PIPELINE] WARNING: Auto-merge failed and review spawn returned None for PR #{pr_number}")
                     except Exception as e:
                         print(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}")
                         # Fallback: spawn review so the pipeline doesn't die
                         try:
-                            await _spawn_pipeline_task(
+                            fallback_review = await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
-                        except Exception:
-                            pass
+                            if not fallback_review:
+                                task.latest_status_message = f"Pipeline stalled: auto-merge failed and review not spawned (iteration cap) for PR #{pr_number}"
+                                task.requires_approval = True
+                                session.add(task)
+                                await session.commit()
+                                print(f"[PIPELINE] WARNING: Fallback review spawn returned None for PR #{pr_number}")
+                        except Exception as e:
+                            print(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {e}")
+                            task.latest_status_message = f"Pipeline stalled: auto-merge and review spawn both failed — {str(e)[:200]}"
+                            session.add(task)
+                            await session.commit()
                 else:
                     # Full pipeline: security scan → review (for main targets or medium+ scope)
                     try:
@@ -2366,6 +2407,12 @@ async def update_agent_status(
                         )
                         if review_task:
                             print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                        else:
+                            task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
+                            task.requires_approval = True
+                            session.add(task)
+                            await session.commit()
+                            print(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -2411,8 +2458,10 @@ async def update_agent_status(
                         verdict_data = verdict_candidates[-1]
                         verdict = verdict_data.get("verdict", "REQUEST_CHANGES")
                         feedback = verdict_data.get("feedback", verdict_text)
-                except Exception:
-                    pass
+                    else:
+                        print(f"[REVIEW PIPELINE] WARNING: No verdict JSON found in review output for task {task.id} (output length: {len(verdict_text)} chars)")
+                except Exception as e:
+                    print(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}")
 
                 # Post the review to the PR as a comment
                 try:
@@ -2539,6 +2588,9 @@ async def update_agent_status(
                             action_taken = True
                     except Exception as e:
                         print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
+                        task.latest_status_message = f"Review approved but merge/CI-check failed: {str(e)[:200]}"
+                        session.add(task)
+                        await session.commit()
                 else:
                     # REQUEST_CHANGES — include CI errors if available (don't wait)
                     ci_errors_text = ""
@@ -2550,8 +2602,8 @@ async def update_agent_status(
                             ci_check = await get_check_runs(gh_token, owner, repo, head_sha)
                             if ci_check.get("conclusion") == "failure" and ci_check.get("failed_logs"):
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}")
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}",
@@ -2559,6 +2611,12 @@ async def update_agent_status(
                     )
                     if fix_task:
                         print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                    else:
+                        task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
+                        task.requires_approval = True
+                        session.add(task)
+                        await session.commit()
+                        print(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
                     action_taken = True
 
                 if not action_taken:
@@ -2605,6 +2663,12 @@ async def update_agent_status(
                     )
                     if review_task:
                         print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+                    else:
+                        task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
+                        task.requires_approval = True
+                        session.add(task)
+                        await session.commit()
+                        print(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
 
             # Plan task completed → decompose into subtasks
             elif task_type == "plan":

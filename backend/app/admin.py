@@ -428,12 +428,16 @@ async def trigger_rollup(
             task.latest_status_message = f"Rollup merge failed: {merge_result.get('message')}"
     else:
         task.context = {**ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-        task.latest_status_message = f"Rollup PR #{rollup_pr_number} created, spawning review"
         review_task = await _spawn_pipeline_task(
             task, "review", session, rollup_pr_number, staging_branch, target_branch,
             original_prompt=task.description or task.title,
             original_task_id=str(task.id)
         )
+        if review_task:
+            task.latest_status_message = f"Rollup PR #{rollup_pr_number} created, review spawned → {review_task.id}"
+        else:
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
 
     session.add(task)
     await session.commit()
