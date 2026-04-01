@@ -123,6 +123,7 @@ async def get_all_tasks(
             "task_type": task_type,
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
+            "status_log": t.status_log or [],
             "created_by": t.created_by,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
@@ -140,17 +141,20 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    # Global active count (not affected by pagination/filters)
+    # Global counts (not affected by pagination/filters)
     active_count = (await session.execute(
         select(func.count()).select_from(Task).where(
-            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING, TaskStatus.EVALUATING])
+            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING])
         )
+    )).scalar() or 0
+    evaluating_count = (await session.execute(
+        select(func.count()).select_from(Task).where(Task.status == TaskStatus.EVALUATING)
     )).scalar() or 0
     queued_count = (await session.execute(
         select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED)
     )).scalar() or 0
 
-    return {"tasks": result_list, "total": total, "active_count": active_count, "queued_count": queued_count}
+    return {"tasks": result_list, "total": total, "active_count": active_count, "evaluating_count": evaluating_count, "queued_count": queued_count}
 
 
 class CreateTaskPayload(BaseModel):
@@ -951,3 +955,25 @@ async def get_autonomous_status(
         })
 
     return {"projects": result}
+
+
+@router.post("/restart-orchestrator")
+async def restart_orchestrator(
+    current_user: dict = Depends(get_current_user)
+):
+    """Restart the orchestrator background task without restarting the entire service."""
+    import asyncio
+    from app.shared_state import background_tasks
+    from app.main import orchestrator_worker
+
+    old_task = background_tasks.get("orchestrator")
+    if old_task and not old_task.done():
+        old_task.cancel()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
+
+    background_tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
+    print("[ADMIN] Orchestrator restarted via admin endpoint")
+    return {"status": "restarted"}

@@ -635,9 +635,9 @@ async def orchestrator_worker():
                         try:
                             started = datetime.fromisoformat(ci_wait_started)
                             if (datetime.utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
-                                print(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min — proceeding to merge")
-                                ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"CI wait timed out, proceeding"
+                                print(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
                                 session.add(ci_task)
                                 await session.commit()
                                 continue
@@ -795,10 +795,15 @@ async def lifespan(app: FastAPI):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
+    # Store references for admin restart endpoint
+    from app.shared_state import background_tasks as _bg_tasks
+    _bg_tasks["orchestrator"] = orchestrator_task
+    _bg_tasks["reaper"] = reaper_task
+    _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
+
     # Monitor background tasks for silent crashes
     async def _monitor_background_tasks():
-        tasks = {"orchestrator": orchestrator_task, "reaper": reaper_task,
-                 "gcp_cleanup": gcp_cleanup_task}
+        tasks = _bg_tasks
         while True:
             await asyncio.sleep(30)
             for name, t in tasks.items():

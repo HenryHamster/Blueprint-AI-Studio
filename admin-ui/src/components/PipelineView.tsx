@@ -94,7 +94,7 @@ function TaskNode({ task, onViewLogs, isOrphan }: { task: Task; onViewLogs: (tas
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
 
-  const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING' || task.status === 'EVALUATING';
+  const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const endTime = isTerminal && task.history && task.history.length > 0
     ? task.history[task.history.length - 1].timestamp

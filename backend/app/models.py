@@ -80,6 +80,8 @@ class Task(SQLModel, table=True):
     description: str = Field(default="")
     parent_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id", index=True)
     latest_status_message: Optional[str] = None
+    status_log: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")))
+
     created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
     requires_approval: bool = Field(default=False)
     
@@ -130,6 +132,16 @@ class TaskHistory(SQLModel, table=True):
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
     
     task: Task = Relationship(back_populates="history")
+
+# Auto-append to status_log whenever latest_status_message is set
+from sqlalchemy import event
+
+@event.listens_for(Task.latest_status_message, "set")
+def _on_status_message_set(target: Task, value, oldvalue, initiator):
+    if value and value != oldvalue:
+        entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
+        target.status_log = (target.status_log or []) + [entry]
+
 
 class MaxPlanAccount(SQLModel, table=True):
     """

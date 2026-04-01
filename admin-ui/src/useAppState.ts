@@ -26,6 +26,7 @@ export function useAppState() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
   const [globalActiveCount, setGlobalActiveCount] = useState(0);
+  const [globalEvaluatingCount, setGlobalEvaluatingCount] = useState(0);
   const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -292,6 +293,7 @@ export function useAppState() {
           newTasks = data.tasks || [];
           setTotalTasks(data.total ?? newTasks.length);
           if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
+          if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
           if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
         }
 
@@ -333,7 +335,7 @@ export function useAppState() {
 
         // Always record metrics data points (rendering depends on showMetrics, not collection)
         const now = Date.now();
-        const activeVMs = data.active_count ?? newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING').length;
+        const activeVMs = data.active_count ?? newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
         const costPerHr = activeVMs * (usingMaxPlanRef.current ? 0.07 : 1.07);
 
         // Compute cumulative cost using the rate from the *previous* interval
@@ -856,7 +858,7 @@ export function useAppState() {
     // Auth
     user, authLoading, error, setError,
     // Tasks
-    tasks, totalTasks, globalActiveCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss,
     // Toasts

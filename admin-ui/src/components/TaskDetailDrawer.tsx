@@ -126,6 +126,20 @@ function DetailsTab({ task }: { task: Task }) {
         </>
       )}
 
+      {task.status_log && task.status_log.length > 0 && (
+        <>
+          <SectionHeader>Status Log ({task.status_log.length})</SectionHeader>
+          <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar bg-neutral-900/50 rounded-lg p-3 border border-neutral-800">
+            {task.status_log.slice().reverse().map((entry, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs">
+                <span className="text-neutral-600 shrink-0 font-mono">{new Date(entry.t).toLocaleTimeString()}</span>
+                <span className="text-neutral-300 break-words min-w-0">{entry.msg}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       {task.history && task.history.length > 0 && (
         <>
           <SectionHeader>History</SectionHeader>

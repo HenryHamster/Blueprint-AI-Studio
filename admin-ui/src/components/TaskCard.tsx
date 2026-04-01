@@ -23,6 +23,7 @@ export interface Task {
   task_type?: TaskType;
   vm_instance_id?: string;
   latest_status_message?: string;
+  status_log?: { t: string; msg: string }[];
   created_by: string;
   requires_approval: boolean;
   parent_task_id?: string;

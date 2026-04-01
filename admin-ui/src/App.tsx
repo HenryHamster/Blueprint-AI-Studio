@@ -21,7 +21,8 @@ import ArchiveView from './components/ArchiveView';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
-  { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS', 'EVALUATING'] },
+  { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
+  { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
   { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
   { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
@@ -31,7 +32,7 @@ export default function App() {
   const s = useAppState();
 
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
-  const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING'), [s.tasks]);
+  const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const completedRecently = useMemo(() => {
     const oneDayAgo = new Date(new Date().getTime() - 24 * 60 * 60 * 1000);
@@ -84,6 +85,7 @@ export default function App() {
         runningTasks={runningTasks}
         queuedTasks={queuedTasks}
         globalActiveCount={s.globalActiveCount}
+        globalEvaluatingCount={s.globalEvaluatingCount}
         globalQueuedCount={s.globalQueuedCount}
         maxConcurrentVMs={s.maxConcurrentVMs}
         usingMaxPlan={s.usingMaxPlan}

@@ -18,3 +18,7 @@ runtime_config: Dict = {
 # --- Autonomous Loop State ---
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
 last_idle_check: Optional[datetime] = None
+
+# --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
+import asyncio
+background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task

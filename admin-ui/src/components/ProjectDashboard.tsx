@@ -31,7 +31,8 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   const projectTasks = tasks.filter(t => t.project_id === projectId);
   return {
     queued: projectTasks.filter(t => t.status === 'QUEUED').length,
-    running: projectTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING' || t.status === 'EVALUATING').length,
+    running: projectTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
+    evaluating: projectTasks.filter(t => t.status === 'EVALUATING').length,
     failed: projectTasks.filter(t => t.status === 'FAILED').length,
     completed: projectTasks.filter(t => t.status === 'COMPLETED').length,
     total: projectTasks.length,
@@ -141,6 +142,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                 <div className="flex gap-2 text-[10px] font-mono">
                   {counts.queued > 0 && <span className="text-neutral-400">{counts.queued} queued</span>}
                   {counts.running > 0 && <span className="text-blue-400">{counts.running} running</span>}
+                  {counts.evaluating > 0 && <span className="text-amber-400">{counts.evaluating} evaluating</span>}
                   {counts.failed > 0 && <span className="text-red-400">{counts.failed} failed</span>}
                   {counts.completed > 0 && <span className="text-emerald-400">{counts.completed} done</span>}
                   {counts.total === 0 && <span className="text-neutral-600">no tasks</span>}

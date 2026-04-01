@@ -760,16 +760,40 @@ async def get_check_runs(
     else:
         agg_conclusion = "failure"
 
-    # Collect failure details from annotations
+    # Collect failure details — prefer actual job logs, fall back to annotations
     failed_logs = ""
     if failed_names:
-        annotation_lines = []
+        log_lines = []
         for cr in check_runs:
             if cr.get("conclusion") != "failure":
                 continue
             cr_id = cr.get("id")
             name = cr.get("name", "unknown")
-            # Fetch annotations for failed check runs
+
+            # Try to fetch actual job logs (GitHub Actions job ID == check run ID)
+            try:
+                log_response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{cr_id}/logs",
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=10.0,
+                )
+                if log_response.status_code == 200:
+                    raw_log = log_response.text
+                    # Extract the last N lines which typically contain the error
+                    lines = raw_log.strip().split("\n")
+                    # Find lines with error-like content for a focused excerpt
+                    error_lines = [l for l in lines if any(kw in l.lower() for kw in ["error", "failed", "err!", "✗", "×"])]
+                    if error_lines:
+                        log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {l.strip()}" for l in error_lines[-30:]))
+                    else:
+                        # Just take the last 30 lines
+                        log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {l.strip()}" for l in lines[-30:]))
+                    continue
+            except Exception:
+                pass
+
+            # Fallback: fetch annotations
             try:
                 ann_response = await client.get(
                     f"https://api.github.com/repos/{owner}/{repo}/check-runs/{cr_id}/annotations",
@@ -780,17 +804,18 @@ async def get_check_runs(
                         msg = ann.get("message", "")
                         path = ann.get("path", "")
                         line = ann.get("start_line", "")
-                        annotation_lines.append(f"  [{name}] {path}:{line} — {msg}")
+                        log_lines.append(f"  [{name}] {path}:{line} — {msg}")
             except Exception:
                 pass
+
             # Also include output summary if available
             output = cr.get("output", {})
             summary = output.get("summary", "") if output else ""
             if summary:
-                annotation_lines.append(f"  [{name}] {summary[:500]}")
+                log_lines.append(f"  [{name}] {summary[:500]}")
 
-        if annotation_lines:
-            failed_logs = "\n".join(annotation_lines)
+        if log_lines:
+            failed_logs = "\n".join(log_lines)
         else:
             failed_logs = "CI checks failed: " + ", ".join(failed_names)
 

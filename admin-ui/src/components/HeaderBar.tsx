@@ -8,6 +8,7 @@ export interface HeaderBarProps {
   runningTasks: Task[];
   queuedTasks: Task[];
   globalActiveCount: number;
+  globalEvaluatingCount: number;
   globalQueuedCount: number;
   maxConcurrentVMs: number;
   usingMaxPlan: boolean;
@@ -67,6 +68,7 @@ export function HeaderBar(props: HeaderBarProps) {
   const {
     queuedTasks,
     globalActiveCount,
+    globalEvaluatingCount,
     maxConcurrentVMs,
     usingMaxPlan,
     lastRefresh,
@@ -144,6 +146,11 @@ export function HeaderBar(props: HeaderBarProps) {
             ${(globalActiveCount * (usingMaxPlan ? 0.07 : 1.07)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
           </span>
           <span className="text-[9px] text-neutral-600 mt-0.5">{usingMaxPlan ? 'VM only (Max plan)' : 'VM + API tokens'}</span>
+        </div>
+        <div className="w-px h-8 bg-neutral-800"></div>
+        <div className="flex flex-col items-center">
+          <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Evaluating</span>
+          <span className="text-xl font-bold text-amber-400 font-mono leading-none">{globalEvaluatingCount}</span>
         </div>
         <div className="w-px h-8 bg-neutral-800"></div>
         <div className="flex flex-col items-center">
