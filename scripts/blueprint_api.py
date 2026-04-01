@@ -1,49 +1,88 @@
 """Blueprint orchestrator API helper.
 
-Used by Claude Code /task and /tasks commands to interact with the deployed orchestrator.
-Reads auth and defaults from .blueprint-config.json — never hardcodes secrets.
+Shared module for all admin scripts. Reads auth from .blueprint-config.json.
+Never hardcodes secrets, repos, or task IDs.
+
+Usage as library:
+    from blueprint_api import api, config
+    tasks = api("GET", "/api/admin/tasks?limit=10")
+    api("PATCH", f"/api/admin/tasks/{task_id}", {"status": "QUEUED"})
+
+Usage as CLI:
+    python scripts/blueprint_api.py create_task "title" "prompt" --type review --pr-number 84
+    python scripts/blueprint_api.py list_tasks --status EVALUATING --limit 20
 """
 
 import json
 import sys
 import urllib.request
+import urllib.error
 from pathlib import Path
+from typing import Any
 
 CONFIG_FILE = ".blueprint-config.json"
 
+_config_cache: dict | None = None
 
-def _load_config() -> dict:
+
+def load_config() -> dict:
     """Load API config from project root. Exits with guidance if missing."""
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
     config_path = Path(__file__).resolve().parent.parent / CONFIG_FILE
     if not config_path.exists():
         print(f"ERROR: {config_path} not found.")
         print("Create it with: api_url, api_key, default_repo, default_base_branch")
         sys.exit(1)
-    return json.loads(config_path.read_text())
+    _config_cache = json.loads(config_path.read_text())
+    return _config_cache
 
 
-def _api_request(method: str, path: str, body: dict | None = None) -> dict:
-    """Make an authenticated request to the orchestrator API."""
-    config = _load_config()
-    url = config["api_url"].rstrip("/") + path
+def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> Any:
+    """Make an authenticated request to the orchestrator API. Returns parsed JSON."""
+    cfg = load_config()
+    url = cfg["api_url"].rstrip("/") + path
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode() if body else None,
         method=method,
         headers={
-            "Authorization": f"Bearer {config['api_key']}",
+            "Authorization": f"Bearer {cfg['api_key']}",
             "Content-Type": "application/json",
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        print(f"API error {e.code}: {e.read().decode()}")
-        sys.exit(1)
+        print(f"API error {e.code}: {e.read().decode()[:500]}")
+        raise
 
 
-# ── Public API ───────────────────────────────────────────────────────────────
+# ── Convenience helpers ─────────────────────────────────────────────────────
+
+def list_tasks(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    """Fetch tasks, optionally filtered by status."""
+    path = f"/api/admin/tasks?limit={limit}&offset={offset}"
+    if status:
+        path += f"&status={status}"
+    data = api("GET", path)
+    return data.get("tasks", data) if isinstance(data, dict) else data
+
+
+def all_tasks_by_status(*statuses: str) -> list[dict]:
+    """Fetch all tasks across multiple statuses."""
+    result = []
+    for status in statuses:
+        result.extend(list_tasks(status=status))
+    return result
+
+
+def patch_task(task_id: str, payload: dict) -> dict:
+    """Update a task via PATCH."""
+    return api("PATCH", f"/api/admin/tasks/{task_id}", payload)
+
 
 def create_task(
     title: str,
@@ -53,42 +92,43 @@ def create_task(
     pr_number: int | None = None,
     branch: str | None = None,
 ) -> dict:
-    """Submit a new task to the orchestrator.
-
-    Args:
-        title:       Short task title (conventional commit style).
-        prompt:      Instructions for the agent.
-        task_type:   One of: create, plan, research, review, fix.
-        base_branch: Target branch (defaults to config's default_base_branch).
-        pr_number:   Required for review/fix tasks.
-        branch:      PR head branch — required for fix, optional for review.
-    """
-    config = _load_config()
+    """Submit a new task to the orchestrator."""
+    cfg = load_config()
     payload = {
-        "github_repo": config["default_repo"],
+        "github_repo": cfg["default_repo"],
         "title": title,
         "prompt": prompt,
-        "base_branch": base_branch or config.get("default_base_branch", "main"),
+        "base_branch": base_branch or cfg.get("default_base_branch", "main"),
         "task_type": task_type,
     }
     if pr_number is not None:
         payload["pr_number"] = pr_number
     if branch is not None:
         payload["branch"] = branch
-    return _api_request("POST", "/api/admin/tasks", payload)
+    return api("POST", "/api/admin/tasks", payload)
 
 
-def list_tasks(limit: int = 10, status: str | None = None) -> list:
-    """Fetch recent tasks, optionally filtered by status."""
-    path = f"/api/admin/tasks?limit={limit}"
-    if status:
-        path += f"&status={status}"
-    data = _api_request("GET", path)
-    # Backend returns {"tasks": [...], "total": N}
-    return data.get("tasks", data) if isinstance(data, dict) else data
+def fmt_task(t: dict, verbose: bool = False) -> str:
+    """Format a task as a one-line summary."""
+    tid = t["id"][:8]
+    status = t.get("status", "?")
+    ttype = t.get("task_type", (t.get("payloads") or [{}])[0].get("type", "?"))
+    title = t.get("title", "")[:50]
+    msg = (t.get("latest_status_message") or "")[:80]
+    parent = (t.get("parent_task_id") or "")[:8]
+    ctx = t.get("context") or {}
+    loop = ctx.get("review_loop", {})
+    ci = loop.get("ci_waiting", False)
+    pr = loop.get("pr_number", (t.get("payloads") or [{}])[0].get("pr_number", "-"))
+    line = f"{tid}  [{ttype:8}] {status:13} {title:<50}"
+    if verbose:
+        line += f"  pr={pr}  ci={ci}  parent={parent or '-'}"
+    if msg:
+        line += f"  | {msg}"
+    return line
 
 
-# ── CLI entrypoint ───────────────────────────────────────────────────────────
+# ── CLI entrypoint ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
@@ -102,16 +142,13 @@ if __name__ == "__main__":
     ct.add_argument("--type", dest="task_type", default="create",
                     choices=["create", "plan", "research", "review", "fix"],
                     help="Task type (default: create)")
-    ct.add_argument("--base-branch", dest="base_branch", default=None,
-                    help="Target branch (default: config's default_base_branch)")
-    ct.add_argument("--pr-number", dest="pr_number", type=int, default=None,
-                    help="PR number (required for review/fix)")
-    ct.add_argument("--branch", dest="branch", default=None,
-                    help="PR head branch (required for fix, optional for review)")
+    ct.add_argument("--base-branch", dest="base_branch", default=None)
+    ct.add_argument("--pr-number", dest="pr_number", type=int, default=None)
+    ct.add_argument("--branch", dest="branch", default=None)
 
     lt = sub.add_parser("list_tasks", help="Fetch recent tasks")
     lt.add_argument("--status", default=None, help="Filter by status")
-    lt.add_argument("--limit", type=int, default=10, help="Max tasks to return")
+    lt.add_argument("--limit", type=int, default=20, help="Max tasks to return")
 
     args = parser.parse_args()
     if not args.command:
@@ -120,14 +157,10 @@ if __name__ == "__main__":
 
     if args.command == "create_task":
         result = create_task(
-            title=args.title,
-            prompt=args.prompt,
-            task_type=args.task_type,
-            base_branch=args.base_branch,
-            pr_number=args.pr_number,
-            branch=args.branch,
+            title=args.title, prompt=args.prompt, task_type=args.task_type,
+            base_branch=args.base_branch, pr_number=args.pr_number, branch=args.branch,
         )
+        print(json.dumps(result, indent=2))
     elif args.command == "list_tasks":
-        result = list_tasks(limit=args.limit, status=args.status)
-
-    print(json.dumps(result, indent=2))
+        for t in list_tasks(limit=args.limit, status=args.status):
+            print(fmt_task(t, verbose=True))
