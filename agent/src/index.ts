@@ -187,9 +187,11 @@ async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
 ) {
-  const prompt = String(payload.prompt || payload.description || task.description || '');
+  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
   const rawBaseBranch = String(payload.base_branch || 'main');
   const rawTitle = String(task.title || payload.title || 'automated changes');
+  // Include title as context so the agent understands intent even if the prompt is terse
+  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
 
   if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
   const baseBranch = rawBaseBranch;
