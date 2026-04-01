@@ -203,7 +203,7 @@ export function SettingsDropdown({
                   <div className="flex-1 min-w-0">
                     <div className="text-xs text-neutral-200 truncate">{a.name}</div>
                     <div className="text-[10px] text-neutral-500 font-mono">
-                      {a.active_tasks} active / {a.total_tasks} total
+                      {a.active_tasks} active
                       {tokenAge && <span className={`ml-1.5 ${isExpiring ? 'text-amber-400' : ''}`}>· token {tokenAge}</span>}
                     </div>
                   </div>

@@ -140,7 +140,17 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    return {"tasks": result_list, "total": total}
+    # Global active count (not affected by pagination/filters)
+    active_count = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING, TaskStatus.EVALUATING])
+        )
+    )).scalar() or 0
+    queued_count = (await session.execute(
+        select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED)
+    )).scalar() or 0
+
+    return {"tasks": result_list, "total": total, "active_count": active_count, "queued_count": queued_count}
 
 
 class CreateTaskPayload(BaseModel):

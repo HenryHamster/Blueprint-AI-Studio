@@ -82,6 +82,8 @@ export default function App() {
       <HeaderBar
         runningTasks={runningTasks}
         queuedTasks={queuedTasks}
+        globalActiveCount={s.globalActiveCount}
+        globalQueuedCount={s.globalQueuedCount}
         maxConcurrentVMs={s.maxConcurrentVMs}
         usingMaxPlan={s.usingMaxPlan}
         lastRefresh={s.lastRefresh}

@@ -7,6 +7,8 @@ import type { Task } from './TaskCard';
 export interface HeaderBarProps {
   runningTasks: Task[];
   queuedTasks: Task[];
+  globalActiveCount: number;
+  globalQueuedCount: number;
   maxConcurrentVMs: number;
   usingMaxPlan: boolean;
   lastRefresh: Date | null;
@@ -63,8 +65,8 @@ function formatTimeAgo(date: Date): string {
 
 export function HeaderBar(props: HeaderBarProps) {
   const {
-    runningTasks,
     queuedTasks,
+    globalActiveCount,
     maxConcurrentVMs,
     usingMaxPlan,
     lastRefresh,
@@ -131,15 +133,15 @@ export function HeaderBar(props: HeaderBarProps) {
         <div className="flex flex-col items-center">
           <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Active VMs</span>
           <span className="text-xl font-bold text-emerald-400 font-mono leading-none flex items-center gap-1.5">
-            {runningTasks.length > 0 && <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>}
-            {runningTasks.length}<span className="text-xs text-neutral-600 font-sans">/{maxConcurrentVMs}</span>
+            {globalActiveCount > 0 && <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>}
+            {globalActiveCount}<span className="text-xs text-neutral-600 font-sans">/{maxConcurrentVMs}</span>
           </span>
         </div>
         <div className="w-px h-8 bg-neutral-800"></div>
         <div className="flex flex-col items-center">
           <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Est. Cost</span>
           <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
-            ${(runningTasks.length * (usingMaxPlan ? 0.07 : 1.07)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
+            ${(globalActiveCount * (usingMaxPlan ? 0.07 : 1.07)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
           </span>
           <span className="text-[9px] text-neutral-600 mt-0.5">{usingMaxPlan ? 'VM only (Max plan)' : 'VM + API tokens'}</span>
         </div>
