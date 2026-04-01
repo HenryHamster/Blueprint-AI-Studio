@@ -152,7 +152,7 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
   }
   if (status === 'EVALUATING') {
     return (
-      <span className="inline-flex items-center gap-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
+      <span className="inline-flex items-center gap-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
         <Clock className="w-3 h-3" />Evaluating subtasks
       </span>
     );
@@ -226,6 +226,9 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <StatusBadge status={task.status} />
+          {isActive && task.last_heartbeat && (
+            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
+          )}
           <TaskTypeBadge taskType={task.task_type} />
           {task.requires_approval && (
             <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">

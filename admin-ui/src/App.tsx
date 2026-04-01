@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Activity, AlertCircle } from 'lucide-react';
 import { useAppState } from './useAppState';
 import { SummaryPanels } from './components/SummaryPanels';
@@ -19,6 +19,8 @@ import type { KanbanColumn } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 
+const ACTIVE_STATUSES = new Set(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED']);
+
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
@@ -30,6 +32,7 @@ const COLUMNS: KanbanColumn[] = [
 
 export default function App() {
   const s = useAppState();
+  const [hideEmptyColumns, setHideEmptyColumns] = useState(true);
 
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
@@ -50,8 +53,10 @@ export default function App() {
     const typeMatch = s.taskTypeFilter === 'all' || taskType === s.taskTypeFilter;
     const query = s.searchQuery.toLowerCase();
     const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
-    return typeMatch && searchMatch;
-  }), [s.tasks, s.taskTypeFilter, s.searchQuery]);
+    const activeMatch = !s.activeOnly || ACTIVE_STATUSES.has(t.status) || t.requires_approval === true;
+    const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
+    return typeMatch && searchMatch && activeMatch && projectMatch;
+  }), [s.tasks, s.taskTypeFilter, s.searchQuery, s.activeOnly, s.selectedProjectId]);
 
   if (s.authLoading) {
     return (
@@ -188,25 +193,37 @@ export default function App() {
         />
       ) : (
         <>
-          <SearchFilterBar
-            searchQuery={s.searchQuery}
-            onSearchChange={s.setSearchQuery}
-            taskTypeFilter={s.taskTypeFilter}
-            onTypeFilterChange={s.setTaskTypeFilter}
-            statusFilter={s.statusFilter}
-            onStatusFilterChange={s.setStatusFilter}
-            filteredCount={filteredTasks.length}
-            totalCount={s.tasks.length}
-          />
+          <div className="flex items-center gap-2 shrink-0">
+            <SearchFilterBar
+              searchQuery={s.searchQuery}
+              onSearchChange={s.setSearchQuery}
+              taskTypeFilter={s.taskTypeFilter}
+              onTypeFilterChange={s.setTaskTypeFilter}
+              statusFilter={s.statusFilter}
+              onStatusFilterChange={s.setStatusFilter}
+              filteredCount={filteredTasks.length}
+              totalCount={s.tasks.length}
+              activeOnly={s.activeOnly}
+              onToggleActiveOnly={() => s.setActiveOnly(v => !v)}
+            />
+            {s.viewMode === 'kanban' && (
+              <button
+                onClick={() => setHideEmptyColumns(v => !v)}
+                className="text-[11px] px-2.5 py-1 rounded border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
+              >
+                {hideEmptyColumns ? 'Show empty' : 'Hide empty'}
+              </button>
+            )}
+          </div>
 
           {s.viewMode === 'kanban' ? (
             <KanbanBoard
               tasks={filteredTasks}
               columns={COLUMNS}
-              selectedProjectId={s.selectedProjectId}
               loading={s.loading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
+              hideEmptyColumns={hideEmptyColumns}
               onApprove={s.handleApprove}
               onCancel={s.handleCancel}
               onRetry={s.handleRetry}
@@ -216,7 +233,17 @@ export default function App() {
             />
           ) : (
             <main className="flex-1 overflow-hidden flex flex-col">
-              <PipelineView tasks={s.selectedProjectId === null ? filteredTasks : filteredTasks.filter(t => t.project_id === s.selectedProjectId)} onViewLogs={s.handleViewLogs} />
+              <PipelineView
+                tasks={filteredTasks}
+                onViewLogs={s.handleViewLogs}
+                onNavigateToParent={(parentTaskId) => {
+                  navigator.clipboard.writeText(parentTaskId).then(() => {
+                    s.addToast('Parent task ID copied — use search to find it', 'info');
+                  }).catch(() => {
+                    s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
+                  });
+                }}
+              />
             </main>
           )}
 

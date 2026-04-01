@@ -9,6 +9,8 @@ interface SearchFilterBarProps {
   onStatusFilterChange: (status: string | null) => void;
   filteredCount: number;
   totalCount: number;
+  activeOnly: boolean;
+  onToggleActiveOnly: () => void;
 }
 
 const STATUS_OPTIONS: { label: string; value: string | null }[] = [
@@ -22,7 +24,7 @@ const STATUS_OPTIONS: { label: string; value: string | null }[] = [
   { label: 'Completed', value: 'COMPLETED' },
 ];
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount, activeOnly, onToggleActiveOnly }: SearchFilterBarProps) {
   return (
     <div className="flex items-center gap-3 mb-4 shrink-0 flex-wrap">
       <div className="relative">
@@ -36,6 +38,16 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         />
       </div>
       <span className="text-xs text-neutral-500">{filteredCount} of {totalCount}</span>
+      <button
+        onClick={onToggleActiveOnly}
+        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
+          activeOnly
+            ? 'bg-blue-950/50 border-blue-500 text-blue-300'
+            : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
+        }`}
+      >
+        Active only
+      </button>
       <div className="flex items-center gap-1">
         {(['all', 'create', 'plan', 'research', 'review', 'fix'] as const).map(opt => (
           <button

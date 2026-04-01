@@ -1,6 +1,7 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
+import { ChevronDown } from 'lucide-react';
 import type { Task } from './TaskCard';
-import { TASK_TYPE_STYLES, useElapsedTime } from './TaskCard';
+import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
@@ -22,6 +23,7 @@ interface TreeNode {
 interface PipelineViewProps {
   tasks: Task[];
   onViewLogs: (task: Task) => void;
+  onNavigateToParent?: (parentTaskId: string) => void;
 }
 
 function buildForest(tasks: Task[]): TreeNode[] {
@@ -89,10 +91,12 @@ function buildForest(tasks: Task[]): TreeNode[] {
   return [...syntheticRoots, ...roots];
 }
 
-function TaskNode({ task, onViewLogs, isOrphan }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
+  const isRunning = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
+  const heartbeat = isRunning && task.last_heartbeat ? getHeartbeatStatus(task.last_heartbeat) : null;
 
   const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
@@ -102,19 +106,29 @@ function TaskNode({ task, onViewLogs, isOrphan }: { task: Task; onViewLogs: (tas
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onViewLogs(task)}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
       className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}\nClick to view logs`}
     >
       {/* Status dot */}
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor}`} />
+      {heartbeat && (
+        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
+      )}
 
       {/* Orphan indicator */}
-      {isOrphan && (
-        <span className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0">
+      {isOrphan && task.parent_task_id && (
+        <button
+          onClick={e => { e.stopPropagation(); onNavigateToParent?.(task.parent_task_id!); }}
+          className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+          title={`Copy parent task ID: ${task.parent_task_id}`}
+        >
           ↑ Parent on another page
-        </span>
+        </button>
       )}
 
       {/* Type badge */}
@@ -133,7 +147,7 @@ function TaskNode({ task, onViewLogs, isOrphan }: { task: Task; onViewLogs: (tas
       <span className="text-[10px] text-neutral-500 font-mono shrink-0">
         {task.status === 'QUEUED' ? 'Waiting' : duration}
       </span>
-    </button>
+    </div>
   );
 }
 
@@ -143,6 +157,7 @@ function TreeBranch({
   allTaskIds,
   prChainMap,
   onViewLogs,
+  onNavigateToParent,
   isLast,
   depth,
 }: {
@@ -151,6 +166,7 @@ function TreeBranch({
   allTaskIds: Set<string>;
   prChainMap: Map<number, Task>;
   onViewLogs: (task: Task) => void;
+  onNavigateToParent?: (parentTaskId: string) => void;
   isLast: boolean;
   depth: number;
 }) {
@@ -229,7 +245,7 @@ function TreeBranch({
           </div>
         )}
 
-        <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} />
+        <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} />
 
         {/* Children */}
         {node.children.length > 0 && (
@@ -242,6 +258,7 @@ function TreeBranch({
                 allTaskIds={allTaskIds}
                 prChainMap={prChainMap}
                 onViewLogs={onViewLogs}
+                onNavigateToParent={onNavigateToParent}
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
               />
@@ -271,7 +288,124 @@ function buildPrChainMap(tasks: Task[]): Map<number, Task> {
   return map;
 }
 
-export function PipelineView({ tasks, onViewLogs }: PipelineViewProps) {
+function RootGroup({
+  root,
+  taskMap,
+  allTaskIds,
+  prChainMap,
+  onViewLogs,
+  onNavigateToParent,
+}: {
+  root: TreeNode;
+  taskMap: Map<string, Task>;
+  allTaskIds: Set<string>;
+  prChainMap: Map<number, Task>;
+  onViewLogs: (task: Task) => void;
+  onNavigateToParent?: (parentTaskId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const isSynthetic = root.isSyntheticParent;
+  const totalInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countNodes(c), 0)
+    : countNodes(root);
+  const completedInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'COMPLETED'), 0)
+    : countByStatus(root, 'COMPLETED');
+  const runningInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatuses(c, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']), 0)
+    : countByStatuses(root, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+  const failedInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatuses(c, ['FAILED']), 0)
+    : countByStatuses(root, ['FAILED']);
+
+  return (
+    <div
+      className={isSynthetic
+        ? 'bg-neutral-900/30 border border-dashed border-neutral-700/60 rounded-xl p-4'
+        : 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4'}
+    >
+      {/* Group header */}
+      <div className="flex items-center justify-between w-full mb-0 px-1 group">
+        <div className="flex items-center gap-2 truncate pr-4">
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => setExpanded(e => !e)}
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(ex => !ex); } }}
+            className="flex items-center gap-2 truncate cursor-pointer"
+          >
+            <ChevronDown
+              className={`w-3.5 h-3.5 shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? '' : '-rotate-90'}`}
+            />
+            <h3 className={`text-[11px] font-bold uppercase tracking-widest truncate ${isSynthetic ? 'text-neutral-500' : 'text-neutral-400'}`}>
+              {root.task.title}
+            </h3>
+          </div>
+          {isSynthetic && root.task.parent_task_id && (
+            <button
+              onClick={() => onNavigateToParent?.(root.task.parent_task_id!)}
+              className="text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              title={`Copy parent task ID: ${root.task.parent_task_id}`}
+            >
+              ↑ Parent on another page
+            </button>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {runningInGroup > 0 && (
+            <span className="flex items-center gap-1 text-[10px] bg-yellow-500/10 text-yellow-400 px-2 py-0.5 rounded-full font-medium border border-yellow-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0" />
+              {runningInGroup}
+            </span>
+          )}
+          {failedInGroup > 0 && (
+            <span className="flex items-center gap-1 text-[10px] bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
+              {failedInGroup}
+            </span>
+          )}
+          <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+            {completedInGroup}/{totalInGroup} done
+          </span>
+        </div>
+      </div>
+
+      {/* Tree */}
+      {expanded && (
+        <div className="space-y-1 mt-3">
+          {isSynthetic ? (
+            root.children.map((child, i) => (
+              <TreeBranch
+                key={child.task.id}
+                node={child}
+                taskMap={taskMap}
+                allTaskIds={allTaskIds}
+                prChainMap={prChainMap}
+                onViewLogs={onViewLogs}
+                onNavigateToParent={onNavigateToParent}
+                isLast={i === root.children.length - 1}
+                depth={0}
+              />
+            ))
+          ) : (
+            <TreeBranch
+              node={root}
+              taskMap={taskMap}
+              allTaskIds={allTaskIds}
+              prChainMap={prChainMap}
+              onViewLogs={onViewLogs}
+              onNavigateToParent={onNavigateToParent}
+              isLast={true}
+              depth={0}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -288,70 +422,17 @@ export function PipelineView({ tasks, onViewLogs }: PipelineViewProps) {
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
       <div className="space-y-4 min-w-[400px]">
-        {forest.map(root => {
-          const isSynthetic = root.isSyntheticParent;
-          const totalInGroup = isSynthetic
-            ? root.children.reduce((sum, c) => sum + countNodes(c), 0)
-            : countNodes(root);
-          const completedInGroup = isSynthetic
-            ? root.children.reduce((sum, c) => sum + countByStatus(c, 'COMPLETED'), 0)
-            : countByStatus(root, 'COMPLETED');
-
-          return (
-            <div
-              key={root.task.id}
-              className={isSynthetic
-                ? 'bg-neutral-900/30 border border-dashed border-neutral-700/60 rounded-xl p-4'
-                : 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4'}
-            >
-              {/* Group header */}
-              <div className="flex items-center justify-between mb-3 px-1">
-                <div className="flex items-center gap-2 truncate pr-4">
-                  <h3 className={`text-[11px] font-bold uppercase tracking-widest truncate ${isSynthetic ? 'text-neutral-500' : 'text-neutral-400'}`}>
-                    {root.task.title}
-                  </h3>
-                  {isSynthetic && (
-                    <span className="text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0">
-                      ↑ Parent on another page
-                    </span>
-                  )}
-                </div>
-                <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700 shrink-0">
-                  {completedInGroup}/{totalInGroup} done
-                </span>
-              </div>
-
-              {/* Tree */}
-              <div className="space-y-1">
-                {isSynthetic ? (
-                  // Render orphan children directly (no synthetic task node)
-                  root.children.map((child, i) => (
-                    <TreeBranch
-                      key={child.task.id}
-                      node={child}
-                      taskMap={taskMap}
-                      allTaskIds={allTaskIds}
-                      prChainMap={prChainMap}
-                      onViewLogs={onViewLogs}
-                      isLast={i === root.children.length - 1}
-                      depth={0}
-                    />
-                  ))
-                ) : (
-                  <TreeBranch
-                    node={root}
-                    taskMap={taskMap}
-                    allTaskIds={allTaskIds}
-                    prChainMap={prChainMap}
-                    onViewLogs={onViewLogs}
-                    isLast={true}
-                    depth={0}
-                  />
-                )}
-              </div>
-            </div>
-          );
-        })}
+        {forest.map(root => (
+          <RootGroup
+            key={root.task.id}
+            root={root}
+            taskMap={taskMap}
+            allTaskIds={allTaskIds}
+            prChainMap={prChainMap}
+            onViewLogs={onViewLogs}
+            onNavigateToParent={onNavigateToParent}
+          />
+        ))}
       </div>
     </div>
   );
@@ -364,4 +445,9 @@ function countNodes(node: TreeNode): number {
 function countByStatus(node: TreeNode, status: string): number {
   const self = node.task.status === status ? 1 : 0;
   return self + node.children.reduce((sum, c) => sum + countByStatus(c, status), 0);
+}
+
+function countByStatuses(node: TreeNode, statuses: string[]): number {
+  const self = statuses.includes(node.task.status) ? 1 : 0;
+  return self + node.children.reduce((sum, c) => sum + countByStatuses(c, statuses), 0);
 }
