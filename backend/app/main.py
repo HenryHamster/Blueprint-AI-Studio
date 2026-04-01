@@ -660,6 +660,31 @@ async def orchestrator_worker():
                             print(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
                             continue
 
+                        # Check for merge conflicts — CI won't trigger on conflicting PRs
+                        if pr_data.get("mergeable") is False:
+                            ci_payload = (ci_task.payloads or [{}])[0]
+                            ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
+                            ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+                            ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
+                            fix_prompt = (
+                                f"PR #{ci_pr_number} has merge conflicts and CI cannot run.\n\n"
+                                f"Rebase the branch onto {ci_base} and resolve all conflicts."
+                            )
+                            fix_task = await _spawn_pipeline_task(
+                                ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
+                                fix_prompt=fix_prompt, original_task_id=ci_orig_id
+                            )
+                            if fix_task:
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
+                                print(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
+                            else:
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, fix not spawned (iteration cap)"
+                            session.add(ci_task)
+                            await session.commit()
+                            continue
+
                         ci_head_sha = pr_data.get("head", {}).get("sha", "")
                         if not ci_head_sha:
                             ci_task.latest_status_message = f"CI waiting on PR #{ci_pr_number} — HEAD SHA unavailable"
