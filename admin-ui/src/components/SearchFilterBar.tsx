@@ -9,8 +9,6 @@ interface SearchFilterBarProps {
   onStatusFilterChange: (status: string | null) => void;
   filteredCount: number;
   totalCount: number;
-  activeOnly: boolean;
-  onToggleActiveOnly: () => void;
 }
 
 const STATUS_OPTIONS: { label: string; value: string | null }[] = [
@@ -24,12 +22,11 @@ const STATUS_OPTIONS: { label: string; value: string | null }[] = [
   { label: 'Completed', value: 'COMPLETED' },
 ];
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount, activeOnly, onToggleActiveOnly }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter !== 'all',
     statusFilter !== null,
-    activeOnly,
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
@@ -38,7 +35,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onSearchChange('');
     onTypeFilterChange('all');
     onStatusFilterChange(null);
-    if (activeOnly) onToggleActiveOnly();
   }
 
   return (
@@ -69,16 +65,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           Clear
         </button>
       )}
-      <button
-        onClick={onToggleActiveOnly}
-        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
-          activeOnly
-            ? 'bg-blue-950/50 border-blue-500 text-blue-300'
-            : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
-        }`}
-      >
-        Active only
-      </button>
       <div className="flex items-center gap-1.5">
         <span className="text-[10px] text-neutral-600 uppercase tracking-wider font-semibold shrink-0">Type</span>
         <div className="flex items-center gap-1">

@@ -19,8 +19,6 @@ import type { KanbanColumn } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 
-const ACTIVE_STATUSES = new Set(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED']);
-
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
   { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
@@ -51,10 +49,9 @@ export default function App() {
     const typeMatch = s.taskTypeFilter === 'all' || taskType === s.taskTypeFilter;
     const query = s.searchQuery.toLowerCase();
     const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
-    const activeMatch = !s.activeOnly || ACTIVE_STATUSES.has(t.status) || t.requires_approval === true;
     const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
-    return typeMatch && searchMatch && activeMatch && projectMatch;
-  }), [s.tasks, s.taskTypeFilter, s.searchQuery, s.activeOnly, s.selectedProjectId]);
+    return typeMatch && searchMatch && projectMatch;
+  }), [s.tasks, s.taskTypeFilter, s.searchQuery, s.selectedProjectId]);
 
   if (s.authLoading) {
     return (
@@ -202,8 +199,6 @@ export default function App() {
               onStatusFilterChange={s.setStatusFilter}
               filteredCount={filteredTasks.length}
               totalCount={s.tasks.length}
-              activeOnly={s.activeOnly}
-              onToggleActiveOnly={() => s.setActiveOnly(v => !v)}
             />
           </div>
 

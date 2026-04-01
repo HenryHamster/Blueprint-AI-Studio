@@ -120,11 +120,8 @@ export function useAppState() {
   const [searchQuery, setSearchQuery] = useState('');
   const [taskTypeFilter, setTaskTypeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
-  const [activeOnly, setActiveOnly] = useState(false);
-
-  // Reset page when status filter or active-only toggle changes
+  // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
-  useEffect(() => { setPage(1); }, [activeOnly]);
 
   // Keyboard shortcut help state
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -930,7 +927,6 @@ export function useAppState() {
     viewMode, setViewMode,
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
-    activeOnly, setActiveOnly,
     // Projects
     projects, selectedProjectId, setSelectedProjectId,
     // Log viewer
