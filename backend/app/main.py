@@ -706,7 +706,25 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = f"CI passed but merge blocked: {merge_result.get('message', 'unknown')}"
                                 print(f"[CI] PR #{ci_pr_number} CI passed but merge blocked")
                         else:
-                            # CI failed — spawn fix
+                            # CI failed — check for existing active fix before spawning
+                            active_tasks = (await session.execute(
+                                select(Task).where(
+                                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                                )
+                            )).scalars().all()
+                            existing_fix = next(
+                                (t for t in active_tasks
+                                 if (t.payloads or [{}])[0].get("type") == "fix"
+                                 and (t.payloads or [{}])[0].get("pr_number") == ci_pr_number),
+                                None
+                            )
+                            if existing_fix:
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix already active → {existing_fix.id}"
+                                print(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id}")
+                                session.add(ci_task)
+                                await session.commit()
+                                continue
                             ci_errors = ci_result.get("failed_logs", "CI checks failed")
                             await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
                                 f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```")

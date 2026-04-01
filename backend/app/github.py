@@ -751,11 +751,11 @@ async def get_check_runs(
     else:
         agg_status = "completed"
 
-    # Aggregate conclusion
+    # Aggregate conclusion — "skipped" and "neutral" are non-failures
     conclusions = [cr.get("conclusion") for cr in check_runs if cr.get("status") == "completed"]
     if not conclusions:
         agg_conclusion = None
-    elif all(c == "success" for c in conclusions):
+    elif all(c in ("success", "skipped", "neutral") for c in conclusions):
         agg_conclusion = "success"
     else:
         agg_conclusion = "failure"

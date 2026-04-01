@@ -330,6 +330,13 @@ async def modify_task(
         task.payloads = payload["payloads"]
         changes["payloads"] = "updated"
 
+    if "parent_task_id" in payload:
+        if payload["parent_task_id"]:
+            task.parent_task_id = uuid.UUID(payload["parent_task_id"])
+        else:
+            task.parent_task_id = None
+        changes["parent_task_id"] = str(task.parent_task_id)
+
     if "context" in payload and isinstance(payload["context"], dict):
         task.context = {**(task.context or {}), **payload["context"]}
         changes["context"] = "updated"
