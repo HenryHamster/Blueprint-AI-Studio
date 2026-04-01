@@ -2453,12 +2453,15 @@ async def update_agent_status(
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
+
+                # Parse verdict: scan backwards from end for last JSON with "verdict" key.
+                # This is more robust than forward-scanning regex since the agent appends
+                # the verdict JSON at the end of the output.
+                import re
+                verdict_parsed = False
                 try:
-                    import re
-                    # Find ALL JSON objects containing "verdict" — use bracket-counting
-                    # to handle nested braces in feedback strings
-                    verdict_candidates = []
-                    for m in re.finditer(r'\{[^"]*"verdict"', verdict_text):
+                    # Find all JSON objects containing "verdict" key (handles any key order)
+                    for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
                         start = m.start()
                         depth = 0
                         for i in range(start, len(verdict_text)):
@@ -2470,19 +2473,26 @@ async def update_agent_status(
                                     try:
                                         candidate = json.loads(verdict_text[start:i+1])
                                         if "verdict" in candidate:
-                                            verdict_candidates.append(candidate)
+                                            verdict = candidate["verdict"]
+                                            feedback = candidate.get("feedback", verdict_text)
+                                            verdict_parsed = True
                                     except json.JSONDecodeError:
                                         pass
                                     break
-                    # Use the LAST valid verdict (most recent in output)
-                    if verdict_candidates:
-                        verdict_data = verdict_candidates[-1]
-                        verdict = verdict_data.get("verdict", "REQUEST_CHANGES")
-                        feedback = verdict_data.get("feedback", verdict_text)
-                    else:
-                        print(f"[REVIEW PIPELINE] WARNING: No verdict JSON found in review output for task {task.id} (output length: {len(verdict_text)} chars)")
                 except Exception as e:
                     print(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}")
+
+                if not verdict_parsed:
+                    # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words
+                    upper_text = verdict_text.upper()
+                    # Only match the verdict keywords, not surrounding review text
+                    approve_idx = upper_text.rfind('"APPROVE"')
+                    rc_idx = upper_text.rfind('"REQUEST_CHANGES"')
+                    if approve_idx > rc_idx:
+                        verdict = "APPROVE"
+                    elif rc_idx > approve_idx:
+                        verdict = "REQUEST_CHANGES"
+                    print(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
 
                 # Post the review to the PR as a comment
                 try:
