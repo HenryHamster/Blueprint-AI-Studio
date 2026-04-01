@@ -287,8 +287,34 @@ async def modify_task(
             raise HTTPException(status_code=400, detail="Invalid status")
 
     if "requires_approval" in payload:
+        was_blocked = task.requires_approval
         task.requires_approval = bool(payload["requires_approval"])
         changes["requires_approval"] = task.requires_approval
+
+        # Security approval: if unblocking a completed task with a PR, continue pipeline
+        # instead of re-running — spawn the review that was skipped
+        if was_blocked and not task.requires_approval and task.status == TaskStatus.COMPLETED:
+            from app.main import _spawn_pipeline_task
+            artifact = (await session.execute(
+                select(Artifact).where(Artifact.task_id == task.id,
+                                       Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+            )).scalars().first()
+            if artifact and artifact.pr_url:
+                pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+                branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
+                task_payload = (task.payloads or [{}])[0]
+                base_branch = task_payload.get("base_branch", "main")
+                original_prompt = task_payload.get("prompt", task.description or "")
+                review_task = await _spawn_pipeline_task(
+                    task, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(task.id)
+                )
+                if review_task:
+                    changes["spawned_review"] = str(review_task.id)
+                    # Remove QUEUED status if the frontend also sent it — task stays COMPLETED
+                    if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
+                        task.status = TaskStatus.COMPLETED
+                        changes["status"] = TaskStatus.COMPLETED
 
     if "payloads" in payload:
         task.payloads = payload["payloads"]

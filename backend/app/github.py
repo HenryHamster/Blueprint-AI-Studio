@@ -570,6 +570,27 @@ async def get_pull_request(
         return response.json()
 
 
+async def get_open_pull_requests(
+    token: str, owner: str, repo: str, base: str
+) -> list[dict]:
+    """Fetches open PRs targeting a specific base branch."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            headers=headers,
+            params={"state": "open", "base": base, "per_page": 100}
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to list PRs for base={base}: {response.text}")
+            return []
+        return response.json()
+
+
 async def get_pull_request_diff(
     token: str, owner: str, repo: str, pr_number: int
 ) -> str:

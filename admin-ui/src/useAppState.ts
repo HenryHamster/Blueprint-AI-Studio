@@ -351,7 +351,7 @@ export function useAppState() {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify({ requires_approval: false, status: 'QUEUED' }),
+        body: JSON.stringify({ requires_approval: false }),
       });
       fetchTasks();
     } catch (error) {

@@ -1996,6 +1996,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         if staging_branch and target_branch and staging_branch != target_branch:
             try:
                 gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
+
+                # Verify all PRs targeting the staging branch are resolved before rolling up
+                from app.github import get_open_pull_requests
+                open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                if open_prs:
+                    pr_nums = [f"#{p['number']}" for p in open_prs]
+                    print(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
+                    return
+
                 is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
                 pr_title = f"[Blueprint] Rollup: {parent.title}"
                 pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
