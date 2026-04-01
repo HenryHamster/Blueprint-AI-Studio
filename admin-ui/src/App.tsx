@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { Activity, AlertCircle } from 'lucide-react';
 import { useAppState } from './useAppState';
 import { SummaryPanels } from './components/SummaryPanels';
@@ -32,8 +32,6 @@ const COLUMNS: KanbanColumn[] = [
 
 export default function App() {
   const s = useAppState();
-  const [hideEmptyColumns, setHideEmptyColumns] = useState(true);
-
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
@@ -207,14 +205,6 @@ export default function App() {
               activeOnly={s.activeOnly}
               onToggleActiveOnly={() => s.setActiveOnly(v => !v)}
             />
-            {s.viewMode === 'kanban' && (
-              <button
-                onClick={() => setHideEmptyColumns(v => !v)}
-                className="text-[11px] px-2.5 py-1 rounded border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 transition-colors shrink-0"
-              >
-                {hideEmptyColumns ? 'Show empty' : 'Hide empty'}
-              </button>
-            )}
           </div>
 
           {s.viewMode === 'kanban' ? (
@@ -224,7 +214,6 @@ export default function App() {
               loading={s.loading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
-              hideEmptyColumns={hideEmptyColumns}
               onApprove={s.handleApprove}
               onCancel={s.handleCancel}
               onRetry={s.handleRetry}

@@ -13,7 +13,6 @@ interface KanbanBoardProps {
   loading: boolean;
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
-  hideEmptyColumns?: boolean;
   onApprove: (id: string) => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
@@ -23,12 +22,11 @@ interface KanbanBoardProps {
   onViewLogs: (task: Task) => void;
 }
 
-export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, hideEmptyColumns = true, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
+export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
   return (
     <main className="flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
       {columns.map(col => {
         const columnTasks = tasks.filter(t => col.includes.includes(t.status));
-        if (hideEmptyColumns && columnTasks.length === 0) return null;
         return (
           <div key={col.id} className="flex-1 min-w-[300px] max-w-[400px] flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 p-3">
             <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 flex items-center justify-between mb-3">
