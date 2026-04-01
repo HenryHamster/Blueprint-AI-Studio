@@ -300,6 +300,7 @@ export default function ArchiveView({
             <ChevronLeft className="w-3.5 h-3.5" />
             Previous
           </button>
+          <span className="text-xs text-neutral-500 min-w-[80px] text-center">Page {archivePage} of {totalPages}</span>
           <button
             onClick={() => setArchivePage(archivePage + 1)}
             disabled={!hasNextPage}

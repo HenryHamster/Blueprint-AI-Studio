@@ -31,7 +31,7 @@ export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoading
         return (
           <div key={col.id} className="flex-1 min-w-[300px] max-w-[400px] flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 p-3">
             <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 flex items-center justify-between mb-3">
-              <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-blue-400' : 'text-neutral-400'}`}>{col.label}</h2>
+              <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
               <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                 {columnTasks.length}
               </span>

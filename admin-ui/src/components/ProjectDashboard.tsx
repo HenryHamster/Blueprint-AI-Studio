@@ -112,7 +112,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                 }`}
               >
                 {counts.failed > 0 && (
-                  <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-500" />
+                  <span className="absolute top-2 right-2 text-[9px] font-bold bg-red-500/15 text-red-400 border border-red-500/20 rounded px-1 py-0.5">{counts.failed} failed</span>
                 )}
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs font-semibold text-neutral-200 truncate pr-2">{project.name}</span>

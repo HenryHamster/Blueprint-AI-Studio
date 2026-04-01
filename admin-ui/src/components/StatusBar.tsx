@@ -23,9 +23,9 @@ export function StatusBar({ apiHealthy, wsConnected, lastFetchTime }: StatusBarP
   }, []);
 
   return (
-    <div className="h-6 flex items-center justify-between px-3 bg-neutral-900 border-b border-neutral-800 text-xs shrink-0">
-      <div className="flex items-center gap-1.5">
-        <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500'}`} />
+    <div className={`h-6 flex items-center justify-between px-3 bg-neutral-900 border-b border-neutral-800 text-xs shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
+      <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
+        <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
         <span className={apiHealthy ? 'text-neutral-400' : 'text-red-400'}>
           API: {apiHealthy ? 'Connected' : 'Error'}
         </span>

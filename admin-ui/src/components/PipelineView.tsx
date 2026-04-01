@@ -295,6 +295,8 @@ function RootGroup({
   prChainMap,
   onViewLogs,
   onNavigateToParent,
+  expanded,
+  onToggle,
 }: {
   root: TreeNode;
   taskMap: Map<string, Task>;
@@ -302,8 +304,9 @@ function RootGroup({
   prChainMap: Map<number, Task>;
   onViewLogs: (task: Task) => void;
   onNavigateToParent?: (parentTaskId: string) => void;
+  expanded: boolean;
+  onToggle: () => void;
 }) {
-  const [expanded, setExpanded] = useState(true);
   const isSynthetic = root.isSyntheticParent;
   const totalInGroup = isSynthetic
     ? root.children.reduce((sum, c) => sum + countNodes(c), 0)
@@ -330,8 +333,8 @@ function RootGroup({
           <div
             role="button"
             tabIndex={0}
-            onClick={() => setExpanded(e => !e)}
-            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(ex => !ex); } }}
+            onClick={onToggle}
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); } }}
             className="flex items-center gap-2 truncate cursor-pointer"
           >
             <ChevronDown
@@ -410,6 +413,12 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const prChainMap = useMemo(() => buildPrChainMap(tasks), [tasks]);
+  const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({});
+
+  const getExpanded = (id: string) => groupExpanded[id] ?? true;
+  const toggleGroup = (id: string) => setGroupExpanded(prev => ({ ...prev, [id]: !(prev[id] ?? true) }));
+  const expandAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, true])));
+  const collapseAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, false])));
 
   if (tasks.length === 0) {
     return (
@@ -419,9 +428,17 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
     );
   }
 
+  const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
+
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
       <div className="space-y-4 min-w-[400px]">
+        {forest.length > 1 && (
+          <div className="flex items-center gap-2">
+            <button className={btnClass} onClick={expandAll}>Expand all</button>
+            <button className={btnClass} onClick={collapseAll}>Collapse all</button>
+          </div>
+        )}
         {forest.map(root => (
           <RootGroup
             key={root.task.id}
@@ -431,6 +448,8 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
             prChainMap={prChainMap}
             onViewLogs={onViewLogs}
             onNavigateToParent={onNavigateToParent}
+            expanded={getExpanded(root.task.id)}
+            onToggle={() => toggleGroup(root.task.id)}
           />
         ))}
       </div>
