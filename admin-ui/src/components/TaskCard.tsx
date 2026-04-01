@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect, useRef } from 'react';
-import { Square, CheckCircle, AlertCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield } from 'lucide-react';
+import { Square, CheckCircle, AlertCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive } from 'lucide-react';
 
 export function isSafeUrl(url: string): boolean {
   try {
@@ -55,6 +55,7 @@ interface TaskCardProps {
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
   onDismiss: (id: string) => void;
+  onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
 }
 
@@ -182,13 +183,13 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: TaskCardProps) {
+export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
   const [statusExpanded, setStatusExpanded] = useState(false);
   const [historyExpanded, setHistoryExpanded] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<'cancel' | 'dismiss' | null>(null);
+  const [confirmAction, setConfirmAction] = useState<'cancel' | 'dismiss' | 'archive' | null>(null);
   const [confirmCountdown, setConfirmCountdown] = useState(3);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -200,7 +201,7 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
     };
   }, []);
 
-  const handleDestructiveClick = (action: 'cancel' | 'dismiss', callback: () => void) => {
+  const handleDestructiveClick = (action: 'cancel' | 'dismiss' | 'archive', callback: () => void) => {
     if (confirmAction === action) {
       if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
       if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
@@ -428,6 +429,15 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
         <div className="mt-3 flex gap-2">
           <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to cancel (${confirmCountdown}s)` : 'Cancel'}
+          </button>
+        </div>
+      ) : null}
+
+      {isTerminal ? (
+        <div className="mt-3">
+          <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+            {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
+            {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
           </button>
         </div>
       ) : null}

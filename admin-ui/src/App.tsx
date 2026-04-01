@@ -188,6 +188,7 @@ export default function App() {
           setArchiveDateRange={s.setArchiveDateRange}
           handleViewLogs={s.handleViewLogs}
           onRetryTask={s.handleRetry}
+          onUnarchiveTask={s.handleUnarchiveTask}
           archiveSortOrder={s.archiveSortOrder}
           setArchiveSortOrder={s.setArchiveSortOrder}
         />
@@ -229,6 +230,7 @@ export default function App() {
               onRetry={s.handleRetry}
               onEditPrompt={s.handleEditPrompt}
               onDismiss={s.handleDismiss}
+              onArchive={s.handleArchiveTask}
               onViewLogs={s.handleViewLogs}
             />
           ) : (

@@ -42,6 +42,7 @@ async def get_all_tasks(
     offset: int = Query(0, ge=0),
     status: Optional[TaskStatus] = None,
     terminal_only: bool = Query(False),
+    archived: Optional[bool] = Query(None),
     search: Optional[str] = Query(None, max_length=200),
     created_after: Optional[datetime] = Query(None),
     session: AsyncSession = Depends(get_session),
@@ -53,6 +54,8 @@ async def get_all_tasks(
         filters.append(Task.status == status)
     elif terminal_only:
         filters.append(Task.status.in_(TERMINAL_STATUSES))
+    if archived is not None:
+        filters.append(Task.archived == archived)
     if search:
         escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         search_pattern = f"%{escaped}%"
@@ -134,6 +137,7 @@ async def get_all_tasks(
             "attempt_count": t.attempt_count,
             "payloads": t.payloads,
             "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
+            "archived": t.archived,
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
             "research_findings": research_map.get(str(t.id)),
@@ -252,6 +256,40 @@ async def create_task_manually(
         "status": new_task.status,
         "vm_instance_id": new_task.vm_instance_id,
     }
+
+@router.post("/tasks/{task_id}/archive")
+async def archive_task(
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in TERMINAL_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Cannot archive task with status '{task.status}'. Only terminal tasks (COMPLETED, FAILED, CANCELLED) can be archived.")
+    task.archived = True
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@router.post("/tasks/{task_id}/unarchive")
+async def unarchive_task(
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.archived = False
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
 
 @router.patch("/tasks/{task_id}")
 async def modify_task(

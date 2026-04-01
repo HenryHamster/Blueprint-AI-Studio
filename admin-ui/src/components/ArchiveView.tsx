@@ -1,4 +1,4 @@
-import { X, Search, ExternalLink, Eye, Loader2, Archive, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
+import { X, Search, ExternalLink, Eye, Loader2, Archive, ArchiveRestore, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
 
@@ -19,6 +19,7 @@ interface ArchiveViewProps {
   setArchiveDateRange: (range: string) => void;
   handleViewLogs: (task: Task) => void;
   onRetryTask?: (taskId: string) => void;
+  onUnarchiveTask?: (taskId: string) => void;
   archiveSortOrder: 'desc' | 'asc';
   setArchiveSortOrder: (order: 'desc' | 'asc') => void;
 }
@@ -82,6 +83,7 @@ export default function ArchiveView({
   setArchiveDateRange,
   handleViewLogs,
   onRetryTask,
+  onUnarchiveTask,
   archiveSortOrder,
   setArchiveSortOrder,
 }: ArchiveViewProps) {
@@ -261,6 +263,18 @@ export default function ArchiveView({
                     >
                       <RefreshCw className="w-3 h-3" />
                       Retry
+                    </button>
+                  )}
+
+                  {/* Unarchive */}
+                  {onUnarchiveTask && (
+                    <button
+                      onClick={() => onUnarchiveTask(task.id)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 transition-colors shrink-0"
+                      title="Unarchive task"
+                    >
+                      <ArchiveRestore className="w-3 h-3" />
+                      Unarchive
                     </button>
                   )}
                 </div>

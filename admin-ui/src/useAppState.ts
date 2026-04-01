@@ -291,7 +291,7 @@ export function useAppState() {
   const fetchTasks = async () => {
     try {
       const offset = (page - 1) * limit;
-      let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}`;
+      let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
       if (statusFilter) url += `&status=${statusFilter}`;
       const res = await authGet(url);
       if (res.ok) {
@@ -472,6 +472,40 @@ export function useAppState() {
     } catch (error) {
       console.error('Failed to dismiss task:', error);
       addToast('Failed to dismiss task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleArchiveTask = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'archive' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      fetchTasks();
+      addToast('Task archived', 'success');
+    } catch (error) {
+      console.error('Failed to archive task:', error);
+      addToast('Failed to archive task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleUnarchiveTask = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'unarchive' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      fetchArchiveTasks();
+      addToast('Task unarchived', 'success');
+    } catch (error) {
+      console.error('Failed to unarchive task:', error);
+      addToast('Failed to unarchive task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
@@ -799,11 +833,9 @@ export function useAppState() {
       const dateRange = dateRangeOverride ?? archiveDateRange;
       const sortOrder = sortOrderOverride ?? archiveSortOrder;
       const offset = (p - 1) * ps;
-      let url = `${API_BASE_URL}/api/admin/tasks?limit=${ps}&offset=${offset}`;
+      let url = `${API_BASE_URL}/api/admin/tasks?limit=${ps}&offset=${offset}&archived=true`;
       if (status !== 'all') {
         url += `&status=${status}`;
-      } else {
-        url += `&terminal_only=true`;
       }
       if (search.trim()) {
         url += `&search=${encodeURIComponent(search.trim())}`;
@@ -891,7 +923,7 @@ export function useAppState() {
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
-    fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss,
+    fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     // Toasts
     toasts, addToast, dismissToast,
     // View

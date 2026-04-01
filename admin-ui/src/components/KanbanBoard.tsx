@@ -19,10 +19,11 @@ interface KanbanBoardProps {
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
   onDismiss: (id: string) => void;
+  onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
 }
 
-export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, hideEmptyColumns = true, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onViewLogs }: KanbanBoardProps) {
+export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, hideEmptyColumns = true, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
   return (
     <main className="flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
       {columns.map(col => {
@@ -49,6 +50,7 @@ export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoading
                   onRetry={onRetry}
                   onEditPrompt={onEditPrompt}
                   onDismiss={onDismiss}
+                  onArchive={onArchive}
                   onViewLogs={onViewLogs}
                 />
               ))}
