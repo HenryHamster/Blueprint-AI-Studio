@@ -162,9 +162,9 @@ class TestFailureClassification:
         task = self._make_task("")
         assert classify_failure(task, "api.github.com returned 502 Bad Gateway") == "EXTERNAL_API"
 
-    def test_external_api_rate_limit(self):
+    def test_rate_limit(self):
         task = self._make_task("rate limit exceeded")
-        assert classify_failure(task) == "EXTERNAL_API"
+        assert classify_failure(task) == "RATE_LIMIT"
 
     def test_agent_timeout_no_heartbeat(self):
         task = self._make_task("No heartbeat for 300s")
