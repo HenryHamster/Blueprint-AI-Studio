@@ -36,6 +36,48 @@ async def get_all_projects(
     projects = result.scalars().all()
     return projects
 
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    directions: Optional[List[Dict[str, Any]]] = None
+    autonomous_enabled: Optional[bool] = None
+
+
+@router.patch("/projects/{project_id}")
+async def update_project(
+    project_id: uuid.UUID,
+    payload: ProjectUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if payload.name is not None:
+        project.name = payload.name
+    if payload.autonomous_enabled is not None:
+        project.autonomous_enabled = payload.autonomous_enabled
+    if payload.directions is not None:
+        # Auto-generate ids for any directions missing one
+        normalized = []
+        for d in payload.directions:
+            entry = dict(d)
+            if not entry.get("id"):
+                entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
+            if entry.get("priority") not in ("high", "medium", "low"):
+                raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
+            if not isinstance(entry.get("text"), str) or not entry["text"].strip():
+                raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
+            normalized.append(entry)
+        project.directions = normalized
+        flag_modified(project, "directions")
+
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
 @router.post("/autonomous/pause-all")
 async def pause_all_autonomous(
     session: AsyncSession = Depends(get_session),
@@ -1210,6 +1252,40 @@ async def add_direction(
     await session.commit()
 
     return {"direction": direction}
+
+
+@router.put("/projects/{project_id}/directions")
+async def replace_directions(
+    project_id: uuid.UUID,
+    payload: List[Dict[str, Any]],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Replace the entire directions array for a project."""
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    normalized = []
+    for d in payload:
+        entry = dict(d)
+        if not entry.get("id"):
+            entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
+        if not entry.get("added_at"):
+            entry["added_at"] = datetime.now(timezone.utc).isoformat()
+        if entry.get("priority") not in ("high", "medium", "low"):
+            raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
+        if not isinstance(entry.get("text"), str) or not entry["text"].strip():
+            raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
+        if "status" not in entry:
+            entry["status"] = "active"
+        normalized.append(entry)
+
+    project.directions = normalized
+    flag_modified(project, "directions")
+    session.add(project)
+    await session.commit()
+    return {"directions": normalized}
 
 
 @router.delete("/projects/{project_id}/directions/{direction_id}")

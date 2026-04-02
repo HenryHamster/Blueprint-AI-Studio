@@ -1,4 +1,5 @@
 import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import fs from 'fs';
 import WebSocket from 'ws';
 
 // ── Environment ─────────────────────────────────────────────────────────────
@@ -162,6 +163,87 @@ async function lintFixLoop(
   return false;
 }
 
+const MAX_TEST_FIX_ATTEMPTS = 2;
+
+/**
+ * Detect the project's test runner, run tests, and retry via Claude on failure.
+ * Returns whether tests passed and whether failures were detected (for commit note).
+ */
+async function testFixLoop(
+  ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+): Promise<{ passed: boolean; testFailuresDetected: boolean }> {
+  const { existsSync, readFileSync } = fs;
+
+  let testCmd: string | null = null;
+  let testArgs: string[] = [];
+
+  const pkgPath = `${WORKSPACE}/package.json`;
+  const pytestIniPath = `${WORKSPACE}/pytest.ini`;
+  const pyprojectPath = `${WORKSPACE}/pyproject.toml`;
+  const cargoPath = `${WORKSPACE}/Cargo.toml`;
+
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      if (pkg.scripts?.test) {
+        testCmd = 'npm';
+        testArgs = ['test'];
+      }
+    } catch { /* malformed package.json — skip */ }
+  }
+
+  if (!testCmd) {
+    if (existsSync(pytestIniPath)) {
+      testCmd = 'python';
+      testArgs = ['-m', 'pytest', '-x', '-q'];
+    } else if (existsSync(pyprojectPath)) {
+      try {
+        if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
+          testCmd = 'python';
+          testArgs = ['-m', 'pytest', '-x', '-q'];
+        }
+      } catch { /* unreadable — skip */ }
+    }
+  }
+
+  if (!testCmd && existsSync(cargoPath)) {
+    testCmd = 'cargo';
+    testArgs = ['test'];
+  }
+
+  if (!testCmd) {
+    sendLog(ws, 'No test runner detected — skipping test step.\n');
+    return { passed: true, testFailuresDetected: false };
+  }
+
+  sendLog(ws, `Detected test runner: ${testCmd} ${testArgs.join(' ')}\n`);
+
+  for (let attempt = 0; attempt <= MAX_TEST_FIX_ATTEMPTS; attempt++) {
+    try {
+      statusRef.value = attempt === 0 ? 'Running test suite...' : `Re-running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...`;
+      sendLog(ws, `Running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...\n`);
+      execFileSync(testCmd, testArgs, { cwd: WORKSPACE, encoding: 'utf-8', timeout: 180_000 });
+      sendLog(ws, 'Tests passed.\n');
+      return { passed: true, testFailuresDetected: false };
+    } catch (testErr: unknown) {
+      const msg = testErr instanceof Error ? testErr.message : String(testErr);
+      if (attempt < MAX_TEST_FIX_ATTEMPTS) {
+        sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+        await runClaudeCode(
+          `Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${msg.slice(0, 5000)}`,
+          ws, statusRef, model, effort
+        );
+        git(['add', '-A']);
+      } else {
+        sendLog(ws, `WARNING: Tests still failing after ${MAX_TEST_FIX_ATTEMPTS} fix attempts. Proceeding with commit.\n`);
+        return { passed: false, testFailuresDetected: true };
+      }
+    }
+  }
+  return { passed: false, testFailuresDetected: true };
+}
+
 // ── Claude Code Runner (shared by all handlers) ─────────────────────────────
 async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
@@ -320,6 +402,12 @@ async function handleCreate(
 
     const commitHash = git(['rev-parse', 'HEAD']);
 
+    // Detect and run tests
+    statusRef.value = 'Running tests...';
+    sendLog(ws, '\nDetecting and running tests...\n');
+    const { passed: testsPassed, testFailuresDetected } = await testFixLoop(ws, statusRef, model, effort);
+    const testSummary = testsPassed ? '✅ Tests passed' : testFailuresDetected ? '⚠️ Test failures detected' : '⚠️ Could not run tests';
+
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
@@ -329,9 +417,7 @@ async function handleCreate(
     statusRef.value = 'Creating pull request...';
     let prUrl = '';
     try {
-      const prBody = lastResultText
-        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-        : `Automated changes for: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
+      const prBody = `## Summary\n\n${lastResultText?.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n## Test Results\n\n${testSummary}\n\n---\n*Automated by Blueprint Agent*`;
       const prRes = await apiPost('/api/agent/github/pull-requests', {
         task_id: taskId, owner, repo, title: `[Blueprint] ${taskTitle}`,
         head: workBranch, base: baseBranch, body: prBody,
@@ -703,13 +789,21 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "title": "Short title (under 60 chars, conventional commit style: feat:, fix:, refactor:, etc.)",
       "prompt": "Self-contained implementation prompt. Describe WHAT to achieve and key constraints. The agent has full repo access and will figure out implementation details.",
       "depends_on_indices": [],
-      "related_files": ["src/main.py", "src/utils.py"]
+      "related_files": ["src/main.py", "src/utils.py"],
+      "model": "claude-sonnet-4-6 | claude-opus-4-6 | null (inherit from parent)",
+      "effort": "low | medium | high | null (inherit from parent)",
+      "scope": "small",
+      "risk": "low"
     },
     {
       "title": "feat: second subtask",
       "prompt": "...",
       "depends_on_indices": [0],
-      "related_files": ["src/main.py"]
+      "related_files": ["src/main.py"],
+      "model": null,
+      "effort": null,
+      "scope": "medium",
+      "risk": "medium"
     }
   ]
 }
@@ -723,6 +817,9 @@ Rules:
 - If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
 - Aim for 2-6 subtasks. If the task is simple enough for 1 PR, output a single subtask with no dependencies
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
+- Use model=claude-opus-4-6 and effort=high only for complex architectural subtasks. Leave null for simple additive changes.
+- scope: "small" for focused changes (1-3 files, clear scope), "medium" for broader changes
+- Set risk=high for changes to auth, data models, core orchestration logic. Set risk=medium for new endpoints or logic changes. Default to risk=low.
 - IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running Claude Code for planning...';
@@ -774,6 +871,26 @@ async function handleResearch(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
+  let gitLogOutput = '';
+  let gitDiffStatOutput = '';
+  try {
+    gitLogOutput = execFileSync('git', ['-C', WORKSPACE, 'log', '--oneline', '-15'], { encoding: 'utf-8' }).trim();
+  } catch (e) {
+    sendLog(ws, `Warning: git log failed: ${e}\n`);
+  }
+  try {
+    gitDiffStatOutput = execFileSync('git', ['-C', WORKSPACE, 'diff', '--stat', 'HEAD~5..HEAD'], { encoding: 'utf-8' }).trim();
+  } catch (e) {
+    sendLog(ws, `Warning: git diff --stat failed: ${e}\n`);
+  }
+  const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? `## Recent Git History (last 15 commits)
+${gitLogOutput || '(unavailable)'}
+
+## Recent Changes Summary (last 5 commits diff stat)
+${gitDiffStatOutput || '(unavailable)'}
+
+` : '';
+
   const directionsText = directions.length > 0
     ? directions.map((d, i) => `${i + 1}. [${d.priority || 'medium'}] ${d.text} (id: ${d.id})`).join('\n')
     : 'No specific directions provided. Identify general improvements.';
@@ -783,7 +900,7 @@ async function handleResearch(
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
 
-  const researchPrompt = `${contextPrefix}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
+  const researchPrompt = `${contextPrefix}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
 ${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
 ${directionsText}
@@ -824,6 +941,7 @@ Valid values:
 - priority: high, medium, low
 
 Rules:
+- Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
 - Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
@@ -1425,6 +1543,86 @@ CRITICAL RULES:
   }
 }
 
+// ── Handler: Smoketest (post-merge end-to-end health checks) ─────────────────
+async function handleSmoketest(
+  taskId: string, payload: Record<string, unknown>, _task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawBaseBranch = String(payload.base_branch || 'main');
+  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
+  const baseBranch = rawBaseBranch;
+
+  // Clone (read-only — no work branch or push needed)
+  statusRef.value = `Cloning ${owner}/${repo}...`;
+  sendLog(ws, `Cloning ${owner}/${repo} @ ${baseBranch}...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  const smoketestPrompt = `You are a smoke test agent. Your job is to run basic end-to-end health checks on this codebase.
+
+Follow these steps:
+
+1. Read the project README to understand the project structure, how to run it, and any existing smoke test setup.
+
+2. Look for existing smoke test scripts:
+   - Check for files matching scripts/smoke*.sh or tests/smoke*.py (or similar names)
+   - Also check for health check scripts, integration test entry points, or CI smoke test jobs in .github/workflows/
+
+3. If a smoke test script exists:
+   - Run it and capture the output
+   - Record each test that passes or fails
+
+4. If no smoke test script exists:
+   - Identify the main entry points from the code (API server, health endpoints, key routes)
+   - Run quick sanity checks: (a) verify the app can start without import errors, (b) check key health/ping endpoints return 200 using curl or the test framework, (c) confirm critical dependencies are importable
+   - Use the project's own test runner (pytest, jest, etc.) with a smoke/health filter if available
+
+5. Write the results to /tmp/smoketest_result.json with this exact structure:
+{
+  "passed": true,
+  "tests": [
+    {"name": "test name", "status": "pass", "message": "details"}
+  ]
+}
+
+Set "passed" to true only if ALL tests have status "pass" or "skip". Set it to false if any test has status "fail".
+
+IMPORTANT: Always write /tmp/smoketest_result.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
+
+  statusRef.value = 'Running smoke tests...';
+  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort);
+
+  // Read result file written by Claude
+  let smoketestResult: { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null = null;
+  try {
+    const resultJson = fs.readFileSync('/tmp/smoketest_result.json', 'utf-8');
+    smoketestResult = JSON.parse(resultJson);
+  } catch {
+    sendLog(ws, 'Warning: /tmp/smoketest_result.json not found or invalid\n');
+  }
+
+  if (exitCode === 0 && smoketestResult) {
+    const passed = smoketestResult.passed;
+    const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
+    const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;
+    sendLog(ws, `\n${summary}\n`);
+    await apiPost('/api/agent/status', {
+      task_id: taskId,
+      status: passed ? 'COMPLETED' : 'FAILED',
+      artifact_type: 'SMOKETEST_RESULT',
+      logs: JSON.stringify(smoketestResult),
+      repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else {
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+      logs: sanitize(allOutput.slice(-10_000)),
+    });
+  }
+}
+
 // ── Handler Registry ────────────────────────────────────────────────────────
 type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1493,8 +1691,11 @@ ${rawPrompt}`;
     const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
     await lintFixLoop(changedPaths, ws, statusRef, 'the refactored code', model, effort);
 
+    const { testFailuresDetected } = await testFixLoop(ws, statusRef, model, effort);
+
     git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `refactor: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `refactor: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
 
     statusRef.value = `Rebasing onto ${baseBranch}...`;
     try {
@@ -1575,6 +1776,7 @@ const handlers: Record<string, Handler> = {
   deps: handleDeps,
   docs: handleDocs,
   migrate: handleMigrate,
+  smoketest: handleSmoketest,
 };
 
 // ── Main ────────────────────────────────────────────────────────────────────

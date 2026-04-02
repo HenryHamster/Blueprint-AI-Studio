@@ -2282,8 +2282,35 @@ async def _spawn_pipeline_task(
                         **({"effort": type_effort} if type_effort else {})}
     else:
         title = f"Fix PR #{pr_number}"
+
+        # Enrich fix prompt with history of prior review feedback for this PR
+        enriched_fix_prompt = fix_prompt
+        try:
+            prior_reviews = (await session.execute(
+                select(Task).where(
+                    Task.project_id == source_task.project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                ).order_by(Task.created_at.asc())
+            )).scalars().all()
+            prior_feedback_entries = []
+            for t in prior_reviews:
+                t_payload = (t.payloads or [{}])[0]
+                if t_payload.get("pr_number") == pr_number and t_payload.get("type") == "review":
+                    feedback_text = t.latest_status_message or t.description or ""
+                    if feedback_text:
+                        prior_feedback_entries.append(feedback_text)
+            prior_feedback_entries = prior_feedback_entries[-3:]  # last 3 iterations
+            if prior_feedback_entries:
+                history_section = "\n\n---\n\n".join(prior_feedback_entries)
+                enriched_fix_prompt = (
+                    f"## Previous review feedback (already addressed):\n{history_section}"
+                    f"\n\n## Current review feedback:\n{fix_prompt}"
+                )
+        except Exception as e:
+            print(f"[PIPELINE] Failed to build review history for PR #{pr_number}: {e}")
+
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "prompt": fix_prompt,
+                        "base_branch": base_branch, "prompt": enriched_fix_prompt,
                         "original_task_id": resolved_original_id,
                         **({"model": type_model} if type_model else {}),
                         **({"effort": type_effort} if type_effort else {})}
@@ -2466,22 +2493,28 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
         full_prompt = prompt_text + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt_text
+        subtask_model = subtask_def.get('model') or model
+        subtask_effort = subtask_def.get('effort') or effort
+        child_scope = subtask_def.get('scope', 'small')
+        child_risk = subtask_def.get('risk', 'low')
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
+            requires_approval=child_risk == 'high',
             payloads=[{
                 "type": "create",
                 "prompt": full_prompt,
                 "base_branch": plan_branch,
-                **({"model": model} if model else {}),
-                **({"effort": effort} if effort else {}),
+                **({"model": subtask_model} if subtask_model else {}),
+                **({"effort": subtask_effort} if subtask_effort else {}),
             }],
             context={
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
-                "scope": "small",  # Plan subtasks are pre-decomposed
+                "scope": child_scope,
+                "risk": child_risk,
                 "related_files": related_files,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
@@ -2608,8 +2641,42 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
                                    {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
 
     await session.commit()
+
+    # Post PR comment for medium/low findings that don't get auto-fixed
+    informational = [f for f in findings if f.get("severity") in ("medium", "low")]
+    if informational:
+        rows = "\n".join(
+            "| {severity} | {title} | {loc} | {desc} |".format(
+                severity=f.get("severity", ""),
+                title=f.get("title", ""),
+                loc=(f.get("file_path", "") + (f":{f['line_number']}" if f.get("line_number") else "")),
+                desc=f.get("description", ""),
+            )
+            for f in informational
+        )
+        comment_body = (
+            "## Security Audit Findings (Informational)\n\n"
+            "The following medium/low severity findings were identified. "
+            "They have not been auto-fixed and require manual review:\n\n"
+            "| Severity | Title | File | Description |\n"
+            "|----------|-------|------|-------------|\n"
+            f"{rows}\n"
+        )
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+            from app.github import get_open_pull_requests
+            open_prs = await get_open_pull_requests(gh_token, owner, repo, base_branch)
+            if open_prs:
+                pr_number = open_prs[0]["number"]
+                await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
+                print(f"[SECURITY AUDIT] Posted informational findings comment on PR #{pr_number}")
+        except Exception as e:
+            print(f"[SECURITY AUDIT] Failed to post PR comment for informational findings: {e}")
+
     task.status = TaskStatus.EVALUATING
-    task.latest_status_message = f"Security audit found {len(findings)} finding(s), spawned {len(child_tasks)} fix task(s)"
+    task.latest_status_message = (
+        f"{len(child_tasks)} critical/high fixed, {len(informational)} medium/low surfaced as PR comment"
+    )
     session.add(task)
     await session.commit()
 
@@ -2661,9 +2728,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in findings:
             f.pop("depends_on_indices", None)
 
+    # Query active/queued tasks for deduplication
+    existing_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == task.project_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.PROVISIONING])
+        )
+    )).scalars().all()
+    existing_titles = [t.title.lower() for t in existing_tasks]
+
+    def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
+        words = set(finding_title.lower().split()) - {'the', 'a', 'an', 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
+        for title in existing:
+            overlap = words & set(title.split())
+            if len(overlap) >= 3:  # 3+ meaningful words in common
+                return True
+        return False
+
     # First pass: create all child tasks
     child_tasks = []
     finding_indices = []  # Track which finding index maps to which child
+    skipped_duplicates = 0
     for i, finding in enumerate(findings):
         scope = finding.get("scope", "small")
         risk = finding.get("risk", "low")
@@ -2671,6 +2756,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         prompt = finding.get("prompt", finding.get("description", ""))
 
         if not prompt:
+            continue
+
+        if _is_duplicate(title, existing_titles):
+            print(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
+            skipped_duplicates += 1
             continue
 
         # Determine task type: research findings can spawn sub-research or specialized agents
@@ -2748,7 +2838,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     await session.commit()
     task.status = TaskStatus.EVALUATING
-    task.latest_status_message = f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
+    task.latest_status_message = (
+        f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
+        + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
+    )
     task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
     session.add(task)
     await session.commit()
@@ -2868,7 +2961,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
-    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs"}
+    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs", "smoketest"}
     children = [c for c in all_children
                 if ((c.payloads or [{}])[0]).get("type", "create") in ROLLUP_TYPES]
 
@@ -3144,7 +3237,17 @@ async def update_agent_status(
         )
         
     await session.commit()
-    
+
+    # 3b. Parse and store smoketest result in task.plan_output for easy retrieval
+    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
+        try:
+            smoketest_data = json.loads(payload.logs)
+            task.plan_output = smoketest_data
+            session.add(task)
+            await session.commit()
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}")
+
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
@@ -3548,13 +3651,49 @@ async def update_agent_status(
                                     if orig:
                                         orig.context = {**(orig.context or {}), "pr_merged": True}
                                         # If this was a rollup PR review, mark the parent as COMPLETED
-                                        if orig.status == TaskStatus.EVALUATING:
+                                        is_rollup_merge = orig.status == TaskStatus.EVALUATING
+                                        if is_rollup_merge:
                                             orig.status = TaskStatus.COMPLETED
                                             orig.latest_status_message = "Rollup PR merged"
                                         session.add(orig)
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
+                                        # Spawn a smoketest after rollup merges to main
+                                        if is_rollup_merge and base_branch == "main":
+                                            try:
+                                                type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
+                                                type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
+                                                smoketest_task = Task(
+                                                    project_id=task.project_id,
+                                                    title=f"Smoketest after rollup merge to {base_branch}",
+                                                    description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
+                                                    payloads=[{
+                                                        "type": "smoketest",
+                                                        "base_branch": base_branch,
+                                                        **({"model": type_model} if type_model else {}),
+                                                        **({"effort": type_effort} if type_effort else {}),
+                                                    }],
+                                                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                                                    status=TaskStatus.QUEUED,
+                                                    created_by="ORCHESTRATOR",
+                                                )
+                                                session.add(smoketest_task)
+                                                await session.commit()
+                                                await session.refresh(smoketest_task)
+                                                history = TaskHistory(
+                                                    task_id=smoketest_task.id, action="SPAWNED",
+                                                    details={"spawned_by": "POST_ROLLUP_MERGE", "base_branch": base_branch}
+                                                )
+                                                session.add(history)
+                                                await session.commit()
+                                                await broadcast_to_project(
+                                                    str(task.project_id), "task_updated",
+                                                    {"task_id": str(smoketest_task.id), "status": TaskStatus.QUEUED}
+                                                )
+                                                print(f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}")
+                                            except Exception as e:
+                                                print(f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}")
                                 except Exception as e:
                                     print(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}")
                             print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
