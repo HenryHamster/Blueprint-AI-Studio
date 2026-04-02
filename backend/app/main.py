@@ -2732,7 +2732,19 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     if is_parent:
         staging = ctx.get("plan_branch") or ctx.get("research_branch")
         if staging:
-            branches_to_delete.append(staging)
+            # Don't delete staging branch if there are still open PRs targeting it
+            try:
+                _gh, _owner, _repo = await get_github_token_for_task(task.id, session)
+                from app.github import get_open_pull_requests
+                open_prs = await get_open_pull_requests(_gh, _owner, _repo, staging)
+                if open_prs:
+                    pr_nums = [f"#{p['number']}" for p in open_prs]
+                    print(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
+                else:
+                    branches_to_delete.append(staging)
+            except Exception:
+                # If we can't check, don't delete (safe default)
+                print(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
@@ -2768,10 +2780,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
 
-    # Only consider create tasks for rollup decisions — review/fix tasks are
-    # pipeline helpers that operate on the same PR as the create task
+    # Consider create, plan, research, and specialized agent tasks for rollup decisions.
+    # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
+    ROLLUP_TYPES = {"create", "", "plan", "research", "security_audit", "qa", "deps", "docs"}
     children = [c for c in all_children
-                if ((c.payloads or [{}])[0]).get("type", "create") in ("create", "")]
+                if ((c.payloads or [{}])[0]).get("type", "create") in ROLLUP_TYPES]
 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
     # while a review/fix cycle is in progress
