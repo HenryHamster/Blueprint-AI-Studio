@@ -3300,7 +3300,10 @@ if os.path.exists(static_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
     
     # Serve index.html for all other non-API routes (SPA fallback)
-    @app.get("/{full_path:path}")
+    # Use api_route to handle all methods — prevents 405 for missing API routes
+    # (a GET-only catch-all causes Starlette to return 405 for POST/PATCH/DELETE
+    # on paths not registered in any router, even if those paths start with "api/")
+    @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
     async def serve_spa(full_path: str, request: Request = None):
         # Don't intercept API routes or WebSocket upgrade requests
         if full_path.startswith("api/"):
