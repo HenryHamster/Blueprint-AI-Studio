@@ -334,8 +334,17 @@ EOF
                     _vm_zones[vm_instance_id] = zone
                     health = _zone_health.setdefault(zone, {})
                     health["last_success"] = datetime.now(timezone.utc)
+                    prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
-                    _zone_failures.pop(zone, None)
+                    was_in_cooldown = zone in _zone_failures
+                    cooldown_since = _zone_failures.pop(zone, None)
+
+                if was_in_cooldown and prev_failures > 0:
+                    cooldown_duration = (datetime.now(timezone.utc) - cooldown_since).total_seconds()
+                    logger.warning(
+                        f"Zone {zone} recovered from cooldown after {cooldown_duration:.0f}s "
+                        f"(had {prev_failures} consecutive failure(s))"
+                    )
 
                 logger.info(f"Successfully provisioned VM {vm_instance_id} in {zone}")
                 return operation.name
@@ -362,12 +371,19 @@ EOF
                         reason = "RESOURCE_UNAVAILABLE"
 
                     with _zone_lock:
+                        entering_cooldown = zone not in _zone_failures
                         _zone_failures[zone] = datetime.now(timezone.utc)
                         health = _zone_health.setdefault(zone, {})
                         health["last_failure"] = datetime.now(timezone.utc)
-                        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+                        new_failure_count = health.get("consecutive_failures", 0) + 1
+                        health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
 
+                    if entering_cooldown:
+                        logger.warning(
+                            f"Zone {zone} entering cooldown: {new_failure_count} consecutive failure(s), "
+                            f"reason={reason}, cooldown={ZONE_COOLDOWN_SECONDS}s"
+                        )
                     logger.warning(f"Zone {zone} unavailable ({reason}) for {vm_instance_id}, trying next zone...")
                     continue
                 # Non-retryable error — don't retry
@@ -376,6 +392,11 @@ EOF
         if skipped_cooldown:
             logger.warning(f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}")
         if not last_error and len(skipped_cooldown) == len(FALLBACK_ZONES):
+            logger.critical(
+                f"ALL {len(FALLBACK_ZONES)} zones are in cooldown simultaneously — "
+                f"no capacity available, retry after {ZONE_COOLDOWN_SECONDS}s. "
+                f"Zones: {[z for z, _ in FALLBACK_ZONES]}"
+            )
             raise Exception(f"All {len(FALLBACK_ZONES)} zones in cooldown — retry after {ZONE_COOLDOWN_SECONDS}s")
         raise last_error or Exception("All zones exhausted")
 

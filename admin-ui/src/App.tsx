@@ -17,10 +17,12 @@ import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
+import { StatusBar } from './components/StatusBar';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
+import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -153,6 +155,53 @@ export default function App() {
     document.addEventListener('keydown', handleActivityFeedShortcut);
     return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
   }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
+  const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
+
+  const zoneHealthAlerts = useMemo(() => {
+    if (!s.zoneHealth) return [];
+    const zones = Object.entries(s.zoneHealth);
+    const exhaustedZones = zones.filter(([, z]) => z.status === 'exhausted').map(([name]) => name);
+    const cooldownZones = zones.filter(([, z]) => z.cooldown_active && z.status !== 'exhausted').map(([name]) => name);
+    const allInCooldown = zones.length > 0 && cooldownZones.length + exhaustedZones.length === zones.length;
+    const alerts: import('./components/AlertsBanner').Alert[] = [];
+    if (exhaustedZones.length > 0) {
+      alerts.push({
+        id: `zone-exhausted-${exhaustedZones.join(',')}`,
+        project_id: '',
+        severity: 'ERROR',
+        title: 'Zone Capacity Exhausted',
+        message: `${exhaustedZones.length === 1 ? 'Zone' : 'Zones'} ${exhaustedZones.join(', ')} ${exhaustedZones.length === 1 ? 'is' : 'are'} exhausted and cannot accept new tasks.`,
+        task_id: null,
+        created_at: new Date().toISOString(),
+        dismissed_at: null,
+      });
+    }
+    if (allInCooldown && exhaustedZones.length === 0) {
+      alerts.push({
+        id: `zone-all-cooldown`,
+        project_id: '',
+        severity: 'WARNING',
+        title: 'All Zones in Cooldown',
+        message: `All compute zones are in cooldown: ${cooldownZones.join(', ')}. New tasks may be delayed.`,
+        task_id: null,
+        created_at: new Date().toISOString(),
+        dismissed_at: null,
+      });
+    } else if (cooldownZones.length > 0 && exhaustedZones.length === 0) {
+      alerts.push({
+        id: `zone-cooldown-${cooldownZones.join(',')}`,
+        project_id: '',
+        severity: 'WARNING',
+        title: 'Zone Cooldown Active',
+        message: `${cooldownZones.length === 1 ? 'Zone' : 'Zones'} ${cooldownZones.join(', ')} ${cooldownZones.length === 1 ? 'is' : 'are'} in cooldown.`,
+        task_id: null,
+        created_at: new Date().toISOString(),
+        dismissed_at: null,
+      });
+    }
+    return alerts.filter(a => !dismissedZoneAlertIds.has(a.id));
+  }, [s.zoneHealth, dismissedZoneAlertIds]);
+
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
@@ -193,6 +242,8 @@ export default function App() {
     const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
     return typeMatch && statusMatch && searchMatch && projectMatch;
   }), [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId]);
+
+  const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
   if (s.authLoading) {
     return (
@@ -301,6 +352,13 @@ export default function App() {
         zoneHealth={s.zoneHealth}
       />
 
+      <StatusBar
+        apiHealthy={s.apiHealthy}
+        wsConnected={s.wsConnected}
+        lastFetchTime={s.lastFetchTime}
+        tasks={s.tasks}
+      />
+
       <div
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
         style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
@@ -318,8 +376,11 @@ export default function App() {
       <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} onSelectTask={s.handleViewLogs} onApproveTask={s.handleApprove} />
 
       <AlertsBanner
-        alerts={s.alerts}
-        onDismiss={s.dismissAlert}
+        alerts={[...zoneHealthAlerts, ...s.alerts]}
+        onDismiss={(id) => {
+          if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+          else s.dismissAlert(id);
+        }}
         onViewTask={(taskId) => {
           const task = s.tasks.find(t => t.id === taskId);
           if (task) s.handleViewLogs(task);
@@ -327,10 +388,19 @@ export default function App() {
         }}
       />
 
+      <OrchestratorHealthBar health={s.orchestratorHealth} />
+
       {s.error && (
         <div className="mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
           <p>{s.error}</p>
+        </div>
+      )}
+
+      {s.projectsFetchError && (
+        <div className="mb-2 bg-yellow-950/50 text-yellow-400 px-4 py-2 rounded-lg text-sm border border-yellow-900/50 flex items-center gap-2 shrink-0">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          <p>{s.projectsFetchError}</p>
         </div>
       )}
 
@@ -515,6 +585,7 @@ export default function App() {
               onToggleTaskSelection={s.toggleTaskSelection}
               groupBy={s.groupBy}
               projects={s.projects}
+              hasActiveFilters={hasActiveFilters}
               onBulkToggle={s.bulkColumnToggle}
               onArchiveColumn={(taskIds, columnLabel) => {
                 s.setConfirmDialog({
@@ -537,6 +608,8 @@ export default function App() {
             <main className="flex-1 overflow-hidden flex flex-col">
               <PipelineView
                 tasks={filteredTasks}
+                loading={s.loading}
+                hasActiveFilters={hasActiveFilters}
                 onViewLogs={s.handleViewLogs}
                 onNavigateToParent={(parentTaskId) => {
                   navigator.clipboard.writeText(parentTaskId).then(() => {
@@ -614,6 +687,7 @@ export default function App() {
           logsConnecting={s.logsConnecting}
           wsDisconnected={s.wsDisconnected}
           actionLoading={s.actionLoadingMap[s.logTask.id]}
+          gcpProjectId={s.deployState?.gcp_project_id}
           onClose={s.closeLogViewer}
           onApprove={s.handleApprove}
           onRequestChanges={s.handleRequestChanges}

@@ -22,6 +22,7 @@ export interface ActivityEvent {
   task_type?: string;
   commit_hash?: string;
   repo_url?: string;
+  status?: string;
 }
 
 interface ActivityFeedProps {
@@ -148,8 +149,19 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           <Clock className="w-4 h-4 text-neutral-400" />
           <h2 className="text-sm font-semibold text-neutral-100">Activity Feed</h2>
           {!loading && (
-            <span className="text-xs text-neutral-500 font-mono">{filteredEvents.length} event{filteredEvents.length !== 1 ? 's' : ''}</span>
+            <span className="bg-neutral-800 text-neutral-400 border border-neutral-700 text-xs font-mono px-2 py-0.5 rounded-full">
+              {filteredEvents.length}
+            </span>
           )}
+          {!loading && (() => {
+            const pendingCount = events.filter(e => e.status === 'NEEDS_REVIEW').length;
+            if (pendingCount === 0) return null;
+            return (
+              <span className="bg-amber-500/20 text-amber-400 border border-amber-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
+                {pendingCount} pending approval
+              </span>
+            );
+          })()}
         </div>
         <button
           onClick={onClose}

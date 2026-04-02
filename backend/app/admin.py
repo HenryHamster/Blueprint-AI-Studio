@@ -678,15 +678,15 @@ async def modify_task(
                             except Exception:
                                 pass
                             changes["merged_pr"] = pr_number
-                            print(f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)")
+                            logger.info(f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)")
                         else:
                             changes["merge_error"] = merge_result.get("message", "unknown")
                             task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
-                            print(f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}")
+                            logger.error(f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}")
                     except Exception as e:
                         changes["merge_error"] = str(e)[:200]
                         task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
-                        print(f"[ADMIN] Approved merge failed: {e}")
+                        logger.error(f"[ADMIN] Approved merge failed: {e}", exc_info=True)
                 else:
                     # Security scan approval: review hasn't happened yet, spawn it
                     from app.main import _spawn_pipeline_task
@@ -924,7 +924,7 @@ async def update_settings(
                 state.paused_at = None
                 state.pre_pause_max_vms = None
                 session.add(state)
-                print(f"[SETTINGS] Cleared {old_status} state — user set max_vms={val}")
+                logger.warning(f"[SETTINGS] Cleared {old_status} state — user set max_vms={val}")
     if "max_retries" in payload:
         try:
             val = int(payload["max_retries"])
@@ -1035,7 +1035,7 @@ async def update_settings(
         state.runtime_autonomous_research_effort = _runtime_config.get("autonomous_research_effort")
         session.add(state)
         await session.commit()
-        print(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
+        logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
 
     return _runtime_config
 
@@ -1717,7 +1717,7 @@ async def restart_orchestrator(
             pass
 
     background_tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
-    print("[ADMIN] Orchestrator restarted via admin endpoint")
+    logger.info("[ADMIN] Orchestrator restarted via admin endpoint")
     return {"status": "restarted"}
 
 
@@ -1737,6 +1737,7 @@ async def get_deploy_state(
     current_user: dict = Depends(get_current_user)
 ):
     """Get current deployment state including monitoring status and health."""
+    import os
     from app.shared_state import deploy_monitoring, external_health, runtime_config
 
     state = await session.get(DeploymentState, 1)
@@ -1774,6 +1775,7 @@ async def get_deploy_state(
         "external_health": external_health,
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
         "zone_health": _get_zone_health_summary(),
+        "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
     }
 
 
@@ -1796,7 +1798,7 @@ async def pause_pipeline(
 
     old_vms = runtime_config["max_concurrent_vms"]
     runtime_config["max_concurrent_vms"] = 0
-    print(f"[ADMIN] Pipeline PAUSED manually (was max_concurrent_vms={old_vms})")
+    logger.warning(f"[ADMIN] Pipeline PAUSED manually (was max_concurrent_vms={old_vms})")
     return {"status": "paused", "previous_max_vms": old_vms}
 
 
@@ -1832,7 +1834,7 @@ async def resume_pipeline(
     state.runtime_max_concurrent_vms = restore_vms
     session.add(state)
     await session.commit()
-    print(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
+    logger.warning(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
     return {"status": "resumed", "max_concurrent_vms": restore_vms}
 
 
@@ -1857,7 +1859,7 @@ async def mark_deploy_stable(
     await session.commit()
 
     deploy_monitoring["window_start"] = None
-    print(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
+    logger.warning(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
     return {"status": "stable", "sha": state.current_sha}
 
 
@@ -1906,10 +1908,10 @@ async def trigger_rollback(
         result = await asyncio.to_thread(_run_gcloud_rollback)
         if result.returncode != 0:
             rollback_error = result.stderr[:500]
-            print(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
+            logger.error(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
     except Exception as e:
         rollback_error = str(e)[:500]
-        print(f"[ADMIN] Rollback command failed: {e}")
+        logger.error(f"[ADMIN] Rollback command failed: {e}", exc_info=True)
 
     # Update deployment state regardless of gcloud result
     state.status = DeploymentStatus.ROLLED_BACK
@@ -1924,7 +1926,7 @@ async def trigger_rollback(
     runtime_config["max_concurrent_vms"] = 0
     deploy_monitoring["window_start"] = None
 
-    print(f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}")
+    logger.warning(f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}")
 
     return {
         "status": "rolled_back" if not rollback_error else "rollback_requested",
@@ -2010,7 +2012,7 @@ async def repair_state(
             repairs.append(f"Cleared orphaned parent ref on {t.id}")
 
     await session.commit()
-    print(f"[ADMIN] State repair completed: {len(repairs)} repairs")
+    logger.warning(f"[ADMIN] State repair completed: {len(repairs)} repairs")
     return {"repairs": repairs, "count": len(repairs)}
 
 

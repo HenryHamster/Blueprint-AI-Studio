@@ -9,6 +9,7 @@ interface TaskDetailDrawerProps {
   logsConnecting?: boolean;
   wsDisconnected?: boolean;
   actionLoading?: string;
+  gcpProjectId?: string;
   onClose: () => void;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
@@ -111,7 +112,7 @@ function DirectionsSection({ directions }: { directions: { text: string; priorit
   );
 }
 
-function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
+function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
@@ -142,7 +143,24 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
         </DetailRow>
       )}
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm">{task.project_id}</span></DetailRow>}
-      {task.vm_instance_id && <DetailRow label="VM Instance"><span className="font-mono text-sm">{task.vm_instance_id}</span></DetailRow>}
+      {task.vm_instance_id && (
+        <DetailRow label="VM Instance">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="font-mono text-sm">{task.vm_instance_id}</span>
+            <a
+              href={gcpProjectId
+                ? `https://console.cloud.google.com/compute/instances?project=${gcpProjectId}`
+                : `https://console.cloud.google.com/compute/instances`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-gray-400 hover:text-gray-200 transition-colors"
+              title="Open in GCP Console"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </span>
+        </DetailRow>
+      )}
 
       <SectionHeader>Timing</SectionHeader>
       <DetailRow label="Created at">{formatTimestamp(task.created_at)}</DetailRow>
@@ -606,6 +624,7 @@ export function TaskDetailDrawer({
   logsConnecting = false,
   wsDisconnected = false,
   actionLoading,
+  gcpProjectId,
   onClose,
   onApprove,
   onRequestChanges,
@@ -803,16 +822,16 @@ export function TaskDetailDrawer({
         </div>
 
         {/* Content */}
+        {wsDisconnected && (
+          <div className="flex items-center gap-2 px-4 py-2 bg-amber-950/40 border-b border-amber-800/50 text-amber-400 text-xs shrink-0">
+            <WifiOff className="w-3.5 h-3.5 shrink-0" />
+            Log stream disconnected
+          </div>
+        )}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} onNavigateToTask={onNavigateToTask} />
+          <DetailsTab task={task} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
         ) : (
           <>
-            {wsDisconnected && (
-              <div className="flex items-center gap-2 px-4 py-2 bg-amber-950/40 border-b border-amber-800/50 text-amber-400 text-xs shrink-0">
-                <WifiOff className="w-3.5 h-3.5 shrink-0" />
-                Log stream disconnected
-              </div>
-            )}
             <LogsTab
               logLines={logLines}
               task={task}

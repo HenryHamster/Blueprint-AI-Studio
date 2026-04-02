@@ -141,6 +141,34 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
   );
 }
 
+function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
+  const [now] = useState(Date.now);
+  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  if (filtered.length < 2) return <NoDataMessage />;
+
+  const ratePoints = filtered.map((p) => {
+    const total = p.completedCount + p.failedCount;
+    const failureRate = total > 0 ? (p.failedCount / total) * 100 : 0;
+    return { timestamp: p.timestamp, failureRate };
+  });
+
+  return (
+    <ResponsiveContainer width="100%" height={160}>
+      <LineChart data={ratePoints}>
+        <CartesianGrid stroke={GRID_COLOR} vertical={false} />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <YAxis tick={TICK_STYLE} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
+        <Tooltip
+          {...TOOLTIP_STYLE}
+          formatter={(value: unknown) => [(value as number).toFixed(1) + '%', 'Failure Rate']}
+          labelFormatter={(ts) => formatTime(Number(ts))}
+        />
+        <Line dataKey="failureRate" stroke="#ef4444" dot={false} name="Failure Rate" />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
 function getTaskCompletedTime(task: Task): number | null {
   if (task.status !== 'COMPLETED') return null;
   if (task.history && task.history.length > 0) {
@@ -172,6 +200,40 @@ export default function MetricsDashboard({
   const count1h = completedTasks.filter((t) => now - t.completedAt <= 3_600_000).length;
   const count6h = completedTasks.filter((t) => now - t.completedAt <= 21_600_000).length;
   const count24h = completedTasks.filter((t) => now - t.completedAt <= 86_400_000).length;
+
+  function getTaskFailedTime(task: Task): number | null {
+    if (task.status !== 'FAILED') return null;
+    if (task.history && task.history.length > 0) {
+      const last = task.history[task.history.length - 1];
+      const ts = new Date(last.timestamp).getTime();
+      if (!isNaN(ts)) return ts;
+    }
+    const ts = new Date(task.created_at).getTime();
+    return isNaN(ts) ? null : ts;
+  }
+
+  const failedTasks = tasks
+    .map((t) => ({ task: t, failedAt: getTaskFailedTime(t) }))
+    .filter((t): t is { task: Task; failedAt: number } => t.failedAt !== null);
+
+  const failed1h = failedTasks.filter((t) => now - t.failedAt <= 3_600_000).length;
+  const failed6h = failedTasks.filter((t) => now - t.failedAt <= 21_600_000).length;
+  const failed24h = failedTasks.filter((t) => now - t.failedAt <= 86_400_000).length;
+
+  function successRate(completed: number, failed: number): string {
+    const total = completed + failed;
+    if (total === 0) return '—';
+    return ((completed / total) * 100).toFixed(1) + '%';
+  }
+
+  function successRateColor(completed: number, failed: number): string {
+    const total = completed + failed;
+    if (total === 0) return 'text-neutral-500';
+    const pct = (completed / total) * 100;
+    if (pct >= 90) return 'text-emerald-400';
+    if (pct >= 70) return 'text-amber-400';
+    return 'text-red-400';
+  }
 
   const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
 
@@ -230,10 +292,37 @@ export default function MetricsDashboard({
           </div>
         </div>
 
+        {/* Success Rate card */}
+        <div className={cardClass}>
+          <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+            Success Rate
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div>
+              <div className={`text-lg font-semibold font-mono ${successRateColor(count1h, failed1h)}`}>{successRate(count1h, failed1h)}</div>
+              <div className="text-[10px] text-neutral-500">1h</div>
+            </div>
+            <div>
+              <div className={`text-lg font-semibold font-mono ${successRateColor(count6h, failed6h)}`}>{successRate(count6h, failed6h)}</div>
+              <div className="text-[10px] text-neutral-500">6h</div>
+            </div>
+            <div>
+              <div className={`text-lg font-semibold font-mono ${successRateColor(count24h, failed24h)}`}>{successRate(count24h, failed24h)}</div>
+              <div className="text-[10px] text-neutral-500">24h</div>
+            </div>
+          </div>
+        </div>
+
         {/* Task Outcomes chart — full width */}
         <div className={`${cardClass} col-span-2`}>
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Task Outcomes</div>
           <TaskOutcomesChart points={metricsHistory} tasks={tasks} windowMs={windowMs} />
+        </div>
+
+        {/* Failure Rate chart */}
+        <div className={cardClass}>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
+          <FailureRateChart points={metricsHistory} windowMs={windowMs} />
         </div>
       </div>
     </div>

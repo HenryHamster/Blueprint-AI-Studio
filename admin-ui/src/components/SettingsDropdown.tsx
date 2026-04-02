@@ -616,6 +616,17 @@ export function SettingsDropdown({
 
           <div className="border-t border-neutral-800 pt-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Max Plan Accounts</h4>
+            {maxPlanAccounts.length > 0 && (() => {
+              const total = maxPlanAccounts.length;
+              const available = maxPlanAccounts.filter(a => a.enabled).length;
+              const warn = available < total;
+              return (
+                <div className={`flex items-center justify-between text-[11px] mb-2 px-2 py-1 rounded border ${warn ? 'bg-amber-950/30 border-amber-900/50 text-amber-400' : 'bg-neutral-950 border-neutral-800 text-neutral-400'}`}>
+                  <span>Pool: <span className={warn ? 'text-amber-300 font-medium' : 'text-neutral-200 font-medium'}>{available}/{total}</span> available</span>
+                  {warn && <span className="text-amber-500 text-[10px]">⚠ degraded</span>}
+                </div>
+              );
+            })()}
             {maxPlanAccounts.length === 0 && (
               <p className="text-[11px] text-neutral-600 mb-2">No accounts — using API key fallback</p>
             )}
@@ -700,10 +711,36 @@ export function SettingsDropdown({
                     </span>
                   </div>
                 )}
-                {deployState.monitoring_window && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-neutral-500">Monitor</span>
-                    <span className="text-[11px] text-blue-400 font-mono">{deployState.monitoring_window.percent}%</span>
+                {deployState.monitoring_window !== null && (
+                  <div className="space-y-1.5 mt-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] text-neutral-500">Monitoring</span>
+                      <span className="text-[11px] text-blue-400 font-mono">
+                        {deployState.monitoring_window.percent}%
+                      </span>
+                    </div>
+                    <div className="w-full bg-neutral-800 rounded-full h-1.5">
+                      <div
+                        className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
+                        style={{ width: `${deployState.monitoring_window.percent}%` }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] text-neutral-500">Elapsed</span>
+                      <span className="text-[11px] text-neutral-300 font-mono">
+                        {Math.floor(deployState.monitoring_window.elapsed_seconds / 60)}m
+                        {' / '}
+                        {Math.floor(deployState.monitoring_window.total_seconds / 60)}m
+                      </span>
+                    </div>
+                    {deployState.task_results_count > 0 && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] text-neutral-500">Tasks monitored</span>
+                        <span className="text-[11px] text-neutral-300 font-mono">
+                          {deployState.task_results_count}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
                 {deployState.rollback_reason && (

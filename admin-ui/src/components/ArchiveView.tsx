@@ -171,7 +171,15 @@ export default function ArchiveView({
       </div>
 
       {/* Results list */}
-      <div className="flex-1 overflow-y-auto px-6 py-4">
+      <div className="flex-1 overflow-y-auto px-6 py-4 relative">
+        {archiveLoading && (
+          <div className="absolute inset-0 bg-neutral-950/60 flex items-center justify-center z-10 rounded-b-lg">
+            <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-neutral-900 border border-neutral-800 shadow-lg">
+              <Loader2 className="w-4 h-4 text-neutral-400 animate-spin" />
+              <span className="text-xs text-neutral-400">Loading...</span>
+            </div>
+          </div>
+        )}
         {archiveTasks.length === 0 && !archiveLoading ? (
           <div className="flex flex-col items-center justify-center h-full text-neutral-500">
             <Archive className="w-10 h-10 mb-3 text-neutral-700" />

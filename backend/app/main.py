@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
@@ -53,8 +54,10 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+logger = logging.getLogger(__name__)
+
 # Initialize the rate limiter
-# In a multi-instance production environment (like Cloud Run), 
+# In a multi-instance production environment (like Cloud Run),
 # you would configure this to use Redis (e.g., storage_uri="redis://...")
 # For now, we use the default in-memory storage.
 limiter = Limiter(key_func=get_remote_address)
@@ -103,7 +106,7 @@ async def load_max_plan_pool():
                 "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
             })
         total_active = sum(active_per_account.values())
-        print(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
+        logger.info(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
 
 def select_max_plan_account() -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count."""
@@ -133,7 +136,7 @@ def recheck_disabled_accounts():
         if disabled_at and (now - disabled_at).total_seconds() >= COOLDOWN_MINUTES * 60:
             acct["enabled"] = True
             acct["disabled_at"] = None
-            print(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
+            logger.warning(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
 
 
 # --- Deployment State Management ---
@@ -216,7 +219,7 @@ async def _init_deployment_state():
             )
             session.add(state)
             await session.commit()
-            print(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
+            logger.info(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
             return
 
         # Restore persisted runtime config values so settings survive restarts
@@ -229,7 +232,7 @@ async def _init_deployment_state():
             if state.runtime_max_autonomous_tasks_per_hour is not None:
                 _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
         except Exception as e:
-            print(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}")
+            logger.warning(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}", exc_info=True)
         try:
             if state.runtime_autonomous_research_interval_minutes is not None:
                 _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
@@ -238,17 +241,17 @@ async def _init_deployment_state():
             if state.runtime_autonomous_research_effort is not None:
                 _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
         except Exception as e:
-            print(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}")
+            logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
-            print(f"[DEPLOY] max_concurrent_vms forced to 0 — state is {state.status} "
+            logger.info(f"[DEPLOY] max_concurrent_vms forced to 0 — state is {state.status} "
                   f"(reason: {state.pause_reason or 'unknown'}). "
                   f"Set max VMs > 0 in settings to resume.")
 
         if state.current_revision == _current_revision:
             # Same revision — normal restart (cold start, scale event, etc.)
-            print(f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}")
+            logger.info(f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}")
             return
 
         # Revision changed — is it a new deploy or a rollback?
@@ -265,14 +268,14 @@ async def _init_deployment_state():
             session.add(state)
             await session.commit()
 
-            print(f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
+            logger.warning(f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
                   f"(consecutive rollbacks: {state.rollback_count})")
 
             if state.rollback_count >= 3:
                 state.status = DeploymentStatus.HALTED
                 session.add(state)
                 await session.commit()
-                print(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
+                logger.error(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
                 _runtime_config["max_concurrent_vms"] = 0
             return
 
@@ -294,7 +297,7 @@ async def _init_deployment_state():
         state.rollback_reason = None
         session.add(state)
         await session.commit()
-        print(f"[DEPLOY] New deploy detected — revision={_current_revision}, starting monitoring window")
+        logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, starting monitoring window")
 
 
 def should_rollback() -> tuple:
@@ -373,7 +376,7 @@ async def _check_monitoring_window():
                     state.rollback_count = 0
                     session.add(state)
                     await session.commit()
-                    print("[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
+                    logger.info("[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
             deploy_monitoring["window_start"] = None
         return
 
@@ -392,17 +395,17 @@ async def _check_monitoring_window():
                 state.rollback_reason = reason
                 session.add(state)
                 await session.commit()
-                print(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
+                logger.warning(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
             else:
                 # No rollback target available — stay in MONITORING, don't promote to STABLE
                 state.rollback_reason = f"Issues detected but no rollback target: {reason}"
                 session.add(state)
                 await session.commit()
-                print("[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
+                logger.warning("[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
                 return  # Don't clear window_start so we keep monitoring
         elif response == "PAUSE":
             # External issue — handled by _check_pause_mode
-            print(f"[DEPLOY] External issue during monitoring: {reason}")
+            logger.info(f"[DEPLOY] External issue during monitoring: {reason}")
         else:
             # Passed monitoring window — mark stable
             state.status = DeploymentStatus.STABLE
@@ -411,7 +414,7 @@ async def _check_monitoring_window():
             state.rollback_count = 0
             session.add(state)
             await session.commit()
-            print(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
+            logger.info(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
 
     deploy_monitoring["window_start"] = None
 
@@ -432,7 +435,8 @@ async def _check_external_health():
         async with AsyncSessionLocal() as session:
             await session.execute(select(Task).limit(1))
         ext["db"] = True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[HEALTH] DB health check failed: {e}", exc_info=True)
         ext["db"] = False
         failed.append("db")
 
@@ -446,7 +450,8 @@ async def _check_external_health():
         ext["github_api"] = resp.status_code == 200
         if not ext["github_api"]:
             failed.append("github_api")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[HEALTH] GitHub API health check failed: {e}", exc_info=True)
         ext["github_api"] = False
         failed.append("github_api")
 
@@ -462,7 +467,7 @@ async def _check_external_health():
         if rate_limit_count >= 3:
             ext["claude_api"] = False
             failed.append("claude_api")
-            print(f"[HEALTH] Claude API rate limited — {rate_limit_count}/5 recent tasks hit limits")
+            logger.warning(f"[HEALTH] Claude API rate limited — {rate_limit_count}/5 recent tasks hit limits")
         else:
             ext["claude_api"] = True
 
@@ -488,7 +493,7 @@ async def _check_external_health():
     recheck_disabled_accounts()
 
     if failed:
-        print(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
+        logger.error(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
 
 
 _pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
@@ -505,7 +510,7 @@ async def _check_pause_mode():
         _pause_failure_streak += 1
         # Require 3 consecutive failures before pausing (avoid flaky single checks)
         if _pause_failure_streak < 3:
-            print(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
+            logger.info(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
             return
         # Should we pause?
         if _runtime_config["max_concurrent_vms"] > 0:
@@ -520,7 +525,7 @@ async def _check_pause_mode():
                     await session.commit()
                     # Only set to 0 after saving pre_pause value
                     _runtime_config["max_concurrent_vms"] = 0
-            print(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
+            logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
     else:
         _pause_failure_streak = 0
         # All deps healthy — should we auto-resume?
@@ -535,7 +540,7 @@ async def _check_pause_mode():
                 session.add(state)
                 await session.commit()
                 _runtime_config["max_concurrent_vms"] = restore
-                print(f"[PAUSE] Auto-resumed pipeline — all deps healthy (max_vms={restore})")
+                logger.info(f"[PAUSE] Auto-resumed pipeline — all deps healthy (max_vms={restore})")
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -549,7 +554,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         # Check if cooldown has elapsed → transition to HALF-OPEN
         if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
-            print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+            logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
     # Guard: must have active directions that aren't in cooldown
@@ -629,7 +634,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if breaker["state"] == "HALF_OPEN":
         breaker["half_open_task_id"] = str(new_task.id)
 
-    print(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
+    logger.info(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
 
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
@@ -641,7 +646,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     if breaker["state"] == "OPEN":
         if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
-            print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+            logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
 
@@ -731,7 +736,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     if breaker["state"] == "HALF_OPEN":
         breaker["half_open_task_id"] = str(new_task.id)
 
-    print(f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}")
+    logger.info(f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}")
 
 
 async def _check_autonomous_research(owner: str, repo: str):
@@ -759,7 +764,7 @@ async def _check_autonomous_research(owner: str, repo: str):
             if active_count < _runtime_config["max_concurrent_vms"]:
                 await _spawn_research_task(project, session)
     except Exception as e:
-        print(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}")
+        logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
 
 
 async def _check_idle_research():
@@ -796,7 +801,7 @@ async def _check_idle_research():
                     for task_type in ("security_audit", "qa", "deps"):
                         await _spawn_periodic_task(project, task_type, session)
     except Exception as e:
-        print(f"[AUTONOMOUS] Error in idle research check: {e}")
+        logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
 
 # --- In-Memory Event Bus for WebSockets ---
@@ -847,7 +852,8 @@ class ConnectionManager:
             for connection in list(self.active_connections[project_id]):
                 try:
                     await connection.send_json(message)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
                     self.disconnect(connection, project_id)
 
 manager = ConnectionManager()
@@ -908,7 +914,7 @@ async def reaper_service():
                         age = int((now - task.created_at).total_seconds())
                         reap_reason = f"Never started — {age}s since creation, no heartbeat"
 
-                    print(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id}) — {reap_reason}")
+                    logger.info(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id}) — {reap_reason}")
 
                     if task.vm_instance_id:
                         asyncio.create_task(delete_agent_vm(task.vm_instance_id))
@@ -924,10 +930,10 @@ async def reaper_service():
                             select(Task).where(Task.parent_task_id == task.id)
                         )).scalars().all()
                         if children:
-                            print(f"[REAPER] Re-evaluating parent task {task.id}")
+                            logger.info(f"[REAPER] Re-evaluating parent task {task.id}")
                             await _requeue_parent_task(task, session)
                         else:
-                            print(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
+                            logger.info(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
                             task.latest_status_message = f"Reaped (attempt {task.attempt_count + 1}/{_runtime_config['max_retries']}): {reap_reason}"
                             task.attempt_count += 1
                             task.status = TaskStatus.QUEUED
@@ -941,7 +947,7 @@ async def reaper_service():
                             {"task_id": str(task.id), "status": task.status, "attempt_count": task.attempt_count}
                         )
                     else:
-                        print(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
+                        logger.error(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
                         task.status = TaskStatus.FAILED
                         task.latest_status_message = f"Failed after {_runtime_config['max_retries']} attempts — last reap: {reap_reason}"
                         record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
@@ -963,19 +969,19 @@ async def reaper_service():
                             try:
                                 await _check_and_trigger_rollup(task, session)
                             except Exception as e:
-                                print(f"[REAPER] Rollup check failed for task {task.id}: {e}")
+                                logger.error(f"[REAPER] Rollup check failed for task {task.id}: {e}", exc_info=True)
                     
         except asyncio.CancelledError:
-            print("[REAPER] Service shutting down.")
+            logger.info("[REAPER] Service shutting down.")
             break
         except Exception as e:
-            print(f"[REAPER] Error: {e}")
+            logger.error(f"[REAPER] Error: {e}", exc_info=True)
             
         # Sleep for 1 minute before checking again
         try:
             await asyncio.sleep(60)
         except asyncio.CancelledError:
-            print("[REAPER] Service shutting down.")
+            logger.info("[REAPER] Service shutting down.")
             break
 
 async def gcp_cleanup_service():
@@ -997,15 +1003,15 @@ async def gcp_cleanup_service():
                 await cleanup_orphaned_vms(active_vm_ids)
                 
         except asyncio.CancelledError:
-            print("[GCP CLEANUP] Service shutting down.")
+            logger.info("[GCP CLEANUP] Service shutting down.")
             break
         except Exception as e:
-            print(f"[GCP CLEANUP] Error: {e}")
+            logger.error(f"[GCP CLEANUP] Error: {e}", exc_info=True)
             
         try:
             await asyncio.sleep(900) # Run every 15 minutes
         except asyncio.CancelledError:
-            print("[GCP CLEANUP] Service shutting down.")
+            logger.info("[GCP CLEANUP] Service shutting down.")
             break
 
 async def orchestrator_worker():
@@ -1035,7 +1041,7 @@ async def orchestrator_worker():
                         t.started_at = None
                         t.vm_instance_id = None
                         session.add(t)
-                        print(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
+                        logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
                 if session.dirty:
                     await session.commit()
                     # Re-fetch after recovery
@@ -1078,7 +1084,7 @@ async def orchestrator_worker():
                     try:
                         dep_uuids = [uuid.UUID(d) for d in deps]
                     except (ValueError, AttributeError) as e:
-                        print(f"[ORCHESTRATOR] Task {task.id} has invalid dependency UUID: {e}")
+                        logger.error(f"[ORCHESTRATOR] Task {task.id} has invalid dependency UUID: {e}", exc_info=True)
                         eligible_ids.append(task.id)
                         continue
                     dep_result = await session.execute(select(Task).where(Task.id.in_(dep_uuids)))
@@ -1109,7 +1115,7 @@ async def orchestrator_worker():
                                 await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
-                        print(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
+                        logger.error(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
                     elif all_met:
                         eligible_ids.append(task.id)
 
@@ -1143,7 +1149,7 @@ async def orchestrator_worker():
                         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
                         should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
                         if should_defer:
-                            print(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {', '.join(sorted(overlap))}")
+                            logger.info(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {', '.join(sorted(overlap))}")
                         else:
                             non_conflicting.append(eid)
                     eligible_ids = non_conflicting
@@ -1160,10 +1166,10 @@ async def orchestrator_worker():
                     ).with_for_update(skip_locked=True)
                     queued_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
-                print(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
+                logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
 
                 for task in queued_tasks:
-                    print(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
+                    logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
                     # Select Max plan account (primary) or fall back to API key
                     account = select_max_plan_account()
@@ -1174,14 +1180,14 @@ async def orchestrator_worker():
                         account_id = account["id"]
                         oauth_token = account.get("oauth_token")
                         claude_config_json = account.get("claude_config_json")
-                        print(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
+                        logger.info(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
                     else:
                         # No Max plan account — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
-                            print("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
+                            logger.info("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
                         else:
                             # No credentials at all — skip this task, don't waste a VM
-                            print(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
+                            logger.warning(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
                             async with AsyncSessionLocal() as msg_session:
                                 msg_task = await msg_session.get(Task, task.id)
                                 if msg_task:
@@ -1203,10 +1209,10 @@ async def orchestrator_worker():
                         # Increment account active_tasks so next iteration picks a different account
                         if account:
                             account["active_tasks"] = account.get("active_tasks", 0) + 1
-                        print(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
+                        logger.info(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
                     except Exception as e:
                         import traceback
-                        print(f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}")
+                        logger.error(f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}", exc_info=True)
                         traceback.print_exc()
                         await session.rollback()
                         continue
@@ -1221,12 +1227,12 @@ async def orchestrator_worker():
                             try:
                                 payload_uri = await upload_json_payload(str(t_id), payloads)
                             except Exception as e:
-                                print(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}")
+                                logger.error(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}", exc_info=True)
 
                         success = await provision_agent_vm(vm_id, t_id, payload_uri,
                                                            oauth_token=token, claude_config_json=config_json)
                         if not success:
-                            print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
+                            logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
                             # Release the Max Plan account slot
                             if acct_id_for_release:
@@ -1247,7 +1253,7 @@ async def orchestrator_worker():
                                             {"task_id": str(t_id), "status": TaskStatus.FAILED}
                                         )
                             except Exception as e:
-                                print(f"[ORCHESTRATOR] Error marking task {t_id} as failed: {e}")
+                                logger.error(f"[ORCHESTRATOR] Error marking task {t_id} as failed: {e}", exc_info=True)
 
                     asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
@@ -1279,14 +1285,14 @@ async def orchestrator_worker():
                         try:
                             started = datetime.fromisoformat(ci_wait_started)
                             if (datetime.utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
-                                print(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
+                                logger.error(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
                                 session.add(ci_task)
                                 await session.commit()
                                 continue
                         except (ValueError, TypeError) as e:
-                            print(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})")
+                            logger.error(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})", exc_info=True)
 
                     try:
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
@@ -1301,7 +1307,7 @@ async def orchestrator_worker():
                             ci_task.latest_status_message = f"PR #{ci_pr_number} already merged/closed"
                             session.add(ci_task)
                             await session.commit()
-                            print(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
+                            logger.info(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
                             continue
 
                         # Check for merge conflicts — CI won't trigger on conflicting PRs
@@ -1321,11 +1327,11 @@ async def orchestrator_worker():
                             if fix_task:
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
-                                print(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
+                                logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
                             else:
                                 # Fix not spawned — likely duplicate guard (fix already running) or iteration cap
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix already in progress or iteration limit reached"
-                                print(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — leaving in EVALUATING")
+                                logger.info(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — leaving in EVALUATING")
                             session.add(ci_task)
                             await session.commit()
                             continue
@@ -1335,7 +1341,7 @@ async def orchestrator_worker():
                             ci_task.latest_status_message = f"CI waiting on PR #{ci_pr_number} — HEAD SHA unavailable"
                             session.add(ci_task)
                             await session.commit()
-                            print(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
+                            logger.info(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
                         ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha)
@@ -1369,12 +1375,12 @@ async def orchestrator_worker():
                                                 orig.latest_status_message = "Rollup PR merged"
                                             session.add(orig)
                                     except Exception as e:
-                                        print(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}")
-                                print(f"[CI] PR #{ci_pr_number} CI passed, merged")
+                                        logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
+                                logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged")
                             else:
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"CI passed but merge blocked: {merge_result.get('message', 'unknown')}"
-                                print(f"[CI] PR #{ci_pr_number} CI passed but merge blocked")
+                                logger.error(f"[CI] PR #{ci_pr_number} CI passed but merge blocked")
                         else:
                             # CI failed — check for existing active fix before spawning
                             active_tasks = (await session.execute(
@@ -1391,7 +1397,7 @@ async def orchestrator_worker():
                             if existing_fix:
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix already active → {existing_fix.id}"
-                                print(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id}")
+                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id}")
                                 session.add(ci_task)
                                 await session.commit()
                                 continue
@@ -1411,30 +1417,30 @@ async def orchestrator_worker():
                             if fix_task:
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
-                                print(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")
+                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")
                             else:
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
-                                print(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None")
+                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None")
 
                         session.add(ci_task)
                         await session.commit()
                         await broadcast_to_project(str(ci_task.project_id), "task_updated",
                                                    {"task_id": str(ci_task.id), "status": ci_task.status})
                     except Exception as e:
-                        print(f"[CI] Error checking CI for task {ci_task.id}: {e}")
+                        logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
                         try:
                             ci_task.latest_status_message = f"CI check error: {str(e)[:200]}"
                             session.add(ci_task)
                             await session.commit()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.error(f"[CI] Failed to update ci_task status after error for task {ci_task.id}: {e}", exc_info=True)
 
         except asyncio.CancelledError:
-            print("[ORCHESTRATOR] Worker shutting down.")
+            logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
         except Exception as e:
-            print(f"[ORCHESTRATOR] Error: {e}")
+            logger.error(f"[ORCHESTRATOR] Error: {e}", exc_info=True)
             
         # Monitoring checks run every cycle (not just when idle)
         try:
@@ -1442,7 +1448,7 @@ async def orchestrator_worker():
             await _check_external_health()
             await _check_pause_mode()
         except Exception as e:
-            print(f"[ORCHESTRATOR] Monitoring check error: {e}")
+            logger.error(f"[ORCHESTRATOR] Monitoring check error: {e}", exc_info=True)
 
         # Sleep based on whether we found tasks
         try:
@@ -1453,7 +1459,7 @@ async def orchestrator_worker():
                 # Check for idle autonomous research when nothing is queued
                 await _check_idle_research()
         except asyncio.CancelledError:
-            print("[ORCHESTRATOR] Worker shutting down.")
+            logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
 
 @asynccontextmanager
@@ -1490,10 +1496,10 @@ async def lifespan(app: FastAPI):
             for name, t in tasks.items():
                 if t.done():
                     exc = t.exception() if not t.cancelled() else None
-                    print(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
+                    logger.error(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
                     # Restart the orchestrator if it died
                     if name == "orchestrator" and not t.cancelled():
-                        print("[MONITOR] Restarting orchestrator worker...")
+                        logger.info("[MONITOR] Restarting orchestrator worker...")
                         tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
@@ -1556,8 +1562,8 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
                 "rollback_reason": state.rollback_reason,
                 "pause_reason": state.pause_reason,
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}", exc_info=True)
 
     return {
         "orchestrator_alive": _orchestrator_last_cycle is not None,
@@ -1566,7 +1572,18 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         "active_tasks": active,
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "pool_size": len(_max_plan_pool),
-        "pool_accounts": [{"name": a["name"], "enabled": a.get("enabled"), "active": a["active_tasks"]} for a in _max_plan_pool],
+        "available_count": sum(1 for a in _max_plan_pool if a.get("enabled", True)),
+        "disabled_count": sum(1 for a in _max_plan_pool if not a.get("enabled", True)),
+        "pool_accounts": [
+            {
+                "name": a["name"],
+                "enabled": a.get("enabled", True),
+                "active": a["active_tasks"],
+                "disabled_at": a["disabled_at"].isoformat() if a.get("disabled_at") else None,
+                "reenable_at": (a["disabled_at"] + timedelta(minutes=30)).isoformat() if a.get("disabled_at") else None,
+            }
+            for a in _max_plan_pool
+        ],
         "deploy_state": deploy_state,
         "deploy_monitoring": {
             "window_active": _shared_state.deploy_monitoring["window_start"] is not None,
@@ -1577,6 +1594,119 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         },
         "zone_health": _get_zone_health_summary(),
     }
+
+
+@app.get("/api/health/detailed")
+async def health_detailed(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
+    """Authenticated endpoint returning structured health status for all system components."""
+    import time
+    from sqlalchemy import text
+    from sqlalchemy import func
+
+    components: Dict[str, Any] = {}
+
+    # --- DB ---
+    db_status = "ok"
+    db_latency_ms: Optional[float] = None
+    try:
+        t0 = time.monotonic()
+        await session.execute(text("SELECT 1"))
+        db_latency_ms = round((time.monotonic() - t0) * 1000, 2)
+        if db_latency_ms > 500:
+            db_status = "degraded"
+    except Exception:
+        db_status = "down"
+    components["db"] = {"status": db_status, "latency_ms": db_latency_ms}
+
+    # --- GitHub API ---
+    gh_ok = _shared_state.external_health.get("github_api", True)
+    last_check = _shared_state.external_health.get("last_check")
+    components["github_api"] = {
+        "status": "ok" if gh_ok else "down",
+        "last_check": last_check.isoformat() if isinstance(last_check, datetime) else last_check,
+    }
+
+    # --- Orchestrator ---
+    cycle_age: Optional[float] = None
+    if _orchestrator_last_cycle:
+        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+    if cycle_age is None:
+        orch_status = "down"
+    elif cycle_age < 60:
+        orch_status = "ok"
+    elif cycle_age < 120:
+        orch_status = "degraded"
+    else:
+        orch_status = "down"
+    try:
+        queued = (await session.execute(
+            select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+        )).scalar() or 0
+        active = (await session.execute(
+            select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+        )).scalar() or 0
+    except Exception:
+        queued = active = 0
+    components["orchestrator"] = {
+        "status": orch_status,
+        "cycle_age_seconds": cycle_age,
+        "queued_tasks": queued,
+        "active_tasks": active,
+    }
+
+    # --- Zone Health ---
+    zone_summary = _get_zone_health_summary()
+    total_zones = zone_summary.get("total_zones", 0)
+    available_zones = zone_summary.get("available", 0)
+    exhausted_zones = zone_summary.get("exhausted", [])
+    if total_zones == 0 or available_zones > 0:
+        zone_status = "ok"
+    elif len(exhausted_zones) < total_zones:
+        zone_status = "degraded"
+    else:
+        zone_status = "down"
+    components["zone_health"] = dict(zone_summary, status=zone_status)
+
+    # --- Max Plan Pool ---
+    total_accounts = len(_max_plan_pool)
+    available_accounts = len([a for a in _max_plan_pool if a.get("enabled", True)])
+    if total_accounts == 0:
+        pool_status = "ok"  # not using Max Plan accounts
+    elif available_accounts > 0:
+        pool_status = "ok"
+    else:
+        pool_status = "down"
+    components["max_plan_pool"] = {"status": pool_status, "total": total_accounts, "available": available_accounts}
+
+    # --- Circuit Breakers ---
+    breaker_states: Dict[str, Any] = {}
+    for project_id, breaker in _shared_state.circuit_breakers.items():
+        breaker_states[project_id] = {
+            "state": breaker.get("state", "CLOSED"),
+            "failure_count": breaker.get("failure_count", 0),
+            "opened_at": breaker["opened_at"].isoformat() if breaker.get("opened_at") else None,
+        }
+    components["circuit_breaker"] = {"status": "ok", "projects": breaker_states}
+
+    # --- Autonomous ---
+    autonomous_enabled = _runtime_config.get("max_concurrent_vms", 0) > 0
+    consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
+    components["autonomous"] = {
+        "status": "ok" if consecutive_failures < 3 else "degraded",
+        "enabled": autonomous_enabled,
+        "consecutive_failures": consecutive_failures,
+    }
+
+    # --- Overall Status ---
+    statuses = [c["status"] for c in components.values() if isinstance(c, dict) and "status" in c]
+    if "down" in statuses:
+        overall = "unhealthy"
+    elif "degraded" in statuses:
+        overall = "degraded"
+    else:
+        overall = "healthy"
+
+    return {"status": overall, "components": components}
 
 
 @app.get("/health")
@@ -1626,7 +1756,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    print(f"Unhandled exception: {exc}")
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={"error": {"code": 500, "message": "Internal Server Error"}},
@@ -2445,7 +2575,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         await session.refresh(child)
     await broadcast_to_project(str(parent.project_id), "task_updated",
                                {"task_id": str(parent.id), "status": TaskStatus.EVALUATING})
-    print(f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried")
+    logger.info(f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried")
     return retried_count
 
 
@@ -2472,7 +2602,7 @@ async def _spawn_pipeline_task(
             continue  # Don't block on ourselves
         t_payload = (t.payloads or [{}])[0]
         if t_payload.get("pr_number") == pr_number and t_payload.get("type") in ("review", "fix"):
-            print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id} ({t_payload.get('type')})")
+            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id} ({t_payload.get('type')})")
             source_task.latest_status_message = f"{task_type.title()} already active for PR #{pr_number} → task {str(t.id)[:8]}"
             session.add(source_task)
             return t
@@ -2494,8 +2624,8 @@ async def _spawn_pipeline_task(
                     session.add(orig)
                     await session.commit()
             except Exception as e:
-                print(f"[PIPELINE] Failed to mark iteration cap on {orig_id}: {e}")
-        print(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
+                logger.warning(f"[PIPELINE] Failed to mark iteration cap on {orig_id}: {e}", exc_info=True)
+        logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
         return None
 
     vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
@@ -2551,7 +2681,7 @@ async def _spawn_pipeline_task(
                     f"\n\n## Current review feedback:\n{fix_prompt}"
                 )
         except Exception as e:
-            print(f"[PIPELINE] Failed to build review history for PR #{pr_number}: {e}")
+            logger.warning(f"[PIPELINE] Failed to build review history for PR #{pr_number}: {e}", exc_info=True)
 
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
                         "base_branch": base_branch, "prompt": enriched_fix_prompt,
@@ -2615,7 +2745,7 @@ def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
                     candidate = text[start:i + 1]
                     return json.loads(candidate)
     except (json.JSONDecodeError, AttributeError) as e:
-        print(f"[PLAN] Failed to parse plan JSON: {e}")
+        logger.warning(f"[PLAN] Failed to parse plan JSON: {e}", exc_info=True)
     return None
 
 
@@ -2662,7 +2792,7 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
                     truncated = raw[:last_close + 1] + ']'
                     findings = json.loads(truncated)
                     if isinstance(findings, list):
-                        print(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
+                        logger.info(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
                         return findings
         except (json.JSONDecodeError, AttributeError):
             pass
@@ -2707,7 +2837,7 @@ def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN"):
             if overlap:
                 a_title = a.get("title", f"#{i}")
                 b_title = b.get("title", f"#{j}")
-                print(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
+                logger.info(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
 
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
@@ -2725,7 +2855,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     # Cap subtask count to prevent runaway VM provisioning
     if len(subtasks) > 10:
         subtasks = subtasks[:10]
-        print(f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10")
+        logger.info(f"[PLAN] Capped subtask count from {len(plan_data['subtasks'])} to 10")
 
     if not _validate_plan_dependencies(subtasks):
         task.latest_status_message = "Plan has circular dependencies"
@@ -2748,10 +2878,10 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         sha = await get_branch_sha(gh_token, owner, repo, parent_base)
         await create_branch(gh_token, owner, repo, plan_branch, sha)
-        print(f"[PLAN] Created branch {plan_branch} from {parent_base}")
+        logger.info(f"[PLAN] Created branch {plan_branch} from {parent_base}")
     except Exception as e:
         # Branch may already exist from a previous run — reuse it
-        print(f"[PLAN] Branch {plan_branch} already exists or creation failed: {e} — reusing")
+        logger.error(f"[PLAN] Branch {plan_branch} already exists or creation failed: {e} — reusing", exc_info=True)
 
     # Store branch info on the plan task for rollup later
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
@@ -2843,7 +2973,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                                    {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
 
     await session.commit()
-    print(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
+    logger.info(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
 
 
 async def _handle_security_audit_completion(task: Task, logs: str, session: AsyncSession):
@@ -2959,9 +3089,9 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             if open_prs:
                 pr_number = open_prs[0]["number"]
                 await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
-                print(f"[SECURITY AUDIT] Posted informational findings comment on PR #{pr_number}")
+                logger.info(f"[SECURITY AUDIT] Posted informational findings comment on PR #{pr_number}")
         except Exception as e:
-            print(f"[SECURITY AUDIT] Failed to post PR comment for informational findings: {e}")
+            logger.warning(f"[SECURITY AUDIT] Failed to post PR comment for informational findings: {e}", exc_info=True)
 
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (
@@ -2972,7 +3102,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
 
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"security_audit_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    print(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
+    logger.info(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
 
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
@@ -3076,9 +3206,9 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             if open_prs:
                 pr_number = open_prs[0]["number"]
                 await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
-                print(f"[PERF] Posted findings summary comment on PR #{pr_number}")
+                logger.info(f"[PERF] Posted findings summary comment on PR #{pr_number}")
         except Exception as e:
-            print(f"[PERF] Failed to post PR comment: {e}")
+            logger.warning(f"[PERF] Failed to post PR comment: {e}", exc_info=True)
 
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (
@@ -3089,7 +3219,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    print(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
+    logger.info(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
 
 
 async def _handle_investigation_completion(task: Task, payload, session: AsyncSession):
@@ -3112,7 +3242,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.latest_status_message = f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — not spawning further tasks"
         session.add(task)
         await session.commit()
-        print(f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})")
+        logger.warning(f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})")
         return
 
     findings = _parse_research_findings(logs)
@@ -3135,14 +3265,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         sha = await get_branch_sha(gh_token, owner, repo, original_base)
         await create_branch(gh_token, owner, repo, research_branch, sha)
-        print(f"[RESEARCH] Created branch {research_branch} from {original_base}")
+        logger.info(f"[RESEARCH] Created branch {research_branch} from {original_base}")
     except Exception as e:
         # Branch may already exist from a previous run — reuse it
-        print(f"[RESEARCH] Branch {research_branch} already exists or creation failed: {e} — reusing")
+        logger.error(f"[RESEARCH] Branch {research_branch} already exists or creation failed: {e} — reusing", exc_info=True)
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):
-        print("[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
+        logger.warning("[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
         for f in findings:
             f.pop("depends_on_indices", None)
 
@@ -3178,7 +3308,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i+1}")
         if _is_duplicate(title, existing_titles):
-            print(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
+            logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
             continue
         p = finding.get("priority", "medium")
@@ -3334,7 +3464,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    print(f"[RESEARCH] Created {len(child_tasks)} tasks from research {task.id}")
+    logger.info(f"[RESEARCH] Created {len(child_tasks)} tasks from research {task.id}")
 
 
 # --- Rollup & Branch Cleanup Helpers ---
@@ -3374,7 +3504,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 task.context = {**(task.context or {}), "pr_merged": True}
                 return True
         except Exception as e:
-            print(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}")
+            logger.warning(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}", exc_info=True)
     return False
 
 
@@ -3404,12 +3534,12 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
                 open_prs = await get_open_pull_requests(_gh, _owner, _repo, staging)
                 if open_prs:
                     pr_nums = [f"#{p['number']}" for p in open_prs]
-                    print(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
+                    logger.warning(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
                 else:
                     branches_to_delete.append(staging)
             except Exception:
                 # If we can't check, don't delete (safe default)
-                print(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
+                logger.warning(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
@@ -3423,9 +3553,9 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
             await _ensure_token()
             deleted = await delete_branch(gh_token, owner, repo, branch)
             if deleted:
-                print(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
+                logger.info(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
         except Exception as e:
-            print(f"[CLEANUP] Failed to delete {branch}: {e}")
+            logger.warning(f"[CLEANUP] Failed to delete {branch}: {e}", exc_info=True)
 
 
 async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> None:
@@ -3497,10 +3627,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         if unmerged:
             titles = [c.title[:40] for c in unmerged]
             parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
-            print(f"[ROLLUP] Parent {parent.id} blocked — {len(unmerged)} children completed but unmerged")
+            logger.error(f"[ROLLUP] Parent {parent.id} blocked — {len(unmerged)} children completed but unmerged")
         elif failed:
             parent.latest_status_message = f"{len(failed)} subtask(s) failed — requeue parent to retry"
-            print(f"[ROLLUP] Parent {parent.id} blocked — {len(failed)} children failed")
+            logger.error(f"[ROLLUP] Parent {parent.id} blocked — {len(failed)} children failed")
         session.add(parent)
         await session.commit()
         return
@@ -3516,7 +3646,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         await _cleanup_branches(parent, session)
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.CANCELLED})
-        print(f"[ROLLUP] Parent {parent.id} cancelled — all children cancelled")
+        logger.info(f"[ROLLUP] Parent {parent.id} cancelled — all children cancelled")
         return
 
     if all_done and (len(children) - cancelled_count) > 0:
@@ -3539,7 +3669,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                 if open_prs:
                     pr_nums = [f"#{p['number']}" for p in open_prs]
-                    print(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
+                    logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
                     return
 
                 is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
@@ -3550,7 +3680,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
                 rollup_pr_url = pr_result.get("html_url", "")
                 rollup_pr_number = pr_result.get("number")
-                print(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+                logger.info(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
 
                 # Auto-merge small rollups on intermediate branches; review large ones
                 # Measure by total lines changed (additions + deletions)
@@ -3560,12 +3690,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 except Exception:
                     lines_changed = 999  # assume large if we can't check
                 is_small_rollup = lines_changed <= 100
-                print(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
+                logger.info(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
                 if is_target_intermediate and is_small_rollup:
                     # Always run security scan before any merge
                     try:
                         rollup_scan = await scan_pr_for_injection(gh_token, owner, repo, rollup_pr_number)
-                        print(f"[SECURITY] Rollup scan: {rollup_scan['summary']}")
+                        logger.info(f"[SECURITY] Rollup scan: {rollup_scan['summary']}")
                         if rollup_scan["blocked"]:
                             parent.requires_approval = True
                             parent.latest_status_message = f"Rollup security scan blocked: {rollup_scan['summary']}"
@@ -3578,7 +3708,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         if rollup_scan["findings"]:
                             await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
                     except Exception as e:
-                        print(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, proceeding: {e}")
+                        logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, proceeding: {e}", exc_info=True)
 
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
                     if merge_result.get("merged"):
@@ -3586,7 +3716,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
                         parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
                         await delete_branch(gh_token, owner, repo, staging_branch)
-                        print(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
+                        logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")
@@ -3614,11 +3744,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             original_task_id=str(parent.id)
                         )
                         if fix_task:
-                            print(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
+                            logger.error(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
                         else:
                             parent.status = TaskStatus.FAILED
                             parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
-                            print(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
+                            logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
@@ -3628,13 +3758,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         original_task_id=str(parent.id)
                     )
                     if review_task:
-                        print(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
+                        logger.info(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
                     else:
                         parent.status = TaskStatus.FAILED
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
-                        print(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
+                        logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
             except Exception as e:
-                print(f"[ROLLUP] Failed to create rollup PR: {e}")
+                logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
                 parent.status = TaskStatus.FAILED
                 parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {str(e)[:200]}"
         else:
@@ -3645,7 +3775,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         await session.commit()
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": parent.status})
-        print(f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})")
+        logger.info(f"[ROLLUP] Parent {parent.id} — all children done (completed={completed_count}, cancelled={cancelled_count})")
 
     elif any(s == TaskStatus.FAILED for s in child_statuses) and active_count == 0:
         # All done but some failed — mark parent as failed but keep staging branch
@@ -3657,7 +3787,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         await session.commit()
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.FAILED})
-        print(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
+        logger.error(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
 
 
 @app.post("/api/agent/status")
@@ -3732,7 +3862,7 @@ async def update_agent_status(
             task.plan_output = smoketest_data
             session.add(task)
         except (json.JSONDecodeError, Exception) as e:
-            print(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}")
+            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}", exc_info=True)
 
     # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
@@ -3800,9 +3930,9 @@ async def update_agent_status(
                         str(task.project_id), "alert_created",
                         {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
                     )
-                    print(f"[SMOKETEST] Spawned plan task {plan_task.id} + alert for {len(failed_tests)} failed smoke tests")
+                    logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} + alert for {len(failed_tests)} failed smoke tests")
         except Exception as e:
-            print(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}")
+            logger.warning(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}", exc_info=True)
 
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
@@ -3843,9 +3973,9 @@ async def update_agent_status(
                     "task_updated",
                     {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
                 )
-                print(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
+                logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
         except (json.JSONDecodeError, Exception) as e:
-            print(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}")
+            logger.warning(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}", exc_info=True)
 
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
@@ -3868,7 +3998,7 @@ async def update_agent_status(
                     if acct["id"] == acct_id:
                         acct["enabled"] = False
                         acct["disabled_at"] = datetime.utcnow()
-                        print(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
+                        logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
                         break
 
         if task.vm_instance_id:
@@ -3932,7 +4062,7 @@ async def update_agent_status(
                 "task_updated",
                 {"task_id": str(debug_task.id), "status": TaskStatus.QUEUED, "title": debug_task.title}
             )
-            print(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
+            logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
 
         # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
@@ -3947,7 +4077,7 @@ async def update_agent_status(
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
                 breaker["opened_at"] = datetime.utcnow()
                 breaker["half_open_task_id"] = None
-                print(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
+                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
 
             # CLOSED → OPEN after 3 consecutive failures
             elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
@@ -3956,7 +4086,7 @@ async def update_agent_status(
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 await broadcast_to_project(project_key, "autonomous_paused",
                                            {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
-                print(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
+                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
         # When review/fix fails permanently, cancel the original create task so rollup
         # skips it (via cancelled-child logic) instead of hanging forever.
         # Other children's work is preserved — only this PR is excluded from the rollup.
@@ -3977,9 +4107,9 @@ async def update_agent_status(
                             # Trigger rollup check so parent can proceed with remaining children
                             if orig.parent_task_id:
                                 await _check_and_trigger_rollup(orig, session)
-                            print(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
+                            logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
                     except Exception as e:
-                        print(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}")
+                        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
 
         if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
@@ -3992,7 +4122,7 @@ async def update_agent_status(
                 breaker["state"] = "CLOSED"
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 breaker["half_open_task_id"] = None
-                print(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
+                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
             elif breaker["state"] == "OPEN":
                 # Shouldn't happen (OPEN blocks spawning), but reset if it does
                 breaker["state"] = "CLOSED"
@@ -4021,7 +4151,7 @@ async def update_agent_status(
                         # Always run security scan before any merge
                         try:
                             scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                            print(f"[SECURITY] Small-scope scan: {scan_result['summary']}")
+                            logger.info(f"[SECURITY] Small-scope scan: {scan_result['summary']}")
                             if scan_result["blocked"]:
                                 task.requires_approval = True
                                 task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
@@ -4033,7 +4163,7 @@ async def update_agent_status(
                             if scan_result["findings"]:
                                 await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                         except Exception as e:
-                            print(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, proceeding: {e}")
+                            logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, proceeding: {e}", exc_info=True)
 
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
                         if merge_result.get("merged"):
@@ -4041,9 +4171,9 @@ async def update_agent_status(
                             session.add(task)
                             await session.commit()
                             await _cleanup_branches(task, session)
-                            print(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
+                            logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
                         else:
-                            print(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
+                            logger.error(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
                             # Fall through to review pipeline for conflict resolution
                             review_task = await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
@@ -4054,9 +4184,9 @@ async def update_agent_status(
                                 task.requires_approval = True
                                 session.add(task)
                                 await session.commit()
-                                print(f"[PIPELINE] WARNING: Auto-merge failed and review spawn returned None for PR #{pr_number}")
+                                logger.error(f"[PIPELINE] WARNING: Auto-merge failed and review spawn returned None for PR #{pr_number}")
                     except Exception as e:
-                        print(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}")
+                        logger.error(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}", exc_info=True)
                         # Fallback: spawn review so the pipeline doesn't die
                         try:
                             fallback_review = await _spawn_pipeline_task(
@@ -4068,9 +4198,9 @@ async def update_agent_status(
                                 task.requires_approval = True
                                 session.add(task)
                                 await session.commit()
-                                print(f"[PIPELINE] WARNING: Fallback review spawn returned None for PR #{pr_number}")
+                                logger.warning(f"[PIPELINE] WARNING: Fallback review spawn returned None for PR #{pr_number}")
                         except Exception as e:
-                            print(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {e}")
+                            logger.error(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {e}", exc_info=True)
                             task.latest_status_message = f"Pipeline stalled: auto-merge and review spawn both failed — {str(e)[:200]}"
                             session.add(task)
                             await session.commit()
@@ -4079,7 +4209,7 @@ async def update_agent_status(
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                        print(f"[SECURITY] {scan_result['summary']}")
+                        logger.info(f"[SECURITY] {scan_result['summary']}")
                         if scan_result["blocked"]:
                             task.requires_approval = True
                             task.latest_status_message = scan_result["summary"]
@@ -4088,7 +4218,7 @@ async def update_agent_status(
                         if scan_result["findings"]:
                             await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                     except Exception as e:
-                        print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
+                        logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}", exc_info=True)
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
                     # Don't block here — let review run, block at merge time
@@ -4104,12 +4234,12 @@ async def update_agent_status(
                             task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large",
                                             "touched_infra": touched_infra, "touched_critical": touched_critical}
                             task.latest_status_message = f"Infrastructure change flagged: {', '.join(touched_infra)}"
-                            print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
+                            logger.info(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
                             session.add(task)
                             await session.commit()
                             _shared_state.deploy_monitoring["is_extended"] = True
                     except Exception as e:
-                        print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
+                        logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
                         review_task = await _spawn_pipeline_task(
@@ -4117,13 +4247,13 @@ async def update_agent_status(
                             original_prompt=original_prompt, original_task_id=str(task.id)
                         )
                         if review_task:
-                            print(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
                         else:
                             task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
                             task.requires_approval = True
                             session.add(task)
                             await session.commit()
-                            print(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
+                            logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -4134,7 +4264,7 @@ async def update_agent_status(
                 original_prompt = task_payload.get("original_prompt", "")
 
                 if not pr_number or not branch:
-                    print(f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
+                    logger.info(f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
                     task.latest_status_message = "Review pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
@@ -4156,9 +4286,9 @@ async def update_agent_status(
                             verdict = vj["verdict"]
                             feedback = vj.get("feedback", verdict_text)
                             verdict_parsed = True
-                            print(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
+                            logger.info(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
                     except (json.JSONDecodeError, TypeError):
-                        print(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
+                        logger.error(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
 
                 # Method 2: Parse JSON from log output
                 if not verdict_parsed:
@@ -4183,7 +4313,7 @@ async def update_agent_status(
                                             pass
                                         break
                     except Exception as e:
-                        print(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}")
+                        logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
 
                 if not verdict_parsed:
                     # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words
@@ -4195,7 +4325,7 @@ async def update_agent_status(
                         verdict = "APPROVE"
                     elif rc_idx > approve_idx:
                         verdict = "REQUEST_CHANGES"
-                    print(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
+                    logger.warning(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
 
                 # Post the review to the PR as a comment
                 try:
@@ -4203,7 +4333,7 @@ async def update_agent_status(
                     review_comment = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
                     await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
                 except Exception as e:
-                    print(f"[REVIEW PIPELINE] Failed to post review comment: {e}")
+                    logger.warning(f"[REVIEW PIPELINE] Failed to post review comment: {e}", exc_info=True)
 
                 action_taken = False
                 if verdict == "APPROVE":
@@ -4213,7 +4343,7 @@ async def update_agent_status(
                         pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
                         pr_head = pr_data.get("head", {}).get("ref", "")
                         if pr_head and pr_head != branch:
-                            print(f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge")
+                            logger.info(f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge")
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge aborted — reviewed branch `{branch}` does not match PR head `{pr_head}`.")
                             task.latest_status_message = f"Branch mismatch: reviewed {branch}, PR head is {pr_head}"
@@ -4238,7 +4368,7 @@ async def update_agent_status(
                                 "ci_wait_started": datetime.utcnow().isoformat()}}
                             session.add(task)
                             await session.commit()
-                            print(f"[CI] PR #{pr_number} approved, CI pending — waiting")
+                            logger.info(f"[CI] PR #{pr_number} approved, CI pending — waiting")
                             action_taken = True
                             return {"status": "accepted"}
 
@@ -4259,13 +4389,13 @@ async def update_agent_status(
                                 original_task_id=original_task_id
                             )
                             if fix_task:
-                                print(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
+                                logger.error(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
                             action_taken = True
                             return {"status": "accepted"}
 
                         # CI passed (or no CI checks exist) — proceed to merge
                         if ci_status and ci_status["conclusion"] == "success":
-                            print(f"[CI] PR #{pr_number} CI passed")
+                            logger.info(f"[CI] PR #{pr_number} CI passed")
 
                         # Critical files gate: block merge into main if security-critical files were touched
                         # Intermediate branches (research/, plan/) don't need human approval
@@ -4284,11 +4414,11 @@ async def update_agent_status(
                                                                {"task_id": str(orig_task.id), "status": TaskStatus.EVALUATING})
                                     await create_pr_comment(gh_token, owner, repo, pr_number,
                                         f"**Blueprint Review Pipeline**: Review approved, but PR touches security-critical files ({', '.join(critical_touched)}). Merge requires human approval.")
-                                    print(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — critical files: {critical_touched}")
+                                    logger.error(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — critical files: {critical_touched}")
                                     action_taken = True
                                     return {"status": "accepted"}
                             except Exception as e:
-                                print(f"[PIPELINE] Error checking critical files for merge gate: {e}")
+                                logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
 
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
 
@@ -4342,12 +4472,12 @@ async def update_agent_status(
                                                     str(task.project_id), "task_updated",
                                                     {"task_id": str(smoketest_task.id), "status": TaskStatus.QUEUED}
                                                 )
-                                                print(f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}")
+                                                logger.info(f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}")
                                             except Exception as e:
-                                                print(f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}")
+                                                logger.warning(f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}", exc_info=True)
                                 except Exception as e:
-                                    print(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}")
-                            print(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
+                                    logger.warning(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}", exc_info=True)
+                            logger.info(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
                             action_taken = True
                         else:
                             # Merge blocked — spawn fix task to rebase and resolve conflicts
@@ -4356,7 +4486,8 @@ async def update_agent_status(
                             try:
                                 pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
                                 files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
-                            except Exception:
+                            except Exception as e:
+                                logger.warning(f"[REVIEW PIPELINE] Failed to fetch file list for PR #{pr_number}: {e}")
                                 files_list = "  (could not fetch file list)"
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Spawning fix task to rebase and resolve conflicts.")
@@ -4378,10 +4509,10 @@ async def update_agent_status(
                                 original_task_id=original_task_id
                             )
                             if fix_task:
-                                print(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
+                                logger.error(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
                             action_taken = True
                     except Exception as e:
-                        print(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}")
+                        logger.warning(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}", exc_info=True)
                         task.latest_status_message = f"Review approved but merge/CI-check failed: {str(e)[:200]}"
                         session.add(task)
                         await session.commit()
@@ -4397,7 +4528,7 @@ async def update_agent_status(
                             if ci_check.get("conclusion") == "failure" and ci_check.get("failed_logs"):
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
                     except Exception as e:
-                        print(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}")
+                        logger.error(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}", exc_info=True)
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}",
@@ -4405,20 +4536,20 @@ async def update_agent_status(
                         current_feedback=feedback
                     )
                     if fix_task:
-                        print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                        logger.info(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
                     else:
                         task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
                         await session.commit()
-                        print(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
+                        logger.warning(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
                     action_taken = True
 
                 if not action_taken:
                     task.latest_status_message = f"Review completed but no action taken (verdict={verdict}) — check orchestrator logs"
                     session.add(task)
                     await session.commit()
-                    print(f"[REVIEW PIPELINE] WARNING: Review {task.id} for PR #{pr_number} completed with no downstream action (verdict={verdict})")
+                    logger.warning(f"[REVIEW PIPELINE] WARNING: Review {task.id} for PR #{pr_number} completed with no downstream action (verdict={verdict})")
 
             # Fix task completed → security scan → spawn new review
             elif task_type == "fix":
@@ -4428,7 +4559,7 @@ async def update_agent_status(
                 original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
 
                 if not pr_number or not branch:
-                    print(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
+                    logger.info(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
                     task.latest_status_message = "Fix pipeline error: missing pr_number or branch"
                     session.add(task)
                     await session.commit()
@@ -4439,7 +4570,7 @@ async def update_agent_status(
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                     scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
-                    print(f"[SECURITY] {scan_result['summary']}")
+                    logger.info(f"[SECURITY] {scan_result['summary']}")
                     if scan_result["blocked"]:
                         scan_blocked = True
                         task.requires_approval = True
@@ -4449,7 +4580,7 @@ async def update_agent_status(
                     if scan_result["findings"]:
                         await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                 except Exception as e:
-                    print(f"[SECURITY] Scan failed for fix PR #{pr_number}, proceeding: {e}")
+                    logger.error(f"[SECURITY] Scan failed for fix PR #{pr_number}, proceeding: {e}", exc_info=True)
 
                 if not scan_blocked:
                     review_task = await _spawn_pipeline_task(
@@ -4457,13 +4588,13 @@ async def update_agent_status(
                         original_task_id=original_task_id
                     )
                     if review_task:
-                        print(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
+                        logger.info(f"[REVIEW PIPELINE] Spawned review after fix for PR #{pr_number} → task {review_task.id}")
                     else:
                         task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
                         await session.commit()
-                        print(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
+                        logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
 
             # Plan task completed → decompose into subtasks
             elif task_type == "plan":
@@ -4971,7 +5102,7 @@ async def github_oauth_callback(
         return RedirectResponse(url=f"{admin_url}?github_connected={account_name}")
 
     except Exception as e:
-        print(f"[GITHUB OAUTH] Error: {e}")
+        logger.error(f"[GITHUB OAUTH] Error: {e}", exc_info=True)
         return RedirectResponse(url=f"{admin_url}?github_error=failed")
 
 @app.post("/api/github/webhook")
@@ -5000,7 +5131,7 @@ async def github_webhook(
     event_type = request.headers.get("x-github-event")
     data = json.loads(payload)
     
-    print(f"[WEBHOOK] Received {event_type} event")
+    logger.info(f"[WEBHOOK] Received {event_type} event")
 
     # Post-merge trigger: check if we should spawn autonomous research
     if event_type == "pull_request":
@@ -5019,7 +5150,7 @@ async def github_webhook(
                     )
                 )
                 if not project_check.scalars().first():
-                    print(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
+                    logger.info(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
                     return {"status": "ignored"}
                 background_tasks.add_task(_check_autonomous_research, owner, repo)
 

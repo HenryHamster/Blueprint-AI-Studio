@@ -20,8 +20,9 @@ export interface DeployState {
   rollback_count: number;
   pause_reason: string | null;
   failure_rate: number;
-  monitoring_progress: number | null;
-  monitoring_window: { percent: number } | null;
+  monitoring_window: { elapsed_seconds: number; total_seconds: number; percent: number } | null;
+  task_results_count: number;
+  gcp_project_id: string;
 }
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -149,6 +150,7 @@ export function useAppState() {
 
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
   const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
 
   // Directions panel state
@@ -457,9 +459,13 @@ export function useAppState() {
       if (res.ok) {
         const data = await res.json();
         setProjects(data || []);
+        setProjectsFetchError(null);
+      } else {
+        setProjectsFetchError('Failed to load projects');
       }
     } catch (err) {
       console.error('Failed to fetch projects:', err);
+      setProjectsFetchError('Failed to load projects');
     }
   };
 
@@ -527,11 +533,17 @@ export function useAppState() {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'approve' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ requires_approval: false }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+        addToast(data.detail ? `Failed to approve task: ${data.detail}` : 'Failed to approve task', 'error');
+        return;
+      }
       fetchTasks();
       addToast('Task approved', 'success');
     } catch (error) {
@@ -570,11 +582,17 @@ export function useAppState() {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'CANCELLED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ status: 'CANCELLED' }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+        addToast(data.detail ? `Failed to cancel task: ${data.detail}` : 'Failed to cancel task', 'error');
+        return;
+      }
       fetchTasks();
       addToast('Task cancelled', 'success');
     } catch (error) {
@@ -802,6 +820,32 @@ export function useAppState() {
     return () => clearInterval(id);
   }, []);
 
+  // --- Orchestrator Health ---
+  interface OrchestratorHealth {
+    last_cycle_seconds_ago: number | null;
+    queued_tasks: number;
+    active_tasks: number;
+    pool_info: Record<string, unknown>;
+    deploy_monitoring?: {
+      external_health?: Record<string, boolean | string | string[]>;
+    };
+  }
+  const [orchestratorHealth, setOrchestratorHealth] = useState<OrchestratorHealth | null>(null);
+
+  const fetchOrchestratorHealth = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/debug/orchestrator`);
+      if (res.ok) setOrchestratorHealth(await res.json());
+      else setOrchestratorHealth(null);
+    } catch { setOrchestratorHealth(null); }
+  };
+
+  useEffect(() => {
+    fetchOrchestratorHealth();
+    const id = setInterval(fetchOrchestratorHealth, 30000);
+    return () => clearInterval(id);
+  }, []);
+
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
@@ -923,27 +967,37 @@ export function useAppState() {
         setNewAccountName('');
         setNewAccountToken('');
         fetchSettings();
+      } else {
+        addToast('Failed to add account', 'error');
       }
-    } catch (err) { console.error('Failed to add account:', err); }
+    } catch (err) { console.error('Failed to add account:', err); addToast('Failed to add account', 'error'); }
   };
 
   const removeMaxPlanAccount = async (id: string) => {
     try {
-      await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
         method: 'DELETE', headers: await authHeaders(),
       });
-      fetchSettings();
-    } catch (err) { console.error('Failed to remove account:', err); }
+      if (res.ok) {
+        fetchSettings();
+      } else {
+        addToast('Failed to remove account', 'error');
+      }
+    } catch (err) { console.error('Failed to remove account:', err); addToast('Failed to remove account', 'error'); }
   };
 
   const toggleMaxPlanAccount = async (id: string, enabled: boolean) => {
     try {
-      await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
         method: 'PATCH', headers: await authHeaders(),
         body: JSON.stringify({ enabled }),
       });
-      fetchSettings();
-    } catch (err) { console.error('Failed to toggle account:', err); }
+      if (res.ok) {
+        fetchSettings();
+      } else {
+        addToast('Failed to update account', 'error');
+      }
+    } catch (err) { console.error('Failed to toggle account:', err); addToast('Failed to update account', 'error'); }
   };
 
   const connectGitHub = async () => {
@@ -952,8 +1006,10 @@ export function useAppState() {
       if (res.ok) {
         const { url } = await res.json();
         window.location.href = url;
+      } else {
+        addToast('Failed to start GitHub connection', 'error');
       }
-    } catch (err) { console.error('Failed to start GitHub OAuth:', err); }
+    } catch (err) { console.error('Failed to start GitHub OAuth:', err); addToast('Failed to start GitHub connection', 'error'); }
   };
 
   const syncTaskTypeDefaults = async () => {
@@ -1215,6 +1271,7 @@ export function useAppState() {
       fetchTasks();
     } catch (error) {
       console.error('Failed to create task:', error);
+      addToast('Failed to create task', 'error');
     }
   };
 
@@ -1357,6 +1414,7 @@ export function useAppState() {
       }
     } catch (err) {
       console.error('Failed to fetch archive tasks:', err);
+      addToast('Failed to load archive', 'error');
     } finally {
       setArchiveLoading(false);
     }
@@ -1434,7 +1492,7 @@ export function useAppState() {
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
     // Projects
-    projects, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
+    projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
     // Log viewer
     logTask, logLines, logsConnecting, wsDisconnected, handleViewLogs, closeLogViewer,
     // Research browser
@@ -1489,5 +1547,7 @@ export function useAppState() {
     handleRollback, handleMarkStable, handleRepairState,
     // Zone health
     zoneHealth,
+    // Orchestrator health
+    orchestratorHealth,
   };
 }
