@@ -839,8 +839,8 @@ async def update_settings(
             val = int(payload["max_concurrent_vms"])
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="max_concurrent_vms must be a number")
-        if not (1 <= val <= 30):
-            raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 1 and 30")
+        if not (1 <= val <= 100):
+            raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 1 and 100")
         _runtime_config["max_concurrent_vms"] = val
     if "max_retries" in payload:
         try:
@@ -893,23 +893,19 @@ async def update_settings(
             raise HTTPException(status_code=400, detail="Invalid effort in task_type_efforts")
         _runtime_config["task_type_efforts"] = val
 
-    # Persist to DB so values survive Cloud Run restarts (only fields present in payload)
+    # Persist to DB so values survive Cloud Run restarts
+    # Always persist all runtime config values (not just changed ones) to ensure consistency
     state = await session.get(DeploymentState, 1)
     if state:
-        if "max_concurrent_vms" in payload:
-            state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
-        if "max_retries" in payload:
-            state.runtime_max_retries = _runtime_config["max_retries"]
-        if "max_autonomous_tasks_per_hour" in payload:
-            state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
-        if "autonomous_research_interval_minutes" in payload:
-            state.runtime_autonomous_research_interval_minutes = _runtime_config["autonomous_research_interval_minutes"]
-        if "autonomous_research_model" in payload:
-            state.runtime_autonomous_research_model = _runtime_config["autonomous_research_model"]
-        if "autonomous_research_effort" in payload:
-            state.runtime_autonomous_research_effort = _runtime_config["autonomous_research_effort"]
+        state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
+        state.runtime_max_retries = _runtime_config["max_retries"]
+        state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
+        state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
+        state.runtime_autonomous_research_model = _runtime_config.get("autonomous_research_model")
+        state.runtime_autonomous_research_effort = _runtime_config.get("autonomous_research_effort")
         session.add(state)
         await session.commit()
+        print(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
 
     return _runtime_config
 
