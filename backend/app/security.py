@@ -1,16 +1,3 @@
-"""
-Pre-review prompt injection scanning for the Blueprint pipeline.
-
-Provides security scanning that runs before code review to detect prompt injection
-attempts in incoming pull requests. Runs in the orchestrator (Python), NOT on a VM —
-can't be influenced by scanned code.
-
-Scans:
-  1. All added lines in the PR diff
-  2. File names in the diff (injection via path)
-  3. Commit messages
-  4. PR title and body
-"""
 import re
 import base64
 from typing import List, Dict, Any, Optional
