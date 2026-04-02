@@ -54,7 +54,7 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 async def get_all_tasks(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    status: Optional[TaskStatus] = None,
+    status: List[TaskStatus] = Query(default=[]),
     terminal_only: bool = Query(False),
     archived: Optional[bool] = Query(None),
     search: Optional[str] = Query(None, max_length=200),
@@ -65,7 +65,7 @@ async def get_all_tasks(
     # Build shared filter conditions
     filters = []
     if status:
-        filters.append(Task.status == status)
+        filters.append(Task.status.in_(status))
     elif terminal_only:
         filters.append(Task.status.in_(TERMINAL_STATUSES))
     if archived is not None:
