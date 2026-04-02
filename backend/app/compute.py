@@ -5,7 +5,7 @@ import asyncio
 import subprocess
 import signal
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +297,7 @@ EOF
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
         last_error = None
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         skipped_cooldown = []
 
         for zone, subnet_name in FALLBACK_ZONES:
@@ -333,7 +333,7 @@ EOF
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
                     health = _zone_health.setdefault(zone, {})
-                    health["last_success"] = datetime.utcnow()
+                    health["last_success"] = datetime.now(timezone.utc)
                     health["consecutive_failures"] = 0
                     _zone_failures.pop(zone, None)
 
@@ -362,9 +362,9 @@ EOF
                         reason = "RESOURCE_UNAVAILABLE"
 
                     with _zone_lock:
-                        _zone_failures[zone] = datetime.utcnow()
+                        _zone_failures[zone] = datetime.now(timezone.utc)
                         health = _zone_health.setdefault(zone, {})
-                        health["last_failure"] = datetime.utcnow()
+                        health["last_failure"] = datetime.now(timezone.utc)
                         health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
                         health["last_failure_reason"] = reason
 
@@ -481,7 +481,7 @@ def get_zone_health() -> dict:
             cooldown_active = False
             last_fail = _zone_failures.get(zone)
             if last_fail:
-                cooldown_active = (datetime.utcnow() - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS
+                cooldown_active = (datetime.now(timezone.utc) - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS
 
             consecutive = data.get("consecutive_failures", 0)
             if consecutive == 0:
