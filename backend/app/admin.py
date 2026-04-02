@@ -402,7 +402,7 @@ async def create_task_manually(
         await session.refresh(project)
 
     # Auto-generate VM instance ID so orchestrator worker picks up the task
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
 
     # Build payload based on task type
     task_payload = {
@@ -593,7 +593,7 @@ async def modify_task(
                     changes["retried_children"] = retried
                 else:
                     task.attempt_count = 0
-                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
                     task.last_heartbeat = None
                     changes["attempt_count"] = 0
                     changes["vm_instance_id"] = task.vm_instance_id
@@ -1322,7 +1322,7 @@ async def create_direction_research_task(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
     task_payload = {
         "type": "research",
         "directions": [direction],
@@ -1419,7 +1419,7 @@ async def trigger_direction_research(
             "directions": [direction],
             "base_branch": "main",
         }],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
         status=TaskStatus.QUEUED,
         created_by="USER",
     )

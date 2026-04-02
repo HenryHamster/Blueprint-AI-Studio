@@ -566,7 +566,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         title="Research: autonomous improvement scan",
         description="Automated research task triggered by autonomous loop",
         payloads=[research_payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
@@ -780,7 +780,7 @@ async def reaper_service():
                             task.latest_status_message = f"Reaped (attempt {task.attempt_count + 1}/{_runtime_config['max_retries']}): {reap_reason}"
                             task.attempt_count += 1
                             task.status = TaskStatus.QUEUED
-                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
+                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
                             task.last_heartbeat = None
                             session.add(task)
 
@@ -1111,8 +1111,9 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
                                 print(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
                             else:
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, fix not spawned (iteration cap)"
+                                # Fix not spawned — likely duplicate guard (fix already running) or iteration cap
+                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix already in progress or iteration limit reached"
+                                print(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — leaving in EVALUATING")
                             session.add(ci_task)
                             await session.commit()
                             continue
@@ -1568,7 +1569,7 @@ async def deploy_blueprint(
     
     for p in payload.payloads:
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
-        vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+        vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
         
         task = Task(
             project_id=project.id,
@@ -2113,7 +2114,7 @@ async def spawn_subtask(
             description=payload.get("description", ""),
             payloads=[payload],
             context={**(req.context or {}), "spawn_depth": spawn_depth + 1},
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
             requires_approval=req.requires_approval,
@@ -2174,7 +2175,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             context={k: v for k, v in (child.context or {}).items()
                      if k != "max_plan_account_id"},  # Strip runtime-only fields
             depends_on=child.depends_on,
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=child.requires_approval,
@@ -2213,7 +2214,7 @@ async def _spawn_pipeline_task(
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
         )
     )).scalars().all()
     for t in active_pipeline:
@@ -2243,7 +2244,7 @@ async def _spawn_pipeline_task(
         print(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
         return None
 
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
 
     # Determine parent: use the original task's parent (so review/fix are siblings of the
     # create task under the plan/research parent), falling back to original task itself
@@ -2473,7 +2474,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "scope": "small",  # Plan subtasks are pre-decomposed
                 "related_files": related_files,
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             depends_on=[],
@@ -2576,7 +2577,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
                 "file_path": finding.get("file_path", ""),
                 "line_number": finding.get("line_number", 0),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=severity == "critical",
@@ -2705,7 +2706,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "related_files": related_files,
                 **({"direction_id": direction_id} if direction_id else {}),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=needs_approval,
@@ -3156,7 +3157,7 @@ async def update_agent_status(
         if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
-            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:8]}"
+            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
             task.last_heartbeat = None
             session.add(task)
             
@@ -3456,9 +3457,10 @@ async def update_agent_status(
                             await session.commit()
                             raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
 
-                        # Check CI status before merging
+                        # Check CI status before merging (only for PRs targeting main)
                         head_sha = pr_data.get("head", {}).get("sha", "")
-                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha) if head_sha else None
+                        is_main_merge = base_branch == "main"
+                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha) if (head_sha and is_main_merge) else None
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
