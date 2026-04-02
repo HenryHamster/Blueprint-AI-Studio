@@ -540,10 +540,8 @@ async def modify_task(
         task.requires_approval = bool(payload["requires_approval"])
         changes["requires_approval"] = task.requires_approval
 
-        # Security approval: if unblocking a completed task with a PR, continue pipeline
-        # instead of re-running — spawn the review that was skipped
-        if was_blocked and not task.requires_approval and task.status == TaskStatus.COMPLETED:
-            from app.main import _spawn_pipeline_task
+        # Approval flow: if unblocking a completed task with a PR, continue pipeline
+        if was_blocked and not task.requires_approval and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING):
             artifact = (await session.execute(
                 select(Artifact).where(Artifact.task_id == task.id,
                                        Artifact.artifact_type == ArtifactType.PULL_REQUEST)
@@ -553,17 +551,49 @@ async def modify_task(
                 branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
                 task_payload = (task.payloads or [{}])[0]
                 base_branch = task_payload.get("base_branch", "main")
-                original_prompt = task_payload.get("prompt", task.description or "")
-                review_task = await _spawn_pipeline_task(
-                    task, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(task.id)
-                )
-                if review_task:
-                    changes["spawned_review"] = str(review_task.id)
-                    # Remove QUEUED status if the frontend also sent it — task stays COMPLETED
-                    if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
-                        task.status = TaskStatus.COMPLETED
-                        changes["status"] = TaskStatus.COMPLETED
+
+                ctx = task.context or {}
+                if ctx.get("touched_critical"):
+                    # Critical file approval: review already passed, merge the PR
+                    try:
+                        from app.main import get_github_token_for_task
+                        from app.github import merge_pull_request, create_pr_comment, delete_branch
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+                        if merge_result.get("merged"):
+                            task.status = TaskStatus.COMPLETED
+                            task.context = {**ctx, "pr_merged": True}
+                            task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
+                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                                "**Blueprint Review Pipeline**: Human-approved merge (security-critical files).")
+                            try:
+                                await delete_branch(gh_token, owner, repo, branch)
+                            except Exception:
+                                pass
+                            changes["merged_pr"] = pr_number
+                            print(f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)")
+                        else:
+                            changes["merge_error"] = merge_result.get("message", "unknown")
+                            task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
+                            print(f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}")
+                    except Exception as e:
+                        changes["merge_error"] = str(e)[:200]
+                        task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
+                        print(f"[ADMIN] Approved merge failed: {e}")
+                else:
+                    # Security scan approval: review hasn't happened yet, spawn it
+                    from app.main import _spawn_pipeline_task
+                    original_prompt = task_payload.get("prompt", task.description or "")
+                    review_task = await _spawn_pipeline_task(
+                        task, "review", session, pr_number, branch, base_branch,
+                        original_prompt=original_prompt, original_task_id=str(task.id)
+                    )
+                    if review_task:
+                        changes["spawned_review"] = str(review_task.id)
+                # Task stays COMPLETED regardless
+                if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
+                    task.status = TaskStatus.COMPLETED
+                    changes["status"] = TaskStatus.COMPLETED
 
     if "payloads" in payload:
         task.payloads = payload["payloads"]

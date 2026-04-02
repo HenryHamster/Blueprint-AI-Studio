@@ -3020,28 +3020,23 @@ async def update_agent_status(
                     except Exception as e:
                         print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
 
-                    # PR file-path flagging: check for infrastructure/security-critical file changes
+                    # PR file-path flagging: flag infrastructure/security-critical file changes
+                    # Don't block here — let review run, block at merge time
                     try:
                         pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
                         INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
                                        "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
                                        "agent/src/index.ts", "CLAUDE.md"}
-                        # Critical files require human approval (hard-block)
                         CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
                         touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
                         touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
                         if touched_infra:
-                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
-                            if touched_critical:
-                                task.requires_approval = True
-                                task.latest_status_message = f"BLOCKED: Security-critical file change: {', '.join(touched_critical)}"
-                                print(f"[PIPELINE] PR #{pr_number} HARD-BLOCKED — touches critical files: {touched_critical}")
-                            else:
-                                task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
-                                print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
+                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large",
+                                            "touched_infra": touched_infra, "touched_critical": touched_critical}
+                            task.latest_status_message = f"Infrastructure change flagged: {', '.join(touched_infra)}"
+                            print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
                             session.add(task)
                             await session.commit()
-                            # Flag for extended deploy monitoring window
                             _shared_state.deploy_monitoring["is_extended"] = True
                     except Exception as e:
                         print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
@@ -3200,6 +3195,27 @@ async def update_agent_status(
                         # CI passed (or no CI checks exist) — proceed to merge
                         if ci_status and ci_status["conclusion"] == "success":
                             print(f"[CI] PR #{pr_number} CI passed")
+
+                        # Critical files gate: block merge if security-critical files were touched
+                        if original_task_id:
+                            try:
+                                orig_task = await session.get(Task, uuid.UUID(original_task_id))
+                                critical_touched = (orig_task.context or {}).get("touched_critical", []) if orig_task else []
+                                if critical_touched:
+                                    orig_task.requires_approval = True
+                                    orig_task.status = TaskStatus.EVALUATING
+                                    orig_task.latest_status_message = f"Review approved — awaiting human approval to merge (critical files: {', '.join(critical_touched)})"
+                                    session.add(orig_task)
+                                    await session.commit()
+                                    await broadcast_to_project(str(orig_task.project_id), "task_updated",
+                                                               {"task_id": str(orig_task.id), "status": TaskStatus.EVALUATING})
+                                    await create_pr_comment(gh_token, owner, repo, pr_number,
+                                        f"**Blueprint Review Pipeline**: Review approved, but PR touches security-critical files ({', '.join(critical_touched)}). Merge requires human approval.")
+                                    print(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — critical files: {critical_touched}")
+                                    action_taken = True
+                                    return {"status": "accepted"}
+                            except Exception as e:
+                                print(f"[PIPELINE] Error checking critical files for merge gate: {e}")
 
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
 

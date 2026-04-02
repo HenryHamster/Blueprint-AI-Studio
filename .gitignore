@@ -17,3 +17,4 @@ coverage/
 database.sqlite
 .blueprint-config.json
 *.tsbuildinfo
+backend/CLAUDE.md

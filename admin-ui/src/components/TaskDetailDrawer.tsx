@@ -562,7 +562,7 @@ export function TaskDetailDrawer({
   };
 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
-  const showApproval = task.requires_approval && task.status === 'QUEUED';
+  const showApproval = task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING');
   const showCancel = isActive && !task.requires_approval;
   const showFailedActions = task.status === 'FAILED';
 

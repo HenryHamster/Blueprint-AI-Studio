@@ -424,7 +424,7 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
         </div>
       </div>
 
-      {task.requires_approval && task.status === 'QUEUED' ? (
+      {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') ? (
         <div className="mt-3 flex gap-2">
           <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`flex-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'approve' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />} Approve
