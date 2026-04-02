@@ -63,7 +63,7 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
     <ResponsiveContainer width="100%" height={160}>
       <AreaChart data={filtered}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(ts)} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
@@ -85,7 +85,7 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
     <ResponsiveContainer width="100%" height={160}>
       <AreaChart data={filtered}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(ts)} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
@@ -127,7 +127,7 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
     <ResponsiveContainer width="100%" height={160}>
       <LineChart data={cumPoints}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(ts)} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}

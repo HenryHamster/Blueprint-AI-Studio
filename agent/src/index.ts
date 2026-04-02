@@ -116,6 +116,52 @@ function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+// ── Lint / Build Checks ─────────────────────────────────────────────────────
+const MAX_LINT_FIX_ATTEMPTS = 3;
+
+/** Run lint/build checks on changed files. Throws with error details on failure. */
+function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
+  const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
+  const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
+  if (touchesFrontend) {
+    sendLog(ws, 'Running frontend lint + build...\n');
+    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
+    execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
+    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
+    sendLog(ws, 'Frontend checks passed.\n');
+  }
+  if (touchesAgent) {
+    sendLog(ws, 'Running agent type check...\n');
+    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
+    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
+    sendLog(ws, 'Agent type check passed.\n');
+  }
+}
+
+/** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
+async function lintFixLoop(
+  changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
+  context: string = 'the code you just wrote'
+): Promise<boolean> {
+  for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
+    try {
+      statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
+      runProjectLintChecks(changedPaths, ws);
+      return true;
+    } catch (lintErr: unknown) {
+      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+      sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      await runClaudeCode(
+        `The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef
+      );
+      git(['add', '-A']);
+    }
+  }
+  sendLog(ws, `WARNING: Lint checks still failing after ${MAX_LINT_FIX_ATTEMPTS} attempts.\n`);
+  return false;
+}
+
 // ── Claude Code Runner (shared by all handlers) ─────────────────────────────
 async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
@@ -223,36 +269,9 @@ async function handleCreate(
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing changes...\n');
-    // Run lint/build checks before committing — catch errors before CI does
-    statusRef.value = 'Running pre-commit checks...';
-    try {
-      const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-      const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
-      const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
-      if (touchesFrontend) {
-        sendLog(ws, 'Running frontend lint + build...\n');
-        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
-        execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
-        execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
-        sendLog(ws, 'Frontend checks passed.\n');
-      }
-      if (touchesAgent) {
-        sendLog(ws, 'Running agent type check...\n');
-        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
-        execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
-        sendLog(ws, 'Agent type check passed.\n');
-      }
-    } catch (lintErr: unknown) {
-      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
-      sendLog(ws, `Pre-commit check failed:\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
-      // Let Claude try to fix the lint errors
-      const lintFixResult = await runClaudeCode(
-        `The following lint/build errors were found in the code you just wrote. Fix them.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef
-      );
-      // Re-stage after fixes
-      git(['add', '-A']);
-    }
+    // Run lint/build checks before committing — retry up to 3 times with Claude fixes
+    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+    await lintFixLoop(changedPaths, ws, statusRef);
 
     git(['add', '-A']);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
@@ -276,6 +295,20 @@ async function handleCreate(
         try { git(['rebase', '--abort']); } catch {}
       }
     } catch { /* no markers found */ }
+
+    // Re-run lint after rebase — upstream changes can introduce new errors
+    try {
+      runProjectLintChecks(changedPaths, ws);
+    } catch (postRebaseLintErr: unknown) {
+      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
+      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
+      await runClaudeCode(
+        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef
+      );
+      git(['add', '-A']);
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: fix post-rebase lint errors'], { encoding: 'utf-8' });
+    }
 
     const commitHash = git(['rev-parse', 'HEAD']);
 
@@ -368,14 +401,16 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
   const fs = await import('fs');
   let logs = '';
-  const verdictPath = `${WORKSPACE}/../review_verdict.json`;
+  let verdictJsonField: string | undefined;
   try {
     if (fs.existsSync('/tmp/review_verdict.json')) {
       const verdictJson = fs.readFileSync('/tmp/review_verdict.json', 'utf-8').trim();
       // Validate it's actual verdict JSON
       const parsed = JSON.parse(verdictJson);
       if (parsed.verdict) {
-        // Prepend the full review text, append the verdict JSON at the end (where the parser expects it)
+        // Send verdict via dedicated field (structured, tamper-resistant vs log parsing)
+        verdictJsonField = verdictJson;
+        // Also append to logs for backwards compatibility
         const reviewText = sanitize(lastResultText || allOutput.slice(-50_000));
         logs = reviewText + '\n\n' + verdictJson;
         sendLog(ws, `Verdict read from file: ${parsed.verdict}\n`);
@@ -392,6 +427,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the 
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
     logs,
+    ...(verdictJsonField ? { verdict_json: verdictJsonField } : {}),
   });
 }
 
@@ -467,34 +503,9 @@ async function handleFix(
   // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);
   if (diff.length > 0 && exitCode === 0) {
-    // Run lint/build checks before committing
-    statusRef.value = 'Running pre-commit checks...';
-    try {
-      const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-      const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
-      const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
-      if (touchesFrontend) {
-        sendLog(ws, 'Running frontend lint + build...\n');
-        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
-        execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
-        execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
-        sendLog(ws, 'Frontend checks passed.\n');
-      }
-      if (touchesAgent) {
-        sendLog(ws, 'Running agent type check...\n');
-        execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
-        execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
-        sendLog(ws, 'Agent type check passed.\n');
-      }
-    } catch (lintErr: unknown) {
-      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
-      sendLog(ws, `Pre-commit check failed:\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
-      await runClaudeCode(
-        `The following lint/build errors were found. Fix them.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef
-      );
-      git(['add', '-A']);
-    }
+    // Run lint/build checks before committing — retry up to 3 times with Claude fixes
+    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied');
 
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -514,7 +525,6 @@ async function handleFix(
   }
 
   // Check for remaining conflict markers — warn but don't block push
-  // The review/fix loop will continue trying if markers remain
   if (exitCode === 0) {
     try {
       const remainingMarkers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
@@ -522,6 +532,24 @@ async function handleFix(
         sendLog(ws, `WARNING: Conflict markers still present in:\n${remainingMarkers}\nPushing anyway — review pipeline will continue resolving.\n`);
       }
     } catch { /* grep found nothing — no markers, good */ }
+  }
+
+  // Re-run lint after rebase — upstream changes can introduce new errors
+  if (exitCode === 0 && diff.length > 0) {
+    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+    try {
+      runProjectLintChecks(changedPaths, ws);
+    } catch (postRebaseLintErr: unknown) {
+      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
+      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
+      await runClaudeCode(
+        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef
+      );
+      git(['add', '-A']);
+      const shortId = taskId.replace(/-/g, '').slice(0, 8);
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    }
   }
 
   // Always push if the branch has diverged from origin (rebase or new commits)

@@ -7,6 +7,7 @@ import uuid
 import json
 import httpx
 import logging
+import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 
@@ -1301,16 +1302,24 @@ async def resume_pipeline(
     from app.shared_state import runtime_config
 
     state = await session.get(DeploymentState, 1)
+    if not state:
+        raise HTTPException(status_code=404, detail="No deployment state found")
+
+    # Validate current state — only resume from PAUSED
+    if state.status == DeploymentStatus.HALTED:
+        raise HTTPException(status_code=400, detail="Pipeline is HALTED (3+ consecutive rollbacks). Use mark-stable to acknowledge before resuming.")
+    if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK):
+        raise HTTPException(status_code=400, detail=f"Pipeline is {state.status}, not paused — nothing to resume")
+
     restore_vms = 5  # default
-    if state:
-        if state.pre_pause_max_vms is not None:
-            restore_vms = state.pre_pause_max_vms
-        state.status = DeploymentStatus.STABLE
-        state.pause_reason = None
-        state.paused_at = None
-        state.pre_pause_max_vms = None
-        session.add(state)
-        await session.commit()
+    if state.pre_pause_max_vms is not None:
+        restore_vms = state.pre_pause_max_vms
+    state.status = DeploymentStatus.STABLE
+    state.pause_reason = None
+    state.paused_at = None
+    state.pre_pause_max_vms = None
+    session.add(state)
+    await session.commit()
 
     runtime_config["max_concurrent_vms"] = restore_vms
     print(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
@@ -1359,6 +1368,10 @@ async def trigger_rollback(
     if not state.last_known_good_revision or state.last_known_good_revision == state.current_revision:
         raise HTTPException(status_code=400, detail="No previous good revision to rollback to")
 
+    # Guard against double-rollback
+    if state.status == DeploymentStatus.ROLLED_BACK:
+        raise HTTPException(status_code=400, detail="Already rolled back — use resume or mark-stable first")
+
     # Get causation analysis for the rollback reason
     from app.main import should_rollback
     _, analysis_reason, _ = should_rollback()
@@ -1373,12 +1386,14 @@ async def trigger_rollback(
     rollback_error = None
 
     try:
-        result = subprocess.run(
-            ["gcloud", "run", "services", "update-traffic", service,
-             "--to-revisions", f"{rollback_revision}=100",
-             "--region", region, "--project", project_id],
-            capture_output=True, text=True, timeout=30
-        )
+        def _run_gcloud_rollback():
+            return subprocess.run(
+                ["gcloud", "run", "services", "update-traffic", service,
+                 "--to-revisions", f"{rollback_revision}=100",
+                 "--region", region, "--project", project_id],
+                capture_output=True, text=True, timeout=30
+            )
+        result = await asyncio.to_thread(_run_gcloud_rollback)
         if result.returncode != 0:
             rollback_error = result.stderr[:500]
             print(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
@@ -1433,10 +1448,11 @@ async def repair_state(
     for t in stuck_tasks:
         cutoff = t.last_heartbeat or t.started_at or t.created_at
         if cutoff and cutoff < fifteen_min_ago:
+            original_status = t.status  # Capture before overwriting
             t.status = TaskStatus.FAILED
-            t.latest_status_message = f"Repaired: stuck in {t.status} with no heartbeat since {cutoff.isoformat()}"
+            t.latest_status_message = f"Repaired: stuck in {original_status} with no heartbeat since {cutoff.isoformat()}"
             session.add(t)
-            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "stuck_no_heartbeat"}))
+            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "stuck_no_heartbeat", "original_status": str(original_status)}))
             repairs.append(f"Failed stuck task {t.id}")
 
             # Clean up VM

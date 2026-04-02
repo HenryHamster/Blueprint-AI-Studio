@@ -481,7 +481,7 @@ export function SettingsDropdown({
                 <div className="flex gap-1.5">
                   <button
                     onClick={() => { if (window.confirm('Rollback to last known good revision? This will pause the pipeline.')) onRollback(); }}
-                    disabled={!deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha?.slice(0, 8)}
+                    disabled={!deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha}
                     className="flex-1 bg-red-950/30 hover:bg-red-900/40 disabled:opacity-30 disabled:cursor-not-allowed text-red-400 text-[10px] py-1 rounded transition-colors border border-red-900/50 flex items-center justify-center gap-1">
                     <RotateCw className="w-2.5 h-2.5" /> Rollback
                   </button>

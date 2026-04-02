@@ -290,26 +290,40 @@ def scan_diff_text(diff_text: str) -> List[Dict[str, str]]:
         elif line.startswith("+++"):
             current_file = line[6:] if line.startswith("+++ b/") else current_file
 
-        elif line.startswith("+") and not line.startswith("+++"):
+        elif (line.startswith("+") and not line.startswith("+++")) or \
+             (line.startswith("-") and not line.startswith("---")):
+            # Scan both added AND deleted lines — deletions of security patterns are suspicious
+            is_deletion = line.startswith("-")
             # Skip auto-generated lock files and security test files
             basename = current_file.rsplit("/", 1)[-1] if "/" in current_file else current_file
             if basename in SKIP_FILENAMES:
                 continue
             if any(skip in current_file for skip in SKIP_PATHS_CONTAINING):
                 continue
-            # Scan added lines
-            added_content = line[1:]
+            # Scan line content
+            line_content = line[1:]
             ext = _get_extension(current_file)
             source_type = "docs" if ext in DOCS_EXTENSIONS else "code"
-            line_findings = _scan_text(added_content, current_file, source_type)
+            line_findings = _scan_text(line_content, current_file, source_type)
+            if is_deletion:
+                # Tag deletion findings so they can be distinguished
+                for f in line_findings:
+                    f["source"] = f"deleted:{f['source']}"
             findings.extend(line_findings)
 
             # Fuzzy matching for evasion (leet-speak, misspellings, separator tricks)
             if ext not in BINARY_EXTENSIONS:
-                findings.extend(_fuzzy_scan(added_content, current_file))
+                fuzzy_findings = _fuzzy_scan(line_content, current_file)
+                if is_deletion:
+                    for f in fuzzy_findings:
+                        f["source"] = f"deleted:{f['source']}"
+                findings.extend(fuzzy_findings)
 
             # Also check for hidden base64 payloads
-            b64_findings = _check_base64_hidden_text(added_content, current_file)
+            b64_findings = _check_base64_hidden_text(line_content, current_file)
+            if is_deletion:
+                for f in b64_findings:
+                    f["source"] = f"deleted:{f['source']}"
             findings.extend(b64_findings)
 
     return findings

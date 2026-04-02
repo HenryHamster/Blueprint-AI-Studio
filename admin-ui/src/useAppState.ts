@@ -9,12 +9,17 @@ import { useToasts } from './components/Toasts';
 
 export interface DeployState {
   status: string;
-  current_sha?: string;
-  last_known_good_sha?: string;
-  failure_rate?: number;
-  monitoring_window?: { percent: number };
-  rollback_reason?: string;
-  pause_reason?: string;
+  current_revision: string;
+  current_sha: string;
+  deployed_at: string;
+  last_known_good_revision: string;
+  last_known_good_sha: string;
+  rollback_reason: string | null;
+  rollback_count: number;
+  pause_reason: string | null;
+  failure_rate: number;
+  monitoring_progress: number | null;
+  monitoring_window: { percent: number } | null;
 }
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -599,9 +604,8 @@ export function useAppState() {
       if (!res.ok) throw new Error(res.statusText);
       addToast('Pipeline paused', 'success');
       fetchDeployState();
-    } catch (error) {
+    } catch {
       addToast('Failed to pause pipeline', 'error');
-      throw error;
     }
   };
 
@@ -610,13 +614,16 @@ export function useAppState() {
       const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/resume`, {
         method: 'POST', headers: await authHeaders(),
       });
-      if (!res.ok) throw new Error(res.statusText);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail || 'Failed to resume pipeline', 'error');
+        return;
+      }
       addToast('Pipeline resumed', 'success');
       fetchDeployState();
       fetchTasks();
-    } catch (error) {
+    } catch {
       addToast('Failed to resume pipeline', 'error');
-      throw error;
     }
   };
 
@@ -627,14 +634,14 @@ export function useAppState() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || res.statusText);
+        addToast(`Rollback failed: ${data.detail || res.statusText}`, 'error');
+        return;
       }
       const data = await res.json();
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
-    } catch (error: unknown) {
-      addToast(`Rollback failed: ${error instanceof Error ? error.message : String(error)}`, 'error');
-      throw error;
+    } catch {
+      addToast('Rollback failed', 'error');
     }
   };
 
@@ -646,9 +653,8 @@ export function useAppState() {
       if (!res.ok) throw new Error(res.statusText);
       addToast('Deploy marked stable', 'success');
       fetchDeployState();
-    } catch (error) {
+    } catch {
       addToast('Failed to mark stable', 'error');
-      throw error;
     }
   };
 
@@ -661,9 +667,8 @@ export function useAppState() {
       const data = await res.json();
       addToast(`Repaired ${data.count} issue${data.count !== 1 ? 's' : ''}`, 'success');
       fetchTasks();
-    } catch (error) {
+    } catch {
       addToast('State repair failed', 'error');
-      throw error;
     }
   };
 

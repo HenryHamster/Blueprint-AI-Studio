@@ -172,19 +172,11 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
     agent_jwt = create_agent_token(str(task_id), vm_instance_id)
 
-    # Claude Code auth: OAuth token passed as env var (no GCS upload needed)
-    oauth_token_block = ""
-    if oauth_token:
-        oauth_token_block = f'CLAUDE_CODE_OAUTH_TOKEN="{oauth_token}"'
-
-    # API key fallback: only if no OAuth token
-    api_key_block = ""
-    if not oauth_token and ANTHROPIC_API_KEY:
-        api_key_block = f'ANTHROPIC_API_KEY="{ANTHROPIC_API_KEY}"'
-
-    # Base64-encode the claude config to avoid heredoc injection
+    # Base64-encode all secrets to prevent heredoc/shell injection
     import base64
     config_b64 = base64.b64encode((claude_config_json or "").encode()).decode() if claude_config_json else ""
+    oauth_b64 = base64.b64encode(oauth_token.encode()).decode() if oauth_token else ""
+    apikey_b64 = base64.b64encode(ANTHROPIC_API_KEY.encode()).decode() if (not oauth_token and ANTHROPIC_API_KEY) else ""
 
     startup_script = f"""#!/bin/bash
     echo "Starting Agent VM Initialization..."
@@ -193,15 +185,21 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     (sleep 3600 && echo "Maximum TTL reached. Self-terminating..." && poweroff) &
 
     # 2. Export environment variables needed by the agent
-    # Quoted heredoc (<<'EOF') prevents shell expansion of embedded values
+    # Static values are safe in heredoc; secrets are base64-decoded separately
     cat <<'EOF' > /etc/agent.env
 VM_INSTANCE_ID="{vm_instance_id}"
 ORCHESTRATOR_URL="{ORCHESTRATOR_URL}"
 AGENT_SECRET_TOKEN="{agent_jwt}"
 PAYLOAD_URI="{payload_uri or ''}"
-{oauth_token_block}
-{api_key_block}
 EOF
+
+    # Decode secrets from base64 and append to env file (avoids shell injection via heredoc)
+    if [ -n "{oauth_b64}" ]; then
+        echo "CLAUDE_CODE_OAUTH_TOKEN=\\"$(echo '{oauth_b64}' | base64 -d)\\"" >> /etc/agent.env
+    fi
+    if [ -n "{apikey_b64}" ]; then
+        echo "ANTHROPIC_API_KEY=\\"$(echo '{apikey_b64}' | base64 -d)\\"" >> /etc/agent.env
+    fi
 
     # 3. Claude Code onboarding bypass — write ~/.claude.json from base64-encoded blob
     if [ -n "{config_b64}" ]; then

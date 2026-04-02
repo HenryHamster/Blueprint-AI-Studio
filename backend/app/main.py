@@ -149,9 +149,20 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     return "CODE_ERROR"
 
 
-def record_task_result(success: bool, failure_class: str = ""):
-    """Record a task result for deployment monitoring."""
+_recorded_task_ids: set = set()  # Track which task IDs have already recorded results
+
+def record_task_result(success: bool, failure_class: str = "", task_id: str = ""):
+    """Record a task result for deployment monitoring. Deduplicates by task_id."""
     from app.shared_state import deploy_monitoring
+    # Deduplicate: only record one result per task
+    if task_id:
+        if task_id in _recorded_task_ids:
+            return
+        _recorded_task_ids.add(task_id)
+        # Keep the set bounded
+        if len(_recorded_task_ids) > 200:
+            _recorded_task_ids.clear()
+
     entry = (datetime.utcnow().isoformat(), "success" if success else "failure", failure_class)
     deploy_monitoring["task_results"].append(entry)
     # Keep only last 100 results
@@ -299,7 +310,19 @@ async def _check_monitoring_window():
     # Window elapsed — check results
     results = deploy_monitoring["task_results"]
     if not results:
-        # No tasks ran during window — can't confirm, extend
+        # No tasks ran during window — if 2x the window has passed, mark stable (idle)
+        if elapsed >= duration * 2:
+            async with AsyncSessionLocal() as session:
+                state = await session.get(DeploymentState, 1)
+                if state and state.status == DeploymentStatus.MONITORING:
+                    state.status = DeploymentStatus.STABLE
+                    state.last_known_good_revision = state.current_revision
+                    state.last_known_good_sha = state.current_sha
+                    state.rollback_count = 0
+                    session.add(state)
+                    await session.commit()
+                    print(f"[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
+            deploy_monitoring["window_start"] = None
         return
 
     async with AsyncSessionLocal() as session:
@@ -311,12 +334,20 @@ async def _check_monitoring_window():
         # Run causation analysis
         do_rollback, reason, response = should_rollback()
 
-        if do_rollback and state.current_revision != state.last_known_good_revision:
-            # Phase B: recommend rollback with reasoning (don't auto-trigger)
-            state.rollback_reason = reason
-            session.add(state)
-            await session.commit()
-            print(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
+        if do_rollback:
+            if state.current_revision != state.last_known_good_revision:
+                # Phase B: recommend rollback with reasoning (don't auto-trigger)
+                state.rollback_reason = reason
+                session.add(state)
+                await session.commit()
+                print(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
+            else:
+                # No rollback target available — stay in MONITORING, don't promote to STABLE
+                state.rollback_reason = f"Issues detected but no rollback target: {reason}"
+                session.add(state)
+                await session.commit()
+                print(f"[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
+                return  # Don't clear window_start so we keep monitoring
         elif response == "PAUSE":
             # External issue — handled by _check_pause_mode
             print(f"[DEPLOY] External issue during monitoring: {reason}")
@@ -356,7 +387,7 @@ async def _check_external_health():
     # GitHub API check — lightweight rate limit endpoint
     try:
         from app.github import _get_client
-        client = await _get_client()
+        client = _get_client()
         resp = await client.get("https://api.github.com/rate_limit", timeout=5.0)
         ext["github_api"] = resp.status_code == 200
         if not ext["github_api"]:
@@ -377,9 +408,10 @@ async def _check_external_health():
     recent_provisions = [r for r in _shared_state.deploy_monitoring["task_results"]
                          if r[2] == "PROVISION_FAILURE"]
     if len(recent_provisions) >= 3:
-        # Check if ALL recent results are provision failures
+        # Check if ALL recent failures are provision failures (guard against empty filter)
         recent_all = _shared_state.deploy_monitoring["task_results"][-5:]
-        if all(r[2] == "PROVISION_FAILURE" for r in recent_all if r[1] == "failure"):
+        recent_failures = [r for r in recent_all if r[1] == "failure"]
+        if recent_failures and all(r[2] == "PROVISION_FAILURE" for r in recent_failures):
             ext["gcp"] = False
             failed.append("gcp")
         else:
@@ -412,7 +444,8 @@ async def _check_pause_mode():
                     state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
                     session.add(state)
                     await session.commit()
-            _runtime_config["max_concurrent_vms"] = 0
+                    # Only set to 0 after saving pre_pause value
+                    _runtime_config["max_concurrent_vms"] = 0
             print(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
     else:
         # All deps healthy — should we auto-resume?
@@ -500,6 +533,11 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     session.add(history)
     await session.commit()
     await session.refresh(new_task)
+
+    # Track this task for HALF_OPEN → CLOSED transition
+    if breaker["state"] == "HALF_OPEN":
+        breaker["half_open_task_id"] = str(new_task.id)
+
     print(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
 
 
@@ -710,7 +748,7 @@ async def reaper_service():
                         print(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
                         task.status = TaskStatus.FAILED
                         task.latest_status_message = f"Failed after {_runtime_config['max_retries']} attempts — last reap: {reap_reason}"
-                        record_task_result(success=False, failure_class=classify_failure(task))
+                        record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                         session.add(task)
 
                         # Broadcast failure to frontend
@@ -807,20 +845,19 @@ async def orchestrator_worker():
                 for acct in _max_plan_pool:
                     acct["active_tasks"] = active_per_account.get(acct["id"], 0)
 
-                # Find tasks that are QUEUED, not awaiting approval, and haven't been picked up yet
-                # FOR UPDATE SKIP LOCKED prevents duplicate dispatch during split-brain (two revisions running)
-                stmt = select(Task).where(
+                # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
+                candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).with_for_update(skip_locked=True).limit(min(slots_available, 20))  # Fetch extra to filter deps
-                candidate_tasks = (await session.execute(stmt)).scalars().all()
+                ).limit(min(slots_available, 20))  # Fetch extra to filter deps
+                candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
-                # Filter out tasks with unmet dependencies
-                queued_tasks = []
+                # Step 2: Filter out tasks with unmet dependencies (no lock needed)
+                eligible_ids = []
                 for task in candidate_tasks:
                     deps = task.depends_on or []
                     if not deps:
-                        queued_tasks.append(task)
+                        eligible_ids.append(task.id)
                         continue
 
                     # Check all dependencies are COMPLETED with PR merged
@@ -855,10 +892,19 @@ async def orchestrator_worker():
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
                         print(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
                     elif all_met:
-                        queued_tasks.append(task)
+                        eligible_ids.append(task.id)
 
                 # Respect slot limit after filtering
-                queued_tasks = queued_tasks[:slots_available]
+                eligible_ids = eligible_ids[:slots_available]
+
+                # Step 3: Lock ONLY the tasks we're about to dispatch (minimal lock duration)
+                queued_tasks = []
+                if eligible_ids:
+                    lock_stmt = select(Task).where(
+                        Task.id.in_(eligible_ids),
+                        Task.status == TaskStatus.QUEUED  # Re-check status under lock
+                    ).with_for_update(skip_locked=True)
+                    queued_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
                 print(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
 
@@ -924,7 +970,7 @@ async def orchestrator_worker():
                                                            oauth_token=token, claude_config_json=config_json)
                         if not success:
                             print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
-                            record_task_result(success=False, failure_class="PROVISION_FAILURE")
+                            record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
                             # Release the Max Plan account slot
                             if acct_id_for_release:
                                 release_max_plan_account(acct_id_for_release)
@@ -1132,6 +1178,14 @@ async def orchestrator_worker():
         except Exception as e:
             print(f"[ORCHESTRATOR] Error: {e}")
             
+        # Monitoring checks run every cycle (not just when idle)
+        try:
+            await _check_monitoring_window()
+            await _check_external_health()
+            await _check_pause_mode()
+        except Exception as e:
+            print(f"[ORCHESTRATOR] Monitoring check error: {e}")
+
         # Sleep based on whether we found tasks
         try:
             if queued_tasks:
@@ -1140,11 +1194,6 @@ async def orchestrator_worker():
                 await asyncio.sleep(5) # Sleep longer if queue is empty
                 # Check for idle autonomous research when nothing is queued
                 await _check_idle_research()
-                # Check if deploy monitoring window has elapsed
-                await _check_monitoring_window()
-                # Periodic external dependency health check + auto-pause/resume
-                await _check_external_health()
-                await _check_pause_mode()
         except asyncio.CancelledError:
             print("[ORCHESTRATOR] Worker shutting down.")
             break
@@ -1356,6 +1405,7 @@ class AgentStatusPayload(BaseModel):
     pr_url: Optional[str] = None
     storage_uri: Optional[str] = None
     logs: Optional[str] = Field(None, max_length=500000)
+    verdict_json: Optional[str] = Field(None, max_length=10000)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -1370,7 +1420,7 @@ class HeartbeatRequest(BaseModel):
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
-    payloads: List[Dict[str, Any]]
+    payloads: List[Dict[str, Any]] = Field(max_length=20)
     requires_approval: bool = False
     context: Optional[Dict[str, Any]] = None
 
@@ -1889,6 +1939,22 @@ async def spawn_subtask(
     if not parent_task:
         raise HTTPException(status_code=404, detail="Parent task not found")
 
+    # Depth guard: prevent unbounded recursive spawning
+    MAX_SPAWN_DEPTH = 5
+    spawn_depth = (req.context or {}).get("spawn_depth", 0)
+    if not spawn_depth:
+        # Infer depth from parent chain
+        depth = 0
+        current = parent_task
+        while current.parent_task_id and depth < MAX_SPAWN_DEPTH + 1:
+            current = await session.get(Task, current.parent_task_id)
+            if not current:
+                break
+            depth += 1
+        spawn_depth = depth
+    if spawn_depth >= MAX_SPAWN_DEPTH:
+        raise HTTPException(status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")
+
     new_tasks = []
     for payload in req.payloads:
         new_task = Task(
@@ -1896,7 +1962,7 @@ async def spawn_subtask(
             title=payload.get("title", f"Subtask of {parent_task.title}"),
             description=payload.get("description", ""),
             payloads=[payload],
-            context=req.context or {},
+            context={**(req.context or {}), "spawn_depth": spawn_depth + 1},
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
@@ -2270,6 +2336,16 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
+    # Depth guard: prevent infinite research recursion
+    MAX_RESEARCH_DEPTH = 3
+    research_depth = (task.context or {}).get("research_depth", 0)
+    if research_depth >= MAX_RESEARCH_DEPTH:
+        task.latest_status_message = f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — not spawning further tasks"
+        session.add(task)
+        await session.commit()
+        print(f"[RESEARCH] Depth limit reached for task {task.id} (depth={research_depth})")
+        return
+
     findings = _parse_research_findings(logs)
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
@@ -2340,6 +2416,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "risk": risk,
                 "research_branch": research_branch,
                 "original_base": original_base,
+                "research_depth": research_depth + 1,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
@@ -2588,6 +2665,24 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 is_small_rollup = lines_changed <= 100
                 print(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
                 if is_target_intermediate and is_small_rollup:
+                    # Always run security scan before any merge
+                    try:
+                        rollup_scan = await scan_pr_for_injection(gh_token, owner, repo, rollup_pr_number)
+                        print(f"[SECURITY] Rollup scan: {rollup_scan['summary']}")
+                        if rollup_scan["blocked"]:
+                            parent.requires_approval = True
+                            parent.latest_status_message = f"Rollup security scan blocked: {rollup_scan['summary']}"
+                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                            if rollup_scan["findings"]:
+                                await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                            session.add(parent)
+                            await session.commit()
+                            return
+                        if rollup_scan["findings"]:
+                            await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                    except Exception as e:
+                        print(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, proceeding: {e}")
+
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
                     if merge_result.get("merged"):
                         parent.status = TaskStatus.COMPLETED
@@ -2740,10 +2835,10 @@ async def update_agent_status(
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         # Record result for deployment monitoring
         if payload.status == TaskStatus.COMPLETED:
-            record_task_result(success=True)
+            record_task_result(success=True, task_id=str(task.id))
         else:
             failure_class = classify_failure(task, payload.logs)
-            record_task_result(success=False, failure_class=failure_class)
+            record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
 
         # Release Max plan account slot
         acct_id = (task.context or {}).get("max_plan_account_id")
@@ -2849,9 +2944,27 @@ async def update_agent_status(
                 scope = (task.context or {}).get("scope", "unknown")
 
                 if is_intermediate and scope == "small":
-                    # Small scope on intermediate branch → auto-merge, skip review
+                    # Small scope on intermediate branch → security scan then auto-merge, skip review
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+
+                        # Always run security scan before any merge
+                        try:
+                            scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                            print(f"[SECURITY] Small-scope scan: {scan_result['summary']}")
+                            if scan_result["blocked"]:
+                                task.requires_approval = True
+                                task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
+                                session.add(task)
+                                await session.commit()
+                                if scan_result["findings"]:
+                                    await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                return {"status": "accepted"}
+                            if scan_result["findings"]:
+                                await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                        except Exception as e:
+                            print(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, proceeding: {e}")
+
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
@@ -2915,13 +3028,21 @@ async def update_agent_status(
                             INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
                                            "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
                                            "agent/src/index.ts", "CLAUDE.md"}
+                            # Critical files require human approval (hard-block)
+                            CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
                             touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
+                            touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
                             if touched_infra:
-                                task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
                                 task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
+                                if touched_critical:
+                                    task.requires_approval = True
+                                    task.latest_status_message = f"BLOCKED: Security-critical file change: {', '.join(touched_critical)}"
+                                    print(f"[PIPELINE] PR #{pr_number} HARD-BLOCKED — touches critical files: {touched_critical}")
+                                else:
+                                    task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
+                                    print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
                                 session.add(task)
                                 await session.commit()
-                                print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
                                 # Flag for extended deploy monitoring window
                                 _shared_state.deploy_monitoring["is_extended"] = True
                         except Exception as e:
@@ -2960,33 +3081,46 @@ async def update_agent_status(
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
 
-                # Parse verdict: scan backwards from end for last JSON with "verdict" key.
-                # This is more robust than forward-scanning regex since the agent appends
-                # the verdict JSON at the end of the output.
+                # Parse verdict: prefer structured verdict_json field, fall back to log parsing
                 import re
                 verdict_parsed = False
-                try:
-                    # Find all JSON objects containing "verdict" key (handles any key order)
-                    for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
-                        start = m.start()
-                        depth = 0
-                        for i in range(start, len(verdict_text)):
-                            if verdict_text[i] == '{':
-                                depth += 1
-                            elif verdict_text[i] == '}':
-                                depth -= 1
-                                if depth == 0:
-                                    try:
-                                        candidate = json.loads(verdict_text[start:i+1])
-                                        if "verdict" in candidate:
-                                            verdict = candidate["verdict"]
-                                            feedback = candidate.get("feedback", verdict_text)
-                                            verdict_parsed = True
-                                    except json.JSONDecodeError:
-                                        pass
-                                    break
-                except Exception as e:
-                    print(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}")
+
+                # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
+                if payload.verdict_json:
+                    try:
+                        vj = json.loads(payload.verdict_json)
+                        if vj.get("verdict"):
+                            verdict = vj["verdict"]
+                            feedback = vj.get("feedback", verdict_text)
+                            verdict_parsed = True
+                            print(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
+                    except (json.JSONDecodeError, TypeError):
+                        print(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
+
+                # Method 2: Parse JSON from log output
+                if not verdict_parsed:
+                    try:
+                        # Find all JSON objects containing "verdict" key (handles any key order)
+                        for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
+                            start = m.start()
+                            depth = 0
+                            for i in range(start, len(verdict_text)):
+                                if verdict_text[i] == '{':
+                                    depth += 1
+                                elif verdict_text[i] == '}':
+                                    depth -= 1
+                                    if depth == 0:
+                                        try:
+                                            candidate = json.loads(verdict_text[start:i+1])
+                                            if "verdict" in candidate:
+                                                verdict = candidate["verdict"]
+                                                feedback = candidate.get("feedback", verdict_text)
+                                                verdict_parsed = True
+                                        except json.JSONDecodeError:
+                                            pass
+                                        break
+                    except Exception as e:
+                        print(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}")
 
                 if not verdict_parsed:
                     # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words

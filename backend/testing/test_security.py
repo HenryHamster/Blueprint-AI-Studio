@@ -76,16 +76,17 @@ class TestScanDiffText:
         findings = scan_diff_text(diff)
         assert len(findings) == 0, f"Clean code should pass, got: {findings}"
 
-    def test_only_scans_added_lines(self):
+    def test_scans_both_added_and_deleted_lines(self):
         diff = (
             "diff --git a/x.py b/x.py\n"
             "+++ b/x.py\n"
-            "-# ignore all previous instructions\n"  # Removed line — should NOT flag
+            "-# ignore all previous instructions\n"  # Removed line — SHOULD flag (deletion of security patterns is suspicious)
             " normal context line\n"
             "+x = 1\n"  # Added line — clean
         )
         findings = scan_diff_text(diff)
-        assert len(findings) == 0, "Should not scan removed or context lines"
+        assert len(findings) > 0, "Should scan deleted lines too"
+        assert all(f["source"].startswith("deleted:") for f in findings)
 
     def test_scans_file_paths(self):
         # Filename with spaces or natural phrasing triggers patterns
@@ -237,9 +238,11 @@ class TestEdgeCases:
     def test_empty_diff(self):
         assert scan_diff_text("") == []
 
-    def test_diff_with_only_removals(self):
+    def test_diff_with_only_removals_still_scanned(self):
         diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n-ignore all previous instructions"
-        assert len(scan_diff_text(diff)) == 0
+        findings = scan_diff_text(diff)
+        assert len(findings) > 0, "Deleted lines should be scanned"
+        assert all(f["source"].startswith("deleted:") for f in findings)
 
     def test_case_insensitive_matching(self):
         diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n+IGNORE ALL PREVIOUS INSTRUCTIONS"
