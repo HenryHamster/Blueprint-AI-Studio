@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
-import { Activity, AlertCircle } from 'lucide-react';
+import { Activity, AlertCircle, Archive, CheckSquare } from 'lucide-react';
+import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { SummaryPanels } from './components/SummaryPanels';
 import { DirectionsPanel } from './components/DirectionsPanel';
@@ -199,6 +200,65 @@ export default function App() {
             />
           </div>
 
+          <div className="flex items-center gap-2 shrink-0 mb-2">
+            {s.viewMode === 'kanban' && (
+            <button
+              onClick={s.toggleSelectionMode}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                s.selectionMode
+                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+              }`}
+            >
+              <CheckSquare className="w-3.5 h-3.5" />
+              {s.selectionMode ? `Select (${s.selectedTaskIds.size} selected)` : 'Select'}
+            </button>
+            )}
+            {s.selectionMode && s.selectedTaskIds.size > 0 && (
+              <button
+                onClick={() => s.setConfirmDialog({
+                  title: `Archive ${s.selectedTaskIds.size} selected task${s.selectedTaskIds.size !== 1 ? 's' : ''}?`,
+                  message: 'This will archive the selected tasks. They can be viewed and unarchived from the Archive view.',
+                  confirmLabel: 'Archive Selected',
+                  onConfirm: s.handleBulkArchiveSelected,
+                })}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-amber-500/20 border-amber-500/40 text-amber-400 hover:bg-amber-500/30 transition-colors"
+              >
+                <Archive className="w-3.5 h-3.5" />
+                Archive Selected
+              </button>
+            )}
+            <div className="flex-1" />
+            <button
+              onClick={() => {
+                s.setConfirmDialog({
+                  title: 'Archive all completed tasks?',
+                  message: 'This will archive all completed tasks across all pages. They can be viewed and unarchived from the Archive view.',
+                  confirmLabel: 'Archive All Completed',
+                  onConfirm: () => s.handleBulkArchive('completed'),
+                });
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              Archive All Completed
+            </button>
+            <button
+              onClick={() => {
+                s.setConfirmDialog({
+                  title: 'Archive all terminal tasks?',
+                  message: 'This will archive all terminal tasks (completed, cancelled, and failed) across all pages. They can be viewed and unarchived from the Archive view.',
+                  confirmLabel: 'Archive All Terminal',
+                  onConfirm: () => s.handleBulkArchive('terminal'),
+                });
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              Archive All Terminal
+            </button>
+          </div>
+
           {s.viewMode === 'kanban' ? (
             <KanbanBoard
               tasks={filteredTasks}
@@ -206,6 +266,17 @@ export default function App() {
               loading={s.loading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
+              selectionMode={s.selectionMode}
+              selectedTaskIds={s.selectedTaskIds}
+              onToggleTaskSelection={s.toggleTaskSelection}
+              onArchiveColumn={(taskIds, columnLabel) => {
+                s.setConfirmDialog({
+                  title: `Archive all ${columnLabel} tasks?`,
+                  message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
+                  confirmLabel: `Archive ${columnLabel}`,
+                  onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+                });
+              }}
               onApprove={s.handleApprove}
               onCancel={s.handleCancel}
               onRetry={s.handleRetry}
@@ -299,6 +370,16 @@ export default function App() {
 
       {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} />}
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
+
+      {s.confirmDialog && (
+        <ConfirmDialog
+          title={s.confirmDialog.title}
+          message={s.confirmDialog.message}
+          confirmLabel={s.confirmDialog.confirmLabel}
+          onConfirm={s.confirmDialog.onConfirm}
+          onCancel={() => s.setConfirmDialog(null)}
+        />
+      )}
     </div>
   );
 }

@@ -129,6 +129,13 @@ export function useAppState() {
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const shortcutHelpRef = useRef<HTMLDivElement>(null);
 
+  // Selection mode state
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
+
+  // Confirm dialog state
+  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; confirmLabel: string; onConfirm: () => void } | null>(null);
+
   // Archive view state
   const [showArchive, setShowArchiveState] = useState(false);
   const [archiveTasks, setArchiveTasks] = useState<Task[]>([]);
@@ -508,6 +515,82 @@ export function useAppState() {
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
     }
+  };
+
+  const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filter }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      fetchTasks();
+      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to bulk archive tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const handleBulkArchiveSelected = async () => {
+    const ids = Array.from(selectedTaskIds);
+    if (ids.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_ids: ids }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      setSelectedTaskIds(new Set());
+      setSelectionMode(false);
+      fetchTasks();
+      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to archive selected tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const handleBulkArchiveColumn = async (taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_ids: taskIds }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      fetchTasks();
+      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to archive column tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const toggleSelectionMode = () => {
+    setSelectionMode(prev => !prev);
+    setSelectedTaskIds(new Set());
+  };
+
+  const toggleTaskSelection = (taskId: string) => {
+    setSelectedTaskIds(prev => {
+      const next = new Set(prev);
+      if (next.has(taskId)) {
+        next.delete(taskId);
+      } else {
+        next.add(taskId);
+      }
+      return next;
+    });
   };
 
   const fetchSettings = async () => {
@@ -923,6 +1006,9 @@ export function useAppState() {
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
+    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
+    selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection,
+    confirmDialog, setConfirmDialog,
     // Toasts
     toasts, addToast, dismissToast,
     // View

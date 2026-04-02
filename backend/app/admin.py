@@ -257,6 +257,46 @@ async def create_task_manually(
         "vm_instance_id": new_task.vm_instance_id,
     }
 
+class BulkArchiveRequest(BaseModel):
+    task_ids: Optional[List[str]] = None
+    filter: Optional[str] = None  # 'completed' or 'terminal'
+
+
+@router.post("/tasks/bulk-archive")
+async def bulk_archive_tasks(
+    request: BulkArchiveRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    if request.task_ids is not None:
+        archived = []
+        for raw_id in request.task_ids:
+            try:
+                task = await session.get(Task, uuid.UUID(raw_id))
+            except (ValueError, AttributeError):
+                continue
+            if task and task.status in TERMINAL_STATUSES and not task.archived:
+                task.archived = True
+                session.add(task)
+                archived.append(task)
+    elif request.filter in ('completed', 'terminal'):
+        if request.filter == 'completed':
+            statuses = [TaskStatus.COMPLETED]
+        else:
+            statuses = TERMINAL_STATUSES
+        query = select(Task).where(Task.archived == False, Task.status.in_(statuses))
+        result = await session.execute(query)
+        archived = result.scalars().all()
+        for task in archived:
+            task.archived = True
+            session.add(task)
+    else:
+        raise HTTPException(status_code=400, detail="Must provide task_ids or a valid filter ('completed' or 'terminal')")
+
+    await session.commit()
+    return {"archived_count": len(archived)}
+
+
 @router.post("/tasks/{task_id}/archive")
 async def archive_task(
     task_id: uuid.UUID,
