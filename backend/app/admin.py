@@ -77,21 +77,38 @@ async def get_all_tasks(
     result = await session.execute(query)
     tasks = result.scalars().all()
 
-    # Join artifacts to include PR URLs, error logs, and research findings
+    # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
-    pr_map = {}
-    logs_map = {}
-    research_map = {}
+    artifacts_map: Dict[str, List[Dict[str, Any]]] = {}
+    pr_map: Dict[str, str] = {}
+    logs_map: Dict[str, str] = {}
+    logs_truncated_map: Dict[str, bool] = {}
+    research_map: Dict[str, str] = {}
+    commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
-        artifact_stmt = select(Artifact).where(Artifact.task_id.in_(task_ids))
+        artifact_stmt = select(Artifact).where(Artifact.task_id.in_(task_ids)).order_by(Artifact.created_at.asc())
         artifacts = (await session.execute(artifact_stmt)).scalars().all()
         for a in artifacts:
+            tid = str(a.task_id)
+            if tid not in artifacts_map:
+                artifacts_map[tid] = []
+            artifacts_map[tid].append({
+                "artifact_type": a.artifact_type,
+                "pr_url": a.pr_url,
+                "commit_hash": a.commit_hash,
+                "repo_url": a.repo_url,
+                "iteration": a.iteration,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            })
             if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
-                pr_map[str(a.task_id)] = a.pr_url
+                pr_map[tid] = a.pr_url
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
-                logs_map[str(a.task_id)] = a.logs[:2000]
+                logs_map[tid] = a.logs[:2000]
+                logs_truncated_map[tid] = len(a.logs) > 2000
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                research_map[str(a.task_id)] = a.logs[:100000]
+                research_map[tid] = a.logs[:100000]
+            if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
+                commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 
     # Fetch task history (last 10 entries per task)
     history_map: Dict[str, List[Dict[str, Any]]] = {}
@@ -113,6 +130,15 @@ async def get_all_tasks(
                     "details": h.details,
                 })
 
+    # Build parent→children map from the fetched result set (no extra DB query)
+    children_map: Dict[str, List[str]] = {}
+    for t in tasks:
+        if t.parent_task_id:
+            parent_key = str(t.parent_task_id)
+            if parent_key not in children_map:
+                children_map[parent_key] = []
+            children_map[parent_key].append(str(t.id))
+
     # Return tasks with artifact data attached
     result_list = []
     for t in tasks:
@@ -133,15 +159,21 @@ async def get_all_tasks(
             "depends_on": t.depends_on or [],
             "plan_output": t.plan_output,
             "created_at": t.created_at.isoformat() if t.created_at else None,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
             "last_heartbeat": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
             "attempt_count": t.attempt_count,
             "payloads": t.payloads,
             "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
             "archived": t.archived,
+            "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
+            "error_logs_truncated": logs_truncated_map.get(str(t.id), False),
             "research_findings": research_map.get(str(t.id)),
+            "commit_hash": commit_map.get(str(t.id), {}).get("commit_hash"),
+            "repo_url": commit_map.get(str(t.id), {}).get("repo_url"),
             "history": history_map.get(str(t.id), []),
+            "child_task_ids": children_map.get(str(t.id), []),
         }
         result_list.append(task_dict)
 
@@ -159,6 +191,108 @@ async def get_all_tasks(
     )).scalar() or 0
 
     return {"tasks": result_list, "total": total, "active_count": active_count, "evaluating_count": evaluating_count, "queued_count": queued_count}
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = await session.get(Task, tid)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Fetch all artifacts for this task (all types, not just last per type)
+    artifact_stmt = select(Artifact).where(Artifact.task_id == tid).order_by(Artifact.created_at.asc())
+    artifacts = (await session.execute(artifact_stmt)).scalars().all()
+    artifacts_list = []
+    pr_url = None
+    error_logs = None
+    error_logs_truncated = False
+    research_findings = None
+    commit_hash = None
+    repo_url = None
+    for a in artifacts:
+        artifacts_list.append({
+            "artifact_type": a.artifact_type,
+            "pr_url": a.pr_url,
+            "commit_hash": a.commit_hash,
+            "repo_url": a.repo_url,
+            "iteration": a.iteration,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        })
+        if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
+            pr_url = a.pr_url
+        if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
+            error_logs_truncated = len(a.logs) > 2000
+            error_logs = a.logs[:2000]
+        if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+            research_findings = a.logs[:100000]
+        if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
+            commit_hash = a.commit_hash
+            repo_url = a.repo_url
+
+    # Fetch full task history (all entries, not capped at 10)
+    history_stmt = (
+        select(TaskHistory)
+        .where(TaskHistory.task_id == tid)
+        .order_by(TaskHistory.timestamp.desc())
+    )
+    all_history = (await session.execute(history_stmt)).scalars().all()
+    history = [
+        {
+            "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+            "action": h.action,
+            "details": h.details,
+        }
+        for h in all_history
+    ]
+
+    # Fetch child task IDs
+    child_ids_result = await session.execute(
+        select(Task.id).where(Task.parent_task_id == tid)
+    )
+    child_task_ids = [str(row) for row in child_ids_result.scalars().all()]
+
+    task_type = ((task.payloads or [{}])[0]).get("type", "create")
+    return {
+        "id": str(task.id),
+        "project_id": str(task.project_id),
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "task_type": task_type,
+        "vm_instance_id": task.vm_instance_id,
+        "latest_status_message": task.latest_status_message,
+        "status_log": task.status_log or [],
+        "created_by": task.created_by,
+        "requires_approval": task.requires_approval,
+        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
+        "depends_on": task.depends_on or [],
+        "plan_output": task.plan_output,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "last_heartbeat": task.last_heartbeat.isoformat() if task.last_heartbeat else None,
+        "attempt_count": task.attempt_count,
+        "payloads": task.payloads,
+        "context": {k: v for k, v in (task.context or {}).items() if not k.startswith("max_plan_")},
+        "archived": task.archived,
+        "artifacts": artifacts_list,
+        "pr_url": pr_url,
+        "error_logs": error_logs,
+        "error_logs_truncated": error_logs_truncated,
+        "commit_hash": commit_hash,
+        "repo_url": repo_url,
+        "research_findings": research_findings,
+        "history": history,
+        "child_task_ids": child_task_ids,
+    }
 
 
 class CreateTaskPayload(BaseModel):

@@ -30,13 +30,20 @@ export interface Task {
   depends_on?: string[];
   plan_output?: Record<string, unknown>;
   created_at: string;
+  started_at?: string;
   last_heartbeat?: string;
   attempt_count?: number;
   payloads?: Record<string, unknown>[];
+  artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
   pr_url?: string;
+  commit_hash?: string;
+  repo_url?: string;
   error_logs?: string;
+  error_logs_truncated?: boolean;
   research_findings?: string;
+  context?: Record<string, unknown>;
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
+  child_task_ids?: string[];
 }
 
 export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {

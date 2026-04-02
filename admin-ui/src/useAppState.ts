@@ -4,7 +4,7 @@ import type { Project } from './components/ProjectDashboard';
 import type { MaxPlanAccount } from './components/SettingsDropdown';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD } from './api';
+import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -814,6 +814,8 @@ export function useAppState() {
     }
     setLogTask(task);
     setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
+    // Fetch fresh task data in the background; show stale list data immediately
+    fetchTask(task.id).then(fresh => setLogTask(fresh)).catch(() => {/* keep stale data */});
     setWsDisconnected(false);
 
     if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;

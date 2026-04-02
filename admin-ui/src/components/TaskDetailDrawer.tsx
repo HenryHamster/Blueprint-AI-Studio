@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
-import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl } from './TaskCard';
+import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime } from './TaskCard';
 import type { Task } from './TaskCard';
 
 interface TaskDetailDrawerProps {
@@ -15,6 +15,7 @@ interface TaskDetailDrawerProps {
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
   onDismiss: (id: string) => void;
+  onNavigateToTask?: (taskId: string) => void;
 }
 
 type Tab = 'details' | 'logs';
@@ -67,18 +68,54 @@ function formatTimestamp(iso: string): string {
   });
 }
 
-function DetailsTab({ task }: { task: Task }) {
+function formatCreatedBy(value: string): string {
+  if (value === 'USER') return 'User';
+  if (value === 'ORCHESTRATOR') return 'Orchestrator';
+  if (value.startsWith('AGENT_')) return `Agent (${value.slice(6)})`;
+  return value;
+}
+
+
+function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
+  const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
+  const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
+  const prArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url));
+  const commitArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT');
+  const multiPR = prArtifacts.length > 1;
 
   return (
     <div className="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-1">
       <SectionHeader>Identifiers</SectionHeader>
       <DetailRow label="Task ID"><CopyableId value={task.id} /></DetailRow>
+      {task.created_by && (
+        <DetailRow label="Created By"><span className="text-sm">{formatCreatedBy(task.created_by)}</span></DetailRow>
+      )}
+      {task.parent_task_id && (
+        <DetailRow label="Parent Task">
+          {onNavigateToTask ? (
+            <button
+              onClick={() => onNavigateToTask(task.parent_task_id!)}
+              className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline cursor-pointer"
+            >
+              {task.parent_task_id}
+            </button>
+          ) : (
+            <CopyableId value={task.parent_task_id} />
+          )}
+        </DetailRow>
+      )}
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && <DetailRow label="VM Instance"><span className="font-mono text-sm">{task.vm_instance_id}</span></DetailRow>}
 
       <SectionHeader>Timing</SectionHeader>
       <DetailRow label="Created at">{formatTimestamp(task.created_at)}</DetailRow>
+      {task.started_at && (
+        <DetailRow label="Started at">{formatTimestamp(task.started_at)}</DetailRow>
+      )}
+      {task.started_at && (
+        <DetailRow label="Duration"><span className="font-mono">{duration}</span></DetailRow>
+      )}
       <DetailRow label="Heartbeat">
         <span className="inline-flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${heartbeat.color}`} />
@@ -101,6 +138,29 @@ function DetailsTab({ task }: { task: Task }) {
         </>
       )}
 
+      {task.payloads && task.payloads.length > 0 && (() => {
+        const payload = task.payloads![0];
+        const prompt = payload.prompt as string | undefined;
+        const baseBranch = payload.base_branch as string | undefined;
+        const prNumber = payload.pr_number as number | undefined;
+        const branch = payload.branch as string | undefined;
+        return (
+          <>
+            <SectionHeader>Task Config</SectionHeader>
+            {prompt && prompt !== task.description && (
+              <DetailRow label="Prompt">
+                <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">
+                  {prompt}
+                </pre>
+              </DetailRow>
+            )}
+            {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm">{baseBranch}</span></DetailRow>}
+            {prNumber && <DetailRow label="PR Number"><span className="font-mono text-sm">#{prNumber}</span></DetailRow>}
+            {branch && <DetailRow label="Branch"><span className="font-mono text-sm">{branch}</span></DetailRow>}
+          </>
+        );
+      })()}
+
       {task.plan_output && (
         <>
           <SectionHeader>Plan Output</SectionHeader>
@@ -119,12 +179,24 @@ function DetailsTab({ task }: { task: Task }) {
         </>
       )}
 
+      {task.context && Object.keys(task.context).length > 0 && (
+        <>
+          <SectionHeader>Context</SectionHeader>
+          <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
+            {JSON.stringify(task.context, null, 2)}
+          </pre>
+        </>
+      )}
+
       {task.error_logs && (
         <>
           <SectionHeader>Error Logs</SectionHeader>
           <pre className="text-sm text-red-300 whitespace-pre-wrap break-words bg-red-950/20 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-red-900/30 font-mono">
             {task.error_logs}
           </pre>
+          {task.error_logs_truncated && (
+            <p className="text-xs text-neutral-500 mt-1 italic">Output truncated to 2000 characters. View full logs in the Logs tab.</p>
+          )}
         </>
       )}
 
@@ -134,7 +206,7 @@ function DetailsTab({ task }: { task: Task }) {
           <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar bg-neutral-900/50 rounded-lg p-3 border border-neutral-800">
             {task.status_log.slice().reverse().map((entry, i) => (
               <div key={i} className="flex items-start gap-2 text-xs">
-                <span className="text-neutral-600 shrink-0 font-mono">{new Date(entry.t).toLocaleTimeString()}</span>
+                <span className="text-neutral-600 shrink-0 font-mono">{formatTimestamp(entry.t)}</span>
                 <span className="text-neutral-300 break-words min-w-0">{entry.msg}</span>
               </div>
             ))}
@@ -164,20 +236,83 @@ function DetailsTab({ task }: { task: Task }) {
         </>
       )}
 
-      {task.pr_url && isSafeUrl(task.pr_url) && (
+      {task.artifacts && task.artifacts.length > 0 ? (
         <>
-          <SectionHeader>Pull Request</SectionHeader>
-          <a
-            href={task.pr_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
-          >
-            {task.pr_url}
-            <ExternalLink className="w-3.5 h-3.5" />
-          </a>
+          {prArtifacts.length > 0 && (
+            <>
+              <SectionHeader>Pull Request{multiPR ? 's' : ''}</SectionHeader>
+              <div className="space-y-1">
+                {prArtifacts.map((a, i) => (
+                  <a
+                    key={i}
+                    href={a.pr_url!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                  >
+                    {multiPR && <span className="text-xs text-neutral-500 font-mono">Iteration {a.iteration}</span>}
+                    {a.pr_url}
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                ))}
+              </div>
+            </>
+          )}
+          {commitArtifacts.length > 0 && (
+            <>
+              <SectionHeader>Git Commit{commitArtifacts.length > 1 ? 's' : ''}</SectionHeader>
+              <div className="space-y-1">
+                {commitArtifacts.map((a, i) => (
+                  <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300">
+                    {a.commit_hash && <span className="text-emerald-400">{a.commit_hash.slice(0, 8)}</span>}
+                    {a.repo_url && isSafeUrl(a.repo_url) ? (
+                      <a href={a.repo_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1">
+                        {a.repo_url}<ExternalLink className="w-3 h-3" />
+                      </a>
+                    ) : a.repo_url ? (
+                      <span className="text-neutral-400">{a.repo_url}</span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </>
-      )}
+      ) : (task.pr_url && isSafeUrl(task.pr_url) || task.commit_hash || task.repo_url && isSafeUrl(task.repo_url)) ? (
+        <>
+          <SectionHeader>Code Output</SectionHeader>
+          <div className="space-y-2">
+            {task.pr_url && isSafeUrl(task.pr_url) && (
+              <a
+                href={task.pr_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                {task.pr_url}
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            )}
+            {task.commit_hash && (
+              <div className="flex items-center gap-1.5">
+                <Hash className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                <CopyableId value={task.commit_hash} />
+              </div>
+            )}
+            {task.repo_url && isSafeUrl(task.repo_url) && (
+              <a
+                href={task.repo_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                {task.repo_url}
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+            )}
+          </div>
+        </>
+      ) : null}
 
       {task.depends_on && task.depends_on.length > 0 && (
         <>
@@ -187,6 +322,29 @@ function DetailsTab({ task }: { task: Task }) {
               <div key={dep} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5">
                 <ChevronRight className="w-3 h-3 text-neutral-600" />
                 {dep}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {task.child_task_ids && task.child_task_ids.length > 0 && (
+        <>
+          <SectionHeader>Child Tasks</SectionHeader>
+          <div className="space-y-1">
+            {task.child_task_ids.map((childId) => (
+              <div key={childId} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5">
+                <ChevronRight className="w-3 h-3 text-neutral-600" />
+                {onNavigateToTask ? (
+                  <button
+                    onClick={() => onNavigateToTask(childId)}
+                    className="text-blue-400 hover:text-blue-300 transition-colors text-left"
+                  >
+                    {childId}
+                  </button>
+                ) : (
+                  <CopyableId value={childId} />
+                )}
               </div>
             ))}
           </div>
@@ -325,6 +483,7 @@ export function TaskDetailDrawer({
   onRetry,
   onEditPrompt,
   onDismiss,
+  onNavigateToTask,
 }: TaskDetailDrawerProps) {
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
@@ -513,7 +672,7 @@ export function TaskDetailDrawer({
 
         {/* Content */}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} />
+          <DetailsTab task={task} onNavigateToTask={onNavigateToTask} />
         ) : (
           <>
             {wsDisconnected && (

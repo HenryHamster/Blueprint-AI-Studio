@@ -8,6 +8,7 @@ import { ResearchBrowser } from './components/ResearchBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
+import { fetchTask } from './api';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { NewTaskModal } from './components/NewTaskModal';
@@ -365,6 +366,16 @@ export default function App() {
           onRetry={s.handleRetry}
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
+          onNavigateToTask={(taskId) => {
+            const target = s.tasks.find(t => t.id === taskId);
+            if (target) {
+              s.handleViewLogs(target);
+            } else {
+              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+                s.addToast('Could not load task — it may have been deleted', 'error');
+              });
+            }
+          }}
         />
       )}
 

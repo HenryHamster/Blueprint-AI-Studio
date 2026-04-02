@@ -45,3 +45,9 @@ export async function apiFetch(
   }
   return fetch(fullUrl, mergedOptions);
 }
+
+export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {
+  const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}`);
+  if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);
+  return res.json();
+}
