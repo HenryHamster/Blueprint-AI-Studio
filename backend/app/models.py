@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class ProjectStatus(str, Enum):
     DRAFT = "DRAFT"
@@ -158,13 +159,13 @@ from sqlalchemy import event
 @event.listens_for(Task.latest_status_message, "set")
 def _on_status_message_set(target: Task, value, oldvalue, initiator):
     if value and value != oldvalue:
-        entry = {"t": datetime.now(timezone.utc).isoformat(), "msg": str(value)[:500]}
+        entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
         target.status_log = (target.status_log or []) + [entry]
 
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
-        entry = {"t": datetime.now(timezone.utc).isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
+        entry = {"t": datetime.utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
         target.status_log = (target.status_log or []) + [entry]
 
 

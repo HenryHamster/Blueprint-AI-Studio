@@ -13,7 +13,7 @@ from sqlmodel import select
 import uuid
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity
@@ -123,7 +123,7 @@ def recheck_disabled_accounts():
     """Re-enable accounts that were disabled by rate limiting after a cooldown.
     Usage windows typically reset after some time — re-enable and let the next
     task attempt determine if usage has actually recovered."""
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     COOLDOWN_MINUTES = 30
 
     for acct in _max_plan_pool:
@@ -188,14 +188,14 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
         if len(_recorded_task_ids) > 200:
             _recorded_task_ids.clear()
 
-    entry = (datetime.now(timezone.utc).isoformat(), "success" if success else "failure", failure_class)
+    entry = (datetime.utcnow().isoformat(), "success" if success else "failure", failure_class)
     deploy_monitoring["task_results"].append(entry)
     # Keep only last 100 results
     if len(deploy_monitoring["task_results"]) > 100:
         deploy_monitoring["task_results"] = deploy_monitoring["task_results"][-100:]
 
     if success:
-        _shared_state.deploy_monitoring["last_completion_time"] = datetime.now(timezone.utc)
+        _shared_state.deploy_monitoring["last_completion_time"] = datetime.utcnow()
 
 
 async def _init_deployment_state():
@@ -209,7 +209,7 @@ async def _init_deployment_state():
                 id=1,
                 current_revision=_current_revision,
                 current_sha=_current_sha,
-                deployed_at=datetime.now(timezone.utc),
+                deployed_at=datetime.utcnow(),
                 status=DeploymentStatus.STABLE,
                 last_known_good_revision=_current_revision,
                 last_known_good_sha=_current_sha,
@@ -261,7 +261,7 @@ async def _init_deployment_state():
             state.rollback_count += 1
             state.current_revision = _current_revision
             state.current_sha = _current_sha
-            state.deployed_at = datetime.now(timezone.utc)
+            state.deployed_at = datetime.utcnow()
             session.add(state)
             await session.commit()
 
@@ -284,11 +284,11 @@ async def _init_deployment_state():
             failures = sum(1 for _, outcome, _ in results if outcome == "failure")
             deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
         deploy_monitoring["task_results"] = []  # Reset for new deploy window
-        deploy_monitoring["window_start"] = datetime.now(timezone.utc)
+        deploy_monitoring["window_start"] = datetime.utcnow()
 
         state.current_revision = _current_revision
         state.current_sha = _current_sha
-        state.deployed_at = datetime.now(timezone.utc)
+        state.deployed_at = datetime.utcnow()
         state.status = DeploymentStatus.MONITORING
         state.rolled_back_from_sha = None
         state.rollback_reason = None
@@ -354,7 +354,7 @@ async def _check_monitoring_window():
         return
 
     duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
-    elapsed = (datetime.now(timezone.utc) - window_start).total_seconds()
+    elapsed = (datetime.utcnow() - window_start).total_seconds()
 
     if elapsed < duration:
         return  # Still within window
@@ -419,7 +419,7 @@ async def _check_monitoring_window():
 async def _check_external_health():
     """Periodic check of external dependencies. Updates shared_state.external_health."""
     ext = _shared_state.external_health
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
 
     # Check every 60 seconds (authenticated via App JWT = 5,000 req/hr)
     if ext["last_check"] and (now - ext["last_check"]).total_seconds() < 60:
@@ -514,7 +514,7 @@ async def _check_pause_mode():
                 if state and state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
-                    state.paused_at = datetime.now(timezone.utc)
+                    state.paused_at = datetime.utcnow()
                     state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
                     session.add(state)
                     await session.commit()
@@ -547,7 +547,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
         # Check if cooldown has elapsed → transition to HALF-OPEN
-        if breaker["opened_at"] and (datetime.now(timezone.utc) - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
             print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
@@ -559,7 +559,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         if d.get("status") == "active"
         and (
             not d.get("last_researched_at")
-            or (datetime.now(timezone.utc) - datetime.fromisoformat(d["last_researched_at"])).total_seconds()
+            or (datetime.utcnow() - datetime.fromisoformat(d["last_researched_at"])).total_seconds()
                >= default_cooldown_hours * 3600
         )
     ]
@@ -576,7 +576,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         if ((t.payloads or [{}])[0]).get("type") == "research":
             return
     # Guard: rate limit autonomous research spawns (not all orchestrator tasks)
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
     recent_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -639,7 +639,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
-        if breaker["opened_at"] and (datetime.now(timezone.utc) - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
             print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
@@ -663,7 +663,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             return
 
     # Guard: rate limit
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
     recent_auto = (await session.execute(
         select(func.count()).select_from(Task).where(
             Task.project_id == project.id,
@@ -687,7 +687,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             last_run = t.created_at
             break
 
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     if last_run is not None:
         elapsed = (now - last_run).total_seconds() / 3600
         if elapsed < interval_hours:
@@ -764,7 +764,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
     if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=interval_minutes):
         return
@@ -878,7 +878,7 @@ async def reaper_service():
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
                 orphaned_tasks = []
-                now = datetime.now(timezone.utc)
+                now = datetime.utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
                 
@@ -1017,7 +1017,7 @@ async def orchestrator_worker():
         queued_tasks = []
         try:
             global _orchestrator_last_cycle
-            _orchestrator_last_cycle = datetime.now(timezone.utc)
+            _orchestrator_last_cycle = datetime.utcnow()
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
@@ -1026,7 +1026,7 @@ async def orchestrator_worker():
                 )).scalars().all()
 
                 # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
-                two_min_ago = datetime.now(timezone.utc) - timedelta(minutes=2)
+                two_min_ago = datetime.utcnow() - timedelta(minutes=2)
                 for t in active_tasks_result:
                     if (t.status == TaskStatus.PROVISIONING
                         and t.last_heartbeat is None
@@ -1184,8 +1184,8 @@ async def orchestrator_worker():
 
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
-                    task.started_at = datetime.now(timezone.utc)
-                    _shared_state.deploy_monitoring["last_dispatch_time"] = datetime.now(timezone.utc)
+                    task.started_at = datetime.utcnow()
+                    _shared_state.deploy_monitoring["last_dispatch_time"] = datetime.utcnow()
                     session.add(task)
                     try:
                         await session.commit()
@@ -1264,7 +1264,7 @@ async def orchestrator_worker():
                     if ci_wait_started:
                         try:
                             started = datetime.fromisoformat(ci_wait_started)
-                            if (datetime.now(timezone.utc) - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
+                            if (datetime.utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
                                 print(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
@@ -1526,7 +1526,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     )).scalar() or 0
     ago = None
     if _orchestrator_last_cycle:
-        ago = (datetime.now(timezone.utc) - _orchestrator_last_cycle).total_seconds()
+        ago = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
     # Include deployment state
     deploy_state = None
     try:
@@ -1573,7 +1573,7 @@ async def health_check():
     orchestrator_alive = _orchestrator_last_cycle is not None
     cycle_age = None
     if _orchestrator_last_cycle:
-        cycle_age = (datetime.now(timezone.utc) - _orchestrator_last_cycle).total_seconds()
+        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
 
     # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
     orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
@@ -2291,7 +2291,7 @@ async def agent_heartbeat(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
         
-    task.last_heartbeat = datetime.now(timezone.utc)
+    task.last_heartbeat = datetime.utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
 
@@ -3295,7 +3295,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         project = await session.get(Project, task.project_id)
         if project:
             directions = list(project.directions or [])
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.utcnow().isoformat()
             for d in directions:
                 if d.get("id") in direction_ids_researched:
                     d["last_researched_at"] = now_iso
@@ -3848,7 +3848,7 @@ async def update_agent_status(
                 for acct in _max_plan_pool:
                     if acct["id"] == acct_id:
                         acct["enabled"] = False
-                        acct["disabled_at"] = datetime.now(timezone.utc)
+                        acct["disabled_at"] = datetime.utcnow()
                         print(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
                         break
 
@@ -3926,14 +3926,14 @@ async def update_agent_status(
             if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
                 breaker["state"] = "OPEN"
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
-                breaker["opened_at"] = datetime.now(timezone.utc)
+                breaker["opened_at"] = datetime.utcnow()
                 breaker["half_open_task_id"] = None
                 print(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
 
             # CLOSED → OPEN after 3 consecutive failures
             elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
                 breaker["state"] = "OPEN"
-                breaker["opened_at"] = datetime.now(timezone.utc)
+                breaker["opened_at"] = datetime.utcnow()
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 await broadcast_to_project(project_key, "autonomous_paused",
                                            {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
@@ -4216,7 +4216,7 @@ async def update_agent_status(
                                 "head_sha": head_sha, "pr_number": pr_number,
                                 "branch": branch, "base_branch": base_branch,
                                 "original_task_id": original_task_id,
-                                "ci_wait_started": datetime.now(timezone.utc).isoformat()}}
+                                "ci_wait_started": datetime.utcnow().isoformat()}}
                             session.add(task)
                             await session.commit()
                             print(f"[CI] PR #{pr_number} approved, CI pending — waiting")
@@ -4843,7 +4843,7 @@ async def register_github_pat(
     
     if integration:
         integration.github_pat = secret_name
-        integration.updated_at = datetime.now(timezone.utc)
+        integration.updated_at = datetime.utcnow()
     else:
         integration = UserIntegration(
             user_id=current_user["user_id"],
@@ -4872,7 +4872,7 @@ async def github_oauth_authorize(
     import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     state = pyjwt.encode(
-        {"sub": current_user["user_id"], "exp": datetime.now(timezone.utc) + timedelta(minutes=10), "type": "github_oauth"},
+        {"sub": current_user["user_id"], "exp": datetime.utcnow() + timedelta(minutes=10), "type": "github_oauth"},
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
@@ -4938,7 +4938,7 @@ async def github_oauth_callback(
         if integration:
             integration.github_installation_id = installation_id
             integration.github_account_name = account_name
-            integration.updated_at = datetime.now(timezone.utc)
+            integration.updated_at = datetime.utcnow()
         else:
             integration = UserIntegration(
                 user_id=firebase_user_id,

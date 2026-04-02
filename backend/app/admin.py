@@ -8,7 +8,7 @@ import json
 import httpx
 import logging
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -1044,7 +1044,7 @@ async def add_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     db_account = MaxPlanAccount(
         name=name,
         oauth_token=oauth_token,
@@ -1123,7 +1123,7 @@ async def update_max_plan_account(
         if not re.fullmatch(r'sk-ant-[A-Za-z0-9_\-]+', new_token):
             raise HTTPException(status_code=400, detail="oauth_token contains invalid characters")
         db_account.oauth_token = new_token
-        db_account.token_created_at = datetime.now(timezone.utc)
+        db_account.token_created_at = datetime.utcnow()
     if "claude_config_json" in payload:
         import json as _json
         try:
@@ -1131,7 +1131,7 @@ async def update_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
         db_account.claude_config_json = payload["claude_config_json"]
-    db_account.updated_at = datetime.now(timezone.utc)
+    db_account.updated_at = datetime.utcnow()
     session.add(db_account)
     await session.commit()
 
@@ -1307,7 +1307,7 @@ async def add_direction(
         "text": payload.text,
         "priority": payload.priority,
         "paths": payload.paths or [],
-        "added_at": datetime.now(timezone.utc).isoformat(),
+        "added_at": datetime.utcnow().isoformat(),
         "status": "active",
     }
     directions = list(project.directions or [])
@@ -1337,7 +1337,7 @@ async def replace_directions(
         if not entry.get("id"):
             entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
         if not entry.get("added_at"):
-            entry["added_at"] = datetime.now(timezone.utc).isoformat()
+            entry["added_at"] = datetime.utcnow().isoformat()
         if entry.get("priority") not in ("high", "medium", "low"):
             raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
         if not isinstance(entry.get("text"), str) or not entry["text"].strip():
@@ -1630,7 +1630,7 @@ async def get_autonomous_status(
         select(Project).order_by(Project.created_at.desc())
     )).scalars().all()
 
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
     auto_tasks = (await session.execute(
@@ -1722,7 +1722,7 @@ async def get_deploy_state(
     window_progress = None
     if deploy_monitoring["window_start"]:
         duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
-        elapsed = (datetime.now(timezone.utc) - deploy_monitoring["window_start"]).total_seconds()
+        elapsed = (datetime.utcnow() - deploy_monitoring["window_start"]).total_seconds()
         window_progress = {"elapsed_seconds": int(elapsed), "total_seconds": duration, "percent": min(100, int(elapsed / duration * 100))}
 
     # Calculate recent failure rate
@@ -1764,7 +1764,7 @@ async def pause_pipeline(
     if state:
         state.status = DeploymentStatus.PAUSED
         state.pause_reason = "Manual pause via admin"
-        state.paused_at = datetime.now(timezone.utc)
+        state.paused_at = datetime.utcnow()
         state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
         session.add(state)
         await session.commit()
@@ -1922,7 +1922,7 @@ async def repair_state(
     repairs = []
 
     # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
-    fifteen_min_ago = datetime.now(timezone.utc) - timedelta(minutes=15)
+    fifteen_min_ago = datetime.utcnow() - timedelta(minutes=15)
     stuck_tasks = (await session.execute(
         select(Task).where(
             Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
@@ -1998,7 +1998,7 @@ async def get_activity(
     current_user: dict = Depends(get_current_user)
 ):
     """Return a reverse-chronological list of recent system events."""
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
     events: List[Dict[str, Any]] = []
 
     # --- 1 & 2: Completed and Failed tasks in last 7 days ---
@@ -2262,7 +2262,7 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    alert.dismissed_at = datetime.now(timezone.utc)
+    alert.dismissed_at = datetime.utcnow()
     session.add(alert)
     await session.commit()
     return {"status": "dismissed"}
