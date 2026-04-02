@@ -252,6 +252,8 @@ EOF
 
     network_interface = compute_v1.NetworkInterface()
     network_interface.network = f"projects/{GCP_PROJECT_ID}/global/networks/{VPC_NETWORK}"
+    default_region = "-".join(GCP_ZONE.split("-")[:-1])
+    network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{default_region}/subnetworks/{VPC_SUBNET}"
     instance_config.network_interfaces = [network_interface]
 
     metadata = compute_v1.Metadata()
