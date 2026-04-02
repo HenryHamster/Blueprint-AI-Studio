@@ -1548,13 +1548,17 @@ async def get_autonomous_status(
 
     one_hour_ago = datetime.utcnow() - timedelta(hours=1)
 
-    # Batch query: count autonomous tasks per project in the last hour
-    tasks_per_project = dict((await session.execute(
-        select(Task.project_id, func.count()).where(
+    # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
+    auto_tasks = (await session.execute(
+        select(Task).where(
             Task.created_by == "ORCHESTRATOR",
             Task.created_at >= one_hour_ago,
-        ).group_by(Task.project_id)
-    )).all())
+        )
+    )).scalars().all()
+    tasks_per_project: dict = {}
+    for t in auto_tasks:
+        if ((t.payloads or [{}])[0]).get("type") == "research":
+            tasks_per_project[t.project_id] = tasks_per_project.get(t.project_id, 0) + 1
 
     # Batch query: most recent autonomous task per project
     last_research_subq = (
