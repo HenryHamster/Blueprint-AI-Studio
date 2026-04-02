@@ -19,6 +19,7 @@ import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
+import ActivityFeed from './components/ActivityFeed';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -110,6 +111,8 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
+        showActivityFeed={s.showActivityFeed}
+        onToggleActivityFeed={() => s.setShowActivityFeed(prev => !prev)}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
         onSignOut={() => signOut(auth)}
@@ -186,7 +189,19 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
       />
 
-      {s.showArchive ? (
+      {s.showActivityFeed ? (
+        <ActivityFeed
+          selectedProjectId={s.selectedProjectId}
+          refreshInterval={s.refreshInterval}
+          onSelectTask={(task) => {
+            s.setShowActivityFeed(false);
+            fetchTask(task.id).then(s.handleViewLogs).catch(() => {
+              s.addToast('Could not load task — it may have been deleted', 'error');
+            });
+          }}
+          onClose={() => s.setShowActivityFeed(false)}
+        />
+      ) : s.showArchive ? (
         <ArchiveView
           archiveTasks={s.archiveTasks}
           archiveLoading={s.archiveLoading}

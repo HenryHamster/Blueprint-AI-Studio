@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Plus, LogOut } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../useAppState';
@@ -23,6 +23,8 @@ export interface HeaderBarProps {
   onToggleResearchBrowser: () => void;
   showArchive: boolean;
   onToggleArchive: () => void;
+  showActivityFeed: boolean;
+  onToggleActivityFeed: () => void;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -94,6 +96,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleResearchBrowser,
     showArchive,
     onToggleArchive,
+    showActivityFeed,
+    onToggleActivityFeed,
     onOpenNewTaskModal,
     onShowDirections,
     onSignOut,
@@ -288,6 +292,17 @@ export function HeaderBar(props: HeaderBarProps) {
           title="Archive"
         >
           <Archive className="w-4 h-4" />
+        </button>
+        <button
+          onClick={onToggleActivityFeed}
+          className={`p-2 rounded text-xs transition-colors border ${
+            showActivityFeed
+              ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+              : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+          }`}
+          title="Activity Feed"
+        >
+          <Clock className="w-4 h-4" />
         </button>
         <button
           onClick={onToggleResearchBrowser}

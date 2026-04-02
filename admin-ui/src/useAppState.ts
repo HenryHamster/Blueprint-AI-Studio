@@ -101,6 +101,9 @@ export function useAppState() {
   // Research browser state
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
 
+  // Activity feed state
+  const [showActivityFeed, setShowActivityFeed] = useState(false);
+
   // Settings state
   const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
@@ -281,6 +284,7 @@ export function useAppState() {
         if (showNewTaskModal) { setShowNewTaskModal(false); return; }
         if (logTask) { closeLogViewer(); return; }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
+        if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showArchive) { setShowArchiveState(false); return; }
         if (showDirections) { setShowDirections(false); return; }
         if (showMetrics) { setShowMetrics(false); return; }
@@ -331,7 +335,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
 
   const fetchTasks = async () => {
     try {
@@ -1236,6 +1240,8 @@ export function useAppState() {
     logTask, logLines, logsConnecting, wsDisconnected, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
+    // Activity feed
+    showActivityFeed, setShowActivityFeed,
     // New task modal
     showNewTaskModal, setShowNewTaskModal,
     newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
