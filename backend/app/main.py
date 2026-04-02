@@ -234,6 +234,55 @@ async def _init_deployment_state():
         print(f"[DEPLOY] New deploy detected — revision={_current_revision}, starting monitoring window")
 
 
+def should_rollback() -> tuple:
+    """Causation analysis: determine if failures are caused by the new deploy.
+    Returns (should_rollback: bool, reason: str, response: str).
+    Response is one of: ROLLBACK, PAUSE, SELF_HEAL"""
+    from app.shared_state import deploy_monitoring, external_health
+
+    results = deploy_monitoring["task_results"]
+    if not results:
+        return False, "No task results to analyze", "SELF_HEAL"
+
+    # 1. Are we already on last_known_good? Rollback won't help.
+    # (This is checked by the caller against DeploymentState)
+
+    # 2. Were things already broken before this deploy?
+    pre_rate = deploy_monitoring.get("pre_deploy_failure_rate", 0.0)
+    if pre_rate > 0.3:
+        return False, f"System was already failing before deploy (pre-deploy rate: {pre_rate:.0%})", "SELF_HEAL"
+
+    # 3. Are external services down?
+    failed_deps = external_health.get("failed_deps", [])
+    critical_down = [d for d in failed_deps if d in ("db", "github_api", "gcp")]
+    if critical_down:
+        return False, f"External dependency down: {', '.join(critical_down)}", "PAUSE"
+
+    # 4. Analyze post-deploy error types vs pre-deploy
+    post_failures = [r for r in results if r[1] == "failure"]
+    post_code_errors = [r for r in post_failures if r[2] == "CODE_ERROR"]
+    post_failure_rate = len(post_failures) / len(results) if results else 0
+
+    # If all failures are non-code (provision, external), don't rollback
+    if post_failures and not post_code_errors:
+        return False, "All failures are external (provision/API), not code errors", "PAUSE"
+
+    # 5. Check if failure rate is significantly higher than pre-deploy
+    if post_failure_rate <= pre_rate + 0.1:
+        return False, f"Failure rate unchanged ({post_failure_rate:.0%} vs {pre_rate:.0%} pre-deploy)", "SELF_HEAL"
+
+    # 6. High code error rate after deploy — likely caused by the deploy
+    if len(post_code_errors) >= 3 and post_failure_rate > 0.5:
+        return True, f"High code error rate after deploy: {post_failure_rate:.0%} ({len(post_code_errors)} code errors)", "ROLLBACK"
+
+    # 7. 100% failure rate is a strong signal
+    if post_failure_rate == 1.0 and len(results) >= 3:
+        return True, f"100% failure rate across {len(results)} tasks after deploy", "ROLLBACK"
+
+    # Not enough signal to attribute to deploy
+    return False, f"Failure rate {post_failure_rate:.0%} — monitoring, not yet attributable", "SELF_HEAL"
+
+
 async def _check_monitoring_window():
     """Called each orchestrator cycle. If monitoring window has elapsed without issues, mark STABLE."""
     from app.shared_state import deploy_monitoring
@@ -253,28 +302,30 @@ async def _check_monitoring_window():
         # No tasks ran during window — can't confirm, extend
         return
 
-    failures = [r for r in results if r[1] == "failure" and r[2] == "CODE_ERROR"]
-    failure_rate = len(failures) / len(results) if results else 0
-
     async with AsyncSessionLocal() as session:
         state = await session.get(DeploymentState, 1)
         if not state or state.status != DeploymentStatus.MONITORING:
             deploy_monitoring["window_start"] = None
             return
 
-        if failure_rate > 0.5:
-            # High failure rate — flag but don't auto-rollback (Phase A = detect + alert only)
-            print(f"[DEPLOY] WARNING: High failure rate during monitoring window: "
-                  f"{failure_rate:.0%} ({len(failures)}/{len(results)} tasks)")
-            state.rollback_reason = f"High failure rate: {failure_rate:.0%} ({len(failures)}/{len(results)})"
+        # Run causation analysis
+        do_rollback, reason, response = should_rollback()
+
+        if do_rollback and state.current_revision != state.last_known_good_revision:
+            # Phase B: recommend rollback with reasoning (don't auto-trigger)
+            state.rollback_reason = reason
             session.add(state)
             await session.commit()
+            print(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
+        elif response == "PAUSE":
+            # External issue — handled by _check_pause_mode
+            print(f"[DEPLOY] External issue during monitoring: {reason}")
         else:
             # Passed monitoring window — mark stable
             state.status = DeploymentStatus.STABLE
             state.last_known_good_revision = state.current_revision
             state.last_known_good_sha = state.current_sha
-            state.rollback_count = 0  # Reset consecutive rollback counter
+            state.rollback_count = 0
             session.add(state)
             await session.commit()
             print(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
@@ -386,6 +437,15 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
+    # Guard: circuit breaker must allow spawning
+    breaker = _shared_state.get_circuit_breaker(str(project.id))
+    if breaker["state"] == "OPEN":
+        # Check if cooldown has elapsed → transition to HALF-OPEN
+        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+            breaker["state"] = "HALF_OPEN"
+            print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+        else:
+            return  # Still in cooldown
     # Guard: must have active directions
     active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
     if not active_directions:
@@ -2710,22 +2770,29 @@ async def update_agent_status(
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
 
-        # Circuit breaker for autonomous tasks: pause autonomy after consecutive failures
+        # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
-            _autonomous_failure_counts[project_key] = _autonomous_failure_counts.get(project_key, 0) + 1
-            if _autonomous_failure_counts[project_key] >= 3:
-                try:
-                    project = await session.get(Project, task.project_id)
-                    if project and project.autonomous_enabled:
-                        project.autonomous_enabled = False
-                        session.add(project)
-                        await session.commit()
-                        await broadcast_to_project(project_key, "autonomous_paused",
-                                                   {"reason": "3 consecutive autonomous task failures"})
-                        print(f"[AUTONOMOUS] Paused project {project_key} after 3 consecutive failures")
-                except Exception as e:
-                    print(f"[AUTONOMOUS] Error in circuit breaker: {e}")
+            breaker = _shared_state.get_circuit_breaker(project_key)
+            breaker["failure_count"] += 1
+            breaker["success_count"] = 0
+
+            # HALF-OPEN test task failed → back to OPEN with doubled cooldown
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+                breaker["state"] = "OPEN"
+                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
+                breaker["opened_at"] = datetime.utcnow()
+                breaker["half_open_task_id"] = None
+                print(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
+
+            # CLOSED → OPEN after 3 consecutive failures
+            elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
+                breaker["state"] = "OPEN"
+                breaker["opened_at"] = datetime.utcnow()
+                breaker["cooldown_seconds"] = breaker["base_cooldown"]
+                await broadcast_to_project(project_key, "autonomous_paused",
+                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
+                print(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
         # When review/fix fails permanently, cancel the original create task so rollup
         # skips it (via cancelled-child logic) instead of hanging forever.
         # Other children's work is preserved — only this PR is excluded from the rollup.
@@ -2751,8 +2818,20 @@ async def update_agent_status(
                         print(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}")
 
         if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
-            # Reset failure counter on success
-            _autonomous_failure_counts.pop(str(task.project_id), None)
+            project_key = str(task.project_id)
+            breaker = _shared_state.get_circuit_breaker(project_key)
+            breaker["failure_count"] = 0
+            breaker["success_count"] += 1
+
+            # HALF-OPEN test task succeeded → back to CLOSED
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+                breaker["state"] = "CLOSED"
+                breaker["cooldown_seconds"] = breaker["base_cooldown"]
+                breaker["half_open_task_id"] = None
+                print(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
+            elif breaker["state"] == "OPEN":
+                # Shouldn't happen (OPEN blocks spawning), but reset if it does
+                breaker["state"] = "CLOSED"
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
@@ -2828,23 +2907,25 @@ async def update_agent_status(
                     except Exception as e:
                         print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
 
-                    # PR file-path flagging: check for infrastructure file changes
-                    try:
-                        pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                        INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
-                                       "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
-                                       "agent/src/index.ts", "CLAUDE.md"}
-                        touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
-                        if touched_infra:
-                            task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
-                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
-                            session.add(task)
-                            await session.commit()
-                            print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
-                            # Flag for extended deploy monitoring window
-                            _shared_state.deploy_monitoring["is_extended"] = True
-                    except Exception as e:
-                        print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
+                    # PR file-path flagging: check for infrastructure file changes (self-repo only)
+                    project = await session.get(Project, task.project_id)
+                    if project and project.is_self_repo:
+                        try:
+                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                            INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
+                                           "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
+                                           "agent/src/index.ts", "CLAUDE.md"}
+                            touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
+                            if touched_infra:
+                                task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
+                                task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
+                                session.add(task)
+                                await session.commit()
+                                print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
+                                # Flag for extended deploy monitoring window
+                                _shared_state.deploy_monitoring["is_extended"] = True
+                        except Exception as e:
+                            print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
                         review_task = await _spawn_pipeline_task(

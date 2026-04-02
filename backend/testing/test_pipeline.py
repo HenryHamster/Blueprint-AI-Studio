@@ -16,6 +16,7 @@ from app.main import (
     _log_file_overlaps,
     classify_failure,
     record_task_result,
+    should_rollback,
     MAX_REVIEW_FIX_ITERATIONS,
 )
 from app.models import Task, TaskStatus, DeploymentStatus
@@ -304,6 +305,94 @@ class TestDependencyValidation:
     def test_out_of_range_ignored(self):
         tasks = [{"title": "A", "depends_on_indices": [99]}]
         assert _validate_plan_dependencies(tasks) is True
+
+
+# ── Causation Analysis ──────────────────────────────────────────────────────
+
+class TestCausationAnalysis:
+    def _setup_monitoring(self, results, pre_rate=0.0, failed_deps=None):
+        import app.shared_state as ss
+        ss.deploy_monitoring["task_results"] = results
+        ss.deploy_monitoring["pre_deploy_failure_rate"] = pre_rate
+        ss.external_health["failed_deps"] = failed_deps or []
+        ss.external_health["db"] = "db" not in (failed_deps or [])
+        ss.external_health["github_api"] = "github_api" not in (failed_deps or [])
+        ss.external_health["gcp"] = "gcp" not in (failed_deps or [])
+
+    def test_no_results(self):
+        self._setup_monitoring([])
+        do_rb, reason, response = should_rollback()
+        assert not do_rb
+        assert response == "SELF_HEAL"
+
+    def test_pre_deploy_already_broken(self):
+        results = [("ts", "failure", "CODE_ERROR")] * 5
+        self._setup_monitoring(results, pre_rate=0.5)
+        do_rb, _, response = should_rollback()
+        assert not do_rb
+        assert response == "SELF_HEAL"
+
+    def test_external_dep_down_pauses(self):
+        results = [("ts", "failure", "CODE_ERROR")] * 5
+        self._setup_monitoring(results, failed_deps=["db"])
+        do_rb, _, response = should_rollback()
+        assert not do_rb
+        assert response == "PAUSE"
+
+    def test_only_provision_failures(self):
+        results = [("ts", "failure", "PROVISION_FAILURE")] * 5
+        self._setup_monitoring(results)
+        do_rb, _, response = should_rollback()
+        assert not do_rb
+        assert response == "PAUSE"
+
+    def test_high_code_error_rate_rollback(self):
+        results = [("ts", "failure", "CODE_ERROR")] * 4 + [("ts", "success", "")]
+        self._setup_monitoring(results)
+        do_rb, _, response = should_rollback()
+        assert do_rb
+        assert response == "ROLLBACK"
+
+    def test_100_percent_failure_rollback(self):
+        results = [("ts", "failure", "CODE_ERROR")] * 3
+        self._setup_monitoring(results)
+        do_rb, _, response = should_rollback()
+        assert do_rb
+        assert response == "ROLLBACK"
+
+    def test_low_failure_rate_self_heal(self):
+        results = [("ts", "success", "")] * 8 + [("ts", "failure", "CODE_ERROR")] * 2
+        self._setup_monitoring(results)
+        do_rb, _, response = should_rollback()
+        assert not do_rb
+        assert response == "SELF_HEAL"
+
+
+# ── Circuit Breaker ─────────────────────────────────────────────────────────
+
+class TestCircuitBreaker:
+    def test_initial_state_is_closed(self):
+        import app.shared_state as ss
+        breaker = ss.get_circuit_breaker("test-project-cb")
+        assert breaker["state"] == "CLOSED"
+        assert breaker["failure_count"] == 0
+
+    def test_breaker_state_persistence(self):
+        import app.shared_state as ss
+        breaker = ss.get_circuit_breaker("test-project-cb2")
+        breaker["state"] = "OPEN"
+        breaker["failure_count"] = 5
+        # Same project returns same dict
+        same = ss.get_circuit_breaker("test-project-cb2")
+        assert same["state"] == "OPEN"
+        assert same["failure_count"] == 5
+
+    def test_different_projects_independent(self):
+        import app.shared_state as ss
+        b1 = ss.get_circuit_breaker("proj-a")
+        b2 = ss.get_circuit_breaker("proj-b")
+        b1["state"] = "OPEN"
+        assert b2["state"] == "CLOSED"
 
 
 # ── Review-Fix Iteration Cap ───────────────────────────────────────────────

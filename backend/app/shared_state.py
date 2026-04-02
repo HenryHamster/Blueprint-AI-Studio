@@ -19,6 +19,25 @@ runtime_config: Dict = {
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
 last_idle_check: Optional[datetime] = None
 
+# --- Circuit Breaker (Hystrix-inspired) ---
+# Per-project circuit breaker state for autonomous task spawning
+# States: CLOSED (normal), OPEN (tripped), HALF_OPEN (testing one task)
+circuit_breakers: Dict[str, Dict] = {}  # project_id -> breaker state
+
+def get_circuit_breaker(project_id: str) -> Dict:
+    """Get or create circuit breaker state for a project."""
+    if project_id not in circuit_breakers:
+        circuit_breakers[project_id] = {
+            "state": "CLOSED",           # CLOSED, OPEN, HALF_OPEN
+            "failure_count": 0,          # consecutive failures
+            "success_count": 0,          # consecutive successes (for half-open)
+            "opened_at": None,           # when the breaker tripped
+            "cooldown_seconds": 1800,    # 30 min initial cooldown
+            "base_cooldown": 1800,       # for exponential backoff reset
+            "half_open_task_id": None,   # the test task in HALF_OPEN
+        }
+    return circuit_breakers[project_id]
+
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 import asyncio
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task

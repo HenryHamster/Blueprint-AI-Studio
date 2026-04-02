@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Settings, GitBranch, RotateCcw, Loader2 } from 'lucide-react';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, Play, Pause, RotateCw, Wrench, CheckCircle } from 'lucide-react';
 
 
 export interface MaxPlanAccount {
@@ -52,6 +52,13 @@ interface SettingsDropdownProps {
   onRestartOrchestrator: () => Promise<void>;
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
+  // Deploy state
+  deployState: Record<string, any> | null;
+  onPausePipeline: () => Promise<void>;
+  onResumePipeline: () => Promise<void>;
+  onRollback: () => Promise<void>;
+  onMarkStable: () => Promise<void>;
+  onRepairState: () => Promise<void>;
 }
 
 function relativeTime(ms: number): string {
@@ -101,6 +108,12 @@ export function SettingsDropdown({
   onRestartOrchestrator,
   anyAutonomousEnabled,
   onPauseAllAutonomous,
+  deployState,
+  onPausePipeline,
+  onResumePipeline,
+  onRollback,
+  onMarkStable,
+  onRepairState,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -402,6 +415,83 @@ export function SettingsDropdown({
             >
               Pause All Autonomous
             </button>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mt-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <Shield className="w-3 h-3" /> Deploy Health
+            </h4>
+            {deployState ? (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-neutral-500">Status</span>
+                  <span className={`text-[11px] font-semibold ${
+                    deployState.status === 'STABLE' ? 'text-emerald-400' :
+                    deployState.status === 'MONITORING' ? 'text-blue-400' :
+                    deployState.status === 'PAUSED' ? 'text-amber-400' :
+                    deployState.status === 'ROLLED_BACK' ? 'text-red-400' :
+                    deployState.status === 'HALTED' ? 'text-red-500' : 'text-neutral-400'
+                  }`}>{deployState.status}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-neutral-500">SHA</span>
+                  <span className="text-[11px] text-neutral-300 font-mono">{deployState.current_sha?.slice(0, 8) || '—'}</span>
+                </div>
+                {deployState.failure_rate > 0 && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-neutral-500">Failure Rate</span>
+                    <span className={`text-[11px] font-mono ${deployState.failure_rate > 0.3 ? 'text-red-400' : 'text-neutral-300'}`}>
+                      {(deployState.failure_rate * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                )}
+                {deployState.monitoring_window && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-neutral-500">Monitor</span>
+                    <span className="text-[11px] text-blue-400 font-mono">{deployState.monitoring_window.percent}%</span>
+                  </div>
+                )}
+                {deployState.rollback_reason && (
+                  <p className="text-[10px] text-amber-400/80 bg-amber-950/20 rounded px-2 py-1 mt-1">{deployState.rollback_reason}</p>
+                )}
+                {deployState.pause_reason && (
+                  <p className="text-[10px] text-amber-400/80 bg-amber-950/20 rounded px-2 py-1 mt-1">{deployState.pause_reason}</p>
+                )}
+                <div className="flex gap-1.5 mt-2">
+                  {deployState.status === 'PAUSED' || deployState.status === 'HALTED' ? (
+                    <button onClick={onResumePipeline}
+                      className="flex-1 bg-emerald-950/30 hover:bg-emerald-900/40 text-emerald-400 text-[10px] py-1 rounded transition-colors border border-emerald-900/50 flex items-center justify-center gap-1">
+                      <Play className="w-2.5 h-2.5" /> Resume
+                    </button>
+                  ) : (
+                    <button onClick={onPausePipeline}
+                      className="flex-1 bg-amber-950/30 hover:bg-amber-900/40 text-amber-400 text-[10px] py-1 rounded transition-colors border border-amber-900/50 flex items-center justify-center gap-1">
+                      <Pause className="w-2.5 h-2.5" /> Pause
+                    </button>
+                  )}
+                  {deployState.status === 'MONITORING' && (
+                    <button onClick={onMarkStable}
+                      className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-emerald-400 text-[10px] py-1 rounded transition-colors border border-neutral-700 flex items-center justify-center gap-1">
+                      <CheckCircle className="w-2.5 h-2.5" /> Stable
+                    </button>
+                  )}
+                </div>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => { if (window.confirm('Rollback to last known good revision? This will pause the pipeline.')) onRollback(); }}
+                    disabled={!deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha?.slice(0, 8)}
+                    className="flex-1 bg-red-950/30 hover:bg-red-900/40 disabled:opacity-30 disabled:cursor-not-allowed text-red-400 text-[10px] py-1 rounded transition-colors border border-red-900/50 flex items-center justify-center gap-1">
+                    <RotateCw className="w-2.5 h-2.5" /> Rollback
+                  </button>
+                  <button onClick={onRepairState}
+                    className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-[10px] py-1 rounded transition-colors border border-neutral-700 flex items-center justify-center gap-1">
+                    <Wrench className="w-2.5 h-2.5" /> Repair
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <p className="text-[11px] text-neutral-600">Loading...</p>
+            )}
           </div>
 
           <div className="border-t border-neutral-800 pt-3 mt-3">

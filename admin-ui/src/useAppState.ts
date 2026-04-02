@@ -570,6 +570,99 @@ export function useAppState() {
     }
   };
 
+  // --- Deploy State ---
+  const [deployState, setDeployState] = useState<Record<string, any> | null>(null);
+
+  const fetchDeployState = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/deploy-state`);
+      if (res.ok) setDeployState(await res.json());
+    } catch { /* ignore */ }
+  };
+
+  const handlePausePipeline = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/pause`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      addToast('Pipeline paused', 'success');
+      fetchDeployState();
+    } catch (error) {
+      addToast('Failed to pause pipeline', 'error');
+      throw error;
+    }
+  };
+
+  const handleResumePipeline = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/resume`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      addToast('Pipeline resumed', 'success');
+      fetchDeployState();
+      fetchTasks();
+    } catch (error) {
+      addToast('Failed to resume pipeline', 'error');
+      throw error;
+    }
+  };
+
+  const handleRollback = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/rollback`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || res.statusText);
+      }
+      const data = await res.json();
+      addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
+      fetchDeployState();
+    } catch (error: any) {
+      addToast(`Rollback failed: ${error.message}`, 'error');
+      throw error;
+    }
+  };
+
+  const handleMarkStable = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/mark-stable`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      addToast('Deploy marked stable', 'success');
+      fetchDeployState();
+    } catch (error) {
+      addToast('Failed to mark stable', 'error');
+      throw error;
+    }
+  };
+
+  const handleRepairState = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/repair-state`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      const data = await res.json();
+      addToast(`Repaired ${data.count} issue${data.count !== 1 ? 's' : ''}`, 'success');
+      fetchTasks();
+    } catch (error) {
+      addToast('State repair failed', 'error');
+      throw error;
+    }
+  };
+
+  // Fetch deploy state on mount and periodically
+  useEffect(() => {
+    fetchDeployState();
+    const id = setInterval(fetchDeployState, 30000);
+    return () => clearInterval(id);
+  }, []);
+
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
@@ -1127,5 +1220,8 @@ export function useAppState() {
     showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,
     // Status bar
     apiHealthy, wsConnected, lastFetchTime,
+    // Deploy state
+    deployState, handlePausePipeline, handleResumePipeline,
+    handleRollback, handleMarkStable, handleRepairState,
   };
 }

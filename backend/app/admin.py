@@ -1335,3 +1335,149 @@ async def mark_deploy_stable(
     deploy_monitoring["window_start"] = None
     print(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
     return {"status": "stable", "sha": state.current_sha}
+
+
+@router.post("/deploy-state/rollback")
+async def trigger_rollback(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """One-click rollback: shift Cloud Run traffic to last_known_good_revision.
+    Pauses the pipeline and records the rollback in deployment state."""
+    import subprocess
+    from app.shared_state import runtime_config, deploy_monitoring
+
+    state = await session.get(DeploymentState, 1)
+    if not state:
+        raise HTTPException(status_code=404, detail="No deployment state found")
+
+    if not state.last_known_good_revision or state.last_known_good_revision == state.current_revision:
+        raise HTTPException(status_code=400, detail="No previous good revision to rollback to")
+
+    # Get causation analysis for the rollback reason
+    from app.main import should_rollback
+    _, analysis_reason, _ = should_rollback()
+
+    # Attempt Cloud Run traffic shift via gcloud
+    import os
+    project_id = os.getenv("GCP_PROJECT_ID", "")
+    region = os.getenv("GCP_REGION", "us-central1")
+    service = "blueprint-orchestrator"
+
+    rollback_revision = state.last_known_good_revision
+    rollback_error = None
+
+    try:
+        result = subprocess.run(
+            ["gcloud", "run", "services", "update-traffic", service,
+             "--to-revisions", f"{rollback_revision}=100",
+             "--region", region, "--project", project_id],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            rollback_error = result.stderr[:500]
+            print(f"[ADMIN] Cloud Run rollback failed: {rollback_error}")
+    except Exception as e:
+        rollback_error = str(e)[:500]
+        print(f"[ADMIN] Rollback command failed: {e}")
+
+    # Update deployment state regardless of gcloud result
+    state.status = DeploymentStatus.ROLLED_BACK
+    state.rolled_back_from_sha = state.current_sha
+    state.rollback_reason = f"Manual rollback: {analysis_reason}"
+    state.rollback_count += 1
+    state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+    session.add(state)
+    await session.commit()
+
+    # Pause pipeline
+    runtime_config["max_concurrent_vms"] = 0
+    deploy_monitoring["window_start"] = None
+
+    print(f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}")
+
+    return {
+        "status": "rolled_back" if not rollback_error else "rollback_requested",
+        "from_sha": state.current_sha,
+        "to_revision": rollback_revision,
+        "to_sha": state.last_known_good_sha,
+        "reason": analysis_reason,
+        "gcloud_error": rollback_error,
+        "pipeline_paused": True,
+    }
+
+
+@router.post("/repair-state")
+async def repair_state(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Post-rollback state audit and repair. Fixes stuck tasks, orphaned parents, stale evaluating tasks."""
+    from app.models import TaskHistory
+    repairs = []
+
+    # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
+    fifteen_min_ago = datetime.utcnow() - timedelta(minutes=15)
+    stuck_tasks = (await session.execute(
+        select(Task).where(
+            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            Task.vm_instance_id.isnot(None),
+        )
+    )).scalars().all()
+
+    for t in stuck_tasks:
+        cutoff = t.last_heartbeat or t.started_at or t.created_at
+        if cutoff and cutoff < fifteen_min_ago:
+            t.status = TaskStatus.FAILED
+            t.latest_status_message = f"Repaired: stuck in {t.status} with no heartbeat since {cutoff.isoformat()}"
+            session.add(t)
+            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "stuck_no_heartbeat"}))
+            repairs.append(f"Failed stuck task {t.id}")
+
+            # Clean up VM
+            if t.vm_instance_id:
+                try:
+                    from app.compute import delete_agent_vm
+                    import asyncio
+                    asyncio.create_task(delete_agent_vm(t.vm_instance_id))
+                except Exception:
+                    pass
+
+    # 2. EVALUATING tasks where all children are terminal but parent not updated
+    evaluating_tasks = (await session.execute(
+        select(Task).where(Task.status == TaskStatus.EVALUATING)
+    )).scalars().all()
+
+    for parent in evaluating_tasks:
+        children = (await session.execute(
+            select(Task).where(Task.parent_task_id == parent.id)
+        )).scalars().all()
+
+        if not children:
+            continue
+
+        all_terminal = all(c.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED] for c in children)
+        if all_terminal:
+            # Re-trigger rollup by setting back to EVALUATING (the orchestrator will pick it up)
+            parent.latest_status_message = "Repaired: all children terminal, re-triggering rollup"
+            session.add(parent)
+            session.add(TaskHistory(task_id=parent.id, action="REPAIR", details={"reason": "stale_evaluating"}))
+            repairs.append(f"Re-triggered rollup for {parent.id}")
+
+    # 3. Tasks with parent_task_id pointing to non-existent tasks
+    all_task_ids = set(str(t.id) for t in (await session.execute(select(Task.id))).scalars().all())
+    orphan_children = (await session.execute(
+        select(Task).where(Task.parent_task_id.isnot(None))
+    )).scalars().all()
+
+    for t in orphan_children:
+        if str(t.parent_task_id) not in all_task_ids:
+            t.parent_task_id = None
+            t.latest_status_message = f"Repaired: cleared orphaned parent reference"
+            session.add(t)
+            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
+            repairs.append(f"Cleared orphaned parent ref on {t.id}")
+
+    await session.commit()
+    print(f"[ADMIN] State repair completed: {len(repairs)} repairs")
+    return {"repairs": repairs, "count": len(repairs)}

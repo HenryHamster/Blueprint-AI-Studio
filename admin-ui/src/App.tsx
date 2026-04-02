@@ -144,6 +144,12 @@ export default function App() {
         onRestartOrchestrator={s.handleRestartOrchestrator}
         anyAutonomousEnabled={s.projects.some(p => p.autonomous_enabled)}
         onPauseAllAutonomous={s.handlePauseAllAutonomous}
+        deployState={s.deployState}
+        onPausePipeline={s.handlePausePipeline}
+        onResumePipeline={s.handleResumePipeline}
+        onRollback={s.handleRollback}
+        onMarkStable={s.handleMarkStable}
+        onRepairState={s.handleRepairState}
       />
 
       <div

@@ -67,6 +67,13 @@ export interface HeaderBarProps {
   onRestartOrchestrator: () => Promise<void>;
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
+  // Deploy state
+  deployState: Record<string, any> | null;
+  onPausePipeline: () => Promise<void>;
+  onResumePipeline: () => Promise<void>;
+  onRollback: () => Promise<void>;
+  onMarkStable: () => Promise<void>;
+  onRepairState: () => Promise<void>;
 }
 
 
@@ -263,6 +270,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onRestartOrchestrator={onRestartOrchestrator}
           anyAutonomousEnabled={anyAutonomousEnabled}
           onPauseAllAutonomous={onPauseAllAutonomous}
+          deployState={props.deployState}
+          onPausePipeline={props.onPausePipeline}
+          onResumePipeline={props.onResumePipeline}
+          onRollback={props.onRollback}
+          onMarkStable={props.onMarkStable}
+          onRepairState={props.onRepairState}
         />
         <button
           onClick={onToggleArchive}

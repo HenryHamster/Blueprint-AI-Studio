@@ -61,6 +61,9 @@ class Project(SQLModel, table=True):
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)
+    # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
+    # Set True when github_owner/github_repo matches Blueprint's own repo
+    is_self_repo: bool = Field(default=False)
 
     tasks: List["Task"] = Relationship(
         back_populates="project", 
