@@ -22,11 +22,12 @@ interface TreeNode {
   isOrphan?: boolean;
 }
 
-type FilterType = 'All' | 'Active' | 'Failed' | 'Needs Review';
+type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
 
 const FILTER_CHIPS: { label: FilterType }[] = [
   { label: 'All' },
   { label: 'Active' },
+  { label: 'Blocked' },
   { label: 'Failed' },
   { label: 'Needs Review' },
 ];
@@ -34,6 +35,7 @@ const FILTER_CHIPS: { label: FilterType }[] = [
 function taskMatchesFilter(task: Task, filter: FilterType): boolean {
   if (filter === 'All') return true;
   if (filter === 'Active') return ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status);
+  if (filter === 'Blocked') return task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0;
   if (filter === 'Failed') return task.status === 'FAILED';
   if (filter === 'Needs Review') return task.requires_approval === true;
   return true;
