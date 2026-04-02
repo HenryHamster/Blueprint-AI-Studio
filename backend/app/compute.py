@@ -13,7 +13,16 @@ LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
 
 # Configuration for GCP Compute Engine
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
-GCP_ZONE = os.getenv("GCP_ZONE", "us-central1-a")
+GCP_ZONE = os.getenv("GCP_ZONE", "us-east4-b")
+FALLBACK_ZONES = [
+    GCP_ZONE,
+    "us-east4-b",
+    "us-east1-c",
+    "us-west1-b",
+    "us-west4-a",
+]
+# Track which zone each VM was created in (for delete/cleanup)
+_vm_zones: dict[str, str] = {}
 MACHINE_TYPE = os.getenv("MACHINE_TYPE", "e2-standard-2")
 
 # Networking Configuration
@@ -231,7 +240,6 @@ EOF
 
     instance_config = compute_v1.Instance()
     instance_config.name = vm_instance_id
-    instance_config.machine_type = f"zones/{GCP_ZONE}/machineTypes/{MACHINE_TYPE}"
 
     initialize_params = compute_v1.AttachedDiskInitializeParams()
     initialize_params.source_image = AGENT_IMAGE_FAMILY
@@ -245,8 +253,6 @@ EOF
 
     network_interface = compute_v1.NetworkInterface()
     network_interface.network = f"projects/{GCP_PROJECT_ID}/global/networks/{VPC_NETWORK}"
-    region = "-".join(GCP_ZONE.split("-")[:-1])
-    network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{region}/subnetworks/{VPC_SUBNET}"
     instance_config.network_interfaces = [network_interface]
 
     metadata = compute_v1.Metadata()
@@ -266,30 +272,48 @@ EOF
 
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
-        # Delete any existing VM with this name first (stale from retries)
-        try:
-            instance_client.get(project=GCP_PROJECT_ID, zone=GCP_ZONE, instance=vm_instance_id)
-            logger.info(f"Deleting stale VM {vm_instance_id} before re-provisioning")
-            del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=GCP_ZONE, instance=vm_instance_id)
-            del_op.result()
-        except Exception:
-            pass  # VM doesn't exist — expected case
-        operation = instance_client.insert(
-            project=GCP_PROJECT_ID,
-            zone=GCP_ZONE,
-            instance_resource=instance_config
-        )
-        operation.result()
-        return operation.name
+        last_error = None
+        for zone in FALLBACK_ZONES:
+            try:
+                # Update zone-dependent config for this attempt
+                instance_config.machine_type = f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
+                zone_region = "-".join(zone.split("-")[:-1])
+                network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{VPC_SUBNET}"
+
+                # Delete any existing VM with this name first (stale from retries)
+                try:
+                    instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                    logger.info(f"Deleting stale VM {vm_instance_id} in {zone} before re-provisioning")
+                    del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                    del_op.result()
+                except Exception:
+                    pass  # VM doesn't exist — expected case
+
+                operation = instance_client.insert(
+                    project=GCP_PROJECT_ID,
+                    zone=zone,
+                    instance_resource=instance_config
+                )
+                operation.result()
+                _vm_zones[vm_instance_id] = zone
+                logger.info(f"Successfully provisioned VM {vm_instance_id} in {zone}")
+                return operation.name
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "does not have enough resources" in err_str or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str or "QUOTA" in err_str:
+                    logger.warning(f"Zone {zone} exhausted for {vm_instance_id}, trying next zone...")
+                    continue
+                # Non-zone error — don't retry
+                raise
+        raise last_error or Exception("All zones exhausted")
 
     try:
         operation_name = await asyncio.to_thread(_insert_instance)
         logger.info(f"GCP Operation completed: {operation_name}")
-        logger.info(f"Successfully provisioned VM: {vm_instance_id}")
         return True
     except Exception as e:
         logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
-        # Store error for the orchestrator to surface in status_log
         _last_provision_error[vm_instance_id] = str(e)[:300]
         return False
 
@@ -301,18 +325,29 @@ async def _delete_gcp(vm_instance_id: str):
 
     def _delete_instance():
         instance_client = compute_v1.InstancesClient()
-        operation = instance_client.delete(
-            project=GCP_PROJECT_ID,
-            zone=GCP_ZONE,
-            instance=vm_instance_id
-        )
-        operation.result()
-        return operation.name
+        # Check known zone first, then try all fallback zones
+        zones_to_try = []
+        known_zone = _vm_zones.pop(vm_instance_id, None)
+        if known_zone:
+            zones_to_try.append(known_zone)
+        zones_to_try.extend(z for z in FALLBACK_ZONES if z not in zones_to_try)
+
+        for zone in zones_to_try:
+            try:
+                instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                operation.result()
+                logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
+                return operation.name
+            except Exception as e:
+                if "was not found" in str(e) or "404" in str(e):
+                    continue
+                raise
+        logger.warning(f"VM {vm_instance_id} not found in any zone")
+        return "not_found"
 
     try:
-        operation_name = await asyncio.to_thread(_delete_instance)
-        logger.info(f"GCP Delete Operation completed: {operation_name}")
-        logger.info(f"Successfully terminated VM: {vm_instance_id}")
+        await asyncio.to_thread(_delete_instance)
         return True
     except Exception as e:
         logger.error(f"Failed to terminate VM {vm_instance_id}: {e}")
@@ -326,26 +361,30 @@ async def _cleanup_gcp(active_vm_ids: list[str]):
 
     def _list_and_delete():
         instance_client = compute_v1.InstancesClient()
-        request = compute_v1.ListInstancesRequest(
-            project=GCP_PROJECT_ID,
-            zone=GCP_ZONE,
-            filter='name:agent-vm-'
-        )
-
         orphaned_count = 0
-        for instance in instance_client.list(request=request):
-            if instance.name not in active_vm_ids:
-                logger.warning(f"Found orphaned VM in GCP: {instance.name}. Terminating...")
-                try:
-                    operation = instance_client.delete(
-                        project=GCP_PROJECT_ID,
-                        zone=GCP_ZONE,
-                        instance=instance.name
-                    )
-                    operation.result()
-                    orphaned_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to delete orphaned VM {instance.name}: {e}")
+
+        for zone in FALLBACK_ZONES:
+            try:
+                request = compute_v1.ListInstancesRequest(
+                    project=GCP_PROJECT_ID,
+                    zone=zone,
+                    filter='name:agent-vm-'
+                )
+                for instance in instance_client.list(request=request):
+                    if instance.name not in active_vm_ids:
+                        logger.warning(f"Found orphaned VM in GCP: {instance.name} ({zone}). Terminating...")
+                        try:
+                            operation = instance_client.delete(
+                                project=GCP_PROJECT_ID,
+                                zone=zone,
+                                instance=instance.name
+                            )
+                            operation.result()
+                            orphaned_count += 1
+                        except Exception as e:
+                            logger.error(f"Failed to delete orphaned VM {instance.name}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to list VMs in zone {zone}: {e}")
 
         return orphaned_count
 
