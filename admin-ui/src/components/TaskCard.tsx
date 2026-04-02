@@ -326,7 +326,7 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequest
         </div>
       ) : null}
 
-      {task.status === 'COMPLETED' && task.pr_url && isSafeUrl(task.pr_url) ? (
+      {(task.status === 'COMPLETED' || task.status === 'EVALUATING') && task.pr_url && isSafeUrl(task.pr_url) ? (
         <a
           href={task.pr_url}
           target="_blank"
@@ -335,6 +335,16 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequest
         >
           <ExternalLink className="w-3.5 h-3.5" />
           View Pull Request
+        </a>
+      ) : (task.task_type === 'review' || task.task_type === 'fix') && task.repo_url && task.payloads?.[0]?.pr_number && isSafeUrl(`${task.repo_url}/pull/${task.payloads[0].pr_number}`) ? (
+        <a
+          href={`${task.repo_url}/pull/${task.payloads[0].pr_number}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-[11px] mb-3 transition-colors"
+        >
+          <ExternalLink className="w-3 h-3" />
+          PR #{task.payloads[0].pr_number as number}
         </a>
       ) : null}
 

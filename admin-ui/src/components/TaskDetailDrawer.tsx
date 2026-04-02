@@ -176,6 +176,8 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
         const baseBranch = payload.base_branch as string | undefined;
         const prNumber = payload.pr_number as number | undefined;
         const branch = payload.branch as string | undefined;
+        const payloadRepoUrl = task.repo_url ?? commitArtifacts[0]?.repo_url;
+        const prLink = prNumber && payloadRepoUrl ? `${payloadRepoUrl}/pull/${prNumber}` : undefined;
         return (
           <>
             <SectionHeader>Task Config</SectionHeader>
@@ -187,7 +189,17 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
               </DetailRow>
             )}
             {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm">{baseBranch}</span></DetailRow>}
-            {prNumber && <DetailRow label="PR Number"><span className="font-mono text-sm">#{prNumber}</span></DetailRow>}
+            {prNumber && (
+              <DetailRow label="PR Number">
+                {prLink && isSafeUrl(prLink) ? (
+                  <a href={prLink} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 font-mono text-sm text-blue-400 hover:text-blue-300 transition-colors">
+                    #{prNumber}<ExternalLink className="w-3 h-3" />
+                  </a>
+                ) : (
+                  <span className="font-mono text-sm">#{prNumber}</span>
+                )}
+              </DetailRow>
+            )}
             {branch && <DetailRow label="Branch"><span className="font-mono text-sm">{branch}</span></DetailRow>}
           </>
         );
