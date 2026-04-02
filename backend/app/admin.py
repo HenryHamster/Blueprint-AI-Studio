@@ -53,7 +53,7 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 
 @router.get("/tasks")
 async def get_all_tasks(
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
     status: List[TaskStatus] = Query(default=[]),
     terminal_only: bool = Query(False),

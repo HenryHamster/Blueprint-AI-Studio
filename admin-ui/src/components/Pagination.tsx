@@ -33,6 +33,8 @@ export function Pagination({ page, onPageChange, taskCount, serverTaskCount, lim
           <option value={25}>25 / page</option>
           <option value={50}>50 / page</option>
           <option value={100}>100 / page</option>
+          <option value={200}>200 / page</option>
+          <option value={10000}>All</option>
         </select>
       </div>
       <div className="flex items-center gap-3">
