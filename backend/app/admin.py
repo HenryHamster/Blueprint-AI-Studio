@@ -13,7 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert
 from app.auth import get_current_user, require_admin
 from app.compute import delete_agent_vm
 from app.github import generate_installation_access_token
@@ -2188,3 +2188,49 @@ def _count_research_findings(logs: Optional[str]) -> int:
     except (json.JSONDecodeError, AttributeError):
         pass
     return 0
+
+
+# ── Alerts ───────────────────────────────────────────────────────────────────
+
+@router.get("/alerts")
+async def get_alerts(
+    project_id: Optional[str] = None,
+    include_dismissed: bool = False,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    query = select(Alert).order_by(Alert.created_at.desc())
+    if project_id:
+        query = query.where(Alert.project_id == uuid.UUID(project_id))
+    if not include_dismissed:
+        query = query.where(Alert.dismissed_at.is_(None))
+    result = await session.execute(query)
+    alerts = result.scalars().all()
+    return [
+        {
+            "id": str(a.id),
+            "project_id": str(a.project_id),
+            "severity": a.severity,
+            "title": a.title,
+            "message": a.message,
+            "task_id": str(a.task_id) if a.task_id else None,
+            "created_at": a.created_at.isoformat(),
+            "dismissed_at": a.dismissed_at.isoformat() if a.dismissed_at else None,
+        }
+        for a in alerts
+    ]
+
+
+@router.post("/alerts/{alert_id}/dismiss")
+async def dismiss_alert(
+    alert_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    alert = await session.get(Alert, uuid.UUID(alert_id))
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.dismissed_at = datetime.utcnow()
+    session.add(alert)
+    await session.commit()
+    return {"status": "dismissed"}

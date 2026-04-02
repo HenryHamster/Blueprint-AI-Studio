@@ -11,6 +11,7 @@ import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask } from './api';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
+import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
@@ -314,6 +315,16 @@ export default function App() {
       </div>
 
       <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} onSelectTask={s.handleViewLogs} onApproveTask={s.handleApprove} />
+
+      <AlertsBanner
+        alerts={s.alerts}
+        onDismiss={s.dismissAlert}
+        onViewTask={(taskId) => {
+          const task = s.tasks.find(t => t.id === taskId);
+          if (task) s.handleViewLogs(task);
+          else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
+        }}
+      />
 
       {s.error && (
         <div className="mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">

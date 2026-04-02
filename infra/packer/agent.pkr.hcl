@@ -14,7 +14,7 @@ variable "project_id" {
 
 variable "zone" {
   type    = string
-  default = "us-central1-b"
+  default = "us-central1-f"
 }
 
 source "googlecompute" "agent_image" {

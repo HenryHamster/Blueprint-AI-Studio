@@ -164,6 +164,22 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
         target.status_log = (target.status_log or []) + [entry]
 
 
+class AlertSeverity(str, Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+class Alert(SQLModel, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    severity: AlertSeverity = Field(default=AlertSeverity.ERROR, sa_column=Column(String, default=AlertSeverity.ERROR))
+    title: str
+    message: str
+    task_id: Optional[uuid.UUID] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    dismissed_at: Optional[datetime] = None
+
+
 class DeploymentStatus(str, Enum):
     MONITORING = "MONITORING"    # New deploy, within observation window
     STABLE = "STABLE"            # Observation window passed, no issues
