@@ -91,3 +91,8 @@ See `.env.example` for the full list.
 - Short-lived JWTs scoped to individual tasks
 - 1-hour hard TTL + heartbeat-based reaper + orphan cleanup
 - GitHub tokens refreshed before each push operation
+
+## Changelog
+
+### 2026-04-01
+- Security and robustness audit completed with 23 fixes applied
