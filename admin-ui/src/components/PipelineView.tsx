@@ -3,6 +3,8 @@ import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 
+const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
+
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
   IN_PROGRESS: 'bg-yellow-500',
@@ -537,7 +539,6 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
   const expandAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, true])));
   const collapseAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, false])));
 
-  const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
   const activeTaskIds = useMemo(
     () => tasks.filter(t => ACTIVE_STATUSES.includes(t.status)).map(t => t.id),
     [tasks],

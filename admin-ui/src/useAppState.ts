@@ -139,6 +139,11 @@ export function useAppState() {
 
   // View toggle state
   const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline'>('viewMode', 'kanban');
+  const [compactMode, setCompactMode] = usePersistedState<boolean>('compactMode', false);
+  const [groupBy, setGroupBy] = usePersistedState<'status' | 'type' | 'project'>('groupBy', 'status');
+
+  // Kanban column preferences (order + visibility)
+  const [columnPrefs, setColumnPrefs] = usePersistedState<{ id: string; visible: boolean }[]>('kanban_column_prefs', []);
 
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
@@ -807,6 +812,20 @@ export function useAppState() {
     });
   };
 
+  const bulkColumnToggle = (taskIds: string[], selected: boolean) => {
+    setSelectedTaskIds(prev => {
+      const next = new Set(prev);
+      for (const id of taskIds) {
+        if (selected) {
+          next.add(id);
+        } else {
+          next.delete(id);
+        }
+      }
+      return next;
+    });
+  };
+
   const fetchSettings = async () => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/settings`);
@@ -1295,12 +1314,16 @@ export function useAppState() {
     actionLoadingMap,
     fetchTasks, handleApprove, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
-    selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection,
+    selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
     confirmDialog, setConfirmDialog,
     // Toasts
     toasts, addToast, dismissToast,
     // View
     viewMode, setViewMode,
+    compactMode, setCompactMode,
+    groupBy, setGroupBy,
+    // Column preferences
+    columnPrefs, setColumnPrefs,
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
     // Projects

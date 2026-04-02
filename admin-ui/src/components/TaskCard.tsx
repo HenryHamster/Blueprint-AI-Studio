@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { useState, useEffect, useRef, memo } from 'react';
-import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench } from 'lucide-react';
+import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
+import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal } from 'lucide-react';
 
 export interface ResearchFinding {
   type?: string;
@@ -109,6 +109,12 @@ interface TaskCardProps {
   task: Task;
   maxRetries?: number;
   actionLoading?: string;
+  compact?: boolean;
+  selectionMode?: boolean;
+  onToggleTaskSelection?: (id: string) => void;
+  colIdx?: number;
+  cardIdx?: number;
+  onNavigate?: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
@@ -234,7 +240,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, maxRetries, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -244,6 +250,8 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
   const [confirmCountdown, setConfirmCountdown] = useState(3);
   const [showChangesForm, setShowChangesForm] = useState(false);
   const [changesFeedback, setChangesFeedback] = useState('');
+  const [showOverflowMenu, setShowOverflowMenu] = useState(false);
+  const overflowMenuRef = useRef<HTMLDivElement>(null);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -253,6 +261,17 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
       if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (!showOverflowMenu) return;
+    function handleClick(e: MouseEvent) {
+      if (overflowMenuRef.current && !overflowMenuRef.current.contains(e.target as Node)) {
+        setShowOverflowMenu(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [showOverflowMenu]);
 
   const handleDestructiveClick = (action: 'cancel' | 'dismiss' | 'archive', callback: () => void) => {
     if (confirmAction === action) {
@@ -288,14 +307,116 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
 
+  const handleRootKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    switch (e.key) {
+      case 'Enter':
+        e.preventDefault();
+        onViewLogs(task);
+        break;
+      case ' ':
+        e.preventDefault();
+        if (selectionMode && onToggleTaskSelection) {
+          onToggleTaskSelection(task.id);
+        } else {
+          onViewLogs(task);
+        }
+        break;
+      case 'Escape':
+        e.preventDefault();
+        (e.currentTarget as HTMLElement).blur();
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        if (colIdx !== undefined && cardIdx !== undefined) onNavigate?.(colIdx, cardIdx, 'down');
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        if (colIdx !== undefined && cardIdx !== undefined) onNavigate?.(colIdx, cardIdx, 'up');
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        if (colIdx !== undefined && cardIdx !== undefined) onNavigate?.(colIdx, cardIdx, 'right');
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        if (colIdx !== undefined && cardIdx !== undefined) onNavigate?.(colIdx, cardIdx, 'left');
+        break;
+    }
+  };
+
+  const taskTypeBorderColor: Record<string, string> = {
+    create: 'border-l-amber-500',
+    plan: 'border-l-blue-400',
+    research: 'border-l-cyan-400',
+    review: 'border-l-purple-400',
+    fix: 'border-l-green-400',
+    refactor: 'border-l-orange-400',
+    docs: 'border-l-gray-400',
+    security_audit: 'border-l-red-400',
+    qa: 'border-l-teal-400',
+    deps: 'border-l-yellow-400',
+    migrate: 'border-l-pink-400',
+  };
+  const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
+
   return (
-    <div className={`bg-neutral-900 p-4 rounded-xl border transition-shadow ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-l-4 border-l-neutral-500 border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-neutral-800 shadow-sm hover:shadow-md hover:border-neutral-700'}`}>
+    <div
+      ref={ref}
+      tabIndex={0}
+      role="article"
+      onKeyDown={handleRootKeyDown}
+      className={`relative group bg-neutral-900 rounded-xl border border-l-4 ${borderColor} transition-shadow outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 ${compact ? 'p-2.5' : 'p-4'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-neutral-800 shadow-sm hover:shadow-md hover:border-neutral-700'}`}
+    >
       <div className="flex justify-between items-start mb-3">
         <div className="flex items-center gap-2 pr-2 overflow-hidden">
           {isChild && <span title="Child Task" className="shrink-0 flex items-center"><SplitSquareHorizontal className="w-4 h-4 text-neutral-500" /></span>}
           <h3 className={`font-medium text-sm truncate ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`} title={task.title}>{task.title}</h3>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {/* Hover quick-action toolbar — inline in header to avoid overlapping the badge cluster */}
+          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+            {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') && (
+              <button
+                title="Approve"
+                onClick={(e) => { e.stopPropagation(); onApprove(task.id); }}
+                disabled={!!actionLoading}
+                className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <CheckCircle className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED') && (
+              <button
+                title={confirmAction === 'cancel' ? `Confirm cancel (${confirmCountdown}s)` : 'Cancel'}
+                onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
+                disabled={!!actionLoading}
+                className={`w-6 h-6 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+              >
+                <XCircle className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {task.status === 'FAILED' && (
+              <button
+                title="Retry"
+                onClick={(e) => { e.stopPropagation(); onRetry(task.id); }}
+                disabled={!!actionLoading}
+                className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {(task.status === 'COMPLETED' || task.status === 'CANCELLED' || task.status === 'FAILED') && (
+              <button
+                title={confirmAction === 'archive' ? `Confirm archive (${confirmCountdown}s)` : 'Archive'}
+                onClick={(e) => { e.stopPropagation(); handleDestructiveClick('archive', () => onArchive(task.id)); }}
+                disabled={!!actionLoading}
+                className={`w-6 h-6 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+              >
+                <Archive className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
           <StatusBadge status={task.status} />
           {isActive && task.last_heartbeat && (
             <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
@@ -334,19 +455,21 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
         </div>
       )}
 
-      <div className="mb-3">
-        <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-2'}`}>{task.description}</p>
-        {task.description.length > 120 && (
-          <button
-            onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}
-            className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5"
-          >
-            {descExpanded ? <>Show less <ChevronUp className="w-3 h-3" /></> : <>Show more <ChevronDown className="w-3 h-3" /></>}
-          </button>
-        )}
-      </div>
+      {!compact && (
+        <div className="mb-3">
+          <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-2'}`}>{task.description}</p>
+          {task.description.length > 120 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}
+              className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5"
+            >
+              {descExpanded ? <>Show less <ChevronUp className="w-3 h-3" /></> : <>Show more <ChevronDown className="w-3 h-3" /></>}
+            </button>
+          )}
+        </div>
+      )}
 
-      {task.latest_status_message ? (
+      {!compact && task.latest_status_message ? (
         <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
           <button
             onClick={() => setStatusExpanded(!statusExpanded)}
@@ -478,9 +601,9 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
       </div>
 
       {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') ? (
-        <div className="mt-4 flex flex-col gap-2">
-          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 py-2.5 rounded-md text-sm font-semibold transition-colors flex items-center justify-center gap-2 ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'approve' ? <Activity className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Approve & Merge
+        <div className={`flex flex-col gap-2 ${compact ? 'mt-2' : 'mt-4'}`}>
+          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-md font-semibold transition-colors flex items-center justify-center gap-2 ${compact ? 'py-1.5 text-xs' : 'py-2.5 text-sm'} ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+            {actionLoading === 'approve' ? <Activity className={compact ? 'w-3.5 h-3.5 animate-spin' : 'w-4 h-4 animate-spin'} /> : <CheckCircle className={compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} />} Approve & Merge
           </button>
           {!showChangesForm ? (
             <div className="flex gap-2">
@@ -525,59 +648,153 @@ export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading
       ) : null}
 
       {!task.requires_approval && isActive ? (
-        <div className="mt-3 flex gap-2">
-          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to cancel (${confirmCountdown}s)` : 'Cancel'}
-          </button>
-        </div>
+        compact ? (
+          <div className="mt-2" ref={overflowMenuRef}>
+            <button
+              onClick={() => setShowOverflowMenu(v => !v)}
+              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+              title="More actions"
+            >
+              <MoreHorizontal className="w-3.5 h-3.5" />
+            </button>
+            {showOverflowMenu && (
+              <div className="mt-1 flex gap-1.5">
+                <button onClick={() => { handleDestructiveClick('cancel', () => { onCancel(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`flex-1 py-1 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'cancel' ? <Activity className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />} {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Cancel'}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="mt-3 flex gap-2">
+            <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+              {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to cancel (${confirmCountdown}s)` : 'Cancel'}
+            </button>
+          </div>
+        )
       ) : null}
 
-      {isTerminal ? (
-        <div className="mt-3">
-          <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
-            {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
-          </button>
-        </div>
+      {isTerminal && task.status !== 'FAILED' ? (
+        compact ? (
+          <div className="mt-2" ref={overflowMenuRef}>
+            <button
+              onClick={() => setShowOverflowMenu(v => !v)}
+              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+              title="More actions"
+            >
+              <MoreHorizontal className="w-3.5 h-3.5" />
+            </button>
+            {showOverflowMenu && (
+              <div className="mt-1 flex gap-1.5">
+                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`flex-1 py-1 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}
+                  {confirmAction === 'archive' ? `Confirm (${confirmCountdown}s)` : 'Archive'}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="mt-3">
+            <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+              {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
+              {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
+            </button>
+          </div>
+        )
       ) : null}
 
       {task.status === 'FAILED' ? (
-        <div className="mt-3 space-y-2">
-          {editing ? (
-            <div className="space-y-2">
+        compact ? (
+          editing ? (
+            <div className="mt-2 space-y-2">
               <textarea
                 value={editPrompt}
                 onChange={e => setEditPrompt(e.target.value)}
-                className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
+                className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[80px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
               />
-              <div className="text-[10px] text-neutral-500">{editPrompt.length} characters</div>
-              <div className="flex gap-2">
+              <div className="flex gap-1.5">
                 <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
                   disabled={!!actionLoading || editPrompt.trim() === ''}
-                  className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
-                  {actionLoading === 'edit' && <Activity className="w-3.5 h-3.5 animate-spin" />}Save
+                  className={`flex-1 border py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'edit' && <Activity className="w-3 h-3 animate-spin" />}Save
                 </button>
                 <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
-                  className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
+                  className="px-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1 rounded text-xs transition-colors">
                   Cancel
                 </button>
               </div>
             </div>
           ) : (
-            <div className="flex gap-2">
-              <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-                {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Retry
-              </button>
-              <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
-                <Pencil className="w-3.5 h-3.5" /> Edit
-              </button>
-              <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
-                {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
-              </button>
-            </div>
-          )}
-        </div>
+          <div className="mt-2" ref={overflowMenuRef}>
+            <button
+              onClick={() => setShowOverflowMenu(v => !v)}
+              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+              title="More actions"
+            >
+              <MoreHorizontal className="w-3.5 h-3.5" />
+            </button>
+            {showOverflowMenu && (
+              <div className="mt-1 flex gap-1.5">
+                <button onClick={() => { onRetry(task.id); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'retry' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Retry
+                </button>
+                <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
+                  <Pencil className="w-3 h-3" />
+                </button>
+                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                  {actionLoading === 'dismiss' ? <Activity className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
+                </button>
+                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Archive">
+                  {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}{confirmAction === 'archive' ? ` (${confirmCountdown}s)` : ''}
+                </button>
+              </div>
+            )}
+          </div>
+          )
+        ) : (
+          <div className="mt-3 space-y-2">
+            {editing ? (
+              <div className="space-y-2">
+                <textarea
+                  value={editPrompt}
+                  onChange={e => setEditPrompt(e.target.value)}
+                  className={`w-full bg-neutral-950 text-neutral-100 rounded px-2 py-1.5 text-xs resize-y focus:outline-none focus:ring-1 focus:ring-blue-500/50 min-h-[120px] font-mono border ${editPrompt.trim() === '' ? 'border-red-500/70' : 'border-neutral-700'}`}
+                />
+                <div className="text-[10px] text-neutral-500">{editPrompt.length} characters</div>
+                <div className="flex gap-2">
+                  <button onClick={() => { onEditPrompt(task.id, editPrompt); setEditing(false); }}
+                    disabled={!!actionLoading || editPrompt.trim() === ''}
+                    className={`flex-1 border py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${editPrompt.trim() === '' ? 'bg-neutral-800 text-neutral-600 border-neutral-700 cursor-not-allowed' : 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border-blue-500/20'} ${actionLoading ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    {actionLoading === 'edit' && <Activity className="w-3.5 h-3.5 animate-spin" />}Save
+                  </button>
+                  <button onClick={() => { setEditing(false); setEditPrompt(task.description || ''); }}
+                    className="px-3 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 border border-neutral-700 py-1.5 rounded text-xs transition-colors">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex gap-2">
+                  <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                    {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Retry
+                  </button>
+                  <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                    <Pencil className="w-3.5 h-3.5" /> Edit
+                  </button>
+                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                    {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
+                  </button>
+                </div>
+                <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
+                  {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
+                </button>
+              </>
+            )}
+          </div>
+        )
       ) : null}
     </div>
   );
-});
+}));

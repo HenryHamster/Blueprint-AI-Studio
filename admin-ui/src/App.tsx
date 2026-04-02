@@ -1,5 +1,5 @@
-import { useMemo, useRef, useEffect } from 'react';
-import { Activity, AlertCircle, Archive, CheckSquare } from 'lucide-react';
+import { useMemo, useRef, useEffect, useState } from 'react';
+import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { SummaryPanels } from './components/SummaryPanels';
@@ -16,7 +16,7 @@ import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
-import type { KanbanColumn } from './components/KanbanBoard';
+import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
@@ -30,9 +30,102 @@ const COLUMNS: KanbanColumn[] = [
   { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
 ];
 
+const SORT_KEY = 'blueprint-admin:kanban-sort';
+
+interface ColumnPref { id: string; visible: boolean; }
+
+function ColumnsPicker({ prefs, onPrefsChange }: { prefs: ColumnPref[]; onPrefsChange: (p: ColumnPref[]) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [open]);
+
+  function toggle(id: string) {
+    onPrefsChange(prefs.map(p => p.id === id ? { ...p, visible: !p.visible } : p));
+  }
+
+  function move(id: string, dir: -1 | 1) {
+    const idx = prefs.findIndex(p => p.id === id);
+    if (idx < 0) return;
+    const swapIdx = idx + dir;
+    if (swapIdx < 0 || swapIdx >= prefs.length) return;
+    const next = [...prefs];
+    [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
+    onPrefsChange(next);
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+          open
+            ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+        }`}
+      >
+        <LayoutGrid className="w-3.5 h-3.5" />
+        Columns
+      </button>
+      {open && (
+        <div className="absolute top-full mt-1.5 left-0 z-50 bg-neutral-900 border border-neutral-800 rounded-xl shadow-xl p-1.5 min-w-[180px]">
+          {prefs.map((pref, idx) => {
+            const col = COLUMNS.find(c => c.id === pref.id);
+            if (!col) return null;
+            return (
+              <div key={pref.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-neutral-800/50 group">
+                <input
+                  type="checkbox"
+                  checked={pref.visible}
+                  onChange={() => toggle(pref.id)}
+                  className="w-3.5 h-3.5 accent-amber-400 cursor-pointer flex-shrink-0"
+                />
+                <span className="flex-1 text-xs text-neutral-300">{col.label}</span>
+                <div className="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    onClick={() => move(pref.id, -1)}
+                    disabled={idx === 0}
+                    className="p-0.5 rounded text-neutral-500 hover:text-neutral-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <ChevronUp className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => move(pref.id, 1)}
+                    disabled={idx === prefs.length - 1}
+                    className="p-0.5 rounded text-neutral-500 hover:text-neutral-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <ChevronDown className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [sortBy, setSortBy] = useState<SortBy>(() => {
+    try {
+      const stored = localStorage.getItem(SORT_KEY);
+      return (stored as SortBy) ?? 'newest';
+    } catch { return 'newest'; }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(SORT_KEY, sortBy);
+  }, [sortBy]);
 
   useEffect(() => {
     function handleSearchShortcut(e: KeyboardEvent) {
@@ -47,17 +140,18 @@ export default function App() {
     return () => document.removeEventListener('keydown', handleSearchShortcut);
   }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
 
+  const { showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed } = s;
   useEffect(() => {
     function handleActivityFeedShortcut(e: KeyboardEvent) {
       if (e.key !== 'a' && e.key !== 'A') return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings) return;
-      s.setShowActivityFeed(prev => !prev);
+      if (showNewTaskModal || logTask || showResearchBrowser || showSettings) return;
+      setShowActivityFeed(prev => !prev);
     }
     document.addEventListener('keydown', handleActivityFeedShortcut);
     return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
-  }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings, s.setShowActivityFeed]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
@@ -72,9 +166,21 @@ export default function App() {
     });
   }, [s.tasks]);
 
+  const effectiveColumnPrefs = useMemo<ColumnPref[]>(() => {
+    const base = s.columnPrefs.length > 0 ? s.columnPrefs : COLUMNS.map(c => ({ id: c.id, visible: true }));
+    // Add any COLUMNS entry not yet in prefs (e.g. newly added columns)
+    const inPrefs = new Set(base.map(p => p.id));
+    const extra = COLUMNS.filter(c => !inPrefs.has(c.id)).map(c => ({ id: c.id, visible: true }));
+    return [...base, ...extra];
+  }, [s.columnPrefs]);
+
   const visibleColumns = useMemo(() => {
-    return COLUMNS.filter(col => col.includes.some(status => s.statusFilter.includes(status)));
-  }, [s.statusFilter]);
+    return effectiveColumnPrefs
+      .filter(pref => pref.visible)
+      .map(pref => COLUMNS.find(c => c.id === pref.id)!)
+      .filter(Boolean)
+      .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
+  }, [effectiveColumnPrefs, s.statusFilter]);
 
   const filteredTasks = useMemo(() => s.tasks.filter(t => {
     const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
@@ -275,6 +381,27 @@ export default function App() {
 
           <div className="flex items-center gap-2 shrink-0 mb-2">
             {s.viewMode === 'kanban' && (
+            <div className="relative group">
+              <button
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                Group: {s.groupBy === 'status' ? 'Status' : s.groupBy === 'type' ? 'Type' : 'Project'}
+              </button>
+              <div className="absolute left-0 top-full mt-1 z-20 hidden group-focus-within:flex group-hover:flex flex-col bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden min-w-[120px]">
+                {(['status', 'type', 'project'] as const).map(opt => (
+                  <button
+                    key={opt}
+                    onClick={() => s.setGroupBy(opt)}
+                    className={`px-3 py-2 text-xs text-left hover:bg-neutral-800 transition-colors ${s.groupBy === opt ? 'text-amber-400 font-medium' : 'text-neutral-300'}`}
+                  >
+                    {opt === 'status' ? 'Status' : opt === 'type' ? 'Type' : 'Project'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            )}
+            {s.viewMode === 'kanban' && (
             <button
               onClick={s.toggleSelectionMode}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
@@ -286,6 +413,36 @@ export default function App() {
               <CheckSquare className="w-3.5 h-3.5" />
               {s.selectionMode ? `Select (${s.selectedTaskIds.size} selected)` : 'Select'}
             </button>
+            )}
+            {s.viewMode === 'kanban' && (
+            <button
+              onClick={() => s.setCompactMode(v => !v)}
+              title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                s.compactMode
+                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+              }`}
+            >
+              <LayoutList className="w-3.5 h-3.5" />
+              {s.compactMode ? 'Compact' : 'Normal'}
+            </button>
+            )}
+            {s.viewMode === 'kanban' && (
+              <select
+                value={sortBy}
+                onChange={e => setSortBy(e.target.value as SortBy)}
+                className="px-2 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors cursor-pointer"
+                title="Sort tasks"
+              >
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="type">Type</option>
+                <option value="title">Title</option>
+              </select>
+            )}
+            {s.viewMode === 'kanban' && (
+              <ColumnsPicker prefs={effectiveColumnPrefs} onPrefsChange={s.setColumnPrefs} />
             )}
             {s.selectionMode && s.selectedTaskIds.size > 0 && (
               <button
@@ -341,7 +498,12 @@ export default function App() {
               actionLoadingMap={s.actionLoadingMap}
               selectionMode={s.selectionMode}
               selectedTaskIds={s.selectedTaskIds}
+              compact={s.compactMode}
+              sortBy={sortBy}
               onToggleTaskSelection={s.toggleTaskSelection}
+              groupBy={s.groupBy}
+              projects={s.projects}
+              onBulkToggle={s.bulkColumnToggle}
               onArchiveColumn={(taskIds, columnLabel) => {
                 s.setConfirmDialog({
                   title: `Archive all ${columnLabel} tasks?`,
