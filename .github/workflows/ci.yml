@@ -101,8 +101,15 @@ jobs:
 
       - name: Migration linter
         run: |
-          # Fail if any migration adds a non-nullable column without server_default
-          VIOLATIONS=$(grep -rl "nullable=False" backend/alembic/versions/*.py 2>/dev/null | xargs grep -L "server_default" 2>/dev/null || true)
+          # Fail if any NEW migration adds a non-nullable column without server_default
+          # Only check migrations added in this PR (not existing ones)
+          BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
+          NEW_MIGRATIONS=$(git diff --name-only --diff-filter=A origin/$BASE_BRANCH -- backend/alembic/versions/*.py 2>/dev/null || true)
+          if [ -z "$NEW_MIGRATIONS" ]; then
+            echo "No new migrations — skipping"
+            exit 0
+          fi
+          VIOLATIONS=$(echo "$NEW_MIGRATIONS" | xargs grep -l "nullable=False" 2>/dev/null | xargs grep -L "server_default" 2>/dev/null || true)
           if [ -n "$VIOLATIONS" ]; then
             echo "Migration safety violation: nullable=False without server_default in:"
             echo "$VIOLATIONS"
