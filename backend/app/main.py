@@ -136,8 +136,13 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "vm failed to start", "failed to provision"]):
         return "PROVISION_FAILURE"
 
+    # Rate limit — Claude API usage exhausted
+    if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "billing",
+                                      "usage limit", "token limit exceeded"]):
+        return "RATE_LIMIT"
+
     # External API failures — GitHub, Claude API outages
-    if any(kw in combined for kw in ["rate limit", "api.github.com", "api.anthropic.com",
+    if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "502 bad gateway", "503 service unavailable",
                                       "github api error", "claude api"]):
         return "EXTERNAL_API"
@@ -421,12 +426,21 @@ async def _check_external_health():
         ext["github_api"] = False
         failed.append("github_api")
 
-    # Claude API — check if any accounts have valid tokens (lightweight)
-    # We don't actually call the API; we check if we have credentials configured
+    # Claude API — check credentials + rate limit failures
     has_credentials = bool(_max_plan_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
-    ext["claude_api"] = has_credentials
     if not has_credentials:
+        ext["claude_api"] = False
         failed.append("claude_api")
+    else:
+        # Check for rate limit burst — 3+ RATE_LIMIT failures in last 5 results means API is exhausted
+        recent_results = _shared_state.deploy_monitoring["task_results"][-5:]
+        rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
+        if rate_limit_count >= 3:
+            ext["claude_api"] = False
+            failed.append("claude_api")
+            print(f"[HEALTH] Claude API rate limited — {rate_limit_count}/5 recent tasks hit limits")
+        else:
+            ext["claude_api"] = True
 
     # GCP — check is implicit via provisioning success/failure tracking
     # Mark unhealthy only if recent provisions all failed
@@ -454,8 +468,8 @@ async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
-    # Only auto-pause on critical deps (DB, GitHub) — not claude_api (just means no credentials)
-    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp")]
+    # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
+    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "claude_api")]
 
     if critical_failures:
         # Should we pause?
