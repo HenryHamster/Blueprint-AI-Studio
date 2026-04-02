@@ -3844,7 +3844,7 @@ async def update_agent_status(
             release_max_plan_account(acct_id)
             # Auto-disable account on rate limit — usage exhausted, stop wasting VMs
             # Re-enables automatically after 30min cooldown
-            if failure_class == "RATE_LIMIT":
+            if payload.status == TaskStatus.FAILED and failure_class == "RATE_LIMIT":
                 for acct in _max_plan_pool:
                     if acct["id"] == acct_id:
                         acct["enabled"] = False
