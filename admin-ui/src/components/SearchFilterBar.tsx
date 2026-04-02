@@ -3,16 +3,17 @@ import { Search } from 'lucide-react';
 interface SearchFilterBarProps {
   searchQuery: string;
   onSearchChange: (query: string) => void;
-  taskTypeFilter: string;
-  onTypeFilterChange: (filter: string) => void;
-  statusFilter: string | null;
-  onStatusFilterChange: (status: string | null) => void;
+  taskTypeFilter: string[];
+  onTypeFilterChange: (filter: string[]) => void;
+  statusFilter: string[];
+  onStatusFilterChange: (status: string[]) => void;
   filteredCount: number;
   totalCount: number;
 }
 
-const STATUS_OPTIONS: { label: string; value: string | null }[] = [
-  { label: 'All', value: null },
+const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix'] as const;
+
+const STATUS_OPTIONS: { label: string; value: string }[] = [
   { label: 'Queued', value: 'QUEUED' },
   { label: 'Provisioning', value: 'PROVISIONING' },
   { label: 'In Progress', value: 'IN_PROGRESS' },
@@ -25,16 +26,32 @@ const STATUS_OPTIONS: { label: string; value: string | null }[] = [
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
   const activeFilterCount = [
     searchQuery !== '',
-    taskTypeFilter !== 'all',
-    statusFilter !== null,
+    taskTypeFilter.length > 0,
+    statusFilter.length > 0,
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
 
   function handleClear() {
     onSearchChange('');
-    onTypeFilterChange('all');
-    onStatusFilterChange(null);
+    onTypeFilterChange([]);
+    onStatusFilterChange([]);
+  }
+
+  function toggleType(opt: string) {
+    if (taskTypeFilter.includes(opt)) {
+      onTypeFilterChange(taskTypeFilter.filter(t => t !== opt));
+    } else {
+      onTypeFilterChange([...taskTypeFilter, opt]);
+    }
+  }
+
+  function toggleStatus(val: string) {
+    if (statusFilter.includes(val)) {
+      onStatusFilterChange(statusFilter.filter(s => s !== val));
+    } else {
+      onStatusFilterChange([...statusFilter, val]);
+    }
   }
 
   return (
@@ -68,12 +85,22 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       <div className="flex items-center gap-1.5">
         <span className="text-[10px] text-neutral-600 uppercase tracking-wider font-semibold shrink-0">Type</span>
         <div className="flex items-center gap-1">
-          {(['all', 'create', 'plan', 'research', 'review', 'fix'] as const).map(opt => (
+          <button
+            onClick={() => onTypeFilterChange([])}
+            className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
+              taskTypeFilter.length === 0
+                ? 'bg-white/5 border-neutral-600 text-neutral-100'
+                : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
+            }`}
+          >
+            All
+          </button>
+          {TYPE_OPTIONS.map(opt => (
             <button
               key={opt}
-              onClick={() => onTypeFilterChange(opt)}
+              onClick={() => toggleType(opt)}
               className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
-                taskTypeFilter === opt
+                taskTypeFilter.includes(opt)
                   ? 'bg-white/5 border-neutral-600 text-neutral-100'
                   : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
               }`}
@@ -86,12 +113,22 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       <div className="flex items-center gap-1.5">
         <span className="text-[10px] text-neutral-600 uppercase tracking-wider font-semibold shrink-0">Status</span>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => onStatusFilterChange([])}
+            className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
+              statusFilter.length === 0
+                ? 'bg-neutral-800/60 border-neutral-500 text-neutral-200'
+                : 'bg-neutral-950 border-neutral-800/60 text-neutral-500 hover:border-neutral-700'
+            }`}
+          >
+            All
+          </button>
           {STATUS_OPTIONS.map(opt => (
             <button
-              key={opt.label}
-              onClick={() => onStatusFilterChange(opt.value)}
+              key={opt.value}
+              onClick={() => toggleStatus(opt.value)}
               className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
-                statusFilter === opt.value
+                statusFilter.includes(opt.value)
                   ? 'bg-neutral-800/60 border-neutral-500 text-neutral-200'
                   : 'bg-neutral-950 border-neutral-800/60 text-neutral-500 hover:border-neutral-700'
               }`}

@@ -118,8 +118,9 @@ export function useAppState() {
 
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState('all');
-  const [statusFilter, setStatusFilter] = useState<string | null>(null);
+  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>([]);
+  const [statusFilter, setStatusFilter] = useState<string[]>([]);
+
   // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
 
@@ -289,7 +290,7 @@ export function useAppState() {
     try {
       const offset = (page - 1) * limit;
       let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
-      if (statusFilter) url += `&status=${statusFilter}`;
+      statusFilter.forEach(s => { url += `&status=${s}`; });
       const res = await authGet(url);
       if (res.ok) {
         const data = await res.json();
