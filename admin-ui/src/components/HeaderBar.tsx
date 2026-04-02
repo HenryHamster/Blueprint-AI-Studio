@@ -54,6 +54,7 @@ export interface HeaderBarProps {
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
   onUpdateAutonomousResearchEffort: (value: string) => void;
+  onSyncTaskTypeDefaults: () => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -132,6 +133,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateAutonomousResearchModel,
     autonomousResearchEffort,
     onUpdateAutonomousResearchEffort,
+    onSyncTaskTypeDefaults,
     githubAccount,
     onConnectGitHub,
     maxPlanAccounts,
@@ -273,6 +275,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutonomousResearchModel={onUpdateAutonomousResearchModel}
           autonomousResearchEffort={autonomousResearchEffort}
           onUpdateAutonomousResearchEffort={onUpdateAutonomousResearchEffort}
+          onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}
           githubAccount={githubAccount}
           onConnectGitHub={onConnectGitHub}
           maxPlanAccounts={maxPlanAccounts}

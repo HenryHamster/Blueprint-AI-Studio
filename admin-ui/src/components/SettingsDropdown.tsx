@@ -40,6 +40,7 @@ interface SettingsDropdownProps {
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
   onUpdateAutonomousResearchEffort: (value: string) => void;
+  onSyncTaskTypeDefaults: () => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -115,6 +116,7 @@ export function SettingsDropdown({
   onUpdateAutonomousResearchModel,
   autonomousResearchEffort,
   onUpdateAutonomousResearchEffort,
+  onSyncTaskTypeDefaults,
   githubAccount,
   onConnectGitHub,
   maxPlanAccounts,
@@ -282,6 +284,7 @@ export function SettingsDropdown({
                           const val = e.target.value;
                           setTaskTypeModels(prev => ({ ...prev, [type]: val }));
                           localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
+                          setTimeout(onSyncTaskTypeDefaults, 0);
                         }}
                         className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
                       >
@@ -299,6 +302,7 @@ export function SettingsDropdown({
                           const val = e.target.value;
                           setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
                           localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
+                          setTimeout(onSyncTaskTypeDefaults, 0);
                         }}
                         className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
                       >

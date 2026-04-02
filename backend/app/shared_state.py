@@ -16,6 +16,10 @@ runtime_config: Dict = {
     "autonomous_research_interval_minutes": 30,
     "autonomous_research_model": None,
     "autonomous_research_effort": None,
+    # Per-task-type model/effort defaults (synced from frontend settings)
+    # e.g. {"research": "claude-opus-4-6", "create": "claude-sonnet-4-6"}
+    "task_type_models": {},
+    "task_type_efforts": {},
 }
 
 # --- Autonomous Loop State ---

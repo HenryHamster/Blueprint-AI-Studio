@@ -814,6 +814,8 @@ async def get_settings(
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
         "autonomous_research_model": _runtime_config.get("autonomous_research_model") or "",
         "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
+        "task_type_models": _runtime_config.get("task_type_models", {}),
+        "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -874,6 +876,22 @@ async def update_settings(
         if val is not None and val not in ("low", "medium", "high"):
             raise HTTPException(status_code=400, detail="autonomous_research_effort must be low, medium, or high")
         _runtime_config["autonomous_research_effort"] = val
+    VALID_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", ""}
+    VALID_EFFORTS = {"low", "medium", "high", "max", ""}
+    if "task_type_models" in payload:
+        val = payload["task_type_models"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_models must be a dict")
+        if any(v not in VALID_MODELS for v in val.values()):
+            raise HTTPException(status_code=400, detail="Invalid model in task_type_models")
+        _runtime_config["task_type_models"] = val
+    if "task_type_efforts" in payload:
+        val = payload["task_type_efforts"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_efforts must be a dict")
+        if any(v not in VALID_EFFORTS for v in val.values()):
+            raise HTTPException(status_code=400, detail="Invalid effort in task_type_efforts")
+        _runtime_config["task_type_efforts"] = val
 
     # Persist to DB so values survive Cloud Run restarts (only fields present in payload)
     state = await session.get(DeploymentState, 1)

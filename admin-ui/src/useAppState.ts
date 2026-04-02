@@ -871,6 +871,27 @@ export function useAppState() {
     } catch (err) { console.error('Failed to start GitHub OAuth:', err); }
   };
 
+  const syncTaskTypeDefaults = async () => {
+    const types = ['create', 'plan', 'research', 'review', 'fix', 'security_audit', 'qa', 'deps', 'docs'];
+    const models: Record<string, string> = {};
+    const efforts: Record<string, string> = {};
+    for (const t of types) {
+      const m = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
+      const e = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
+      if (m) models[t] = m;
+      if (e) efforts[t] = e;
+    }
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ task_type_models: models, task_type_efforts: efforts }),
+      });
+    } catch (err) {
+      console.error('Failed to sync task type defaults:', err);
+    }
+  };
+
   const updateMaxVMs = async (value: number) => {
     const clamped = Math.max(1, Math.min(30, value));
     setMaxConcurrentVMs(clamped);
@@ -1307,7 +1328,7 @@ export function useAppState() {
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
     autonomousResearchIntervalMinutes, autonomousResearchModel, autonomousResearchEffort,
-    updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate,
+    updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     handleUpdateAutonomousResearchInterval, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

@@ -196,18 +196,25 @@ async def _init_deployment_state():
             return
 
         # Restore persisted runtime config values so settings survive restarts
-        if state.runtime_max_concurrent_vms is not None:
-            _runtime_config["max_concurrent_vms"] = state.runtime_max_concurrent_vms
-        if state.runtime_max_retries is not None:
-            _runtime_config["max_retries"] = state.runtime_max_retries
-        if state.runtime_max_autonomous_tasks_per_hour is not None:
-            _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
-        if state.runtime_autonomous_research_interval_minutes is not None:
-            _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
-        if state.runtime_autonomous_research_model is not None:
-            _runtime_config["autonomous_research_model"] = state.runtime_autonomous_research_model
-        if state.runtime_autonomous_research_effort is not None:
-            _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
+        # Wrapped in try/except: if migration hasn't added these columns yet, skip gracefully
+        try:
+            if state.runtime_max_concurrent_vms is not None:
+                _runtime_config["max_concurrent_vms"] = state.runtime_max_concurrent_vms
+            if state.runtime_max_retries is not None:
+                _runtime_config["max_retries"] = state.runtime_max_retries
+            if state.runtime_max_autonomous_tasks_per_hour is not None:
+                _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
+        except Exception as e:
+            print(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}")
+        try:
+            if state.runtime_autonomous_research_interval_minutes is not None:
+                _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
+            if state.runtime_autonomous_research_model is not None:
+                _runtime_config["autonomous_research_model"] = state.runtime_autonomous_research_model
+            if state.runtime_autonomous_research_effort is not None:
+                _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
+        except Exception as e:
+            print(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}")
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
@@ -530,8 +537,9 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )).scalars().first()
     base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
 
-    research_model = _runtime_config.get("autonomous_research_model") or None
-    research_effort = _runtime_config.get("autonomous_research_effort") or None
+    # Use per-type defaults, fall back to autonomous-specific config
+    research_model = _runtime_config.get("task_type_models", {}).get("research") or _runtime_config.get("autonomous_research_model") or None
+    research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or _runtime_config.get("autonomous_research_effort") or None
     research_payload: dict = {
         "type": "research",
         "directions": active_directions,
@@ -2237,16 +2245,24 @@ async def _spawn_pipeline_task(
     except Exception:
         pass
 
+    # Apply per-task-type model/effort defaults from settings
+    type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
+    type_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
+
     if task_type == "review":
         title = f"Review PR #{pr_number}"
         payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
                         "base_branch": base_branch, "original_prompt": original_prompt,
-                        "original_task_id": resolved_original_id}
+                        "original_task_id": resolved_original_id,
+                        **({"model": type_model} if type_model else {}),
+                        **({"effort": type_effort} if type_effort else {})}
     else:
         title = f"Fix PR #{pr_number}"
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
                         "base_branch": base_branch, "prompt": fix_prompt,
-                        "original_task_id": resolved_original_id}
+                        "original_task_id": resolved_original_id,
+                        **({"model": type_model} if type_model else {}),
+                        **({"effort": type_effort} if type_effort else {})}
 
     new_task = Task(
         project_id=source_task.project_id,

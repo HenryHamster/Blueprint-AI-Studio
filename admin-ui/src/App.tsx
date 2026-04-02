@@ -149,6 +149,7 @@ export default function App() {
         onUpdateAutonomousResearchModel={s.handleUpdateAutonomousResearchModel}
         autonomousResearchEffort={s.autonomousResearchEffort}
         onUpdateAutonomousResearchEffort={s.handleUpdateAutonomousResearchEffort}
+        onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}
         githubAccount={s.githubAccount}
         onConnectGitHub={s.connectGitHub}
         maxPlanAccounts={s.maxPlanAccounts}

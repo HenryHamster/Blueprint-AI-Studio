@@ -26,7 +26,7 @@ def setup_telemetry(app: FastAPI, engine=None):
     trace.set_tracer_provider(provider)
     
     # 2. Configure the Exporter
-    if HAS_GCP_EXPORTER and os.getenv("GCP_PROJECT_ID"):
+    if HAS_GCP_EXPORTER and os.getenv("GCP_PROJECT_ID") and os.getenv("ENABLE_CLOUD_TRACE", "").lower() == "true":
         try:
             exporter = CloudTraceSpanExporter(project_id=os.getenv("GCP_PROJECT_ID"))
             processor = BatchSpanProcessor(exporter)
