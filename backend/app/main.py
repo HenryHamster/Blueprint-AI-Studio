@@ -531,11 +531,11 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
     if not active_directions:
         return
-    # Guard: no existing research task already running/queued
+    # Guard: no existing research task already running/queued/evaluating
     active_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
         )
     )).scalars().all()
     for t in active_tasks:
