@@ -692,7 +692,7 @@ export function TaskDetailDrawer({
   };
 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
-  const showApproval = task.requires_approval && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(task.status);
+  const showApproval = task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status);
   const showCancel = isActive && !task.requires_approval;
   const showFailedActions = task.status === 'FAILED';
   const [showChangesForm, setShowChangesForm] = useState(false);
