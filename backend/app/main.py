@@ -464,14 +464,22 @@ async def _check_external_health():
         print(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
 
 
+_pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
+
 async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
+    global _pause_failure_streak
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
     critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "claude_api")]
 
     if critical_failures:
+        _pause_failure_streak += 1
+        # Require 3 consecutive failures before pausing (avoid flaky single checks)
+        if _pause_failure_streak < 3:
+            print(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
+            return
         # Should we pause?
         if _runtime_config["max_concurrent_vms"] > 0:
             async with AsyncSessionLocal() as session:
@@ -487,6 +495,7 @@ async def _check_pause_mode():
                     _runtime_config["max_concurrent_vms"] = 0
             print(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
     else:
+        _pause_failure_streak = 0
         # All deps healthy — should we auto-resume?
         async with AsyncSessionLocal() as session:
             state = await session.get(DeploymentState, 1)
@@ -532,16 +541,17 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     for t in active_tasks:
         if ((t.payloads or [{}])[0]).get("type") == "research":
             return
-    # Guard: rate limit autonomous tasks
+    # Guard: rate limit autonomous research spawns (not all orchestrator tasks)
     one_hour_ago = datetime.utcnow() - timedelta(hours=1)
-    recent_auto = (await session.execute(
-        select(func.count()).select_from(Task).where(
+    recent_research = (await session.execute(
+        select(Task).where(
             Task.project_id == project.id,
             Task.created_by == "ORCHESTRATOR",
             Task.created_at >= one_hour_ago,
         )
-    )).scalar() or 0
-    if recent_auto >= _runtime_config["max_autonomous_tasks_per_hour"]:
+    )).scalars().all()
+    recent_research_count = sum(1 for t in recent_research if ((t.payloads or [{}])[0]).get("type") == "research")
+    if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
     # Infer base_branch from the most recent task in this project, or default to main
