@@ -586,16 +586,15 @@ async def _check_autonomous_research(owner: str, repo: str):
             if not project:
                 return
 
-            # Check if queue is empty for this project
+            # Spawn if there are available VM slots (don't wait for empty queue)
             from sqlalchemy import func
-            queued = (await session.execute(
+            active_count = (await session.execute(
                 select(func.count()).select_from(Task).where(
-                    Task.project_id == project.id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                 )
             )).scalar() or 0
 
-            if queued == 0:
+            if active_count < _runtime_config["max_concurrent_vms"]:
                 await _spawn_research_task(project, session)
     except Exception as e:
         print(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}")
@@ -622,14 +621,14 @@ async def _check_idle_research():
                 if not active_directions:
                     continue
 
-                queued = (await session.execute(
+                # Spawn if there are available VM slots (don't wait for empty queue)
+                active_count = (await session.execute(
                     select(func.count()).select_from(Task).where(
-                        Task.project_id == project.id,
                         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                     )
                 )).scalar() or 0
 
-                if queued == 0:
+                if active_count < _runtime_config["max_concurrent_vms"]:
                     await _spawn_research_task(project, session)
     except Exception as e:
         print(f"[AUTONOMOUS] Error in idle research check: {e}")
