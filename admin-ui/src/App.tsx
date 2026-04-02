@@ -545,6 +545,7 @@ export default function App() {
                     s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
                   });
                 }}
+                onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
               />
             </main>
           )}

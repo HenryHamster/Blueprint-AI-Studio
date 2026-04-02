@@ -45,6 +45,7 @@ interface PipelineViewProps {
   tasks: Task[];
   onViewLogs: (task: Task) => void;
   onNavigateToParent?: (parentTaskId: string) => void;
+  onClearWaveDeps?: () => void;
 }
 
 function buildForest(tasks: Task[]): TreeNode[] {
@@ -518,7 +519,7 @@ function RootGroup({
   );
 }
 
-export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: PipelineViewProps) {
+export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -592,6 +593,14 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
               {label}
             </button>
           ))}
+          {onClearWaveDeps && tasks.some(t => t.status === 'QUEUED' && t.depends_on && t.depends_on.length > 0) && (
+            <button
+              className="px-2.5 py-1 text-xs rounded-full border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors font-medium"
+              onClick={onClearWaveDeps}
+            >
+              Clear All Deps
+            </button>
+          )}
         </div>
         {forest.length > 1 && (
           <div className="flex items-center gap-2">

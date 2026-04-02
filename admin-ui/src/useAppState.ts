@@ -506,6 +506,22 @@ export function useAppState() {
     }
   };
 
+  const handleClearWaveDeps = async (projectId: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}/clear-wave-deps`, {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: '{}',
+      });
+      const data = await res.json();
+      addToast(`Cleared dependencies on ${data.cleared} tasks`, 'success');
+      fetchTasks();
+    } catch (error) {
+      console.error('Failed to clear wave deps:', error);
+      addToast('Failed to clear wave dependencies', 'error');
+    }
+  };
+
   const handleApprove = async (taskId: string) => {
     const original = tasks.find(t => t.id === taskId);
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
@@ -1401,7 +1417,7 @@ export function useAppState() {
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
-    fetchTasks, handleApprove, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
+    fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
     selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
     confirmDialog, setConfirmDialog,
