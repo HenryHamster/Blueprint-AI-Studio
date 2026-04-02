@@ -2069,7 +2069,7 @@ async def claim_task(
     }
 
     task_type = (task.payloads or [{}])[0].get("type", "")
-    if task_type in ("research", "plan"):
+    if task_type in ("research", "plan", "create"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project
         active_stmt = select(Task).where(
             Task.project_id == task.project_id,
@@ -2139,7 +2139,7 @@ async def claim_task(
             research_findings_summary = None
             for a in task_artifacts:
                 if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                    research_findings_summary = a.logs[:2000]
+                    research_findings_summary = a.logs[:4000]
                     break
             recently_completed_tasks.append({
                 "id": str(t.id),
@@ -2282,12 +2282,18 @@ async def spawn_subtask(
 
     new_tasks = []
     for payload in req.payloads:
+        parent_payload = (parent_task.payloads or [{}])[0]
+        parent_context = {
+            "parent_task_id": str(parent_task.id),
+            "parent_title": parent_task.title,
+            "parent_prompt": (parent_payload.get("prompt") or parent_payload.get("description") or "")[:500]
+        }
         new_task = Task(
             project_id=parent_task.project_id,
             title=payload.get("title", f"Subtask of {parent_task.title}"),
             description=payload.get("description", ""),
             payloads=[payload],
-            context={**(req.context or {}), "spawn_depth": spawn_depth + 1},
+            context={**(req.context or {}), "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
@@ -2381,7 +2387,8 @@ MAX_REVIEW_FIX_ITERATIONS = 30
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
-    original_prompt: str = "", fix_prompt: str = "", original_task_id: str = ""
+    original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
+    current_feedback: str = ""
 ) -> Optional[Task]:
     """Spawn a review or fix task as part of the automated review pipeline.
     Returns None if the review-fix cycle limit has been reached or a duplicate exists."""
@@ -2482,6 +2489,13 @@ async def _spawn_pipeline_task(
                         **({"model": type_model} if type_model else {}),
                         **({"effort": type_effort} if type_effort else {})}
 
+    # Build review_history: carry forward from source task, appending current feedback if spawning a fix
+    prev_review_history = source_loop.get("review_history", [])
+    if task_type == "fix" and current_feedback:
+        new_review_history = prev_review_history + [{"iteration": iteration - 1, "feedback": current_feedback}]
+    else:
+        new_review_history = prev_review_history
+
     new_task = Task(
         project_id=source_task.project_id,
         title=title,
@@ -2491,7 +2505,8 @@ async def _spawn_pipeline_task(
         context={"review_loop": {"pr_number": pr_number, "branch": branch,
                                   "base_branch": base_branch,
                                   "original_task_id": resolved_original_id,
-                                  "iteration": iteration}},
+                                  "iteration": iteration,
+                                  **({"review_history": new_review_history} if new_review_history else {})}},
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -2655,6 +2670,11 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     parent_payload = (task.payloads or [{}])[0]
     model = parent_payload.get('model')
     effort = parent_payload.get('effort')
+    plan_parent_context = {
+        "parent_task_id": str(task.id),
+        "parent_title": task.title,
+        "parent_prompt": (parent_payload.get("prompt") or parent_payload.get("description") or "")[:500]
+    }
     child_tasks = []
     for subtask_def in subtasks:
         related_files = subtask_def.get("related_files", [])
@@ -2666,6 +2686,10 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         subtask_effort = subtask_def.get('effort') or effort
         child_scope = subtask_def.get('scope', 'small')
         child_risk = subtask_def.get('risk', 'low')
+        child_approval_reason = subtask_def.get('approval_reason') if child_risk == 'high' else None
+        _allowed_types = {'create', 'refactor', 'migrate', 'qa'}
+        raw_type = subtask_def.get('type', 'create')
+        subtask_type = raw_type if raw_type in _allowed_types else 'create'
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
@@ -2673,7 +2697,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             parent_task_id=task.id,
             requires_approval=child_risk == 'high',
             payloads=[{
-                "type": "create",
+                "type": subtask_type,
                 "prompt": full_prompt,
                 "base_branch": plan_branch,
                 **({"model": subtask_model} if subtask_model else {}),
@@ -2686,6 +2710,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "scope": child_scope,
                 "risk": child_risk,
                 "related_files": related_files,
+                "parent_context": plan_parent_context,
+                **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
@@ -2858,6 +2884,141 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
     print(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
 
 
+async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
+    """Parse perf findings and spawn create tasks for high-severity issues."""
+    findings = None
+    try:
+        json_match = re.search(r'\[\s*\{[\s\S]*"severity"[\s\S]*\]', logs, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, list):
+                findings = parsed
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    if not findings:
+        task.latest_status_message = "Perf analysis completed with no parseable findings"
+        task.plan_output = []
+        session.add(task)
+        await session.commit()
+        return
+
+    # Store all findings for display
+    task.plan_output = findings
+    session.add(task)
+    await session.commit()
+
+    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+
+    # Spawn create tasks for high-severity findings
+    actionable = [f for f in findings if f.get("severity") == "high"]
+    if len(actionable) > 10:
+        actionable = actionable[:10]
+
+    child_tasks = []
+    for i, finding in enumerate(actionable):
+        fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
+        if not fix_prompt:
+            continue
+        title = finding.get("title", f"Perf fix #{i+1}")
+        area = finding.get("area", "")
+
+        new_task = Task(
+            project_id=task.project_id,
+            title=f"[PERF] {title}",
+            description=finding.get("description", fix_prompt[:200]),
+            parent_task_id=task.id,
+            payloads=[{
+                "type": "create",
+                "prompt": fix_prompt,
+                "base_branch": base_branch,
+            }],
+            context={
+                "perf_task_id": str(task.id),
+                "finding_index": i,
+                "severity": "high",
+                "area": area,
+                "related_files": finding.get("related_files", []),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            depends_on=[],
+        )
+        session.add(new_task)
+        child_tasks.append(new_task)
+
+    await session.commit()
+    for ct in child_tasks:
+        await session.refresh(ct)
+        history = TaskHistory(
+            task_id=ct.id, action="SPAWNED",
+            details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)}
+        )
+        session.add(history)
+        await broadcast_to_project(str(task.project_id), "task_updated",
+                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+
+    await session.commit()
+
+    # Post a summary comment on open PRs for medium/low findings
+    informational = [f for f in findings if f.get("severity") in ("medium", "low")]
+    all_surfaced = informational + [f for f in findings if f.get("severity") == "high" and f not in actionable]
+    if all_surfaced or findings:
+        rows = "\n".join(
+            "| {area} | {severity} | {title} | {desc} |".format(
+                area=f.get("area", ""),
+                severity=f.get("severity", ""),
+                title=f.get("title", ""),
+                desc=f.get("description", "")[:120],
+            )
+            for f in findings
+        )
+        comment_body = (
+            "## Performance Analysis Findings\n\n"
+            f"Analyzed codebase for performance bottlenecks. "
+            f"{len(child_tasks)} high-severity fix task(s) spawned automatically.\n\n"
+            "| Area | Severity | Title | Description |\n"
+            "|------|----------|-------|-------------|\n"
+            f"{rows}\n"
+        )
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+            from app.github import get_open_pull_requests
+            open_prs = await get_open_pull_requests(gh_token, owner, repo, base_branch)
+            if open_prs:
+                pr_number = open_prs[0]["number"]
+                await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
+                print(f"[PERF] Posted findings summary comment on PR #{pr_number}")
+        except Exception as e:
+            print(f"[PERF] Failed to post PR comment: {e}")
+
+    task.status = TaskStatus.EVALUATING
+    task.latest_status_message = (
+        f"{len(child_tasks)} high-severity fix task(s) spawned, "
+        f"{len(informational)} medium/low finding(s) surfaced as PR comment"
+    )
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(str(task.project_id), "autonomous_activity",
+                               {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
+    print(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
+
+
+async def _handle_investigation_completion(task: Task, payload, session: AsyncSession):
+    """Store investigation report logs in plan_output and mark task completed."""
+    if payload.logs:
+        try:
+            task.plan_output = json.loads(payload.logs)
+        except (json.JSONDecodeError, Exception):
+            task.plan_output = {"raw": payload.logs}
+    task.status = TaskStatus.COMPLETED
+    session.add(task)
+    await session.commit()
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Depth guard: prevent infinite research recursion
@@ -2973,7 +3134,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             finding_type = finding.get("type", "improvement")
             if finding_type == "research":
                 task_type = "research"  # deeper investigation before implementation
-            elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate"):
+            elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
                 task_type = finding_type  # spawn specialized agent
             elif finding_type == "refactor":
                 task_type = "refactor"  # code quality improvement, no behavior change
@@ -3200,7 +3361,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
-    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs", "smoketest"}
+    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs", "smoketest", "perf"}
     children = [c for c in all_children
                 if ((c.payloads or [{}])[0]).get("type", "create") in ROLLUP_TYPES]
 
@@ -3487,6 +3648,50 @@ async def update_agent_status(
         except (json.JSONDecodeError, Exception) as e:
             print(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}")
 
+    # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
+    if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
+        try:
+            debug_data = json.loads(payload.logs)
+            task.plan_output = debug_data
+            session.add(task)
+            await session.commit()
+
+            # If confidence is high, auto-spawn a create task using the fix_prompt
+            if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
+                failed_task_id = (task.context or {}).get("failed_task_id", "")
+                base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                debug_title = task.title or ""
+                fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
+                fix_task = Task(
+                    project_id=task.project_id,
+                    title=f"Fix: {fix_title}",
+                    description=debug_data["fix_prompt"],
+                    parent_task_id=task.parent_task_id or task.id,
+                    payloads=[{
+                        "type": "create",
+                        "prompt": debug_data["fix_prompt"],
+                        "base_branch": base_branch,
+                    }],
+                    context={
+                        "debug_task_id": str(task.id),
+                        "failed_task_id": failed_task_id,
+                        "root_cause": debug_data.get("root_cause", ""),
+                    },
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                )
+                session.add(fix_task)
+                await session.commit()
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "task_updated",
+                    {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
+                )
+                print(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}")
+
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
@@ -3521,6 +3726,49 @@ async def update_agent_status(
                 {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
+
+        # Spawn a debug task for permanently failed tasks (retries exhausted)
+        failed_task_payload = (task.payloads or [{}])[0]
+        failed_task_type = failed_task_payload.get("type", "")
+        should_auto_debug = (
+            failed_task_type != "debug" and  # Don't recursively debug debug tasks
+            (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
+            payload.logs and
+            (
+                (task.context or {}).get("auto_debug") is True or
+                task.parent_task_id is not None  # Part of a pipeline (plan/research subtask)
+            )
+        )
+        if should_auto_debug:
+            base_branch = failed_task_payload.get("base_branch", "main")
+            debug_task = Task(
+                project_id=task.project_id,
+                title=f"Debug: {task.title}",
+                description=f"Automated root cause analysis for failed task: {task.title}",
+                parent_task_id=task.id,
+                payloads=[{
+                    "type": "debug",
+                    "failed_task_id": str(task.id),
+                    "failed_task_title": task.title,
+                    "error_logs": (payload.logs or "")[:20000],
+                    "base_branch": base_branch,
+                }],
+                context={
+                    "failed_task_id": str(task.id),
+                    "parent_base": base_branch,
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+            session.add(debug_task)
+            await session.commit()
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(debug_task.id), "status": TaskStatus.QUEUED, "title": debug_task.title}
+            )
+            print(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
 
         # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
@@ -3989,7 +4237,8 @@ async def update_agent_status(
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}",
-                        original_task_id=original_task_id
+                        original_task_id=original_task_id,
+                        current_feedback=feedback
                     )
                     if fix_task:
                         print(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
@@ -4066,6 +4315,15 @@ async def update_agent_status(
             elif task_type == "security_audit":
                 audit_logs = payload.logs or task.latest_status_message or ""
                 await _handle_security_audit_completion(task, audit_logs, session)
+
+            # Perf audit completed → spawn fix tasks for high-severity findings
+            elif task_type == "perf":
+                perf_logs = payload.logs or task.latest_status_message or ""
+                await _handle_perf_completion(task, perf_logs, session)
+
+            # Investigation completed → store report, no child tasks
+            elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
+                await _handle_investigation_completion(task, payload, session)
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:

@@ -117,6 +117,7 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
   const prArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url));
   const commitArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT');
+  const investigationArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT');
   const multiPR = prArtifacts.length > 1;
 
   return (
@@ -231,6 +232,78 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
           </pre>
         </>
       )}
+
+      {(task.task_type === 'investigate' && task.plan_output) || investigationArtifacts.length > 0 ? (() => {
+        const report = task.plan_output as {
+          summary?: string;
+          root_cause?: string;
+          affected_files?: { path: string; issue: string }[];
+          recommended_fix?: string;
+          severity?: 'critical' | 'high' | 'medium' | 'low';
+          confidence?: 'high' | 'medium' | 'low';
+        } | null;
+        if (!report) return null;
+
+        const severityColors: Record<string, string> = {
+          critical: 'text-red-400 bg-red-950/30 border-red-800/40',
+          high: 'text-orange-400 bg-orange-950/30 border-orange-800/40',
+          medium: 'text-yellow-400 bg-yellow-950/30 border-yellow-800/40',
+          low: 'text-green-400 bg-green-950/30 border-green-800/40',
+        };
+
+        return (
+          <>
+            <SectionHeader>Investigation Report</SectionHeader>
+            <div className="space-y-3 bg-amber-950/10 rounded-lg p-3 border border-amber-900/30">
+              {report.severity && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0">Severity</span>
+                  <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${severityColors[report.severity] ?? 'text-neutral-400'}`}>
+                    {report.severity}
+                  </span>
+                </div>
+              )}
+              {report.confidence && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0">Confidence</span>
+                  <span className="text-sm text-neutral-200 capitalize">{report.confidence}</span>
+                </div>
+              )}
+              {report.summary && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Summary</span>
+                  <p className="text-sm text-neutral-200 min-w-0 break-words">{report.summary}</p>
+                </div>
+              )}
+              {report.root_cause && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Root Cause</span>
+                  <p className="text-sm text-neutral-200 min-w-0 break-words">{report.root_cause}</p>
+                </div>
+              )}
+              {report.recommended_fix && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Recommended Fix</span>
+                  <p className="text-sm text-neutral-200 min-w-0 break-words">{report.recommended_fix}</p>
+                </div>
+              )}
+              {report.affected_files && report.affected_files.length > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Affected Files</span>
+                  <div className="min-w-0 space-y-1.5">
+                    {report.affected_files.map((f, i) => (
+                      <div key={i} className="text-sm">
+                        <span className="font-mono text-blue-300 break-all">{f.path}</span>
+                        {f.issue && <p className="text-neutral-400 text-xs mt-0.5 break-words">{f.issue}</p>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })() : null}
 
       {task.context && Object.keys(task.context).length > 0 && (
         <>
