@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
-import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
+import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime } from './TaskCard';
 import type { Task } from './TaskCard';
 
@@ -77,6 +77,31 @@ function formatCreatedBy(value: string): string {
 }
 
 
+function DirectionsSection({ directions }: { directions: { text: string; priority?: string; status?: string }[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="mt-5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-200 transition-colors w-full text-left mb-2"
+      >
+        {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        Directions ({directions.length})
+      </button>
+      {open && (
+        <ul className="space-y-1.5 pl-1">
+          {directions.map((d, i) => (
+            <li key={i} className="flex items-start gap-2 text-sm text-neutral-200">
+              <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-neutral-500 shrink-0" />
+              <span className="break-words min-w-0">{d.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
@@ -138,6 +163,12 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
           </pre>
         </>
       )}
+
+      {task.payloads && task.payloads.length > 0 && (() => {
+        const directions = task.payloads![0].directions as { text: string; priority?: string; status?: string }[] | undefined;
+        if (!directions || directions.length === 0) return null;
+        return <DirectionsSection directions={directions} />;
+      })()}
 
       {task.payloads && task.payloads.length > 0 && (() => {
         const payload = task.payloads![0];
