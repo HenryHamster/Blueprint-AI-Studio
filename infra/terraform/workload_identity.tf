@@ -99,3 +99,18 @@ resource "google_project_iam_member" "github_actions_run_invoker" {
   role    = "roles/run.invoker"
   member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
+
+# Compute Engine permissions for Packer agent image builds
+resource "google_project_iam_member" "github_actions_compute_instance_admin" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+resource "google_project_iam_member" "github_actions_compute_image_user" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/compute.imageUser"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}

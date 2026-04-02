@@ -91,6 +91,15 @@ jobs:
           cp CLAUDE.md backend/CLAUDE.md
           docker build -t blueprint-backend-test ./backend
 
+      - name: Verify app imports
+        run: |
+          docker run --rm \
+            -e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+            -e AGENT_JWT_SECRET=ci-test-secret \
+            -e WS_TICKET_SECRET=ci-test-secret \
+            blueprint-backend-test \
+            python -c "from app.main import app; print(f'OK: {len(app.routes)} routes')"
+
       - name: Run tests
         run: |
           docker run --rm \

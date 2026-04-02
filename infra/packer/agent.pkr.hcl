@@ -53,10 +53,15 @@ build {
     destination = "/opt/agent/package.json"
   }
 
+  provisioner "file" {
+    source      = "../../agent/package-lock.json"
+    destination = "/opt/agent/package-lock.json"
+  }
+
   provisioner "shell" {
     inline = [
       "sudo useradd -m -s /bin/bash agent",
-      "cd /opt/agent && npm install",
+      "cd /opt/agent && npm ci",
       "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",
       "sudo chmod 644 /etc/agent.env",

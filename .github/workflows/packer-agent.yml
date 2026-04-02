@@ -1,0 +1,40 @@
+name: Build Agent VM Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+  workflow_dispatch: {}
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  build-agent-image:
+    name: Packer Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Packer Init
+        working-directory: ./infra/packer
+        run: packer init agent.pkr.hcl
+
+      - name: Packer Build
+        working-directory: ./infra/packer
+        run: packer build -var "project_id=${{ env.PROJECT_ID }}" agent.pkr.hcl
