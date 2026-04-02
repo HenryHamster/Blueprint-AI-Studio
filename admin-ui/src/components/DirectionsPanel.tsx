@@ -60,6 +60,10 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   // Collapsible sections — all expanded by default
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
+  // Research button state
+  const [researchingIds, setResearchingIds] = useState<Record<string, boolean>>({});
+  const [researchSuccessIds, setResearchSuccessIds] = useState<Record<string, boolean>>({});
+
   useEffect(() => {
     fetchProjects();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -204,6 +208,24 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     } catch {
       setDirections(previousDirections);
       setError('Failed to reorder directions. Please try again.');
+    }
+  }
+
+  async function triggerResearch(id: string) {
+    setResearchingIds(prev => ({ ...prev, [id]: true }));
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}/research`, {
+        method: 'POST', headers: h,
+      });
+      if (!res.ok) throw new Error('Failed to trigger research');
+      setResearchSuccessIds(prev => ({ ...prev, [id]: true }));
+      setTimeout(() => setResearchSuccessIds(prev => ({ ...prev, [id]: false })), 3000);
+    } catch {
+      setError('Failed to trigger research. Please try again.');
+    } finally {
+      setResearchingIds(prev => ({ ...prev, [id]: false }));
     }
   }
 
@@ -424,6 +446,16 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                         )}
                                       </>);
                                     })()}
+                                    {key === 'active' && (
+                                      <button
+                                        onClick={() => triggerResearch(d.id)}
+                                        disabled={researchingIds[d.id]}
+                                        title="Trigger research for this direction"
+                                        className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-50 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700/60"
+                                      >
+                                        {researchingIds[d.id] ? '…' : researchSuccessIds[d.id] ? 'Queued' : 'Research'}
+                                      </button>
+                                    )}
                                     <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
                                       <Pencil className="w-3 h-3" />
                                     </button>

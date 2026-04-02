@@ -1266,6 +1266,63 @@ async def update_direction(
     return {"direction": next(d for d in directions if d.get("id") == direction_id)}
 
 
+@router.post("/projects/{project_id}/directions/{direction_id}/research")
+async def create_direction_research_task(
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
+    if not direction:
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    vm_name = f"agent-vm-{uuid.uuid4().hex[:8]}"
+    task_payload = {
+        "type": "research",
+        "directions": [direction],
+        "base_branch": project.base_branch or "main",
+    }
+    direction_text = direction.get("text", "")
+    new_task = Task(
+        project_id=project.id,
+        title=f"Research: {direction_text[:60]}",
+        description=direction_text,
+        payloads=[task_payload],
+        vm_instance_id=vm_name,
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        requires_approval=False,
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="CREATED",
+        details={
+            "created_by": "USER",
+            "method": "direction_research",
+            "direction_id": direction_id,
+        }
+    )
+    session.add(history)
+    await session.commit()
+
+    return {
+        "id": str(new_task.id),
+        "project_id": str(project.id),
+        "title": new_task.title,
+        "status": new_task.status,
+        "vm_instance_id": new_task.vm_instance_id,
+    }
+
+
 @router.get("/projects/{project_id}/directions/task-counts")
 async def get_direction_task_counts(
     project_id: uuid.UUID,
