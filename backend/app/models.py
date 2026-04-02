@@ -147,6 +147,12 @@ def _on_status_message_set(target: Task, value, oldvalue, initiator):
         entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
         target.status_log = (target.status_log or []) + [entry]
 
+@event.listens_for(Task.status, "set")
+def _on_status_set(target: Task, value, oldvalue, initiator):
+    if value and isinstance(oldvalue, str) and value != oldvalue:
+        entry = {"t": datetime.utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
+        target.status_log = (target.status_log or []) + [entry]
+
 
 class DeploymentStatus(str, Enum):
     MONITORING = "MONITORING"    # New deploy, within observation window

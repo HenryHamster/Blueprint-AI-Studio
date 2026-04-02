@@ -2686,6 +2686,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
+        if pipeline_active and (parent.latest_status_message or "").startswith("Blocked:"):
+            parent.latest_status_message = "Fix/review pipeline running — waiting for PR to merge"
+            session.add(parent)
+            await session.commit()
         return
 
     # Surface what's blocking if children are done but not all merged

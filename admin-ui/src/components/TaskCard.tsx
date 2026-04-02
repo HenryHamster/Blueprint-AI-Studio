@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package } from 'lucide-react';
 
 export interface ResearchFinding {
@@ -21,6 +21,40 @@ export function isSafeUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function linkifyStatusMessage(msg: string, prUrl?: string): React.ReactNode {
+  // Derive base URL from pr_url, e.g. https://github.com/owner/repo/pull/42 -> https://github.com/owner/repo/pull/
+  let baseUrl: string | undefined;
+  if (prUrl) {
+    const m = prUrl.match(/^(.+\/pull\/)\d+/);
+    if (m) baseUrl = m[1];
+  }
+  if (!baseUrl) return msg;
+
+  const regex = /PR #(\d+)/g;
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(msg)) !== null) {
+    if (lastIndex < match.index) parts.push(msg.slice(lastIndex, match.index));
+    const url = `${baseUrl}${match[1]}`;
+    if (isSafeUrl(url)) {
+      parts.push(
+        <a key={match.index} href={url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline">
+          {match[0]}
+        </a>
+      );
+    } else {
+      parts.push(match[0]);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (parts.length === 0) return msg;
+  if (lastIndex < msg.length) parts.push(msg.slice(lastIndex));
+  return <>{parts}</>;
 }
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
@@ -317,14 +351,14 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequest
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
           >
             <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${statusExpanded ? 'rotate-90' : ''}`} />
-            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Agent Status:</span>
+            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Status:</span>
             {!statusExpanded && (
-              <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 80)}</span>
+              <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 120)}</span>
             )}
           </button>
           {statusExpanded && (
             <div className="px-2.5 pb-2.5 whitespace-pre-wrap break-words">
-              &gt; {task.latest_status_message}
+              &gt; {linkifyStatusMessage(task.latest_status_message, task.pr_url)}
             </div>
           )}
         </div>

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
-import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime } from './TaskCard';
+import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage } from './TaskCard';
 import type { Task } from './TaskCard';
 
 interface TaskDetailDrawerProps {
@@ -74,6 +74,15 @@ function formatCreatedBy(value: string): string {
   if (value === 'ORCHESTRATOR') return 'Orchestrator';
   if (value.startsWith('AGENT_')) return `Agent (${value.slice(6)})`;
   return value;
+}
+
+function getLogEntryColor(msg: string): string {
+  const lower = msg.toLowerCase();
+  if (lower.includes('failed') || lower.includes('error') || lower.includes('cancelled')) return 'text-red-400';
+  if (lower.includes('blocked') || lower.includes('conflict')) return 'text-amber-400';
+  if (lower.includes('merged') || lower.includes('completed') || lower.includes('passed')) return 'text-emerald-400';
+  if (msg.startsWith('Status changed:')) return 'text-blue-400';
+  return 'text-neutral-300';
 }
 
 
@@ -248,12 +257,15 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
         <>
           <SectionHeader>Status Log ({task.status_log.length})</SectionHeader>
           <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar bg-neutral-900/50 rounded-lg p-3 border border-neutral-800">
-            {task.status_log.slice().reverse().map((entry, i) => (
-              <div key={i} className="flex items-start gap-2 text-xs">
-                <span className="text-neutral-600 shrink-0 font-mono">{formatTimestamp(entry.t)}</span>
-                <span className="text-neutral-300 break-words min-w-0">{entry.msg}</span>
-              </div>
-            ))}
+            {task.status_log.slice().reverse().map((entry, i) => {
+              const isStatusTransition = entry.msg.startsWith('Status changed:');
+              return (
+                <div key={i} className={`flex items-start gap-2 text-xs${isStatusTransition ? ' pl-2 border-l-2 border-blue-600/50' : ''}`}>
+                  <span className="text-neutral-600 shrink-0 font-mono">{formatTimestamp(entry.t)}</span>
+                  <span className={`${getLogEntryColor(entry.msg)} break-words min-w-0`}>{linkifyStatusMessage(entry.msg, task.pr_url)}</span>
+                </div>
+              );
+            })}
           </div>
         </>
       )}
