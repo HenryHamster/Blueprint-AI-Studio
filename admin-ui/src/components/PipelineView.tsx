@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 
@@ -18,6 +18,23 @@ interface TreeNode {
   children: TreeNode[];
   isSyntheticParent?: boolean;
   isOrphan?: boolean;
+}
+
+type FilterType = 'All' | 'Active' | 'Failed' | 'Needs Review';
+
+const FILTER_CHIPS: { label: FilterType }[] = [
+  { label: 'All' },
+  { label: 'Active' },
+  { label: 'Failed' },
+  { label: 'Needs Review' },
+];
+
+function taskMatchesFilter(task: Task, filter: FilterType): boolean {
+  if (filter === 'All') return true;
+  if (filter === 'Active') return ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status);
+  if (filter === 'Failed') return task.status === 'FAILED';
+  if (filter === 'Needs Review') return task.requires_approval === true;
+  return true;
 }
 
 interface PipelineViewProps {
@@ -91,7 +108,7 @@ function buildForest(tasks: Task[]): TreeNode[] {
   return [...syntheticRoots, ...roots];
 }
 
-function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; activeFilter: FilterType }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
@@ -104,20 +121,22 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent }: { task: Ta
     ? task.history[task.history.length - 1].timestamp
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
+  const dimmed = !taskMatchesFilter(task, activeFilter);
 
   return (
     <div
       role="button"
       tabIndex={0}
+      data-task-id={task.id}
       onClick={() => onViewLogs(task)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
-      className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
+      className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'} ${dimmed ? 'opacity-40 grayscale' : ''}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}\nClick to view logs`}
     >
       {/* Status dot */}
       <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor}`} />
       {heartbeat && (
-        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
+        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${heartbeat.color}${heartbeat.color === 'bg-red-500' ? ' animate-pulse' : ''}`} title={heartbeat.text} />
       )}
 
       {/* Orphan indicator */}
@@ -138,10 +157,50 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent }: { task: Ta
         </span>
       )}
 
-      {/* Title */}
-      <span className="text-xs text-neutral-200 truncate flex-1 group-hover:text-neutral-100">
-        {task.title}
-      </span>
+      {/* Retry badge */}
+      {task.attempt_count != null && task.attempt_count > 0 && (
+        <span className="text-orange-400 bg-orange-500/10 border border-orange-500/20 text-[9px] px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
+          ↺{task.attempt_count + 1}
+        </span>
+      )}
+
+      {/* PR badge */}
+      {task.pr_url && prNumberFromUrl(task.pr_url) != null && (
+        <a
+          href={task.pr_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={e => e.stopPropagation()}
+          className="text-[9px] text-sky-400/80 border border-sky-500/30 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-300 px-1.5 py-0.5 rounded font-medium whitespace-nowrap flex items-center gap-0.5 shrink-0 transition-colors"
+        >
+          PR #{prNumberFromUrl(task.pr_url)}<ExternalLink className="w-2.5 h-2.5" />
+        </a>
+      )}
+
+      {/* Iteration count badge */}
+      {(() => {
+        const prCount = task.artifacts?.filter(a => a.artifact_type === 'PULL_REQUEST').length ?? 0;
+        return prCount > 1 ? (
+          <span
+            className="bg-orange-500/10 border border-orange-500/20 text-orange-400 text-[9px] font-mono px-1.5 py-0.5 rounded whitespace-nowrap shrink-0"
+            title={`This task required ${prCount} PR iterations`}
+          >
+            ×{prCount} iters
+          </span>
+        ) : null;
+      })()}
+
+      {/* Title + status message */}
+      <div className="flex flex-col min-w-0 flex-1">
+        <span className="text-xs text-neutral-200 truncate group-hover:text-neutral-100">
+          {task.title}
+        </span>
+        {task.latest_status_message && task.status !== 'QUEUED' && task.status !== 'COMPLETED' && task.status !== 'CANCELLED' && (
+          <span className="text-[10px] text-neutral-500 truncate">
+            {task.latest_status_message}
+          </span>
+        )}
+      </div>
 
       {/* Duration */}
       <span className="text-[10px] text-neutral-500 font-mono shrink-0">
@@ -160,6 +219,7 @@ function TreeBranch({
   onNavigateToParent,
   isLast,
   depth,
+  activeFilter,
 }: {
   node: TreeNode;
   taskMap: Map<string, Task>;
@@ -169,6 +229,7 @@ function TreeBranch({
   onNavigateToParent?: (parentTaskId: string) => void;
   isLast: boolean;
   depth: number;
+  activeFilter: FilterType;
 }) {
   const depIds = node.task.depends_on || [];
   const depTasks = depIds
@@ -193,6 +254,9 @@ function TreeBranch({
   const chainColor = node.task.task_type === 'fix' ? 'border-orange-500/50' : 'border-amber-500/50';
   const chainBadgeBg = node.task.task_type === 'fix' ? 'bg-orange-500/10 border-orange-500/30 text-orange-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400';
   const chainLabel = node.task.task_type === 'fix' ? 'Fix' : 'Review';
+
+  const [childrenExpanded, setChildrenExpanded] = useState(true);
+  const hasChildren = node.children.length > 0;
 
   return (
     <div className="relative">
@@ -245,10 +309,25 @@ function TreeBranch({
           </div>
         )}
 
-        <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} />
+        <div className="flex items-center gap-1">
+          {hasChildren && (
+            <button
+              onClick={e => { e.stopPropagation(); setChildrenExpanded(v => !v); }}
+              className="shrink-0 p-0.5 text-neutral-500 hover:text-neutral-300 transition-colors"
+              title={childrenExpanded ? 'Collapse children' : 'Expand children'}
+            >
+              {childrenExpanded
+                ? <ChevronDown className="w-3.5 h-3.5" />
+                : <ChevronRight className="w-3.5 h-3.5" />}
+            </button>
+          )}
+          <div className="flex-1 min-w-0">
+            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} activeFilter={activeFilter} />
+          </div>
+        </div>
 
         {/* Children */}
-        {node.children.length > 0 && (
+        {hasChildren && childrenExpanded && (
           <div className="mt-1 space-y-1">
             {node.children.map((child, i) => (
               <TreeBranch
@@ -261,6 +340,7 @@ function TreeBranch({
                 onNavigateToParent={onNavigateToParent}
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
+                activeFilter={activeFilter}
               />
             ))}
           </div>
@@ -297,6 +377,7 @@ function RootGroup({
   onNavigateToParent,
   expanded,
   onToggle,
+  activeFilter,
 }: {
   root: TreeNode;
   taskMap: Map<string, Task>;
@@ -306,6 +387,7 @@ function RootGroup({
   onNavigateToParent?: (parentTaskId: string) => void;
   expanded: boolean;
   onToggle: () => void;
+  activeFilter: FilterType;
 }) {
   const isSynthetic = root.isSyntheticParent;
   const totalInGroup = isSynthetic
@@ -373,6 +455,28 @@ function RootGroup({
         </div>
       </div>
 
+      {/* Progress bar */}
+      {(() => {
+        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup;
+        const segments = [
+          { count: queuedInGroup, color: 'bg-neutral-700' },
+          { count: runningInGroup, color: 'bg-yellow-500' },
+          { count: failedInGroup, color: 'bg-red-500' },
+          { count: completedInGroup, color: 'bg-emerald-500' },
+        ].filter(s => s.count > 0);
+        return (
+          <div className="flex w-full h-1 rounded-full overflow-hidden mt-2">
+            {segments.map((s, i) => (
+              <div
+                key={i}
+                className={s.color}
+                style={{ flexGrow: s.count }}
+              />
+            ))}
+          </div>
+        );
+      })()}
+
       {/* Tree */}
       {expanded && (
         <div className="space-y-1 mt-3">
@@ -388,6 +492,7 @@ function RootGroup({
                 onNavigateToParent={onNavigateToParent}
                 isLast={i === root.children.length - 1}
                 depth={0}
+                activeFilter={activeFilter}
               />
             ))
           ) : (
@@ -400,6 +505,7 @@ function RootGroup({
               onNavigateToParent={onNavigateToParent}
               isLast={true}
               depth={0}
+              activeFilter={activeFilter}
             />
           )}
         </div>
@@ -414,11 +520,48 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const prChainMap = useMemo(() => buildPrChainMap(tasks), [tasks]);
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({});
+  const [activeFilter, setActiveFilter] = useState<FilterType>('All');
 
-  const getExpanded = (id: string) => groupExpanded[id] ?? true;
-  const toggleGroup = (id: string) => setGroupExpanded(prev => ({ ...prev, [id]: !(prev[id] ?? true) }));
+  const defaultExpanded = useMemo(() =>
+    Object.fromEntries(
+      forest.map(r => [
+        r.task.id,
+        countByStatuses(r, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'FAILED']) > 0,
+      ])
+    ),
+    [forest]
+  );
+
+  const getExpanded = (id: string) => id in groupExpanded ? groupExpanded[id] : (defaultExpanded[id] ?? true);
+  const toggleGroup = (id: string) => setGroupExpanded(prev => ({ ...prev, [id]: !getExpanded(id) }));
   const expandAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, true])));
   const collapseAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, false])));
+
+  const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
+  const activeTaskIds = useMemo(
+    () => tasks.filter(t => ACTIVE_STATUSES.includes(t.status)).map(t => t.id),
+    [tasks],
+  );
+
+  const jumpToActive = () => {
+    // Expand all root groups that contain active tasks
+    const toExpand: Record<string, boolean> = {};
+    for (const root of forest) {
+      const hasActive = root.isSyntheticParent
+        ? root.children.some(c => countByStatuses(c, ACTIVE_STATUSES) > 0)
+        : countByStatuses(root, ACTIVE_STATUSES) > 0;
+      if (hasActive) toExpand[root.task.id] = true;
+    }
+    setGroupExpanded(prev => ({ ...prev, ...toExpand }));
+
+    // After re-render, scroll to the first active task element
+    setTimeout(() => {
+      const firstActiveId = activeTaskIds[0];
+      if (!firstActiveId) return;
+      const el = document.querySelector(`[data-task-id="${firstActiveId}"]`);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 0);
+  };
 
   if (tasks.length === 0) {
     return (
@@ -429,14 +572,36 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
   }
 
   const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
+  const chipBase = 'px-2.5 py-1 text-xs rounded-full border transition-colors font-medium';
+  const chipActive = 'bg-neutral-700 border-neutral-500 text-neutral-100';
+  const chipInactive = 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300 hover:border-neutral-600';
 
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
       <div className="space-y-4 min-w-[400px]">
+        <div className="flex items-center gap-1.5">
+          {FILTER_CHIPS.map(({ label }) => (
+            <button
+              key={label}
+              className={`${chipBase} ${activeFilter === label ? chipActive : chipInactive}`}
+              onClick={() => setActiveFilter(label)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         {forest.length > 1 && (
           <div className="flex items-center gap-2">
             <button className={btnClass} onClick={expandAll}>Expand all</button>
             <button className={btnClass} onClick={collapseAll}>Collapse all</button>
+            {activeTaskIds.length > 0 && (
+              <button
+                className="px-2 py-1 text-xs text-yellow-400 hover:text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded transition-colors"
+                onClick={jumpToActive}
+              >
+                Jump to active
+              </button>
+            )}
           </div>
         )}
         {forest.map(root => (
@@ -450,6 +615,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent }: Pipeline
             onNavigateToParent={onNavigateToParent}
             expanded={getExpanded(root.task.id)}
             onToggle={() => toggleGroup(root.task.id)}
+            activeFilter={activeFilter}
           />
         ))}
       </div>
