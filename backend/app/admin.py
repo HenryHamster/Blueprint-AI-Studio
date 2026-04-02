@@ -10,6 +10,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus
@@ -1171,6 +1172,36 @@ async def remove_direction(
     return {"message": "Direction removed"}
 
 
+@router.patch("/projects/{project_id}/directions/reorder")
+async def reorder_directions(
+    project_id: uuid.UUID,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    direction_ids = payload.get("direction_ids")
+    if not isinstance(direction_ids, list):
+        raise HTTPException(status_code=400, detail="direction_ids must be a list")
+
+    existing_ids = {d.get("id") for d in (project.directions or [])}
+    provided_ids = set(direction_ids)
+    if existing_ids != provided_ids:
+        raise HTTPException(status_code=400, detail="direction_ids must match existing direction IDs exactly")
+
+    directions_by_id = {d.get("id"): d for d in (project.directions or [])}
+    reordered = [directions_by_id[id] for id in direction_ids]
+
+    project.directions = reordered
+    flag_modified(project, 'directions')
+    session.add(project)
+    await session.commit()
+    return {"directions": reordered}
+
+
 @router.patch("/projects/{project_id}/directions/{direction_id}")
 async def update_direction(
     project_id: uuid.UUID,
@@ -1209,9 +1240,40 @@ async def update_direction(
         raise HTTPException(status_code=404, detail="Direction not found")
 
     project.directions = directions
+    flag_modified(project, 'directions')
     session.add(project)
     await session.commit()
     return {"direction": next(d for d in directions if d.get("id") == direction_id)}
+
+
+@router.get("/projects/{project_id}/directions/task-counts")
+async def get_direction_task_counts(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+        )
+    )
+    tasks = result.scalars().all()
+
+    counts: Dict[str, int] = {}
+    for task in tasks:
+        payload = (task.payloads or [{}])[0]
+        if payload.get("type") != "research":
+            continue
+        for direction in payload.get("directions", []):
+            d_id = direction.get("id")
+            if d_id:
+                counts[d_id] = counts.get(d_id, 0) + 1
+
+    return {"counts": counts}
 
 
 @router.patch("/projects/{project_id}/autonomous")

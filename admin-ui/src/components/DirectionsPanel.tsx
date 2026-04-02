@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight } from 'lucide-react';
+import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
 
 interface Project {
@@ -28,12 +28,21 @@ const statusColors: Record<string, string> = {
   paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
 };
 
+const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+
+const STATUS_GROUPS: Array<{ key: 'active' | 'paused' | 'completed'; label: string }> = [
+  { key: 'active', label: 'Active' },
+  { key: 'paused', label: 'Paused' },
+  { key: 'completed', label: 'Completed' },
+];
+
 export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [directions, setDirections] = useState<Direction[]>([]);
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
 
   // Add form
   const [newText, setNewText] = useState('');
@@ -47,6 +56,9 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
   const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused'>('active');
+
+  // Collapsible sections — all expanded by default
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     fetchProjects();
@@ -74,11 +86,18 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     setLoading(true);
     try {
       const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, { headers: h });
+      const [res, countsRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, { headers: h }),
+        fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/task-counts`, { headers: h }),
+      ]);
       if (!res.ok) throw new Error('Failed to fetch directions');
       const data = await res.json();
       setDirections(data.directions ?? []);
       setAutonomousEnabled(data.autonomous_enabled ?? false);
+      if (countsRes.ok) {
+        const countsData = await countsRes.json();
+        setTaskCounts(countsData.counts ?? {});
+      }
     } catch { /* ignore */ }
     setLoading(false);
   }
@@ -117,6 +136,22 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function quickToggleStatus(id: string, currentStatus: 'active' | 'paused') {
+    setError(null);
+    const newStatus = currentStatus === 'active' ? 'paused' : 'active';
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!res.ok) throw new Error('Failed to update status');
+      fetchDirections();
+    } catch {
+      setError('Failed to update status. Please try again.');
+    }
+  }
+
   async function deleteDirection(id: string) {
     if (!window.confirm('Are you sure you want to delete this direction?')) return;
     setError(null);
@@ -148,12 +183,51 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function reorderDirections(newOrder: Direction[]) {
+    const previousDirections = directions;
+    // Optimistic update: replace directions with new order (non-active directions stay in place)
+    setDirections(prev => {
+      const nonActive = prev.filter(d => d.status !== 'active');
+      return [...newOrder, ...nonActive];
+    });
+    setError(null);
+    try {
+      const h = await authHeaders();
+      // Full reorder: active in new order, then non-active in original order
+      const nonActive = previousDirections.filter(d => d.status !== 'active');
+      const allOrdered = [...newOrder, ...nonActive];
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/reorder`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ direction_ids: allOrdered.map(d => d.id) }),
+      });
+      if (!res.ok) throw new Error('Failed to reorder directions');
+    } catch {
+      setDirections(previousDirections);
+      setError('Failed to reorder directions. Please try again.');
+    }
+  }
+
   function startEdit(d: Direction) {
     setEditingId(d.id);
     setEditText(d.text);
     setEditPriority(d.priority);
     setEditStatus(d.status);
   }
+
+  function toggleSection(key: string) {
+    setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
+  }
+
+  const grouped = STATUS_GROUPS.map(({ key, label }) => ({
+    key,
+    label,
+    // Active directions preserve user-defined order; others sort by priority
+    items: key === 'active'
+      ? directions.filter(d => d.status === key)
+      : directions
+          .filter(d => d.status === key)
+          .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]),
+  }));
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -186,16 +260,21 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
           </div>
 
           {selectedProjectId && (
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
-              <button onClick={toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors">
-                {autonomousEnabled ? (
-                  <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>
-                ) : (
-                  <><ToggleLeft className="w-6 h-6 text-neutral-600" /><span className="text-neutral-500 text-xs font-medium">Off</span></>
-                )}
-              </button>
-            </div>
+            <>
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-medium text-neutral-400 uppercase tracking-wider">Autonomous Mode</span>
+                <button onClick={toggleAutonomous} className="flex items-center gap-1.5 text-sm transition-colors">
+                  {autonomousEnabled ? (
+                    <><ToggleRight className="w-6 h-6 text-emerald-400" /><span className="text-emerald-400 text-xs font-medium">On</span></>
+                  ) : (
+                    <><ToggleLeft className="w-6 h-6 text-neutral-600" /><span className="text-neutral-500 text-xs font-medium">Off</span></>
+                  )}
+                </button>
+              </div>
+              <p className="text-xs text-neutral-500 leading-relaxed">
+                Active directions guide the research agent. Only Active directions are included in new tasks.
+              </p>
+            </>
           )}
         </div>
 
@@ -249,74 +328,145 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
           ) : directions.length === 0 ? (
             <p className="text-xs text-neutral-500 text-center py-8">No directions yet</p>
           ) : (
-            <div className="space-y-2">
-              {directions.map(d => (
-                <div key={d.id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-                  {editingId === d.id ? (
-                    /* Edit mode */
-                    <div className="space-y-2">
-                      <input
-                        value={editText}
-                        onChange={e => setEditText(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      />
-                      <div className="flex items-center gap-2">
-                        <select
-                          value={editPriority}
-                          onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
-                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        >
-                          <option value="high">High</option>
-                          <option value="medium">Medium</option>
-                          <option value="low">Low</option>
-                        </select>
-                        <select
-                          value={editStatus}
-                          onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused')}
-                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        >
-                          <option value="active">Active</option>
-                          <option value="completed">Completed</option>
-                          <option value="paused">Paused</option>
-                        </select>
-                        <div className="flex-1" />
-                        <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
-                          <Check className="w-3.5 h-3.5" />
-                        </button>
-                        <button onClick={() => setEditingId(null)} className="text-neutral-500 hover:text-neutral-300 transition-colors">
-                          <X className="w-3.5 h-3.5" />
-                        </button>
+            <div className="space-y-4">
+              {grouped.map(({ key, label, items }) => {
+                if (items.length === 0) return null;
+                const isCollapsed = collapsed[key] ?? false;
+                return (
+                  <div key={key}>
+                    <button
+                      onClick={() => toggleSection(key)}
+                      className="flex items-center gap-1.5 w-full text-left mb-2 group"
+                    >
+                      {isCollapsed
+                        ? <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                        : <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                      }
+                      <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider group-hover:text-neutral-300 transition-colors">
+                        {label} ({items.length})
+                      </span>
+                    </button>
+                    {!isCollapsed && (
+                      <div className="space-y-2">
+                        {items.map(d => (
+                          <div key={d.id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                            {editingId === d.id ? (
+                              /* Edit mode */
+                              <div className="space-y-2">
+                                <input
+                                  value={editText}
+                                  onChange={e => setEditText(e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                />
+                                <div className="flex items-center gap-2">
+                                  <select
+                                    value={editPriority}
+                                    onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
+                                    className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                  >
+                                    <option value="high">High</option>
+                                    <option value="medium">Medium</option>
+                                    <option value="low">Low</option>
+                                  </select>
+                                  <select
+                                    value={editStatus}
+                                    onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused')}
+                                    className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                  >
+                                    <option value="active">Active</option>
+                                    <option value="completed">Completed</option>
+                                    <option value="paused">Paused</option>
+                                  </select>
+                                  <div className="flex-1" />
+                                  <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
+                                    <Check className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button onClick={() => setEditingId(null)} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              /* View mode */
+                              <div>
+                                <div className="flex items-start gap-2">
+                                  <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {key === 'active' && (() => {
+                                      const activeItems = grouped.find(g => g.key === 'active')!.items;
+                                      const idx = activeItems.findIndex(x => x.id === d.id);
+                                      return (<>
+                                        {idx > 0 && (
+                                          <button
+                                            onClick={() => {
+                                              const next = [...activeItems];
+                                              [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                                              reorderDirections(next);
+                                            }}
+                                            className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5"
+                                            title="Move up"
+                                          >
+                                            <ChevronUp className="w-3 h-3" />
+                                          </button>
+                                        )}
+                                        {idx < activeItems.length - 1 && (
+                                          <button
+                                            onClick={() => {
+                                              const next = [...activeItems];
+                                              [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+                                              reorderDirections(next);
+                                            }}
+                                            className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5"
+                                            title="Move down"
+                                          >
+                                            <ChevronDown className="w-3 h-3" />
+                                          </button>
+                                        )}
+                                      </>);
+                                    })()}
+                                    <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
+                                      <Pencil className="w-3 h-3" />
+                                    </button>
+                                    <button onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2 mt-2">
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
+                                    {d.priority}
+                                  </span>
+                                  {d.status === 'active' || d.status === 'paused' ? (
+                                    <button
+                                      onClick={() => quickToggleStatus(d.id, d.status as 'active' | 'paused')}
+                                      title={d.status === 'active' ? 'Click to pause' : 'Click to activate'}
+                                      className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-70 cursor-pointer ${statusColors[d.status]}`}
+                                    >
+                                      {d.status}
+                                    </button>
+                                  ) : (
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors[d.status]}`}>
+                                      {d.status}
+                                    </span>
+                                  )}
+                                  <span className="text-[10px] text-neutral-600 ml-auto">
+                                    {new Date(d.added_at).toLocaleDateString()}
+                                  </span>
+                                  {(taskCounts[d.id] ?? 0) > 0 && (
+                                    <span className="text-[10px] text-neutral-500">
+                                      {taskCounts[d.id]} {taskCounts[d.id] === 1 ? 'task' : 'tasks'}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        ))}
                       </div>
-                    </div>
-                  ) : (
-                    /* View mode */
-                    <div>
-                      <div className="flex items-start gap-2">
-                        <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-                        <div className="flex items-center gap-1 shrink-0">
-                          <button onClick={() => startEdit(d)} className="text-neutral-600 hover:text-neutral-300 transition-colors p-0.5">
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                          <button onClick={() => deleteDirection(d.id)} className="text-neutral-600 hover:text-red-400 transition-colors p-0.5">
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 mt-2">
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
-                          {d.priority}
-                        </span>
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors[d.status]}`}>
-                          {d.status}
-                        </span>
-                        <span className="text-[10px] text-neutral-600 ml-auto">
-                          {new Date(d.added_at).toLocaleDateString()}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
