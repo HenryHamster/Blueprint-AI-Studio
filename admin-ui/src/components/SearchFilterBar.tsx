@@ -1,5 +1,6 @@
 import { Search, ChevronDown, Check } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
+import { STATUS_OPTIONS } from '../constants';
 
 interface SearchFilterBarProps {
   searchQuery: string;
@@ -14,15 +15,7 @@ interface SearchFilterBarProps {
 
 const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix'] as const;
 
-const STATUS_OPTIONS: { label: string; value: string }[] = [
-  { label: 'Queued', value: 'QUEUED' },
-  { label: 'Provisioning', value: 'PROVISIONING' },
-  { label: 'In Progress', value: 'IN_PROGRESS' },
-  { label: 'Evaluating', value: 'EVALUATING' },
-  { label: 'Failed', value: 'FAILED' },
-  { label: 'Cancelled', value: 'CANCELLED' },
-  { label: 'Completed', value: 'COMPLETED' },
-];
+
 
 interface MultiSelectDropdownProps {
   label: string;
@@ -55,7 +48,8 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
     }
   }
 
-  const buttonLabel = selected.length === 0
+  const allSelected = selected.length === options.length;
+  const buttonLabel = allSelected
     ? label
     : selected.length === 1
       ? options.find(o => o.value === selected[0])?.label ?? label
@@ -66,7 +60,7 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
       <button
         onClick={() => setOpen(prev => !prev)}
         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all border ${
-          selected.length > 0
+          !allSelected
             ? 'bg-white/5 border-neutral-600 text-neutral-100'
             : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
@@ -78,13 +72,13 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
       {open && (
         <div className="absolute top-full mt-1 left-0 z-50 min-w-[140px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
           <button
-            onClick={() => { onChange([]); setOpen(false); }}
+            onClick={() => { onChange(options.map(o => o.value)); setOpen(false); }}
             className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-neutral-800 transition-colors ${
-              selected.length === 0 ? 'text-neutral-100' : 'text-neutral-400'
+              allSelected ? 'text-neutral-100' : 'text-neutral-400'
             }`}
           >
             <span>All</span>
-            {selected.length === 0 && <Check className="w-3 h-3 text-neutral-400" />}
+            {allSelected && <Check className="w-3 h-3 text-neutral-400" />}
           </button>
           <div className="border-t border-neutral-800" />
           {options.map(opt => {
@@ -109,21 +103,21 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
 }
 
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
+  const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
+
   const activeFilterCount = [
     searchQuery !== '',
-    taskTypeFilter.length > 0,
-    statusFilter.length > 0,
+    taskTypeFilter.length < typeOptions.length,
+    statusFilter.length < STATUS_OPTIONS.length,
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
 
   function handleClear() {
     onSearchChange('');
-    onTypeFilterChange([]);
-    onStatusFilterChange([]);
+    onTypeFilterChange(typeOptions.map(o => o.value));
+    onStatusFilterChange(STATUS_OPTIONS.map(o => o.value));
   }
-
-  const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
 
   return (
     <div className="flex items-center gap-2 mb-4 shrink-0 flex-wrap">

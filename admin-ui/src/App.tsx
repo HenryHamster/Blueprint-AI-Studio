@@ -46,14 +46,13 @@ export default function App() {
   }, [s.tasks]);
 
   const visibleColumns = useMemo(() => {
-    if (s.statusFilter.length === 0) return COLUMNS;
     return COLUMNS.filter(col => col.includes.some(status => s.statusFilter.includes(status)));
   }, [s.statusFilter]);
 
   const filteredTasks = useMemo(() => s.tasks.filter(t => {
     const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-    const typeMatch = s.taskTypeFilter.length === 0 || s.taskTypeFilter.includes(taskType);
-    const statusMatch = s.statusFilter.length === 0 || s.statusFilter.includes(t.status);
+    const typeMatch = s.taskTypeFilter.includes(taskType);
+    const statusMatch = s.statusFilter.includes(t.status);
     const query = s.searchQuery.toLowerCase();
     const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
     const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;

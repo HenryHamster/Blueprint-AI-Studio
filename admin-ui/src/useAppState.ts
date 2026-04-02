@@ -6,6 +6,7 @@ import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
 import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
+import { STATUS_OPTIONS } from './constants';
 
 export interface DeployState {
   status: string;
@@ -155,8 +156,8 @@ export function useAppState() {
 
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>([]);
-  const [statusFilter, setStatusFilter] = useState<string[]>([]);
+  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>(['create', 'plan', 'research', 'review', 'fix']);
+  const [statusFilter, setStatusFilter] = useState<string[]>(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED']);
 
   // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
@@ -334,7 +335,9 @@ export function useAppState() {
     try {
       const offset = (page - 1) * limit;
       let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
-      statusFilter.forEach(s => { url += `&status=${s}`; });
+      if (statusFilter.length < STATUS_OPTIONS.length) {
+        statusFilter.forEach(s => { url += `&status=${s}`; });
+      }
       const res = await authGet(url);
       if (res.ok) {
         const data = await res.json();
