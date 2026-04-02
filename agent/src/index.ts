@@ -1858,9 +1858,9 @@ async function main() {
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
-    // Dispatch to handler
-    const handler = handlers[taskType];
-    if (!handler) throw new Error(`Unknown task type: ${taskType}`);
+    // Dispatch to handler (fall back to create for unknown types)
+    const handler = handlers[taskType] || handlers.create;
+    if (!handlers[taskType]) sendLog(ws, `Warning: unknown task type "${taskType}", using create handler\n`);
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     sendLog(ws, '\nTask completed.\n');
 
