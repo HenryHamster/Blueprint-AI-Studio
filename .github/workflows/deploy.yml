@@ -57,14 +57,11 @@ jobs:
             echo "migrations=${{ steps.filter.outputs.migrations }}" >> $GITHUB_OUTPUT
           fi
 
-  deploy-backend:
-    name: Backend
+  build-backend:
+    name: Build Backend Image
     runs-on: ubuntu-latest
-    needs: [detect, run-migrations]
-    if: |
-      always() &&
-      needs.detect.outputs.backend == 'true' &&
-      (needs.run-migrations.result == 'success' || needs.run-migrations.result == 'skipped')
+    needs: detect
+    if: needs.detect.outputs.backend == 'true'
     permissions:
       contents: read
       id-token: write
@@ -89,8 +86,27 @@ jobs:
           docker build -t "${IMAGE_URI}:${{ github.sha }}" -t "${IMAGE_URI}:latest" .
           docker push "${IMAGE_URI}" --all-tags
 
-      # Only update the image — all env vars, secrets, VPC config are already
-      # set on the service from the initial deploy via setup.sh
+  deploy-backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    needs: [detect, build-backend, run-migrations]
+    if: |
+      always() &&
+      needs.detect.outputs.backend == 'true' &&
+      needs.build-backend.result == 'success' &&
+      (needs.run-migrations.result == 'success' || needs.run-migrations.result == 'skipped')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy blueprint-orchestrator \
@@ -120,10 +136,12 @@ jobs:
   run-migrations:
     name: Migrations
     runs-on: ubuntu-latest
-    needs: detect
-    # Always run migrations on backend deploys — alembic upgrade head is idempotent
-    # (skips already-applied migrations), so this is safe and prevents schema drift
-    if: needs.detect.outputs.backend == 'true' || needs.detect.outputs.migrations == 'true'
+    needs: [detect, build-backend]
+    # Run after image is built so migration job has latest alembic files
+    if: |
+      always() &&
+      (needs.detect.outputs.backend == 'true' || needs.detect.outputs.migrations == 'true') &&
+      (needs.build-backend.result == 'success' || needs.build-backend.result == 'skipped')
     permissions:
       contents: read
       id-token: write
@@ -136,7 +154,16 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Run migrations job
+      - name: Update migration job image
+        if: needs.build-backend.result == 'success'
+        run: |
+          IMAGE_URI="${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}"
+          gcloud run jobs update blueprint-migrate \
+            --region ${{ env.REGION }} \
+            --image "${IMAGE_URI}" \
+            --quiet
+
+      - name: Run migrations
         run: |
           gcloud run jobs execute blueprint-migrate \
             --region ${{ env.REGION }} \
