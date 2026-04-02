@@ -20,12 +20,6 @@ interface ProjectDashboardProps {
   onSelectProject: (projectId: string | null) => void;
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  active: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-  paused: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-  completed: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
-  archived: 'bg-neutral-500/10 text-neutral-400 border-neutral-500/20',
-};
 
 function getTaskCounts(tasks: Task[], projectId: string) {
   const projectTasks = tasks.filter(t => t.project_id === projectId);
@@ -106,7 +100,6 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           {projects.map(project => {
             const counts = getTaskCounts(tasks, project.id);
             const isSelected = selectedProjectId === project.id;
-            const statusStyle = STATUS_COLORS[project.status] || STATUS_COLORS.active;
 
             return (
               <button
@@ -134,17 +127,14 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </span>
                 </div>
 
-                <div className="flex items-center gap-2 mb-2">
-                  <span className={`text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded border ${statusStyle}`}>
-                    {project.status}
-                  </span>
-                  {project.directions.length > 0 && (
+                {project.directions.length > 0 && (
+                  <div className="flex items-center gap-2 mb-2">
                     <span className="text-[10px] text-neutral-500 flex items-center gap-0.5">
                       <Compass className="w-3 h-3" />
                       {project.directions.length}
                     </span>
-                  )}
-                </div>
+                  </div>
+                )}
 
                 <div className="flex gap-2 text-[10px] font-mono">
                   {counts.queued > 0 && <span className="text-neutral-400">{counts.queued} queued</span>}
