@@ -770,6 +770,22 @@ export function useAppState() {
     return () => clearInterval(id);
   }, []);
 
+  // --- Zone Health ---
+  const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);
+
+  const fetchZoneHealth = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/zone-health`);
+      if (res.ok) setZoneHealth(await res.json());
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    fetchZoneHealth();
+    const id = setInterval(fetchZoneHealth, 30000);
+    return () => clearInterval(id);
+  }, []);
+
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
@@ -1455,5 +1471,7 @@ export function useAppState() {
     // Deploy state
     deployState, handlePausePipeline, handleResumePipeline,
     handleRollback, handleMarkStable, handleRepairState,
+    // Zone health
+    zoneHealth,
   };
 }

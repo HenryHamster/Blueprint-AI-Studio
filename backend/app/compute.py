@@ -4,7 +4,8 @@ import logging
 import asyncio
 import subprocess
 import signal
-from typing import Optional
+import threading
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -14,14 +15,35 @@ LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
 # Configuration for GCP Compute Engine
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 GCP_ZONE = os.getenv("GCP_ZONE", "us-central1-f")
-FALLBACK_ZONES = [
-    GCP_ZONE,
-    "us-central1-c",
-    "us-central1-b",
-    "us-central1-a",
+
+# Cross-region fallback: (zone, subnet_name) tuples
+# Primary region first, then additional regions with their dedicated subnets
+FALLBACK_ZONES: list[tuple[str, str]] = [
+    ("us-central1-f", "agent-sandbox-subnet"),
+    ("us-central1-c", "agent-sandbox-subnet"),
+    ("us-central1-b", "agent-sandbox-subnet"),
+    ("us-central1-a", "agent-sandbox-subnet"),
+    ("us-east4-b",    "agent-sandbox-subnet-us-east4"),
+    ("us-east4-a",    "agent-sandbox-subnet-us-east4"),
+    ("us-east1-c",    "agent-sandbox-subnet-us-east1"),
+    ("us-east1-b",    "agent-sandbox-subnet-us-east1"),
+    ("us-west1-b",    "agent-sandbox-subnet-us-west1"),
+    ("us-west1-a",    "agent-sandbox-subnet-us-west1"),
 ]
+
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
+
+# Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
+_zone_failures: dict[str, datetime] = {}
+ZONE_COOLDOWN_SECONDS = 300  # 5 minutes
+
+# Zone health tracking: populated by provisioning attempts
+_zone_health: dict[str, dict] = {}
+# Structure: { "us-central1-f": {"last_success": datetime, "last_failure": datetime, "consecutive_failures": 0, "last_failure_reason": str} }
+
+# Thread lock for zone state dicts (modified from asyncio.to_thread workers, read from event loop)
+_zone_lock = threading.RLock()
 MACHINE_TYPE = os.getenv("MACHINE_TYPE", "e2-standard-2")
 
 # Networking Configuration
@@ -47,7 +69,7 @@ AGENT_SERVICE_ACCOUNT_EMAIL = os.getenv(
 # Agent source directory for local mode
 AGENT_DIR = os.getenv("AGENT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "agent"))
 
-from app.auth import create_agent_token
+from app.auth import create_agent_token  # noqa: E402 — must be after env vars
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
@@ -252,6 +274,7 @@ EOF
 
     network_interface = compute_v1.NetworkInterface()
     network_interface.network = f"projects/{GCP_PROJECT_ID}/global/networks/{VPC_NETWORK}"
+    # Default subnet — will be overridden per-zone in the fallback loop
     default_region = "-".join(GCP_ZONE.split("-")[:-1])
     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{default_region}/subnetworks/{VPC_SUBNET}"
     instance_config.network_interfaces = [network_interface]
@@ -274,12 +297,21 @@ EOF
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
         last_error = None
-        for zone in FALLBACK_ZONES:
+        now = datetime.utcnow()
+        skipped_cooldown = []
+
+        for zone, subnet_name in FALLBACK_ZONES:
+            # Skip zones in cooldown (recently failed)
+            last_fail = _zone_failures.get(zone)
+            if last_fail and (now - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS:
+                skipped_cooldown.append(zone)
+                continue
+
             try:
                 # Update zone-dependent config for this attempt
                 instance_config.machine_type = f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
                 zone_region = "-".join(zone.split("-")[:-1])
-                network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{VPC_SUBNET}"
+                network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
 
                 # Delete any existing VM with this name first (stale from retries)
                 try:
@@ -287,8 +319,9 @@ EOF
                     logger.info(f"Deleting stale VM {vm_instance_id} in {zone} before re-provisioning")
                     del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
                     del_op.result()
-                except Exception:
-                    pass  # VM doesn't exist — expected case
+                except Exception as e:
+                    if "was not found" not in str(e) and "404" not in str(e):
+                        logger.warning(f"Failed to clean stale VM {vm_instance_id} in {zone}: {e}")
 
                 operation = instance_client.insert(
                     project=GCP_PROJECT_ID,
@@ -296,17 +329,44 @@ EOF
                     instance_resource=instance_config
                 )
                 operation.result()
-                _vm_zones[vm_instance_id] = zone
+
+                with _zone_lock:
+                    _vm_zones[vm_instance_id] = zone
+                    health = _zone_health.setdefault(zone, {})
+                    health["last_success"] = datetime.utcnow()
+                    health["consecutive_failures"] = 0
+                    _zone_failures.pop(zone, None)
+
                 logger.info(f"Successfully provisioned VM {vm_instance_id} in {zone}")
                 return operation.name
             except Exception as e:
                 last_error = e
                 err_str = str(e)
                 if "does not have enough resources" in err_str or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str or "QUOTA" in err_str:
-                    logger.warning(f"Zone {zone} exhausted for {vm_instance_id}, trying next zone...")
+                    # Classify failure reason for operators
+                    if "QUOTA" in err_str:
+                        reason = "QUOTA"
+                    elif "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str:
+                        reason = "RESOURCE_POOL_EXHAUSTED"
+                    else:
+                        reason = "RESOURCE_UNAVAILABLE"
+
+                    with _zone_lock:
+                        _zone_failures[zone] = datetime.utcnow()
+                        health = _zone_health.setdefault(zone, {})
+                        health["last_failure"] = datetime.utcnow()
+                        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+                        health["last_failure_reason"] = reason
+
+                    logger.warning(f"Zone {zone} unavailable ({reason}) for {vm_instance_id}, trying next zone...")
                     continue
                 # Non-zone error — don't retry
                 raise
+
+        if skipped_cooldown:
+            logger.warning(f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}")
+        if not last_error and len(skipped_cooldown) == len(FALLBACK_ZONES):
+            raise Exception(f"All {len(FALLBACK_ZONES)} zones in cooldown — retry after {ZONE_COOLDOWN_SECONDS}s")
         raise last_error or Exception("All zones exhausted")
 
     try:
@@ -328,10 +388,11 @@ async def _delete_gcp(vm_instance_id: str):
         instance_client = compute_v1.InstancesClient()
         # Check known zone first, then try all fallback zones
         zones_to_try = []
-        known_zone = _vm_zones.pop(vm_instance_id, None)
+        with _zone_lock:
+            known_zone = _vm_zones.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
-        zones_to_try.extend(z for z in FALLBACK_ZONES if z not in zones_to_try)
+        zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
 
         for zone in zones_to_try:
             try:
@@ -364,7 +425,7 @@ async def _cleanup_gcp(active_vm_ids: list[str]):
         instance_client = compute_v1.InstancesClient()
         orphaned_count = 0
 
-        for zone in FALLBACK_ZONES:
+        for zone, _ in FALLBACK_ZONES:
             try:
                 request = compute_v1.ListInstancesRequest(
                     project=GCP_PROJECT_ID,
@@ -397,3 +458,46 @@ async def _cleanup_gcp(active_vm_ids: list[str]):
     except Exception as e:
         logger.error(f"Failed to run orphaned VM cleanup: {e}")
         return 0
+
+
+# ─── Zone Health API ───────────────────────────────────────────────────────
+
+def get_zone_health() -> dict:
+    """Return zone health data for admin API consumption."""
+    result = {}
+    with _zone_lock:
+        for zone, _ in FALLBACK_ZONES:
+            data = _zone_health.get(zone, {})
+            cooldown_active = False
+            last_fail = _zone_failures.get(zone)
+            if last_fail:
+                cooldown_active = (datetime.utcnow() - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS
+
+            consecutive = data.get("consecutive_failures", 0)
+            if consecutive == 0:
+                status = "healthy"
+            elif cooldown_active:
+                status = "exhausted"
+            else:
+                status = "recovering"
+
+            result[zone] = {
+                "status": status,
+                "last_success": data["last_success"].isoformat() if data.get("last_success") else None,
+                "last_failure": data["last_failure"].isoformat() if data.get("last_failure") else None,
+                "last_failure_reason": data.get("last_failure_reason"),
+                "consecutive_failures": consecutive,
+                "cooldown_active": cooldown_active,
+            }
+    return result
+
+
+def get_zone_health_summary() -> dict:
+    """Return a compact summary for health endpoints."""
+    health = get_zone_health()
+    exhausted = [z for z, d in health.items() if d["status"] == "exhausted"]
+    return {
+        "total_zones": len(FALLBACK_ZONES),
+        "available": len(FALLBACK_ZONES) - len(exhausted),
+        "exhausted": exhausted,
+    }

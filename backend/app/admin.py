@@ -286,7 +286,7 @@ async def bulk_archive_tasks(
             statuses = [TaskStatus.COMPLETED]
         else:
             statuses = TERMINAL_STATUSES
-        query = select(Task).where(Task.archived == False, Task.status.in_(statuses))
+        query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses))
         result = await session.execute(query)
         archived = result.scalars().all()
         for task in archived:
@@ -766,7 +766,7 @@ async def trigger_rollup(
     current_user: dict = Depends(get_current_user)
 ):
     """Manually trigger rollup PR for an EVALUATING parent task."""
-    from app.main import get_github_token_for_task, _spawn_pipeline_task, broadcast_to_project
+    from app.main import get_github_token_for_task, _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 
     task = await session.get(Task, task_id)
@@ -1698,6 +1698,14 @@ async def restart_orchestrator(
 
 # --- Deployment State & Health ---
 
+def _get_zone_health_summary() -> dict:
+    try:
+        from app.compute import get_zone_health_summary
+        return get_zone_health_summary()
+    except Exception:
+        return {"total_zones": 0, "available": 0, "exhausted": []}
+
+
 @router.get("/deploy-state")
 async def get_deploy_state(
     session: AsyncSession = Depends(get_session),
@@ -1740,6 +1748,7 @@ async def get_deploy_state(
         "task_results_count": len(results),
         "external_health": external_health,
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
+        "zone_health": _get_zone_health_summary(),
     }
 
 
@@ -1970,7 +1979,7 @@ async def repair_state(
     for t in orphan_children:
         if str(t.parent_task_id) not in all_task_ids:
             t.parent_task_id = None
-            t.latest_status_message = f"Repaired: cleared orphaned parent reference"
+            t.latest_status_message = "Repaired: cleared orphaned parent reference"
             session.add(t)
             session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
             repairs.append(f"Cleared orphaned parent ref on {t.id}")
@@ -2200,6 +2209,17 @@ def _count_research_findings(logs: Optional[str]) -> int:
     except (json.JSONDecodeError, AttributeError):
         pass
     return 0
+
+
+# ── Zone Health ──────────────────────────────────────────────────────────────
+
+@router.get("/zone-health")
+async def get_zone_health_endpoint(
+    current_user: dict = Depends(get_current_user),
+):
+    """Get GCP zone health status for VM provisioning."""
+    from app.compute import get_zone_health
+    return get_zone_health()
 
 
 # ── Alerts ───────────────────────────────────────────────────────────────────

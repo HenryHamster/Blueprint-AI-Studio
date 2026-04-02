@@ -298,6 +298,7 @@ export default function App() {
         onRollback={s.handleRollback}
         onMarkStable={s.handleMarkStable}
         onRepairState={s.handleRepairState}
+        zoneHealth={s.zoneHealth}
       />
 
       <div

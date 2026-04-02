@@ -68,6 +68,8 @@ interface SettingsDropdownProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  // Zone health
+  zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
 }
 
 function relativeTime(ms: number): string {
@@ -143,6 +145,7 @@ export function SettingsDropdown({
   onRollback,
   onMarkStable,
   onRepairState,
+  zoneHealth,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -743,6 +746,45 @@ export function SettingsDropdown({
               </div>
             ) : (
               <p className="text-[11px] text-neutral-600">Loading...</p>
+            )}
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mt-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Zone Health</h4>
+            {zoneHealth ? (
+              <div className="space-y-1">
+                {Object.entries(zoneHealth).map(([zone, data]) => {
+                  const region = zone.split('-').slice(0, 2).join('-');
+                  const dotColor = data.status === 'healthy' ? 'bg-emerald-500'
+                    : data.status === 'exhausted' ? 'bg-red-500 animate-pulse'
+                    : 'bg-amber-500'; // recovering
+                  const labelColor = data.status === 'healthy' ? 'text-neutral-600'
+                    : data.status === 'exhausted' ? 'text-red-400'
+                    : 'text-amber-400';
+                  return (
+                    <div key={zone} className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
+                        <span className="text-[10px] text-neutral-400 font-mono">{zone}</span>
+                      </div>
+                      <span className={`text-[10px] ${labelColor}`}>
+                        {data.status === 'healthy' ? region
+                          : `${data.consecutive_failures} fail${data.consecutive_failures !== 1 ? 's' : ''}${data.last_failure_reason ? ` (${data.last_failure_reason})` : ''}`}
+                      </span>
+                    </div>
+                  );
+                })}
+                {Object.values(zoneHealth).every(d => d.status === 'healthy') && (
+                  <p className="text-[10px] text-emerald-500/60 mt-1">All zones healthy</p>
+                )}
+                {Object.values(zoneHealth).some(d => d.status === 'exhausted') && (
+                  <p className="text-[10px] text-amber-400/80 mt-1">
+                    {Object.values(zoneHealth).filter(d => d.status === 'healthy').length}/{Object.keys(zoneHealth).length} zones available
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-[11px] text-neutral-600">No data yet</p>
             )}
           </div>
 

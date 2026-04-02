@@ -1505,6 +1505,15 @@ app.include_router(admin_router)
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: Optional[datetime] = None
 
+def _get_zone_health_summary() -> dict:
+    """Get zone health summary from compute module, with fallback if not in GCP mode."""
+    try:
+        from app.compute import get_zone_health_summary
+        return get_zone_health_summary()
+    except Exception:
+        return {"total_zones": 0, "available": 0, "exhausted": []}
+
+
 @app.get("/api/debug/orchestrator")
 async def debug_orchestrator(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
     """Diagnostic endpoint: check if the orchestrator loop is alive."""
@@ -1552,6 +1561,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
             "last_completion": _shared_state.deploy_monitoring["last_completion_time"].isoformat() if _shared_state.deploy_monitoring["last_completion_time"] else None,
             "external_health": _shared_state.external_health,
         },
+        "zone_health": _get_zone_health_summary(),
     }
 
 
