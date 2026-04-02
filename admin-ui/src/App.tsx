@@ -84,6 +84,7 @@ export default function App() {
   return (
     <div className="h-screen overflow-hidden flex flex-col bg-neutral-950 text-neutral-200 font-sans p-6">
       <HeaderBar
+        tasks={s.tasks}
         runningTasks={runningTasks}
         queuedTasks={queuedTasks}
         globalActiveCount={s.globalActiveCount}

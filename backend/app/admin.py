@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any, List
 import uuid
+import json
 import httpx
 import logging
 from datetime import datetime, timedelta, timezone
@@ -106,7 +107,11 @@ async def get_all_tasks(
                 logs_map[tid] = a.logs[:2000]
                 logs_truncated_map[tid] = len(a.logs) > 2000
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                research_map[tid] = a.logs[:100000]
+                try:
+                    parsed = json.loads(a.logs[:100000])
+                    research_map[str(a.task_id)] = parsed if isinstance(parsed, list) else parsed.get('logs', [])
+                except (json.JSONDecodeError, AttributeError):
+                    pass
             if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
                 commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 

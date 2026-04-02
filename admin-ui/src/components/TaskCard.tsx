@@ -2,6 +2,18 @@
 import { useState, useEffect, useRef } from 'react';
 import { Square, CheckCircle, AlertCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive } from 'lucide-react';
 
+export interface ResearchFinding {
+  type?: string;
+  title: string;
+  description: string;
+  prompt: string;
+  scope: 'small' | 'medium' | 'large';
+  risk: 'low' | 'medium' | 'high';
+  priority: number;
+  related_files: string[];
+  direction_id?: string;
+}
+
 export function isSafeUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -40,7 +52,7 @@ export interface Task {
   repo_url?: string;
   error_logs?: string;
   error_logs_truncated?: boolean;
-  research_findings?: string;
+  research_findings?: ResearchFinding[] | null;
   context?: Record<string, unknown>;
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
@@ -111,20 +123,10 @@ export function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
   );
 }
 
-function ResearchFindings({ findings }: { findings: string }) {
+function ResearchFindings({ findings }: { findings: ResearchFinding[] }) {
   const [expanded, setExpanded] = useState(false);
 
-  let parsed: Record<string, string>[] | null = null;
-  try {
-    const result = JSON.parse(findings);
-    if (Array.isArray(result)) parsed = result;
-  } catch { /* fall through */ }
-
-  if (!parsed) {
-    return <span className="text-neutral-400">{findings.slice(0, 2000)}</span>;
-  }
-
-  const items = expanded ? parsed : parsed.slice(0, 5);
+  const items = expanded ? findings : findings.slice(0, 5);
   return (
     <div>
       <div className={`space-y-1 ${expanded ? 'max-h-64 overflow-y-auto custom-scrollbar' : ''}`}>
@@ -138,12 +140,12 @@ function ResearchFindings({ findings }: { findings: string }) {
           </div>
         ))}
       </div>
-      {parsed.length > 5 ? (
+      {findings.length > 5 ? (
         <button
           onClick={() => setExpanded(!expanded)}
           className="text-[10px] text-neutral-500 hover:text-neutral-300 mt-1 transition-colors"
         >
-          {expanded ? 'Show less' : `Show all ${parsed.length} findings`}
+          {expanded ? 'Show less' : `Show all ${findings.length} findings`}
         </button>
       ) : null}
     </div>

@@ -1193,21 +1193,33 @@ async def get_project_tasks(
         
     # Group artifacts by task_id
     artifacts_by_task = {}
+    research_map = {}
     for a in artifacts:
         if a.task_id not in artifacts_by_task:
             artifacts_by_task[a.task_id] = []
         artifacts_by_task[a.task_id].append(a)
-        
+        if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+            try:
+                parsed = json.loads(a.logs[:100000])
+                research_map[a.task_id] = parsed if isinstance(parsed, list) else parsed.get('logs', [])
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
     # Combine
     result = []
     for t in tasks:
         task_dict = {
             "id": t.id,
+            "title": t.title,
             "status": t.status,
+            "task_type": ((t.payloads or [{}])[0]).get("type", "create"),
             "vm_instance_id": t.vm_instance_id,
             "payloads": t.payloads,
             "created_at": t.created_at,
-            "artifacts": artifacts_by_task.get(t.id, [])
+            "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
+            "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
+            "artifacts": artifacts_by_task.get(t.id, []),
+            "research_findings": research_map.get(t.id),
         }
         result.append(task_dict)
         

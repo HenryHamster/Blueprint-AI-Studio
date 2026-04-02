@@ -1,10 +1,12 @@
 import type { RefObject } from 'react';
+import { useMemo } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, LogOut } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { Task } from './TaskCard';
 
 export interface HeaderBarProps {
+  tasks: Task[];
   runningTasks: Task[];
   queuedTasks: Task[];
   globalActiveCount: number;
@@ -61,6 +63,7 @@ export interface HeaderBarProps {
 
 export function HeaderBar(props: HeaderBarProps) {
   const {
+    tasks,
     queuedTasks,
     globalActiveCount,
     globalEvaluatingCount,
@@ -110,6 +113,27 @@ export function HeaderBar(props: HeaderBarProps) {
     wsConnected,
     lastFetchTime,
   } = props;
+
+  const pendingFindingsCount = useMemo(() => {
+    // Build set of implemented finding keys
+    const implemented = new Set<string>();
+    for (const t of tasks) {
+      const ctx = t.context as Record<string, unknown> | undefined;
+      if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
+        implemented.add(`${ctx.research_task_id}-${ctx.finding_index}`);
+      }
+    }
+    // Count unimplemented findings from completed research tasks
+    let count = 0;
+    for (const t of tasks) {
+      if (t.task_type !== 'research' || t.status !== 'COMPLETED' || !t.research_findings) continue;
+      const arr = Array.isArray(t.research_findings) ? t.research_findings : [];
+      arr.forEach((_: unknown, i: number) => {
+        if (!implemented.has(`${t.id}-${i}`)) count++;
+      });
+    }
+    return count;
+  }, [tasks]);
 
   return (
     <header className="mb-6 flex justify-between items-center shrink-0">
@@ -226,7 +250,7 @@ export function HeaderBar(props: HeaderBarProps) {
         </button>
         <button
           onClick={onToggleResearchBrowser}
-          className={`p-2 rounded text-xs transition-colors border ${
+          className={`p-2 rounded text-xs transition-colors border relative flex items-center ${
             showResearchBrowser
               ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
               : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
@@ -234,6 +258,11 @@ export function HeaderBar(props: HeaderBarProps) {
           title="Research Findings"
         >
           <Microscope className="w-4 h-4" />
+          {pendingFindingsCount > 0 && (
+            <span className="ml-1 bg-cyan-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+              {pendingFindingsCount}
+            </span>
+          )}
         </button>
         <button
           onClick={onOpenNewTaskModal}

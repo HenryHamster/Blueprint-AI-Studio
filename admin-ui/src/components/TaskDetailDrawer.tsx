@@ -174,7 +174,7 @@ function DetailsTab({ task, onNavigateToTask }: { task: Task; onNavigateToTask?:
         <>
           <SectionHeader>Research Findings</SectionHeader>
           <pre className="text-sm text-neutral-300 whitespace-pre-wrap break-words bg-cyan-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-cyan-900/30">
-            {task.research_findings}
+            {JSON.stringify(task.research_findings, null, 2)}
           </pre>
         </>
       )}
