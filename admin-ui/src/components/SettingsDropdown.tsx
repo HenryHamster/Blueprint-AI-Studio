@@ -1,13 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Settings, GitBranch } from 'lucide-react';
+import { Settings, GitBranch, RotateCcw, Loader2 } from 'lucide-react';
 
-function relativeTime(ts: number): string {
-  if (!ts) return '—';
-  const sec = Math.floor((Date.now() - ts) / 1000);
-  if (sec < 10) return 'just now';
-  if (sec < 60) return `${sec}s ago`;
-  return `${Math.floor(sec / 60)}m ago`;
-}
 
 export interface MaxPlanAccount {
   id: string;
@@ -30,11 +23,15 @@ interface SettingsDropdownProps {
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
+  soundOnComplete: boolean;
+  onUpdateSoundOnComplete: (value: boolean) => void;
   // Existing
   maxConcurrentVMs: number;
   onUpdateMaxVMs: (value: number) => void;
   maxRetries: number;
   onUpdateMaxRetries: (value: number) => void;
+  maxAutonomousTasksPerHour: number;
+  onUpdateMaxAutonomousRate: (value: number) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -47,9 +44,23 @@ interface SettingsDropdownProps {
   onAddAccount: () => void;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
+  pageSize: number;
+  onUpdatePageSize: (value: number) => void;
   apiHealthy: boolean;
   wsConnected: boolean;
   lastFetchTime: number;
+  onRestartOrchestrator: () => Promise<void>;
+  anyAutonomousEnabled: boolean;
+  onPauseAllAutonomous: () => Promise<void>;
+}
+
+function relativeTime(ms: number): string {
+  if (!ms) return 'never';
+  const diff = Math.floor((Date.now() - ms) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
 }
 
 export function SettingsDropdown({
@@ -62,10 +73,14 @@ export function SettingsDropdown({
   onToggleViewMode,
   notifyOnComplete,
   onUpdateNotifyOnComplete,
+  soundOnComplete,
+  onUpdateSoundOnComplete,
   maxConcurrentVMs,
   onUpdateMaxVMs,
   maxRetries,
   onUpdateMaxRetries,
+  maxAutonomousTasksPerHour,
+  onUpdateMaxAutonomousRate,
   githubAccount,
   onConnectGitHub,
   maxPlanAccounts,
@@ -78,11 +93,18 @@ export function SettingsDropdown({
   onAddAccount,
   refreshInterval,
   onUpdateRefreshInterval,
+  pageSize,
+  onUpdatePageSize,
   apiHealthy,
   wsConnected,
   lastFetchTime,
+  onRestartOrchestrator,
+  anyAutonomousEnabled,
+  onPauseAllAutonomous,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
+  const [restarting, setRestarting] = useState(false);
+  const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
@@ -99,22 +121,16 @@ export function SettingsDropdown({
       </button>
       {showSettings && (
         <div className="absolute right-0 top-full mt-2 w-80 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
-          <div className={`flex items-center justify-between mb-4 px-2 py-1.5 rounded border ${apiHealthy ? 'bg-neutral-950 border-neutral-800' : 'bg-red-950/20 border-red-900/50'}`}>
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
-                <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
-                <span className={`text-[11px] ${apiHealthy ? 'text-neutral-400' : 'text-red-400'}`}>
-                  API: {apiHealthy ? 'Connected' : 'Error'}
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
-                <span className={`text-[11px] ${wsConnected ? 'text-blue-400' : 'text-neutral-500'}`}>
-                  WS: {wsConnected ? 'Active' : 'Idle'}
-                </span>
-              </div>
-            </div>
-            <span className="text-[11px] text-neutral-500">Updated {relativeTime(lastFetchTime)}</span>
+          <div className={`flex items-center gap-4 mb-3 px-1 py-1.5 rounded ${ !apiHealthy ? 'bg-red-950/20' : ''}`}>
+            <span className="flex items-center gap-1.5">
+              <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
+              <span className={`text-[10px] ${apiHealthy ? 'text-neutral-400' : 'text-red-400'}`}>{apiHealthy ? 'API Connected' : 'API Error'}</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
+              <span className={`text-[10px] ${wsConnected ? 'text-blue-400' : 'text-neutral-500'}`}>{wsConnected ? 'WS Active' : 'WS Idle'}</span>
+            </span>
+            <span className="text-[10px] text-neutral-500">Fetched {relativeTime(lastFetchTime)}</span>
           </div>
 
           <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-3">Defaults</h3>
@@ -168,6 +184,43 @@ export function SettingsDropdown({
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Autonomous Tasks/Hour (1-50)</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={maxAutonomousTasksPerHour}
+              onChange={e => onUpdateMaxAutonomousRate(parseInt(e.target.value) || 1)}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+
+          <div className="mb-4">
+            <button
+              disabled={restarting}
+              onClick={async () => {
+                if (!window.confirm('Restart the orchestrator? In-flight task state will be preserved.')) return;
+                setRestarting(true);
+                setRestartStatus('idle');
+                try {
+                  await onRestartOrchestrator();
+                  setRestartStatus('success');
+                } catch {
+                  setRestartStatus('error');
+                } finally {
+                  setRestarting(false);
+                }
+              }}
+              className="w-full bg-neutral-800 hover:bg-amber-900/30 disabled:opacity-50 border border-neutral-700 text-amber-400 text-xs py-1.5 rounded transition-colors flex items-center justify-center gap-1.5"
+            >
+              {restarting
+                ? <><Loader2 className="w-3 h-3 animate-spin" /> Restarting…</>
+                : <><RotateCcw className="w-3 h-3" /> Restart Orchestrator</>}
+            </button>
+            {restartStatus === 'success' && <p className="text-[11px] text-emerald-400 mt-1">Orchestrator restarted successfully.</p>}
+            {restartStatus === 'error' && <p className="text-[11px] text-red-400 mt-1">Restart failed. Check console for details.</p>}
+          </div>
 
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
@@ -180,6 +233,20 @@ export function SettingsDropdown({
               <option value={30000}>30s</option>
               <option value={60000}>60s</option>
               <option value={0}>Manual only</option>
+            </select>
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Tasks Per Page</label>
+            <select
+              value={pageSize}
+              onChange={e => onUpdatePageSize(Number(e.target.value))}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={200}>200</option>
             </select>
           </div>
 
@@ -200,6 +267,15 @@ export function SettingsDropdown({
                 <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${notifyOnComplete ? 'translate-x-4' : ''}`} />
               </button>
             </label>
+            <label className="flex items-center justify-between cursor-pointer mt-2">
+              <span className="text-[11px] font-medium text-neutral-400">Play sound on task completion</span>
+              <button
+                onClick={() => onUpdateSoundOnComplete(!soundOnComplete)}
+                className={`relative w-8 h-4 rounded-full transition-colors ${soundOnComplete ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${soundOnComplete ? 'translate-x-4' : ''}`} />
+              </button>
+            </label>
           </div>
 
           <div className="border-t border-neutral-800 pt-3 mb-4">
@@ -215,6 +291,59 @@ export function SettingsDropdown({
                 <GitBranch className="w-3 h-3" /> Connect GitHub
               </button>
             )}
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-4">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Export / Import</h4>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  const keys = ['viewMode', 'refreshInterval', 'pageSize', 'defaultTaskType', 'notifyOnComplete', 'soundOnComplete', 'archivePageSize'];
+                  const settings: Record<string, unknown> = {};
+                  keys.forEach(k => {
+                    const val = localStorage.getItem(`blueprint-admin:${k}`);
+                    if (val !== null) settings[k] = JSON.parse(val);
+                  });
+                  const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = 'blueprint-settings.json';
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs py-1.5 rounded transition-colors border border-neutral-700"
+              >
+                Export Settings
+              </button>
+              <button
+                onClick={() => {
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.accept = '.json,application/json';
+                  input.onchange = (e) => {
+                    const file = (e.target as HTMLInputElement).files?.[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (ev) => {
+                      try {
+                        const settings = JSON.parse(ev.target?.result as string);
+                        const allowed = ['viewMode', 'refreshInterval', 'pageSize', 'defaultTaskType', 'notifyOnComplete', 'soundOnComplete', 'archivePageSize'];
+                        allowed.forEach(k => {
+                          if (k in settings) localStorage.setItem(`blueprint-admin:${k}`, JSON.stringify(settings[k]));
+                        });
+                        window.location.reload();
+                      } catch { alert('Invalid settings file'); }
+                    };
+                    reader.readAsText(file);
+                  };
+                  input.click();
+                }}
+                className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs py-1.5 rounded transition-colors border border-neutral-700"
+              >
+                Import Settings
+              </button>
+            </div>
           </div>
 
           <div className="border-t border-neutral-800 pt-3">
@@ -261,6 +390,41 @@ export function SettingsDropdown({
                 className="w-full bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 text-xs py-1 rounded transition-colors border border-neutral-700">
                 Add Account
               </button>
+            </div>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mt-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Autonomous</h4>
+            <button
+              onClick={onPauseAllAutonomous}
+              disabled={!anyAutonomousEnabled}
+              className="w-full bg-amber-950/30 hover:bg-amber-900/40 disabled:opacity-30 disabled:cursor-not-allowed text-amber-400 text-xs py-1.5 rounded transition-colors border border-amber-900/50"
+            >
+              Pause All Autonomous
+            </button>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mt-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Keyboard Shortcuts</h4>
+            <div className="space-y-1">
+              {[
+                ['1', 'Kanban view'],
+                ['2', 'Pipeline view'],
+                ['N', 'New task'],
+                ['R', 'Refresh'],
+                ['D', 'Directions panel'],
+                ['S', 'Settings'],
+                ['M', 'Metrics'],
+                ['A', 'Archive'],
+                ['?', 'Shortcut help'],
+                ['F', 'Fullscreen (in drawer)'],
+                ['Esc', 'Close modal'],
+              ].map(([key, label]) => (
+                <div key={key} className="flex items-center justify-between">
+                  <span className="text-[11px] text-neutral-500">{label}</span>
+                  <kbd className="text-[10px] font-mono bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded">{key}</kbd>
+                </div>
+              ))}
             </div>
           </div>
         </div>

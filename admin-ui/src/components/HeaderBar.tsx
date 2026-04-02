@@ -38,9 +38,13 @@ export interface HeaderBarProps {
   onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
+  soundOnComplete: boolean;
+  onUpdateSoundOnComplete: (value: boolean) => void;
   maxRetries: number;
+  maxAutonomousTasksPerHour: number;
   onUpdateMaxVMs: (value: number) => void;
   onUpdateMaxRetries: (value: number) => void;
+  onUpdateMaxAutonomousRate: (value: number) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -55,9 +59,14 @@ export interface HeaderBarProps {
   onToggleMetrics: () => void;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
+  pageSize: number;
+  onUpdatePageSize: (value: number) => void;
   apiHealthy: boolean;
   wsConnected: boolean;
   lastFetchTime: number;
+  onRestartOrchestrator: () => Promise<void>;
+  anyAutonomousEnabled: boolean;
+  onPauseAllAutonomous: () => Promise<void>;
 }
 
 
@@ -92,9 +101,13 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateDefaultTaskType,
     notifyOnComplete,
     onUpdateNotifyOnComplete,
+    soundOnComplete,
+    onUpdateSoundOnComplete,
     maxRetries,
+    maxAutonomousTasksPerHour,
     onUpdateMaxVMs,
     onUpdateMaxRetries,
+    onUpdateMaxAutonomousRate,
     githubAccount,
     onConnectGitHub,
     maxPlanAccounts,
@@ -109,9 +122,14 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleMetrics,
     refreshInterval,
     onUpdateRefreshInterval,
+    pageSize,
+    onUpdatePageSize,
     apiHealthy,
     wsConnected,
     lastFetchTime,
+    onRestartOrchestrator,
+    anyAutonomousEnabled,
+    onPauseAllAutonomous,
   } = props;
 
   const pendingFindingsCount = useMemo(() => {
@@ -217,10 +235,14 @@ export function HeaderBar(props: HeaderBarProps) {
           onToggleViewMode={onToggleViewMode}
           notifyOnComplete={notifyOnComplete}
           onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
+          soundOnComplete={soundOnComplete}
+          onUpdateSoundOnComplete={onUpdateSoundOnComplete}
           maxConcurrentVMs={maxConcurrentVMs}
           onUpdateMaxVMs={onUpdateMaxVMs}
           maxRetries={maxRetries}
           onUpdateMaxRetries={onUpdateMaxRetries}
+          maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
+          onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           githubAccount={githubAccount}
           onConnectGitHub={onConnectGitHub}
           maxPlanAccounts={maxPlanAccounts}
@@ -233,9 +255,14 @@ export function HeaderBar(props: HeaderBarProps) {
           onAddAccount={onAddAccount}
           refreshInterval={refreshInterval}
           onUpdateRefreshInterval={onUpdateRefreshInterval}
+          pageSize={pageSize}
+          onUpdatePageSize={onUpdatePageSize}
           apiHealthy={apiHealthy}
           wsConnected={wsConnected}
           lastFetchTime={lastFetchTime}
+          onRestartOrchestrator={onRestartOrchestrator}
+          anyAutonomousEnabled={anyAutonomousEnabled}
+          onPauseAllAutonomous={onPauseAllAutonomous}
         />
         <button
           onClick={onToggleArchive}

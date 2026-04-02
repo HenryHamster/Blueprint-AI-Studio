@@ -34,6 +34,18 @@ async def get_all_projects(
     projects = result.scalars().all()
     return projects
 
+@router.post("/autonomous/pause-all")
+async def pause_all_autonomous(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Disable autonomous mode on all projects at once."""
+    projects = (await session.execute(select(Project))).scalars().all()
+    for p in projects:
+        p.autonomous_enabled = False
+    await session.commit()
+    return {"paused": len(projects)}
+
 TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
 
 
@@ -697,6 +709,7 @@ async def get_settings(
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
+        "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -730,6 +743,14 @@ async def update_settings(
         if not (0 <= val <= 10):
             raise HTTPException(status_code=400, detail="max_retries must be between 0 and 10")
         _runtime_config["max_retries"] = val
+    if "max_autonomous_tasks_per_hour" in payload:
+        try:
+            val = int(payload["max_autonomous_tasks_per_hour"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be between 1 and 50")
+        _runtime_config["max_autonomous_tasks_per_hour"] = val
     return _runtime_config
 
 

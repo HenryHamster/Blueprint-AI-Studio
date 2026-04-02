@@ -99,6 +99,8 @@ export default function App() {
         onUpdateDefaultTaskType={s.setDefaultTaskType}
         notifyOnComplete={s.notifyOnComplete}
         onUpdateNotifyOnComplete={s.setNotifyOnComplete}
+        soundOnComplete={s.soundOnComplete}
+        onUpdateSoundOnComplete={s.setSoundOnComplete}
         onToggleViewMode={() => s.setViewMode(v => v === 'kanban' ? 'pipeline' : 'kanban')}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
@@ -116,8 +118,10 @@ export default function App() {
         onToggleSettings={s.handleToggleSettings}
         settingsRef={s.settingsRef}
         maxRetries={s.maxRetries}
+        maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
         onUpdateMaxVMs={s.updateMaxVMs}
         onUpdateMaxRetries={s.updateMaxRetries}
+        onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
         githubAccount={s.githubAccount}
         onConnectGitHub={s.connectGitHub}
         maxPlanAccounts={s.maxPlanAccounts}
@@ -132,9 +136,14 @@ export default function App() {
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         refreshInterval={s.refreshInterval}
         onUpdateRefreshInterval={s.setRefreshInterval}
+        pageSize={s.limit}
+        onUpdatePageSize={s.setLimit}
         apiHealthy={s.apiHealthy}
         wsConnected={s.wsConnected}
         lastFetchTime={s.lastFetchTime}
+        onRestartOrchestrator={s.handleRestartOrchestrator}
+        anyAutonomousEnabled={s.projects.some(p => p.autonomous_enabled)}
+        onPauseAllAutonomous={s.handlePauseAllAutonomous}
       />
 
       <div

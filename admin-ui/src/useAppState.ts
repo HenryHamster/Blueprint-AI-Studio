@@ -20,6 +20,22 @@ function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<
   return [state, setState];
 }
 
+function playCompletionSound() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.setValueAtTime(1100, ctx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.4);
+  } catch { /* AudioContext not available */ }
+}
+
 export function useAppState() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -71,6 +87,7 @@ export function useAppState() {
   const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
   const [maxRetries, setMaxRetries] = useState(3);
+  const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -88,9 +105,12 @@ export function useAppState() {
   // Defaults
   const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix'>('defaultTaskType', 'create');
   const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
+  const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
   const prevTasksRef = useRef<Task[]>([]);
   const notifyRef = useRef(notifyOnComplete);
   useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
+  const soundOnCompleteRef = useRef(soundOnComplete);
+  useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
 
   // View toggle state
   const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline'>('viewMode', 'kanban');
@@ -194,7 +214,7 @@ export function useAppState() {
     if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
       setWsDisconnected(false);
     }
-  }, [logTask?.status]);
+  }, [logTask, logTask?.status]);
 
   // Clean up WebSocket on close
   useEffect(() => {
@@ -315,17 +335,22 @@ export function useAppState() {
         }
 
         // Browser notifications for completed/failed tasks
-        if (notifyRef.current && prevTasksRef.current.length > 0) {
+        if (prevTasksRef.current.length > 0) {
           const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          let didTransition = false;
           for (const t of newTasks) {
             const prev = prevMap.get(t.id);
             if (prev && prev !== t.status && (t.status === 'COMPLETED' || t.status === 'FAILED')) {
-              if (Notification.permission === 'granted') {
+              if (notifyRef.current && Notification.permission === 'granted') {
                 new Notification(`Task ${t.status.toLowerCase()}`, {
                   body: t.title || t.id,
                 });
               }
+              didTransition = true;
             }
+          }
+          if (didTransition && soundOnCompleteRef.current) {
+            playCompletionSound();
           }
         }
         // Count incremental completed/failed transitions since last snapshot
@@ -389,6 +414,19 @@ export function useAppState() {
       }
     } catch (err) {
       console.error('Failed to fetch projects:', err);
+    }
+  };
+
+  const handlePauseAllAutonomous = async () => {
+    const res = await fetch(`${API_BASE_URL}/api/admin/autonomous/pause-all`, {
+      method: 'POST',
+      headers: await authHeaders(),
+    });
+    if (res.ok) {
+      await fetchProjects();
+      addToast('All autonomous projects paused', 'success');
+    } else {
+      addToast('Failed to pause autonomous projects', 'error');
     }
   };
 
@@ -517,6 +555,21 @@ export function useAppState() {
     }
   };
 
+  const handleRestartOrchestrator = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/restart-orchestrator`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      addToast('Orchestrator restarted', 'success');
+    } catch (error) {
+      console.error('Failed to restart orchestrator:', error);
+      addToast('Failed to restart orchestrator', 'error');
+      throw error;
+    }
+  };
+
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
@@ -600,6 +653,7 @@ export function useAppState() {
         const data = await res.json();
         setMaxConcurrentVMs(data.max_concurrent_vms);
         setMaxRetries(data.max_retries ?? 3);
+        setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
@@ -673,6 +727,15 @@ export function useAppState() {
     authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
       method: 'PATCH', headers: h,
       body: JSON.stringify({ max_retries: v }),
+    })).catch(() => {});
+  };
+
+  const handleUpdateMaxAutonomousRate = (value: number) => {
+    const v = Math.max(1, Math.min(50, value));
+    setMaxAutonomousTasksPerHour(v);
+    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
+      method: 'PATCH', headers: h,
+      body: JSON.stringify({ max_autonomous_tasks_per_hour: v }),
     })).catch(() => {});
   };
 
@@ -1018,7 +1081,7 @@ export function useAppState() {
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
     // Projects
-    projects, selectedProjectId, setSelectedProjectId,
+    projects, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
     // Log viewer
     logTask, logLines, logsConnecting, wsDisconnected, handleViewLogs, closeLogViewer,
     // Research browser
@@ -1035,13 +1098,16 @@ export function useAppState() {
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,
+    soundOnComplete, setSoundOnComplete,
     // Settings
     showSettings, settingsRef, handleToggleSettings,
-    maxConcurrentVMs, maxRetries, usingMaxPlan,
-    updateMaxVMs, updateMaxRetries,
+    maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
+    updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,
+    // Orchestrator
+    handleRestartOrchestrator,
     // GitHub
     githubAccount, connectGitHub,
     // Directions
