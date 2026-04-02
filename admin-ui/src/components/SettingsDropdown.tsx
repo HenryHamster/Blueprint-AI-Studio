@@ -72,6 +72,16 @@ function relativeTime(ms: number): string {
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
+const REFRESH_PRESETS = [
+  { label: '10s', value: 10000 },
+  { label: '30s', value: 30000 },
+  { label: '60s', value: 60000 },
+  { label: 'Off', value: 0 },
+];
+
+const PAGE_PRESETS = [25, 50, 100, 200];
+const ALL_PAGE_SIZE = 10000;
+
 export function SettingsDropdown({
   showSettings,
   onToggleSettings,
@@ -120,6 +130,8 @@ export function SettingsDropdown({
   const [, setTick] = useState(0);
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [refreshInputVal, setRefreshInputVal] = useState('');
+  const [pageSizeInputVal, setPageSizeInputVal] = useState('');
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
@@ -239,30 +251,88 @@ export function SettingsDropdown({
 
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
-            <select
-              value={refreshInterval}
-              onChange={e => onUpdateRefreshInterval(Number(e.target.value))}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            >
-              <option value={10000}>10s</option>
-              <option value={30000}>30s</option>
-              <option value={60000}>60s</option>
-              <option value={0}>Manual only</option>
-            </select>
+            <div className="flex gap-1 mb-1.5">
+              {REFRESH_PRESETS.map(p => (
+                <button
+                  key={p.value}
+                  onClick={() => { onUpdateRefreshInterval(p.value); setRefreshInputVal(''); }}
+                  className={`flex-1 text-[11px] py-1 rounded border transition-colors ${refreshInterval === p.value && !refreshInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <input
+                type="number"
+                min={1}
+                placeholder="Custom (s)"
+                value={refreshInputVal}
+                onChange={e => setRefreshInputVal(e.target.value)}
+                onBlur={() => {
+                  const secs = parseInt(refreshInputVal);
+                  if (secs > 0) onUpdateRefreshInterval(secs * 1000);
+                  setRefreshInputVal('');
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    const secs = parseInt(refreshInputVal);
+                    if (secs > 0) onUpdateRefreshInterval(secs * 1000);
+                    setRefreshInputVal('');
+                  }
+                }}
+                className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+              <span className="text-[11px] text-neutral-500 shrink-0">
+                {refreshInterval === 0 ? 'off' : `${refreshInterval / 1000}s`}
+              </span>
+            </div>
           </div>
 
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Tasks Per Page</label>
-            <select
-              value={pageSize}
-              onChange={e => onUpdatePageSize(Number(e.target.value))}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            >
-              <option value={25}>25</option>
-              <option value={50}>50</option>
-              <option value={100}>100</option>
-              <option value={200}>200</option>
-            </select>
+            <div className="flex gap-1 mb-1.5">
+              {PAGE_PRESETS.map(p => (
+                <button
+                  key={p}
+                  onClick={() => { onUpdatePageSize(p); setPageSizeInputVal(''); }}
+                  className={`flex-1 text-[11px] py-1 rounded border transition-colors ${pageSize === p && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                >
+                  {p}
+                </button>
+              ))}
+              <button
+                onClick={() => { onUpdatePageSize(ALL_PAGE_SIZE); setPageSizeInputVal(''); }}
+                className={`flex-1 text-[11px] py-1 rounded border transition-colors ${pageSize === ALL_PAGE_SIZE && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+              >
+                All
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <input
+                type="number"
+                min={1}
+                placeholder="Custom"
+                value={pageSizeInputVal}
+                onChange={e => setPageSizeInputVal(e.target.value)}
+                onBlur={() => {
+                  const n = parseInt(pageSizeInputVal);
+                  if (n > 0) onUpdatePageSize(n);
+                  setPageSizeInputVal('');
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    const n = parseInt(pageSizeInputVal);
+                    if (n > 0) onUpdatePageSize(n);
+                    setPageSizeInputVal('');
+                  }
+                }}
+                className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+              <span className="text-[11px] text-neutral-500 shrink-0">
+                {pageSize >= ALL_PAGE_SIZE ? 'all' : pageSize}
+              </span>
+            </div>
           </div>
 
           <div className="border-t border-neutral-800 pt-3 mb-4">
