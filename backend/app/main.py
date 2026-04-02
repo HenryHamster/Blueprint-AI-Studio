@@ -405,7 +405,7 @@ async def _check_external_health():
     ext = _shared_state.external_health
     now = datetime.utcnow()
 
-    # Only check every 60 seconds
+    # Check every 60 seconds (authenticated via App JWT = 5,000 req/hr)
     if ext["last_check"] and (now - ext["last_check"]).total_seconds() < 60:
         return
     ext["last_check"] = now
@@ -420,11 +420,13 @@ async def _check_external_health():
         ext["db"] = False
         failed.append("db")
 
-    # GitHub API check — lightweight rate limit endpoint
+    # GitHub API check — authenticated via App JWT (5,000 req/hr vs 60 unauthenticated)
     try:
-        from app.github import _get_client
+        from app.github import _get_client, generate_github_app_jwt
         client = _get_client()
-        resp = await client.get("https://api.github.com/rate_limit", timeout=5.0)
+        jwt_token = generate_github_app_jwt()
+        resp = await client.get("https://api.github.com/app", timeout=5.0,
+                                headers={"Authorization": f"Bearer {jwt_token}"})
         ext["github_api"] = resp.status_code == 200
         if not ext["github_api"]:
             failed.append("github_api")
