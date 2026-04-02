@@ -946,7 +946,7 @@ export function useAppState() {
   };
 
   const updateMaxVMs = async (value: number) => {
-    const clamped = Math.max(1, Math.min(30, value));
+    const clamped = Math.max(1, Math.min(100, value));
     const prev = maxConcurrentVMs;
     setMaxConcurrentVMs(clamped);
     try {
