@@ -13,13 +13,12 @@ LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
 
 # Configuration for GCP Compute Engine
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
-GCP_ZONE = os.getenv("GCP_ZONE", "us-east4-b")
+GCP_ZONE = os.getenv("GCP_ZONE", "us-central1-f")
 FALLBACK_ZONES = [
     GCP_ZONE,
-    "us-east4-b",
-    "us-east1-c",
-    "us-west1-b",
-    "us-west4-a",
+    "us-central1-c",
+    "us-central1-b",
+    "us-central1-a",
 ]
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
