@@ -49,7 +49,7 @@ function buildPolyline(
 
 function NoDataMessage() {
   return (
-    <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+    <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" style={{ height: SVG_H }} preserveAspectRatio="xMidYMid meet">
       <text x={SVG_W / 2} y={SVG_H / 2} textAnchor="middle" dominantBaseline="middle" fill="#737373" fontSize="12">
         Collecting data…
       </text>
@@ -146,7 +146,7 @@ function ChartSvg({
 
   return (
     <div className="relative">
-      <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+      <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" style={{ height: SVG_H }} preserveAspectRatio="none">
         {/* Grid lines */}
         {gridLines.map((y) => (
           <line key={y} x1={PAD.left} x2={SVG_W - PAD.right} y1={y} y2={y} stroke="#262626" strokeWidth={1} />
@@ -229,7 +229,7 @@ function ChartSvg({
   );
 }
 
-function TaskOutcomesChart({ points }: { points: MetricsPoint[] }) {
+function TaskOutcomesChart({ points, tasks }: { points: MetricsPoint[]; tasks: Task[] }) {
   const now = new Date().getTime();
   const tMin = now - TWO_HOURS;
   const tMax = now;
@@ -237,12 +237,21 @@ function TaskOutcomesChart({ points }: { points: MetricsPoint[] }) {
 
   if (filtered.length < 2) return <NoDataMessage />;
 
-  // Build cumulative counts over the window
+  const baselineCompleted = tasks.filter(t => t.status === 'COMPLETED').length;
+  const baselineFailed = tasks.filter(t => t.status === 'FAILED').length;
+
+  const totalDeltaCompleted = filtered.reduce((s, p) => s + p.completedCount, 0);
+  const totalDeltaFailed = filtered.reduce((s, p) => s + p.failedCount, 0);
+
+  const offsetCompleted = Math.max(0, baselineCompleted - totalDeltaCompleted);
+  const offsetFailed = Math.max(0, baselineFailed - totalDeltaFailed);
+
+  // Build cumulative counts over the window, offset so final value aligns with absolute counts
   const cumPoints = filtered.reduce<{ timestamp: number; cumCompleted: number; cumFailed: number }[]>(
     (acc, p) => {
       const prev = acc[acc.length - 1];
-      const cumCompleted = (prev?.cumCompleted ?? 0) + p.completedCount;
-      const cumFailed = (prev?.cumFailed ?? 0) + p.failedCount;
+      const cumCompleted = (prev?.cumCompleted ?? offsetCompleted) + p.completedCount;
+      const cumFailed = (prev?.cumFailed ?? offsetFailed) + p.failedCount;
       return [...acc, { timestamp: p.timestamp, cumCompleted, cumFailed }];
     },
     [],
@@ -268,7 +277,7 @@ function TaskOutcomesChart({ points }: { points: MetricsPoint[] }) {
   const timeTicks = [tMin, tMin + TWO_HOURS / 2, tMax];
 
   return (
-    <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+    <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full" style={{ height: SVG_H }} preserveAspectRatio="none">
       {gridLines.map((y) => (
         <line key={y} x1={PAD.left} x2={SVG_W - PAD.right} y1={y} y2={y} stroke="#262626" strokeWidth={1} />
       ))}
@@ -360,7 +369,7 @@ export default function MetricsDashboard({
       {/* Session Totals card */}
       <div className={cardClass}>
         <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
-          Est. Cost Since Page Load
+          Est. Cumulative Cost
         </div>
         <div className="text-lg font-semibold text-neutral-100 font-mono">
           ${cumulativeCost.toFixed(2)}
@@ -380,7 +389,7 @@ export default function MetricsDashboard({
       {/* Task Outcomes chart — full width */}
       <div className={`${cardClass} col-span-2`}>
         <div className="text-xs text-neutral-400 mb-1">Task Outcomes</div>
-        <TaskOutcomesChart points={metricsHistory} />
+        <TaskOutcomesChart points={metricsHistory} tasks={tasks} />
       </div>
     </div>
   );

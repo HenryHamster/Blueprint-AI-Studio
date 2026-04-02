@@ -1,6 +1,7 @@
 import type { RefObject } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
+import { COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD } from '../api';
 
 export interface MetricsBarProps {
   globalActiveCount: number;
@@ -57,11 +58,12 @@ export function MetricsBar({
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <div className="flex flex-col items-center">
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Est. Cost</span>
-        <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
-          ${(globalActiveCount * (usingMaxPlan ? 0.07 : 1.07)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
+        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">
+          {usingMaxPlan ? 'Est. Cost (Max)' : 'Est. Cost'}
         </span>
-        <span className="text-[9px] text-neutral-600 mt-0.5">{usingMaxPlan ? 'VM only (Max plan)' : 'VM + API tokens'}</span>
+        <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
+          ${(globalActiveCount * (usingMaxPlan ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
+        </span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <div className="flex flex-col items-center">

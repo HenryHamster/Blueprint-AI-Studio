@@ -2,6 +2,9 @@ import { getIdToken } from './firebase';
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
+export const COST_PER_VM_MAX_PLAN = 0.07;   // $/hr, VM only
+export const COST_PER_VM_STANDARD = 1.07;    // $/hr, VM + API tokens
+
 export async function authHeaders(): Promise<Record<string, string>> {
   const token = await getIdToken();
   return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };

@@ -4,7 +4,7 @@ import type { Project } from './components/ProjectDashboard';
 import type { MaxPlanAccount } from './components/SettingsDropdown';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet } from './api';
+import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD } from './api';
 import { useToasts } from './components/Toasts';
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -104,9 +104,10 @@ export function useAppState() {
 
   // Metrics dashboard state
   const [showMetrics, setShowMetrics] = useState(false);
-  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
-  const [cumulativeCost, setCumulativeCost] = useState(0);
+  const [metricsHistory, setMetricsHistory] = usePersistedState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>('metricsHistory', []);
+  const [cumulativeCost, setCumulativeCost] = usePersistedState<number>('cumulativeCost', 0);
   const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
+  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 7200000); }, []);
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -345,7 +346,7 @@ export function useAppState() {
         // Always record metrics data points (rendering depends on showMetrics, not collection)
         const now = Date.now();
         const activeVMs = data.active_count ?? newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-        const costPerHr = activeVMs * (usingMaxPlanRef.current ? 0.07 : 1.07);
+        const costPerHr = activeVMs * (usingMaxPlanRef.current ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD);
 
         // Compute cumulative cost using the rate from the *previous* interval
         const prevHistory = metricsHistoryRef.current;

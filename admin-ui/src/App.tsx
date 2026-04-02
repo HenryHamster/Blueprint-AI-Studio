@@ -136,7 +136,7 @@ export default function App() {
 
       <div
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
-        style={{ maxHeight: s.showMetrics ? '500px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
+        style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
       >
         <MetricsDashboard
           metricsHistory={s.metricsHistory}
