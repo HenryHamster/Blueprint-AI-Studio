@@ -46,6 +46,18 @@ export default function App() {
     document.addEventListener('keydown', handleSearchShortcut);
     return () => document.removeEventListener('keydown', handleSearchShortcut);
   }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
+
+  useEffect(() => {
+    function handleActivityFeedShortcut(e: KeyboardEvent) {
+      if (e.key !== 'a' && e.key !== 'A') return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings) return;
+      s.setShowActivityFeed(prev => !prev);
+    }
+    document.addEventListener('keydown', handleActivityFeedShortcut);
+    return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
+  }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings, s.setShowActivityFeed]);
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);

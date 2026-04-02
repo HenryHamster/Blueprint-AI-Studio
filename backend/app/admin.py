@@ -1820,6 +1820,7 @@ async def repair_state(
 async def get_activity(
     project_id: Optional[uuid.UUID] = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    event_types: Optional[List[str]] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -1952,6 +1953,40 @@ async def get_activity(
                 "rollback_count": None,
             })
 
+    # --- 3b: In-progress tasks (QUEUED / PROVISIONING / IN_PROGRESS) ---
+    inprogress_filters = [
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    ]
+    if project_id:
+        inprogress_filters.append(Task.project_id == project_id)
+
+    inprogress_result = await session.execute(
+        select(Task).where(*inprogress_filters)
+    )
+    inprogress_tasks = inprogress_result.scalars().all()
+
+    for t in inprogress_tasks:
+        tid = str(t.id)
+        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        events.append({
+            "id": f"inprogress-{tid}",
+            "type": "TASK_IN_PROGRESS",
+            "timestamp": t.started_at.isoformat() if t.started_at else t.created_at.isoformat(),
+            "title": t.title or "In-progress task",
+            "task_id": tid,
+            "task_type": task_type,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "latest_status_message": t.latest_status_message,
+            "pr_url": None,
+            "repo_url": None,
+            "commit_hash": None,
+            "error_summary": None,
+            "finding_count": None,
+            "deploy_sha": None,
+            "deploy_status": None,
+            "rollback_count": None,
+        })
+
     # --- 4: Deploy event from DeploymentState singleton ---
     state = await session.get(DeploymentState, 1)
     if state and state.deployed_at:
@@ -1978,6 +2013,9 @@ async def get_activity(
 
     # Sort descending by timestamp, nulls last
     events.sort(key=lambda e: e["timestamp"] or "", reverse=True)
+
+    if event_types:
+        events = [e for e in events if e["type"] in event_types]
 
     total = len(events)
     return {"events": events[:limit], "total": total}

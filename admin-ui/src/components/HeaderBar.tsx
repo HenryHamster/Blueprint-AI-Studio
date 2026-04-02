@@ -224,7 +224,7 @@ export function HeaderBar(props: HeaderBarProps) {
                   ['D', 'Toggle directions'],
                   ['S', 'Toggle settings'],
                   ['M', 'Toggle metrics'],
-                  ['A', 'Toggle archive'],
+                  ['A', 'Toggle activity feed'],
                   ['?', 'This help'],
                   ['Esc', 'Close panel/modal'],
                 ].map(([key, desc]) => (
@@ -321,7 +321,7 @@ export function HeaderBar(props: HeaderBarProps) {
               ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
               : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
           }`}
-          title="Activity Feed"
+          title="Toggle activity feed (A)"
         >
           <Clock className="w-4 h-4" />
         </button>

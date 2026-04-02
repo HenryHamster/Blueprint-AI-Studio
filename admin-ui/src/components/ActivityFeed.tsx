@@ -1,10 +1,10 @@
 import { useEffect, useState, useCallback, type ReactElement } from 'react';
-import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock } from 'lucide-react';
+import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 import { isSafeUrl } from './TaskCard';
 import type { Task } from './TaskCard';
 
-export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT';
+export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT' | 'TASK_IN_PROGRESS';
 
 export interface ActivityEvent {
   id: string;
@@ -17,6 +17,11 @@ export interface ActivityEvent {
   finding_count?: number;
   deploy_status?: string;
   project_id?: string;
+  started_at?: string;
+  latest_status_message?: string;
+  task_type?: string;
+  commit_hash?: string;
+  repo_url?: string;
 }
 
 interface ActivityFeedProps {
@@ -49,6 +54,7 @@ const EVENT_ICON: Record<ActivityEventType, ReactElement> = {
   TASK_FAILED: <XCircle className="w-4 h-4 text-red-400 shrink-0" />,
   RESEARCH_FINDINGS: <Microscope className="w-4 h-4 text-blue-400 shrink-0" />,
   DEPLOY_EVENT: <Rocket className="w-4 h-4 text-purple-400 shrink-0" />,
+  TASK_IN_PROGRESS: <Loader2 className="w-4 h-4 text-amber-400 shrink-0 animate-spin" />,
 };
 
 const EVENT_BORDER: Record<ActivityEventType, string> = {
@@ -56,6 +62,7 @@ const EVENT_BORDER: Record<ActivityEventType, string> = {
   TASK_FAILED: 'border-l-red-500',
   RESEARCH_FINDINGS: 'border-l-blue-500',
   DEPLOY_EVENT: 'border-l-purple-500',
+  TASK_IN_PROGRESS: 'border-l-amber-500',
 };
 
 const DEPLOY_STATUS_BADGE: Record<string, string> = {
@@ -81,10 +88,22 @@ function SkeletonRow() {
   );
 }
 
+type FilterOption = ActivityEventType | 'ALL';
+
+const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[] = [
+  { label: 'All', value: 'ALL', activeClass: 'bg-neutral-600 text-neutral-100 border-neutral-500' },
+  { label: 'Completed', value: 'TASK_COMPLETED', activeClass: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
+  { label: 'Failed', value: 'TASK_FAILED', activeClass: 'bg-red-500/20 text-red-400 border-red-500/40' },
+  { label: 'Research', value: 'RESEARCH_FINDINGS', activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/40' },
+  { label: 'Deploy', value: 'DEPLOY_EVENT', activeClass: 'bg-purple-500/20 text-purple-400 border-purple-500/40' },
+];
+
 export default function ActivityFeed({ selectedProjectId, refreshInterval, onSelectTask, onClose }: ActivityFeedProps) {
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
+  const [activeFilter, setActiveFilter] = useState<FilterOption>('ALL');
 
   const fetchEvents = useCallback(async () => {
     try {
@@ -113,6 +132,8 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     return () => clearInterval(interval);
   }, [fetchEvents, refreshInterval]);
 
+  const filteredEvents = activeFilter === 'ALL' ? events : events.filter(e => e.type === activeFilter);
+
   const handleRowClick = (event: ActivityEvent) => {
     if (!event.task_id) return;
     // Construct a minimal Task object to open TaskDetailDrawer
@@ -127,7 +148,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           <Clock className="w-4 h-4 text-neutral-400" />
           <h2 className="text-sm font-semibold text-neutral-100">Activity Feed</h2>
           {!loading && (
-            <span className="text-xs text-neutral-500 font-mono">{events.length} event{events.length !== 1 ? 's' : ''}</span>
+            <span className="text-xs text-neutral-500 font-mono">{filteredEvents.length} event{filteredEvents.length !== 1 ? 's' : ''}</span>
           )}
         </div>
         <button
@@ -138,6 +159,57 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           <X className="w-4 h-4" />
         </button>
       </div>
+
+      {/* Filter pills */}
+      <div className="px-6 py-2 border-b border-neutral-800 flex items-center gap-1.5 flex-wrap shrink-0">
+        {FILTER_PILLS.map(pill => (
+          <button
+            key={pill.value}
+            onClick={() => setActiveFilter(pill.value)}
+            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+              activeFilter === pill.value
+                ? pill.activeClass
+                : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
+            }`}
+          >
+            {pill.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Summary bar */}
+      {!loading && (() => {
+        const todayUtc = new Date().toISOString().slice(0, 10);
+        const counts = {
+          TASK_COMPLETED: 0,
+          TASK_FAILED: 0,
+          RESEARCH_FINDINGS: 0,
+          DEPLOY_EVENT: 0,
+        };
+        for (const e of events) {
+          if (e.timestamp.slice(0, 10) === todayUtc && e.type in counts) {
+            counts[e.type as keyof typeof counts]++;
+          }
+        }
+        const pills: { label: string; color: string }[] = [];
+        if (counts.TASK_COMPLETED > 0) pills.push({ label: `${counts.TASK_COMPLETED} completed`, color: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' });
+        if (counts.TASK_FAILED > 0)    pills.push({ label: `${counts.TASK_FAILED} failed`,    color: 'bg-red-500/20 text-red-400 border-red-500/30' });
+        if (counts.RESEARCH_FINDINGS > 0) pills.push({ label: `${counts.RESEARCH_FINDINGS} research`, color: 'bg-blue-500/20 text-blue-400 border-blue-500/30' });
+        if (counts.DEPLOY_EVENT > 0)   pills.push({ label: `${counts.DEPLOY_EVENT} deploy`,   color: 'bg-purple-500/20 text-purple-400 border-purple-500/30' });
+        return (
+          <div className="px-6 py-2 border-b border-neutral-800 flex items-center gap-2 flex-wrap shrink-0">
+            {pills.length === 0 ? (
+              <span className="text-xs text-neutral-600">No activity today</span>
+            ) : (
+              pills.map(({ label, color }) => (
+                <span key={label} className={`border text-[10px] font-semibold px-2 py-0.5 rounded-full leading-none ${color}`}>
+                  {label}
+                </span>
+              ))
+            )}
+          </div>
+        );
+      })()}
 
       {/* Error banner */}
       {error && (
@@ -150,14 +222,40 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
         {loading ? (
           Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} />)
-        ) : events.length === 0 ? (
+        ) : filteredEvents.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
             <Clock className="w-8 h-8 mb-3 opacity-40" />
-            <p className="text-sm">No recent activity</p>
-            <p className="text-xs mt-1 opacity-70">Events will appear here as tasks run</p>
+            <p className="text-sm">{activeFilter === 'ALL' ? 'No recent activity' : 'No matching events'}</p>
+            <p className="text-xs mt-1 opacity-70">{activeFilter === 'ALL' ? 'Events will appear here as tasks run' : 'Try a different filter'}</p>
           </div>
-        ) : (
-          events.map(event => (
+        ) : (() => {
+          const now = new Date();
+          const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
+          const startOfWeek = new Date(startOfToday.getTime() - 6 * 86400000);
+
+          const groups: { label: string; events: ActivityEvent[] }[] = [
+            { label: 'Today', events: [] },
+            { label: 'Yesterday', events: [] },
+            { label: 'This Week', events: [] },
+            { label: 'Older', events: [] },
+          ];
+
+          for (const event of filteredEvents) {
+            const d = new Date(event.timestamp);
+            if (d >= startOfToday) groups[0].events.push(event);
+            else if (d >= startOfYesterday) groups[1].events.push(event);
+            else if (d >= startOfWeek) groups[2].events.push(event);
+            else groups[3].events.push(event);
+          }
+
+          return groups.flatMap(({ label, events: groupEvents }) => {
+            if (groupEvents.length === 0) return [];
+            return [
+              <div key={`header-${label}`} className="pt-2 pb-1 first:pt-0 sticky top-0 z-10 bg-neutral-950/90 backdrop-blur-sm">
+                <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{label}</span>
+              </div>,
+              ...groupEvents.map(event => (
             <div
               key={event.id}
               onClick={() => handleRowClick(event)}
@@ -179,6 +277,13 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
                       </span>
                     )}
 
+                    {/* Task type badge */}
+                    {event.type === 'TASK_COMPLETED' && event.task_type && (
+                      <span className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded">
+                        {event.task_type}
+                      </span>
+                    )}
+
                     {/* Deploy status badge */}
                     {event.type === 'DEPLOY_EVENT' && event.deploy_status && (
                       <span className={`shrink-0 border text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
@@ -189,13 +294,66 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
                   {/* Error summary for TASK_FAILED */}
                   {event.type === 'TASK_FAILED' && event.error_summary && (
-                    <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.error_summary}>
-                      {event.error_summary}
+                    expandedErrors.has(event.id) ? (
+                      <pre className="whitespace-pre-wrap text-xs text-red-400/80 mt-1 max-h-32 overflow-y-auto font-mono bg-neutral-950 rounded p-2">
+                        {event.error_summary}
+                      </pre>
+                    ) : (
+                      <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.error_summary}>
+                        {event.error_summary}
+                      </p>
+                    )
+                  )}
+
+                  {/* Status message for TASK_IN_PROGRESS */}
+                  {event.type === 'TASK_IN_PROGRESS' && event.latest_status_message && (
+                    <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.latest_status_message}>
+                      {event.latest_status_message}
                     </p>
                   )}
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0 ml-auto">
+                  {/* Expand toggle for TASK_FAILED */}
+                  {event.type === 'TASK_FAILED' && event.error_summary && (
+                    <button
+                      onClick={e => {
+                        e.stopPropagation();
+                        setExpandedErrors(prev => {
+                          const next = new Set(prev);
+                          if (next.has(event.id)) next.delete(event.id);
+                          else next.add(event.id);
+                          return next;
+                        });
+                      }}
+                      className="text-neutral-500 hover:text-neutral-300 transition-colors"
+                      title={expandedErrors.has(event.id) ? 'Collapse error' : 'Expand error'}
+                    >
+                      {expandedErrors.has(event.id)
+                        ? <ChevronDown className="w-3.5 h-3.5" />
+                        : <ChevronRight className="w-3.5 h-3.5" />}
+                    </button>
+                  )}
+
+                  {/* Commit hash badge */}
+                  {event.type === 'TASK_COMPLETED' && event.commit_hash && (
+                    event.repo_url && isSafeUrl(event.repo_url) ? (
+                      <a
+                        href={event.repo_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={e => e.stopPropagation()}
+                        className="font-mono text-[10px] bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
+                        title={event.commit_hash}
+                      >
+                        {event.commit_hash.slice(0, 7)}
+                      </a>
+                    ) : (
+                      <span className="font-mono text-[10px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
+                        {event.commit_hash.slice(0, 7)}
+                      </span>
+                    )
+                  )}
                   {/* PR link */}
                   {event.pr_url && isSafeUrl(event.pr_url) && (
                     <a
@@ -220,8 +378,11 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
                 </div>
               </div>
             </div>
-          ))
-        )}
+              ))
+            ];
+          });
+        })()
+        }
       </div>
 
       {/* Loading indicator for background refresh */}
