@@ -3,6 +3,7 @@ import { useMemo } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, LogOut } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
+import type { DeployState } from '../useAppState';
 import type { Task } from './TaskCard';
 
 export interface HeaderBarProps {
@@ -68,7 +69,7 @@ export interface HeaderBarProps {
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
   // Deploy state
-  deployState: Record<string, any> | null;
+  deployState: DeployState | null;
   onPausePipeline: () => Promise<void>;
   onResumePipeline: () => Promise<void>;
   onRollback: () => Promise<void>;

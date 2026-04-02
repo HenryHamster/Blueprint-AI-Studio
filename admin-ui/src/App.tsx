@@ -161,6 +161,8 @@ export default function App() {
           cumulativeCost={s.cumulativeCost}
           maxConcurrentVMs={s.maxConcurrentVMs}
           tasks={s.tasks}
+          metricsWindow={s.metricsWindow}
+          onWindowChange={s.setMetricsWindow}
         />
       </div>
 

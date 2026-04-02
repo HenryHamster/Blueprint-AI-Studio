@@ -49,7 +49,7 @@ export function MetricsBar({
       className="flex items-center gap-8 px-6 py-2 bg-neutral-900/30 rounded-lg border border-neutral-800/50 cursor-pointer hover:bg-neutral-900/50 transition-colors"
       title="Toggle metrics dashboard"
     >
-      <div className="flex flex-col items-center">
+      <div className="flex flex-col items-center" title={`${globalActiveCount} VMs active out of ${maxConcurrentVMs} configured maximum`}>
         <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Active VMs</span>
         <span className="text-xl font-bold text-emerald-400 font-mono leading-none flex items-center gap-1.5">
           {globalActiveCount > 0 && <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>}
@@ -57,12 +57,13 @@ export function MetricsBar({
         </span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
-      <div className="flex flex-col items-center">
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">
-          {usingMaxPlan ? 'Est. Cost (Max)' : 'Est. Cost'}
-        </span>
+      <div
+        className="flex flex-col items-center"
+        title={usingMaxPlan ? `Max plan: $${COST_PER_VM_MAX_PLAN}/hr per VM (VM compute only)` : `Standard plan: $${COST_PER_VM_STANDARD}/hr per VM (includes API tokens)`}
+      >
+        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Est. Cost/hr</span>
         <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
-          ${(globalActiveCount * (usingMaxPlan ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD)).toFixed(2)}<span className="text-xs text-neutral-500 font-sans">/hr</span>
+          ${(globalActiveCount * (usingMaxPlan ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD)).toFixed(2)}<span className="text-sm text-neutral-400 font-sans">/hr</span>
         </span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>

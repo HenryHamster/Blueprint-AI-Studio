@@ -7,6 +7,16 @@ import type { User } from 'firebase/auth';
 import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
 
+export interface DeployState {
+  status: string;
+  current_sha?: string;
+  last_known_good_sha?: string;
+  failure_rate?: number;
+  monitoring_window?: { percent: number };
+  rollback_reason?: string;
+  pause_reason?: string;
+}
+
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
   const [state, setState] = useState<T>(() => {
     try {
@@ -126,8 +136,9 @@ export function useAppState() {
   const [showMetrics, setShowMetrics] = useState(false);
   const [metricsHistory, setMetricsHistory] = usePersistedState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>('metricsHistory', []);
   const [cumulativeCost, setCumulativeCost] = usePersistedState<number>('cumulativeCost', 0);
+  const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '6h'>('metricsWindow', '1h');
   const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
-  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 7200000); }, []);
+  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 21600000); }, [metricsHistory]);
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -388,7 +399,7 @@ export function useAppState() {
           setCumulativeCost(c => c + lastPoint.costPerHr * (intervalMs / 3600000));
         }
 
-        const filtered = prevHistory.filter(p => now - p.timestamp <= 7200000);
+        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 21600000);
         const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr, completedCount, failedCount }];
         metricsHistoryRef.current = newHistory;
         setMetricsHistory(newHistory);
@@ -571,7 +582,7 @@ export function useAppState() {
   };
 
   // --- Deploy State ---
-  const [deployState, setDeployState] = useState<Record<string, any> | null>(null);
+  const [deployState, setDeployState] = useState<DeployState | null>(null);
 
   const fetchDeployState = async () => {
     try {
@@ -621,8 +632,8 @@ export function useAppState() {
       const data = await res.json();
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
-    } catch (error: any) {
-      addToast(`Rollback failed: ${error.message}`, 'error');
+    } catch (error) {
+      addToast(`Rollback failed: ${(error as Error).message}`, 'error');
       throw error;
     }
   };
@@ -1206,7 +1217,7 @@ export function useAppState() {
     // Directions
     showDirections, setShowDirections,
     // Metrics
-    showMetrics, setShowMetrics, metricsHistory, cumulativeCost,
+    showMetrics, setShowMetrics, metricsHistory, cumulativeCost, metricsWindow, setMetricsWindow,
     // Archive
     showArchive, setShowArchive, archiveTasks, archiveLoading,
     archivePage, setArchivePage, archivePageSize, setArchivePageSize,

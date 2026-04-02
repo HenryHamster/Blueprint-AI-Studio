@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, Play, Pause, RotateCw, Wrench, CheckCircle } from 'lucide-react';
+import type { DeployState } from '../useAppState';
 
 
 export interface MaxPlanAccount {
@@ -53,7 +54,7 @@ interface SettingsDropdownProps {
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
   // Deploy state
-  deployState: Record<string, any> | null;
+  deployState: DeployState | null;
   onPausePipeline: () => Promise<void>;
   onResumePipeline: () => Promise<void>;
   onRollback: () => Promise<void>;
@@ -437,11 +438,11 @@ export function SettingsDropdown({
                   <span className="text-[11px] text-neutral-500">SHA</span>
                   <span className="text-[11px] text-neutral-300 font-mono">{deployState.current_sha?.slice(0, 8) || '—'}</span>
                 </div>
-                {deployState.failure_rate > 0 && (
+                {(deployState.failure_rate ?? 0) > 0 && (
                   <div className="flex items-center justify-between">
                     <span className="text-[11px] text-neutral-500">Failure Rate</span>
-                    <span className={`text-[11px] font-mono ${deployState.failure_rate > 0.3 ? 'text-red-400' : 'text-neutral-300'}`}>
-                      {(deployState.failure_rate * 100).toFixed(0)}%
+                    <span className={`text-[11px] font-mono ${(deployState.failure_rate ?? 0) > 0.3 ? 'text-red-400' : 'text-neutral-300'}`}>
+                      {((deployState.failure_rate ?? 0) * 100).toFixed(0)}%
                     </span>
                   </div>
                 )}
