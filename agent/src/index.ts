@@ -727,11 +727,22 @@ Rules:
 - Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
-- Do NOT include findings that require human architectural decisions
 - Limit to 10 findings maximum, prioritized by impact
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
-- For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
-- IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.`;
+- Use type=research for areas needing deeper investigation before implementation — these spawn sub-research tasks. Prefer this for broad or architectural topics. Don't try to implement everything in one pass; research first, then implement.
+- IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+
+Context — you are part of an autonomous pipeline:
+- You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
+- Think iteratively. You don't need to solve everything in one pass. Prefer laying clean foundations that future research cycles can build on over shipping everything at once.
+- Keep the codebase clean. Other agents will read and modify the same code after you. Messy patterns multiply — extensible patterns compound.
+- Use type=research findings for areas that need deeper investigation before implementation. This spawns a sub-research agent to dig in further. Don't rush to implement something you're uncertain about.
+
+Approach:
+- This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. Changes that touch one layer usually need corresponding changes in other layers.
+- Prefer extensible, data-driven designs over copy-paste. If adding a new instance of something (a new type, a new endpoint, a new UI panel), first check if the pattern should be generalized.
+- Frontend changes are just as important as backend changes. Every new backend capability needs corresponding UI to be useful.
+- Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.`;
 
   statusRef.value = 'Running codebase research...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef);
