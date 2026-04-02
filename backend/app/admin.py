@@ -1353,6 +1353,47 @@ async def get_direction_task_counts(
     return {"counts": counts}
 
 
+@router.post("/projects/{project_id}/directions/{direction_id}/research")
+async def trigger_direction_research(
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Spawn a research task scoped to a single direction."""
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
+    if not direction:
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    new_task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text'][:80]}",
+        description=f"Targeted research for direction: {direction['text']}",
+        payloads=[{
+            "type": "research",
+            "directions": [direction],
+            "base_branch": "main",
+        }],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="CREATED",
+        details={"created_by": "USER", "method": "direction_research", "direction_id": direction_id}
+    )
+    session.add(history)
+    await session.commit()
+    await session.refresh(new_task)
+
+    return {"id": str(new_task.id), "title": new_task.title, "status": new_task.status}
+
+
 @router.patch("/projects/{project_id}/autonomous")
 async def toggle_autonomous(
     project_id: uuid.UUID,
