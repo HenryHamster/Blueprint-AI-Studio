@@ -677,7 +677,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the 
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort);
 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
-  const fs = await import('fs');
+
   let logs = '';
   let verdictJsonField: string | undefined;
   try {
@@ -1031,7 +1031,7 @@ Rules:
 
   // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
-  const fs = await import('fs');
+
   const planPath = '/tmp/plan_output.json';
   try {
     if (fs.existsSync(planPath)) {
@@ -1117,7 +1117,7 @@ ${hotspotsSection}
 ` : '';
 
   // Build codebase summary to reduce exploration overhead
-  const fs = await import('fs');
+
   const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;
   const claudeMd = fs.existsSync(claudeMdPath)
     ? fs.readFileSync(claudeMdPath, 'utf-8').slice(0, 2000)
@@ -1982,7 +1982,7 @@ async function handleDebug(
   const failedTaskId = String(payload.failed_task_id || '');
   const failedTaskTitle = String(payload.failed_task_title || task.title || '');
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
+  validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone for read-only analysis (no work branch or push needed)
   statusRef.value = `Cloning ${owner}/${repo} for debug analysis...`;
@@ -2207,7 +2207,7 @@ IMPORTANT:
   statusRef.value = 'Running investigation...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
 
-  const fs = await import('fs');
+
   const reportPath = '/tmp/investigation_report.json';
 
   let logs = '';
@@ -2317,7 +2317,7 @@ async function main() {
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch {}
     // Clean up /tmp files written by Claude Code handlers
-    for (const f of ['/tmp/review_verdict.json', '/tmp/smoketest_result.json', '/tmp/debug_output.json', '/tmp/investigation_report.json']) {
+    for (const f of ['/tmp/review_verdict.json', '/tmp/smoketest_result.json', '/tmp/debug_output.json', '/tmp/investigation_report.json', '/tmp/perf_output.json']) {
       try { fs.unlinkSync(f); } catch {}
     }
     log('Agent shutdown complete.');

@@ -226,6 +226,9 @@ async def _init_deployment_state():
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
+            print(f"[DEPLOY] max_concurrent_vms forced to 0 — state is {state.status} "
+                  f"(reason: {state.pause_reason or 'unknown'}). "
+                  f"Set max VMs > 0 in settings to resume.")
 
         if state.current_revision == _current_revision:
             # Same revision — normal restart (cold start, scale event, etc.)
@@ -2940,13 +2943,11 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         task.latest_status_message = "Perf analysis completed with no parseable findings"
         task.plan_output = []
         session.add(task)
-        await session.commit()
         return
 
     # Store all findings for display
     task.plan_output = findings
     session.add(task)
-    await session.commit()
 
     base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
 
@@ -2989,9 +2990,8 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         session.add(new_task)
         child_tasks.append(new_task)
 
-    await session.commit()
+    await session.flush()
     for ct in child_tasks:
-        await session.refresh(ct)
         history = TaskHistory(
             task_id=ct.id, action="SPAWNED",
             details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)}
@@ -2999,8 +2999,6 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         session.add(history)
         await broadcast_to_project(str(task.project_id), "task_updated",
                                    {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
-
-    await session.commit()
 
     # Post a summary comment on open PRs for medium/low findings
     informational = [f for f in findings if f.get("severity") in ("medium", "low")]
@@ -3040,7 +3038,6 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         f"{len(informational)} medium/low finding(s) surfaced as PR comment"
     )
     session.add(task)
-    await session.commit()
 
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
@@ -3056,7 +3053,6 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             task.plan_output = {"raw": payload.logs}
     task.status = TaskStatus.COMPLETED
     session.add(task)
-    await session.commit()
 
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):

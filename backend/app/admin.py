@@ -888,6 +888,18 @@ async def update_settings(
         if not (1 <= val <= 100):
             raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 1 and 100")
         _runtime_config["max_concurrent_vms"] = val
+        # Clear PAUSED/HALTED state if user explicitly sets VMs > 0
+        # Otherwise the next cold start will override back to 0
+        if val > 0:
+            state = await session.get(DeploymentState, 1)
+            if state and state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                old_status = state.status
+                state.status = DeploymentStatus.STABLE
+                state.pause_reason = None
+                state.paused_at = None
+                state.pre_pause_max_vms = None
+                session.add(state)
+                print(f"[SETTINGS] Cleared {old_status} state — user set max_vms={val}")
     if "max_retries" in payload:
         try:
             val = int(payload["max_retries"])
