@@ -14,6 +14,7 @@ interface Direction {
   priority: 'high' | 'medium' | 'low';
   added_at: string;
   status: 'active' | 'completed' | 'paused';
+  paths?: string[];
 }
 
 const priorityColors: Record<string, string> = {
@@ -47,6 +48,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   // Add form
   const [newText, setNewText] = useState('');
   const [newPriority, setNewPriority] = useState<'high' | 'medium' | 'low'>('medium');
+  const [newPaths, setNewPaths] = useState('');
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +58,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
   const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused'>('active');
+  const [editPaths, setEditPaths] = useState('');
 
   // Collapsible sections — all expanded by default
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -109,15 +112,17 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   async function addDirection() {
     if (!newText.trim() || !selectedProjectId) return;
     setError(null);
+    const paths = newPaths.split(',').map(p => p.trim()).filter(Boolean);
     try {
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST', headers: h,
-        body: JSON.stringify({ text: newText.trim(), priority: newPriority }),
+        body: JSON.stringify({ text: newText.trim(), priority: newPriority, paths }),
       });
       if (!res.ok) throw new Error('Failed to add direction');
       setNewText('');
       setNewPriority('medium');
+      setNewPaths('');
       fetchDirections();
     } catch {
       setError('Failed to add direction. Please try again.');
@@ -126,11 +131,12 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
 
   async function updateDirection(id: string) {
     setError(null);
+    const paths = editPaths.split(',').map(p => p.trim()).filter(Boolean);
     try {
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH', headers: h,
-        body: JSON.stringify({ text: editText, priority: editPriority, status: editStatus }),
+        body: JSON.stringify({ text: editText, priority: editPriority, status: editStatus, paths }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       setEditingId(null);
@@ -234,6 +240,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     setEditText(d.text);
     setEditPriority(d.priority);
     setEditStatus(d.status);
+    setEditPaths((d.paths ?? []).join(', '));
   }
 
   function toggleSection(key: string) {
@@ -328,6 +335,12 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                 <Plus className="w-3.5 h-3.5" />
               </button>
             </div>
+            <input
+              value={newPaths}
+              onChange={e => setNewPaths(e.target.value)}
+              placeholder="Path scope (optional, comma-separated, e.g. backend/, frontend/src/)"
+              className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+            />
           </div>
         )}
 
@@ -379,6 +392,12 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                   value={editText}
                                   onChange={e => setEditText(e.target.value)}
                                   className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                />
+                                <input
+                                  value={editPaths}
+                                  onChange={e => setEditPaths(e.target.value)}
+                                  placeholder="Path scope (comma-separated, e.g. backend/, frontend/src/)"
+                                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
                                 />
                                 <div className="flex items-center gap-2">
                                   <select
@@ -490,6 +509,15 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                     </span>
                                   )}
                                 </div>
+                                {d.paths && d.paths.length > 0 && (
+                                  <div className="flex flex-wrap gap-1 mt-1.5">
+                                    {d.paths.map(p => (
+                                      <span key={p} className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 border border-neutral-700/60 text-neutral-400 font-mono">
+                                        {p}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>

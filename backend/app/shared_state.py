@@ -20,6 +20,17 @@ runtime_config: Dict = {
     # e.g. {"research": "claude-opus-4-6", "create": "claude-sonnet-4-6"}
     "task_type_models": {},
     "task_type_efforts": {},
+    # Per-type extra instructions appended to the agent's base prompt
+    # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
+    "agent_prompt_suffixes": {},
+    # Periodic autonomous spawning for non-research task types (opt-in)
+    "autonomous_periodic_tasks": {
+        "security_audit": {"interval_hours": 168, "enabled": False},  # weekly
+        "qa": {"interval_hours": 72, "enabled": False},               # every 3 days
+        "deps": {"interval_hours": 168, "enabled": False},            # weekly
+    },
+    "autonomous_direction_cooldown_hours": 4,
+    "autonomous_research_wave_size": 10,
 }
 
 # --- Autonomous Loop State ---

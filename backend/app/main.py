@@ -64,6 +64,10 @@ limiter = Limiter(key_func=get_remote_address)
 from app.shared_state import runtime_config as _runtime_config, autonomous_failure_counts as _autonomous_failure_counts
 import app.shared_state as _shared_state
 
+# --- Task Priority Map ---
+# Maps priority string labels to integer values stored on Task.priority.
+TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
+
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
 # Each entry: {id, name, oauth_token, claude_config_json, enabled, active_tasks, total_tasks, token_created_at}
@@ -527,8 +531,17 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
-    # Guard: must have active directions
-    active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    # Guard: must have active directions that aren't in cooldown
+    default_cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
+    active_directions = [
+        d for d in (project.directions or [])
+        if d.get("status") == "active"
+        and (
+            not d.get("last_researched_at")
+            or (datetime.now(timezone.utc) - datetime.fromisoformat(d["last_researched_at"])).total_seconds()
+               >= default_cooldown_hours * 3600
+        )
+    ]
     if not active_directions:
         return
     # Guard: no existing research task already running/queued/evaluating
@@ -564,12 +577,14 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Use per-type defaults, fall back to autonomous-specific config
     research_model = _runtime_config.get("task_type_models", {}).get("research") or _runtime_config.get("autonomous_research_model") or None
     research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or _runtime_config.get("autonomous_research_effort") or None
+    research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     research_payload: dict = {
         "type": "research",
         "directions": active_directions,
         "base_branch": base_branch,
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
+        **({"prompt_suffix": research_suffix} if research_suffix else {}),
     }
     new_task = Task(
         project_id=project.id,
@@ -594,6 +609,108 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         breaker["half_open_task_id"] = str(new_task.id)
 
     print(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
+
+
+async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
+    """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
+    from sqlalchemy import func
+
+    # Guard: circuit breaker must allow spawning
+    breaker = _shared_state.get_circuit_breaker(str(project.id))
+    if breaker["state"] == "OPEN":
+        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+            breaker["state"] = "HALF_OPEN"
+            print(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
+        else:
+            return  # Still in cooldown
+
+    periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(task_type, {})
+    if not periodic_cfg.get("enabled", False):
+        return
+
+    interval_hours = periodic_cfg.get("interval_hours", 168)
+
+    # Guard: no task of this type already QUEUED/PROVISIONING/IN_PROGRESS
+    active_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active_tasks:
+        if ((t.payloads or [{}])[0]).get("type") == task_type:
+            return
+
+    # Guard: rate limit
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    recent_auto = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.project_id == project.id,
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        )
+    )).scalar() or 0
+    if recent_auto >= _runtime_config["max_autonomous_tasks_per_hour"]:
+        return
+
+    # Check when this type last ran (most recent completed task of this type)
+    completed_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.COMPLETED,
+        ).order_by(Task.created_at.desc()).limit(100)
+    )).scalars().all()
+    last_run = None
+    for t in completed_tasks:
+        if ((t.payloads or [{}])[0]).get("type") == task_type:
+            last_run = t.created_at
+            break
+
+    now = datetime.utcnow()
+    if last_run is not None:
+        elapsed = (now - last_run).total_seconds() / 3600
+        if elapsed < interval_hours:
+            return
+
+    # Infer base_branch from the most recent task in this project
+    recent_task = (await session.execute(
+        select(Task).where(Task.project_id == project.id)
+        .order_by(Task.created_at.desc()).limit(1)
+    )).scalars().first()
+    base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
+
+    task_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
+    task_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
+    task_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
+    payload: dict = {
+        "type": task_type,
+        "base_branch": base_branch,
+        **({"model": task_model} if task_model else {}),
+        **({"effort": task_effort} if task_effort else {}),
+        **({"prompt_suffix": task_suffix} if task_suffix else {}),
+    }
+    new_task = Task(
+        project_id=project.id,
+        title=f"{task_type.upper()} scan: autonomous periodic",
+        description=f"Automated {task_type} task triggered by autonomous periodic scheduler",
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "periodic_schedule", "task_type": task_type}
+    )
+    session.add(history)
+    await session.commit()
+    await session.refresh(new_task)
+
+    if breaker["state"] == "HALF_OPEN":
+        breaker["half_open_task_id"] = str(new_task.id)
+
+    print(f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}")
 
 
 async def _check_autonomous_research(owner: str, repo: str):
@@ -654,6 +771,9 @@ async def _check_idle_research():
 
                 if active_count < _runtime_config["max_concurrent_vms"]:
                     await _spawn_research_task(project, session)
+
+                    for task_type in ("security_audit", "qa", "deps"):
+                        await _spawn_periodic_task(project, task_type, session)
     except Exception as e:
         print(f"[AUTONOMOUS] Error in idle research check: {e}")
 
@@ -904,7 +1024,7 @@ async def orchestrator_worker():
                 candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).limit(min(slots_available, 20))  # Fetch extra to filter deps
+                ).order_by(Task.priority.desc(), Task.created_at.asc()).limit(min(slots_available, 20))  # Fetch extra to filter deps
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -949,7 +1069,31 @@ async def orchestrator_worker():
                     elif all_met:
                         eligible_ids.append(task.id)
 
-                # Respect slot limit after filtering
+                # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
+                # Build a set of files currently being modified by IN_PROGRESS tasks
+                in_progress_files: set[str] = set()
+                for t in active_tasks_result:
+                    if t.status == TaskStatus.IN_PROGRESS:
+                        in_progress_files.update((t.context or {}).get("related_files", []))
+
+                # Only apply conflict check if we have file data to work with
+                if in_progress_files:
+                    non_conflicting = []
+                    for eid in eligible_ids:
+                        # Find the candidate task
+                        candidate = next((t for t in candidate_tasks if t.id == eid), None)
+                        if candidate is None:
+                            non_conflicting.append(eid)
+                            continue
+                        candidate_files = set((candidate.context or {}).get("related_files", []))
+                        overlap = candidate_files & in_progress_files
+                        if overlap:
+                            print(f"[DISPATCH] Deferring task {eid} — file conflict with in-progress tasks: {', '.join(sorted(overlap))}")
+                        else:
+                            non_conflicting.append(eid)
+                    eligible_ids = non_conflicting
+
+                # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 
                 # Step 3: Lock ONLY the tasks we're about to dispatch (minimal lock duration)
@@ -1479,6 +1623,7 @@ class SpawnTaskRequest(BaseModel):
     payloads: List[Dict[str, Any]] = Field(max_length=20)
     requires_approval: bool = False
     context: Optional[Dict[str, Any]] = None
+    priority: Optional[int] = None
 
 class GitHubCommitStatusRequest(BaseModel):
     task_id: uuid.UUID
@@ -2019,11 +2164,30 @@ async def claim_task(
         )
         open_prs_rows = (await session.execute(open_prs_stmt)).scalars().all()
 
+        sibling_tasks = []
+        if task.parent_task_id:
+            sibling_result = await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == task.parent_task_id,
+                    Task.id != task.id,
+                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                )
+            )
+            for sib in sibling_result.scalars().all():
+                sibling_tasks.append({
+                    "id": str(sib.id),
+                    "title": sib.title,
+                    "status": sib.status,
+                    "related_files": (sib.context or {}).get("related_files", []),
+                    "task_type": ((sib.payloads or [{}])[0]).get("type", ""),
+                })
+
         response["project_context"] = {
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
             "open_prs": list(open_prs_rows),
+            "sibling_tasks": sibling_tasks,
         }
 
     return response
@@ -2128,7 +2292,8 @@ async def spawn_subtask(
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
             requires_approval=req.requires_approval,
-            parent_task_id=parent_task.id
+            parent_task_id=parent_task.id,
+            **({"priority": req.priority} if req.priority is not None else {}),
         )
         session.add(new_task)
         new_tasks.append(new_task)
@@ -2493,6 +2658,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         related_files = subtask_def.get("related_files", [])
         prompt_text = subtask_def.get("prompt", "")
         full_prompt = prompt_text + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt_text
+        create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+        subtask_priority = TASK_PRIORITY_MAP.get(subtask_def.get("priority", "medium"), 50)
         subtask_model = subtask_def.get('model') or model
         subtask_effort = subtask_def.get('effort') or effort
         child_scope = subtask_def.get('scope', 'small')
@@ -2509,6 +2676,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "base_branch": plan_branch,
                 **({"model": subtask_model} if subtask_model else {}),
                 **({"effort": subtask_effort} if subtask_effort else {}),
+                **({"prompt_suffix": create_suffix} if create_suffix else {}),
             }],
             context={
                 "plan_branch": plan_branch,
@@ -2521,6 +2689,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             depends_on=[],
+            priority=subtask_priority,
         )
         session.add(child)
         child_tasks.append(child)
@@ -2595,6 +2764,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
         await session.commit()
         return
 
+    create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
     child_tasks = []
     for i, finding in enumerate(actionable):
         fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
@@ -2612,6 +2782,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
                 "type": "create",
                 "prompt": fix_prompt,
                 "base_branch": base_branch,
+                **({"prompt_suffix": create_suffix} if create_suffix else {}),
             }],
             context={
                 "security_audit_task_id": str(task.id),
@@ -2745,98 +2916,164 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 return True
         return False
 
-    # First pass: create all child tasks
-    child_tasks = []
-    finding_indices = []  # Track which finding index maps to which child
+    # Sort findings by priority: high → medium → low (preserve original order within each tier)
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    indexed_findings = list(enumerate(findings))
+    indexed_findings.sort(key=lambda x: priority_order.get(x[1].get("priority", "medium"), 1))
+
+    wave_size = max(1, _runtime_config.get("autonomous_research_wave_size", 10))
+
+    # Group into waves by priority tier, each capped at wave_size
+    waves: list[list[tuple[int, dict]]] = []
+    current_priority = None
+    current_wave: list[tuple[int, dict]] = []
     skipped_duplicates = 0
-    for i, finding in enumerate(findings):
-        scope = finding.get("scope", "small")
-        risk = finding.get("risk", "low")
-        title = finding.get("title", f"Research finding #{i+1}")
-        prompt = finding.get("prompt", finding.get("description", ""))
-
-        if not prompt:
-            continue
-
+    for orig_i, finding in indexed_findings:
+        title = finding.get("title", f"Research finding #{orig_i+1}")
         if _is_duplicate(title, existing_titles):
             print(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
             continue
-
-        # Determine task type: research findings can spawn sub-research or specialized agents
-        finding_type = finding.get("type", "improvement")
-        if finding_type == "research":
-            task_type = "research"  # deeper investigation before implementation
-        elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate"):
-            task_type = finding_type  # spawn specialized agent
-        elif finding_type == "refactor":
-            task_type = "refactor"  # code quality improvement, no behavior change
-        elif scope == "large":
-            task_type = "plan"     # large scope needs decomposition
+        p = finding.get("priority", "medium")
+        if p != current_priority:
+            if current_wave:
+                # Flush current wave, splitting into chunks of wave_size
+                for chunk_start in range(0, len(current_wave), wave_size):
+                    waves.append(current_wave[chunk_start:chunk_start + wave_size])
+            current_wave = [(orig_i, finding)]
+            current_priority = p
         else:
-            task_type = "create"   # small/medium scope is single-PR work
-        needs_approval = risk == "high"
+            current_wave.append((orig_i, finding))
+            if len(current_wave) >= wave_size:
+                waves.append(current_wave)
+                current_wave = []
+    if current_wave:
+        for chunk_start in range(0, len(current_wave), wave_size):
+            waves.append(current_wave[chunk_start:chunk_start + wave_size])
 
-        direction_id = finding.get("direction_id")
-        finding_model = finding.get('model')
-        finding_effort = finding.get('effort')
+    # First pass: create all child tasks, recording which wave each belongs to
+    child_tasks = []
+    finding_indices = []  # Track which finding index maps to which child task index
+    # wave_task_indices[w] = list of child_tasks indices for wave w
+    wave_task_indices: list[list[int]] = [[] for _ in waves]
 
-        related_files = finding.get("related_files", [])
-        full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
-        new_task = Task(
-            project_id=task.project_id,
-            title=title,
-            description=finding.get("description", prompt[:200]),
-            parent_task_id=task.id,
-            payloads=[{
-                "type": task_type,
-                "prompt": full_prompt,
-                "base_branch": research_branch,
-                **(({'model': finding_model} if finding_model else {})),
-                **(({'effort': finding_effort} if finding_effort else {})),
-            }],
-            context={
-                "research_task_id": str(task.id),
-                "finding_index": i,
-                "scope": scope,
-                "risk": risk,
-                "research_branch": research_branch,
-                "original_base": original_base,
-                "research_depth": research_depth + 1,
-                "related_files": related_files,
-                **({"direction_id": direction_id} if direction_id else {}),
-            },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-            requires_approval=needs_approval,
-            depends_on=[],
-        )
-        session.add(new_task)
-        child_tasks.append(new_task)
-        finding_indices.append(i)
+    for wave_idx, wave in enumerate(waves):
+        for orig_i, finding in wave:
+            scope = finding.get("scope", "small")
+            risk = finding.get("risk", "low")
+            title = finding.get("title", f"Research finding #{orig_i+1}")
+            prompt = finding.get("prompt", finding.get("description", ""))
+
+            if not prompt:
+                continue
+
+            # Determine task type: research findings can spawn sub-research or specialized agents
+            finding_type = finding.get("type", "improvement")
+            if finding_type == "research":
+                task_type = "research"  # deeper investigation before implementation
+            elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate"):
+                task_type = finding_type  # spawn specialized agent
+            elif finding_type == "refactor":
+                task_type = "refactor"  # code quality improvement, no behavior change
+            elif scope == "large":
+                task_type = "plan"     # large scope needs decomposition
+            else:
+                task_type = "create"   # small/medium scope is single-PR work
+            needs_approval = risk == "high"
+
+            direction_id = finding.get("direction_id")
+            finding_model = finding.get('model')
+            finding_effort = finding.get('effort')
+
+            related_files = finding.get("related_files", [])
+            full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
+            type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
+            finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
+            new_task = Task(
+                project_id=task.project_id,
+                title=title,
+                description=finding.get("description", prompt[:200]),
+                parent_task_id=task.id,
+                payloads=[{
+                    "type": task_type,
+                    "prompt": full_prompt,
+                    "base_branch": research_branch,
+                    **(({'model': finding_model} if finding_model else {})),
+                    **(({'effort': finding_effort} if finding_effort else {})),
+                    **({"prompt_suffix": type_suffix} if type_suffix else {}),
+                }],
+                context={
+                    "research_task_id": str(task.id),
+                    "finding_index": orig_i,
+                    "scope": scope,
+                    "risk": risk,
+                    "research_branch": research_branch,
+                    "original_base": original_base,
+                    "research_depth": research_depth + 1,
+                    "related_files": related_files,
+                    **({"direction_id": direction_id} if direction_id else {}),
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                requires_approval=needs_approval,
+                depends_on=[],
+                priority=finding_priority,
+            )
+            session.add(new_task)
+            ci = len(child_tasks)
+            child_tasks.append(new_task)
+            finding_indices.append(orig_i)
+            wave_task_indices[wave_idx].append(ci)
 
     await session.commit()
     for ct in child_tasks:
         await session.refresh(ct)
 
-    # Second pass: resolve depends_on_indices to actual UUIDs
+    # Second pass: resolve depends_on_indices to actual UUIDs and apply wave dependencies
     # finding_indices maps child_tasks position → findings array position
     finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}
-    for ci, fi in enumerate(finding_indices):
-        dep_indices = findings[fi].get("depends_on_indices", [])
-        child_tasks[ci].depends_on = [
-            str(child_tasks[finding_to_child[j]].id)
-            for j in dep_indices
-            if j in finding_to_child
-        ]
-        if child_tasks[ci].depends_on:
-            session.add(child_tasks[ci])
+    for wave_idx, wave_ci_list in enumerate(wave_task_indices):
+        # All tasks in the preceding wave must complete before this wave starts
+        prev_wave_uuids = (
+            [str(child_tasks[ci].id) for ci in wave_task_indices[wave_idx - 1]]
+            if wave_idx > 0 else []
+        )
+        for ci in wave_ci_list:
+            fi = finding_indices[ci]
+            dep_indices = findings[fi].get("depends_on_indices", [])
+            explicit_deps = [
+                str(child_tasks[finding_to_child[j]].id)
+                for j in dep_indices
+                if j in finding_to_child
+            ]
+            # Merge wave deps with explicit depends_on_indices (deduplicated)
+            merged = list(dict.fromkeys(prev_wave_uuids + explicit_deps))
+            child_tasks[ci].depends_on = merged
+            if merged:
+                session.add(child_tasks[ci])
 
     # Log file overlap warnings for observability
     _log_file_overlaps(findings, "RESEARCH")
 
     await session.commit()
+
+    # Update last_researched_at for each direction included in this research
+    task_directions = ((task.payloads or [{}])[0]).get("directions", [])
+    direction_ids_researched = {d["id"] for d in task_directions if d.get("id")}
+    if direction_ids_researched:
+        project = await session.get(Project, task.project_id)
+        if project:
+            directions = list(project.directions or [])
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for d in directions:
+                if d.get("id") in direction_ids_researched:
+                    d["last_researched_at"] = now_iso
+            project.directions = directions
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(project, "directions")
+            session.add(project)
+
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (
         f"Research created {len(child_tasks)} tasks from {len(findings)} findings"

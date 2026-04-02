@@ -332,7 +332,11 @@ async function handleCreate(
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
-  const finalPrompt = `${contextPrefix}${prompt}`;
+  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
+  const siblingNote = (projectCtx?.sibling_tasks as unknown[] | undefined)?.length
+    ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
+    : '';
+  const finalPrompt = `${contextPrefix}${prompt}${siblingNote}${promptSuffix}`;
 
   // Clone
   statusRef.value = `Cloning ${owner}/${repo}...`;
@@ -744,6 +748,17 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     lines.push('');
   }
 
+  const siblingTasks = ctx.sibling_tasks as Array<Record<string, unknown>> | undefined;
+  if (siblingTasks && siblingTasks.length > 0) {
+    lines.push('## Sibling Tasks (parallel tasks from the same parent — avoid duplicating their work)');
+    for (const t of siblingTasks) {
+      const files = (t.related_files as string[] | undefined);
+      const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
+      lines.push(`- [${t.status}] ${t.title}${filesSuffix}`);
+    }
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 
@@ -755,6 +770,7 @@ async function handlePlan(
 ) {
   const prompt = String(payload.prompt || payload.description || task.description || '');
   const baseBranch = String(payload.base_branch || 'main');
+  const planPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
 
   if (!prompt) throw new Error('Plan task missing prompt');
 
@@ -820,7 +836,7 @@ Rules:
 - Use model=claude-opus-4-6 and effort=high only for complex architectural subtasks. Leave null for simple additive changes.
 - scope: "small" for focused changes (1-3 files, clear scope), "medium" for broader changes
 - Set risk=high for changes to auth, data models, core orchestration logic. Set risk=medium for new endpoints or logic changes. Default to risk=low.
-- IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
+- IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
 
   statusRef.value = 'Running Claude Code for planning...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort);
@@ -892,7 +908,12 @@ ${gitDiffStatOutput || '(unavailable)'}
 ` : '';
 
   const directionsText = directions.length > 0
-    ? directions.map((d, i) => `${i + 1}. [${d.priority || 'medium'}] ${d.text} (id: ${d.id})`).join('\n')
+    ? directions.map((d, i) => {
+        const pathScope = Array.isArray(d.paths) && (d.paths as string[]).length > 0
+          ? ` [scope: ${(d.paths as string[]).join(', ')}]`
+          : '';
+        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})`;
+      }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
@@ -900,10 +921,23 @@ ${gitDiffStatOutput || '(unavailable)'}
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
 
+  const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
+    ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string}>)
+    : [];
+
   const researchPrompt = `${contextPrefix}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
 ${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
 ${directionsText}
+
+Recently completed tasks (DO NOT re-propose these — they were already implemented):
+${recentlyCompleted.length > 0
+  ? recentlyCompleted.map(t => `- [${t.task_type}] ${t.title}`).join('\n')
+  : '(none yet)'}
+
+Rules for avoiding duplication:
+- Do not propose findings that are substantially the same as any recently completed task above.
+- If a recently completed task partially addressed an issue and more work remains, you MAY propose a follow-up but must reference the prior work in your description.
 
 Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find patterns.
@@ -941,10 +975,12 @@ Valid values:
 - priority: high, medium, low
 
 Rules:
+- When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
 - Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
+- Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
 - Limit to 30 findings maximum, prioritized by impact
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
 - For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
@@ -953,6 +989,7 @@ Rules:
 - For type=deps findings, the prompt can be minimal (e.g. 'Update dependencies') — it will spawn a dedicated dependency update agent
 - For type=docs findings, the prompt can be minimal (e.g. 'Update documentation') — it will spawn a dedicated documentation agent
 - Use model=claude-opus-4-6 and effort=high only for complex architectural changes. Leave null for most findings to use the project default.
+- Do NOT propose findings that duplicate recently completed tasks listed above.
 
 How your findings get routed (you control this via type and scope):
 - type=security_audit → spawns a **security audit** agent that scans for vulnerabilities and auto-spawns fix tasks for critical/high findings
@@ -977,8 +1014,9 @@ Approach:
 - Frontend changes are just as important as backend changes. Every new backend capability needs corresponding UI to be useful.
 - Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.`;
 
+  const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
@@ -1052,8 +1090,9 @@ Steps:
 
 Be thorough but precise. Every statement in the documentation must reflect the actual code.`;
 
+  const docsPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(docsPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(docsPrompt + docsPromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1163,8 +1202,9 @@ Rules:
 - IMPORTANT: Write your findings JSON array to /tmp/security_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
+  const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + securityPromptSuffix, ws, statusRef, model, effort);
 
   let logs = '';
   const fs = await import('fs');
@@ -1240,8 +1280,9 @@ IMPORTANT RULES:
 - If a test requires mocking, use the same mocking approach as existing tests`;
 
   // Run Claude
+  const qaPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(qaPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(qaPrompt + qaPromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1356,8 +1397,9 @@ Steps to follow:
 
 IMPORTANT: Only update minor/patch versions. If a package would require a major version bump to get any update, skip it. Focus on security patches and bug fixes.`;
 
+  const depsPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running dependency updates...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(depsPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(depsPrompt + depsPromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1484,8 +1526,9 @@ CRITICAL RULES:
 - If autogenerate produces an empty migration with no changes, verify that your model changes were saved and the alembic env.py is configured to detect them
 - Document any data loss risks prominently using inline comments in the migration file`;
 
+  const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running migration workflow...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migratePrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migratePrompt + migratePromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1679,8 +1722,9 @@ ${rawPrompt}`;
   sendLog(ws, `Working branch: ${workBranch}\n`);
 
   // Run Claude
+  const refactorPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(refactorPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(refactorPrompt + refactorPromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String, text
+from sqlalchemy import Column, String, Integer, Index, text
 from sqlalchemy.dialects.postgresql import JSONB
 import uuid
 from datetime import datetime
@@ -111,11 +111,17 @@ class Task(SQLModel, table=True):
     # Agent Heartbeat mechanism
     last_heartbeat: Optional[datetime] = Field(default=None)
     
+    priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
+
     attempt_count: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = Field(default=None)
     archived: bool = Field(default=False)
     
+    __table_args__ = (
+        Index("ix_task_status_priority", "status", "priority"),
+    )
+
     project: Project = Relationship(back_populates="tasks")
     artifacts: List["Artifact"] = Relationship(
         back_populates="task",

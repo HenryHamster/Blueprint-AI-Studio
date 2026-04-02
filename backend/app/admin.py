@@ -858,6 +858,10 @@ async def get_settings(
         "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
         "task_type_models": _runtime_config.get("task_type_models", {}),
         "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
+        "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
+        "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
+        "autonomous_direction_cooldown_hours": _runtime_config.get("autonomous_direction_cooldown_hours", 4),
+        "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 10),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -934,6 +938,53 @@ async def update_settings(
         if any(v not in VALID_EFFORTS for v in val.values()):
             raise HTTPException(status_code=400, detail="Invalid effort in task_type_efforts")
         _runtime_config["task_type_efforts"] = val
+    if "agent_prompt_suffixes" in payload:
+        val = payload["agent_prompt_suffixes"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="agent_prompt_suffixes must be a dict")
+        if any(not isinstance(v, str) for v in val.values()):
+            raise HTTPException(status_code=400, detail="agent_prompt_suffixes values must be strings")
+        _runtime_config["agent_prompt_suffixes"] = val
+    if "autonomous_periodic_tasks" in payload:
+        val = payload["autonomous_periodic_tasks"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="autonomous_periodic_tasks must be a dict")
+        VALID_TYPES = {"security_audit", "qa", "deps"}
+        for type_key, type_cfg in val.items():
+            if type_key not in VALID_TYPES:
+                raise HTTPException(status_code=400, detail=f"Invalid task type: {type_key}")
+            if not isinstance(type_cfg, dict):
+                raise HTTPException(status_code=400, detail=f"Config for {type_key} must be a dict")
+            if "enabled" in type_cfg and not isinstance(type_cfg["enabled"], bool):
+                raise HTTPException(status_code=400, detail=f"enabled for {type_key} must be a boolean")
+            if "interval_hours" in type_cfg:
+                try:
+                    ih = int(type_cfg["interval_hours"])
+                except (ValueError, TypeError):
+                    raise HTTPException(status_code=400, detail=f"interval_hours for {type_key} must be a number")
+                if not (1 <= ih <= 8760):
+                    raise HTTPException(status_code=400, detail=f"interval_hours for {type_key} must be between 1 and 8760")
+        # Merge into existing config (don't replace keys not in the payload)
+        existing = _runtime_config.get("autonomous_periodic_tasks", {})
+        for type_key, type_cfg in val.items():
+            existing.setdefault(type_key, {}).update(type_cfg)
+        _runtime_config["autonomous_periodic_tasks"] = existing
+    if "autonomous_direction_cooldown_hours" in payload:
+        try:
+            val = int(payload["autonomous_direction_cooldown_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
+        if not (1 <= val <= 8760):
+            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be between 1 and 8760")
+        _runtime_config["autonomous_direction_cooldown_hours"] = val
+    if "autonomous_research_wave_size" in payload:
+        try:
+            val = int(payload["autonomous_research_wave_size"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be a number")
+        if not (1 <= val <= 100):
+            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 100")
+        _runtime_config["autonomous_research_wave_size"] = val
 
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
@@ -1213,6 +1264,7 @@ async def list_github_branches(
 class DirectionPayload(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
+    paths: Optional[List[str]] = None
 
 
 @router.get("/projects/{project_id}/directions")
@@ -1242,6 +1294,7 @@ async def add_direction(
         "id": f"d-{uuid.uuid4().hex[:8]}",
         "text": payload.text,
         "priority": payload.priority,
+        "paths": payload.paths or [],
         "added_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
     }
@@ -1303,10 +1356,24 @@ async def remove_direction(
     if len(directions) == len(project.directions or []):
         raise HTTPException(status_code=404, detail="Direction not found")
 
+    # Cancel QUEUED tasks spawned for this direction
+    cancelled_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.QUEUED,
+            Task.context["direction_id"].as_string() == direction_id
+        )
+    )
+    cancelled_tasks = cancelled_result.scalars().all()
+    for t in cancelled_tasks:
+        t.status = TaskStatus.CANCELLED
+        t.latest_status_message = f"Cancelled: direction {direction_id} was removed"
+        session.add(t)
+
     project.directions = directions
     session.add(project)
     await session.commit()
-    return {"message": "Direction removed"}
+    return {"message": "Direction removed", "cancelled_tasks": len(cancelled_tasks)}
 
 
 @router.patch("/projects/{project_id}/directions/reorder")
@@ -1359,6 +1426,9 @@ async def update_direction(
     if "text" in payload:
         if not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1:
             raise HTTPException(status_code=400, detail="text must be 1-500 characters")
+    if "paths" in payload:
+        if not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"]):
+            raise HTTPException(status_code=400, detail="paths must be a list of strings")
 
     directions = list(project.directions or [])
     updated = False
@@ -1370,6 +1440,8 @@ async def update_direction(
                 d["status"] = payload["status"]
             if "text" in payload:
                 d["text"] = payload["text"]
+            if "paths" in payload:
+                d["paths"] = payload["paths"]
             updated = True
             break
 
