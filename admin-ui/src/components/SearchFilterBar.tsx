@@ -1,5 +1,6 @@
 import { Search, ChevronDown, Check } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
+import type { RefObject } from 'react';
 import { STATUS_OPTIONS } from '../constants';
 
 interface SearchFilterBarProps {
@@ -11,6 +12,7 @@ interface SearchFilterBarProps {
   onStatusFilterChange: (status: string[]) => void;
   filteredCount: number;
   totalCount: number;
+  inputRef?: RefObject<HTMLInputElement | null>;
 }
 
 const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix'] as const;
@@ -102,8 +104,20 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
   );
 }
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount, inputRef }: SearchFilterBarProps) {
+  const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onSearchChange(inputValue);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [inputValue, onSearchChange]);
+
+  useEffect(() => {
+    setInputValue(searchQuery);
+  }, [searchQuery]);
 
   const activeFilterCount = [
     searchQuery !== '',
@@ -124,9 +138,10 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500" />
         <input
+          ref={inputRef}
           type="text"
-          value={searchQuery}
-          onChange={e => onSearchChange(e.target.value)}
+          value={inputValue}
+          onChange={e => setInputValue(e.target.value)}
           placeholder="Search tasks..."
           className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 w-64 outline-none"
         />

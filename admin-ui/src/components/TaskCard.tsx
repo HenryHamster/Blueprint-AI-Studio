@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, memo } from 'react';
 import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package } from 'lucide-react';
 
 export interface ResearchFinding {
@@ -232,7 +232,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
+export const TaskCard = memo(function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -351,9 +351,9 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequest
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
           >
             <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${statusExpanded ? 'rotate-90' : ''}`} />
-            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Status:</span>
+            <span className="font-semibold text-neutral-500 font-sans text-[11px]">Agent Status:</span>
             {!statusExpanded && (
-              <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 120)}</span>
+              <span className="truncate ml-1">&gt; {task.latest_status_message.split('\n')[0].slice(0, 80)}</span>
             )}
           </button>
           {statusExpanded && (
@@ -578,4 +578,4 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequest
       ) : null}
     </div>
   );
-}
+});

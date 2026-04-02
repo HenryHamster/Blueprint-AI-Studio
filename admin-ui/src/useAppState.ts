@@ -112,6 +112,7 @@ export function useAppState() {
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
   const usingMaxPlanRef = useRef(usingMaxPlan);
   useEffect(() => { usingMaxPlanRef.current = usingMaxPlan; }, [usingMaxPlan]);
 
@@ -217,19 +218,26 @@ export function useAppState() {
     }
   }, []);
 
+  // Immediate fetch when filters, page, or project selection change
   useEffect(() => {
     if (!user) return;
     fetchTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, limit, user, statusFilter, selectedProjectId]);
+
+  // Polling interval — only restarts when refreshInterval or user changes
+  useEffect(() => {
+    if (!user) return;
     fetchSettings();
     fetchProjects();
     const projectInterval = setInterval(fetchProjects, 60000);
     if (refreshInterval === 0) {
       return () => { clearInterval(projectInterval); };
     }
-    const interval = setInterval(fetchTasks, refreshInterval);
+    const interval = setInterval(() => fetchTasksRef.current(), refreshInterval);
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, limit, user, statusFilter, refreshInterval]);
+  }, [refreshInterval, user]);
 
   // Clear wsDisconnected banner when task reaches a terminal state
   useEffect(() => {
@@ -429,6 +437,7 @@ export function useAppState() {
       setLoading(false);
     }
   };
+  fetchTasksRef.current = fetchTasks;
 
   const fetchProjects = async () => {
     try {
@@ -456,6 +465,8 @@ export function useAppState() {
   };
 
   const handleApprove = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'approve' }));
     try {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -467,6 +478,7 @@ export function useAppState() {
       addToast('Task approved', 'success');
     } catch (error) {
       console.error('Failed to approve task:', error);
+      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
       addToast('Failed to approve task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
@@ -496,6 +508,8 @@ export function useAppState() {
   };
 
   const handleCancel = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'CANCELLED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
     try {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -507,6 +521,7 @@ export function useAppState() {
       addToast('Task cancelled', 'success');
     } catch (error) {
       console.error('Failed to cancel task:', error);
+      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
       addToast('Failed to cancel task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
@@ -514,6 +529,8 @@ export function useAppState() {
   };
 
   const handleRetry = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'QUEUED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'retry' }));
     try {
       await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -526,6 +543,7 @@ export function useAppState() {
       addToast('Task queued for retry', 'success');
     } catch (error) {
       console.error('Failed to retry task:', error);
+      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
       addToast('Failed to retry task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
@@ -1076,7 +1094,7 @@ export function useAppState() {
             }
             if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
               if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
-              fetchTasksDebounceRef.current = setTimeout(() => { fetchTasks(); }, 500);
+              fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
             }
           } catch {
             // ignore parse errors
@@ -1102,7 +1120,6 @@ export function useAppState() {
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
       }
     })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const closeLogViewer = () => {

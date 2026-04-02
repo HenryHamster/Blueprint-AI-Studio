@@ -142,6 +142,9 @@ export function SettingsDropdown({
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [refreshInputVal, setRefreshInputVal] = useState('');
   const [pageSizeInputVal, setPageSizeInputVal] = useState('');
+  const [vmInputVal, setVmInputVal] = useState(String(maxConcurrentVMs));
+  const [retriesInputVal, setRetriesInputVal] = useState(String(maxRetries));
+  const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
 
   // Global model/effort defaults
   const [defaultModel, setDefaultModel] = useState<string>(
@@ -170,6 +173,9 @@ export function SettingsDropdown({
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
+  useEffect(() => { setVmInputVal(String(maxConcurrentVMs)); }, [maxConcurrentVMs]);
+  useEffect(() => { setRetriesInputVal(String(maxRetries)); }, [maxRetries]);
+  useEffect(() => { setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); }, [maxAutonomousTasksPerHour]);
 
   return (
     <div className="relative" ref={settingsRef}>
@@ -303,8 +309,10 @@ export function SettingsDropdown({
               type="number"
               min={1}
               max={30}
-              value={maxConcurrentVMs}
-              onChange={e => onUpdateMaxVMs(parseInt(e.target.value) || 1)}
+              value={vmInputVal}
+              onChange={e => setVmInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(vmInputVal); if (n >= 1 && n <= 30) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 1 && n <= 30) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -314,8 +322,10 @@ export function SettingsDropdown({
               type="number"
               min={0}
               max={10}
-              value={maxRetries}
-              onChange={e => onUpdateMaxRetries(parseInt(e.target.value) || 0)}
+              value={retriesInputVal}
+              onChange={e => setRetriesInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(retriesInputVal); if (!isNaN(n) && n >= 0 && n <= 10) onUpdateMaxRetries(n); else setRetriesInputVal(String(maxRetries)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(retriesInputVal); if (!isNaN(n) && n >= 0 && n <= 10) onUpdateMaxRetries(n); else setRetriesInputVal(String(maxRetries)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -325,8 +335,10 @@ export function SettingsDropdown({
               type="number"
               min={1}
               max={50}
-              value={maxAutonomousTasksPerHour}
-              onChange={e => onUpdateMaxAutonomousRate(parseInt(e.target.value) || 1)}
+              value={autonomousRateInputVal}
+              onChange={e => setAutonomousRateInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(autonomousRateInputVal); if (n >= 1 && n <= 50) onUpdateMaxAutonomousRate(n); else setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(autonomousRateInputVal); if (n >= 1 && n <= 50) onUpdateMaxAutonomousRate(n); else setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
@@ -680,6 +692,7 @@ export function SettingsDropdown({
               {[
                 ['1', 'Kanban view'],
                 ['2', 'Pipeline view'],
+                ['/', 'Focus search'],
                 ['N', 'New task'],
                 ['R', 'Refresh'],
                 ['D', 'Directions panel'],

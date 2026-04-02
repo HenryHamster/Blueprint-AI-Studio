@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { Archive } from 'lucide-react';
 import { TaskCard } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
@@ -31,10 +32,18 @@ interface KanbanBoardProps {
 }
 
 export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, selectionMode, selectedTaskIds, onToggleTaskSelection, onArchiveColumn, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
+  const tasksByColumn = useMemo(() => {
+    const map: Record<string, Task[]> = {};
+    for (const col of columns) {
+      map[col.id] = tasks.filter(t => col.includes.includes(t.status));
+    }
+    return map;
+  }, [tasks, columns]);
+
   return (
     <main className="flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
       {columns.map(col => {
-        const columnTasks = tasks.filter(t => col.includes.includes(t.status));
+        const columnTasks = tasksByColumn[col.id] ?? [];
         const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
         return (
           <div key={col.id} className="flex-1 min-w-[300px] max-w-[400px] flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 p-3">

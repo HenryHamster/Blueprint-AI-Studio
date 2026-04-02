@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useRef, useEffect } from 'react';
 import { Activity, AlertCircle, Archive, CheckSquare } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
@@ -32,6 +32,20 @@ const COLUMNS: KanbanColumn[] = [
 
 export default function App() {
   const s = useAppState();
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    function handleSearchShortcut(e: KeyboardEvent) {
+      if (e.key !== '/') return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings) return;
+      e.preventDefault();
+      searchInputRef.current?.focus();
+    }
+    document.addEventListener('keydown', handleSearchShortcut);
+    return () => document.removeEventListener('keydown', handleSearchShortcut);
+  }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
   const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
@@ -235,6 +249,7 @@ export default function App() {
               onStatusFilterChange={s.setStatusFilter}
               filteredCount={filteredTasks.length}
               totalCount={s.tasks.length}
+              inputRef={searchInputRef}
             />
           </div>
 
