@@ -330,7 +330,7 @@ export function SettingsDropdown({
             <input
               type="number"
               min={1}
-              max={30}
+              max={100}
               value={vmInputVal}
               onChange={e => setVmInputVal(e.target.value)}
               onBlur={() => { const n = parseInt(vmInputVal); if (n >= 1 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}

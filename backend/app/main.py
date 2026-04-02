@@ -1124,15 +1124,26 @@ async def orchestrator_worker():
                 if in_progress_files:
                     non_conflicting = []
                     for eid in eligible_ids:
-                        # Find the candidate task
                         candidate = next((t for t in candidate_tasks if t.id == eid), None)
                         if candidate is None:
                             non_conflicting.append(eid)
                             continue
                         candidate_files = set((candidate.context or {}).get("related_files", []))
+                        if not candidate_files:
+                            non_conflicting.append(eid)
+                            continue
                         overlap = candidate_files & in_progress_files
-                        if overlap:
-                            print(f"[DISPATCH] Deferring task {eid} — file conflict with in-progress tasks: {', '.join(sorted(overlap))}")
+                        if not overlap:
+                            non_conflicting.append(eid)
+                            continue
+                        # Large scope tasks (refactors, etc.) defer on any overlap
+                        scope = (candidate.context or {}).get("scope", "small")
+                        task_type = ((candidate.payloads or [{}])[0]).get("type", "")
+                        is_large = scope == "large" or task_type in ("refactor", "plan")
+                        # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
+                        should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
+                        if should_defer:
+                            print(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {', '.join(sorted(overlap))}")
                         else:
                             non_conflicting.append(eid)
                     eligible_ids = non_conflicting
