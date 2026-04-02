@@ -84,13 +84,6 @@ const ALL_PAGE_SIZE = 10000;
 
 const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix'] as const;
 type TaskType = typeof TASK_TYPES[number];
-const TASK_TYPE_MODEL_DEFAULTS: Record<TaskType, string> = {
-  plan: 'claude-opus-4-5',
-  research: 'claude-opus-4-5',
-  create: 'claude-sonnet-4-5',
-  fix: 'claude-sonnet-4-5',
-  review: 'claude-sonnet-4-5',
-};
 
 export function SettingsDropdown({
   showSettings,
@@ -237,9 +230,9 @@ export function SettingsDropdown({
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
               <option value="">Orchestrator default</option>
-              <option value="claude-opus-4-5">claude-opus-4-5</option>
-              <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
-              <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+              <option value="claude-opus-4-6">claude-opus-4-6</option>
+              <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+              <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
             </select>
           </div>
           <div className="mb-4">
@@ -256,6 +249,7 @@ export function SettingsDropdown({
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high">high</option>
+              <option value="max">max</option>
             </select>
           </div>
 
@@ -264,36 +258,43 @@ export function SettingsDropdown({
             <div className="space-y-2">
               {TASK_TYPES.map(type => (
                 <div key={type} className="bg-neutral-950 border border-neutral-800 rounded px-2 py-2">
-                  <div className="text-[11px] font-medium text-neutral-300 capitalize mb-1.5">{type}</div>
-                  <div className="flex gap-2">
-                    <select
-                      value={taskTypeModels[type]}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setTaskTypeModels(prev => ({ ...prev, [type]: val }));
-                        localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
-                      }}
-                      className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                    >
-                      <option value="">{TASK_TYPE_MODEL_DEFAULTS[type]} (default)</option>
-                      <option value="claude-opus-4-5">claude-opus-4-5</option>
-                      <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
-                      <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-                    </select>
-                    <select
-                      value={taskTypeEfforts[type]}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
-                        localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
-                      }}
-                      className="w-24 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                    >
-                      <option value="">effort</option>
-                      <option value="low">low</option>
-                      <option value="medium">medium</option>
-                      <option value="high">high</option>
-                    </select>
+                  <div className="text-[11px] font-medium text-neutral-300 capitalize mb-2">{type}</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="text-[10px] text-neutral-500 mb-1">Model</div>
+                      <select
+                        value={taskTypeModels[type]}
+                        onChange={e => {
+                          const val = e.target.value;
+                          setTaskTypeModels(prev => ({ ...prev, [type]: val }));
+                          localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
+                        }}
+                        className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      >
+                        <option value="">default</option>
+                        <option value="claude-opus-4-6">claude-opus-4-6</option>
+                        <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+                        <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
+                      <select
+                        value={taskTypeEfforts[type]}
+                        onChange={e => {
+                          const val = e.target.value;
+                          setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
+                          localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
+                        }}
+                        className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      >
+                        <option value="">default</option>
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                        <option value="max">max</option>
+                      </select>
+                    </div>
                   </div>
                 </div>
               ))}
