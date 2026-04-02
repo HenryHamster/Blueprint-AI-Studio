@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect, useRef } from 'react';
-import { Square, CheckCircle, AlertCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive } from 'lucide-react';
+import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive } from 'lucide-react';
 
 export interface ResearchFinding {
   type?: string;
@@ -70,6 +70,7 @@ interface TaskCardProps {
   maxRetries?: number;
   actionLoading?: string;
   onApprove: (id: string) => void;
+  onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
@@ -193,7 +194,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
+export function TaskCard({ task, maxRetries, actionLoading, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: TaskCardProps) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -201,6 +202,8 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [confirmAction, setConfirmAction] = useState<'cancel' | 'dismiss' | 'archive' | null>(null);
   const [confirmCountdown, setConfirmCountdown] = useState(3);
+  const [showChangesForm, setShowChangesForm] = useState(false);
+  const [changesFeedback, setChangesFeedback] = useState('');
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -425,13 +428,49 @@ export function TaskCard({ task, maxRetries, actionLoading, onApprove, onCancel,
       </div>
 
       {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') ? (
-        <div className="mt-3 flex gap-2">
-          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`flex-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'approve' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />} Approve
+        <div className="mt-4 flex flex-col gap-2">
+          <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 py-2.5 rounded-md text-sm font-semibold transition-colors flex items-center justify-center gap-2 ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+            {actionLoading === 'approve' ? <Activity className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Approve & Merge
           </button>
-          <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-red-500/10 hover:bg-red-500/20 text-red-500 border-red-500/20'} ${actionLoading && actionLoading !== 'cancel' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-            {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <AlertCircle className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to reject (${confirmCountdown}s)` : 'Reject'}
-          </button>
+          {!showChangesForm ? (
+            <div className="flex gap-2">
+              <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-2 rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
+                <RotateCcw className="w-3.5 h-3.5" /> Request Changes
+              </button>
+              <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
+                {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject'}
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 bg-neutral-800/50 rounded-md p-2 border border-neutral-700">
+              <textarea
+                value={changesFeedback}
+                onChange={e => setChangesFeedback(e.target.value)}
+                placeholder="Describe what needs to change..."
+                className="w-full bg-neutral-900 border border-neutral-700 rounded text-xs text-neutral-200 p-2 resize-none focus:outline-none focus:border-neutral-500 placeholder-neutral-600"
+                rows={3}
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
+                  disabled={!changesFeedback.trim() || !!actionLoading}
+                  className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                >
+                  {actionLoading === 'request-changes' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Send Fix
+                </button>
+                <button
+                  onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
+                  disabled={!!actionLoading}
+                  className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Search className="w-3 h-3" /> Re-review
+                </button>
+                <button onClick={() => { setShowChangesForm(false); setChangesFeedback(''); }} className="px-2 py-1.5 text-neutral-500 hover:text-neutral-300 text-xs">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       ) : null}
 

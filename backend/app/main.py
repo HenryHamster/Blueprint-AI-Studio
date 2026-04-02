@@ -3196,8 +3196,10 @@ async def update_agent_status(
                         if ci_status and ci_status["conclusion"] == "success":
                             print(f"[CI] PR #{pr_number} CI passed")
 
-                        # Critical files gate: block merge if security-critical files were touched
-                        if original_task_id:
+                        # Critical files gate: block merge into main if security-critical files were touched
+                        # Intermediate branches (research/, plan/) don't need human approval
+                        is_main_target = base_branch == "main"
+                        if original_task_id and is_main_target:
                             try:
                                 orig_task = await session.get(Task, uuid.UUID(original_task_id))
                                 critical_touched = (orig_task.context or {}).get("touched_critical", []) if orig_task else []

@@ -297,6 +297,7 @@ export default function App() {
                 });
               }}
               onApprove={s.handleApprove}
+              onRequestChanges={s.handleRequestChanges}
               onCancel={s.handleCancel}
               onRetry={s.handleRetry}
               onEditPrompt={s.handleEditPrompt}
@@ -380,6 +381,7 @@ export default function App() {
           actionLoading={s.actionLoadingMap[s.logTask.id]}
           onClose={s.closeLogViewer}
           onApprove={s.handleApprove}
+          onRequestChanges={s.handleRequestChanges}
           onCancel={s.handleCancel}
           onRetry={s.handleRetry}
           onEditPrompt={s.handleEditPrompt}

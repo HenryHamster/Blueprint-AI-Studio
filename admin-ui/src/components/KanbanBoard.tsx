@@ -21,6 +21,7 @@ interface KanbanBoardProps {
   onToggleTaskSelection: (id: string) => void;
   onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
   onApprove: (id: string) => void;
+  onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
@@ -29,7 +30,7 @@ interface KanbanBoardProps {
   onViewLogs: (task: Task) => void;
 }
 
-export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, selectionMode, selectedTaskIds, onToggleTaskSelection, onArchiveColumn, onApprove, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
+export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoadingMap, selectionMode, selectedTaskIds, onToggleTaskSelection, onArchiveColumn, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }: KanbanBoardProps) {
   return (
     <main className="flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
       {columns.map(col => {
@@ -74,6 +75,7 @@ export function KanbanBoard({ tasks, columns, loading, maxRetries, actionLoading
                       maxRetries={maxRetries}
                       actionLoading={actionLoadingMap[task.id]}
                       onApprove={onApprove}
+                      onRequestChanges={onRequestChanges}
                       onCancel={onCancel}
                       onRetry={onRetry}
                       onEditPrompt={onEditPrompt}

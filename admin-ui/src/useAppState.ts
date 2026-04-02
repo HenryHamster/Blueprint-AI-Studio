@@ -464,6 +464,28 @@ export function useAppState() {
     }
   };
 
+  const handleRequestChanges = async (taskId: string, feedback: string, action: 'fix' | 'review' = 'fix') => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'request-changes' }));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/request-changes`, {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({ feedback, action }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail || 'Failed to request changes', 'error');
+        return;
+      }
+      fetchTasks();
+      addToast(action === 'fix' ? 'Fix task spawned' : 'Re-review spawned', 'success');
+    } catch {
+      addToast('Failed to request changes', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
   const handleCancel = async (taskId: string) => {
     setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
     try {
@@ -1179,7 +1201,7 @@ export function useAppState() {
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
-    fetchTasks, handleApprove, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
+    fetchTasks, handleApprove, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
     selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection,
     confirmDialog, setConfirmDialog,

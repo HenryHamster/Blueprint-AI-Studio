@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
-import { Terminal, X, Copy, Check, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
+import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime } from './TaskCard';
 import type { Task } from './TaskCard';
 
@@ -11,6 +11,7 @@ interface TaskDetailDrawerProps {
   actionLoading?: string;
   onClose: () => void;
   onApprove: (id: string) => void;
+  onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
   onEditPrompt: (id: string, newPrompt: string) => void;
@@ -479,6 +480,7 @@ export function TaskDetailDrawer({
   actionLoading,
   onClose,
   onApprove,
+  onRequestChanges,
   onCancel,
   onRetry,
   onEditPrompt,
@@ -565,6 +567,8 @@ export function TaskDetailDrawer({
   const showApproval = task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING');
   const showCancel = isActive && !task.requires_approval;
   const showFailedActions = task.status === 'FAILED';
+  const [showChangesForm, setShowChangesForm] = useState(false);
+  const [changesFeedback, setChangesFeedback] = useState('');
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -696,22 +700,57 @@ export function TaskDetailDrawer({
         {(showApproval || showCancel || showFailedActions) && (
           <div className="border-t border-neutral-800 p-4 shrink-0 flex items-center gap-2">
             {showApproval && (
-              <>
-                <button
-                  onClick={() => onApprove(task.id)}
-                  disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {actionLoading === 'approve' && <Loader2 className="w-3 h-3 animate-spin" />}Approve
-                </button>
-                <button
-                  onClick={() => onCancel(task.id)}
-                  disabled={!!actionLoading}
-                  className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Reject
-                </button>
-              </>
+              <div className="flex flex-col gap-2 w-full">
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onApprove(task.id)}
+                    disabled={!!actionLoading}
+                    className="flex-1 px-6 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {actionLoading === 'approve' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Approve & Merge
+                  </button>
+                  <button
+                    onClick={() => setShowChangesForm(!showChangesForm)}
+                    className="px-4 py-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors border border-neutral-700 flex items-center justify-center gap-1.5"
+                  >
+                    Request Changes
+                  </button>
+                  <button
+                    onClick={() => onCancel(task.id)}
+                    disabled={!!actionLoading}
+                    className="px-3 py-3 rounded-lg bg-neutral-800 hover:bg-red-900/50 text-neutral-500 hover:text-red-400 text-sm transition-colors disabled:opacity-50 border border-neutral-700"
+                  >
+                    Reject
+                  </button>
+                </div>
+                {showChangesForm && (
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      value={changesFeedback}
+                      onChange={e => setChangesFeedback(e.target.value)}
+                      placeholder="Describe what needs to change..."
+                      className="w-full bg-neutral-900 border border-neutral-700 rounded-lg text-sm text-neutral-200 p-3 resize-none focus:outline-none focus:border-neutral-500 placeholder-neutral-600"
+                      rows={3}
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
+                        disabled={!changesFeedback.trim() || !!actionLoading}
+                        className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                      >
+                        {actionLoading === 'request-changes' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null} Send Fix
+                      </button>
+                      <button
+                        onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
+                        disabled={!!actionLoading}
+                        className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-2 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-1.5"
+                      >
+                        Re-review
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
 
             {showCancel && !confirmCancel && (

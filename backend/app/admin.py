@@ -454,6 +454,60 @@ async def create_task_manually(
         "vm_instance_id": new_task.vm_instance_id,
     }
 
+class RequestChangesPayload(BaseModel):
+    feedback: str = Field(..., min_length=1, max_length=5000)
+    action: str = Field(default="fix", pattern=r"^(fix|review)$")
+
+@router.post("/tasks/{task_id}/request-changes")
+async def request_changes(
+    task_id: uuid.UUID,
+    payload: RequestChangesPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Request changes on a task awaiting approval. Spawns a fix or re-review task."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.requires_approval:
+        raise HTTPException(status_code=400, detail="Task is not awaiting approval")
+
+    # Find the PR
+    artifact = (await session.execute(
+        select(Artifact).where(Artifact.task_id == task_id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+    )).scalars().first()
+    if not artifact or not artifact.pr_url:
+        raise HTTPException(status_code=400, detail="No PR found for this task")
+
+    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+    branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
+    task_payload = (task.payloads or [{}])[0]
+    base_branch = task_payload.get("base_branch", "main")
+
+    from app.main import _spawn_pipeline_task
+    if payload.action == "fix":
+        spawned = await _spawn_pipeline_task(
+            task, "fix", session, pr_number, branch, base_branch,
+            fix_prompt=f"Human reviewer requested changes:\n\n{payload.feedback}",
+            original_task_id=str(task.id)
+        )
+    else:
+        spawned = await _spawn_pipeline_task(
+            task, "review", session, pr_number, branch, base_branch,
+            original_prompt=task_payload.get("prompt", task.description or ""),
+            original_task_id=str(task.id)
+        )
+
+    if spawned:
+        task.requires_approval = False
+        task.latest_status_message = f"Changes requested — spawned {payload.action} task"
+        session.add(task)
+        await session.commit()
+        return {"spawned_task_id": str(spawned.id), "action": payload.action}
+
+    raise HTTPException(status_code=500, detail="Failed to spawn task (iteration cap?)")
+
+
 @router.post("/tasks/{task_id}/archive")
 async def archive_task(
     task_id: uuid.UUID,
