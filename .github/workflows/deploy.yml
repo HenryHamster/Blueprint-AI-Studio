@@ -118,8 +118,9 @@ jobs:
     name: Migrations
     runs-on: ubuntu-latest
     needs: detect
-    # Run migrations BEFORE backend deploy so DB schema matches new code
-    if: needs.detect.outputs.migrations == 'true'
+    # Always run migrations on backend deploys — alembic upgrade head is idempotent
+    # (skips already-applied migrations), so this is safe and prevents schema drift
+    if: needs.detect.outputs.backend == 'true' || needs.detect.outputs.migrations == 'true'
     permissions:
       contents: read
       id-token: write
