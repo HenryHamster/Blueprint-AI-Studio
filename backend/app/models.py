@@ -28,6 +28,7 @@ class ArtifactType(str, Enum):
     SCREENSHOT = "SCREENSHOT"
     ERROR_LOG = "ERROR_LOG"
     RESEARCH_FINDINGS = "RESEARCH_FINDINGS"
+    SECURITY_REPORT = "SECURITY_REPORT"
 
 # --- Models ---
 

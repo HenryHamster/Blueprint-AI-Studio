@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useEffect, useRef } from 'react';
-import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive } from 'lucide-react';
+import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package } from 'lucide-react';
 
 export interface ResearchFinding {
   type?: string;
@@ -24,7 +24,7 @@ export function isSafeUrl(url: string): boolean {
 }
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix';
+export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'docs' | 'security_audit' | 'qa' | 'deps';
 
 export interface Task {
   id: string;
@@ -63,6 +63,10 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-400', icon: Microscope, label: 'Research' },
   review: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Search, label: 'Review' },
   fix: { bg: 'bg-orange-500/10 border-orange-500/20', text: 'text-orange-400', icon: RotateCcw, label: 'Fix' },
+  docs: { bg: 'bg-indigo-500/10 border-indigo-500/20', text: 'text-indigo-400', icon: BookOpen, label: 'Docs' },
+  security_audit: { bg: 'bg-red-500/10 border-red-500/20', text: 'text-red-400', icon: ShieldAlert, label: 'Security Audit' },
+  qa: { bg: 'bg-green-500/10 border-green-500/20', text: 'text-green-400', icon: TestTube, label: 'QA' },
+  deps: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Package, label: 'Deps' },
 };
 
 interface TaskCardProps {

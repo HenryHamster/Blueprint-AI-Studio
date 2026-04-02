@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
@@ -2334,6 +2335,99 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     print(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
 
 
+async def _handle_security_audit_completion(task: Task, logs: str, session: AsyncSession):
+    """Parse security audit findings and spawn create tasks for critical/high severity issues."""
+    # Parse the JSON findings array from logs
+    findings = None
+    try:
+        json_match = re.search(r'\[\s*\{[\s\S]*"severity"[\s\S]*\]', logs, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, list):
+                findings = parsed
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    if not findings:
+        task.latest_status_message = "Security audit completed with no parseable findings"
+        task.plan_output = []
+        session.add(task)
+        await session.commit()
+        return
+
+    # Store all findings for display
+    task.plan_output = findings
+    session.add(task)
+    await session.commit()
+
+    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+
+    # Spawn create tasks for critical and high severity findings
+    actionable = [f for f in findings if f.get("severity") in ("critical", "high")]
+    if len(actionable) > 10:
+        actionable = actionable[:10]
+    if not actionable:
+        task.latest_status_message = f"Security audit found {len(findings)} finding(s), none critical/high — no tasks spawned"
+        session.add(task)
+        await session.commit()
+        return
+
+    child_tasks = []
+    for i, finding in enumerate(actionable):
+        fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
+        if not fix_prompt:
+            continue
+        title = finding.get("title", f"Security fix #{i+1}")
+        severity = finding.get("severity", "high")
+
+        new_task = Task(
+            project_id=task.project_id,
+            title=f"[{severity.upper()}] {title}",
+            description=finding.get("description", fix_prompt[:200]),
+            parent_task_id=task.id,
+            payloads=[{
+                "type": "create",
+                "prompt": fix_prompt,
+                "base_branch": base_branch,
+            }],
+            context={
+                "security_audit_task_id": str(task.id),
+                "finding_index": i,
+                "severity": severity,
+                "file_path": finding.get("file_path", ""),
+                "line_number": finding.get("line_number", 0),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            requires_approval=severity == "critical",
+            depends_on=[],
+        )
+        session.add(new_task)
+        child_tasks.append(new_task)
+
+    await session.commit()
+    for ct in child_tasks:
+        await session.refresh(ct)
+        history = TaskHistory(
+            task_id=ct.id, action="SPAWNED",
+            details={"spawned_by": "SECURITY_AUDIT", "parent_audit_id": str(task.id)}
+        )
+        session.add(history)
+        await broadcast_to_project(str(task.project_id), "task_updated",
+                                   {"task_id": str(ct.id), "status": TaskStatus.QUEUED})
+
+    await session.commit()
+    task.status = TaskStatus.EVALUATING
+    task.latest_status_message = f"Security audit found {len(findings)} finding(s), spawned {len(child_tasks)} fix task(s)"
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(str(task.project_id), "autonomous_activity",
+                               {"security_audit_task_id": str(task.id), "tasks_created": len(child_tasks)})
+    print(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Depth guard: prevent infinite research recursion
@@ -2389,10 +2483,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if not prompt:
             continue
 
-        # Determine task type: research findings can spawn sub-research
+        # Determine task type: research findings can spawn sub-research or specialized agents
         finding_type = finding.get("type", "improvement")
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
+        elif finding_type in ("security_audit", "qa", "deps", "docs"):
+            task_type = finding_type  # spawn specialized agent
         elif scope == "large":
             task_type = "plan"     # large scope needs decomposition
         else:
@@ -2935,9 +3031,10 @@ async def update_agent_status(
             review_loop = (task.context or {}).get("review_loop", {})
 
             # Create task completed with PR → route based on target branch
-            if task_type in ("create", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
+            if task_type in ("create", "docs", "qa", "deps", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
-                branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
+                short_id = str(task.id).replace('-', '')[:8]
+                branch = f"blueprint/docs-{short_id}" if task_type == "docs" else f"blueprint/deps-{short_id}" if task_type == "deps" else f"blueprint/task-{short_id}"
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
                 is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
@@ -3366,6 +3463,11 @@ async def update_agent_status(
             elif task_type == "research":
                 research_logs = payload.logs or task.latest_status_message or ""
                 await _handle_research_completion(task, research_logs, session)
+
+            # Security audit completed → spawn fix tasks for critical/high findings
+            elif task_type == "security_audit":
+                audit_logs = payload.logs or task.latest_status_message or ""
+                await _handle_security_audit_completion(task, audit_logs, session)
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:

@@ -364,7 +364,7 @@ class CreateTaskPayload(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1)
     base_branch: str = Field(default="main", pattern=r"^[a-zA-Z0-9_./-]+$")
-    task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix)$")
+    task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix|security_audit|qa|deps|docs)$")
     pr_number: Optional[int] = None
     branch: Optional[str] = None
 
