@@ -45,6 +45,11 @@ export default function App() {
     });
   }, [s.tasks]);
 
+  const visibleColumns = useMemo(() => {
+    if (s.statusFilter.length === 0) return COLUMNS;
+    return COLUMNS.filter(col => col.includes.some(status => s.statusFilter.includes(status)));
+  }, [s.statusFilter]);
+
   const filteredTasks = useMemo(() => s.tasks.filter(t => {
     const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
     const typeMatch = s.taskTypeFilter.length === 0 || s.taskTypeFilter.includes(taskType);
@@ -281,7 +286,7 @@ export default function App() {
           {s.viewMode === 'kanban' ? (
             <KanbanBoard
               tasks={filteredTasks}
-              columns={COLUMNS}
+              columns={visibleColumns}
               loading={s.loading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
