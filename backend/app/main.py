@@ -2590,6 +2590,23 @@ async def _spawn_pipeline_task(
     """Spawn a review or fix task as part of the automated review pipeline.
     Returns None if the review-fix cycle limit has been reached.
     Returns the existing active task if a review/fix is already active for this PR."""
+    # Guard: don't spawn if PR is already merged
+    orig_id = original_task_id or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "") or ((source_task.payloads or [{}])[0]).get("original_task_id", "")
+    if orig_id:
+        try:
+            orig_task = await session.get(Task, uuid.UUID(orig_id))
+            if orig_task and (orig_task.context or {}).get("pr_merged"):
+                print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {orig_id[:8]})")
+                source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
+                session.add(source_task)
+                return None
+        except Exception:
+            pass
+    # Also check the source task itself
+    if (source_task.context or {}).get("pr_merged"):
+        print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
+        return None
+
     # Guard: don't spawn if there's already an active review/fix for this PR
     active_pipeline = (await session.execute(
         select(Task).where(
@@ -2916,7 +2933,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             title=subtask_def.get("title", "Untitled subtask"),
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
-            requires_approval=child_risk == 'high',
+            requires_approval=False,  # review pipeline handles quality; only merge to main gates
             payloads=[{
                 "type": subtask_type,
                 "prompt": full_prompt,
@@ -3043,7 +3060,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
-            requires_approval=severity == "critical",
+            requires_approval=False,  # review pipeline handles quality; only merge to main gates
             depends_on=[],
         )
         session.add(new_task)
@@ -3356,9 +3373,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 task_type = "plan"     # large scope needs decomposition
             else:
                 task_type = "create"   # small/medium scope is single-PR work
-            # Read-only task types (research, audits, QA) don't need approval — they don't modify code
-            READ_ONLY_TYPES = {"research", "security_audit", "qa", "perf"}
-            needs_approval = risk == "high" and task_type not in READ_ONLY_TYPES
+            # Pre-spawn approval removed: the review pipeline handles quality gates.
+            # Only final merge to main requires human approval (critical files gate).
+            needs_approval = False
 
             direction_id = finding.get("direction_id")
             finding_model = finding.get('model')
@@ -4270,6 +4287,21 @@ async def update_agent_status(
                     await session.commit()
                     return {"status": "accepted"}
 
+                # Early exit: skip review pipeline if PR is already merged or closed
+                try:
+                    gh_token_check, owner_check, repo_check = await get_github_token_for_task(task.id, session)
+                    pr_data_check = await get_pull_request(gh_token_check, owner_check, repo_check, pr_number)
+                    pr_state = pr_data_check.get("state", "open")
+                    if pr_state == "closed" or pr_data_check.get("merged"):
+                        merged_label = "merged" if pr_data_check.get("merged") else "closed"
+                        print(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}")
+                        task.latest_status_message = f"PR #{pr_number} already {merged_label} — review skipped"
+                        session.add(task)
+                        await session.commit()
+                        return {"status": "accepted"}
+                except Exception as e:
+                    print(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review")
+
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
@@ -4564,6 +4596,20 @@ async def update_agent_status(
                     session.add(task)
                     await session.commit()
                     return {"status": "accepted"}
+
+                # Early exit: skip if PR is already merged or closed
+                try:
+                    gh_token_check, owner_check, repo_check = await get_github_token_for_task(task.id, session)
+                    pr_data_check = await get_pull_request(gh_token_check, owner_check, repo_check, pr_number)
+                    if pr_data_check.get("state") == "closed" or pr_data_check.get("merged"):
+                        merged_label = "merged" if pr_data_check.get("merged") else "closed"
+                        print(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}")
+                        task.latest_status_message = f"PR #{pr_number} already {merged_label} — re-review skipped"
+                        session.add(task)
+                        await session.commit()
+                        return {"status": "accepted"}
+                except Exception as e:
+                    print(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding")
 
                 # Security scan fix output before re-review
                 scan_blocked = False

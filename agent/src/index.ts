@@ -191,7 +191,14 @@ async function pushAndCreatePR(
   const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
   const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-  git(['push', 'origin', workBranch]);
+  try {
+    git(['push', 'origin', workBranch]);
+  } catch {
+    // Branch may exist from a previous attempt (requeue) — fetch and force-push
+    sendLog(ws, `Push rejected — remote branch exists, force-pushing (requeued task)\n`);
+    try { git(['fetch', 'origin', workBranch]); } catch { /* branch may not exist */ }
+    git(['push', '--force-with-lease', 'origin', workBranch]);
+  }
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
   statusRef.value = 'Creating pull request...';
@@ -1544,7 +1551,13 @@ IMPORTANT RULES:
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    git(['push', 'origin', workBranch]);
+    try {
+      git(['push', 'origin', workBranch]);
+    } catch {
+      sendLog(ws, `Push rejected — remote branch exists, force-pushing (requeued task)\n`);
+      try { git(['fetch', 'origin', workBranch]); } catch {}
+      git(['push', '--force-with-lease', 'origin', workBranch]);
+    }
     sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
     statusRef.value = 'Creating pull request...';
@@ -1751,7 +1764,13 @@ CRITICAL RULES:
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    git(['push', 'origin', workBranch]);
+    try {
+      git(['push', 'origin', workBranch]);
+    } catch {
+      sendLog(ws, `Push rejected — remote branch exists, force-pushing (requeued task)\n`);
+      try { git(['fetch', 'origin', workBranch]); } catch {}
+      git(['push', '--force-with-lease', 'origin', workBranch]);
+    }
     sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
     statusRef.value = 'Creating pull request...';
