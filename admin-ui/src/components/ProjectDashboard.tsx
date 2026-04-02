@@ -40,14 +40,21 @@ function getTaskCounts(tasks: Task[], projectId: string) {
 }
 
 export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject }: ProjectDashboardProps) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    const stored = localStorage.getItem('projectDashboardCollapsed');
+    return stored === null ? true : stored === 'true';
+  });
 
   if (projects.length === 0) return null;
 
   return (
     <div className="mb-4 shrink-0">
       <button
-        onClick={() => setCollapsed(c => !c)}
+        onClick={() => {
+          const next = !collapsed;
+          setCollapsed(next);
+          localStorage.setItem('projectDashboardCollapsed', String(next));
+        }}
         className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-300 transition-colors"
       >
         <FolderKanban className="w-3.5 h-3.5" />

@@ -53,6 +53,9 @@ export interface HeaderBarProps {
   onToggleMetrics: () => void;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
+  apiHealthy: boolean;
+  wsConnected: boolean;
+  lastFetchTime: number;
 }
 
 
@@ -103,6 +106,9 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleMetrics,
     refreshInterval,
     onUpdateRefreshInterval,
+    apiHealthy,
+    wsConnected,
+    lastFetchTime,
   } = props;
 
   return (
@@ -203,6 +209,9 @@ export function HeaderBar(props: HeaderBarProps) {
           onAddAccount={onAddAccount}
           refreshInterval={refreshInterval}
           onUpdateRefreshInterval={onUpdateRefreshInterval}
+          apiHealthy={apiHealthy}
+          wsConnected={wsConnected}
+          lastFetchTime={lastFetchTime}
         />
         <button
           onClick={onToggleArchive}

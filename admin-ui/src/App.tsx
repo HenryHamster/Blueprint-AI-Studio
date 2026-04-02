@@ -11,7 +11,6 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
-import { StatusBar } from './components/StatusBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
@@ -130,9 +129,6 @@ export default function App() {
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         refreshInterval={s.refreshInterval}
         onUpdateRefreshInterval={s.setRefreshInterval}
-      />
-
-      <StatusBar
         apiHealthy={s.apiHealthy}
         wsConnected={s.wsConnected}
         lastFetchTime={s.lastFetchTime}

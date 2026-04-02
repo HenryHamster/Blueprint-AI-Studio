@@ -1,4 +1,5 @@
-import { AlertTriangle, Activity, CheckCircle, Check } from 'lucide-react';
+import { useState } from 'react';
+import { AlertTriangle, Activity, CheckCircle, Check, ChevronDown, ChevronUp } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { isSafeUrl } from './TaskCard';
 
@@ -12,8 +13,30 @@ interface SummaryPanelsProps {
 }
 
 export function SummaryPanels({ actionRequiredTasks, runningTasks, completedRecently, queuedTasks, onSelectTask, onApproveTask }: SummaryPanelsProps) {
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('summaryPanelsCollapsed') === 'true');
+
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem('summaryPanelsCollapsed', String(next));
+  };
+
   return (
-    <div className="grid grid-cols-3 gap-4 mb-6 shrink-0">
+    <div className="mb-6 shrink-0">
+      <button
+        onClick={toggle}
+        className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-300 transition-colors"
+      >
+        {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+        Summary
+        {actionRequiredTasks.length > 0 && (
+          <span className="text-[10px] normal-case tracking-normal font-medium text-amber-400 ml-1">
+            {actionRequiredTasks.length} action required
+          </span>
+        )}
+      </button>
+      {!collapsed && (
+    <div className="grid grid-cols-3 gap-4">
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4 flex flex-col gap-3 min-h-[120px] max-h-[200px]">
         <div className="flex items-center justify-between">
           <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-2">
@@ -95,6 +118,8 @@ export function SummaryPanels({ actionRequiredTasks, runningTasks, completedRece
           {completedRecently.length === 0 && <div className="text-xs text-neutral-600 m-auto">No recent completions</div>}
         </div>
       </div>
+    </div>
+      )}
     </div>
   );
 }

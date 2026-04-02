@@ -1,4 +1,13 @@
+import { useEffect, useState } from 'react';
 import { Settings, GitBranch } from 'lucide-react';
+
+function relativeTime(ts: number): string {
+  if (!ts) return '—';
+  const sec = Math.floor((Date.now() - ts) / 1000);
+  if (sec < 10) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  return `${Math.floor(sec / 60)}m ago`;
+}
 
 export interface MaxPlanAccount {
   id: string;
@@ -38,6 +47,9 @@ interface SettingsDropdownProps {
   onAddAccount: () => void;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
+  apiHealthy: boolean;
+  wsConnected: boolean;
+  lastFetchTime: number;
 }
 
 export function SettingsDropdown({
@@ -66,7 +78,16 @@ export function SettingsDropdown({
   onAddAccount,
   refreshInterval,
   onUpdateRefreshInterval,
+  apiHealthy,
+  wsConnected,
+  lastFetchTime,
 }: SettingsDropdownProps) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   return (
     <div className="relative" ref={settingsRef}>
       <button
@@ -78,6 +99,24 @@ export function SettingsDropdown({
       </button>
       {showSettings && (
         <div className="absolute right-0 top-full mt-2 w-80 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
+          <div className={`flex items-center justify-between mb-4 px-2 py-1.5 rounded border ${apiHealthy ? 'bg-neutral-950 border-neutral-800' : 'bg-red-950/20 border-red-900/50'}`}>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
+                <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
+                <span className={`text-[11px] ${apiHealthy ? 'text-neutral-400' : 'text-red-400'}`}>
+                  API: {apiHealthy ? 'Connected' : 'Error'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
+                <span className={`text-[11px] ${wsConnected ? 'text-blue-400' : 'text-neutral-500'}`}>
+                  WS: {wsConnected ? 'Active' : 'Idle'}
+                </span>
+              </div>
+            </div>
+            <span className="text-[11px] text-neutral-500">Updated {relativeTime(lastFetchTime)}</span>
+          </div>
+
           <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-3">Defaults</h3>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default Task Type</label>
