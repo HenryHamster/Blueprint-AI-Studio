@@ -119,6 +119,22 @@ def release_max_plan_account(account_id: str):
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
             break
 
+def recheck_disabled_accounts():
+    """Re-enable accounts that were disabled by rate limiting after a cooldown.
+    Usage windows typically reset after some time — re-enable and let the next
+    task attempt determine if usage has actually recovered."""
+    now = datetime.utcnow()
+    COOLDOWN_MINUTES = 30
+
+    for acct in _max_plan_pool:
+        if acct.get("enabled", True):
+            continue
+        disabled_at = acct.get("disabled_at")
+        if disabled_at and (now - disabled_at).total_seconds() >= COOLDOWN_MINUTES * 60:
+            acct["enabled"] = True
+            acct["disabled_at"] = None
+            print(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
+
 
 # --- Deployment State Management ---
 
@@ -467,6 +483,9 @@ async def _check_external_health():
         ext["gcp"] = True
 
     ext["failed_deps"] = failed
+
+    # Re-enable rate-limited accounts after cooldown
+    recheck_disabled_accounts()
 
     if failed:
         print(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
@@ -3813,6 +3832,15 @@ async def update_agent_status(
         acct_id = (task.context or {}).get("max_plan_account_id")
         if acct_id:
             release_max_plan_account(acct_id)
+            # Auto-disable account on rate limit — usage exhausted, stop wasting VMs
+            # Re-enables automatically after 30min cooldown
+            if failure_class == "RATE_LIMIT":
+                for acct in _max_plan_pool:
+                    if acct["id"] == acct_id:
+                        acct["enabled"] = False
+                        acct["disabled_at"] = datetime.utcnow()
+                        print(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
+                        break
 
         if task.vm_instance_id:
             background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
