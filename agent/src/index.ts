@@ -17,16 +17,25 @@ const apiHeaders: Record<string, string> = {
 async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
-        method: 'POST', headers: apiHeaders, body: JSON.stringify(body),
+        method: 'POST', headers: apiHeaders, body: JSON.stringify(body), signal: controller.signal,
       });
+      clearTimeout(timeout);
       if (res.ok) return res.json();
-      if (res.status < 500 || attempt === retries - 1) {
-        const text = await res.text();
+      const text = await res.text();
+      // 4xx errors are not transient — fail immediately
+      if (res.status < 500) {
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
+      // 5xx: retry if we have attempts left
+      if (attempt === retries - 1) {
         throw new Error(`POST ${path} failed (${res.status}): ${text}`);
       }
     } catch (e) {
-      if (attempt === retries - 1) throw e;
+      // Re-throw 4xx errors and final-attempt errors immediately
+      if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
     await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
   }
@@ -36,14 +45,20 @@ async function apiPost(path: string, body: Record<string, unknown> = {}, retries
 async function apiGet(path: string, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders, signal: controller.signal });
+      clearTimeout(timeout);
       if (res.ok) return res.json();
-      if (res.status < 500 || attempt === retries - 1) {
-        const text = await res.text();
+      const text = await res.text();
+      if (res.status < 500) {
+        throw new Error(`GET ${path} failed (${res.status}): ${text}`);
+      }
+      if (attempt === retries - 1) {
         throw new Error(`GET ${path} failed (${res.status}): ${text}`);
       }
     } catch (e) {
-      if (attempt === retries - 1) throw e;
+      if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
     await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
   }
@@ -104,6 +119,14 @@ function sanitize(text: string): string {
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
     .replace(/sk-ant-[A-Za-z0-9_\-]+/g, 'sk-ant-***')
     .replace(/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, 'eyJ***');
+}
+
+function validateBranchName(branch: string, label: string): string {
+  if (!branch) throw new Error(`${label} is required`);
+  if (!/^[a-zA-Z0-9_./-]+$/.test(branch)) throw new Error(`Invalid ${label}: ${branch}`);
+  if (branch.includes('..')) throw new Error(`Invalid ${label} (contains ..): ${branch}`);
+  if (branch.startsWith('-')) throw new Error(`Invalid ${label} (starts with -): ${branch}`);
+  return branch;
 }
 
 function sendLog(ws: WebSocket | null, content: string) {
@@ -406,6 +429,15 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
     if (effort) args.push('--effort', effort);
     const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv });
 
+    // Kill Claude if it exceeds 30 minutes
+    const CLAUDE_TIMEOUT_MS = 30 * 60 * 1000;
+    const killTimer = setTimeout(() => {
+      log('Claude Code process timed out after 30 minutes — killing');
+      sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
+      claude.kill('SIGTERM');
+      setTimeout(() => { try { claude.kill('SIGKILL'); } catch {} }, 5000);
+    }, CLAUDE_TIMEOUT_MS);
+
     claude.stdout.on('data', (data: Buffer) => {
       const text = data.toString();
       allOutput += text;
@@ -436,8 +468,8 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
       sendLog(ws, `[stderr] ${text}`);
     });
 
-    claude.on('error', (err) => { sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
-    claude.on('close', (code) => { log(`Claude Code exited with code ${code}`); resolve(code ?? 1); });
+    claude.on('error', (err) => { clearTimeout(killTimer); sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
+    claude.on('close', (code) => { clearTimeout(killTimer); log(`Claude Code exited with code ${code}`); resolve(code ?? 1); });
   });
 
   sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
@@ -456,8 +488,7 @@ async function handleCreate(
   // Include title as context so the agent understands intent even if the prompt is terse
   const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
 
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!prompt) throw new Error('No prompt found in task payloads');
 
@@ -558,12 +589,11 @@ async function handleReview(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const prNumber = payload.pr_number as number;
-  const branch = String(payload.branch || '');
-  const baseBranch = String(payload.base_branch || 'main');
+  const prNumber = Number(payload.pr_number);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${payload.pr_number}`);
+  const branch = validateBranchName(String(payload.branch || ''), 'branch');
+  const baseBranch = validateBranchName(String(payload.base_branch || 'main'), 'base_branch');
   const originalPrompt = String(payload.original_prompt || '');
-
-  if (!branch || !prNumber) throw new Error('Review task missing branch or pr_number');
 
   // Read review iteration from task context
   const iteration = (task.context as any)?.review_loop?.iteration || 1;
@@ -685,12 +715,13 @@ async function handleFix(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const branch = String(payload.branch || '');
-  const baseBranch = String(payload.base_branch || 'main');
+  const branch = validateBranchName(String(payload.branch || ''), 'branch');
+  const baseBranch = validateBranchName(String(payload.base_branch || 'main'), 'base_branch');
   const prompt = String(payload.prompt || '');
-  const prNumber = payload.pr_number as number;
+  const prNumber = Number(payload.pr_number);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${payload.pr_number}`);
 
-  if (!branch || !prompt) throw new Error('Fix task missing branch or prompt');
+  if (!prompt) throw new Error('Fix task missing prompt');
 
   // Clone the existing PR branch (don't create a new one)
   statusRef.value = `Cloning ${owner}/${repo} (fixing PR #${prNumber})...`;
@@ -1259,8 +1290,7 @@ async function handleDocs(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone and setup workspace
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'docs', taskId, ws, statusRef);
@@ -1324,8 +1354,7 @@ async function handleSecurityAudit(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for security audit...`;
   sendLog(ws, `Starting security audit...\n`);
@@ -1443,8 +1472,7 @@ async function handleQA(
   const rawBaseBranch = String(payload.base_branch || 'main');
   const rawTitle = String(task.title || payload.title || 'add test coverage');
 
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
   // Clone
@@ -1553,8 +1581,7 @@ async function handleDeps(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone and setup workspace
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'deps', taskId, ws, statusRef);
@@ -1637,8 +1664,7 @@ async function handleMigrate(
   const rawTitle = String(task.title || payload.title || 'database migration');
   const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
 
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!prompt) throw new Error('No prompt found in task payloads');
 
@@ -1762,8 +1788,7 @@ async function handleSmoketest(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone (read-only — no work branch or push needed)
   statusRef.value = `Cloning ${owner}/${repo}...`;
@@ -1852,8 +1877,7 @@ async function handleRefactor(
   const rawBaseBranch = String(payload.base_branch || 'main');
   const rawTitle = String(task.title || payload.title || 'refactor');
 
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!rawPrompt) throw new Error('No prompt found in task payloads');
 
@@ -2059,8 +2083,7 @@ async function handlePerf(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for performance analysis...`;
   sendLog(ws, `Starting performance analysis...\n`);
@@ -2145,8 +2168,7 @@ async function handleInvestigate(
   model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
-  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
-  const baseBranch = rawBaseBranch;
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const userPrompt = String(payload.prompt || payload.description || task.description || '');
 
   statusRef.value = `Cloning ${owner}/${repo} for investigation...`;
@@ -2292,6 +2314,12 @@ async function main() {
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
+    // Clean up workspace to avoid leaking tokens in git config
+    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch {}
+    // Clean up /tmp files written by Claude Code handlers
+    for (const f of ['/tmp/review_verdict.json', '/tmp/smoketest_result.json', '/tmp/debug_output.json', '/tmp/investigation_report.json']) {
+      try { fs.unlinkSync(f); } catch {}
+    }
     log('Agent shutdown complete.');
   }
 }

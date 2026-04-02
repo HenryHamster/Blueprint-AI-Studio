@@ -7,24 +7,37 @@ resource "google_service_account" "orchestrator_sa" {
 }
 
 # Grant Orchestrator SA permissions to manage Compute Engine instances
-resource "google_project_iam_member" "orchestrator_compute_admin" {
+resource "google_project_iam_member" "orchestrator_compute_instance_admin" {
   project = var.project_id
-  role    = "roles/compute.admin"
+  role    = "roles/compute.instanceAdmin.v1"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to manage Secret Manager
-resource "google_project_iam_member" "orchestrator_secret_admin" {
+# Grant Orchestrator SA permissions to read secrets
+resource "google_project_iam_member" "orchestrator_secret_accessor" {
   project = var.project_id
-  role    = "roles/secretmanager.admin"
+  role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to manage Cloud Storage (for signed URLs)
-resource "google_project_iam_member" "orchestrator_storage_admin" {
+# Grant Orchestrator SA permissions to create secrets and add versions
+resource "google_project_iam_member" "orchestrator_secret_version_adder" {
   project = var.project_id
-  role    = "roles/storage.admin"
+  role    = "roles/secretmanager.secretVersionAdder"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+resource "google_project_iam_member" "orchestrator_secret_creator" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretCreator"
+  member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# Grant Orchestrator SA permissions to sign blobs (for GCS signed URLs)
+resource "google_service_account_iam_member" "orchestrator_sa_token_creator" {
+  service_account_id = google_service_account.orchestrator_sa.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
 # ------------------------------------------------------------------------------

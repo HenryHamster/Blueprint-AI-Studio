@@ -16,7 +16,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus
+from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -27,7 +27,6 @@ from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
     generate_installation_access_token,
-    generate_github_app_jwt,
     GITHUB_WEBHOOK_SECRET,
     GITHUB_CLIENT_ID,
     exchange_oauth_code,
@@ -61,7 +60,7 @@ from slowapi.errors import RateLimitExceeded
 limiter = Limiter(key_func=get_remote_address)
 
 # --- Runtime Config & Autonomous State (shared with admin.py) ---
-from app.shared_state import runtime_config as _runtime_config, autonomous_failure_counts as _autonomous_failure_counts
+from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
 
 # --- Task Priority Map ---
@@ -355,7 +354,7 @@ async def _check_monitoring_window():
                     state.rollback_count = 0
                     session.add(state)
                     await session.commit()
-                    print(f"[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
+                    print("[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
             deploy_monitoring["window_start"] = None
         return
 
@@ -380,7 +379,7 @@ async def _check_monitoring_window():
                 state.rollback_reason = f"Issues detected but no rollback target: {reason}"
                 session.add(state)
                 await session.commit()
-                print(f"[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
+                print("[DEPLOY] Issues detected but no rollback target — staying in MONITORING")
                 return  # Don't clear window_start so we keep monitoring
         elif response == "PAUSE":
             # External issue — handled by _check_pause_mode
@@ -517,8 +516,6 @@ async def _check_pause_mode():
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
     """Spawn a research task for a project if conditions are met."""
-    from sqlalchemy import func
-
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
@@ -1004,6 +1001,24 @@ async def orchestrator_worker():
                     select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
                 )).scalars().all()
 
+                # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
+                two_min_ago = datetime.now(timezone.utc) - timedelta(minutes=2)
+                for t in active_tasks_result:
+                    if (t.status == TaskStatus.PROVISIONING
+                        and t.last_heartbeat is None
+                        and t.started_at and t.started_at < two_min_ago):
+                        t.status = TaskStatus.QUEUED
+                        t.started_at = None
+                        t.vm_instance_id = None
+                        session.add(t)
+                        print(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
+                if session.dirty:
+                    await session.commit()
+                    # Re-fetch after recovery
+                    active_tasks_result = (await session.execute(
+                        select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                    )).scalars().all()
+
                 # Enforce concurrency limit
                 active_count = len(active_tasks_result)
                 slots_available = max(0, _runtime_config["max_concurrent_vms"] - active_count)
@@ -1036,7 +1051,12 @@ async def orchestrator_worker():
                         continue
 
                     # Check all dependencies are COMPLETED with PR merged
-                    dep_uuids = [uuid.UUID(d) for d in deps]
+                    try:
+                        dep_uuids = [uuid.UUID(d) for d in deps]
+                    except (ValueError, AttributeError) as e:
+                        print(f"[ORCHESTRATOR] Task {task.id} has invalid dependency UUID: {e}")
+                        eligible_ids.append(task.id)
+                        continue
                     dep_result = await session.execute(select(Task).where(Task.id.in_(dep_uuids)))
                     dep_tasks = dep_result.scalars().all()
 
@@ -1123,7 +1143,7 @@ async def orchestrator_worker():
                     else:
                         # No Max plan account — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
-                            print(f"[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
+                            print("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
                         else:
                             # No credentials at all — skip this task, don't waste a VM
                             print(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
@@ -1437,7 +1457,6 @@ async def lifespan(app: FastAPI):
                     if name == "orchestrator" and not t.cancelled():
                         print("[MONITOR] Restarting orchestrator worker...")
                         tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
-                        orchestrator_task = tasks["orchestrator"]
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
@@ -1515,7 +1534,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
 @app.get("/health")
 async def health_check():
     """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""
-    from app.shared_state import deploy_monitoring, external_health
+    from app.shared_state import external_health
 
     orchestrator_alive = _orchestrator_last_cycle is not None
     cycle_age = None
@@ -2565,10 +2584,31 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
             json_match = re.search(r'\[\s*\{[\s\S]*"title"[\s\S]*"prompt"', text, re.DOTALL)
             if json_match:
                 raw = json_match.group()
-                # Find last complete object (ends with })
-                last_brace = raw.rfind('}')
-                if last_brace > 0:
-                    truncated = raw[:last_brace + 1] + ']'
+                # Find last complete top-level object using depth tracking
+                depth = 0
+                last_close = -1
+                in_string = False
+                escape_next = False
+                for i, c in enumerate(raw):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if c == '\\' and in_string:
+                        escape_next = True
+                        continue
+                    if c == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            last_close = i
+                if last_close > 0:
+                    truncated = raw[:last_close + 1] + ']'
                     findings = json.loads(truncated)
                     if isinstance(findings, list):
                         print(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
@@ -3058,7 +3098,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):
-        print(f"[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
+        print("[RESEARCH] Findings have circular dependencies — ignoring depends_on_indices")
         for f in findings:
             f.pop("depends_on_indices", None)
 
@@ -3351,7 +3391,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if not child_task.parent_task_id:
         return
 
-    parent = await session.get(Task, child_task.parent_task_id)
+    # Lock parent row to serialize concurrent rollup checks from sibling completions
+    parent = (await session.execute(
+        select(Task).where(Task.id == child_task.parent_task_id).with_for_update()
+    )).scalars().first()
     if not parent or parent.status != TaskStatus.EVALUATING:
         return
 
@@ -3626,17 +3669,15 @@ async def update_agent_status(
         
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(
-            str(task.project_id), 
-            "artifact_created", 
+            str(task.project_id),
+            "artifact_created",
             {
-                "task_id": str(task.id), 
+                "task_id": str(task.id),
                 "artifact_type": payload.artifact_type,
                 "logs": payload.logs,
                 "storage_uri": payload.storage_uri
             }
         )
-        
-    await session.commit()
 
     # 3b. Parse and store smoketest result in task.plan_output for easy retrieval
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
@@ -3644,9 +3685,78 @@ async def update_agent_status(
             smoketest_data = json.loads(payload.logs)
             task.plan_output = smoketest_data
             session.add(task)
-            await session.commit()
         except (json.JSONDecodeError, Exception) as e:
             print(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}")
+
+    # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
+    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
+        try:
+            smoketest_data = json.loads(payload.logs)
+            if not smoketest_data.get("passed"):
+                failed_tests = [t for t in smoketest_data.get("tests", []) if t.get("status") == "fail"]
+                if failed_tests:
+                    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                    failure_summary = "\n".join(
+                        f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
+                    )
+                    type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
+                    type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
+                    plan_task = Task(
+                        project_id=task.project_id,
+                        title=f"Fix smoketest failures on {base_branch}",
+                        description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
+                        parent_task_id=task.id,
+                        payloads=[{
+                            "type": "plan",
+                            "prompt": (
+                                f"Smoke tests failed after a merge to {base_branch}. "
+                                f"Investigate and plan fixes for these failures:\n\n"
+                                f"{failure_summary}\n\n"
+                                f"Diagnose root causes, identify which recent changes likely caused each failure, "
+                                f"and produce subtasks to fix them."
+                            ),
+                            "base_branch": base_branch,
+                            **({"model": type_model} if type_model else {}),
+                            **({"effort": type_effort} if type_effort else {}),
+                        }],
+                        context={
+                            "smoketest_task_id": str(task.id),
+                            "failed_tests": [t["name"] for t in failed_tests],
+                        },
+                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                        status=TaskStatus.QUEUED,
+                        created_by="ORCHESTRATOR",
+                    )
+                    session.add(plan_task)
+                    await session.flush()
+                    history = TaskHistory(
+                        task_id=plan_task.id, action="SPAWNED",
+                        details={"spawned_by": "SMOKETEST_FAILURE", "failed_tests": [t["name"] for t in failed_tests]}
+                    )
+                    session.add(history)
+
+                    # Create persistent alert
+                    alert = Alert(
+                        project_id=task.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=f"Smoke tests failed on {base_branch}",
+                        message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                                + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else ""),
+                        task_id=task.id,
+                    )
+                    session.add(alert)
+
+                    await broadcast_to_project(
+                        str(task.project_id), "task_updated",
+                        {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
+                    )
+                    await broadcast_to_project(
+                        str(task.project_id), "alert_created",
+                        {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
+                    )
+                    print(f"[SMOKETEST] Spawned plan task {plan_task.id} + alert for {len(failed_tests)} failed smoke tests")
+        except Exception as e:
+            print(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}")
 
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
@@ -3654,7 +3764,6 @@ async def update_agent_status(
             debug_data = json.loads(payload.logs)
             task.plan_output = debug_data
             session.add(task)
-            await session.commit()
 
             # If confidence is high, auto-spawn a create task using the fix_prompt
             if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
@@ -3682,7 +3791,7 @@ async def update_agent_status(
                     created_by="ORCHESTRATOR",
                 )
                 session.add(fix_task)
-                await session.commit()
+                await session.flush()
                 await broadcast_to_project(
                     str(task.project_id),
                     "task_updated",
@@ -3762,7 +3871,7 @@ async def update_agent_status(
                 created_by="ORCHESTRATOR",
             )
             session.add(debug_task)
-            await session.commit()
+            await session.flush()
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
@@ -4360,8 +4469,12 @@ async def update_agent_status(
                 await session.commit()
                 await broadcast_to_project(str(project.id), "project_updated", {"status": new_project_status})
 
+    # Final commit for any deferred changes (status, artifacts, spawned tasks)
+    if session.dirty or session.new:
+        await session.commit()
+
     return {
-        "status": "received", 
+        "status": "received",
         "message": f"Status update for task {payload.task_id} recorded."
     }
 
@@ -4770,8 +4883,7 @@ async def github_oauth_callback(
         user_token = token_data["access_token"]
 
         # Get the GitHub user's profile to confirm identity
-        gh_user = await get_github_user(user_token)
-        gh_login = gh_user["login"]
+        await get_github_user(user_token)
 
         # Discover which of this App's installations the user can access
         installations = await get_user_installations(user_token)
@@ -4844,6 +4956,16 @@ async def github_webhook(
             repo_full = data.get("repository", {}).get("full_name", "")
             if "/" in repo_full:
                 owner, repo = repo_full.split("/", 1)
+                # Verify repo belongs to a registered project
+                project_check = await session.execute(
+                    select(Project).where(
+                        Project.github_owner == owner,
+                        Project.github_repo == repo,
+                    )
+                )
+                if not project_check.scalars().first():
+                    print(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
+                    return {"status": "ignored"}
                 background_tasks.add_task(_check_autonomous_research, owner, repo)
 
     return {"status": "received"}

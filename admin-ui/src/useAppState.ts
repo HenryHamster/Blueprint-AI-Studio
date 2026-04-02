@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task } from './components/TaskCard';
 import type { Project } from './components/ProjectDashboard';
 import type { MaxPlanAccount } from './components/SettingsDropdown';
+import type { Alert } from './components/AlertsBanner';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
 import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD, fetchTask } from './api';
@@ -90,6 +91,7 @@ export function useAppState() {
   const [useManualBranch, setUseManualBranch] = useState(false);
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
   const { toasts, addToast, dismissToast } = useToasts();
+  const [alerts, setAlerts] = useState<Alert[]>([]);
 
   // Log viewer state
   const [logTask, setLogTask] = useState<Task | null>(null);
@@ -230,6 +232,7 @@ export function useAppState() {
   useEffect(() => {
     if (!user) return;
     fetchTasks();
+    fetchAlerts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, limit, user, statusFilter, selectedProjectId]);
 
@@ -238,11 +241,12 @@ export function useAppState() {
     if (!user) return;
     fetchSettings();
     fetchProjects();
+    fetchAlerts();
     const projectInterval = setInterval(fetchProjects, 60000);
     if (refreshInterval === 0) {
       return () => { clearInterval(projectInterval); };
     }
-    const interval = setInterval(() => fetchTasksRef.current(), refreshInterval);
+    const interval = setInterval(() => { fetchTasksRef.current(); fetchAlerts(); }, refreshInterval);
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshInterval, user]);
@@ -456,6 +460,36 @@ export function useAppState() {
       }
     } catch (err) {
       console.error('Failed to fetch projects:', err);
+    }
+  };
+
+  const fetchAlerts = async () => {
+    try {
+      const url = selectedProjectId
+        ? `${API_BASE_URL}/api/admin/alerts?project_id=${selectedProjectId}`
+        : `${API_BASE_URL}/api/admin/alerts`;
+      const res = await authGet(url);
+      if (res.ok) {
+        setAlerts(await res.json());
+      }
+    } catch (err) {
+      console.error('Failed to fetch alerts:', err);
+    }
+  };
+
+  const dismissAlert = async (alertId: string) => {
+    const prev = alerts;
+    setAlerts(prevAlerts => prevAlerts.filter(a => a.id !== alertId));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/alerts/${alertId}/dismiss`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error('Failed to dismiss alert:', err);
+      setAlerts(prev);
+      addToast('Failed to dismiss alert', 'error');
     }
   };
 
@@ -913,59 +947,98 @@ export function useAppState() {
 
   const updateMaxVMs = async (value: number) => {
     const clamped = Math.max(1, Math.min(30, value));
+    const prev = maxConcurrentVMs;
     setMaxConcurrentVMs(clamped);
     try {
-      await fetch(`${API_BASE_URL}/api/admin/settings`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ max_concurrent_vms: clamped }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch (err) {
       console.error('Failed to update settings:', err);
+      setMaxConcurrentVMs(prev);
+      addToast('Failed to update max VMs', 'error');
     }
   };
 
-  const updateMaxRetries = (value: number) => {
+  const updateMaxRetries = async (value: number) => {
     const v = Math.max(0, Math.min(10, value));
+    const prev = maxRetries;
     setMaxRetries(v);
-    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
-      method: 'PATCH', headers: h,
-      body: JSON.stringify({ max_retries: v }),
-    })).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ max_retries: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setMaxRetries(prev);
+      addToast('Failed to update max retries', 'error');
+    }
   };
 
-  const handleUpdateMaxAutonomousRate = (value: number) => {
+  const handleUpdateMaxAutonomousRate = async (value: number) => {
     const v = Math.max(1, Math.min(50, value));
+    const prev = maxAutonomousTasksPerHour;
     setMaxAutonomousTasksPerHour(v);
-    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
-      method: 'PATCH', headers: h,
-      body: JSON.stringify({ max_autonomous_tasks_per_hour: v }),
-    })).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ max_autonomous_tasks_per_hour: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setMaxAutonomousTasksPerHour(prev);
+      addToast('Failed to update autonomous rate', 'error');
+    }
   };
 
-  const handleUpdateAutonomousResearchInterval = (value: number) => {
+  const handleUpdateAutonomousResearchInterval = async (value: number) => {
     const v = Math.max(1, Math.min(1440, value));
+    const prev = autonomousResearchIntervalMinutes;
     setAutonomousResearchIntervalMinutes(v);
-    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
-      method: 'PATCH', headers: h,
-      body: JSON.stringify({ autonomous_research_interval_minutes: v }),
-    })).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ autonomous_research_interval_minutes: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutonomousResearchIntervalMinutes(prev);
+      addToast('Failed to update research interval', 'error');
+    }
   };
 
-  const handleUpdateAutonomousResearchModel = (value: string) => {
+  const handleUpdateAutonomousResearchModel = async (value: string) => {
+    const prev = autonomousResearchModel;
     setAutonomousResearchModel(value);
-    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
-      method: 'PATCH', headers: h,
-      body: JSON.stringify({ autonomous_research_model: value }),
-    })).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ autonomous_research_model: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutonomousResearchModel(prev);
+      addToast('Failed to update research model', 'error');
+    }
   };
 
-  const handleUpdateAutonomousResearchEffort = (value: string) => {
+  const handleUpdateAutonomousResearchEffort = async (value: string) => {
+    const prev = autonomousResearchEffort;
     setAutonomousResearchEffort(value);
-    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
-      method: 'PATCH', headers: h,
-      body: JSON.stringify({ autonomous_research_effort: value }),
-    })).catch(() => {});
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ autonomous_research_effort: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutonomousResearchEffort(prev);
+      addToast('Failed to update research effort', 'error');
+    }
   };
 
   const handleToggleSettings = () => {
@@ -1318,6 +1391,8 @@ export function useAppState() {
     confirmDialog, setConfirmDialog,
     // Toasts
     toasts, addToast, dismissToast,
+    // Alerts
+    alerts, dismissAlert,
     // View
     viewMode, setViewMode,
     compactMode, setCompactMode,

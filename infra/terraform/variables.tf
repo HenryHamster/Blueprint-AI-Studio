@@ -15,6 +15,12 @@ variable "zone" {
   default     = "us-central1-a"
 }
 
+variable "github_owner" {
+  description = "The GitHub organization or user that owns the repository (e.g., 'HenryHamster')"
+  type        = string
+  default     = ""
+}
+
 variable "github_repository" {
   description = "The GitHub repository (e.g., 'owner/repo') that is allowed to deploy via Workload Identity. Set to empty string to skip CI/CD setup."
   type        = string

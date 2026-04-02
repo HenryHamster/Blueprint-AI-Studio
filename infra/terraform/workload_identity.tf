@@ -22,7 +22,7 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
     "attribute.repository_owner" = "assertion.repository_owner"
   }
 
-  attribute_condition = "assertion.repository == \"${var.github_repository}\""
+  attribute_condition = "assertion.repository_owner == \"${var.github_owner}\" && assertion.repository == \"${var.github_repository}\""
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -113,4 +113,14 @@ resource "google_project_iam_member" "github_actions_compute_image_user" {
   project = var.project_id
   role    = "roles/compute.imageUser"
   member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
+# Packer needs to create VMs as the default Compute Engine SA
+data "google_compute_default_service_account" "default" {}
+
+resource "google_service_account_iam_member" "github_actions_use_default_compute_sa" {
+  count              = var.enable_cicd ? 1 : 0
+  service_account_id = data.google_compute_default_service_account.default.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
