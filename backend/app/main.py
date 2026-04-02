@@ -3020,33 +3020,31 @@ async def update_agent_status(
                     except Exception as e:
                         print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
 
-                    # PR file-path flagging: check for infrastructure file changes (self-repo only)
-                    project = await session.get(Project, task.project_id)
-                    if project and project.is_self_repo:
-                        try:
-                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                            INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
-                                           "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
-                                           "agent/src/index.ts", "CLAUDE.md"}
-                            # Critical files require human approval (hard-block)
-                            CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
-                            touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
-                            touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
-                            if touched_infra:
-                                task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
-                                if touched_critical:
-                                    task.requires_approval = True
-                                    task.latest_status_message = f"BLOCKED: Security-critical file change: {', '.join(touched_critical)}"
-                                    print(f"[PIPELINE] PR #{pr_number} HARD-BLOCKED — touches critical files: {touched_critical}")
-                                else:
-                                    task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
-                                    print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
-                                session.add(task)
-                                await session.commit()
-                                # Flag for extended deploy monitoring window
-                                _shared_state.deploy_monitoring["is_extended"] = True
-                        except Exception as e:
-                            print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
+                    # PR file-path flagging: check for infrastructure/security-critical file changes
+                    try:
+                        pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                        INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
+                                       "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
+                                       "agent/src/index.ts", "CLAUDE.md"}
+                        # Critical files require human approval (hard-block)
+                        CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
+                        touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
+                        touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
+                        if touched_infra:
+                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
+                            if touched_critical:
+                                task.requires_approval = True
+                                task.latest_status_message = f"BLOCKED: Security-critical file change: {', '.join(touched_critical)}"
+                                print(f"[PIPELINE] PR #{pr_number} HARD-BLOCKED — touches critical files: {touched_critical}")
+                            else:
+                                task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
+                                print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
+                            session.add(task)
+                            await session.commit()
+                            # Flag for extended deploy monitoring window
+                            _shared_state.deploy_monitoring["is_extended"] = True
+                    except Exception as e:
+                        print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
                         review_task = await _spawn_pipeline_task(
