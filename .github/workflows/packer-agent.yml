@@ -37,4 +37,14 @@ jobs:
 
       - name: Packer Build
         working-directory: ./infra/packer
-        run: packer build -var "project_id=${{ env.PROJECT_ID }}" agent.pkr.hcl
+        run: |
+          for zone in us-central1-f us-west1-b us-east1-c us-west4-a us-east4-b; do
+            echo "Trying zone: $zone"
+            if packer build -var "project_id=${{ env.PROJECT_ID }}" -var "zone=$zone" agent.pkr.hcl; then
+              echo "Build succeeded in $zone"
+              exit 0
+            fi
+            echo "Zone $zone failed, trying next..."
+          done
+          echo "All zones exhausted"
+          exit 1
