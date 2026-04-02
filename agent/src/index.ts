@@ -731,7 +731,6 @@ Rules:
 - Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
-- Do NOT include findings that require human architectural decisions
 - Limit to 30 findings maximum, prioritized by impact
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
 - For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
@@ -740,10 +739,14 @@ Rules:
 - For type=deps findings, the prompt can be minimal (e.g. 'Update dependencies') — it will spawn a dedicated dependency update agent
 - For type=docs findings, the prompt can be minimal (e.g. 'Update documentation') — it will spawn a dedicated documentation agent
 
-How your findings get routed (you control this via scope and type):
-- scope=small or scope=medium → spawns a **create** agent that directly implements the change in a single PR
-- scope=large → spawns a **plan** agent that decomposes the work into ordered subtasks, then implements each one. Use this for cross-cutting changes, architectural refactors, or anything touching 5+ files.
-- type=research → spawns another **research** agent for deeper investigation before any implementation happens. Use this when you need more context or the right approach isn't clear yet.
+How your findings get routed (you control this via type and scope):
+- type=security_audit → spawns a **security audit** agent that scans for vulnerabilities and auto-spawns fix tasks for critical/high findings
+- type=qa → spawns a **QA** agent that generates missing tests and opens a PR
+- type=deps → spawns a **dependency updater** agent that checks for outdated/insecure deps and opens a PR
+- type=docs → spawns a **docs** agent that generates/updates documentation and opens a PR
+- type=research → spawns another **research** agent for deeper investigation before any implementation
+- type=improvement/bug/refactor/feature/test with scope=large → spawns a **plan** agent that decomposes into subtasks
+- type=improvement/bug/refactor/feature/test with scope=small or medium → spawns a **create** agent (single PR)
 - IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 
 Context — you are part of an autonomous pipeline:
