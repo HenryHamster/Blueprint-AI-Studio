@@ -97,6 +97,16 @@ jobs:
             --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
             --region ${{ env.REGION }}
 
+      - name: Smoke test
+        run: |
+          SERVICE_URL=$(gcloud run services describe blueprint-orchestrator --region ${{ env.REGION }} --format 'value(status.url)')
+          echo "Service URL: $SERVICE_URL"
+          # Wait for new revision to stabilize
+          sleep 10
+          # Health check (unauthenticated)
+          curl -sf "$SERVICE_URL/health" || (echo "Health check failed" && exit 1)
+          echo "Health check passed"
+
   run-migrations:
     name: Migrations
     runs-on: ubuntu-latest

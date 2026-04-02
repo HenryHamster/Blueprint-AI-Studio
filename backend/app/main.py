@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount
+from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -116,6 +116,267 @@ def release_max_plan_account(account_id: str):
             break
 
 
+# --- Deployment State Management ---
+
+# Current revision from Cloud Run (set on startup)
+_current_revision: str = os.getenv("K_REVISION", "local-dev")
+_current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
+
+
+def classify_failure(task: Task, logs: Optional[str] = None) -> str:
+    """Classify a task failure for deployment monitoring.
+    Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
+    status_msg = (task.latest_status_message or "").lower()
+    logs_lower = (logs or "").lower()
+    combined = status_msg + " " + logs_lower
+
+    # Provision failures — GCP quota, network, VM issues
+    if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
+                                      "vm failed to start", "failed to provision"]):
+        return "PROVISION_FAILURE"
+
+    # External API failures — GitHub, Claude API outages
+    if any(kw in combined for kw in ["rate limit", "api.github.com", "api.anthropic.com",
+                                      "502 bad gateway", "503 service unavailable",
+                                      "github api error", "claude api"]):
+        return "EXTERNAL_API"
+
+    # Agent timeout — reaped by heartbeat timeout
+    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out"]):
+        return "AGENT_TIMEOUT"
+
+    # Default: code error
+    return "CODE_ERROR"
+
+
+def record_task_result(success: bool, failure_class: str = ""):
+    """Record a task result for deployment monitoring."""
+    from app.shared_state import deploy_monitoring
+    entry = (datetime.utcnow().isoformat(), "success" if success else "failure", failure_class)
+    deploy_monitoring["task_results"].append(entry)
+    # Keep only last 100 results
+    if len(deploy_monitoring["task_results"]) > 100:
+        deploy_monitoring["task_results"] = deploy_monitoring["task_results"][-100:]
+
+    if success:
+        _shared_state.deploy_monitoring["last_completion_time"] = datetime.utcnow()
+
+
+async def _init_deployment_state():
+    """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
+    async with AsyncSessionLocal() as session:
+        state = await session.get(DeploymentState, 1)
+
+        if not state:
+            # First boot — create the singleton row
+            state = DeploymentState(
+                id=1,
+                current_revision=_current_revision,
+                current_sha=_current_sha,
+                deployed_at=datetime.utcnow(),
+                status=DeploymentStatus.STABLE,
+                last_known_good_revision=_current_revision,
+                last_known_good_sha=_current_sha,
+            )
+            session.add(state)
+            await session.commit()
+            print(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
+            return
+
+        if state.current_revision == _current_revision:
+            # Same revision — normal restart (cold start, scale event, etc.)
+            print(f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}")
+            return
+
+        # Revision changed — is it a new deploy or a rollback?
+        if _current_revision == state.last_known_good_revision and state.status == DeploymentStatus.MONITORING:
+            # We're back on the last known good revision while we were monitoring a new deploy
+            # This means the new deploy was rolled back (externally or via Cloud Run)
+            state.status = DeploymentStatus.ROLLED_BACK
+            state.rolled_back_from_sha = state.current_sha
+            state.rollback_reason = "Revision reverted to last known good during monitoring window"
+            state.rollback_count += 1
+            state.current_revision = _current_revision
+            state.current_sha = _current_sha
+            state.deployed_at = datetime.utcnow()
+            session.add(state)
+            await session.commit()
+
+            print(f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
+                  f"(consecutive rollbacks: {state.rollback_count})")
+
+            if state.rollback_count >= 3:
+                state.status = DeploymentStatus.HALTED
+                session.add(state)
+                await session.commit()
+                print(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
+                _runtime_config["max_concurrent_vms"] = 0
+            return
+
+        # New deploy — start monitoring window
+        # Capture pre-deploy failure rate as baseline
+        from app.shared_state import deploy_monitoring
+        results = deploy_monitoring["task_results"]
+        if results:
+            failures = sum(1 for _, outcome, _ in results if outcome == "failure")
+            deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
+        deploy_monitoring["task_results"] = []  # Reset for new deploy window
+        deploy_monitoring["window_start"] = datetime.utcnow()
+
+        state.current_revision = _current_revision
+        state.current_sha = _current_sha
+        state.deployed_at = datetime.utcnow()
+        state.status = DeploymentStatus.MONITORING
+        state.rolled_back_from_sha = None
+        state.rollback_reason = None
+        session.add(state)
+        await session.commit()
+        print(f"[DEPLOY] New deploy detected — revision={_current_revision}, starting monitoring window")
+
+
+async def _check_monitoring_window():
+    """Called each orchestrator cycle. If monitoring window has elapsed without issues, mark STABLE."""
+    from app.shared_state import deploy_monitoring
+    window_start = deploy_monitoring.get("window_start")
+    if not window_start:
+        return
+
+    duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
+    elapsed = (datetime.utcnow() - window_start).total_seconds()
+
+    if elapsed < duration:
+        return  # Still within window
+
+    # Window elapsed — check results
+    results = deploy_monitoring["task_results"]
+    if not results:
+        # No tasks ran during window — can't confirm, extend
+        return
+
+    failures = [r for r in results if r[1] == "failure" and r[2] == "CODE_ERROR"]
+    failure_rate = len(failures) / len(results) if results else 0
+
+    async with AsyncSessionLocal() as session:
+        state = await session.get(DeploymentState, 1)
+        if not state or state.status != DeploymentStatus.MONITORING:
+            deploy_monitoring["window_start"] = None
+            return
+
+        if failure_rate > 0.5:
+            # High failure rate — flag but don't auto-rollback (Phase A = detect + alert only)
+            print(f"[DEPLOY] WARNING: High failure rate during monitoring window: "
+                  f"{failure_rate:.0%} ({len(failures)}/{len(results)} tasks)")
+            state.rollback_reason = f"High failure rate: {failure_rate:.0%} ({len(failures)}/{len(results)})"
+            session.add(state)
+            await session.commit()
+        else:
+            # Passed monitoring window — mark stable
+            state.status = DeploymentStatus.STABLE
+            state.last_known_good_revision = state.current_revision
+            state.last_known_good_sha = state.current_sha
+            state.rollback_count = 0  # Reset consecutive rollback counter
+            session.add(state)
+            await session.commit()
+            print(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
+
+    deploy_monitoring["window_start"] = None
+
+
+async def _check_external_health():
+    """Periodic check of external dependencies. Updates shared_state.external_health."""
+    ext = _shared_state.external_health
+    now = datetime.utcnow()
+
+    # Only check every 60 seconds
+    if ext["last_check"] and (now - ext["last_check"]).total_seconds() < 60:
+        return
+    ext["last_check"] = now
+    failed = []
+
+    # DB check — if we can run this function, DB is likely fine, but verify explicitly
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(select(Task).limit(1))
+        ext["db"] = True
+    except Exception:
+        ext["db"] = False
+        failed.append("db")
+
+    # GitHub API check — lightweight rate limit endpoint
+    try:
+        from app.github import _get_client
+        client = await _get_client()
+        resp = await client.get("https://api.github.com/rate_limit", timeout=5.0)
+        ext["github_api"] = resp.status_code == 200
+        if not ext["github_api"]:
+            failed.append("github_api")
+    except Exception:
+        ext["github_api"] = False
+        failed.append("github_api")
+
+    # Claude API — check if any accounts have valid tokens (lightweight)
+    # We don't actually call the API; we check if we have credentials configured
+    has_credentials = bool(_max_plan_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    ext["claude_api"] = has_credentials
+    if not has_credentials:
+        failed.append("claude_api")
+
+    # GCP — check is implicit via provisioning success/failure tracking
+    # Mark unhealthy only if recent provisions all failed
+    recent_provisions = [r for r in _shared_state.deploy_monitoring["task_results"]
+                         if r[2] == "PROVISION_FAILURE"]
+    if len(recent_provisions) >= 3:
+        # Check if ALL recent results are provision failures
+        recent_all = _shared_state.deploy_monitoring["task_results"][-5:]
+        if all(r[2] == "PROVISION_FAILURE" for r in recent_all if r[1] == "failure"):
+            ext["gcp"] = False
+            failed.append("gcp")
+        else:
+            ext["gcp"] = True
+    else:
+        ext["gcp"] = True
+
+    ext["failed_deps"] = failed
+
+    if failed:
+        print(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
+
+
+async def _check_pause_mode():
+    """Auto-pause when critical external deps fail, auto-resume when they recover."""
+    ext = _shared_state.external_health
+    failed = ext.get("failed_deps", [])
+    # Only auto-pause on critical deps (DB, GitHub) — not claude_api (just means no credentials)
+    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp")]
+
+    if critical_failures:
+        # Should we pause?
+        if _runtime_config["max_concurrent_vms"] > 0:
+            async with AsyncSessionLocal() as session:
+                state = await session.get(DeploymentState, 1)
+                if state and state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                    state.status = DeploymentStatus.PAUSED
+                    state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
+                    state.paused_at = datetime.utcnow()
+                    state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
+                    session.add(state)
+                    await session.commit()
+            _runtime_config["max_concurrent_vms"] = 0
+            print(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
+    else:
+        # All deps healthy — should we auto-resume?
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state and state.status == DeploymentStatus.PAUSED and state.pre_pause_max_vms is not None:
+                restore = state.pre_pause_max_vms
+                state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
+                state.pause_reason = None
+                state.paused_at = None
+                state.pre_pause_max_vms = None
+                session.add(state)
+                await session.commit()
+                _runtime_config["max_concurrent_vms"] = restore
+                print(f"[PAUSE] Auto-resumed pipeline — all deps healthy (max_vms={restore})")
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -316,11 +577,12 @@ async def reaper_service():
     while True:
         try:
             async with AsyncSessionLocal() as session:
+                # FOR UPDATE SKIP LOCKED prevents split-brain double-reaping
                 stmt = select(Task).where(
                     Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-                )
+                ).with_for_update(skip_locked=True)
                 active_tasks = (await session.execute(stmt)).scalars().all()
-                
+
                 orphaned_tasks = []
                 now = datetime.utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
@@ -388,6 +650,7 @@ async def reaper_service():
                         print(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
                         task.status = TaskStatus.FAILED
                         task.latest_status_message = f"Failed after {_runtime_config['max_retries']} attempts — last reap: {reap_reason}"
+                        record_task_result(success=False, failure_class=classify_failure(task))
                         session.add(task)
 
                         # Broadcast failure to frontend
@@ -485,10 +748,11 @@ async def orchestrator_worker():
                     acct["active_tasks"] = active_per_account.get(acct["id"], 0)
 
                 # Find tasks that are QUEUED, not awaiting approval, and haven't been picked up yet
+                # FOR UPDATE SKIP LOCKED prevents duplicate dispatch during split-brain (two revisions running)
                 stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).limit(min(slots_available, 20))  # Fetch extra to filter deps
+                ).with_for_update(skip_locked=True).limit(min(slots_available, 20))  # Fetch extra to filter deps
                 candidate_tasks = (await session.execute(stmt)).scalars().all()
 
                 # Filter out tasks with unmet dependencies
@@ -572,6 +836,7 @@ async def orchestrator_worker():
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = datetime.utcnow()
+                    _shared_state.deploy_monitoring["last_dispatch_time"] = datetime.utcnow()
                     session.add(task)
                     try:
                         await session.commit()
@@ -599,6 +864,7 @@ async def orchestrator_worker():
                                                            oauth_token=token, claude_config_json=config_json)
                         if not success:
                             print(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
+                            record_task_result(success=False, failure_class="PROVISION_FAILURE")
                             # Release the Max Plan account slot
                             if acct_id_for_release:
                                 release_max_plan_account(acct_id_for_release)
@@ -814,6 +1080,11 @@ async def orchestrator_worker():
                 await asyncio.sleep(5) # Sleep longer if queue is empty
                 # Check for idle autonomous research when nothing is queued
                 await _check_idle_research()
+                # Check if deploy monitoring window has elapsed
+                await _check_monitoring_window()
+                # Periodic external dependency health check + auto-pause/resume
+                await _check_external_health()
+                await _check_pause_mode()
         except asyncio.CancelledError:
             print("[ORCHESTRATOR] Worker shutting down.")
             break
@@ -825,6 +1096,9 @@ async def lifespan(app: FastAPI):
 
     # Load persisted Max plan accounts into in-memory pool
     await load_max_plan_pool()
+
+    # Check deployment state (detect new deploy, rollback, or normal restart)
+    await _init_deployment_state()
 
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
@@ -892,6 +1166,24 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     ago = None
     if _orchestrator_last_cycle:
         ago = (datetime.now(timezone.utc) - _orchestrator_last_cycle).total_seconds()
+    # Include deployment state
+    deploy_state = None
+    try:
+        state = await session.get(DeploymentState, 1)
+        if state:
+            deploy_state = {
+                "revision": state.current_revision,
+                "sha": state.current_sha[:8] if state.current_sha else "",
+                "status": state.status,
+                "deployed_at": state.deployed_at.isoformat() if state.deployed_at else None,
+                "last_known_good_sha": state.last_known_good_sha[:8] if state.last_known_good_sha else "",
+                "rollback_count": state.rollback_count,
+                "rollback_reason": state.rollback_reason,
+                "pause_reason": state.pause_reason,
+            }
+    except Exception:
+        pass
+
     return {
         "orchestrator_alive": _orchestrator_last_cycle is not None,
         "last_cycle_seconds_ago": ago,
@@ -900,7 +1192,43 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "pool_size": len(_max_plan_pool),
         "pool_accounts": [{"name": a["name"], "enabled": a.get("enabled"), "active": a["active_tasks"]} for a in _max_plan_pool],
+        "deploy_state": deploy_state,
+        "deploy_monitoring": {
+            "window_active": _shared_state.deploy_monitoring["window_start"] is not None,
+            "task_results_count": len(_shared_state.deploy_monitoring["task_results"]),
+            "last_dispatch": _shared_state.deploy_monitoring["last_dispatch_time"].isoformat() if _shared_state.deploy_monitoring["last_dispatch_time"] else None,
+            "last_completion": _shared_state.deploy_monitoring["last_completion_time"].isoformat() if _shared_state.deploy_monitoring["last_completion_time"] else None,
+            "external_health": _shared_state.external_health,
+        },
     }
+
+
+@app.get("/health")
+async def health_check():
+    """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""
+    from app.shared_state import deploy_monitoring, external_health
+
+    orchestrator_alive = _orchestrator_last_cycle is not None
+    cycle_age = None
+    if _orchestrator_last_cycle:
+        cycle_age = (datetime.now(timezone.utc) - _orchestrator_last_cycle).total_seconds()
+
+    # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
+    orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
+
+    healthy = orchestrator_healthy and all(v for k, v in external_health.items() if k not in ("last_check", "failed_deps"))
+
+    status_code = 200 if healthy else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "healthy" if healthy else "unhealthy",
+            "revision": _current_revision,
+            "orchestrator_alive": orchestrator_alive,
+            "orchestrator_cycle_age_seconds": cycle_age,
+            "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps")},
+        }
+    )
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
@@ -959,6 +1287,7 @@ class DeployPayload(BaseModel):
     github_repo: Optional[str] = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
 
 class AgentStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     status: TaskStatus
     artifact_type: Optional[ArtifactType] = None
@@ -969,14 +1298,17 @@ class AgentStatusPayload(BaseModel):
     logs: Optional[str] = Field(None, max_length=500000)
 
 class UploadUrlRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     filename: str
 
 class HeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     status_message: Optional[str] = None
 
 class SpawnTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     payloads: List[Dict[str, Any]]
     requires_approval: bool = False
@@ -1921,8 +2253,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if not prompt:
             continue
 
-        # Only large scope needs decomposition — medium is still single-PR work
-        task_type = "plan" if scope == "large" else "create"
+        # Determine task type: research findings can spawn sub-research
+        finding_type = finding.get("type", "improvement")
+        if finding_type == "research":
+            task_type = "research"  # deeper investigation before implementation
+        elif scope == "large":
+            task_type = "plan"     # large scope needs decomposition
+        else:
+            task_type = "create"   # small/medium scope is single-PR work
         needs_approval = risk == "high"
 
         new_task = Task(
@@ -2290,7 +2628,12 @@ async def update_agent_status(
     
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-        
+
+    # Idempotency guard: if the task is already in a terminal state, ignore duplicate
+    # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return {"status": "already_terminal", "task_id": str(task.id)}
+
     # 2. Update task status
     task.status = payload.status
     # Preserve logs on the task when no artifact is created (e.g., "no changes" completion)
@@ -2335,6 +2678,13 @@ async def update_agent_status(
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+        # Record result for deployment monitoring
+        if payload.status == TaskStatus.COMPLETED:
+            record_task_result(success=True)
+        else:
+            failure_class = classify_failure(task, payload.logs)
+            record_task_result(success=False, failure_class=failure_class)
+
         # Release Max plan account slot
         acct_id = (task.context or {}).get("max_plan_account_id")
         if acct_id:
@@ -2342,7 +2692,7 @@ async def update_agent_status(
 
         if task.vm_instance_id:
             background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
-            
+
         # Retry logic for failed tasks
         if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
@@ -2477,6 +2827,24 @@ async def update_agent_status(
                             await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                     except Exception as e:
                         print(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}")
+
+                    # PR file-path flagging: check for infrastructure file changes
+                    try:
+                        pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                        INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
+                                       "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
+                                       "agent/src/index.ts", "CLAUDE.md"}
+                        touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
+                        if touched_infra:
+                            task.latest_status_message = f"Infrastructure change: {', '.join(touched_infra)}"
+                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large"}
+                            session.add(task)
+                            await session.commit()
+                            print(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra}")
+                            # Flag for extended deploy monitoring window
+                            _shared_state.deploy_monitoring["is_extended"] = True
+                    except Exception as e:
+                        print(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
                         review_task = await _spawn_pipeline_task(

@@ -144,6 +144,34 @@ def _on_status_message_set(target: Task, value, oldvalue, initiator):
         target.status_log = (target.status_log or []) + [entry]
 
 
+class DeploymentStatus(str, Enum):
+    MONITORING = "MONITORING"    # New deploy, within observation window
+    STABLE = "STABLE"            # Observation window passed, no issues
+    ROLLED_BACK = "ROLLED_BACK"  # Reverted to last known good
+    PAUSED = "PAUSED"            # External dependency down, dispatch halted
+    HALTED = "HALTED"            # Multiple consecutive rollbacks, manual intervention needed
+
+class DeploymentState(SQLModel, table=True):
+    """
+    Singleton row tracking the current deployment health.
+    Used for rollback detection, monitoring windows, and progressive trust.
+    """
+    id: int = Field(default=1, primary_key=True)
+    current_revision: str = Field(default="")       # Cloud Run K_REVISION
+    current_sha: str = Field(default="")             # git commit SHA
+    deployed_at: datetime = Field(default_factory=datetime.utcnow)
+    status: str = Field(default=DeploymentStatus.STABLE, sa_column=Column(String, default=DeploymentStatus.STABLE))
+    last_known_good_revision: str = Field(default="")
+    last_known_good_sha: str = Field(default="")
+    rolled_back_from_sha: Optional[str] = Field(default=None)
+    rollback_reason: Optional[str] = Field(default=None)
+    rollback_count: int = Field(default=0)           # consecutive rollbacks (reset on STABLE)
+    pause_reason: Optional[str] = Field(default=None)
+    paused_at: Optional[datetime] = Field(default=None)
+    # Pre-deploy saved max_concurrent_vms for PAUSE mode restore
+    pre_pause_max_vms: Optional[int] = Field(default=None)
+
+
 class MaxPlanAccount(SQLModel, table=True):
     """
     Persisted Max plan account for Claude Code OAuth token pooling.

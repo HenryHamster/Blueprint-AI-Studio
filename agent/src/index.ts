@@ -689,8 +689,9 @@ Instructions:
 ]
 
 Valid values:
-- type: improvement, bug, refactor, feature, test
-- scope: small (under 50 lines), medium (50-200 lines), large (200+ lines)
+- type: improvement, bug, refactor, feature, test, research
+  (use "research" when an area needs deeper investigation before implementation)
+- scope: small (single file, under 50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural, orchestrator/model/agent/security changes — anything that could break the system if done wrong)
 - risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
 - priority: high, medium, low
 
@@ -701,6 +702,7 @@ Rules:
 - Do NOT include findings that require human architectural decisions
 - Limit to 10 findings maximum, prioritized by impact
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
+- For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
 - IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.`;
 
   statusRef.value = 'Running codebase research...';

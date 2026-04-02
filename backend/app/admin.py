@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus
 from app.auth import get_current_user, require_admin
 from app.compute import delete_agent_vm
 from app.github import generate_installation_access_token
@@ -1215,3 +1215,123 @@ async def restart_orchestrator(
     background_tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
     print("[ADMIN] Orchestrator restarted via admin endpoint")
     return {"status": "restarted"}
+
+
+# --- Deployment State & Health ---
+
+@router.get("/deploy-state")
+async def get_deploy_state(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get current deployment state including monitoring status and health."""
+    from app.shared_state import deploy_monitoring, external_health, runtime_config
+
+    state = await session.get(DeploymentState, 1)
+    if not state:
+        return {"error": "No deployment state found — service may not have initialized yet"}
+
+    # Calculate monitoring window progress
+    window_progress = None
+    if deploy_monitoring["window_start"]:
+        duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
+        elapsed = (datetime.utcnow() - deploy_monitoring["window_start"]).total_seconds()
+        window_progress = {"elapsed_seconds": int(elapsed), "total_seconds": duration, "percent": min(100, int(elapsed / duration * 100))}
+
+    # Calculate recent failure rate
+    results = deploy_monitoring["task_results"]
+    failure_rate = 0.0
+    if results:
+        failures = sum(1 for _, outcome, _ in results if outcome == "failure")
+        failure_rate = failures / len(results)
+
+    return {
+        "current_revision": state.current_revision,
+        "current_sha": state.current_sha,
+        "deployed_at": state.deployed_at.isoformat() if state.deployed_at else None,
+        "status": state.status,
+        "last_known_good_revision": state.last_known_good_revision,
+        "last_known_good_sha": state.last_known_good_sha,
+        "rolled_back_from_sha": state.rolled_back_from_sha,
+        "rollback_reason": state.rollback_reason,
+        "rollback_count": state.rollback_count,
+        "pause_reason": state.pause_reason,
+        "monitoring_window": window_progress,
+        "failure_rate": round(failure_rate, 3),
+        "task_results_count": len(results),
+        "external_health": external_health,
+        "max_concurrent_vms": runtime_config["max_concurrent_vms"],
+    }
+
+
+@router.post("/deploy-state/pause")
+async def pause_pipeline(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Manually pause the pipeline (set max_concurrent_vms=0). Used for manual intervention."""
+    from app.shared_state import runtime_config
+
+    state = await session.get(DeploymentState, 1)
+    if state:
+        state.status = DeploymentStatus.PAUSED
+        state.pause_reason = "Manual pause via admin"
+        state.paused_at = datetime.utcnow()
+        state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+        session.add(state)
+        await session.commit()
+
+    old_vms = runtime_config["max_concurrent_vms"]
+    runtime_config["max_concurrent_vms"] = 0
+    print(f"[ADMIN] Pipeline PAUSED manually (was max_concurrent_vms={old_vms})")
+    return {"status": "paused", "previous_max_vms": old_vms}
+
+
+@router.post("/deploy-state/resume")
+async def resume_pipeline(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Resume the pipeline after a pause. Restores max_concurrent_vms to pre-pause value."""
+    from app.shared_state import runtime_config
+
+    state = await session.get(DeploymentState, 1)
+    restore_vms = 5  # default
+    if state:
+        if state.pre_pause_max_vms is not None:
+            restore_vms = state.pre_pause_max_vms
+        state.status = DeploymentStatus.STABLE
+        state.pause_reason = None
+        state.paused_at = None
+        state.pre_pause_max_vms = None
+        session.add(state)
+        await session.commit()
+
+    runtime_config["max_concurrent_vms"] = restore_vms
+    print(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
+    return {"status": "resumed", "max_concurrent_vms": restore_vms}
+
+
+@router.post("/deploy-state/mark-stable")
+async def mark_deploy_stable(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Manually mark the current deploy as stable (skip monitoring window)."""
+    from app.shared_state import deploy_monitoring
+
+    state = await session.get(DeploymentState, 1)
+    if not state:
+        raise HTTPException(status_code=404, detail="No deployment state found")
+
+    state.status = DeploymentStatus.STABLE
+    state.last_known_good_revision = state.current_revision
+    state.last_known_good_sha = state.current_sha
+    state.rollback_count = 0
+    state.rollback_reason = None
+    session.add(state)
+    await session.commit()
+
+    deploy_monitoring["window_start"] = None
+    print(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
+    return {"status": "stable", "sha": state.current_sha}

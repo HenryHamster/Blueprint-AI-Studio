@@ -6,7 +6,7 @@ endpoints need to read or mutate autonomous-loop / runtime-config state.
 
 import os
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
@@ -22,3 +22,31 @@ last_idle_check: Optional[datetime] = None
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 import asyncio
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
+
+# --- Deployment Monitoring (Phase A: detect + alert) ---
+deploy_monitoring: Dict = {
+    "window_start": None,           # datetime when monitoring began for current deploy
+    "window_duration": 900,         # 15 minutes default
+    "extended_window": 1800,        # 30 min for large/infra changes
+    "is_extended": False,           # set True when infra files are touched
+    "task_results": [],             # list of (timestamp_iso, "success"|"failure", failure_class)
+    "pre_deploy_failure_rate": 0.0, # baseline from before deploy
+    "health_checks": {
+        "dispatch_working": True,   # orchestrator picked up a task in last 5 min
+        "completions_received": True, # at least one agent reported back
+        "db_accessible": True,       # can read/write tasks
+    },
+    "last_dispatch_time": None,     # last time orchestrator dispatched a task
+    "last_completion_time": None,   # last time an agent reported completion
+    "consecutive_health_failures": 0,
+}
+
+# --- External Dependency Health ---
+external_health: Dict = {
+    "github_api": True,
+    "claude_api": True,
+    "gcp": True,
+    "db": True,
+    "last_check": None,             # datetime of last health check
+    "failed_deps": [],              # list of currently-failed dependency names
+}
