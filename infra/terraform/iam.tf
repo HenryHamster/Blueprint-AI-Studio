@@ -27,9 +27,10 @@ resource "google_project_iam_member" "orchestrator_secret_version_adder" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
+# secretmanager.admin needed for create_secret() — no narrower project-level role exists
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
-  role    = "roles/secretmanager.secretCreator"
+  role    = "roles/secretmanager.admin"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 

@@ -342,12 +342,22 @@ EOF
             except Exception as e:
                 last_error = e
                 err_str = str(e)
-                if "does not have enough resources" in err_str or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str or "QUOTA" in err_str:
+                # Retryable zone/infra errors — try next zone
+                retryable = (
+                    "does not have enough resources" in err_str
+                    or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str
+                    or "QUOTA" in err_str
+                    or "subnetwork" in err_str.lower()  # Subnet not found (infra not provisioned)
+                    or "was not found" in err_str
+                )
+                if retryable:
                     # Classify failure reason for operators
                     if "QUOTA" in err_str:
                         reason = "QUOTA"
                     elif "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str:
                         reason = "RESOURCE_POOL_EXHAUSTED"
+                    elif "subnetwork" in err_str.lower() or "was not found" in err_str:
+                        reason = "SUBNET_NOT_FOUND"
                     else:
                         reason = "RESOURCE_UNAVAILABLE"
 
@@ -360,7 +370,7 @@ EOF
 
                     logger.warning(f"Zone {zone} unavailable ({reason}) for {vm_instance_id}, trying next zone...")
                     continue
-                # Non-zone error — don't retry
+                # Non-retryable error — don't retry
                 raise
 
         if skipped_cooldown:
