@@ -333,8 +333,8 @@ export function SettingsDropdown({
               max={30}
               value={vmInputVal}
               onChange={e => setVmInputVal(e.target.value)}
-              onBlur={() => { const n = parseInt(vmInputVal); if (n >= 1 && n <= 30) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
-              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 1 && n <= 30) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
+              onBlur={() => { const n = parseInt(vmInputVal); if (n >= 1 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 1 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
