@@ -84,6 +84,7 @@ export interface HeaderBarProps {
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
+  zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
 }
 
 
@@ -302,6 +303,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onRollback={props.onRollback}
           onMarkStable={props.onMarkStable}
           onRepairState={props.onRepairState}
+          zoneHealth={props.zoneHealth}
         />
         <button
           onClick={onToggleArchive}
