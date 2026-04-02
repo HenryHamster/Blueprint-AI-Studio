@@ -1063,7 +1063,7 @@ async def orchestrator_worker():
                 candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).order_by(Task.priority.desc(), Task.created_at.asc()).limit(min(slots_available, 20))  # Fetch extra to filter deps
+                ).order_by(Task.priority.desc(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra to account for dep/conflict filtering
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -1189,6 +1189,9 @@ async def orchestrator_worker():
                     session.add(task)
                     try:
                         await session.commit()
+                        # Increment account active_tasks so next iteration picks a different account
+                        if account:
+                            account["active_tasks"] = account.get("active_tasks", 0) + 1
                         print(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
                     except Exception as e:
                         import traceback

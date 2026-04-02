@@ -717,6 +717,10 @@ async def modify_task(
         task.context = {**(task.context or {}), **payload["context"]}
         changes["context"] = "updated"
 
+    if "depends_on" in payload:
+        task.depends_on = payload["depends_on"] if isinstance(payload["depends_on"], list) else []
+        changes["depends_on"] = task.depends_on
+
     if changes:
         session.add(task)
 
@@ -757,6 +761,27 @@ async def modify_task(
         "attempt_count": task.attempt_count,
         "requires_approval": task.requires_approval,
     }
+
+
+@router.post("/projects/{project_id}/clear-wave-deps")
+async def clear_wave_deps(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Clear depends_on on all QUEUED tasks in a project to unblock wave-gated tasks."""
+    result = await session.execute(
+        select(Task).where(Task.project_id == project_id, Task.status == TaskStatus.QUEUED)
+    )
+    tasks = result.scalars().all()
+    cleared = 0
+    for task in tasks:
+        if task.depends_on:
+            task.depends_on = []
+            session.add(task)
+            cleared += 1
+    await session.commit()
+    return {"cleared": cleared, "total_queued": len(tasks)}
 
 
 @router.post("/tasks/{task_id}/rollup")
