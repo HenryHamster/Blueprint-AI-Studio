@@ -2175,7 +2175,20 @@ async def _spawn_pipeline_task(
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = ""
 ) -> Optional[Task]:
     """Spawn a review or fix task as part of the automated review pipeline.
-    Returns None if the review-fix cycle limit has been reached."""
+    Returns None if the review-fix cycle limit has been reached or a duplicate exists."""
+    # Guard: don't spawn if there's already an active review/fix for this PR
+    active_pipeline = (await session.execute(
+        select(Task).where(
+            Task.project_id == source_task.project_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active_pipeline:
+        t_payload = (t.payloads or [{}])[0]
+        if t_payload.get("pr_number") == pr_number and t_payload.get("type") in ("review", "fix"):
+            print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id} ({t_payload.get('type')})")
+            return None
+
     # Track review-fix iteration count to prevent infinite loops
     source_loop = (source_task.context or {}).get("review_loop", {})
     source_payload = (source_task.payloads or [{}])[0]

@@ -101,17 +101,18 @@ jobs:
         run: |
           SERVICE_URL=$(gcloud run services describe blueprint-orchestrator --region ${{ env.REGION }} --format 'value(status.url)')
           echo "Service URL: $SERVICE_URL"
-          # Retry health check (3 attempts, 10s apart) to handle cold start
-          for attempt in 1 2 3; do
-            echo "Health check attempt $attempt/3..."
-            sleep 10
-            if curl -sf "$SERVICE_URL/health"; then
+          # Retry health check (5 attempts, 15s apart) to handle cold start + migration
+          for attempt in 1 2 3 4 5; do
+            echo "Health check attempt $attempt/5..."
+            sleep 15
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -L "$SERVICE_URL/health" || echo "000")
+            echo "HTTP status: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
               echo "Health check passed on attempt $attempt"
               exit 0
             fi
-            echo "Attempt $attempt failed"
           done
-          echo "Health check failed after 3 attempts"
+          echo "Health check failed after 5 attempts"
           exit 1
 
   run-migrations:
