@@ -811,6 +811,9 @@ async def get_settings(
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
         "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
+        "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
+        "autonomous_research_model": _runtime_config.get("autonomous_research_model") or "",
+        "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -853,6 +856,24 @@ async def update_settings(
         if not (1 <= val <= 50):
             raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be between 1 and 50")
         _runtime_config["max_autonomous_tasks_per_hour"] = val
+    if "autonomous_research_interval_minutes" in payload:
+        try:
+            val = int(payload["autonomous_research_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be a number")
+        if not (1 <= val <= 1440):
+            raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
+        _runtime_config["autonomous_research_interval_minutes"] = val
+    if "autonomous_research_model" in payload:
+        val = payload["autonomous_research_model"] or None
+        if val is not None and val not in ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"):
+            raise HTTPException(status_code=400, detail="Invalid autonomous_research_model")
+        _runtime_config["autonomous_research_model"] = val
+    if "autonomous_research_effort" in payload:
+        val = payload["autonomous_research_effort"] or None
+        if val is not None and val not in ("low", "medium", "high"):
+            raise HTTPException(status_code=400, detail="autonomous_research_effort must be low, medium, or high")
+        _runtime_config["autonomous_research_effort"] = val
 
     # Persist to DB so values survive Cloud Run restarts (only fields present in payload)
     state = await session.get(DeploymentState, 1)
@@ -863,6 +884,12 @@ async def update_settings(
             state.runtime_max_retries = _runtime_config["max_retries"]
         if "max_autonomous_tasks_per_hour" in payload:
             state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
+        if "autonomous_research_interval_minutes" in payload:
+            state.runtime_autonomous_research_interval_minutes = _runtime_config["autonomous_research_interval_minutes"]
+        if "autonomous_research_model" in payload:
+            state.runtime_autonomous_research_model = _runtime_config["autonomous_research_model"]
+        if "autonomous_research_effort" in payload:
+            state.runtime_autonomous_research_effort = _runtime_config["autonomous_research_effort"]
         session.add(state)
         await session.commit()
 

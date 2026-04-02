@@ -1,19 +1,19 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown } from 'lucide-react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench } from 'lucide-react';
 
 interface NewTaskModalProps {
   newTaskRepo: string;
   newTaskBranch: string;
   newTaskTitle: string;
   newTaskPrompt: string;
-  newTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix';
+  newTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
   newTaskPrNumber: string;
   newTaskPrBranch: string;
   setNewTaskRepo: (value: string) => void;
   setNewTaskBranch: (value: string) => void;
   setNewTaskTitle: (value: string) => void;
   setNewTaskPrompt: (value: string) => void;
-  setNewTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
+  setNewTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
   setNewTaskPrNumber: (value: string) => void;
   setNewTaskPrBranch: (value: string) => void;
   newTaskModel: string;
@@ -80,7 +80,7 @@ export function NewTaskModal({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const handleTaskTypeChange = (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => {
+  const handleTaskTypeChange = (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => {
     setNewTaskType(value);
     setNewTaskModel(getDefaultModelForType(value));
     setNewTaskEffort(getDefaultEffortForType(value));
@@ -208,10 +208,12 @@ export function NewTaskModal({
             <div className="flex gap-2">
               {([
                 { value: 'create' as const, label: 'Create', desc: 'Write code, open PR', icon: Plus },
+                { value: 'refactor' as const, label: 'Refactor', desc: 'Improve code quality', icon: Wrench },
                 { value: 'plan' as const, label: 'Plan', desc: 'Decompose into subtasks', icon: GitFork },
                 { value: 'research' as const, label: 'Research', desc: 'Analyze codebase', icon: Microscope },
                 { value: 'review' as const, label: 'Review', desc: 'Review existing PR', icon: CheckCircle },
                 { value: 'fix' as const, label: 'Fix', desc: 'Fix PR from feedback', icon: AlertCircle },
+                { value: 'migrate' as const, label: 'Migrate', desc: 'Generate DB migration', icon: ArrowUpDown },
               ]).map(opt => (
                 <button
                   key={opt.value}

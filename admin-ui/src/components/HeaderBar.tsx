@@ -37,8 +37,8 @@ export interface HeaderBarProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: RefObject<HTMLDivElement | null>;
-  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix';
-  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
+  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
+  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
   soundOnComplete: boolean;
@@ -48,6 +48,12 @@ export interface HeaderBarProps {
   onUpdateMaxVMs: (value: number) => void;
   onUpdateMaxRetries: (value: number) => void;
   onUpdateMaxAutonomousRate: (value: number) => void;
+  autonomousResearchIntervalMinutes: number;
+  onUpdateAutonomousResearchInterval: (value: number) => void;
+  autonomousResearchModel: string;
+  onUpdateAutonomousResearchModel: (value: string) => void;
+  autonomousResearchEffort: string;
+  onUpdateAutonomousResearchEffort: (value: string) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -120,6 +126,12 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateMaxVMs,
     onUpdateMaxRetries,
     onUpdateMaxAutonomousRate,
+    autonomousResearchIntervalMinutes,
+    onUpdateAutonomousResearchInterval,
+    autonomousResearchModel,
+    onUpdateAutonomousResearchModel,
+    autonomousResearchEffort,
+    onUpdateAutonomousResearchEffort,
     githubAccount,
     onConnectGitHub,
     maxPlanAccounts,
@@ -255,6 +267,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxRetries={onUpdateMaxRetries}
           maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
+          autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
+          onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
+          autonomousResearchModel={autonomousResearchModel}
+          onUpdateAutonomousResearchModel={onUpdateAutonomousResearchModel}
+          autonomousResearchEffort={autonomousResearchEffort}
+          onUpdateAutonomousResearchEffort={onUpdateAutonomousResearchEffort}
           githubAccount={githubAccount}
           onConnectGitHub={onConnectGitHub}
           maxPlanAccounts={maxPlanAccounts}

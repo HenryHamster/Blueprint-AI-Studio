@@ -15,7 +15,7 @@ interface SearchFilterBarProps {
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
-const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix'] as const;
+const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as const;
 
 
 

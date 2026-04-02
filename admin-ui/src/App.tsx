@@ -143,6 +143,12 @@ export default function App() {
         onUpdateMaxVMs={s.updateMaxVMs}
         onUpdateMaxRetries={s.updateMaxRetries}
         onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
+        autonomousResearchIntervalMinutes={s.autonomousResearchIntervalMinutes}
+        onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
+        autonomousResearchModel={s.autonomousResearchModel}
+        onUpdateAutonomousResearchModel={s.handleUpdateAutonomousResearchModel}
+        autonomousResearchEffort={s.autonomousResearchEffort}
+        onUpdateAutonomousResearchEffort={s.handleUpdateAutonomousResearchEffort}
         githubAccount={s.githubAccount}
         onConnectGitHub={s.connectGitHub}
         maxPlanAccounts={s.maxPlanAccounts}

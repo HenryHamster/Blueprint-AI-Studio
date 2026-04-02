@@ -13,6 +13,9 @@ runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
     "max_autonomous_tasks_per_hour": 5,
+    "autonomous_research_interval_minutes": 30,
+    "autonomous_research_model": None,
+    "autonomous_research_effort": None,
 }
 
 # --- Autonomous Loop State ---

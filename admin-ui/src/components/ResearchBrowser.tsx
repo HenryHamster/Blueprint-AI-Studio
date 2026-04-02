@@ -291,6 +291,11 @@ function FindingCard({ finding, onLaunch, implementedStatus }: { finding: Resear
       <div className="flex items-center gap-3 mb-3 text-[10px] text-neutral-500">
         <span className="font-mono">Priority: {finding.priority}</span>
         {finding.type && <span className="font-mono">Type: {finding.type}</span>}
+        {finding.direction_id && (
+          <span className="font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
+            {finding.direction_id}
+          </span>
+        )}
       </div>
 
       {finding.related_files?.length > 0 && (

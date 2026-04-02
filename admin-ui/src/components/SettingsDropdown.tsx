@@ -18,8 +18,8 @@ interface SettingsDropdownProps {
   onToggleSettings: () => void;
   settingsRef: React.RefObject<HTMLDivElement | null>;
   // Defaults
-  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix';
-  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
+  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
+  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
   viewMode: 'kanban' | 'pipeline';
   onToggleViewMode: () => void;
   // Notifications
@@ -34,6 +34,12 @@ interface SettingsDropdownProps {
   onUpdateMaxRetries: (value: number) => void;
   maxAutonomousTasksPerHour: number;
   onUpdateMaxAutonomousRate: (value: number) => void;
+  autonomousResearchIntervalMinutes: number;
+  onUpdateAutonomousResearchInterval: (value: number) => void;
+  autonomousResearchModel: string;
+  onUpdateAutonomousResearchModel: (value: string) => void;
+  autonomousResearchEffort: string;
+  onUpdateAutonomousResearchEffort: (value: string) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -82,7 +88,7 @@ const REFRESH_PRESETS = [
 const PAGE_PRESETS = [25, 50, 100, 200];
 const ALL_PAGE_SIZE = 10000;
 
-const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix'] as const;
+const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as const;
 type TaskType = typeof TASK_TYPES[number];
 
 export function SettingsDropdown({
@@ -103,6 +109,12 @@ export function SettingsDropdown({
   onUpdateMaxRetries,
   maxAutonomousTasksPerHour,
   onUpdateMaxAutonomousRate,
+  autonomousResearchIntervalMinutes,
+  onUpdateAutonomousResearchInterval,
+  autonomousResearchModel,
+  onUpdateAutonomousResearchModel,
+  autonomousResearchEffort,
+  onUpdateAutonomousResearchEffort,
   githubAccount,
   onConnectGitHub,
   maxPlanAccounts,
@@ -150,14 +162,14 @@ export function SettingsDropdown({
   // Per-task-type overrides
   const [taskTypeModels, setTaskTypeModels] = useState<Record<TaskType, string>>(() => {
     const result = {} as Record<TaskType, string>;
-    for (const t of ['create', 'plan', 'research', 'review', 'fix'] as TaskType[]) {
+    for (const t of ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as TaskType[]) {
       result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
     }
     return result;
   });
   const [taskTypeEfforts, setTaskTypeEfforts] = useState<Record<TaskType, string>>(() => {
     const result = {} as Record<TaskType, string>;
-    for (const t of ['create', 'plan', 'research', 'review', 'fix'] as TaskType[]) {
+    for (const t of ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as TaskType[]) {
       result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
     }
     return result;
@@ -198,14 +210,16 @@ export function SettingsDropdown({
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default Task Type</label>
             <select
               value={defaultTaskType}
-              onChange={e => onUpdateDefaultTaskType(e.target.value as 'create' | 'plan' | 'research' | 'review' | 'fix')}
+              onChange={e => onUpdateDefaultTaskType(e.target.value as 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor')}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
               <option value="create">Create</option>
+              <option value="refactor">Refactor</option>
               <option value="plan">Plan</option>
               <option value="research">Research</option>
               <option value="review">Review</option>
               <option value="fix">Fix</option>
+              <option value="migrate">Migrate</option>
             </select>
           </div>
           <div className="mb-4">
@@ -342,6 +356,47 @@ export function SettingsDropdown({
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(autonomousRateInputVal); if (n >= 1 && n <= 50) onUpdateMaxAutonomousRate(n); else setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Autonomous Research</h4>
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Interval (minutes)</label>
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              value={autonomousResearchIntervalMinutes}
+              onChange={e => onUpdateAutonomousResearchInterval(parseInt(e.target.value) || 30)}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Model</label>
+            <select
+              value={autonomousResearchModel}
+              onChange={e => onUpdateAutonomousResearchModel(e.target.value)}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="">Orchestrator default</option>
+              <option value="claude-opus-4-6">claude-opus-4-6</option>
+              <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+              <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
+            </select>
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Effort</label>
+            <select
+              value={autonomousResearchEffort}
+              onChange={e => onUpdateAutonomousResearchEffort(e.target.value)}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="">Orchestrator default</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
           </div>
 
           <div className="mb-4">

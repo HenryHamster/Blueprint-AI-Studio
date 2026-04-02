@@ -72,7 +72,7 @@ export function useAppState() {
   const [newTaskBranch, setNewTaskBranch] = useState('main');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
-  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research' | 'review' | 'fix'>('create');
+  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('create');
   const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
   const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
   const [newTaskModel, setNewTaskModel] = useState('');
@@ -109,6 +109,9 @@ export function useAppState() {
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
   const [maxRetries, setMaxRetries] = useState(3);
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
+  const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
+  const [autonomousResearchModel, setAutonomousResearchModel] = useState('');
+  const [autonomousResearchEffort, setAutonomousResearchEffort] = useState('');
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -125,7 +128,7 @@ export function useAppState() {
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
 
   // Defaults
-  const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix'>('defaultTaskType', 'create');
+  const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('defaultTaskType', 'create');
   const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
   const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
   const prevTasksRef = useRef<Task[]>([]);
@@ -162,7 +165,7 @@ export function useAppState() {
 
   // Search and filter state
   const [searchQuery, setSearchQuery] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>(['create', 'plan', 'research', 'review', 'fix']);
+  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>(['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor']);
   const [statusFilter, setStatusFilter] = useState<string[]>(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED']);
 
   // Reset page when status filter changes
@@ -812,6 +815,9 @@ export function useAppState() {
         setMaxConcurrentVMs(data.max_concurrent_vms);
         setMaxRetries(data.max_retries ?? 3);
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
+        setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
+        setAutonomousResearchModel(data.autonomous_research_model ?? '');
+        setAutonomousResearchEffort(data.autonomous_research_effort ?? '');
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
@@ -894,6 +900,31 @@ export function useAppState() {
     authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
       method: 'PATCH', headers: h,
       body: JSON.stringify({ max_autonomous_tasks_per_hour: v }),
+    })).catch(() => {});
+  };
+
+  const handleUpdateAutonomousResearchInterval = (value: number) => {
+    const v = Math.max(1, Math.min(1440, value));
+    setAutonomousResearchIntervalMinutes(v);
+    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
+      method: 'PATCH', headers: h,
+      body: JSON.stringify({ autonomous_research_interval_minutes: v }),
+    })).catch(() => {});
+  };
+
+  const handleUpdateAutonomousResearchModel = (value: string) => {
+    setAutonomousResearchModel(value);
+    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
+      method: 'PATCH', headers: h,
+      body: JSON.stringify({ autonomous_research_model: value }),
+    })).catch(() => {});
+  };
+
+  const handleUpdateAutonomousResearchEffort = (value: string) => {
+    setAutonomousResearchEffort(value);
+    authHeaders().then(h => fetch(`${API_BASE_URL}/api/admin/settings`, {
+      method: 'PATCH', headers: h,
+      body: JSON.stringify({ autonomous_research_effort: value }),
     })).catch(() => {});
   };
 
@@ -1275,7 +1306,9 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
+    autonomousResearchIntervalMinutes, autonomousResearchModel, autonomousResearchEffort,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate,
+    handleUpdateAutonomousResearchInterval, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,

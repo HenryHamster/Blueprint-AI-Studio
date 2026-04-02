@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo } from 'react';
-import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package } from 'lucide-react';
+import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench } from 'lucide-react';
 
 export interface ResearchFinding {
   type?: string;
@@ -58,7 +58,7 @@ export function linkifyStatusMessage(msg: string, prUrl?: string): React.ReactNo
 }
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'docs' | 'security_audit' | 'qa' | 'deps';
+export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'refactor' | 'docs' | 'security_audit' | 'qa' | 'deps' | 'migrate';
 
 export interface Task {
   id: string;
@@ -97,10 +97,12 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-400', icon: Microscope, label: 'Research' },
   review: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Search, label: 'Review' },
   fix: { bg: 'bg-orange-500/10 border-orange-500/20', text: 'text-orange-400', icon: RotateCcw, label: 'Fix' },
+  refactor: { bg: 'bg-teal-500/10 border-teal-500/20', text: 'text-teal-400', icon: Wrench, label: 'Refactor' },
   docs: { bg: 'bg-indigo-500/10 border-indigo-500/20', text: 'text-indigo-400', icon: BookOpen, label: 'Docs' },
   security_audit: { bg: 'bg-red-500/10 border-red-500/20', text: 'text-red-400', icon: ShieldAlert, label: 'Security Audit' },
   qa: { bg: 'bg-green-500/10 border-green-500/20', text: 'text-green-400', icon: TestTube, label: 'QA' },
   deps: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Package, label: 'Deps' },
+  migrate: { bg: 'bg-teal-500/10 border-teal-500/20', text: 'text-teal-400', icon: ArrowUpDown, label: 'Migrate' },
 };
 
 interface TaskCardProps {

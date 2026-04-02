@@ -246,6 +246,12 @@ async function handleCreate(
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!prompt) throw new Error('No prompt found in task payloads');
 
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
+    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const finalPrompt = `${contextPrefix}${prompt}`;
+
   // Clone
   statusRef.value = `Cloning ${owner}/${repo}...`;
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
@@ -263,7 +269,7 @@ async function handleCreate(
 
   // Run Claude
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(prompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPrompt, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -360,13 +366,30 @@ async function handleReview(
 
   if (!branch || !prNumber) throw new Error('Review task missing branch or pr_number');
 
+  // Read review iteration from task context
+  const iteration = (task.context as any)?.review_loop?.iteration || 1;
+
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
-  sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch}\n`);
+  sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['clone', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
   git(['checkout', branch]);
+
+  // Fetch PR metadata (title + body) from GitHub API — best-effort
+  let prTitle = '';
+  let prBody = '';
+  try {
+    const prRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+      headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
+    });
+    if (prRes.ok) {
+      const prData = await prRes.json() as { title?: string; body?: string };
+      prTitle = prData.title || '';
+      prBody = prData.body || '';
+    }
+  } catch { /* best-effort, continue without PR metadata */ }
 
   // Get a summary of changed files for context
   let changedFiles = '';
@@ -374,10 +397,15 @@ async function handleReview(
     changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
   } catch { changedFiles = '(could not generate file list)'; }
 
+  // Build iteration preamble
+  const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
+
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPrompt = `You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
-${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}Files changed in this PR:
+${iterationPreamble}
+
+${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}
 
 You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
@@ -777,17 +805,20 @@ Instructions:
     "priority": "high",
     "related_files": ["path/to/file1.py"],
     "depends_on_indices": [],
-    "direction_id": "d-1 or null if self-discovered"
+    "direction_id": "d-1 or null if self-discovered",
+    "model": "claude-opus-4-6 | claude-sonnet-4-6 | null (use project default)",
+    "effort": "high | medium | low | null (use project default)"
   }
 ]
 
 Valid values:
-- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs
+- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate
   (use "research" when an area needs deeper investigation before implementation)
   (use "security_audit" when the finding involves security vulnerabilities that need a dedicated audit)
   (use "qa" when the finding is about missing test coverage)
   (use "deps" when the finding is about outdated or insecure dependencies)
   (use "docs" when the finding is about missing or outdated documentation)
+  (use "migrate" when the finding requires a database schema migration via Alembic)
 - scope: small (single file, under 50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural, orchestrator/model/agent/security changes — anything that could break the system if done wrong)
 - risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
 - priority: high, medium, low
@@ -803,12 +834,14 @@ Rules:
 - For type=qa findings, the prompt should describe what to test — it will spawn a dedicated QA agent
 - For type=deps findings, the prompt can be minimal (e.g. 'Update dependencies') — it will spawn a dedicated dependency update agent
 - For type=docs findings, the prompt can be minimal (e.g. 'Update documentation') — it will spawn a dedicated documentation agent
+- Use model=claude-opus-4-6 and effort=high only for complex architectural changes. Leave null for most findings to use the project default.
 
 How your findings get routed (you control this via type and scope):
 - type=security_audit → spawns a **security audit** agent that scans for vulnerabilities and auto-spawns fix tasks for critical/high findings
 - type=qa → spawns a **QA** agent that generates missing tests and opens a PR
 - type=deps → spawns a **dependency updater** agent that checks for outdated/insecure deps and opens a PR
 - type=docs → spawns a **docs** agent that generates/updates documentation and opens a PR
+- type=migrate → spawns a **migration** agent that generates Alembic migrations and opens a PR
 - type=research → spawns another **research** agent for deeper investigation before any implementation
 - type=improvement/bug/refactor/feature/test with scope=large → spawns a **plan** agent that decomposes into subtasks
 - type=improvement/bug/refactor/feature/test with scope=small or medium → spawns a **create** agent (single PR)
@@ -861,7 +894,8 @@ Approach:
 // ── Handler: Docs (analyze codebase, generate/update documentation, open PR) ─
 async function handleDocs(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
   if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
@@ -901,7 +935,7 @@ Steps:
 Be thorough but precise. Every statement in the documentation must reflect the actual code.`;
 
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(docsPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(docsPrompt, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -961,7 +995,8 @@ Be thorough but precise. Every statement in the documentation must reflect the a
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
 async function handleSecurityAudit(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
   if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
@@ -1011,7 +1046,7 @@ Rules:
 - Also output the same JSON array as the final output in your logs.`;
 
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt, ws, statusRef, model, effort);
 
   let logs = '';
   const fs = await import('fs');
@@ -1044,7 +1079,8 @@ Rules:
 // ── Handler: QA (analyze coverage, generate tests, open PR) ─────────────────
 async function handleQA(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const rawPrompt = String(payload.prompt || payload.description || task.description || '');
   const rawBaseBranch = String(payload.base_branch || 'main');
@@ -1087,7 +1123,7 @@ IMPORTANT RULES:
 
   // Run Claude
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(qaPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(qaPrompt, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1146,7 +1182,8 @@ IMPORTANT RULES:
 // ── Handler: Deps (update dependencies to latest minor/patch versions) ─────
 async function handleDeps(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const rawBaseBranch = String(payload.base_branch || 'main');
   if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
@@ -1202,7 +1239,7 @@ Steps to follow:
 IMPORTANT: Only update minor/patch versions. If a package would require a major version bump to get any update, skip it. Focus on security patches and bug fixes.`;
 
   statusRef.value = 'Running dependency updates...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(depsPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(depsPrompt, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -1260,6 +1297,134 @@ IMPORTANT: Only update minor/patch versions. If a package would require a major 
   }
 }
 
+// ── Handler: Migrate (Alembic/SQLAlchemy database migration workflow) ────────
+async function handleMigrate(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
+  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawTitle = String(task.title || payload.title || 'database migration');
+  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
+
+  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
+  const baseBranch = rawBaseBranch;
+  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
+  if (!prompt) throw new Error('No prompt found in task payloads');
+
+  // Clone
+  statusRef.value = `Cloning ${owner}/${repo}...`;
+  sendLog(ws, `Cloning ${owner}/${repo}...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', 'Blueprint Agent']);
+
+  const shortId = taskId.replace(/-/g, '').slice(0, 8);
+  const workBranch = `blueprint/migrate-${shortId}`;
+  git(['checkout', '-b', workBranch]);
+  sendLog(ws, `Working branch: ${workBranch}\n`);
+
+  const migratePrompt = `You are a database migration agent specializing in Alembic and SQLAlchemy/SQLModel workflows.
+
+Your task: ${prompt}
+
+Follow these steps precisely:
+
+1. **Examine existing migrations**: Look at \`backend/alembic/versions/\` to understand naming conventions, import patterns, and how previous migrations are structured. Note the revision ID format, how dependencies are chained, and any project-specific patterns.
+
+2. **Make model changes**: Apply the requested SQLModel/SQLAlchemy model changes in the appropriate files (typically under \`backend/app/models/\` or similar). Do NOT manually write migration files — autogenerate will handle that.
+
+3. **Generate migration**: Run \`alembic revision --autogenerate -m "description"\` from the backend directory (where alembic.ini lives). Use a concise, snake_case description that matches existing naming conventions.
+
+   IMPORTANT: Do NOT hand-edit the generated migration file unless autogenerate produced clearly incorrect output (e.g., dropped the wrong table, missed an index, used wrong column type). If you must edit, add a comment explaining why.
+
+4. **Review the generated migration**: Open and carefully read the generated file. Check for:
+   - Data loss risks (e.g., \`DROP COLUMN\`, \`DROP TABLE\`, type changes that truncate data)
+   - Missing indexes on foreign keys or frequently-queried columns
+   - Incorrect \`nullable\` settings
+   - Server defaults that should be included for backfills
+   - \`op.execute()\` statements needed for data migrations
+   If you find issues, fix them and document your changes with inline comments.
+
+5. **Test the migration applies cleanly**: Run \`alembic upgrade head\` to verify the migration applies without errors. If it fails:
+   - Read the error carefully
+   - Fix the migration file (add a comment explaining the manual fix)
+   - Run \`alembic upgrade head\` again
+   - Repeat until it succeeds
+
+6. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
+
+7. Once migration applies cleanly, the files should be modified. Do NOT commit — the agent harness will handle the commit.
+
+CRITICAL RULES:
+- Never delete or modify existing migration files in \`backend/alembic/versions/\` (except the one you just generated)
+- Never run \`alembic stamp\` or \`alembic downgrade base\` — these can corrupt production databases
+- If autogenerate produces an empty migration with no changes, verify that your model changes were saved and the alembic env.py is configured to detect them
+- Document any data loss risks prominently using inline comments in the migration file`;
+
+  statusRef.value = 'Running migration workflow...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migratePrompt, ws, statusRef, model, effort);
+
+  const diff = git(['status', '--porcelain']);
+  const hasChanges = diff.length > 0;
+
+  if (hasChanges && exitCode === 0) {
+    statusRef.value = 'Pushing changes...';
+    sendLog(ws, '\nCommitting and pushing migration changes...\n');
+
+    git(['add', '-A']);
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+
+    // Rebase onto latest base branch before push
+    statusRef.value = `Rebasing onto ${baseBranch}...`;
+    try {
+      git(['fetch', 'origin', baseBranch]);
+      git(['rebase', `origin/${baseBranch}`]);
+      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
+    } catch {
+      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
+      try { git(['rebase', '--abort']); } catch {}
+    }
+
+    const commitHash = git(['rev-parse', 'HEAD']);
+
+    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
+    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+    git(['push', 'origin', workBranch]);
+    sendLog(ws, `Pushed to branch: ${workBranch}\n`);
+
+    statusRef.value = 'Creating pull request...';
+    let prUrl = '';
+    try {
+      const prBody = lastResultText
+        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
+        : `Database migration: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
+      const prRes = await apiPost('/api/agent/github/pull-requests', {
+        task_id: taskId, owner, repo, title: `migrate: ${taskTitle}`,
+        head: workBranch, base: baseBranch, body: prBody,
+      });
+      prUrl = prRes.data?.html_url || '';
+      sendLog(ws, `PR created: ${prUrl}\n`);
+    } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
+
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
+      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else if (exitCode === 0) {
+    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No migration changes generated.' });
+  } else {
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+    });
+  }
+}
+
 // ── Handler Registry ────────────────────────────────────────────────────────
 type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1267,8 +1432,140 @@ type Handler = (
   model?: string, effort?: string
 ) => Promise<void>;
 
+// ── Handler: Refactor (improve code quality without changing behavior) ────────
+async function handleRefactor(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
+  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawTitle = String(task.title || payload.title || 'refactor');
+
+  if (!/^[a-zA-Z0-9_./-]+$/.test(rawBaseBranch)) throw new Error(`Invalid base_branch: ${rawBaseBranch}`);
+  const baseBranch = rawBaseBranch;
+  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
+  if (!rawPrompt) throw new Error('No prompt found in task payloads');
+
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
+    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+
+  const refactorPrompt = `${contextPrefix}REFACTOR TASK — STRICT CONSTRAINTS:
+- Do NOT add new features or new behavior.
+- Do NOT change any observable behavior, API contracts, or public interfaces.
+- Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).
+- Run the existing test suite BEFORE making any changes to establish a baseline. If tests fail before you start, report them and do not proceed.
+- Make your refactor changes.
+- Run the test suite AGAIN after your changes. All tests that passed before must still pass. If any test regresses, revert or fix the regression before committing.
+- Keep the diff minimal — only change what is necessary for the chosen refactor concern.
+
+Task: ${task.title ? task.title : 'Refactor'}
+
+${rawPrompt}`;
+
+  // Clone
+  statusRef.value = `Cloning ${owner}/${repo}...`;
+  sendLog(ws, `Cloning ${owner}/${repo}...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+
+  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', 'Blueprint Agent']);
+
+  const shortId = taskId.replace(/-/g, '').slice(0, 8);
+  const workBranch = `blueprint/refactor-${shortId}`;
+  git(['checkout', '-b', workBranch]);
+  sendLog(ws, `Working branch: ${workBranch}\n`);
+
+  // Run Claude
+  statusRef.value = 'Running Claude Code...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(refactorPrompt, ws, statusRef, model, effort);
+
+  const diff = git(['status', '--porcelain']);
+  const hasChanges = diff.length > 0;
+
+  if (hasChanges && exitCode === 0) {
+    statusRef.value = 'Pushing changes...';
+    sendLog(ws, '\nCommitting and pushing changes...\n');
+    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+    await lintFixLoop(changedPaths, ws, statusRef, 'the refactored code', model, effort);
+
+    git(['add', '-A']);
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `refactor: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+
+    statusRef.value = `Rebasing onto ${baseBranch}...`;
+    try {
+      git(['fetch', 'origin', baseBranch]);
+      git(['rebase', `origin/${baseBranch}`]);
+      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
+    } catch {
+      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is, review pipeline will handle\n`);
+      try { git(['rebase', '--abort']); } catch {}
+    }
+
+    try {
+      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      if (markers) {
+        sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
+        try { git(['rebase', '--abort']); } catch {}
+      }
+    } catch { /* no markers found */ }
+
+    try {
+      runProjectLintChecks(changedPaths, ws);
+    } catch (postRebaseLintErr: unknown) {
+      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
+      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
+      await runClaudeCode(
+        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
+        ws, statusRef, model, effort
+      );
+      git(['add', '-A']);
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'refactor: fix post-rebase lint errors'], { encoding: 'utf-8' });
+    }
+
+    const commitHash = git(['rev-parse', 'HEAD']);
+
+    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
+    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+    git(['push', 'origin', workBranch]);
+    sendLog(ws, `Pushed to branch: ${workBranch}\n`);
+
+    statusRef.value = 'Creating pull request...';
+    let prUrl = '';
+    try {
+      const prBody = lastResultText
+        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
+        : `Refactor: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
+      const prRes = await apiPost('/api/agent/github/pull-requests', {
+        task_id: taskId, owner, repo, title: `refactor: ${taskTitle}`,
+        head: workBranch, base: baseBranch, body: prBody,
+      });
+      prUrl = prRes.data?.html_url || '';
+      sendLog(ws, `PR created: ${prUrl}\n`);
+    } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
+
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
+      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else if (exitCode === 0) {
+    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No file changes.' });
+  } else {
+    await apiPost('/api/agent/status', {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+    });
+  }
+}
+
+// ── Handler Registry ────────────────────────────────────────────────────────
 const handlers: Record<string, Handler> = {
   create: handleCreate,
+  refactor: handleRefactor,
   review: handleReview,
   fix: handleFix,
   plan: handlePlan,
@@ -1277,6 +1574,7 @@ const handlers: Record<string, Handler> = {
   qa: handleQA,
   deps: handleDeps,
   docs: handleDocs,
+  migrate: handleMigrate,
 };
 
 // ── Main ────────────────────────────────────────────────────────────────────

@@ -184,6 +184,9 @@ class DeploymentState(SQLModel, table=True):
     runtime_max_concurrent_vms: Optional[int] = Field(default=None)
     runtime_max_retries: Optional[int] = Field(default=None)
     runtime_max_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
+    runtime_autonomous_research_interval_minutes: Optional[int] = Field(default=None)
+    runtime_autonomous_research_model: Optional[str] = Field(default=None)
+    runtime_autonomous_research_effort: Optional[str] = Field(default=None)
 
 
 class MaxPlanAccount(SQLModel, table=True):

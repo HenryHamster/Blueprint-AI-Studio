@@ -202,6 +202,12 @@ async def _init_deployment_state():
             _runtime_config["max_retries"] = state.runtime_max_retries
         if state.runtime_max_autonomous_tasks_per_hour is not None:
             _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
+        if state.runtime_autonomous_research_interval_minutes is not None:
+            _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
+        if state.runtime_autonomous_research_model is not None:
+            _runtime_config["autonomous_research_model"] = state.runtime_autonomous_research_model
+        if state.runtime_autonomous_research_effort is not None:
+            _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
@@ -524,15 +530,20 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )).scalars().first()
     base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
 
+    research_model = _runtime_config.get("autonomous_research_model") or None
+    research_effort = _runtime_config.get("autonomous_research_effort") or None
+    research_payload: dict = {
+        "type": "research",
+        "directions": active_directions,
+        "base_branch": base_branch,
+        **({"model": research_model} if research_model else {}),
+        **({"effort": research_effort} if research_effort else {}),
+    }
     new_task = Task(
         project_id=project.id,
         title="Research: autonomous improvement scan",
         description="Automated research task triggered by autonomous loop",
-        payloads=[{
-            "type": "research",
-            "directions": active_directions,
-            "base_branch": base_branch,
-        }],
+        payloads=[research_payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -585,7 +596,8 @@ async def _check_autonomous_research(owner: str, repo: str):
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     now = datetime.now(timezone.utc)
-    if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=30):
+    interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
+    if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=interval_minutes):
         return
     _shared_state.last_idle_check = now
 
@@ -2406,8 +2418,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
 
     # First pass: create all child tasks
+    parent_payload = (task.payloads or [{}])[0]
+    model = parent_payload.get('model')
+    effort = parent_payload.get('effort')
     child_tasks = []
     for subtask_def in subtasks:
+        related_files = subtask_def.get("related_files", [])
+        prompt_text = subtask_def.get("prompt", "")
+        full_prompt = prompt_text + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt_text
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),
@@ -2415,13 +2433,16 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             parent_task_id=task.id,
             payloads=[{
                 "type": "create",
-                "prompt": subtask_def.get("prompt", ""),
+                "prompt": full_prompt,
                 "base_branch": plan_branch,
+                **({"model": model} if model else {}),
+                **({"effort": effort} if effort else {}),
             }],
             context={
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
                 "scope": "small",  # Plan subtasks are pre-decomposed
+                "related_files": related_files,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
@@ -2616,14 +2637,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         finding_type = finding.get("type", "improvement")
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
-        elif finding_type in ("security_audit", "qa", "deps", "docs"):
+        elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate"):
             task_type = finding_type  # spawn specialized agent
+        elif finding_type == "refactor":
+            task_type = "refactor"  # code quality improvement, no behavior change
         elif scope == "large":
             task_type = "plan"     # large scope needs decomposition
         else:
             task_type = "create"   # small/medium scope is single-PR work
         needs_approval = risk == "high"
 
+        direction_id = finding.get("direction_id")
+        finding_model = finding.get('model')
+        finding_effort = finding.get('effort')
+
+        related_files = finding.get("related_files", [])
+        full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -2631,8 +2660,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             parent_task_id=task.id,
             payloads=[{
                 "type": task_type,
-                "prompt": prompt,
+                "prompt": full_prompt,
                 "base_branch": research_branch,
+                **(({'model': finding_model} if finding_model else {})),
+                **(({'effort': finding_effort} if finding_effort else {})),
             }],
             context={
                 "research_task_id": str(task.id),
@@ -2642,6 +2673,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_branch": research_branch,
                 "original_base": original_base,
                 "research_depth": research_depth + 1,
+                "related_files": related_files,
+                **({"direction_id": direction_id} if direction_id else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
             status=TaskStatus.QUEUED,
@@ -2793,9 +2826,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
 
-    # Consider create, plan, research, and specialized agent tasks for rollup decisions.
+    # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
-    ROLLUP_TYPES = {"create", "", "plan", "research", "security_audit", "qa", "deps", "docs"}
+    ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs"}
     children = [c for c in all_children
                 if ((c.payloads or [{}])[0]).get("type", "create") in ROLLUP_TYPES]
 
@@ -3177,10 +3210,10 @@ async def update_agent_status(
             review_loop = (task.context or {}).get("review_loop", {})
 
             # Create task completed with PR → route based on target branch
-            if task_type in ("create", "docs", "qa", "deps", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
+            if task_type in ("create", "refactor", "docs", "qa", "deps", "migrate", "") and payload.pr_url and payload.artifact_type == ArtifactType.PULL_REQUEST:
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
                 short_id = str(task.id).replace('-', '')[:8]
-                branch = f"blueprint/docs-{short_id}" if task_type == "docs" else f"blueprint/deps-{short_id}" if task_type == "deps" else f"blueprint/task-{short_id}"
+                branch = f"blueprint/docs-{short_id}" if task_type == "docs" else f"blueprint/deps-{short_id}" if task_type == "deps" else f"blueprint/migrate-{short_id}" if task_type == "migrate" else f"blueprint/refactor-{short_id}" if task_type == "refactor" else f"blueprint/task-{short_id}"
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
                 is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
