@@ -600,7 +600,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
       </div>
 
-      {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') ? (
+      {task.requires_approval && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(task.status) ? (
         <div className={`flex flex-col gap-2 ${compact ? 'mt-2' : 'mt-4'}`}>
           <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-md font-semibold transition-colors flex items-center justify-center gap-2 ${compact ? 'py-1.5 text-xs' : 'py-2.5 text-sm'} ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'approve' ? <Activity className={compact ? 'w-3.5 h-3.5 animate-spin' : 'w-4 h-4 animate-spin'} /> : <CheckCircle className={compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} />} Approve & Merge

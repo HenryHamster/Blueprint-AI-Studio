@@ -3209,7 +3209,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 task_type = "plan"     # large scope needs decomposition
             else:
                 task_type = "create"   # small/medium scope is single-PR work
-            needs_approval = risk == "high"
+            # Read-only task types (research, audits, QA) don't need approval — they don't modify code
+            READ_ONLY_TYPES = {"research", "security_audit", "qa", "perf"}
+            needs_approval = risk == "high" and task_type not in READ_ONLY_TYPES
 
             direction_id = finding.get("direction_id")
             finding_model = finding.get('model')
