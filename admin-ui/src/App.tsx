@@ -78,7 +78,8 @@ export default function App() {
 
   const filteredTasks = useMemo(() => s.tasks.filter(t => {
     const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-    const typeMatch = s.taskTypeFilter.includes(taskType);
+    const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
+    const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
     const statusMatch = s.statusFilter.includes(t.status);
     const query = s.searchQuery.toLowerCase();
     const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));

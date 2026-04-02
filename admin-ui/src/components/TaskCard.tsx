@@ -154,8 +154,8 @@ export function getHeartbeatStatus(lastHeartbeat?: string) {
 }
 
 export function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
-  if (!taskType || !(taskType in TASK_TYPE_STYLES)) return null;
-  const style = TASK_TYPE_STYLES[taskType];
+  if (!taskType) return null;
+  const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
   const Icon = style.icon;
   return (
     <span className={`${style.bg} ${style.text} border text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1`}>
