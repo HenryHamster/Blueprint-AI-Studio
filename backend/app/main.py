@@ -2393,6 +2393,8 @@ async def _spawn_pipeline_task(
         )
     )).scalars().all()
     for t in active_pipeline:
+        if t.id == source_task.id:
+            continue  # Don't block on ourselves
         t_payload = (t.payloads or [{}])[0]
         if t_payload.get("pr_number") == pr_number and t_payload.get("type") in ("review", "fix"):
             print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id} ({t_payload.get('type')})")
