@@ -632,8 +632,8 @@ export function useAppState() {
       const data = await res.json();
       addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
       fetchDeployState();
-    } catch (error) {
-      addToast(`Rollback failed: ${(error as Error).message}`, 'error');
+    } catch (error: unknown) {
+      addToast(`Rollback failed: ${error instanceof Error ? error.message : String(error)}`, 'error');
       throw error;
     }
   };

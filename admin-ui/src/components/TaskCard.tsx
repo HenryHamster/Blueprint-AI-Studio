@@ -126,6 +126,7 @@ export function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
 function ResearchFindings({ findings }: { findings: ResearchFinding[] }) {
   const [expanded, setExpanded] = useState(false);
 
+  if (!Array.isArray(findings)) return null;
   const items = expanded ? findings : findings.slice(0, 5);
   return (
     <div>

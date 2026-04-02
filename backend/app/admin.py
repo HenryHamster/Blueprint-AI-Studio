@@ -121,7 +121,12 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                 try:
                     parsed = json.loads(a.logs[:100000])
-                    research_map[str(a.task_id)] = parsed if isinstance(parsed, list) else parsed.get('logs', [])
+                    if isinstance(parsed, list):
+                        research_map[str(a.task_id)] = parsed
+                    elif isinstance(parsed, dict):
+                        logs = parsed.get('logs', [])
+                        if isinstance(logs, list):
+                            research_map[str(a.task_id)] = logs
                 except (json.JSONDecodeError, AttributeError):
                     pass
             if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:

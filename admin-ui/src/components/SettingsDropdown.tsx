@@ -12,6 +12,7 @@ export interface MaxPlanAccount {
   token_created_at: string | null;
 }
 
+
 interface SettingsDropdownProps {
   showSettings: boolean;
   onToggleSettings: () => void;
