@@ -1330,7 +1330,7 @@ async def create_direction_research_task(
     task_payload = {
         "type": "research",
         "directions": [direction],
-        "base_branch": project.base_branch or "main",
+        "base_branch": "main",
     }
     direction_text = direction.get("text", "")
     new_task = Task(
