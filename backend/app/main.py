@@ -2354,8 +2354,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
 
     # Cap findings to prevent runaway task creation
-    if len(findings) > 10:
-        findings = findings[:10]
+    if len(findings) > 30:
+        findings = findings[:30]
 
     original_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
