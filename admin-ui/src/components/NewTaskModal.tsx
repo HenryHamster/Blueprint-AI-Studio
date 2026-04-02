@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown } from 'lucide-react';
 
 interface NewTaskModalProps {
   newTaskRepo: string;
@@ -16,6 +16,12 @@ interface NewTaskModalProps {
   setNewTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => void;
   setNewTaskPrNumber: (value: string) => void;
   setNewTaskPrBranch: (value: string) => void;
+  newTaskModel: string;
+  newTaskEffort: string;
+  setNewTaskModel: (value: string) => void;
+  setNewTaskEffort: (value: string) => void;
+  getDefaultModelForType: (taskType: string) => string;
+  getDefaultEffortForType: (taskType: string) => string;
   repoOptions: Array<{ full_name: string; default_branch: string }>;
   repoLoading: boolean;
   repoError: string | null;
@@ -47,6 +53,12 @@ export function NewTaskModal({
   setNewTaskType,
   setNewTaskPrNumber,
   setNewTaskPrBranch,
+  newTaskModel,
+  newTaskEffort,
+  setNewTaskModel,
+  setNewTaskEffort,
+  getDefaultModelForType,
+  getDefaultEffortForType,
   repoOptions,
   repoLoading,
   repoError,
@@ -65,7 +77,14 @@ export function NewTaskModal({
   const [submitting, setSubmitting] = useState(false);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [prNumberError, setPrNumberError] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
+
+  const handleTaskTypeChange = (value: 'create' | 'plan' | 'research' | 'review' | 'fix') => {
+    setNewTaskType(value);
+    setNewTaskModel(getDefaultModelForType(value));
+    setNewTaskEffort(getDefaultEffortForType(value));
+  };
 
   const isPrNumberValid = (value: string) => /^[1-9]\d*$/.test(value);
 
@@ -197,7 +216,7 @@ export function NewTaskModal({
                 <button
                   key={opt.value}
                   type="button"
-                  onClick={() => setNewTaskType(opt.value)}
+                  onClick={() => handleTaskTypeChange(opt.value)}
                   className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                     newTaskType === opt.value
                       ? 'bg-white/5 border-neutral-600 text-neutral-100'
@@ -265,6 +284,46 @@ export function NewTaskModal({
               />
               <span className="text-[10px] text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
             </div>
+          </div>
+          <div className="mb-4">
+            <button
+              type="button"
+              onClick={() => setAdvancedOpen(o => !o)}
+              className="flex items-center gap-1 text-[11px] font-semibold text-neutral-500 hover:text-neutral-300 uppercase tracking-wider transition-colors"
+            >
+              <ChevronDown className={`w-3 h-3 transition-transform ${advancedOpen ? 'rotate-180' : ''}`} />
+              Advanced
+            </button>
+            {advancedOpen && (
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Model</label>
+                  <select
+                    value={newTaskModel}
+                    onChange={e => setNewTaskModel(e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  >
+                    <option value="">Default</option>
+                    <option value="claude-opus-4-5">claude-opus-4-5</option>
+                    <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
+                    <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Effort</label>
+                  <select
+                    value={newTaskEffort}
+                    onChange={e => setNewTaskEffort(e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                  >
+                    <option value="">Default</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </div>
+              </div>
+            )}
           </div>
           <div className="flex justify-end gap-2 items-center">
             {submitAttempted && (repoError || branchError) && (

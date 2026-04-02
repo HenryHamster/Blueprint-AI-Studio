@@ -141,7 +141,7 @@ function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
 /** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
 async function lintFixLoop(
   changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
-  context: string = 'the code you just wrote'
+  context: string = 'the code you just wrote', model?: string, effort?: string
 ): Promise<boolean> {
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
     try {
@@ -153,7 +153,7 @@ async function lintFixLoop(
       sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
       await runClaudeCode(
         `The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef
+        ws, statusRef, model, effort
       );
       git(['add', '-A']);
     }
@@ -163,7 +163,7 @@ async function lintFixLoop(
 }
 
 // ── Claude Code Runner (shared by all handlers) ─────────────────────────────
-async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }): Promise<{
+async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
   let allOutput = '';
@@ -186,9 +186,10 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
       claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
     }
 
-    const claude = spawn('claude', [
-      '-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions',
-    ], { cwd: WORKSPACE, env: claudeEnv });
+    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+    if (model) args.push('--model', model);
+    if (effort) args.push('--effort', effort);
+    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv });
 
     claude.stdout.on('data', (data: Buffer) => {
       const text = data.toString();
@@ -231,7 +232,8 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────
 async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const rawPrompt = String(payload.prompt || payload.description || task.description || '');
   const rawBaseBranch = String(payload.base_branch || 'main');
@@ -261,7 +263,7 @@ async function handleCreate(
 
   // Run Claude
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(prompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(prompt, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -271,7 +273,7 @@ async function handleCreate(
     sendLog(ws, '\nCommitting and pushing changes...\n');
     // Run lint/build checks before committing — retry up to 3 times with Claude fixes
     const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-    await lintFixLoop(changedPaths, ws, statusRef);
+    await lintFixLoop(changedPaths, ws, statusRef, 'the code you just wrote', model, effort);
 
     git(['add', '-A']);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
@@ -304,7 +306,7 @@ async function handleCreate(
       sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
       await runClaudeCode(
         `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef
+        ws, statusRef, model, effort
       );
       git(['add', '-A']);
       execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: fix post-rebase lint errors'], { encoding: 'utf-8' });
@@ -348,7 +350,8 @@ async function handleCreate(
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
 async function handleReview(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const prNumber = payload.pr_number as number;
   const branch = String(payload.branch || '');
@@ -396,7 +399,7 @@ If changes are needed before merging:
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running code review...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort);
 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
   const fs = await import('fs');
@@ -434,7 +437,8 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the 
 // ── Handler: Fix (address review feedback on existing PR branch) ─────────────
 async function handleFix(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const branch = String(payload.branch || '');
   const baseBranch = String(payload.base_branch || 'main');
@@ -498,14 +502,14 @@ async function handleFix(
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
-  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef);
+  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort);
 
   // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);
   if (diff.length > 0 && exitCode === 0) {
     // Run lint/build checks before committing — retry up to 3 times with Claude fixes
     const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied');
+    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort);
 
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -544,7 +548,7 @@ async function handleFix(
       sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
       await runClaudeCode(
         `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef
+        ws, statusRef, model, effort
       );
       git(['add', '-A']);
       const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -632,7 +636,8 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const prompt = String(payload.prompt || payload.description || task.description || '');
   const baseBranch = String(payload.base_branch || 'main');
@@ -693,7 +698,7 @@ Rules:
 - IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running Claude Code for planning...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort);
 
   // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
@@ -727,7 +732,8 @@ Rules:
 // ── Handler: Research (analyze codebase, output improvement findings) ──────
 async function handleResearch(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) {
   const directions = payload.directions as Array<Record<string, unknown>> || [];
   const baseBranch = String(payload.base_branch || 'main');
@@ -821,7 +827,7 @@ Approach:
 - Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.`;
 
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt, ws, statusRef, model, effort);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
@@ -1257,7 +1263,8 @@ IMPORTANT: Only update minor/patch versions. If a package would require a major 
 // ── Handler Registry ────────────────────────────────────────────────────────
 type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string }
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
 ) => Promise<void>;
 
 const handlers: Record<string, Handler> = {
@@ -1290,6 +1297,8 @@ async function main() {
   const payloads = task.payloads || [];
   const payload = payloads[0] || {};
   const taskType = String(payload.type || 'create');
+  const model = payload.model ? String(payload.model) : undefined;
+  const effort = payload.effort ? String(payload.effort) : undefined;
   log(`Claimed task ${taskId} (type: ${taskType}): "${task.title}"`);
 
   // Start heartbeat & log stream
@@ -1308,7 +1317,7 @@ async function main() {
     // Dispatch to handler
     const handler = handlers[taskType];
     if (!handler) throw new Error(`Unknown task type: ${taskType}`);
-    await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef);
+    await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     sendLog(ws, '\nTask completed.\n');
 
   } catch (error) {

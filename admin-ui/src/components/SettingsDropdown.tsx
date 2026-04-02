@@ -82,6 +82,16 @@ const REFRESH_PRESETS = [
 const PAGE_PRESETS = [25, 50, 100, 200];
 const ALL_PAGE_SIZE = 10000;
 
+const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix'] as const;
+type TaskType = typeof TASK_TYPES[number];
+const TASK_TYPE_MODEL_DEFAULTS: Record<TaskType, string> = {
+  plan: 'claude-opus-4-5',
+  research: 'claude-opus-4-5',
+  create: 'claude-sonnet-4-5',
+  fix: 'claude-sonnet-4-5',
+  review: 'claude-sonnet-4-5',
+};
+
 export function SettingsDropdown({
   showSettings,
   onToggleSettings,
@@ -132,6 +142,30 @@ export function SettingsDropdown({
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [refreshInputVal, setRefreshInputVal] = useState('');
   const [pageSizeInputVal, setPageSizeInputVal] = useState('');
+
+  // Global model/effort defaults
+  const [defaultModel, setDefaultModel] = useState<string>(
+    () => JSON.parse(localStorage.getItem('blueprint-admin:defaultModel') ?? 'null') ?? ''
+  );
+  const [defaultEffort, setDefaultEffort] = useState<string>(
+    () => JSON.parse(localStorage.getItem('blueprint-admin:defaultEffort') ?? 'null') ?? ''
+  );
+
+  // Per-task-type overrides
+  const [taskTypeModels, setTaskTypeModels] = useState<Record<TaskType, string>>(() => {
+    const result = {} as Record<TaskType, string>;
+    for (const t of ['create', 'plan', 'research', 'review', 'fix'] as TaskType[]) {
+      result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
+    }
+    return result;
+  });
+  const [taskTypeEfforts, setTaskTypeEfforts] = useState<Record<TaskType, string>>(() => {
+    const result = {} as Record<TaskType, string>;
+    for (const t of ['create', 'plan', 'research', 'review', 'fix'] as TaskType[]) {
+      result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
+    }
+    return result;
+  });
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
@@ -184,6 +218,80 @@ export function SettingsDropdown({
               <span>{viewMode === 'kanban' ? 'Kanban' : 'Pipeline'}</span>
               <span className="text-neutral-500 text-xs">Click to toggle</span>
             </button>
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default Model</label>
+            <select
+              value={defaultModel}
+              onChange={e => {
+                setDefaultModel(e.target.value);
+                localStorage.setItem('blueprint-admin:defaultModel', JSON.stringify(e.target.value));
+              }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="">Orchestrator default</option>
+              <option value="claude-opus-4-5">claude-opus-4-5</option>
+              <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
+              <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+            </select>
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default Effort</label>
+            <select
+              value={defaultEffort}
+              onChange={e => {
+                setDefaultEffort(e.target.value);
+                localStorage.setItem('blueprint-admin:defaultEffort', JSON.stringify(e.target.value));
+              }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="">Orchestrator default</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Per-Task-Type Overrides</h4>
+            <div className="space-y-2">
+              {TASK_TYPES.map(type => (
+                <div key={type} className="bg-neutral-950 border border-neutral-800 rounded px-2 py-2">
+                  <div className="text-[11px] font-medium text-neutral-300 capitalize mb-1.5">{type}</div>
+                  <div className="flex gap-2">
+                    <select
+                      value={taskTypeModels[type]}
+                      onChange={e => {
+                        const val = e.target.value;
+                        setTaskTypeModels(prev => ({ ...prev, [type]: val }));
+                        localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
+                      }}
+                      className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                    >
+                      <option value="">{TASK_TYPE_MODEL_DEFAULTS[type]} (default)</option>
+                      <option value="claude-opus-4-5">claude-opus-4-5</option>
+                      <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
+                      <option value="claude-haiku-4-5">claude-haiku-4-5</option>
+                    </select>
+                    <select
+                      value={taskTypeEfforts[type]}
+                      onChange={e => {
+                        const val = e.target.value;
+                        setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
+                        localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
+                      }}
+                      className="w-24 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                    >
+                      <option value="">effort</option>
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                    </select>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="border-t border-neutral-800 pt-3 mb-4">

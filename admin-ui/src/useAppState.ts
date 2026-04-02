@@ -75,6 +75,8 @@ export function useAppState() {
   const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research' | 'review' | 'fix'>('create');
   const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
   const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
+  const [newTaskModel, setNewTaskModel] = useState('');
+  const [newTaskEffort, setNewTaskEffort] = useState('');
 
   // GitHub repo/branch dropdown state
   interface RepoOption { full_name: string; default_branch: string; }
@@ -933,9 +935,21 @@ export function useAppState() {
     }
   };
 
+  const getDefaultModelForType = (taskType: string) => {
+    return JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${taskType}`) ?? 'null') ??
+      JSON.parse(localStorage.getItem('blueprint-admin:defaultModel') ?? 'null') ?? '';
+  };
+
+  const getDefaultEffortForType = (taskType: string) => {
+    return JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${taskType}`) ?? 'null') ??
+      JSON.parse(localStorage.getItem('blueprint-admin:defaultEffort') ?? 'null') ?? '';
+  };
+
   const openNewTaskModal = () => {
     setShowNewTaskModal(true);
     setNewTaskType(defaultTaskType);
+    setNewTaskModel(getDefaultModelForType(defaultTaskType));
+    setNewTaskEffort(getDefaultEffortForType(defaultTaskType));
     setUseManualRepo(false);
     setUseManualBranch(false);
     setBranchOptions([]);
@@ -985,6 +999,8 @@ export function useAppState() {
             pr_number: parseInt(newTaskPrNumber, 10),
             branch: newTaskPrBranch || undefined,
           } : {}),
+          ...(newTaskModel ? { model: newTaskModel } : {}),
+          ...(newTaskEffort ? { effort: newTaskEffort } : {}),
         }),
       });
       if (!res.ok) {
@@ -1223,12 +1239,12 @@ export function useAppState() {
     // New task modal
     showNewTaskModal, setShowNewTaskModal,
     newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
-    newTaskPrNumber, newTaskPrBranch,
+    newTaskPrNumber, newTaskPrBranch, newTaskModel, newTaskEffort,
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
-    setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch,
+    setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, handleRepoChange, handleCreateTask,
+    openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,

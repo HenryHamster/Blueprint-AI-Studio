@@ -367,6 +367,8 @@ class CreateTaskPayload(BaseModel):
     task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix|security_audit|qa|deps|docs)$")
     pr_number: Optional[int] = None
     branch: Optional[str] = None
+    model: Optional[str] = Field(default=None, min_length=1)
+    effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high)$")
 
 
 @router.post("/tasks")
@@ -408,6 +410,10 @@ async def create_task_manually(
         "prompt": payload.prompt,
         "base_branch": payload.base_branch,
     }
+    if payload.model is not None:
+        task_payload["model"] = payload.model
+    if payload.effort is not None:
+        task_payload["effort"] = payload.effort
     # Review/fix tasks need pr_number and branch
     if payload.task_type in ("review", "fix") and payload.pr_number:
         task_payload["pr_number"] = payload.pr_number

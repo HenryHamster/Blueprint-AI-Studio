@@ -345,6 +345,12 @@ export default function App() {
           setNewTaskType={s.setNewTaskType}
           setNewTaskPrNumber={s.setNewTaskPrNumber}
           setNewTaskPrBranch={s.setNewTaskPrBranch}
+          newTaskModel={s.newTaskModel}
+          newTaskEffort={s.newTaskEffort}
+          setNewTaskModel={s.setNewTaskModel}
+          setNewTaskEffort={s.setNewTaskEffort}
+          getDefaultModelForType={s.getDefaultModelForType}
+          getDefaultEffortForType={s.getDefaultEffortForType}
           repoOptions={s.repoOptions}
           repoLoading={s.repoLoading}
           repoError={s.repoError}
