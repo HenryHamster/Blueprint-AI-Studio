@@ -180,6 +180,10 @@ class DeploymentState(SQLModel, table=True):
     paused_at: Optional[datetime] = Field(default=None)
     # Pre-deploy saved max_concurrent_vms for PAUSE mode restore
     pre_pause_max_vms: Optional[int] = Field(default=None)
+    # Persisted runtime config — restored on startup so settings survive restarts
+    runtime_max_concurrent_vms: Optional[int] = Field(default=None)
+    runtime_max_retries: Optional[int] = Field(default=None)
+    runtime_max_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
 
 
 class MaxPlanAccount(SQLModel, table=True):

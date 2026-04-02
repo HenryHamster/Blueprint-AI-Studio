@@ -825,6 +825,7 @@ async def get_settings(
 @router.patch("/settings")
 async def update_settings(
     payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     from app.shared_state import runtime_config as _runtime_config
@@ -852,6 +853,19 @@ async def update_settings(
         if not (1 <= val <= 50):
             raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be between 1 and 50")
         _runtime_config["max_autonomous_tasks_per_hour"] = val
+
+    # Persist to DB so values survive Cloud Run restarts (only fields present in payload)
+    state = await session.get(DeploymentState, 1)
+    if state:
+        if "max_concurrent_vms" in payload:
+            state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
+        if "max_retries" in payload:
+            state.runtime_max_retries = _runtime_config["max_retries"]
+        if "max_autonomous_tasks_per_hour" in payload:
+            state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
+        session.add(state)
+        await session.commit()
+
     return _runtime_config
 
 
@@ -1478,6 +1492,9 @@ async def resume_pipeline(
     await session.commit()
 
     runtime_config["max_concurrent_vms"] = restore_vms
+    state.runtime_max_concurrent_vms = restore_vms
+    session.add(state)
+    await session.commit()
     print(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
     return {"status": "resumed", "max_concurrent_vms": restore_vms}
 

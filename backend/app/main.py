@@ -195,6 +195,17 @@ async def _init_deployment_state():
             print(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
             return
 
+        # Restore persisted runtime config values so settings survive restarts
+        if state.runtime_max_concurrent_vms is not None:
+            _runtime_config["max_concurrent_vms"] = state.runtime_max_concurrent_vms
+        if state.runtime_max_retries is not None:
+            _runtime_config["max_retries"] = state.runtime_max_retries
+        if state.runtime_max_autonomous_tasks_per_hour is not None:
+            _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
+        # Respect paused/halted state — these override the persisted value
+        if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+            _runtime_config["max_concurrent_vms"] = 0
+
         if state.current_revision == _current_revision:
             # Same revision — normal restart (cold start, scale event, etc.)
             print(f"[DEPLOY] Normal restart — same revision {_current_revision}, status={state.status}")
