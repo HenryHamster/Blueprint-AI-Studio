@@ -580,6 +580,55 @@ async function handleFix(
   }
 }
 
+// ── Shared: Format project_context into a markdown section ────────────────
+function formatProjectContext(ctx: Record<string, unknown>): string {
+  const lines: string[] = [
+    '## Project Context',
+    'The following tasks are already active or completed in this project. Avoid duplicating their work.',
+    '',
+  ];
+
+  const activeTasks = ctx.active_tasks as Array<Record<string, unknown>> | undefined;
+  if (activeTasks && activeTasks.length > 0) {
+    lines.push('### Active Tasks');
+    for (const t of activeTasks) {
+      lines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 120)}`);
+    }
+    lines.push('');
+  }
+
+  const queuedTasks = ctx.queued_tasks as Array<Record<string, unknown>> | undefined;
+  if (queuedTasks && queuedTasks.length > 0) {
+    lines.push('### Queued Tasks');
+    for (const t of queuedTasks) {
+      lines.push(`- [${t.task_type}] **${t.title}** — ${String(t.prompt || '').slice(0, 120)}`);
+    }
+    lines.push('');
+  }
+
+  const recentTasks = ctx.recently_completed_tasks as Array<Record<string, unknown>> | undefined;
+  if (recentTasks && recentTasks.length > 0) {
+    lines.push('### Recently Completed Tasks');
+    for (const t of recentTasks) {
+      const pr = t.pr_url ? ` (${t.pr_url})` : '';
+      const summary = t.research_findings_summary ? ` — ${String(t.research_findings_summary).slice(0, 120)}` : '';
+      lines.push(`- [${t.task_type}] **${t.title}**${pr}${summary}`);
+    }
+    lines.push('');
+  }
+
+  const openPRs = ctx.open_prs as string[] | undefined;
+  if (openPRs && openPRs.length > 0) {
+    lines.push('### Open PRs');
+    for (const pr of openPRs) {
+      lines.push(`- ${pr}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -597,7 +646,12 @@ async function handlePlan(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
-  const planPrompt = `You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
+    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+
+  const planPrompt = `${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}
@@ -690,7 +744,12 @@ async function handleResearch(
     ? directions.map((d, i) => `${i + 1}. [${d.priority || 'medium'}] ${d.text} (id: ${d.id})`).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
-  const researchPrompt = `You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
+    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+
+  const researchPrompt = `${contextPrefix}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
 ${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
 ${directionsText}

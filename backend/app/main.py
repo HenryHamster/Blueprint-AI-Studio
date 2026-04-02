@@ -1860,13 +1860,118 @@ async def claim_task(
     
     # Strip internal fields (max_plan_account_id) from context before returning to agent
     safe_context = {k: v for k, v in (task.context or {}).items() if not k.startswith("max_plan_")}
-    return {
+    response = {
         "task_id": str(task.id),
         "title": task.title,
         "description": task.description,
         "payloads": task.payloads,
         "context": safe_context
     }
+
+    task_type = (task.payloads or [{}])[0].get("type", "")
+    if task_type in ("research", "plan"):
+        # Active tasks (IN_PROGRESS or EVALUATING) in the same project
+        active_stmt = select(Task).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+        )
+        active_tasks_rows = (await session.execute(active_stmt)).scalars().all()
+        active_tasks = []
+        for t in active_tasks_rows:
+            p = (t.payloads or [{}])[0]
+            active_tasks.append({
+                "id": str(t.id),
+                "title": t.title,
+                "task_type": p.get("type", ""),
+                "status": t.status,
+                "prompt": p.get("prompt", p.get("description", "")),
+            })
+
+        # Queued tasks in the same project
+        queued_stmt = select(Task).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.status == TaskStatus.QUEUED
+        )
+        queued_tasks_rows = (await session.execute(queued_stmt)).scalars().all()
+        queued_tasks = []
+        for t in queued_tasks_rows:
+            p = (t.payloads or [{}])[0]
+            queued_tasks.append({
+                "id": str(t.id),
+                "title": t.title,
+                "task_type": p.get("type", ""),
+                "prompt": p.get("prompt", p.get("description", "")),
+            })
+
+        # Recently completed tasks (10 most recent)
+        completed_stmt = select(Task).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.status == TaskStatus.COMPLETED
+        ).order_by(Task.created_at.desc()).limit(10)
+        completed_tasks_rows = (await session.execute(completed_stmt)).scalars().all()
+
+        completed_task_ids = [t.id for t in completed_tasks_rows]
+        completed_artifacts: list = []
+        if completed_task_ids:
+            art_stmt = select(Artifact).where(
+                Artifact.task_id.in_(completed_task_ids),
+                Artifact.artifact_type.in_([ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS])
+            )
+            completed_artifacts = (await session.execute(art_stmt)).scalars().all()
+
+        artifacts_by_completed_task: dict = {}
+        for a in completed_artifacts:
+            artifacts_by_completed_task.setdefault(a.task_id, []).append(a)
+
+        recently_completed_tasks = []
+        for t in completed_tasks_rows:
+            p = (t.payloads or [{}])[0]
+            task_artifacts = artifacts_by_completed_task.get(t.id, [])
+            pr_url = t.context.get("rollup_pr_url") if t.context else None
+            if not pr_url:
+                for a in task_artifacts:
+                    if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
+                        pr_url = a.pr_url
+                        break
+            research_findings_summary = None
+            for a in task_artifacts:
+                if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+                    research_findings_summary = a.logs[:2000]
+                    break
+            recently_completed_tasks.append({
+                "id": str(t.id),
+                "title": t.title,
+                "task_type": p.get("type", ""),
+                "pr_url": pr_url,
+                "research_findings_summary": research_findings_summary,
+            })
+
+        # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
+        open_prs_stmt = (
+            select(Artifact.pr_url)
+            .join(Task, Artifact.task_id == Task.id)
+            .where(
+                Task.project_id == task.project_id,
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                Artifact.pr_url.isnot(None),
+                Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+            )
+            .distinct()
+            .limit(20)
+        )
+        open_prs_rows = (await session.execute(open_prs_stmt)).scalars().all()
+
+        response["project_context"] = {
+            "active_tasks": active_tasks,
+            "queued_tasks": queued_tasks,
+            "recently_completed_tasks": recently_completed_tasks,
+            "open_prs": list(open_prs_rows),
+        }
+
+    return response
 
 @app.post("/api/agent/artifacts/upload-url")
 async def get_upload_url(
