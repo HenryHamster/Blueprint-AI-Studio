@@ -507,6 +507,10 @@ async def modify_task(
             task.status = new_status
             changes["status"] = new_status.value
 
+            # Clear approval flag on terminal statuses
+            if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
+                task.requires_approval = False
+
             # Delete VM and release account when cancelling an active task
             if new_status == TaskStatus.CANCELLED and task.vm_instance_id:
                 background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
