@@ -4,7 +4,11 @@ from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import Column, String, Integer, Index, text
 from sqlalchemy.dialects.postgresql import JSONB
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 class ProjectStatus(str, Enum):
     DRAFT = "DRAFT"
@@ -50,8 +54,8 @@ class UserIntegration(SQLModel, table=True):
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
     github_pat: Optional[str] = None
     
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
 
 class Project(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -60,7 +64,7 @@ class Project(SQLModel, table=True):
     status: ProjectStatus = Field(default=ProjectStatus.DRAFT, sa_column=Column(String, default=ProjectStatus.DRAFT))
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
     # Autonomous improvement: user-defined high-level directions for research agents
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
@@ -117,7 +121,7 @@ class Task(SQLModel, table=True):
     priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
 
     attempt_count: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
     started_at: Optional[datetime] = Field(default=None)
     archived: bool = Field(default=False)
     
@@ -142,7 +146,7 @@ class TaskHistory(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
     
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_utcnow)
     action: str # e.g., "STATUS_CHANGE", "SPLIT", "SPAWNED_CHILD", "MODIFIED_PAYLOAD"
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
     
@@ -154,13 +158,13 @@ from sqlalchemy import event
 @event.listens_for(Task.latest_status_message, "set")
 def _on_status_message_set(target: Task, value, oldvalue, initiator):
     if value and value != oldvalue:
-        entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
+        entry = {"t": datetime.now(timezone.utc).isoformat(), "msg": str(value)[:500]}
         target.status_log = (target.status_log or []) + [entry]
 
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
-        entry = {"t": datetime.utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
+        entry = {"t": datetime.now(timezone.utc).isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
         target.status_log = (target.status_log or []) + [entry]
 
 
@@ -176,7 +180,7 @@ class Alert(SQLModel, table=True):
     title: str
     message: str
     task_id: Optional[uuid.UUID] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
     dismissed_at: Optional[datetime] = None
 
 
@@ -195,7 +199,7 @@ class DeploymentState(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     current_revision: str = Field(default="")       # Cloud Run K_REVISION
     current_sha: str = Field(default="")             # git commit SHA
-    deployed_at: datetime = Field(default_factory=datetime.utcnow)
+    deployed_at: datetime = Field(default_factory=_utcnow)
     status: str = Field(default=DeploymentStatus.STABLE, sa_column=Column(String, default=DeploymentStatus.STABLE))
     last_known_good_revision: str = Field(default="")
     last_known_good_sha: str = Field(default="")
@@ -228,8 +232,8 @@ class MaxPlanAccount(SQLModel, table=True):
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
     token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
 
 
 class Artifact(SQLModel, table=True):
@@ -248,6 +252,6 @@ class Artifact(SQLModel, table=True):
     logs: Optional[str] = None
     
     iteration: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
     
     task: Task = Relationship(back_populates="artifacts")
