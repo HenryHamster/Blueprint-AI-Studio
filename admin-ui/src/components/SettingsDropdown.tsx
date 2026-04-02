@@ -326,7 +326,7 @@ export function SettingsDropdown({
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Settings</h4>
           </div>
           <div className="mb-4">
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (1-30)</label>
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (1-100)</label>
             <input
               type="number"
               min={1}
