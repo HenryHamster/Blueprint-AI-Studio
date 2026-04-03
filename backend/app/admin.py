@@ -624,11 +624,17 @@ async def modify_task(
 
             # Reset retry state when manually re-queuing a task
             if new_status == TaskStatus.QUEUED:
-                # Check if this is a parent with children — re-evaluate instead of re-run
+                # Check if this is a research/plan parent with work children — re-evaluate
+                # instead of re-run. Don't treat review/fix/create tasks as parents just
+                # because they have incidental debug children.
+                task_type = ((task.payloads or [{}])[0]).get("type", task.task_type or "")
+                is_parent_type = task_type in ("research", "plan")
                 from app.main import _requeue_parent_task
-                children = (await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )).scalars().all()
+                children = []
+                if is_parent_type:
+                    children = (await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id)
+                    )).scalars().all()
                 if children:
                     retried = await _requeue_parent_task(task, session)
                     changes["status"] = TaskStatus.EVALUATING

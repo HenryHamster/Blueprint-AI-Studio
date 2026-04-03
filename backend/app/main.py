@@ -1019,10 +1019,16 @@ async def reaper_service():
                         release_max_plan_account(acct_id)
 
                     if task.attempt_count < _runtime_config["max_retries"]:
-                        # Check if this is a parent with children — re-evaluate instead of re-run
-                        children = (await session.execute(
-                            select(Task).where(Task.parent_task_id == task.id)
-                        )).scalars().all()
+                        # Check if this is a research/plan parent with work children —
+                        # re-evaluate instead of re-run. Don't treat review/fix/create
+                        # tasks as parents just because they have debug children.
+                        task_type = ((task.payloads or [{}])[0]).get("type", task.task_type or "")
+                        is_parent_type = task_type in ("research", "plan")
+                        children = []
+                        if is_parent_type:
+                            children = (await session.execute(
+                                select(Task).where(Task.parent_task_id == task.id)
+                            )).scalars().all()
                         if children:
                             logger.info(f"[REAPER] Re-evaluating parent task {task.id}")
                             await _requeue_parent_task(task, session)
