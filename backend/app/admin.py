@@ -627,7 +627,7 @@ async def modify_task(
                 # Check if this is a research/plan parent with work children — re-evaluate
                 # instead of re-run. Don't treat review/fix/create tasks as parents just
                 # because they have incidental debug children.
-                task_type = ((task.payloads or [{}])[0]).get("type", task.task_type or "")
+                task_type = ((task.payloads or [{}])[0]).get("type", "")
                 is_parent_type = task_type in ("research", "plan")
                 from app.main import _requeue_parent_task
                 children = []
