@@ -135,8 +135,20 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; disk_free_mb?
 function startHeartbeat(taskId: string, getMessage: () => string) {
   heartbeatTimer = setInterval(async () => {
     try {
-      await apiPost('/api/agent/heartbeat', { task_id: taskId, status_message: getMessage(), metrics: collectMetrics() });
-    } catch (e) { log(`Heartbeat failed: ${e}`); }
+      const metrics = collectMetrics();
+      await apiPost('/api/agent/heartbeat', {
+        task_id: taskId,
+        status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
+        metrics,
+      });
+    } catch (e: any) {
+      log(`Heartbeat failed: ${e}`);
+      // 4xx = task reassigned to new VM (404) or cancelled (409) — exit immediately
+      if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
+        log('Task no longer assigned to this VM — self-terminating');
+        process.exit(0);
+      }
+    }
   }, 30_000);
 }
 
@@ -539,9 +551,11 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
       setTimeout(() => { try { claude.kill('SIGKILL'); } catch {} }, 5000);
     }, CLAUDE_TIMEOUT_MS);
 
+    const MAX_OUTPUT = 10_000_000; // 10MB cap — prevents unbounded memory growth
+
     claude.stdout.on('data', (data: Buffer) => {
       const text = data.toString();
-      allOutput += text;
+      if (allOutput.length < MAX_OUTPUT) allOutput += text;
       for (const line of text.split('\n').filter(Boolean)) {
         try {
           const obj = JSON.parse(line);
@@ -565,7 +579,7 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
 
     claude.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
-      allOutput += text;
+      if (allOutput.length < MAX_OUTPUT) allOutput += text;
       sendLog(ws, `[stderr] ${text}`);
     });
 
@@ -2526,5 +2540,21 @@ async function main() {
     log('Agent shutdown complete.');
   }
 }
+
+// Global crash handlers — ensure fatal errors are logged before the process dies
+// (without these, unhandled rejections/exceptions silently kill the agent and
+// the reaper eventually times out with zero forensic evidence)
+process.on('unhandledRejection', (reason) => {
+  console.error(`[FATAL] Unhandled rejection: ${reason}`);
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  console.error(`[FATAL] Uncaught exception: ${err instanceof Error ? `${err.message}\n${err.stack}` : err}`);
+  process.exit(1);
+});
+process.on('SIGTERM', () => {
+  console.error('[FATAL] Received SIGTERM — VM shutting down');
+  process.exit(143);
+});
 
 main().catch((err) => { console.error('Agent failed to start:', err); process.exit(1); });

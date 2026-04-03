@@ -535,7 +535,7 @@ async def _delete_gcp(vm_instance_id: str):
 
     logger.info(f"Issuing external kill command for VM: {vm_instance_id}")
 
-    def _delete_instance():
+    def _capture_serial_and_delete():
         instance_client = compute_v1.InstancesClient()
         # Check known zone first, then try all fallback zones
         zones_to_try = []
@@ -548,6 +548,19 @@ async def _delete_gcp(vm_instance_id: str):
         for zone in zones_to_try:
             try:
                 instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+
+                # Capture serial console output before deletion — this is the only
+                # forensic evidence of agent crashes (OOM, segfaults, unhandled errors)
+                try:
+                    serial = instance_client.get_serial_port_output(
+                        project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id,
+                        timeout=10
+                    )
+                    tail = (serial.contents or "")[-2000:]
+                    logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
+                except Exception as serial_err:
+                    logger.warning(f"[VM-SERIAL] Could not fetch serial for {vm_instance_id}: {serial_err}")
+
                 operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
                 operation.result()
                 logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
@@ -560,7 +573,7 @@ async def _delete_gcp(vm_instance_id: str):
         return "not_found"
 
     try:
-        await asyncio.to_thread(_delete_instance)
+        await asyncio.to_thread(_capture_serial_and_delete)
         # Best-effort: clean up any leftover credentials secret (e.g. if VM was killed before it ran)
         await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
@@ -588,6 +601,17 @@ async def _cleanup_gcp(active_vm_ids: list[str]):
                 for instance in instance_client.list(request=request):
                     if instance.name not in active_vm_ids:
                         logger.warning(f"Found orphaned VM in GCP: {instance.name} ({zone}). Terminating...")
+                        # Capture serial console before deletion — orphans are the most
+                        # suspicious VMs (likely crash victims), forensic evidence is critical
+                        try:
+                            serial = instance_client.get_serial_port_output(
+                                project=GCP_PROJECT_ID, zone=zone, instance=instance.name,
+                                timeout=10
+                            )
+                            tail = (serial.contents or "")[-2000:]
+                            logger.info(f"[VM-SERIAL] orphan {instance.name} last output:\n{tail}")
+                        except Exception as serial_err:
+                            logger.warning(f"[VM-SERIAL] Could not fetch serial for orphan {instance.name}: {serial_err}")
                         try:
                             operation = instance_client.delete(
                                 project=GCP_PROJECT_ID,

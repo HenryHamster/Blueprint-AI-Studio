@@ -76,6 +76,8 @@ build {
       "echo 'EnvironmentFile=/etc/agent.env' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'ExecStart=/usr/bin/npm start' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'Restart=no' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
+      "echo 'MemoryMax=6G' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
+      "echo 'TimeoutStopSec=30' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo '' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo '[Install]' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'WantedBy=multi-user.target' | sudo tee -a /etc/systemd/system/blueprint-agent.service",

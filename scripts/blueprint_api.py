@@ -71,11 +71,11 @@ def list_tasks(status: str | None = None, limit: int = 50, offset: int = 0) -> l
     return data.get("tasks", data) if isinstance(data, dict) else data
 
 
-def all_tasks_by_status(*statuses: str) -> list[dict]:
+def all_tasks_by_status(*statuses: str, limit: int = 500) -> list[dict]:
     """Fetch all tasks across multiple statuses."""
     result = []
     for status in statuses:
-        result.extend(list_tasks(status=status))
+        result.extend(list_tasks(status=status, limit=limit))
     return result
 
 

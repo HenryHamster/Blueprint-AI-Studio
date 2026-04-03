@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import logging
@@ -1014,6 +1015,7 @@ async def reaper_service():
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
                             task.last_heartbeat = None
+                            task.started_at = None  # Fresh timeout window for the new VM
                             session.add(task)
 
                         await broadcast_to_project(
@@ -1505,7 +1507,7 @@ async def orchestrator_worker():
                     except Exception as e:
                         logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
                         try:
-                            ci_task.latest_status_message = f"CI check error: {str(e)[:200]}"
+                            ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
                             session.add(ci_task)
                             await session.commit()
                         except Exception as e:
@@ -2529,13 +2531,23 @@ async def agent_heartbeat(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
-    stmt = select(Task).where(Task.id == req.task_id)
+
+    # FOR UPDATE serializes with the reaper's FOR UPDATE SKIP LOCKED:
+    # - If reaper holds the lock, we wait and then see the changed vm_instance_id (404)
+    # - If we hold the lock, reaper skips the row (correct — task is actively heartbeating)
+    stmt = select(Task).where(
+        Task.id == req.task_id,
+        Task.vm_instance_id == token.get("vm_instance_id")
+    ).with_for_update()
     task = (await session.execute(stmt)).scalars().first()
-    
+
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-        
+        raise HTTPException(status_code=404, detail="Task not found for this VM")
+
+    # Signal agent to stop if task was cancelled/completed externally
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        raise HTTPException(status_code=409, detail="Task already terminal")
+
     task.last_heartbeat = datetime.utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
@@ -2649,6 +2661,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
 
+    # Refresh base_branch from parent's staging branch — the original child's
+    # base_branch may reference a deleted branch (e.g., plan/* after rollup merge)
+    parent_ctx = parent.context or {}
+    parent_staging = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
+
     retried_count = 0
     for child in children:
         if child.status != TaskStatus.FAILED:
@@ -2658,13 +2675,17 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child.latest_status_message = "Parent requeued — replaced by retry"
         session.add(child)
 
-        # Clone as a new task with fresh VM assignment
+        # Clone as a new task with fresh VM assignment — refresh base_branch
+        # to prevent cloning into a deleted branch
+        new_payloads = copy.deepcopy(child.payloads or [])
+        if parent_staging and new_payloads:
+            new_payloads[0]["base_branch"] = parent_staging
         new_child = Task(
             project_id=child.project_id,
             title=child.title,
             description=child.description,
             parent_task_id=parent.id,
-            payloads=child.payloads,
+            payloads=new_payloads,
             context={k: v for k, v in (child.context or {}).items()
                      if k != "max_plan_account_id"},  # Strip runtime-only fields
             depends_on=child.depends_on,
@@ -3911,6 +3932,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                 if open_prs:
                     pr_nums = [f"#{p['number']}" for p in open_prs]
+                    parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"
+                    session.add(parent)
+                    await session.commit()
                     logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
                     return
 
@@ -3950,7 +3974,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         if rollup_scan["findings"]:
                             await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
                     except Exception as e:
-                        logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, proceeding: {e}", exc_info=True)
+                        logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}", exc_info=True)
+                        parent.requires_approval = True
+                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        session.add(parent)
+                        await session.commit()
+                        return
 
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
                     if merge_result.get("merged"):
@@ -4008,7 +4038,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             except Exception as e:
                 logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
                 parent.status = TaskStatus.FAILED
-                parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {str(e)[:200]}"
+                parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
@@ -4045,13 +4075,19 @@ async def update_agent_status(
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
         
-    # 1. Fetch task
-    stmt = select(Task).where(Task.id == payload.task_id)
+    # 1. Fetch task — validate vm_instance_id to prevent stale agents from
+    # overwriting status after a task was requeued with a new VM.
+    # FOR UPDATE prevents race with reaper: without it, a stale agent's
+    # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
+    stmt = select(Task).where(
+        Task.id == payload.task_id,
+        Task.vm_instance_id == token.get("vm_instance_id")
+    ).with_for_update()
     result = await session.execute(stmt)
     task = result.scalars().first()
-    
+
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail="Task not found for this VM")
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
@@ -4252,8 +4288,9 @@ async def update_agent_status(
             task.status = TaskStatus.QUEUED
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
             task.last_heartbeat = None
+            task.started_at = None  # Fresh timeout window for the new VM
             session.add(task)
-            
+
             await session.commit()
             
             await broadcast_to_project(
@@ -4270,6 +4307,7 @@ async def update_agent_status(
             failed_task_type != "debug" and  # Don't recursively debug debug tasks
             (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
             payload.logs and
+            failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
             (
                 (task.context or {}).get("auto_debug") is True or
                 task.parent_task_id is not None  # Part of a pipeline (plan/research subtask)
@@ -4405,7 +4443,12 @@ async def update_agent_status(
                             if scan_result["findings"]:
                                 await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                         except Exception as e:
-                            logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, proceeding: {e}", exc_info=True)
+                            logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}", exc_info=True)
+                            task.requires_approval = True
+                            task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                            session.add(task)
+                            await session.commit()
+                            return {"status": "accepted"}
 
                         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
                         if merge_result.get("merged"):
@@ -4443,7 +4486,7 @@ async def update_agent_status(
                                 logger.warning(f"[PIPELINE] WARNING: Fallback review spawn returned None for PR #{pr_number}")
                         except Exception as e:
                             logger.error(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {e}", exc_info=True)
-                            task.latest_status_message = f"Pipeline stalled: auto-merge and review spawn both failed — {str(e)[:200]}"
+                            task.latest_status_message = f"Pipeline stalled: auto-merge and review spawn both failed — {type(e).__name__}: {e!r}"[:500]
                             session.add(task)
                             await session.commit()
                 else:
@@ -4460,7 +4503,11 @@ async def update_agent_status(
                         if scan_result["findings"]:
                             await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                     except Exception as e:
-                        logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, proceeding with review: {e}", exc_info=True)
+                        logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}", exc_info=True)
+                        task.requires_approval = True
+                        task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                        session.add(task)
+                        await session.commit()
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
                     # Don't block here — let review run, block at merge time
@@ -4770,7 +4817,7 @@ async def update_agent_status(
                             action_taken = True
                     except Exception as e:
                         logger.warning(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}", exc_info=True)
-                        task.latest_status_message = f"Review approved but merge/CI-check failed: {str(e)[:200]}"
+                        task.latest_status_message = f"Review approved but merge/CI-check failed: {type(e).__name__}: {e!r}"[:500]
                         session.add(task)
                         await session.commit()
                 else:
@@ -4851,7 +4898,11 @@ async def update_agent_status(
                     if scan_result["findings"]:
                         await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                 except Exception as e:
-                    logger.error(f"[SECURITY] Scan failed for fix PR #{pr_number}, proceeding: {e}", exc_info=True)
+                    logger.error(f"[SECURITY] Scan failed for fix PR #{pr_number}, flagging for approval: {e}", exc_info=True)
+                    task.requires_approval = True
+                    task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                    session.add(task)
+                    await session.commit()
 
                 if not scan_blocked:
                     review_task = await _spawn_pipeline_task(

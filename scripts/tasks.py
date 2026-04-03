@@ -9,10 +9,32 @@ Usage:
     python scripts/tasks.py cancel-all [--status STATUS]
     python scripts/tasks.py evaluating
     python scripts/tasks.py requeue-ci
+    python scripts/tasks.py trigger-rollup [<parent_id>]    — mark unmerged children as merged, trigger rollup
+    python scripts/tasks.py children <parent_id> [--all]   — list children with merge status
 """
 import json
 import sys
 from blueprint_api import list_tasks, all_tasks_by_status, patch_task, fmt_task
+
+
+def _resolve_task(query):
+    """Find a task by ID prefix or title substring. Returns full task dict or None."""
+    for st in ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED", "COMPLETED", "CANCELLED"]:
+        for t in list_tasks(status=st, limit=200):
+            if t["id"].startswith(query) or query.lower() in t.get("title", "").lower():
+                return t
+    return None
+
+
+def _get_children(parent_id):
+    """Get all children of a parent task across all statuses."""
+    all_t = all_tasks_by_status("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED", "COMPLETED", "CANCELLED")
+    return [t for t in all_t if t.get("parent_task_id") and t["parent_task_id"].startswith(parent_id)]
+
+
+def _safe(s, maxlen=60):
+    """Truncate and ASCII-encode for safe terminal output."""
+    return s[:maxlen].encode("ascii", "replace").decode()
 
 
 def cmd_list(args):
@@ -42,24 +64,22 @@ def cmd_show(args):
     if not args:
         print("Usage: tasks.py show <id_or_title>")
         return
-    query = args[0]
-    for st in ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED", "COMPLETED", "CANCELLED"]:
-        for t in list_tasks(status=st, limit=100):
-            if t["id"].startswith(query) or query.lower() in t.get("title", "").lower():
-                print(json.dumps({
-                    "id": t["id"], "title": t["title"], "status": t["status"],
-                    "task_type": t.get("task_type"),
-                    "parent_task_id": t.get("parent_task_id"),
-                    "vm_instance_id": t.get("vm_instance_id"),
-                    "latest_status_message": (t.get("latest_status_message") or "")[:500],
-                    "status_log": t.get("status_log", [])[-10:],
-                    "payloads": t.get("payloads"),
-                    "context": {k: v for k, v in (t.get("context") or {}).items() if not k.startswith("max_plan_")},
-                    "error_logs": (t.get("error_logs") or "")[:500],
-                    "attempt_count": t.get("attempt_count"),
-                }, indent=2))
-                return
-    print(f"Task '{query}' not found.")
+    t = _resolve_task(args[0])
+    if not t:
+        print(f"Task '{args[0]}' not found.")
+        return
+    print(json.dumps({
+        "id": t["id"], "title": t["title"], "status": t["status"],
+        "task_type": t.get("task_type"),
+        "parent_task_id": t.get("parent_task_id"),
+        "vm_instance_id": t.get("vm_instance_id"),
+        "latest_status_message": (t.get("latest_status_message") or "")[:500],
+        "status_log": t.get("status_log", [])[-10:],
+        "payloads": t.get("payloads"),
+        "context": {k: v for k, v in (t.get("context") or {}).items() if not k.startswith("max_plan_")},
+        "error_logs": (t.get("error_logs") or "")[:500],
+        "attempt_count": t.get("attempt_count"),
+    }, indent=2, ensure_ascii=True))
 
 
 def cmd_tree(args):
@@ -73,9 +93,9 @@ def cmd_tree(args):
     parent = next((t for t in all_t if t["id"].startswith(parent_id)), None)
     if parent:
         full_id = parent["id"]
-        print(f"Parent: {parent['title']}")
+        print(f"Parent: {_safe(parent['title'], 80)}")
         print(f"Status: {parent['status']}")
-        print(f"Message: {(parent.get('latest_status_message') or 'none')[:200]}")
+        print(f"Message: {_safe(parent.get('latest_status_message') or 'none', 200)}")
         print()
         children = [t for t in all_t if (t.get("parent_task_id") or "").startswith(parent_id)]
         icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R", "COMPLETED": "D",
@@ -83,12 +103,39 @@ def cmd_tree(args):
         print(f"Children: {len(children)}")
         for c in children:
             s = icons.get(c["status"], "?")
+            ptype = (c.get("payloads") or [{}])[0].get("type", "?")
             pr = (c.get("payloads") or [{}])[0].get("pr_number", "-")
             merged = (c.get("context") or {}).get("pr_merged", False)
-            title = c["title"][:60]
-            print(f"  [{s}] {c['id'][:8]}  {title:<60}  pr={pr}  merged={merged}")
+            title = _safe(c["title"])
+            print(f"  [{s}] {c['id'][:8]}  [{ptype:8}]  {title:<55}  pr={pr}  merged={merged}")
     else:
         print(f"Parent task '{parent_id}' not found.")
+
+
+def cmd_children(args):
+    """List children of a parent, filtering out review/fix unless --all."""
+    if not args:
+        print("Usage: tasks.py children <parent_id> [--all]")
+        return
+    parent_id = args[0]
+    show_all = "--all" in args
+
+    children = _get_children(parent_id)
+    if not children:
+        print(f"No children found for {parent_id[:8]}.")
+        return
+
+    icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R", "COMPLETED": "D",
+             "FAILED": "F", "CANCELLED": "X", "EVALUATING": "E"}
+    for c in children:
+        ptype = (c.get("payloads") or [{}])[0].get("type", "?")
+        if not show_all and ptype in ("review", "fix", "debug"):
+            continue
+        s = icons.get(c["status"], "?")
+        merged = (c.get("context") or {}).get("pr_merged", False)
+        pr = (c.get("payloads") or [{}])[0].get("pr_number", "-")
+        title = _safe(c["title"])
+        print(f"  [{s}] {c['id'][:8]}  [{ptype:8}] {c['status']:13}  merged={str(merged):5}  pr={pr:<4}  {title}")
 
 
 def cmd_requeue(args):
@@ -97,11 +144,15 @@ def cmd_requeue(args):
         print("Usage: tasks.py requeue <task_id> [<task_id> ...]")
         return
     for tid in args:
+        t = _resolve_task(tid)
+        if not t:
+            print(f"  {tid[:8]}: not found")
+            continue
         try:
-            resp = patch_task(tid, {"status": "QUEUED"})
+            resp = patch_task(t["id"], {"status": "QUEUED"})
             print(f"  {tid[:8]}: {resp.get('status', 'ok')}")
         except Exception as e:
-            print(f"  {tid[:8]}: FAILED — {e}")
+            print(f"  {tid[:8]}: FAILED -- {e}")
 
 
 def cmd_cancel(args):
@@ -110,11 +161,15 @@ def cmd_cancel(args):
         print("Usage: tasks.py cancel <task_id> [<task_id> ...]")
         return
     for tid in args:
+        t = _resolve_task(tid)
+        if not t:
+            print(f"  {tid[:8]}: not found")
+            continue
         try:
-            resp = patch_task(tid, {"status": "CANCELLED"})
+            resp = patch_task(t["id"], {"status": "CANCELLED"})
             print(f"  {tid[:8]}: cancelled")
         except Exception as e:
-            print(f"  {tid[:8]}: FAILED — {e}")
+            print(f"  {tid[:8]}: FAILED -- {e}")
 
 
 def cmd_cancel_all(args):
@@ -125,7 +180,7 @@ def cmd_cancel_all(args):
         tasks = list_tasks(status=status, limit=100)
         for t in tasks:
             tid = t["id"]
-            title = t["title"][:50]
+            title = _safe(t["title"], 50)
             print(f"  Cancelling [{status[:4]}] {tid[:8]} {title}...", end=" ")
             try:
                 patch_task(tid, {"status": "CANCELLED"})
@@ -137,7 +192,7 @@ def cmd_cancel_all(args):
 
 
 def cmd_evaluating(args):
-    """Show all EVALUATING tasks with CI-waiting info."""
+    """Show all EVALUATING tasks with blocking info."""
     tasks = list_tasks(status="EVALUATING")
     if not tasks:
         print("No EVALUATING tasks.")
@@ -147,7 +202,10 @@ def cmd_evaluating(args):
         loop = ctx.get("review_loop", {})
         ci = loop.get("ci_waiting", False)
         pr = loop.get("pr_number", "-")
-        print(f"  {t['id'][:8]}  {t['title'][:55]:<55}  ci_waiting={ci}  pr={pr}")
+        msg = _safe(t.get("latest_status_message") or "", 80)
+        print(f"  {t['id'][:8]}  {_safe(t['title'], 55):<55}  ci={ci}  pr={pr}")
+        if msg:
+            print(f"           {msg}")
 
 
 def cmd_requeue_ci(args):
@@ -168,15 +226,97 @@ def cmd_requeue_ci(args):
             print(f"FAILED: {e}")
 
 
+def cmd_trigger_rollup(args):
+    """Mark unmerged COMPLETED children as merged to trigger rollup on stuck parents.
+
+    Finds EVALUATING research/plan parents with COMPLETED children missing
+    pr_merged, patches them to set pr_merged=true, which triggers the backend
+    rollup check. Run without args to scan all, or pass a parent ID.
+    """
+    if args:
+        parents = [_resolve_task(args[0])]
+        if not parents[0]:
+            print(f"Task '{args[0]}' not found.")
+            return
+    else:
+        parents = list_tasks(status="EVALUATING", limit=200)
+
+    parents = [p for p in parents if p and p["status"] == "EVALUATING"
+               and (p.get("payloads") or [{}])[0].get("type") in ("research", "plan")]
+
+    if not parents:
+        print("No stuck EVALUATING research/plan parents found.")
+        return
+
+    all_tasks = all_tasks_by_status("COMPLETED", "FAILED", "CANCELLED", "QUEUED",
+                                    "IN_PROGRESS", "PROVISIONING", "EVALUATING",
+                                    limit=500)
+
+    for parent in parents:
+        pid = parent["id"]
+        children = [t for t in all_tasks if t.get("parent_task_id") == pid]
+        work_children = [c for c in children
+                         if (c.get("payloads") or [{}])[0].get("type") not in ("review", "fix", "debug")]
+
+        unmerged = [c for c in work_children
+                    if c["status"] == "COMPLETED"
+                    and not (c.get("context") or {}).get("pr_merged")]
+
+        failed = [c for c in work_children if c["status"] == "FAILED"]
+        active = [c for c in work_children
+                  if c["status"] in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING")]
+
+        print(f"\n  {pid[:8]}  {_safe(parent['title'], 60)}")
+        total = len(work_children)
+        merged = len([c for c in work_children if (c.get("context") or {}).get("pr_merged")])
+        cancelled = len([c for c in work_children if c["status"] == "CANCELLED"])
+        print(f"  Children: {total} total, {merged} merged, {len(unmerged)} unmerged, "
+              f"{len(failed)} failed, {len(active)} active, {cancelled} cancelled")
+
+        if active:
+            print(f"  Skipping -- {len(active)} children still active")
+            continue
+
+        if not unmerged:
+            if failed:
+                print(f"  No unmerged children, but {len(failed)} failed. Use: tasks.py requeue {pid[:8]}")
+                continue
+            # All merged but parent still EVALUATING -- force rollup by re-completing a child
+            any_merged = next((c for c in work_children
+                               if c["status"] == "COMPLETED" and (c.get("context") or {}).get("pr_merged")), None)
+            if any_merged:
+                print(f"  All children merged but rollup didn't fire. Re-triggering...")
+                try:
+                    patch_task(any_merged["id"], {"status": "COMPLETED"})
+                    print(f"    Re-completed {any_merged['id'][:8]} to trigger rollup")
+                except Exception as e:
+                    print(f"    FAILED: {e}")
+            else:
+                print(f"  Nothing to do -- all children cancelled")
+            continue
+
+        for c in unmerged:
+            title = _safe(c["title"], 50)
+            print(f"    Patching {c['id'][:8]}  {title}")
+            try:
+                patch_task(c["id"], {"context": {"pr_merged": True}})
+            except Exception as e:
+                print(f"    FAILED: {e}")
+
+        print(f"  Patched {len(unmerged)} children. Rollup should trigger.")
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
     "tree": cmd_tree,
+    "children": cmd_children,
     "requeue": cmd_requeue,
     "cancel": cmd_cancel,
     "cancel-all": cmd_cancel_all,
     "evaluating": cmd_evaluating,
     "requeue-ci": cmd_requeue_ci,
+    "trigger-rollup": cmd_trigger_rollup,
 }
 
 if __name__ == "__main__":
