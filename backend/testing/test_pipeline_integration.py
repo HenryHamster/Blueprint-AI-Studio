@@ -72,6 +72,7 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.main.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
 
     # ------------------------------------------------------------------
     # Step 1: Create project + create-type task (QUEUED)
@@ -255,6 +256,7 @@ async def test_create_task_spawns_review_on_pr_completion(
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.main.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
 
     project = Project(name="Spawn Review Test", user_id="test-user-123")
     db_session.add(project)

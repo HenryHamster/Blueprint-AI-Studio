@@ -672,6 +672,9 @@ class TestResearchCompletion:
         must be deduplicated — no new child task should be created for them.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Dedup findings test", user_id="user1")
         db_session.add(project)
@@ -739,6 +742,9 @@ class TestResearchCompletion:
         must have their depends_on field set to the UUIDs of the referenced tasks.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Deps ordering test", user_id="user1")
         db_session.add(project)
@@ -804,6 +810,9 @@ class TestResearchCompletion:
         Tasks in wave N must have depends_on set to all UUIDs in wave N-1.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Wave ordering test", user_id="user1")
         db_session.add(project)

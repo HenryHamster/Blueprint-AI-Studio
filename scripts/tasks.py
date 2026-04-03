@@ -5,6 +5,8 @@ Usage:
     python scripts/tasks.py show <id_or_title>
     python scripts/tasks.py tree <parent_id>
     python scripts/tasks.py diagnose                       — health check all active tasks (attempts, errors, memory)
+    python scripts/tasks.py failures                       — analyze failed tasks, group by root cause
+    python scripts/tasks.py health                         — system health: autonomy, deploy, settings
     python scripts/tasks.py complete <task_id> [--message MSG]  — mark task as COMPLETED
     python scripts/tasks.py set-status <task_id> <status> [--message MSG]  — set arbitrary status
     python scripts/tasks.py requeue <task_id> [<task_id> ...]
@@ -63,21 +65,70 @@ def cmd_list(args):
 
 
 def cmd_show(args):
-    """Show full details of a task by ID or title substring."""
+    """Show full details of a task by ID or title substring.
+
+    Flags:
+      --transitions   Show only status transitions from the full log (not heartbeats)
+      --heartbeats    Show ALL log entries including heartbeats (with optional --since filter)
+      --full-log      Show the entire status_log as JSON (can be very long)
+      --since TIME    Filter entries after this ISO timestamp (e.g. --since 2026-04-03T08:30)
+    """
     if not args:
-        print("Usage: tasks.py show <id_or_title>")
+        print("Usage: tasks.py show <id_or_title> [--transitions] [--heartbeats] [--full-log]")
         return
-    t = _resolve_task(args[0])
+    show_transitions = "--transitions" in args
+    show_heartbeats = "--heartbeats" in args
+    show_full_log = "--full-log" in args
+    query = [a for a in args if not a.startswith("--")][0]
+
+    t = _resolve_task(query)
     if not t:
-        print(f"Task '{args[0]}' not found.")
+        print(f"Task '{query}' not found.")
         return
+
+    # For --transitions/--heartbeats, fetch full task from admin API to get complete status_log
+    if show_transitions or show_heartbeats or show_full_log:
+        from blueprint_api import api
+        try:
+            full = api("GET", f"/api/admin/tasks/{t['id']}")
+            t = full.get("task", full)
+        except Exception:
+            pass  # Fall back to list_tasks data
+
+    if show_transitions or show_heartbeats:
+        log = t.get("status_log", [])
+        since = None
+        for i, a in enumerate(args):
+            if a == "--since" and i + 1 < len(args):
+                since = args[i + 1]
+        print(f"Task: {_safe(t.get('title', '?'), 80)}")
+        print(f"Total log entries: {len(log)}")
+        print(f"Created: {t.get('created_at', '?')}")
+        print(f"Attempts: {t.get('attempt_count', '?')}")
+        print(f"Error: {_safe((t.get('error_logs') or '')[:300], 300)}")
+        print()
+        label = "All Log Entries" if show_heartbeats else "Status Transitions"
+        print(f"=== {label} ===")
+        for e in log:
+            ts = e.get("t", "")
+            if since and ts < since:
+                continue
+            msg = e.get("msg", "")
+            if show_heartbeats or any(kw in msg for kw in ["Status changed", "Failed", "Reaped", "Fatal"]):
+                print(f"  {ts}  {_safe(msg, 150)}")
+        return
+
+    log_entries = t.get("status_log", [])
+    if not show_full_log:
+        log_entries = log_entries[-10:]
+
     print(json.dumps({
         "id": t["id"], "title": t["title"], "status": t["status"],
         "task_type": t.get("task_type"),
         "parent_task_id": t.get("parent_task_id"),
         "vm_instance_id": t.get("vm_instance_id"),
         "latest_status_message": (t.get("latest_status_message") or "")[:500],
-        "status_log": t.get("status_log", [])[-10:],
+        "status_log": log_entries,
         "payloads": t.get("payloads"),
         "context": {k: v for k, v in (t.get("context") or {}).items() if not k.startswith("max_plan_")},
         "error_logs": (t.get("error_logs") or "")[:500],
@@ -434,12 +485,220 @@ def cmd_set_status(args):
         print(f"  {t['id'][:8]}: FAILED -- {e}")
 
 
+def cmd_failures(args):
+    """Analyze failed tasks — group by root cause, show actionable details."""
+    from blueprint_api import api
+    limit = 50
+    for i, a in enumerate(args):
+        if a == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1])
+
+    tasks = list_tasks(status="FAILED", limit=limit)
+    if not tasks:
+        print("No failed tasks.")
+        return
+
+    # Classify each failure
+    buckets = {}  # cause -> list of tasks
+    for t in tasks:
+        msg = t.get("latest_status_message") or ""
+        error = t.get("error_logs") or ""
+        logs = t.get("status_log") or []
+        ctx = t.get("context") or {}
+        fc = ctx.get("failure_class", "")
+
+        # Determine root cause from patterns
+        cause = "UNKNOWN"
+        if "No heartbeat" in msg and "since prov" in msg:
+            cause = "HEARTBEAT_NEVER_STARTED"
+        elif "No heartbeat" in msg:
+            cause = "HEARTBEAT_STARVATION"
+        elif "git clone" in error or "git clone" in msg:
+            cause = "GIT_CLONE_FAILED"
+        elif "Secret Manager" in error or "secret" in error.lower():
+            cause = "SECRET_MANAGER_ERROR"
+        elif "RATE_LIMIT" in fc or "rate" in error.lower():
+            cause = "RATE_LIMIT"
+        elif "CODE_ERROR" in fc:
+            cause = "CODE_ERROR"
+        elif "AGENT_TIMEOUT" in fc:
+            cause = "AGENT_TIMEOUT"
+        elif fc:
+            cause = fc
+
+        buckets.setdefault(cause, []).append(t)
+
+    print(f"\n=== FAILED TASKS ({len(tasks)}) ===\n")
+    for cause, group in sorted(buckets.items(), key=lambda x: -len(x[1])):
+        print(f"--- {cause} ({len(group)} tasks) ---")
+        for t in group:
+            tid = t["id"][:8]
+            ttype = (t.get("payloads") or [{}])[0].get("type", "?")
+            title = _safe(t.get("title", ""), 55)
+            attempts = t.get("attempt_count", 0)
+            parent = (t.get("parent_task_id") or "")[:8]
+            msg = _safe(t.get("latest_status_message") or "", 100)
+            error = _safe((t.get("error_logs") or "").split("\n")[0], 120)
+            print(f"  {tid}  [{ttype:8}]  att={attempts}  parent={parent or '-':>8}  {title}")
+            if error:
+                print(f"    ERR: {error}")
+            elif msg:
+                print(f"    MSG: {msg}")
+
+            # Show timing pattern from status_log
+            logs = t.get("status_log") or []
+            in_prog_times = [l for l in logs if "IN_PROGRESS" in (l.get("msg") or "") and "PROVISIONING" not in (l.get("msg") or "")]
+            fail_times = [l for l in logs if "FAILED" in (l.get("msg") or "") and "Failed after" not in (l.get("msg") or "")]
+            if in_prog_times and fail_times:
+                # Check for instant failures (< 5s between IN_PROGRESS and FAILED)
+                instant_fails = 0
+                for ip in in_prog_times:
+                    for ft in fail_times:
+                        try:
+                            ip_t = ip["t"]
+                            ft_t = ft["t"]
+                            # Parse ISO timestamps
+                            from datetime import datetime
+                            ip_dt = datetime.fromisoformat(ip_t)
+                            ft_dt = datetime.fromisoformat(ft_t)
+                            delta = (ft_dt - ip_dt).total_seconds()
+                            if 0 < delta < 5:
+                                instant_fails += 1
+                        except (ValueError, KeyError):
+                            pass
+                if instant_fails:
+                    print(f"    PATTERN: {instant_fails} instant failure(s) (<5s after start)")
+        print()
+
+    # Summary
+    print("=== SUMMARY ===")
+    for cause, group in sorted(buckets.items(), key=lambda x: -len(x[1])):
+        requeue_candidates = [t for t in group if cause not in ("CODE_ERROR",)]
+        print(f"  {cause}: {len(group)} tasks" + (f" ({len(requeue_candidates)} requeueable)" if requeue_candidates else ""))
+    print()
+
+    # Actionable suggestions
+    if "GIT_CLONE_FAILED" in buckets:
+        branch_set = set()
+        for t in buckets["GIT_CLONE_FAILED"]:
+            bb = (t.get("payloads") or [{}])[0].get("base_branch", "?")
+            branch_set.add(bb)
+        print(f"  ACTION [GIT_CLONE_FAILED]: Check if branch(es) exist: {', '.join(branch_set)}")
+        print(f"         Requeue with: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["GIT_CLONE_FAILED"]))
+    if "HEARTBEAT_NEVER_STARTED" in buckets:
+        print(f"  ACTION [HEARTBEAT_NEVER_STARTED]: Agent process failed to start on VM.")
+        print(f"         Check VM image, systemd journal, or Secret Manager provisioning.")
+        print(f"         Requeue with: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["HEARTBEAT_NEVER_STARTED"]))
+    if "HEARTBEAT_STARVATION" in buckets:
+        print(f"  ACTION [HEARTBEAT_STARVATION]: Agents died mid-work (OOM? GCP preemption?).")
+        print(f"         Check for concurrent failures = systemic event (deploy, zone issue).")
+        print(f"         Requeue with: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["HEARTBEAT_STARVATION"]))
+
+
+def cmd_health(args):
+    """Check system health: autonomy state, deploy status, settings, circuit breakers."""
+    from blueprint_api import api
+
+    # Fetch all endpoints in sequence (can't parallelize in sync code)
+    settings = {}
+    try:
+        settings = api("GET", "/api/admin/settings")
+    except Exception as e:
+        print(f"  Settings fetch failed: {e}")
+
+    autonomy = {}
+    try:
+        autonomy = api("GET", "/api/admin/autonomous-status")
+    except Exception as e:
+        print(f"  Autonomy status fetch failed: {e}")
+
+    deploy = {}
+    try:
+        deploy = api("GET", "/api/admin/deploy-state")
+    except Exception as e:
+        print(f"  Deploy state fetch failed: {e}")
+
+    zone_health = {}
+    try:
+        zone_health = api("GET", "/api/admin/zone-health")
+    except Exception:
+        pass
+
+    print("=== SYSTEM HEALTH ===\n")
+
+    # Settings
+    if settings:
+        print("--- Runtime Settings ---")
+        for key in ["max_concurrent_vms", "max_retries", "max_autonomous_tasks_per_hour",
+                     "autonomous_research_interval_minutes", "autonomous_direction_cooldown_minutes",
+                     "min_research_interval_hours", "autonomous_research_model",
+                     "autonomous_research_effort"]:
+            val = settings.get(key, "?")
+            print(f"  {key}: {val}")
+        print()
+
+    # Autonomy
+    if autonomy:
+        print("--- Autonomy State ---")
+        projects = autonomy.get("projects", [])
+        for p in projects:
+            print(f"  Project: {p.get('project_name', '?')}")
+            print(f"    enabled: {p.get('autonomous_enabled')}")
+            print(f"    consecutive_failures: {p.get('consecutive_failures', 0)}")
+            print(f"    tasks_spawned_last_hour: {p.get('tasks_spawned_last_hour', 0)}")
+            print(f"    last_research_at: {p.get('last_research_at', 'never')}")
+        print()
+
+    # Deploy
+    if deploy:
+        print("--- Deploy State ---")
+        for key in ["status", "current_revision", "deployed_at",
+                     "pause_reason", "paused_at", "max_concurrent_vms",
+                     "failure_rate", "rollback_count"]:
+            val = deploy.get(key)
+            if val is not None:
+                print(f"  {key}: {val}")
+        ext = deploy.get("external_health", {})
+        if ext:
+            failed = ext.get("failed_deps", [])
+            if failed:
+                print(f"  UNHEALTHY deps: {', '.join(failed)}")
+            else:
+                print(f"  external_health: all OK")
+        monitoring = deploy.get("monitoring_window", {})
+        if monitoring:
+            pct = monitoring.get("percent", 0)
+            elapsed = monitoring.get("elapsed_seconds", 0)
+            total = monitoring.get("total_seconds", 0)
+            print(f"  monitoring_window: {elapsed}s / {total}s ({pct}%)")
+        print()
+
+    # Zone health
+    if zone_health:
+        zones = zone_health if isinstance(zone_health, dict) else {}
+        unhealthy = {z: d for z, d in zones.items()
+                     if isinstance(d, dict) and d.get("status") != "healthy"}
+        if unhealthy:
+            print("--- Zone Health (unhealthy) ---")
+            for z, d in unhealthy.items():
+                print(f"  {z}: {d.get('status')} (failures={d.get('consecutive_failures', 0)}, cooldown={d.get('cooldown_active')})")
+            print()
+
+    # Task counts
+    print("--- Task Counts ---")
+    for st in ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "FAILED"]:
+        all_t = list_tasks(status=st, limit=200)
+        print(f"  {st}: {len(all_t)}")
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
     "tree": cmd_tree,
     "children": cmd_children,
     "diagnose": cmd_diagnose,
+    "failures": cmd_failures,
+    "health": cmd_health,
     "complete": cmd_complete,
     "set-status": cmd_set_status,
     "requeue": cmd_requeue,

@@ -3,6 +3,7 @@ import pytest
 from httpx import AsyncClient
 from app.models import Project, ProjectStatus
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_read_root(client: AsyncClient):
     """
@@ -41,6 +42,7 @@ async def test_deploy_blueprint(client: AsyncClient, mocker):
     assert project_data["name"] == "Test Project"
     assert project_data["status"] == ProjectStatus.DEPLOYING
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_list_projects_empty(client: AsyncClient):
     """

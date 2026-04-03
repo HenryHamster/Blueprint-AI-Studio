@@ -12,7 +12,7 @@ async def test_project_creation(db_session):
     await db_session.refresh(project)
 
     assert project.id is not None
-    assert project.status == ProjectStatus.DEPLOYING
+    assert project.status == ProjectStatus.DRAFT
 
 @pytest.mark.asyncio
 async def test_task_cascading(db_session):

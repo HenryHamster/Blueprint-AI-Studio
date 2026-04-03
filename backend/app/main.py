@@ -630,12 +630,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
-    # Infer base_branch from the most recent task in this project, or default to main
-    recent_task = (await session.execute(
-        select(Task).where(Task.project_id == project.id)
-        .order_by(Task.created_at.desc()).limit(1)
-    )).scalars().first()
-    base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
+    # Autonomous research creates independent tasks (no parent_task_id), so they
+    # must always branch from main.  Staging branches (research/*, plan/*) are
+    # ephemeral — they get deleted when their parent's rollup merges.  An
+    # independent task using someone else's staging branch will break when that
+    # rollup cleans up.  Actual subresearch (spawned by _handle_research_completion
+    # with parent_task_id set) correctly inherits its parent's staging branch.
+    base_branch = "main"
 
     # Use per-type defaults, fall back to autonomous-specific config
     research_model = _runtime_config.get("task_type_models", {}).get("research") or _runtime_config.get("autonomous_research_model") or None
@@ -2564,17 +2565,30 @@ async def agent_heartbeat(
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
-    # FOR UPDATE serializes with the reaper's FOR UPDATE SKIP LOCKED:
-    # - If reaper holds the lock, we wait and then see the changed vm_instance_id (404)
-    # - If we hold the lock, reaper skips the row (correct — task is actively heartbeating)
+    # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
+    # (processing completion/pipeline), skip instead of blocking.  Blocking
+    # would starve the heartbeat (agent's 30s HTTP timeout fires, but the
+    # PostgreSQL query keeps waiting with no lock_timeout configured),
+    # causing last_heartbeat to go stale and the reaper to kill the task.
+    # Skipping one heartbeat is safe — the reaper's threshold is 5 minutes,
+    # and the next heartbeat (30s later) will succeed once the lock releases.
     stmt = select(Task).where(
         Task.id == req.task_id,
         Task.vm_instance_id == token.get("vm_instance_id")
-    ).with_for_update()
+    ).with_for_update(skip_locked=True)
     task = (await session.execute(stmt)).scalars().first()
 
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found for this VM")
+        # Row is either locked (skip_locked skipped it) or vm_instance_id changed.
+        # Distinguish: check without FOR UPDATE to see if the task exists at all.
+        check_stmt = select(Task).where(Task.id == req.task_id)
+        check_task = (await session.execute(check_stmt)).scalars().first()
+        if not check_task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if check_task.vm_instance_id != token.get("vm_instance_id"):
+            raise HTTPException(status_code=404, detail="Task not found for this VM")
+        # Row exists but was locked — skip this heartbeat cycle, try next time
+        return {"status": "ok", "skipped": True}
 
     # Signal agent to stop if task was cancelled/completed externally
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
@@ -2934,55 +2948,92 @@ def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
+    """Find the first JSON array in text containing objects with the required keys.
+
+    Uses bracket-depth counting (O(n)) instead of regex with greedy groups,
+    which can cause O(n*k) backtracking on malformed input and block the
+    async event loop for seconds.
+    """
+    # Cap input to prevent scanning megabytes of raw output
+    text = text[:500_000]
+    for key in required_keys:
+        if f'"{key}"' not in text:
+            return None
+    # Find outermost [ ... ] containing the required keys
+    start = text.find("[")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\" and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    if all(f'"{k}"' in candidate for k in required_keys):
+                        return candidate
+                    break  # This bracket pair didn't match, try next [
+        start = text.find("[", start + 1)
+    return None
+
+
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
     """Extract structured research findings JSON array from agent output text."""
-    import re
-    try:
-        # Find JSON array containing objects with "title" and "prompt"
-        json_match = re.search(r'\[\s*\{[\s\S]*"title"[\s\S]*"prompt"[\s\S]*\]', text, re.DOTALL)
-        if json_match:
-            findings = json.loads(json_match.group())
+    json_str = _extract_json_array(text, "title", "prompt")
+    if json_str:
+        try:
+            findings = json.loads(json_str)
             if isinstance(findings, list):
                 return findings
-    except json.JSONDecodeError:
-        # JSON may be truncated — try to recover complete objects
-        try:
-            json_match = re.search(r'\[\s*\{[\s\S]*"title"[\s\S]*"prompt"', text, re.DOTALL)
-            if json_match:
-                raw = json_match.group()
-                # Find last complete top-level object using depth tracking
-                depth = 0
-                last_close = -1
-                in_string = False
-                escape_next = False
-                for i, c in enumerate(raw):
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if c == '\\' and in_string:
-                        escape_next = True
-                        continue
-                    if c == '"' and not escape_next:
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if c == '{':
-                        depth += 1
-                    elif c == '}':
-                        depth -= 1
-                        if depth == 0:
-                            last_close = i
-                if last_close > 0:
-                    truncated = raw[:last_close + 1] + ']'
+        except json.JSONDecodeError:
+            # JSON may be truncated — try to recover complete objects
+            # Find last complete top-level object using depth tracking
+            depth = 0
+            last_close = -1
+            in_string = False
+            escape_next = False
+            for i, c in enumerate(json_str):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if c == '\\' and in_string:
+                    escape_next = True
+                    continue
+                if c == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        last_close = i
+            if last_close > 0:
+                try:
+                    truncated = json_str[:last_close + 1] + ']'
                     findings = json.loads(truncated)
                     if isinstance(findings, list):
                         logger.info(f"[RESEARCH] Recovered {len(findings)} findings from truncated JSON")
                         return findings
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    except AttributeError:
-        pass
+                except json.JSONDecodeError:
+                    pass
     return None
 
 
@@ -3088,14 +3139,32 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     plan_branch = f"plan/{short_id}"
 
     # Create staging branch for this plan's subtasks
+    gh_token = owner = repo = None
     try:
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         sha = await get_branch_sha(gh_token, owner, repo, parent_base)
         await create_branch(gh_token, owner, repo, plan_branch, sha)
         logger.info(f"[PLAN] Created branch {plan_branch} from {parent_base}")
     except Exception as e:
-        # Branch may already exist from a previous run — reuse it
-        logger.error(f"[PLAN] Branch {plan_branch} already exists or creation failed: {e} — reusing", exc_info=True)
+        # Branch may already exist from a previous run — verify it actually exists
+        if gh_token:
+            try:
+                await get_branch_sha(gh_token, owner, repo, plan_branch)
+                logger.info(f"[PLAN] Branch {plan_branch} already exists — reusing")
+            except Exception:
+                logger.error(f"[PLAN] Branch {plan_branch} does not exist and creation failed: {e!r} — aborting subtask creation")
+                task.status = TaskStatus.FAILED
+                task.latest_status_message = f"Failed to create plan branch: {type(e).__name__}: {e!r}"[:500]
+                session.add(task)
+                await session.commit()
+                return
+        else:
+            logger.error(f"[PLAN] Cannot create branch — GitHub token unavailable: {e!r}")
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = f"Failed to create plan branch: {type(e).__name__}: {e!r}"[:500]
+            session.add(task)
+            await session.commit()
+            return
 
     # Store branch info on the plan task for rollup later
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
@@ -3285,9 +3354,9 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
     # Parse the JSON findings array from logs
     findings = None
     try:
-        json_match = re.search(r'\[\s*\{[\s\S]*"severity"[\s\S]*\]', logs, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group())
+        json_str = _extract_json_array(logs, "severity")
+        if json_str:
+            parsed = json.loads(json_str)
             if isinstance(parsed, list):
                 findings = parsed
     except (json.JSONDecodeError, AttributeError):
@@ -3413,9 +3482,9 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     """Parse perf findings and spawn create tasks for high-severity issues."""
     findings = None
     try:
-        json_match = re.search(r'\[\s*\{[\s\S]*"severity"[\s\S]*\]', logs, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group())
+        json_str = _extract_json_array(logs, "severity")
+        if json_str:
+            parsed = json.loads(json_str)
             if isinstance(parsed, list):
                 findings = parsed
     except (json.JSONDecodeError, AttributeError):
@@ -3565,14 +3634,32 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     research_branch = f"research/{short_id}"
 
     # Create staging branch for this research batch
+    gh_token = owner = repo = None
     try:
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         sha = await get_branch_sha(gh_token, owner, repo, original_base)
         await create_branch(gh_token, owner, repo, research_branch, sha)
         logger.info(f"[RESEARCH] Created branch {research_branch} from {original_base}")
     except Exception as e:
-        # Branch may already exist from a previous run — reuse it
-        logger.error(f"[RESEARCH] Branch {research_branch} already exists or creation failed: {e} — reusing", exc_info=True)
+        # Branch may already exist from a previous run — verify it actually exists
+        if gh_token:
+            try:
+                await get_branch_sha(gh_token, owner, repo, research_branch)
+                logger.info(f"[RESEARCH] Branch {research_branch} already exists — reusing")
+            except Exception:
+                logger.error(f"[RESEARCH] Branch {research_branch} does not exist and creation failed: {e!r} — aborting child task creation")
+                task.status = TaskStatus.FAILED
+                task.latest_status_message = f"Failed to create research branch: {type(e).__name__}: {e!r}"[:500]
+                session.add(task)
+                await session.commit()
+                return
+        else:
+            logger.error(f"[RESEARCH] Cannot create branch — GitHub token unavailable: {e!r}")
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = f"Failed to create research branch: {type(e).__name__}: {e!r}"[:500]
+            session.add(task)
+            await session.commit()
+            return
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):
@@ -4202,12 +4289,27 @@ async def update_agent_status(
             }
         )
 
-    # 3b. Parse and store smoketest result in task.plan_output for easy retrieval
+    # 3b. Parse and store smoketest result in task.plan_output + document in history
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
         try:
             smoketest_data = json.loads(payload.logs)
             task.plan_output = smoketest_data
             session.add(task)
+            # Document every smoketest result (pass or fail) in task history
+            all_tests = smoketest_data.get("tests", [])
+            pass_count = len([t for t in all_tests if t.get("status") == "pass"])
+            fail_count = len([t for t in all_tests if t.get("status") == "fail"])
+            session.add(TaskHistory(
+                task_id=task.id, action="SMOKETEST_RESULT",
+                details={
+                    "passed": smoketest_data.get("passed", False),
+                    "total_tests": len(all_tests),
+                    "passed_count": pass_count,
+                    "failed_count": fail_count,
+                    "suite_results": smoketest_data.get("suites", {}),
+                    "guardrail_violations": smoketest_data.get("guardrail_violations", []),
+                }
+            ))
         except (json.JSONDecodeError, Exception) as e:
             logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}", exc_info=True)
 
@@ -4218,66 +4320,104 @@ async def update_agent_status(
             if not smoketest_data.get("passed"):
                 failed_tests = [t for t in smoketest_data.get("tests", []) if t.get("status") == "fail"]
                 if failed_tests:
-                    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
-                    failure_summary = "\n".join(
-                        f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
-                    )
-                    type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
-                    type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
-                    plan_task = Task(
-                        project_id=task.project_id,
-                        title=f"Fix smoketest failures on {base_branch}",
-                        description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
-                        parent_task_id=task.id,
-                        payloads=[{
-                            "type": "plan",
-                            "prompt": (
-                                f"Smoke tests failed after a merge to {base_branch}. "
-                                f"Investigate and plan fixes for these failures:\n\n"
-                                f"{failure_summary}\n\n"
-                                f"Diagnose root causes, identify which recent changes likely caused each failure, "
-                                f"and produce subtasks to fix them."
-                            ),
-                            "base_branch": base_branch,
-                            **({"model": type_model} if type_model else {}),
-                            **({"effort": type_effort} if type_effort else {}),
-                        }],
-                        context={
-                            "smoketest_task_id": str(task.id),
-                            "failed_tests": [t["name"] for t in failed_tests],
-                        },
-                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-                        status=TaskStatus.QUEUED,
-                        created_by="ORCHESTRATOR",
-                    )
-                    session.add(plan_task)
-                    await session.flush()
-                    history = TaskHistory(
-                        task_id=plan_task.id, action="SPAWNED",
-                        details={"spawned_by": "SMOKETEST_FAILURE", "failed_tests": [t["name"] for t in failed_tests]}
-                    )
-                    session.add(history)
+                    # Duplicate prevention: skip if a fix task already exists for this smoketest
+                    existing_fix = (await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id).limit(1)
+                    )).scalars().first()
+                    if existing_fix:
+                        logger.info(f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate")
+                    else:
+                        base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                        failure_summary = "\n".join(
+                            f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
+                        )
 
-                    # Create persistent alert
-                    alert = Alert(
-                        project_id=task.project_id,
-                        severity=AlertSeverity.ERROR,
-                        title=f"Smoke tests failed on {base_branch}",
-                        message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
-                                + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else ""),
-                        task_id=task.id,
-                    )
-                    session.add(alert)
+                        # Determine priority based on which suite failed (higher = dispatched first)
+                        suite_results = smoketest_data.get("suites", {})
+                        if suite_results.get("startup", {}).get("passed") is False:
+                            fix_priority = 90  # Startup failure — critical
+                        elif suite_results.get("curated", {}).get("passed") is False:
+                            fix_priority = 70  # Curated test failure — high
+                        else:
+                            fix_priority = 50  # Regression-only failure — normal
 
-                    await broadcast_to_project(
-                        str(task.project_id), "task_updated",
-                        {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
-                    )
-                    await broadcast_to_project(
-                        str(task.project_id), "alert_created",
-                        {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
-                    )
-                    logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} + alert for {len(failed_tests)} failed smoke tests")
+                        type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
+                        type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
+                        plan_task = Task(
+                            project_id=task.project_id,
+                            title=f"Fix smoketest failures on {base_branch}",
+                            description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
+                            parent_task_id=task.id,
+                            priority=fix_priority,
+                            payloads=[{
+                                "type": "plan",
+                                "prompt": (
+                                    f"Smoke tests failed after a merge to {base_branch}. "
+                                    f"Investigate and plan fixes for these failures:\n\n"
+                                    f"{failure_summary}\n\n"
+                                    f"IMPORTANT GUARDRAILS:\n"
+                                    f"- Do NOT delete or skip tests just to make them pass\n"
+                                    f"- First diagnose: is the failure in the CODE or the TEST?\n"
+                                    f"- If the test is wrong, fix it to correctly test the intended behavior\n"
+                                    f"- If the code is wrong, fix the code\n"
+                                    f"- Tests may only be removed if the tested functionality was removed — explain why\n"
+                                    f"- Do NOT weaken assertions without justification\n"
+                                    f"Diagnose root causes, identify which recent changes caused each failure, "
+                                    f"and produce subtasks to fix them."
+                                ),
+                                "base_branch": base_branch,
+                                **({"model": type_model} if type_model else {}),
+                                **({"effort": type_effort} if type_effort else {}),
+                            }],
+                            context={
+                                "smoketest_task_id": str(task.id),
+                                "failed_tests": [t["name"] for t in failed_tests],
+                                "suite_results": suite_results,
+                                "guardrail_violations": smoketest_data.get("guardrail_violations", []),
+                                "total_tests": len(smoketest_data.get("tests", [])),
+                                "passed_count": len([t for t in smoketest_data.get("tests", []) if t.get("status") == "pass"]),
+                                "failed_count": len(failed_tests),
+                            },
+                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                            status=TaskStatus.QUEUED,
+                            created_by="ORCHESTRATOR",
+                        )
+                        session.add(plan_task)
+                        await session.flush()
+                        history = TaskHistory(
+                            task_id=plan_task.id, action="SPAWNED",
+                            details={"spawned_by": "SMOKETEST_FAILURE", "priority": fix_priority, "failed_tests": [t["name"] for t in failed_tests]}
+                        )
+                        session.add(history)
+
+                        # Build suite breakdown for alert message
+                        suite_detail = ""
+                        for suite_name, suite_data in suite_results.items():
+                            if isinstance(suite_data, dict) and suite_data.get("passed") is False:
+                                suite_fails = [t for t in suite_data.get("tests", []) if t.get("status") == "fail"]
+                                if suite_fails:
+                                    suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
+
+                        alert = Alert(
+                            project_id=task.project_id,
+                            severity=AlertSeverity.ERROR,
+                            title=f"Smoke tests failed on {base_branch}",
+                            message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                                    + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else "")
+                                    + (suite_detail if suite_detail else ""),
+                            task_id=task.id,
+                        )
+                        session.add(alert)
+
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
+                        )
+                        await broadcast_to_project(
+                            str(task.project_id), "alert_created",
+                            {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
+                        )
+                        logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests")
         except Exception as e:
             logger.warning(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}", exc_info=True)
 
@@ -4476,6 +4616,18 @@ async def update_agent_status(
             elif breaker["state"] == "OPEN":
                 # Shouldn't happen (OPEN blocks spawning), but reset if it does
                 breaker["state"] = "CLOSED"
+
+        # ── EARLY COMMIT ──
+        # Release the FOR UPDATE lock NOW, before downstream processing.
+        # Everything below (review pipeline, completion handlers, rollup) makes
+        # GitHub API calls that can hang 15-120+ seconds during connectivity issues.
+        # Holding the lock during those calls starves the heartbeat endpoint
+        # (which also needs FOR UPDATE on this row), causing last_heartbeat to go
+        # stale and the reaper to kill the task.
+        # At this point the status change, artifact, and retry logic are all
+        # persisted.  expire_on_commit=False keeps the task object usable.
+        if session.dirty or session.new:
+            await session.commit()
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:

@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.models import Project, Task, TaskStatus, ProjectStatus, ArtifactType, Artifact
 from app.auth import create_agent_token
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_claim_success(client: AsyncClient, db_session):
     """
@@ -36,6 +37,7 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     await db_session.refresh(task)
     assert task.status == TaskStatus.IN_PROGRESS
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_claim_unauthorized(client: AsyncClient):
     """
@@ -54,6 +56,7 @@ async def test_agent_claim_not_found(client: AsyncClient):
     resp = await client.post("/api/agent/claim", headers=headers)
     assert resp.status_code == 404
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     """

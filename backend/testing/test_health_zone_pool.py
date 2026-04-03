@@ -87,6 +87,7 @@ async def health_client():
 
 # ─── /health Endpoint ────────────────────────────────────────────────────────
 
+@pytest.mark.smoketest
 class TestHealthEndpoint:
     """Integration tests for GET /health.
 
@@ -227,12 +228,14 @@ class TestHealthEndpoint:
 class TestZoneHealth:
     """Unit tests for zone cooldown, recovery, and summary logic in compute.py."""
 
+    @pytest.mark.smoketest
     def test_get_zone_health_returns_entry_for_every_fallback_zone(self, clean_zone_state):
         """get_zone_health() has an entry for each zone in FALLBACK_ZONES."""
         result = get_zone_health()
         for zone, _ in FALLBACK_ZONES:
             assert zone in result, f"Missing zone: {zone}"
 
+    @pytest.mark.smoketest
     def test_get_zone_health_fresh_zones_are_healthy(self, clean_zone_state):
         """Zones with no failure history report status=healthy and cooldown_active=False."""
         result = get_zone_health()
@@ -243,6 +246,7 @@ class TestZoneHealth:
             assert result[zone]["last_success"] is None
             assert result[zone]["last_failure"] is None
 
+    @pytest.mark.smoketest
     def test_zone_cooldown_activation_on_recent_failure(self, clean_zone_state):
         """A zone with a fresh failure entry enters cooldown and reports status=exhausted."""
         zone = FALLBACK_ZONES[0][0]
@@ -251,6 +255,7 @@ class TestZoneHealth:
             "consecutive_failures": 1,
             "last_failure": datetime.now(timezone.utc),
             "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
+            "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
         }
 
         result = get_zone_health()
@@ -322,6 +327,7 @@ class TestZoneHealth:
         result = get_zone_health()
         assert result[zone]["last_failure"] == fail_time.isoformat()
 
+    @pytest.mark.smoketest
     def test_get_zone_health_summary_shape(self, clean_zone_state):
         """get_zone_health_summary() returns exactly the expected keys."""
         summary = get_zone_health_summary()
@@ -347,6 +353,7 @@ class TestZoneHealth:
                 "consecutive_failures": 1,
                 "last_failure": datetime.now(timezone.utc),
                 "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
+                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
             }
 
         summary = get_zone_health_summary()
@@ -363,6 +370,7 @@ class TestZoneHealth:
                 "consecutive_failures": 3,
                 "last_failure": datetime.now(timezone.utc),
                 "last_failure_reason": "RESOURCE_POOL_EXHAUSTED",
+                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
             }
 
         summary = get_zone_health_summary()
@@ -376,11 +384,17 @@ class TestZoneHealth:
 
         # zone_exhausted: in cooldown (fresh failure)
         _zone_failures[zone_exhausted] = datetime.now(timezone.utc)
-        _zone_health[zone_exhausted] = {"consecutive_failures": 1}
+        _zone_health[zone_exhausted] = {
+            "consecutive_failures": 1,
+            "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=ZONE_COOLDOWN_SECONDS),
+        }
 
         # zone_recovering: cooldown expired
         _zone_failures[zone_recovering] = datetime.now(timezone.utc) - timedelta(seconds=ZONE_COOLDOWN_SECONDS + 10)
-        _zone_health[zone_recovering] = {"consecutive_failures": 1}
+        _zone_health[zone_recovering] = {
+            "consecutive_failures": 1,
+            "cooldown_expires_at": datetime.now(timezone.utc) - timedelta(seconds=10),
+        }
 
         # zone_healthy: no failures
         # (already clean)

@@ -1,0 +1,39 @@
+# Smoketest configuration — read by the smoketest agent on each run.
+# This file defines WHAT to test and HOW to interpret results.
+#
+# The smoketest agent runs three tiers in order:
+#   1. startup   — can the app import without errors?
+#   2. curated   — hand-picked critical-path tests (pytest -m smoketest)
+#   3. regression — full test suite
+#
+# Fix tasks spawned from failures must NOT delete or weaken tests.
+# See CLAUDE.md "Test Guidelines" for the rules all agents must follow.
+
+suites:
+  startup:
+    description: "Verify app can import and basic modules load"
+    commands:
+      - "python -c \"from app.main import app; print(f'OK: {len(app.routes)} routes')\""
+      - "python -c \"from app.compute import FALLBACK_ZONES; print(f'OK: {len(FALLBACK_ZONES)} zones')\""
+      - "python -c \"from app.github import validate_fine_grained_pat; print('OK: github module')\""
+    fail_action: "critical"
+
+  curated:
+    description: "Hand-picked tests for critical paths (tagged @pytest.mark.smoketest)"
+    pytest_args: "-m smoketest -v --tb=short"
+    fail_action: "fix_high_priority"
+
+  regression:
+    description: "Full test suite"
+    pytest_args: "testing/ -v --tb=short"
+    fail_action: "fix_normal_priority"
+
+guardrails:
+  min_test_count:
+    curated: 10
+    regression: 40
+  fix_task_rules:
+    - "Do NOT delete or skip tests just to make them pass"
+    - "Tests may be removed ONLY when the functionality they test has been removed — explain why in the PR"
+    - "Do NOT weaken assertions (e.g., changing assertEqual to assertIn) without justification"
+    - "Diagnose whether the failure is in the TEST or the CODE before changing either"

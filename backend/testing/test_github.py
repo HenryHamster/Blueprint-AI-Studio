@@ -16,67 +16,55 @@ class MockResponse:
         return self._json_data
 
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_validate_github_token_invalid_format(client: AsyncClient):
+async def test_validate_fine_grained_pat_rejects_classic_token():
     """
-    Tests that a classic token (ghp_) is immediately rejected without hitting the GitHub API.
+    A classic token (ghp_) is immediately rejected with HTTP 400
+    without hitting the GitHub API.
     """
-    payload = {"token": "ghp_classic_token_123"}
-    response = await client.post("/api/github/validate-token", json=payload)
-    
-    assert response.status_code == 400
-    assert "Invalid token format" in response.json()["detail"]
+    from app.github import validate_fine_grained_pat
 
+    with pytest.raises(HTTPException) as exc_info:
+        await validate_fine_grained_pat("ghp_classic_token_123")
+
+    assert exc_info.value.status_code == 400
+    assert "Invalid token format" in exc_info.value.detail
+
+
+@pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_validate_github_token_success(client: AsyncClient, mocker):
+async def test_validate_fine_grained_pat_success(mocker):
     """
-    Tests a successful validation of a Fine-Grained PAT.
-    We mock the httpx.AsyncClient.get call so we don't actually hit GitHub.
+    A valid Fine-Grained PAT returns the authenticated user's login.
     """
-    # Mock the httpx.AsyncClient.get call inside validate_fine_grained_pat
+    from app.github import validate_fine_grained_pat
+
     mock_get = mocker.patch("httpx.AsyncClient.get")
-    
-    # Create a mock response object
-    class MockResponse:
-        def __init__(self, status_code, json_data):
-            self.status_code = status_code
-            self._json_data = json_data
-        def json(self):
-            return self._json_data
-            
-    # Tell the mock to return a 200 OK with a fake username
     mock_get.return_value = MockResponse(200, {"login": "testuser"})
-    
-    payload = {"token": "github_pat_valid_token_123"}
-    response = await client.post("/api/github/validate-token", json=payload)
-    
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "valid"
-    assert data["user"] == "testuser"
 
+    result = await validate_fine_grained_pat("github_pat_valid_token_123")
+
+    assert result["user"] == "testuser"
+    assert result["status"] == "valid"
+
+
+@pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_validate_github_token_unauthorized(client: AsyncClient, mocker):
+async def test_validate_fine_grained_pat_unauthorized_raises_401(mocker):
     """
-    Tests the scenario where GitHub rejects the token (e.g., expired or revoked).
+    An expired or revoked token raises HTTPException(401).
     """
+    from app.github import validate_fine_grained_pat
+
     mock_get = mocker.patch("httpx.AsyncClient.get")
-    
-    class MockResponse:
-        def __init__(self, status_code, json_data):
-            self.status_code = status_code
-            self._json_data = json_data
-        def json(self):
-            return self._json_data
-            
-    # Tell the mock to return a 401 Unauthorized
     mock_get.return_value = MockResponse(401, {"message": "Bad credentials"})
-    
-    payload = {"token": "github_pat_expired_token_123"}
-    response = await client.post("/api/github/validate-token", json=payload)
-    
-    assert response.status_code == 401
-    assert "invalid or expired" in response.json()["detail"]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await validate_fine_grained_pat("github_pat_expired_token_123")
+
+    assert exc_info.value.status_code == 401
+    assert "invalid or expired" in exc_info.value.detail
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +187,7 @@ async def test_merge_pull_request_rate_limit_propagates_error(mocker):
     assert exc_info.value.status_code >= 400
 
 
+@pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_validate_fine_grained_pat_expired_token_returns_401_not_500(mocker):
     """

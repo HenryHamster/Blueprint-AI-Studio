@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "smoketest: Critical tests run by the smoketest agent after every merge to main",
+]

@@ -38,6 +38,11 @@ async function tryRefreshToken(): Promise<boolean> {
 }
 
 async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 5) {
+  // Cap logs field to avoid 422 from backend's max_length=500000 validation.
+  // A 422 is a 4xx = no retry = agent dies silently.
+  if (body.logs && typeof body.logs === 'string' && (body.logs as string).length > 450_000) {
+    body = { ...body, logs: (body.logs as string).slice(0, 450_000) + '\n...(truncated)' };
+  }
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -115,10 +120,21 @@ function log(msg: string) {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-function collectMetrics(): { rss_mb: number; heap_used_mb: number; disk_free_mb?: number; disk_total_mb?: number } {
+function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
   const mem = process.memoryUsage();
   const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
   const heap_used_mb = Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10;
+  // Read cgroup memory (includes agent + Claude Code + all subprocesses).
+  // The agent's own RSS (93MB) hides the real picture — Claude Code can use
+  // several GB. MemoryMax=6G triggers cgroup OOM killer (SIGKILL, no handler).
+  let cgroup_mb: number | undefined;
+  let cgroup_limit_mb: number | undefined;
+  try {
+    const current = fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf-8').trim();
+    cgroup_mb = Math.round(parseInt(current, 10) / 1024 / 1024);
+    const max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf-8').trim();
+    if (max !== 'max') cgroup_limit_mb = Math.round(parseInt(max, 10) / 1024 / 1024);
+  } catch { /* cgroup v2 not available */ }
   try {
     const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
     const line = dfOut.split('\n')[1];
@@ -126,10 +142,10 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; disk_free_mb?
       const parts = line.trim().split(/\s+/);
       const disk_total_mb = Math.round(parseInt(parts[1], 10) / 1024);
       const disk_free_mb = Math.round(parseInt(parts[3], 10) / 1024);
-      return { rss_mb, heap_used_mb, disk_free_mb, disk_total_mb };
+      return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb, disk_free_mb, disk_total_mb };
     }
   } catch { /* disk metrics are best-effort */ }
-  return { rss_mb, heap_used_mb };
+  return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb };
 }
 
 function startHeartbeat(taskId: string, getMessage: () => string) {
@@ -527,6 +543,7 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
 }> {
   let allOutput = '';
   let lastResultText = '';
+  let stderrBuffer = '';
 
   sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
   log('Spawning Claude Code CLI...');
@@ -588,6 +605,7 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
     claude.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
       if (allOutput.length < MAX_OUTPUT) allOutput += text;
+      if (stderrBuffer.length < 50_000) stderrBuffer += text;
       sendLog(ws, `[stderr] ${text}`);
     });
 
@@ -596,6 +614,16 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
   });
 
   sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
+
+  // Detect usage exhaustion / rate limits from Claude's stderr output
+  if (exitCode !== 0) {
+    const combined = (stderrBuffer + allOutput.slice(-5000)).toLowerCase();
+    const isUsageExhausted = /usage.*limit|rate.*limit|quota.*exceeded|credit|billing|exceeded.*plan|max.*usage|token.*limit|out of.*credit/i.test(combined);
+    if (isUsageExhausted) {
+      throw new Error(`Claude API usage exhausted — ${stderrBuffer.slice(0, 500)}`);
+    }
+  }
+
   return { exitCode, allOutput, lastResultText };
 }
 
@@ -1974,34 +2002,44 @@ async function handleSmoketest(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
-  const smoketestPrompt = `You are a smoke test agent. Your job is to run basic end-to-end health checks on this codebase.
+  const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
-1. Read the project README to understand the project structure, how to run it, and any existing smoke test setup.
+1. Read backend/testing/smoketest.yaml to understand the test suites and guardrails.
 
-2. Look for existing smoke test scripts:
-   - Check for files matching scripts/smoke*.sh or tests/smoke*.py (or similar names)
-   - Also check for health check scripts, integration test entry points, or CI smoke test jobs in .github/workflows/
+2. Run each suite IN ORDER from the config (startup, curated, regression):
 
-3. If a smoke test script exists:
-   - Run it and capture the output
-   - Record each test that passes or fails
+   a. STARTUP: Run each command listed in suites.startup.commands from the backend/ directory.
+      Record pass/fail for each command.
 
-4. If no smoke test script exists:
-   - Identify the main entry points from the code (API server, health endpoints, key routes)
-   - Run quick sanity checks: (a) verify the app can start without import errors, (b) check key health/ping endpoints return 200 using curl or the test framework, (c) confirm critical dependencies are importable
-   - Use the project's own test runner (pytest, jest, etc.) with a smoke/health filter if available
+   b. CURATED: Run pytest with the args from suites.curated.pytest_args.
+      Working directory: backend/
+      Command: python -m pytest <pytest_args from config>
+      Record individual test results (name, pass/fail, error message if any).
 
-5. Write the results to /tmp/smoketest_result.json with this exact structure:
+   c. REGRESSION: Run pytest with the args from suites.regression.pytest_args.
+      Working directory: backend/
+      Command: python -m pytest <pytest_args from config>
+      Record individual test results.
+
+3. Check guardrails from the config:
+   - Count tests collected for curated and regression suites
+   - If count < guardrails.min_test_count for either suite, record a guardrail_violation
+
+4. Write results to /tmp/smoketest_result.json with this structure:
 {
-  "passed": true,
-  "tests": [
-    {"name": "test name", "status": "pass", "message": "details"}
-  ]
+  "passed": false,
+  "suites": {
+    "startup": {"passed": true, "tests": [{"name": "...", "status": "pass", "message": "..."}]},
+    "curated": {"passed": true, "tests": [...]},
+    "regression": {"passed": false, "tests": [...]}
+  },
+  "guardrail_violations": [],
+  "tests": [<flat list of ALL tests from all suites, for backward compatibility>]
 }
 
-Set "passed" to true only if ALL tests have status "pass" or "skip". Set it to false if any test has status "fail".
+Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
 IMPORTANT: Always write /tmp/smoketest_result.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
 
@@ -2406,6 +2444,7 @@ async function main() {
   // Claim task
   const task = await apiPost('/api/agent/claim');
   const taskId = String(task.task_id);
+  process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
   const payloads = task.payloads || [];
   const payload = payloads[0] || {};
   const taskType = String(payload.type || 'create');
@@ -2437,12 +2476,27 @@ async function main() {
     const safeErr = sanitize(errMsg);
     log(`Fatal error: ${safeErr}`);
     sendLog(ws, `\nFatal error: ${safeErr}\n`);
-    try {
-      await apiPost('/api/agent/status', {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: sanitize(`Fatal error: ${errMsg}`),
-      });
-    } catch (e) { log(`Failed to report error: ${e}`); }
+    // Surface the error through the heartbeat so it's visible even if the
+    // status POST fails — the heartbeat updates latest_status_message on the
+    // backend, giving us forensic evidence instead of silent death.
+    statusRef.value = `[ERROR] ${safeErr.slice(0, 200)}`;
+    // Retry status POST aggressively — if this fails, the backend never learns
+    // the result and the reaper eventually times out with no forensic evidence.
+    // Keep heartbeat alive during retries so the reaper doesn't kill us mid-report.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await apiPost('/api/agent/status', {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: sanitize(`Fatal error: ${errMsg}`),
+        });
+        break; // Success — stop retrying
+      } catch (e) {
+        const postErr = e instanceof Error ? e.message : String(e);
+        log(`Failed to report error (attempt ${attempt + 1}/3): ${postErr}`);
+        statusRef.value = `[ERROR] status POST failed: ${sanitize(postErr).slice(0, 150)}`;
+        if (attempt < 2) await new Promise(r => setTimeout(r, 10_000 * (attempt + 1)));
+      }
+    }
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
@@ -2456,20 +2510,37 @@ async function main() {
   }
 }
 
-// Global crash handlers — ensure fatal errors are logged before the process dies
-// (without these, unhandled rejections/exceptions silently kill the agent and
-// the reaper eventually times out with zero forensic evidence)
+// Global crash handlers — report errors via heartbeat before dying.
+// process.exit() skips the finally block, so the crash handler is the
+// ONLY chance to surface forensic evidence to the backend.  Without this,
+// every failure mode (uncaughtException, SIGTERM, cgroup OOM SIGKILL)
+// looks identical: heartbeats stop, task stays IN_PROGRESS, no evidence.
+function _crashReport(label: string, detail: string, exitCode: number) {
+  console.error(`[FATAL] ${label}: ${detail}`);
+  // Fire-and-forget: try to send one last heartbeat with the error info.
+  // This updates latest_status_message so the reaper's "last heartbeat"
+  // carries the crash reason instead of the last tool name.
+  try {
+    const metrics = collectMetrics();
+    const msg = `[FATAL:${label}] ${detail.slice(0, 300)}`;
+    fetch(`${ORCHESTRATOR_URL}/api/agent/heartbeat`, {
+      method: 'POST', headers: apiHeaders,
+      body: JSON.stringify({ task_id: process.env.TASK_ID, status_message: `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, metrics }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {});
+  } catch { /* best effort */ }
+  // Give the fetch 1s to flush before exiting
+  setTimeout(() => process.exit(exitCode), 1000);
+}
+
 process.on('unhandledRejection', (reason) => {
-  console.error(`[FATAL] Unhandled rejection: ${reason}`);
-  process.exit(1);
+  _crashReport('unhandledRejection', String(reason), 1);
 });
 process.on('uncaughtException', (err) => {
-  console.error(`[FATAL] Uncaught exception: ${err instanceof Error ? `${err.message}\n${err.stack}` : err}`);
-  process.exit(1);
+  _crashReport('uncaughtException', err instanceof Error ? `${err.message}\n${err.stack}` : String(err), 1);
 });
 process.on('SIGTERM', () => {
-  console.error('[FATAL] Received SIGTERM — VM shutting down');
-  process.exit(143);
+  _crashReport('SIGTERM', 'VM shutting down', 143);
 });
 
 main().catch((err) => { console.error('Agent failed to start:', err); process.exit(1); });
