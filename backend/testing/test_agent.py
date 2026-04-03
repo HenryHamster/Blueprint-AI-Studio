@@ -267,6 +267,47 @@ async def test_agent_status_already_completed_returns_200_idempotent(client: Asy
     assert data["task_id"] == str(task.id)
 
 
+@pytest.mark.asyncio
+async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_session):
+    """
+    Tests that an agent cannot use a JWT for a task that has been terminated.
+    The _terminated_task_ids set (populated by SQLAlchemy event on status transition)
+    causes verify_agent_token to reject the request with 401.
+    """
+    from app.main import _terminated_task_ids
+
+    project = Project(name="Token Revocation Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-revoked",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id_str = str(task.id)
+    token = create_agent_token(task_id_str, "agent-vm-revoked")
+    headers = {"x-agent-token": token}
+
+    # Simulate task reaching terminal state (what the SQLAlchemy event does in production)
+    _terminated_task_ids[task_id_str] = 9999999999.0  # far-future timestamp
+
+    # Heartbeat should now be rejected
+    resp = await client.post("/api/agent/heartbeat",
+        json={"task_id": task_id_str, "status_message": "still running"},
+        headers=headers)
+    assert resp.status_code == 401
+
+    # Clean up to avoid polluting other tests
+    _terminated_task_ids.pop(task_id_str, None)
+
+
 def test_agent_ws_invalid_token_closes_with_1008(mocker):
     """
     Tests that connecting to the agent WebSocket without a valid token causes

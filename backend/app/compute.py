@@ -399,10 +399,17 @@ STATICENV
 
     service_account = compute_v1.ServiceAccount()
     service_account.email = AGENT_SERVICE_ACCOUNT_EMAIL
+    # Security note: cloud-platform is the ONLY OAuth2 scope that covers Secret Manager.
+    # There is no narrower secretmanager-specific scope. The actual security boundary is
+    # the agent SA's IAM bindings (see infra/terraform/iam.tf):
+    #   - ZERO project-level IAM roles
+    #   - secretAccessor on its own specific secret only (granted per-VM in _store_agent_secret)
+    #   - objectViewer on the artifact bucket only
+    #   - logWriter for Stackdriver logs
     service_account.scopes = [
         "https://www.googleapis.com/auth/devstorage.read_only",
         "https://www.googleapis.com/auth/logging.write",
-        "https://www.googleapis.com/auth/cloud-platform",  # Required for Secret Manager access
+        "https://www.googleapis.com/auth/cloud-platform",
     ]
     instance_config.service_accounts = [service_account]
 

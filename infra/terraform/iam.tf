@@ -50,6 +50,13 @@ resource "google_service_account" "agent_sa" {
   description  = "Has ZERO default permissions. Orchestrator grants access dynamically."
 }
 
+# Grant Agent SA permission to write logs (Stackdriver/Cloud Logging)
+resource "google_project_iam_member" "agent_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
 # Grant Orchestrator SA permission to attach the Agent SA to new VMs
 resource "google_service_account_iam_member" "orchestrator_act_as_agent" {
   service_account_id = google_service_account.agent_sa.name

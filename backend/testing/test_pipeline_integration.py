@@ -568,7 +568,9 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     )
     assert result1.get("status") == "received"
 
-    # Second identical call — task is already terminal, should be a no-op
+    # Second identical call — task is already terminal, should be a no-op.
+    # The status endpoint is exempt from JWT revocation (agents may retry
+    # their own completion POST), so it returns 200 with already_terminal.
     result2 = await _status(
         client, review_task,
         status="COMPLETED",

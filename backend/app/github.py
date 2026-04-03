@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 from fastapi import HTTPException, status
 import logging
@@ -36,6 +38,54 @@ async def close_github_client():
         _github_client = None
 
 
+async def _github_request(
+    method: str,
+    url: str,
+    headers: dict,
+    max_retries: int = 3,
+    **kwargs,
+) -> httpx.Response:
+    """Make a GitHub API request with retry on 5xx/network/rate-limit errors."""
+    response = None
+    for attempt in range(max_retries):
+        try:
+            client = _get_client()
+            response = await client.request(method, url, headers=headers, **kwargs)
+            # 429 rate limit — respect Retry-After header
+            if response.status_code == 429 and attempt < max_retries - 1:
+                retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
+                retry_after = min(retry_after, 60)  # cap at 60s
+                logger.warning(
+                    f"[GITHUB] {method} {url} rate limited, "
+                    f"retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(retry_after)
+                continue
+            if response.status_code < 500 or attempt == max_retries - 1:
+                if attempt > 0 and response.status_code >= 500:
+                    logger.error(
+                        f"[GITHUB] {method} {url} failed with {response.status_code} "
+                        f"after {max_retries} attempts"
+                    )
+                return response
+            delay = 2 ** attempt  # 1s, 2s, 4s
+            logger.warning(
+                f"[GITHUB] {method} {url} returned {response.status_code}, "
+                f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+            )
+            await asyncio.sleep(delay)
+        except httpx.HTTPError as exc:
+            if attempt == max_retries - 1:
+                raise
+            delay = 2 ** attempt
+            logger.warning(
+                f"[GITHUB] {method} {url} network error: {exc}, "
+                f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+            )
+            await asyncio.sleep(delay)
+    return response  # unreachable but satisfies type checker
+
+
 def generate_github_app_jwt() -> str:
     """
     Generates a JWT to authenticate as the GitHub App.
@@ -72,10 +122,8 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-    client = _get_client()
-    resp = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/installation",
-        headers=headers
+    resp = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/installation", headers
     )
     if resp.status_code != 200:
         logger.warning(f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}")
@@ -90,11 +138,10 @@ async def exchange_oauth_code(code: str) -> dict:
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
         raise ValueError("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set")
 
-    client = _get_client()
-    resp = await client.post(
-        "https://github.com/login/oauth/access_token",
+    resp = await _github_request(
+        "POST", "https://github.com/login/oauth/access_token",
+        {"Accept": "application/json"},
         json={"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET, "code": code},
-        headers={"Accept": "application/json"},
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="GitHub OAuth exchange failed")
@@ -111,10 +158,9 @@ async def get_user_installations(user_token: str) -> list[dict]:
         "Accept": "application/vnd.github.v3+json",
     }
     installations = []
-    client = _get_client()
     url = "https://api.github.com/user/installations?per_page=100"
     while url:
-        resp = await client.get(url, headers=headers)
+        resp = await _github_request("GET", url, headers)
         if resp.status_code != 200:
             logger.error(f"Failed to fetch user installations: {resp.text}")
             raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
@@ -127,10 +173,9 @@ async def get_user_installations(user_token: str) -> list[dict]:
 
 async def get_github_user(user_token: str) -> dict:
     """Get the authenticated GitHub user's profile."""
-    client = _get_client()
-    resp = await client.get(
-        "https://api.github.com/user",
-        headers={"Authorization": f"Bearer {user_token}", "Accept": "application/vnd.github.v3+json"},
+    resp = await _github_request(
+        "GET", "https://api.github.com/user",
+        {"Authorization": f"Bearer {user_token}", "Accept": "application/vnd.github.v3+json"},
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Failed to fetch GitHub user profile")
@@ -153,12 +198,11 @@ async def generate_installation_access_token(installation_id: str, repositories:
     if repositories:
         payload["repositories"] = repositories
 
-    client = _get_client()
     try:
-        response = await client.post(
+        response = await _github_request(
+            "POST",
             f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-            headers=headers,
-            json=payload
+            headers, json=payload
         )
     except httpx.HTTPError as e:
         logger.error(f"Network error generating installation token: {e}")
@@ -195,9 +239,8 @@ async def validate_fine_grained_pat(token: str, target_repo: str = None) -> dict
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-    client = _get_client()
     # 1. Check if the token is valid by hitting the authenticated user endpoint
-    user_response = await client.get("https://api.github.com/user", headers=headers)
+    user_response = await _github_request("GET", "https://api.github.com/user", headers)
 
     if user_response.status_code == 401:
         raise HTTPException(
@@ -213,7 +256,7 @@ async def validate_fine_grained_pat(token: str, target_repo: str = None) -> dict
 
     # 2. If a target repo is provided, verify the token can access it
     if target_repo:
-        repo_response = await client.get(f"https://api.github.com/repos/{target_repo}", headers=headers)
+        repo_response = await _github_request("GET", f"https://api.github.com/repos/{target_repo}", headers)
         if repo_response.status_code == 404:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -269,11 +312,9 @@ async def update_commit_status(
     if target_url:
         payload["target_url"] = target_url
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/statuses/{sha}",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/statuses/{sha}",
+        headers, json=payload
     )
 
     if response.status_code != 201:
@@ -306,11 +347,9 @@ async def create_pr_comment(
         "body": body
     }
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        headers, json=payload
     )
 
     if response.status_code != 201:
@@ -349,11 +388,9 @@ async def create_pr_review_comment(
         "side": "RIGHT"
     }
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
+        headers, json=payload
     )
 
     if response.status_code != 201:
@@ -389,11 +426,9 @@ async def create_issue(
     if assignees:
         payload["assignees"] = assignees
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/issues",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
+        headers, json=payload
     )
 
     if response.status_code != 201:
@@ -420,10 +455,9 @@ async def get_issues(
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}",
+        headers
     )
 
     if response.status_code != 200:
@@ -456,12 +490,19 @@ async def create_branch(
         "sha": sha
     }
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/git/refs",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+        headers, json=payload
     )
+
+    if response.status_code == 422:
+        # Branch may already exist (e.g., retry after 502 that actually succeeded)
+        try:
+            existing_sha = await get_branch_sha(token, owner, repo, branch_name)
+            logger.info(f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing")
+            return {"ref": f"refs/heads/{branch_name}", "object": {"sha": existing_sha}}
+        except Exception:
+            pass  # fall through to error below
 
     if response.status_code != 201:
         logger.error(f"Failed to create branch: {response.text}")
@@ -482,10 +523,9 @@ async def get_branch_sha(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+        headers
     )
     if response.status_code != 200:
         logger.error(f"Failed to get SHA for branch {branch}: {response.text}")
@@ -505,10 +545,9 @@ async def delete_branch(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.delete(
-        f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
-        headers=headers
+    response = await _github_request(
+        "DELETE", f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
+        headers
     )
     if response.status_code == 204:
         return True
@@ -541,11 +580,9 @@ async def create_pull_request(
         "body": body
     }
 
-    client = _get_client()
-    response = await client.post(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers=headers,
-        json=payload
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers, json=payload
     )
 
     if response.status_code == 201:
@@ -559,9 +596,10 @@ async def create_pull_request(
             if "pull request already exists" in str(err.get("message", "")).lower():
                 # Return the existing PR instead of failing
                 logger.info(f"PR already exists for {head} -> {base}, fetching existing PR")
-                list_resp = await client.get(
+                list_resp = await _github_request(
+                    "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{head}&base={base}&state=open",
-                    headers=headers
+                    headers
                 )
                 if list_resp.status_code == 200 and list_resp.json():
                     return list_resp.json()[0]
@@ -582,10 +620,9 @@ async def get_pull_request(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers
     )
     if response.status_code != 200:
         logger.error(f"Failed to get PR #{pr_number}: {response.text}")
@@ -602,11 +639,9 @@ async def get_open_pull_requests(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers=headers,
-        params={"state": "open", "base": base, "per_page": 100}
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers, params={"state": "open", "base": base, "per_page": 100}
     )
     if response.status_code != 200:
         logger.error(f"Failed to list PRs for base={base}: {response.text}")
@@ -623,11 +658,9 @@ async def get_pull_request_diff(
         "Accept": "application/vnd.github.v3.diff",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers=headers,
-        timeout=30.0
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers, timeout=30.0
     )
     if response.status_code != 200:
         logger.error(f"Failed to get PR diff #{pr_number}: {response.text}")
@@ -644,10 +677,9 @@ async def get_pull_request_commits(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
+        headers
     )
     if response.status_code != 200:
         logger.error(f"Failed to get PR commits #{pr_number}: {response.text}")
@@ -664,11 +696,9 @@ async def merge_pull_request(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.put(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
-        headers=headers,
-        json={"merge_method": merge_method}
+    response = await _github_request(
+        "PUT", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers, json={"merge_method": merge_method}
     )
     data = response.json()
     if response.status_code == 200:
@@ -691,10 +721,9 @@ async def get_pr_files(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
+        headers
     )
     if response.status_code != 200:
         logger.error(f"Failed to get PR files #{pr_number}: {response.text}")
@@ -718,10 +747,9 @@ async def get_check_runs(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    client = _get_client()
-    response = await client.get(
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
-        headers=headers
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
+        headers
     )
     if response.status_code != 200:
         logger.error(f"Failed to get check runs for {ref}: {response.text}")
@@ -772,11 +800,10 @@ async def get_check_runs(
 
             # Try to fetch actual job logs (GitHub Actions job ID == check run ID)
             try:
-                log_response = await client.get(
+                log_response = await _github_request(
+                    "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{cr_id}/logs",
-                    headers=headers,
-                    follow_redirects=True,
-                    timeout=10.0,
+                    headers, follow_redirects=True, timeout=10.0,
                 )
                 if log_response.status_code == 200:
                     raw_log = log_response.text
@@ -795,9 +822,10 @@ async def get_check_runs(
 
             # Fallback: fetch annotations
             try:
-                ann_response = await client.get(
+                ann_response = await _github_request(
+                    "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/check-runs/{cr_id}/annotations",
-                    headers=headers
+                    headers
                 )
                 if ann_response.status_code == 200:
                     for ann in ann_response.json():

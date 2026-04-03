@@ -3,6 +3,7 @@ import httpx
 import os
 import re
 import logging
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
@@ -20,7 +21,7 @@ import json
 from datetime import datetime, timedelta
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity
+from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -72,6 +73,9 @@ import app.shared_state as _shared_state
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
+
+# Deadlock detection throttle — only check every 60 seconds
+_last_deadlock_check: float = 0.0
 
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
@@ -941,11 +945,68 @@ async def broadcast_deploy_state():
     except Exception as e:
         logger.warning(f"[WS] Failed to broadcast deploy state: {e}")
 
-def verify_agent_token(x_agent_token: str = Header(..., description="Secret token for agent authentication")):
+# JWT revocation: tasks that have reached terminal state (COMPLETED/FAILED/CANCELLED).
+# Maps task_id -> timestamp of termination. Entries older than _TERMINATED_TTL are evicted
+# to prevent unbounded growth (JWTs expire after 8h, so older entries are redundant).
+# After a cold start this dict is empty; the DB fallback below covers that case.
+_terminated_task_ids: dict[str, float] = {}
+_TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
+_on_task_terminal_callbacks.append(lambda tid: _terminated_task_ids.__setitem__(tid, time.time()))
+# TTL cache for "known active" tasks — avoids DB query per request.
+# Maps task_id -> expiry timestamp. Only checked on _terminated_task_ids miss.
+_agent_active_cache: dict[str, float] = {}
+_AGENT_CACHE_TTL = 60.0  # seconds
+_AGENT_CACHE_MAX = 5000  # evict expired entries when cache exceeds this size
+
+
+async def verify_agent_token(request: Request, x_agent_token: str = Header(..., description="Secret token for agent authentication")):
     """
     Validates the short-lived JWT passed by the agent VM.
+    Rejects tokens for tasks that are no longer active (completed/failed/cancelled).
+    The status endpoint is exempt because agents may retry their own completion POST
+    (the endpoint has its own idempotency guard).
     """
     payload = verify_agent_jwt(x_agent_token)
+    task_id = payload.get("sub")
+    if not task_id:
+        return payload
+
+    # Fast path: known terminated (in-memory, O(1))
+    # Allow status endpoint through — it has its own idempotency guard for retries
+    if task_id in _terminated_task_ids:
+        if request.url.path != "/api/agent/status":
+            raise HTTPException(status_code=401, detail="Task is no longer active")
+        return payload
+
+    # Fast path: recently verified as active (TTL cache)
+    cached_expiry = _agent_active_cache.get(task_id)
+    if cached_expiry and time.time() < cached_expiry:
+        return payload
+
+    # Slow path: DB check (runs at most once per AGENT_CACHE_TTL per task)
+    try:
+        async with AsyncSessionLocal() as session:
+            task = await session.get(Task, uuid.UUID(task_id))
+            if not task or task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                _terminated_task_ids[task_id] = time.time()
+                raise HTTPException(status_code=401, detail="Task is no longer active")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # DB error — fail open to avoid blocking agents during DB issues
+        logger.warning(f"[AUTH] DB check failed for task {task_id}, allowing request: {e}")
+
+    now = time.time()
+    _agent_active_cache[task_id] = now + _AGENT_CACHE_TTL
+    # Evict expired entries to prevent unbounded growth
+    if len(_agent_active_cache) > _AGENT_CACHE_MAX:
+        _agent_active_cache.clear()
+    # Evict stale terminated entries (JWT expired, entry is redundant)
+    if len(_terminated_task_ids) > _AGENT_CACHE_MAX:
+        cutoff = now - _TERMINATED_TTL
+        stale = [k for k, v in _terminated_task_ids.items() if v <= cutoff]
+        for k in stale:
+            _terminated_task_ids.pop(k, None)
     return payload
 
 async def reaper_service():
@@ -1228,6 +1289,45 @@ async def orchestrator_worker():
                         logger.error(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
                     elif all_met:
                         eligible_ids.append(task.id)
+
+                # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
+                global _last_deadlock_check
+                now = time.time()
+                if now - _last_deadlock_check > 60:
+                    _last_deadlock_check = now
+                    stuck_tasks = [t for t in candidate_tasks
+                                   if t.id not in eligible_ids
+                                   and (t.depends_on or [])
+                                   and t.status == TaskStatus.QUEUED]
+                    if stuck_tasks:
+                        stuck_ids = {t.id for t in stuck_tasks}
+                        for stask in stuck_tasks:
+                            dep_uuids = set()
+                            for d in (stask.depends_on or []):
+                                try:
+                                    dep_uuids.add(uuid.UUID(d))
+                                except (ValueError, AttributeError):
+                                    continue
+                            # If ALL deps are stuck or not in candidate pool, task is deadlocked
+                            candidate_ids = {t.id for t in candidate_tasks}
+                            all_stuck_or_missing = dep_uuids and all(
+                                d in stuck_ids or d not in candidate_ids
+                                for d in dep_uuids
+                            )
+                            if all_stuck_or_missing:
+                                async with AsyncSessionLocal() as fix_session:
+                                    fix_task = await fix_session.get(Task, stask.id)
+                                    if fix_task:
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Breaking deadlock: clearing depends_on "
+                                            f"for task {stask.id} (had {len(dep_uuids)} stuck deps)"
+                                        )
+                                        fix_task.depends_on = []
+                                        fix_task.latest_status_message = "Dependencies cleared: deadlock detected"
+                                        fix_session.add(fix_task)
+                                        await fix_session.commit()
+                                eligible_ids.append(stask.id)
+                                break  # One per check — conservative
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 # Build a set of files currently being modified by IN_PROGRESS tasks
@@ -2567,9 +2667,10 @@ async def agent_heartbeat(
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
-    # would starve the heartbeat (agent's 30s HTTP timeout fires, but the
-    # PostgreSQL query keeps waiting with no lock_timeout configured),
-    # causing last_heartbeat to go stale and the reaper to kill the task.
+    # would starve the heartbeat (agent's 30s HTTP timeout fires before the
+    # 10s lock_timeout, but retries compound and the lock holder may take
+    # longer than the timeout), causing last_heartbeat to go stale and the
+    # reaper to kill the task.
     # Skipping one heartbeat is safe — the reaper's threshold is 5 minutes,
     # and the next heartbeat (30s later) will succeed once the lock releases.
     stmt = select(Task).where(
@@ -2926,7 +3027,6 @@ async def _spawn_pipeline_task(
 
 def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
     """Extract structured plan JSON from agent output text."""
-    import re
     try:
         # Find the start of the JSON block containing "subtasks"
         match = re.search(r'\{\s*"subtasks"\s*:\s*\[', text)
@@ -3105,6 +3205,38 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
                 print(f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}")
 
 
+async def _ensure_branch(
+    task: Task, branch_name: str, source_branch: str,
+    label: str, session: AsyncSession
+) -> bool:
+    """Create a branch, or verify it already exists.
+
+    Returns True on success, False on failure (task set to FAILED).
+    """
+    gh_token = owner = repo = None
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        sha = await get_branch_sha(gh_token, owner, repo, source_branch)
+        await create_branch(gh_token, owner, repo, branch_name, sha)
+        logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
+        return True
+    except Exception as e:
+        if gh_token:
+            try:
+                await get_branch_sha(gh_token, owner, repo, branch_name)
+                logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
+                return True
+            except Exception:
+                logger.error(f"[{label}] Branch {branch_name} does not exist and creation failed: {e!r}")
+        else:
+            logger.error(f"[{label}] Cannot create branch — GitHub token unavailable: {e!r}")
+        task.status = TaskStatus.FAILED
+        task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
+        session.add(task)
+        await session.commit()
+        return False
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     plan_data = _parse_plan_output(logs)
@@ -3139,32 +3271,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     plan_branch = f"plan/{short_id}"
 
     # Create staging branch for this plan's subtasks
-    gh_token = owner = repo = None
-    try:
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        sha = await get_branch_sha(gh_token, owner, repo, parent_base)
-        await create_branch(gh_token, owner, repo, plan_branch, sha)
-        logger.info(f"[PLAN] Created branch {plan_branch} from {parent_base}")
-    except Exception as e:
-        # Branch may already exist from a previous run — verify it actually exists
-        if gh_token:
-            try:
-                await get_branch_sha(gh_token, owner, repo, plan_branch)
-                logger.info(f"[PLAN] Branch {plan_branch} already exists — reusing")
-            except Exception:
-                logger.error(f"[PLAN] Branch {plan_branch} does not exist and creation failed: {e!r} — aborting subtask creation")
-                task.status = TaskStatus.FAILED
-                task.latest_status_message = f"Failed to create plan branch: {type(e).__name__}: {e!r}"[:500]
-                session.add(task)
-                await session.commit()
-                return
-        else:
-            logger.error(f"[PLAN] Cannot create branch — GitHub token unavailable: {e!r}")
-            task.status = TaskStatus.FAILED
-            task.latest_status_message = f"Failed to create plan branch: {type(e).__name__}: {e!r}"[:500]
-            session.add(task)
-            await session.commit()
-            return
+    if not await _ensure_branch(task, plan_branch, parent_base, "PLAN", session):
+        return
 
     # Store branch info on the plan task for rollup later
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
@@ -3319,6 +3427,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     # Inject serial dependencies for subtasks that share files (additive only)
     _inject_file_overlap_deps(subtasks, "PLAN")
+
+    # Re-validate after file overlap injection — injection can create cycles
+    # (e.g., A explicitly depends on B, but file overlap adds B → A)
+    if not _validate_plan_dependencies(subtasks):
+        logger.error("[PLAN] Circular dependency after file overlap injection — stripping all depends_on_indices")
+        for st in subtasks:
+            st.pop("depends_on_indices", None)
 
     # Second pass: resolve depends_on_indices to actual UUIDs
     for i, subtask_def in enumerate(subtasks):
@@ -3634,32 +3749,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     research_branch = f"research/{short_id}"
 
     # Create staging branch for this research batch
-    gh_token = owner = repo = None
-    try:
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        sha = await get_branch_sha(gh_token, owner, repo, original_base)
-        await create_branch(gh_token, owner, repo, research_branch, sha)
-        logger.info(f"[RESEARCH] Created branch {research_branch} from {original_base}")
-    except Exception as e:
-        # Branch may already exist from a previous run — verify it actually exists
-        if gh_token:
-            try:
-                await get_branch_sha(gh_token, owner, repo, research_branch)
-                logger.info(f"[RESEARCH] Branch {research_branch} already exists — reusing")
-            except Exception:
-                logger.error(f"[RESEARCH] Branch {research_branch} does not exist and creation failed: {e!r} — aborting child task creation")
-                task.status = TaskStatus.FAILED
-                task.latest_status_message = f"Failed to create research branch: {type(e).__name__}: {e!r}"[:500]
-                session.add(task)
-                await session.commit()
-                return
-        else:
-            logger.error(f"[RESEARCH] Cannot create branch — GitHub token unavailable: {e!r}")
-            task.status = TaskStatus.FAILED
-            task.latest_status_message = f"Failed to create research branch: {type(e).__name__}: {e!r}"[:500]
-            session.add(task)
-            await session.commit()
-            return
+    if not await _ensure_branch(task, research_branch, original_base, "RESEARCH", session):
+        return
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):
@@ -4080,6 +4171,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             rollup_note = f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
 
         if staging_branch and target_branch and staging_branch != target_branch:
+            gh_token = owner = repo = None
             try:
                 gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
 
@@ -4177,6 +4269,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             parent.status = TaskStatus.FAILED
                             parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
+                            try:
+                                await delete_branch(gh_token, owner, repo, staging_branch)
+                                logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (fix spawn failed)")
+                            except Exception as cleanup_err:
+                                logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
@@ -4191,10 +4288,21 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.status = TaskStatus.FAILED
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
+                        try:
+                            await delete_branch(gh_token, owner, repo, staging_branch)
+                            logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (review spawn failed)")
+                        except Exception as cleanup_err:
+                            logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
             except Exception as e:
                 logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
                 parent.status = TaskStatus.FAILED
                 parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
+                if gh_token:
+                    try:
+                        await delete_branch(gh_token, owner, repo, staging_branch)
+                        logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (rollup exception)")
+                    except Exception as cleanup_err:
+                        logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
@@ -5208,29 +5316,40 @@ async def update_agent_status(
                         await session.commit()
                         logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
 
-            # Plan task completed → decompose into subtasks
-            elif task_type == "plan":
-                plan_logs = payload.logs or task.latest_status_message or ""
-                await _handle_plan_completion(task, plan_logs, session)
+            # Completion handlers — wrapped in try/except to prevent VM leak.
+            # If a handler throws after the early commit, BackgroundTasks (including
+            # delete_agent_vm) won't run on a 500 response. We catch, log, and ensure
+            # VM cleanup via asyncio.create_task as a fallback.
+            try:
+                if task_type == "plan":
+                    plan_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_plan_completion(task, plan_logs, session)
 
-            # Research task completed → create tasks from findings
-            elif task_type == "research":
-                research_logs = payload.logs or task.latest_status_message or ""
-                await _handle_research_completion(task, research_logs, session)
+                elif task_type == "research":
+                    research_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_research_completion(task, research_logs, session)
 
-            # Security audit completed → spawn fix tasks for critical/high findings
-            elif task_type == "security_audit":
-                audit_logs = payload.logs or task.latest_status_message or ""
-                await _handle_security_audit_completion(task, audit_logs, session)
+                elif task_type == "security_audit":
+                    audit_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_security_audit_completion(task, audit_logs, session)
 
-            # Perf audit completed → spawn fix tasks for high-severity findings
-            elif task_type == "perf":
-                perf_logs = payload.logs or task.latest_status_message or ""
-                await _handle_perf_completion(task, perf_logs, session)
+                elif task_type == "perf":
+                    perf_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_perf_completion(task, perf_logs, session)
 
-            # Investigation completed → store report, no child tasks
-            elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
-                await _handle_investigation_completion(task, payload, session)
+                elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
+                    await _handle_investigation_completion(task, payload, session)
+            except Exception as handler_exc:
+                logger.error(
+                    f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",
+                    exc_info=True,
+                )
+                task.latest_status_message = (
+                    f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
+                )
+                session.add(task)
+                if task.vm_instance_id:
+                    asyncio.create_task(delete_agent_vm(task.vm_instance_id))
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
@@ -5768,6 +5887,30 @@ async def github_webhook(
                     logger.info(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
                     return {"status": "ignored"}
                 background_tasks.add_task(_check_autonomous_research, owner, repo)
+
+                # Propagate pr_merged to tasks that created this PR
+                pr_number = data["pull_request"].get("number")
+                if pr_number:
+                    pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
+                    art_result = await session.execute(
+                        select(Artifact).where(
+                            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                            Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
+                        )
+                    )
+                    pr_artifacts = art_result.scalars().all()
+                    affected_tasks = []
+                    for art in pr_artifacts:
+                        pr_task = await session.get(Task, art.task_id)
+                        if pr_task and not (pr_task.context or {}).get("pr_merged"):
+                            pr_task.context = {**(pr_task.context or {}), "pr_merged": True}
+                            session.add(pr_task)
+                            affected_tasks.append(pr_task)
+                            logger.info(f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})")
+                    if affected_tasks:
+                        await session.commit()
+                        for at in affected_tasks:
+                            await _check_and_trigger_rollup(at, session)
 
     return {"status": "received"}
 

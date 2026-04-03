@@ -54,6 +54,16 @@ async function apiPost(path: string, body: Record<string, unknown> = {}, retries
       clearTimeout(timeout);
       if (res.ok) return res.json();
       const text = await res.text();
+      // 401 with "no longer active": task completed/failed — our previous POST worked.
+      // This happens when a status COMPLETED POST succeeded but the response was lost,
+      // so the agent retries and hits JWT revocation. Treat as success.
+      if (res.status === 401 && text.includes('no longer active')) {
+        if (path === '/api/agent/status') {
+          log(`POST ${path} got 401 (task terminated) — previous POST likely succeeded`);
+          return { status: 'already_terminal', task_id: body.task_id };
+        }
+        throw new Error(`POST ${path} failed (401): ${text}`);
+      }
       // 401: attempt token refresh at most once, then retry
       if (res.status === 401) {
         if (tokenRefreshed) throw new Error(`POST ${path} failed (401): ${text}`);
@@ -565,15 +575,17 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
     if (model) args.push('--model', model);
     if (effort) args.push('--effort', effort);
-    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv });
+    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true });
 
-    // Kill Claude if it exceeds 30 minutes
+    // Kill Claude if it exceeds 30 minutes — kill entire process group (negative PID)
+    // so child processes (npm, pytest, etc.) are also terminated
     const CLAUDE_TIMEOUT_MS = 30 * 60 * 1000;
     const killTimer = setTimeout(() => {
-      log('Claude Code process timed out after 30 minutes — killing');
+      log('Claude Code process timed out after 30 minutes — killing process group');
       sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
-      claude.kill('SIGTERM');
-      setTimeout(() => { try { claude.kill('SIGKILL'); } catch {} }, 5000);
+      const pid = claude.pid;
+      if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch {} }
+      setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch {} } }, 5000);
     }, CLAUDE_TIMEOUT_MS);
 
     const MAX_OUTPUT = 10_000_000; // 10MB cap — prevents unbounded memory growth
@@ -873,7 +885,7 @@ If the changes look good and should be merged:
 If changes are needed before merging:
 {"verdict": "REQUEST_CHANGES", "feedback": "...", "issues": [{"severity": "critical|major|minor", "description": "..."}]}
 
-IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
+IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running code review...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort);
@@ -883,8 +895,8 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict.json (NOT in the 
   let logs = '';
   let verdictJsonField: string | undefined;
   try {
-    if (fs.existsSync('/tmp/review_verdict.json')) {
-      const verdictJson = fs.readFileSync('/tmp/review_verdict.json', 'utf-8').trim();
+    if (fs.existsSync(`/tmp/review_verdict_${taskId}.json`)) {
+      const verdictJson = fs.readFileSync(`/tmp/review_verdict_${taskId}.json`, 'utf-8').trim();
       // Validate it's actual verdict JSON
       const parsed = JSON.parse(verdictJson);
       if (parsed.verdict) {
@@ -1299,7 +1311,7 @@ Rules:
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
 - For subtasks that involve the agent system (agent/src/index.ts), note that the agent is a monolithic file — changes must be minimal and focused to avoid conflicts with parallel subtasks.
-- IMPORTANT: Write your plan JSON to /tmp/plan_output.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
+- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
 
   statusRef.value = 'Running Claude Code for planning...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort);
@@ -1307,11 +1319,11 @@ Rules:
   // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
 
-  const planPath = '/tmp/plan_output.json';
+  const planPath = `/tmp/plan_output_${taskId}.json`;
   try {
     if (fs.existsSync(planPath)) {
       logs = sanitize(fs.readFileSync(planPath, 'utf-8'));
-      sendLog(ws, 'Read plan output from /tmp/plan_output.json\n');
+      sendLog(ws, `Read plan output from ${planPath}\n`);
     }
   } catch (e) {
     sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
@@ -1565,7 +1577,7 @@ How your findings get routed (you control this via type and scope):
 - type=research → spawns another **research** agent for deeper investigation before any implementation
 - type=improvement/bug/refactor/feature/test with scope=large → spawns a **plan** agent that decomposes into subtasks
 - type=improvement/bug/refactor/feature/test with scope=small or medium → spawns a **create** agent (single PR)
-- IMPORTANT: Write your findings JSON array to /tmp/research_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/research_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 
 Context — you are part of an autonomous pipeline:
 - You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
@@ -1585,11 +1597,11 @@ Approach:
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
-  const findingsPath = '/tmp/research_findings.json';
+  const findingsPath = `/tmp/research_findings_${taskId}.json`;
   try {
     if (fs.existsSync(findingsPath)) {
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, 'Read research findings from /tmp/research_findings.json\n');
+      sendLog(ws, `Read research findings from ${findingsPath}\n`);
     }
   } catch (e) {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
@@ -1726,7 +1738,7 @@ Rules:
 - Each finding must have a concrete, actionable fix_prompt
 - Limit to 20 findings maximum, prioritized by severity
 - For findings without a specific line number, use 0
-- IMPORTANT: Write your findings JSON array to /tmp/security_findings.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
@@ -1734,11 +1746,11 @@ Rules:
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + securityPromptSuffix, ws, statusRef, model, effort);
 
   let logs = '';
-  const findingsPath = '/tmp/security_findings.json';
+  const findingsPath = `/tmp/security_findings_${taskId}.json`;
   try {
     if (fs.existsSync(findingsPath)) {
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, 'Read security findings from /tmp/security_findings.json\n');
+      sendLog(ws, `Read security findings from ${findingsPath}\n`);
     }
   } catch (e) {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
@@ -2027,7 +2039,7 @@ Follow these steps:
    - Count tests collected for curated and regression suites
    - If count < guardrails.min_test_count for either suite, record a guardrail_violation
 
-4. Write results to /tmp/smoketest_result.json with this structure:
+4. Write results to /tmp/smoketest_result_${taskId}.json with this structure:
 {
   "passed": false,
   "suites": {
@@ -2041,7 +2053,7 @@ Follow these steps:
 
 Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
-IMPORTANT: Always write /tmp/smoketest_result.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
+IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
 
   statusRef.value = 'Running smoke tests...';
   const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort);
@@ -2049,10 +2061,10 @@ IMPORTANT: Always write /tmp/smoketest_result.json even if you cannot run any te
   // Read result file written by Claude
   let smoketestResult: { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null = null;
   try {
-    const resultJson = fs.readFileSync('/tmp/smoketest_result.json', 'utf-8');
+    const resultJson = fs.readFileSync(`/tmp/smoketest_result_${taskId}.json`, 'utf-8');
     smoketestResult = JSON.parse(resultJson);
   } catch {
-    sendLog(ws, 'Warning: /tmp/smoketest_result.json not found or invalid\n');
+    sendLog(ws, `Warning: /tmp/smoketest_result_${taskId}.json not found or invalid\n`);
   }
 
   if (exitCode === 0 && smoketestResult) {
@@ -2202,7 +2214,7 @@ ${gitDiffStat}
 
 4. Identify the specific root cause — name the file, function, and line where the problem originates.
 
-5. Write your analysis to /tmp/debug_output.json with EXACTLY this structure:
+5. Write your analysis to /tmp/debug_output_${taskId}.json with EXACTLY this structure:
 {
   "root_cause": "One clear paragraph explaining what caused the failure, which file/function is responsible, and how it broke",
   "affected_files": ["path/to/file1.ts", "path/to/file2.py"],
@@ -2215,17 +2227,17 @@ Set confidence to:
 - "medium" if you have a strong hypothesis but some uncertainty
 - "low" if the root cause is unclear or spans many systems
 
-IMPORTANT: Always write /tmp/debug_output.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
+IMPORTANT: Always write /tmp/debug_output_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
   const { allOutput } = await runClaudeCode(debugPrompt, ws, statusRef, model, effort);
 
   let debugResult: { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null = null;
   try {
-    const resultJson = fs.readFileSync('/tmp/debug_output.json', 'utf-8');
+    const resultJson = fs.readFileSync(`/tmp/debug_output_${taskId}.json`, 'utf-8');
     debugResult = JSON.parse(resultJson);
   } catch {
-    sendLog(ws, 'Warning: /tmp/debug_output.json not found or invalid\n');
+    sendLog(ws, `Warning: /tmp/debug_output_${taskId}.json not found or invalid\n`);
   }
 
   if (debugResult) {
@@ -2276,7 +2288,7 @@ Instructions:
 1. Read key files: backend/app/models.py (table/index definitions), backend/app/main.py (query patterns, endpoint handlers), and admin-ui/src (React components, imports).
 2. For each finding, identify the specific file, function, and line range where the problem is observable.
 3. Only report findings that are demonstrably present — cite the exact code pattern that shows the problem.
-4. Produce your findings as a JSON array written to /tmp/perf_output.json:
+4. Produce your findings as a JSON array written to /tmp/perf_output_${taskId}.json:
 
 [
   {
@@ -2298,18 +2310,18 @@ Rules:
 - Do NOT flag theoretical issues (e.g. "this could be slow if data grows") — only flag patterns that are demonstrably inefficient now
 - fix_prompt must be fully self-contained — the fixing agent has no context beyond that string
 - Limit to 15 findings maximum, prioritized by severity
-- IMPORTANT: Write your findings JSON array to /tmp/perf_output.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/perf_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
   statusRef.value = 'Running performance analysis...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt, ws, statusRef, model, effort);
 
   let logs = '';
-  const findingsPath = '/tmp/perf_output.json';
+  const findingsPath = `/tmp/perf_output_${taskId}.json`;
   try {
     if (fs.existsSync(findingsPath)) {
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, 'Read perf findings from /tmp/perf_output.json\n');
+      sendLog(ws, `Read perf findings from ${findingsPath}\n`);
     }
   } catch (e) {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
@@ -2356,7 +2368,7 @@ Instructions:
 1. Read relevant source files to understand the codebase and locate the root cause of the issue.
 2. DO NOT make any changes to any files — this is a read-only analysis.
 3. Identify the root cause, affected files, and a recommended fix.
-4. Write your diagnosis as a JSON object to /tmp/investigation_report.json with EXACTLY this schema:
+4. Write your diagnosis as a JSON object to /tmp/investigation_report_${taskId}.json with EXACTLY this schema:
 
 {
   "summary": "Brief summary of the issue and findings",
@@ -2370,7 +2382,7 @@ Instructions:
 }
 
 IMPORTANT:
-- Write ONLY the JSON object to /tmp/investigation_report.json — no markdown, no code fences, no extra text.
+- Write ONLY the JSON object to /tmp/investigation_report_${taskId}.json — no markdown, no code fences, no extra text.
 - Do NOT modify any files in the repository.
 - Base every claim on code you have actually read.`;
 
@@ -2378,7 +2390,7 @@ IMPORTANT:
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
 
 
-  const reportPath = '/tmp/investigation_report.json';
+  const reportPath = `/tmp/investigation_report_${taskId}.json`;
 
   let logs = '';
   try {
@@ -2389,7 +2401,7 @@ IMPORTANT:
     // Validate it parses as JSON
     JSON.parse(raw);
     logs = sanitize(raw);
-    sendLog(ws, 'Read investigation report from /tmp/investigation_report.json\n');
+    sendLog(ws, `Read investigation report from ${reportPath}\n`);
   } catch (e) {
     const errMsg = `Failed to read investigation report: ${e}`;
     sendLog(ws, `${errMsg}\n`);
@@ -2502,9 +2514,9 @@ async function main() {
     if (ws) ws.close();
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch {}
-    // Clean up /tmp files written by Claude Code handlers
-    for (const f of ['/tmp/review_verdict.json', '/tmp/smoketest_result.json', '/tmp/debug_output.json', '/tmp/investigation_report.json', '/tmp/perf_output.json']) {
-      try { fs.unlinkSync(f); } catch {}
+    // Clean up /tmp files written by Claude Code handlers (task-specific paths)
+    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report']) {
+      try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch {}
     }
     log('Agent shutdown complete.');
   }

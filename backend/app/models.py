@@ -3,8 +3,11 @@ from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import Column, String, Integer, Index, text
 from sqlalchemy.dialects.postgresql import JSONB
+import logging
 import uuid
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -164,11 +167,23 @@ def _on_status_message_set(target: Task, value, oldvalue, initiator):
         entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
         target.status_log = (target.status_log or []) + [entry]
 
+# Callbacks invoked when a task reaches a terminal state.
+# main.py registers _terminated_task_ids.add here to revoke agent JWTs.
+_on_task_terminal_callbacks: list = []
+
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
         entry = {"t": datetime.utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
         target.status_log = (target.status_log or []) + [entry]
+        # Notify JWT revocation when task reaches terminal state
+        if value in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            task_id = str(target.id)
+            for cb in _on_task_terminal_callbacks:
+                try:
+                    cb(task_id)
+                except Exception as e:
+                    logger.error(f"[MODELS] Terminal callback failed for task {task_id}: {e}", exc_info=True)
 
 
 class AlertSeverity(str, Enum):
