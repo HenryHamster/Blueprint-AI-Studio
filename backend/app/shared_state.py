@@ -87,3 +87,8 @@ external_health: Dict = {
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
 }
+
+# Track last successful GitHub API operation (tokens, PR comments, etc.)
+# Used by health check to passively verify GitHub is reachable without
+# making an active API call that competes for the shared connection pool.
+last_github_success: Optional[datetime] = None

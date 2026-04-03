@@ -1,4 +1,5 @@
 import copy
+import httpx
 import os
 import re
 import logging
@@ -442,20 +443,36 @@ async def _check_external_health():
         ext["db"] = False
         failed.append("db")
 
-    # GitHub API check — authenticated via App JWT (5,000 req/hr vs 60 unauthenticated)
-    try:
-        from app.github import _get_client, generate_github_app_jwt
-        client = _get_client()
-        jwt_token = generate_github_app_jwt()
-        resp = await client.get("https://api.github.com/app", timeout=5.0,
-                                headers={"Authorization": f"Bearer {jwt_token}"})
-        ext["github_api"] = resp.status_code == 200
-        if not ext["github_api"]:
+    # GitHub API check — passive first, active fallback.
+    # Primary: check if recent agent operations succeeded (avoids connection pool
+    # contention that caused false auto-pause under load).
+    # Fallback: if no operations in 5 minutes (e.g., pipeline idle, no agents),
+    # make a dedicated active check to verify GitHub is actually reachable.
+    github_stale_threshold = 300  # 5 minutes
+    github_age = (now - _shared_state.last_github_success).total_seconds() if _shared_state.last_github_success else None
+
+    if github_age is not None and github_age < github_stale_threshold:
+        # Recent success — GitHub is healthy, no active check needed
+        ext["github_api"] = True
+    else:
+        # No recent success — either idle or actually down. Make a dedicated active check
+        # using a separate short-lived client to avoid connection pool contention.
+        try:
+            from app.github import generate_github_app_jwt
+            jwt_token = generate_github_app_jwt()
+            async with httpx.AsyncClient(timeout=10.0) as health_client:
+                resp = await health_client.get("https://api.github.com/app",
+                                               headers={"Authorization": f"Bearer {jwt_token}"})
+            ext["github_api"] = resp.status_code == 200
+            if ext["github_api"]:
+                _shared_state.last_github_success = now  # Update tracker on active check success
+            else:
+                logger.warning(f"[HEALTH] GitHub API returned {resp.status_code}")
+                failed.append("github_api")
+        except Exception as e:
+            logger.warning(f"[HEALTH] GitHub API health check failed: {type(e).__name__}: {e!r}")
+            ext["github_api"] = False
             failed.append("github_api")
-    except Exception as e:
-        logger.warning(f"[HEALTH] GitHub API health check failed: {e}", exc_info=True)
-        ext["github_api"] = False
-        failed.append("github_api")
 
     # Claude API — check credentials + rate limit failures
     has_credentials = bool(_max_plan_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
@@ -5023,6 +5040,9 @@ async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession) -
                 detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat."
             )
         
+    # Track successful GitHub API interaction for passive health checking
+    _shared_state.last_github_success = datetime.utcnow()
+
     return token, project.github_owner, project.github_repo
 
 @app.get("/api/agent/github/token")

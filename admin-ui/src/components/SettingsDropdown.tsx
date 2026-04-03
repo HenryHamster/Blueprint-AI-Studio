@@ -36,6 +36,8 @@ interface SettingsDropdownProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
+  directionCooldownHours: number;
+  onUpdateDirectionCooldown: (value: number) => void;
   autonomousResearchModel: string;
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
@@ -115,6 +117,8 @@ export function SettingsDropdown({
   onUpdateMaxAutonomousRate,
   autonomousResearchIntervalMinutes,
   onUpdateAutonomousResearchInterval,
+  directionCooldownHours,
+  onUpdateDirectionCooldown,
   autonomousResearchModel,
   onUpdateAutonomousResearchModel,
   autonomousResearchEffort,
@@ -370,16 +374,29 @@ export function SettingsDropdown({
           <div className="border-t border-neutral-800 pt-3 mb-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Autonomous Research</h4>
           </div>
-          <div className="mb-4">
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Interval (minutes)</label>
-            <input
-              type="number"
-              min={1}
-              max={1440}
-              value={autonomousResearchIntervalMinutes}
-              onChange={e => onUpdateAutonomousResearchInterval(parseInt(e.target.value) || 30)}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            />
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div>
+              <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Interval (min)</label>
+              <input
+                type="number"
+                min={1}
+                max={1440}
+                value={autonomousResearchIntervalMinutes}
+                onChange={e => onUpdateAutonomousResearchInterval(parseInt(e.target.value) || 30)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Direction Cooldown (hrs)</label>
+              <input
+                type="number"
+                min={1}
+                max={168}
+                value={directionCooldownHours}
+                onChange={e => onUpdateDirectionCooldown(parseInt(e.target.value) || 4)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+            </div>
           </div>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Model</label>

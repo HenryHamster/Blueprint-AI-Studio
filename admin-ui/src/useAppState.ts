@@ -119,6 +119,7 @@ export function useAppState() {
   const [maxRetries, setMaxRetries] = useState(3);
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
+  const [directionCooldownHours, setDirectionCooldownHours] = useState(4);
   const [autonomousResearchModel, setAutonomousResearchModel] = useState('');
   const [autonomousResearchEffort, setAutonomousResearchEffort] = useState('');
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
@@ -995,6 +996,7 @@ export function useAppState() {
         setMaxRetries(data.max_retries ?? 3);
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
+        setDirectionCooldownHours(data.autonomous_direction_cooldown_hours ?? 4);
         setAutonomousResearchModel(data.autonomous_research_model ?? '');
         setAutonomousResearchEffort(data.autonomous_research_effort ?? '');
         setUsingMaxPlan(data.using_max_plan ?? false);
@@ -1146,6 +1148,22 @@ export function useAppState() {
     } catch {
       setAutonomousResearchIntervalMinutes(prev);
       addToast('Failed to update research interval', 'error');
+    }
+  };
+
+  const handleUpdateDirectionCooldown = async (value: number) => {
+    const v = Math.max(1, Math.min(168, value));
+    const prev = directionCooldownHours;
+    setDirectionCooldownHours(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ autonomous_direction_cooldown_hours: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setDirectionCooldownHours(prev);
+      addToast('Failed to update direction cooldown', 'error');
     }
   };
 
@@ -1580,9 +1598,9 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, autonomousResearchModel, autonomousResearchEffort,
+    autonomousResearchIntervalMinutes, directionCooldownHours, autonomousResearchModel, autonomousResearchEffort,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
-    handleUpdateAutonomousResearchInterval, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
+    handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldown, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,

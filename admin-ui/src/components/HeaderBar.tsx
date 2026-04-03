@@ -49,6 +49,8 @@ export interface HeaderBarProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
+  directionCooldownHours: number;
+  onUpdateDirectionCooldown: (value: number) => void;
   autonomousResearchModel: string;
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
@@ -129,6 +131,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateMaxAutonomousRate,
     autonomousResearchIntervalMinutes,
     onUpdateAutonomousResearchInterval,
+    directionCooldownHours,
+    onUpdateDirectionCooldown,
     autonomousResearchModel,
     onUpdateAutonomousResearchModel,
     autonomousResearchEffort,
@@ -270,6 +274,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
+          directionCooldownHours={directionCooldownHours}
+          onUpdateDirectionCooldown={onUpdateDirectionCooldown}
           autonomousResearchModel={autonomousResearchModel}
           onUpdateAutonomousResearchModel={onUpdateAutonomousResearchModel}
           autonomousResearchEffort={autonomousResearchEffort}
