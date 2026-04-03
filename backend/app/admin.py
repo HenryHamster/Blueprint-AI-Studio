@@ -1496,6 +1496,7 @@ async def update_direction(
 async def create_direction_research_task(
     project_id: uuid.UUID,
     direction_id: str,
+    bypass_cooldown: bool = False,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -1507,17 +1508,33 @@ async def create_direction_research_task(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
+    if not bypass_cooldown:
+        cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
+        last_researched_at = direction.get("last_researched_at")
+        if last_researched_at:
+            elapsed = (datetime.utcnow() - datetime.fromisoformat(last_researched_at)).total_seconds()
+            if elapsed < cooldown_hours * 3600:
+                remaining_minutes = int((cooldown_hours * 3600 - elapsed) / 60)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Direction is in cooldown for {remaining_minutes} more minutes. Use bypass_cooldown=true to force."
+                )
+
+    direction_text = direction.get("text", "")
+    description = direction_text
+    if bypass_cooldown:
+        description = f"[cooldown bypassed manually] {direction_text}"
+
     vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
     task_payload = {
         "type": "research",
         "directions": [direction],
         "base_branch": "main",
     }
-    direction_text = direction.get("text", "")
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text[:60]}",
-        description=direction_text,
+        description=description,
         payloads=[task_payload],
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
@@ -1535,6 +1552,7 @@ async def create_direction_research_task(
             "created_by": "USER",
             "method": "direction_research",
             "direction_id": direction_id,
+            "bypass_cooldown": bypass_cooldown,
         }
     )
     session.add(history)
@@ -1578,46 +1596,6 @@ async def get_direction_task_counts(
 
     return {"counts": counts}
 
-
-@router.post("/projects/{project_id}/directions/{direction_id}/research")
-async def trigger_direction_research(
-    project_id: uuid.UUID,
-    direction_id: str,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
-):
-    """Spawn a research task scoped to a single direction."""
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
-    if not direction:
-        raise HTTPException(status_code=404, detail="Direction not found")
-
-    new_task = Task(
-        project_id=project.id,
-        title=f"Research: {direction['text'][:80]}",
-        description=f"Targeted research for direction: {direction['text']}",
-        payloads=[{
-            "type": "research",
-            "directions": [direction],
-            "base_branch": "main",
-        }],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        status=TaskStatus.QUEUED,
-        created_by="USER",
-    )
-    session.add(new_task)
-    history = TaskHistory(
-        task_id=new_task.id, action="CREATED",
-        details={"created_by": "USER", "method": "direction_research", "direction_id": direction_id}
-    )
-    session.add(history)
-    await session.commit()
-    await session.refresh(new_task)
-
-    return {"id": str(new_task.id), "title": new_task.title, "status": new_task.status}
 
 
 @router.patch("/projects/{project_id}/autonomous")
@@ -2293,3 +2271,155 @@ async def dismiss_alert(
     session.add(alert)
     await session.commit()
     return {"status": "dismissed"}
+
+
+# ── Autonomy Debug ────────────────────────────────────────────────────────────
+
+@router.get("/projects/{project_id}/autonomy-debug")
+async def get_autonomy_debug(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a detailed snapshot of why autonomy is or isn't spawning for a project."""
+    from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    now = datetime.utcnow()
+    blocking_guards = []
+
+    # Guard 1: autonomous_disabled
+    if not project.autonomous_enabled:
+        blocking_guards.append({
+            "guard": "autonomous_disabled",
+            "reason": "project.autonomous_enabled is False",
+        })
+
+    # Guard 2: circuit_breaker_open
+    raw_breaker = get_circuit_breaker(str(project_id))
+    breaker_state = raw_breaker["state"]
+    cooldown_ends_at = None
+    if raw_breaker.get("opened_at"):
+        cooldown_end = raw_breaker["opened_at"] + timedelta(seconds=raw_breaker["cooldown_seconds"])
+        cooldown_ends_at = cooldown_end.isoformat()
+        if breaker_state == "OPEN" and now < cooldown_end:
+            blocking_guards.append({
+                "guard": "circuit_breaker_open",
+                "reason": "Circuit breaker is OPEN and cooldown has not elapsed",
+                "opened_at": raw_breaker["opened_at"].isoformat(),
+                "cooldown_ends_at": cooldown_ends_at,
+                "failure_count": raw_breaker["failure_count"],
+            })
+
+    circuit_breaker_info = {
+        "state": breaker_state,
+        "failure_count": raw_breaker["failure_count"],
+        "success_count": raw_breaker["success_count"],
+        "opened_at": raw_breaker["opened_at"].isoformat() if raw_breaker.get("opened_at") else None,
+        "cooldown_seconds": raw_breaker["cooldown_seconds"],
+        "cooldown_ends_at": cooldown_ends_at,
+    }
+
+    # Guard 3: no_eligible_directions
+    cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
+    cooldown_seconds_dir = cooldown_hours * 3600
+    directions_info = []
+    for d in (project.directions or []):
+        if d.get("status") != "active":
+            continue
+        last_researched_at = d.get("last_researched_at")
+        if last_researched_at:
+            last_dt = datetime.fromisoformat(last_researched_at)
+            elapsed = (now - last_dt).total_seconds()
+            remaining = cooldown_seconds_dir - elapsed
+            is_eligible = remaining <= 0
+            seconds_until_eligible = max(0, int(remaining)) if not is_eligible else None
+        else:
+            is_eligible = True
+            seconds_until_eligible = None
+        directions_info.append({
+            "id": d.get("id"),
+            "text": d.get("text", ""),
+            "status": d.get("status", "active"),
+            "last_researched_at": last_researched_at,
+            "cooldown_hours": cooldown_hours,
+            "is_eligible": is_eligible,
+            "seconds_until_eligible": seconds_until_eligible,
+        })
+
+    eligible_directions = [d for d in directions_info if d["is_eligible"]]
+    if not eligible_directions:
+        # Either no active directions at all, or all are in cooldown
+        min_wait = min(
+            (d["seconds_until_eligible"] for d in directions_info if d["seconds_until_eligible"] is not None),
+            default=None,
+        )
+        reason = (
+            "No active directions exist"
+            if not directions_info
+            else "All active directions are still in cooldown"
+        )
+        blocking_guards.append({
+            "guard": "no_eligible_directions",
+            "reason": reason,
+            "time_until_eligible_seconds": min_wait,
+        })
+
+    # Guard 4: research_task_active
+    active_tasks_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+        )
+    )
+    active_tasks = active_tasks_result.scalars().all()
+    blocking_research_task_id = None
+    for t in active_tasks:
+        if ((t.payloads or [{}])[0]).get("type") == "research":
+            blocking_research_task_id = str(t.id)
+            break
+    if blocking_research_task_id:
+        blocking_guards.append({
+            "guard": "research_task_active",
+            "reason": "A research task is already active (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)",
+            "task_id": blocking_research_task_id,
+        })
+
+    # Guard 5: rate_limit_exceeded
+    one_hour_ago = now - timedelta(hours=1)
+    recent_tasks_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        )
+    )
+    recent_tasks = recent_tasks_result.scalars().all()
+    tasks_this_hour = sum(1 for t in recent_tasks if ((t.payloads or [{}])[0]).get("type") == "research")
+    max_per_hour = _runtime_config.get("max_autonomous_tasks_per_hour", 5)
+    if tasks_this_hour >= max_per_hour:
+        blocking_guards.append({
+            "guard": "rate_limit_exceeded",
+            "reason": f"tasks_this_hour ({tasks_this_hour}) >= max_per_hour ({max_per_hour})",
+            "tasks_this_hour": tasks_this_hour,
+            "max_per_hour": max_per_hour,
+        })
+
+    # next_check_at: based on autonomous_research_interval_minutes
+    interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
+    next_check_at = (now + timedelta(minutes=interval_minutes)).isoformat()
+
+    return {
+        "spawn_blocked": len(blocking_guards) > 0,
+        "blocking_guards": blocking_guards,
+        "circuit_breaker": circuit_breaker_info,
+        "rate_limit": {
+            "tasks_this_hour": tasks_this_hour,
+            "max_per_hour": max_per_hour,
+        },
+        "directions": directions_info,
+        "next_check_at": next_check_at,
+    }

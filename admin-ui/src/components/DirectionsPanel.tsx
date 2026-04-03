@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Zap } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
 
 interface Project {
@@ -15,6 +15,34 @@ interface Direction {
   added_at: string;
   status: 'active' | 'completed' | 'paused';
   paths?: string[];
+  last_researched_at?: string | null;
+}
+
+function formatRelativeTime(isoString: string): string {
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHrs = Math.floor(diffMins / 60);
+  if (diffHrs < 24) return `${diffHrs}h ${diffMins % 60}m ago`;
+  return `${Math.floor(diffHrs / 24)}d ago`;
+}
+
+function formatTimeRemaining(isoString: string, cooldownHours: number): string {
+  const elapsedMs = Date.now() - new Date(isoString).getTime();
+  const remainingMs = cooldownHours * 3600 * 1000 - elapsedMs;
+  if (remainingMs <= 0) return '';
+  const remainingMins = Math.ceil(remainingMs / 60000);
+  if (remainingMins < 60) return `${remainingMins}m left`;
+  const hrs = Math.floor(remainingMins / 60);
+  const mins = remainingMins % 60;
+  return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
+}
+
+function getCooldownStatus(d: Direction, cooldownHours: number): 'ready' | 'cooling' | 'never' {
+  if (!d.last_researched_at) return 'never';
+  const elapsedMs = Date.now() - new Date(d.last_researched_at).getTime();
+  return elapsedMs < cooldownHours * 3600 * 1000 ? 'cooling' : 'ready';
 }
 
 const priorityColors: Record<string, string> = {
@@ -67,15 +95,46 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   const [researchingIds, setResearchingIds] = useState<Record<string, boolean>>({});
   const [researchSuccessIds, setResearchSuccessIds] = useState<Record<string, boolean>>({});
 
+  // Cooldown settings
+  const [cooldownHours, setCooldownHours] = useState<number>(4);
+
+  // Force-research confirmation popover
+  const [forceConfirmId, setForceConfirmId] = useState<string | null>(null);
+  const forceConfirmRef = useRef<HTMLDivElement | null>(null);
+
   useEffect(() => {
     fetchProjects();
+    fetchCooldownSetting();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Close force-confirm popover on outside click
+  useEffect(() => {
+    if (!forceConfirmId) return;
+    function handleClick(e: MouseEvent) {
+      if (forceConfirmRef.current && !forceConfirmRef.current.contains(e.target as Node)) {
+        setForceConfirmId(null);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [forceConfirmId]);
 
   useEffect(() => {
     if (selectedProjectId) fetchDirections();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
+
+  async function fetchCooldownSetting() {
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, { headers: h });
+      if (!res.ok) return;
+      const data = await res.json();
+      const val = data.autonomous_direction_cooldown_hours;
+      if (typeof val === 'number' && val > 0) setCooldownHours(val);
+    } catch { /* ignore */ }
+  }
 
   async function fetchProjects() {
     try {
@@ -217,14 +276,14 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
     }
   }
 
-  async function triggerResearch(id: string) {
+  async function triggerResearch(id: string, bypass = false) {
     setResearchingIds(prev => ({ ...prev, [id]: true }));
+    setForceConfirmId(null);
     setError(null);
     try {
       const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}/research`, {
-        method: 'POST', headers: h,
-      });
+      const url = `${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}/research${bypass ? '?bypass_cooldown=true' : ''}`;
+      const res = await fetch(url, { method: 'POST', headers: h });
       if (!res.ok) throw new Error('Failed to trigger research');
       setResearchSuccessIds(prev => ({ ...prev, [id]: true }));
       setTimeout(() => setResearchSuccessIds(prev => ({ ...prev, [id]: false })), 3000);
@@ -465,16 +524,57 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                         )}
                                       </>);
                                     })()}
-                                    {key === 'active' && (
-                                      <button
-                                        onClick={() => triggerResearch(d.id)}
-                                        disabled={researchingIds[d.id]}
-                                        title="Trigger research for this direction"
-                                        className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-50 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700/60"
-                                      >
-                                        {researchingIds[d.id] ? '…' : researchSuccessIds[d.id] ? 'Queued' : 'Research'}
-                                      </button>
-                                    )}
+                                    {key === 'active' && (() => {
+                                      const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                      const inCooldown = cooldownStatus === 'cooling';
+                                      return (
+                                        <div className="relative flex items-center gap-1">
+                                          <button
+                                            onClick={() => !inCooldown && triggerResearch(d.id)}
+                                            disabled={researchingIds[d.id] || inCooldown}
+                                            title={inCooldown ? 'Direction is in cooldown — use force to bypass' : 'Trigger research for this direction'}
+                                            className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:enabled:text-neutral-200 hover:enabled:bg-neutral-700/60"
+                                          >
+                                            {researchingIds[d.id] ? '…' : researchSuccessIds[d.id] ? 'Queued' : 'Research'}
+                                          </button>
+                                          {inCooldown && (
+                                            <div className="relative">
+                                              <button
+                                                onClick={() => setForceConfirmId(forceConfirmId === d.id ? null : d.id)}
+                                                disabled={researchingIds[d.id]}
+                                                title="Force research (bypass cooldown)"
+                                                className="text-[10px] px-1 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-amber-950/40 border-amber-900/50 text-amber-400 hover:bg-amber-900/40"
+                                              >
+                                                <Zap className="w-2.5 h-2.5" />
+                                              </button>
+                                              {forceConfirmId === d.id && (
+                                                <div
+                                                  ref={forceConfirmRef}
+                                                  className="absolute right-0 top-6 z-10 w-52 bg-neutral-900 border border-amber-900/60 rounded-lg p-3 shadow-xl"
+                                                >
+                                                  <p className="text-[11px] text-amber-300 font-medium mb-1">Force research?</p>
+                                                  <p className="text-[10px] text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
+                                                  <div className="flex gap-2">
+                                                    <button
+                                                      onClick={() => triggerResearch(d.id, true)}
+                                                      className="flex-1 text-[10px] px-2 py-1 rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
+                                                    >
+                                                      Force
+                                                    </button>
+                                                    <button
+                                                      onClick={() => setForceConfirmId(null)}
+                                                      className="flex-1 text-[10px] px-2 py-1 rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
+                                                    >
+                                                      Cancel
+                                                    </button>
+                                                  </div>
+                                                </div>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })()}
                                     <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
                                       <Pencil className="w-3 h-3" />
                                     </button>
@@ -483,6 +583,17 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                     </button>
                                   </div>
                                 </div>
+                                {/* Last researched / cooldown subtitle */}
+                                {key === 'active' && (() => {
+                                  const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                  if (cooldownStatus === 'never') {
+                                    return <p className="text-[10px] text-neutral-600 mt-0.5">Never researched</p>;
+                                  }
+                                  if (cooldownStatus === 'cooling') {
+                                    return <p className="text-[10px] text-amber-500/80 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at!)}</p>;
+                                  }
+                                  return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at!)}</p>;
+                                })()}
                                 <div className="flex items-center gap-2 mt-2">
                                   <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
                                     {d.priority}
@@ -500,6 +611,22 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                       {d.status}
                                     </span>
                                   )}
+                                  {/* Cooldown badge */}
+                                  {key === 'active' && (() => {
+                                    const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                    if (cooldownStatus === 'cooling') {
+                                      return (
+                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
+                                          Cooling down · {formatTimeRemaining(d.last_researched_at!, cooldownHours)}
+                                        </span>
+                                      );
+                                    }
+                                    return (
+                                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 text-emerald-400 border-emerald-900/50">
+                                        Ready
+                                      </span>
+                                    );
+                                  })()}
                                   <span className="text-[10px] text-neutral-600 ml-auto">
                                     {new Date(d.added_at).toLocaleDateString()}
                                   </span>

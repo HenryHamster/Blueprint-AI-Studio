@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
-import { Zap, ZapOff, AlertTriangle, RefreshCw } from 'lucide-react';
-import { API_BASE_URL, authHeaders } from '../api';
+import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, Loader2, Gauge } from 'lucide-react';
+import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 
 interface ProjectAutonomousStatus {
   project_id: string;
@@ -12,28 +12,261 @@ interface ProjectAutonomousStatus {
   rate_limit: number;
 }
 
+interface BlockingGuard {
+  guard: string;
+  reason: string;
+  // circuit_breaker_open
+  opened_at?: string;
+  cooldown_ends_at?: string;
+  failure_count?: number;
+  // no_eligible_directions
+  time_until_eligible_seconds?: number | null;
+  // research_task_active
+  task_id?: string;
+  // rate_limit_exceeded
+  tasks_this_hour?: number;
+  max_per_hour?: number;
+}
+
+interface CircuitBreakerInfo {
+  state: string; // CLOSED | OPEN | HALF_OPEN
+  failure_count: number;
+  success_count: number;
+  opened_at: string | null;
+  cooldown_seconds: number;
+  cooldown_ends_at: string | null;
+}
+
+interface AutonomyDebug {
+  spawn_blocked: boolean;
+  blocking_guards: BlockingGuard[];
+  circuit_breaker: CircuitBreakerInfo;
+  rate_limit: {
+    tasks_this_hour: number;
+    max_per_hour: number;
+  };
+  directions: Array<{
+    id: string;
+    text: string;
+    status: string;
+    last_researched_at: string | null;
+    cooldown_hours: number;
+    is_eligible: boolean;
+    seconds_until_eligible: number | null;
+  }>;
+  next_check_at: string;
+}
+
 interface AutonomousStatusProps {
   onRefreshTasks?: () => void;
   wsRef?: RefObject<WebSocket | null>;
 }
 
+const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Spawning', 'Executing', 'Cooldowns'] as const;
+
+function getLifecyclePhase(debug: AutonomyDebug): number {
+  const guards = debug.blocking_guards.map(g => g.guard);
+  if (guards.includes('research_task_active')) return 3; // Executing
+  return 0; // Idle
+}
+
+function formatSeconds(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function secondsUntil(iso: string): number {
+  return Math.max(0, Math.floor((new Date(iso).getTime() - Date.now()) / 1000));
+}
+
+function CircuitBreakerPill({ state }: { state: string }) {
+  const styles: Record<string, string> = {
+    CLOSED: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30',
+    OPEN: 'bg-red-500/15 text-red-400 border border-red-500/30',
+    HALF_OPEN: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
+  };
+  return (
+    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded font-mono ${styles[state] ?? 'bg-neutral-700 text-neutral-400'}`}>
+      {state}
+    </span>
+  );
+}
+
+function GuardIcon({ guard }: { guard: string }) {
+  switch (guard) {
+    case 'autonomous_disabled':
+      return <Lock className="w-3 h-3 shrink-0 text-neutral-500" />;
+    case 'circuit_breaker_open':
+      return <Zap className="w-3 h-3 shrink-0 text-red-400" />;
+    case 'no_eligible_directions':
+      return <Clock className="w-3 h-3 shrink-0 text-amber-400" />;
+    case 'research_task_active':
+      return <Loader2 className="w-3 h-3 shrink-0 text-blue-400 animate-spin" />;
+    case 'rate_limit_exceeded':
+      return <Gauge className="w-3 h-3 shrink-0 text-orange-400" />;
+    default:
+      return <AlertTriangle className="w-3 h-3 shrink-0 text-neutral-400" />;
+  }
+}
+
+function guardColor(guard: string): string {
+  switch (guard) {
+    case 'autonomous_disabled': return 'text-neutral-400';
+    case 'circuit_breaker_open': return 'text-red-400';
+    case 'no_eligible_directions': return 'text-amber-400';
+    case 'research_task_active': return 'text-blue-400';
+    case 'rate_limit_exceeded': return 'text-orange-400';
+    default: return 'text-neutral-400';
+  }
+}
+
+function guardLabel(g: BlockingGuard): string {
+  switch (g.guard) {
+    case 'autonomous_disabled':
+      return 'Autonomy is disabled';
+    case 'circuit_breaker_open': {
+      const mins = g.cooldown_ends_at ? Math.ceil(secondsUntil(g.cooldown_ends_at) / 60) : '?';
+      return `Circuit breaker OPEN — resets in ${mins}m (${g.failure_count ?? '?'} consecutive failures)`;
+    }
+    case 'no_eligible_directions': {
+      if (g.time_until_eligible_seconds == null) return 'No active directions exist';
+      return `All directions in cooldown — next eligible in ${formatSeconds(g.time_until_eligible_seconds)}`;
+    }
+    case 'research_task_active':
+      return 'Research task already running';
+    case 'rate_limit_exceeded':
+      return `Rate limit: ${g.tasks_this_hour ?? '?'}/${g.max_per_hour ?? '?'} tasks this hour`;
+    default:
+      return g.reason;
+  }
+}
+
+function SpawnGuardDiagnostics({ guards }: { guards: BlockingGuard[] }) {
+  if (guards.length === 0) return null;
+  return (
+    <div className="mt-2 rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
+      <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">
+        Why autonomy isn't spawning
+      </p>
+      <ul className="space-y-1">
+        {guards.map((g, i) => (
+          <li key={i} className="flex items-start gap-1.5">
+            <span className="mt-px"><GuardIcon guard={g.guard} /></span>
+            <span className={`text-[11px] leading-tight ${guardColor(g.guard)}`}>
+              {guardLabel(g)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function CircuitBreakerDetail({ cb }: { cb: CircuitBreakerInfo }) {
+  const secsLeft = cb.cooldown_ends_at ? secondsUntil(cb.cooldown_ends_at) : null;
+  return (
+    <div className="flex items-center justify-between text-[11px]">
+      <span className="text-neutral-500 flex items-center gap-1">
+        <Zap className="w-3 h-3 shrink-0" />
+        Circuit breaker
+      </span>
+      <span className="flex items-center gap-1.5">
+        <CircuitBreakerPill state={cb.state} />
+        {cb.failure_count > 0 && (
+          <span className="text-neutral-500 font-mono">{cb.failure_count}f</span>
+        )}
+        {cb.state === 'OPEN' && secsLeft != null && secsLeft > 0 && (
+          <span className="text-red-400 font-mono text-[10px]">-{formatSeconds(secsLeft)}</span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
+  const activeStep = getLifecyclePhase(debug);
+  const nextCheckSecs = secondsUntil(debug.next_check_at);
+
+  return (
+    <div className="mt-2">
+      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5">
+        Loop lifecycle
+      </p>
+      <div className="flex items-center w-full">
+        {LIFECYCLE_STEPS.map((step, i) => {
+          const isActive = i === activeStep;
+          const isPast = i < activeStep;
+          return (
+            <div key={step} className="flex items-center flex-1 min-w-0">
+              <div className="flex flex-col items-center shrink-0">
+                <div
+                  className={`w-2 h-2 rounded-full border transition-colors ${
+                    isActive
+                      ? 'bg-emerald-400 border-emerald-400 ring-2 ring-emerald-400/30'
+                      : isPast
+                      ? 'bg-neutral-600 border-neutral-600'
+                      : 'bg-transparent border-neutral-600'
+                  }`}
+                />
+                <span
+                  className={`text-[9px] mt-0.5 leading-tight text-center whitespace-nowrap ${
+                    isActive ? 'text-emerald-400 font-semibold' : 'text-neutral-600'
+                  }`}
+                >
+                  {step}
+                  {step === 'Idle' && isActive && nextCheckSecs > 0 && (
+                    <span className="block text-neutral-600 font-normal">{formatSeconds(nextCheckSecs)}</span>
+                  )}
+                </span>
+              </div>
+              {i < LIFECYCLE_STEPS.length - 1 && (
+                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-neutral-600' : 'bg-neutral-800'}`} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProps) {
   const [projects, setProjects] = useState<ProjectAutonomousStatus[]>([]);
+  const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // authHeaders is stable; fetchStatus is intentionally run only on mount
   const fetchStatus = useCallback(async () => {
     try {
       const headers = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/autonomous-status`, {
         headers: { Authorization: headers.Authorization },
       });
-      if (res.ok) {
-        const data = await res.json();
-        setProjects(data.projects || []);
+      if (!res.ok) return;
+      const data = await res.json();
+      const fetched: ProjectAutonomousStatus[] = data.projects || [];
+      setProjects(fetched);
+
+      // Fetch debug data for each project in parallel
+      const settled = await Promise.allSettled(
+        fetched.map(p =>
+          apiFetch(`/api/admin/projects/${p.project_id}/autonomy-debug`)
+            .then(r => (r.ok ? r.json() : null))
+            .then((d): [string, AutonomyDebug] | null => (d ? [p.project_id, d as AutonomyDebug] : null))
+            .catch(() => null)
+        )
+      );
+      const newDebug: Record<string, AutonomyDebug> = {};
+      for (const result of settled) {
+        if (result.status === 'fulfilled' && result.value) {
+          const [id, d] = result.value;
+          newDebug[id] = d;
+        }
       }
+      setDebugData(newDebug);
     } catch {
       // silent
     }
@@ -45,7 +278,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
     return () => clearInterval(interval);
   }, [fetchStatus]);
 
-  // Close dropdown on outside click (matches Settings pattern in App.tsx)
+  // Close dropdown on outside click
   useEffect(() => {
     if (!expanded) return;
     const handleClick = (e: MouseEvent) => {
@@ -58,8 +291,6 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
   }, [expanded]);
 
   // Subscribe to WebSocket autonomous events for real-time updates.
-  // We poll wsRef.current on an interval because ref mutations don't trigger
-  // re-renders, so a dependency on wsRef.current would miss reconnections.
   useEffect(() => {
     if (!wsRef) return;
     let attachedWs: WebSocket | null = null;
@@ -78,23 +309,16 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
     const attach = () => {
       const currentWs = wsRef.current;
       if (currentWs === attachedWs) return;
-      if (attachedWs) {
-        attachedWs.removeEventListener('message', handleMessage);
-      }
+      if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
       attachedWs = currentWs;
-      if (currentWs) {
-        currentWs.addEventListener('message', handleMessage);
-      }
+      if (currentWs) currentWs.addEventListener('message', handleMessage);
     };
 
     attach();
     const interval = setInterval(attach, 5000);
-
     return () => {
       clearInterval(interval);
-      if (attachedWs) {
-        attachedWs.removeEventListener('message', handleMessage);
-      }
+      if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
     };
   }, [wsRef, fetchStatus]);
 
@@ -155,7 +379,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
       </button>
 
       {expanded && (
-        <div className="absolute top-full mt-2 right-0 w-80 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[60vh] overflow-y-auto custom-scrollbar">
+        <div className="absolute top-full mt-2 right-0 w-96 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline</h3>
             <button onClick={fetchStatus} className="text-neutral-500 hover:text-neutral-300 transition-colors">
@@ -167,54 +391,73 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
             <p className="text-xs text-neutral-600">No projects found</p>
           )}
 
-          {projects.map(p => (
-            <div key={p.project_id} className="mb-3 last:mb-0 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-medium text-neutral-200 truncate max-w-[180px]">{p.project_name}</span>
-                <button
-                  onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
-                  disabled={toggling === p.project_id}
-                  className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
-                    p.autonomous_enabled
-                      ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
-                      : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
-                  } ${toggling === p.project_id ? 'opacity-50' : ''}`}
-                >
-                  {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
-                </button>
-              </div>
+          {projects.map(p => {
+            const debug = debugData[p.project_id];
+            return (
+              <div key={p.project_id} className="mb-3 last:mb-0 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
+                {/* Header */}
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-medium text-neutral-200 truncate max-w-[200px]">{p.project_name}</span>
+                  <button
+                    onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
+                    disabled={toggling === p.project_id}
+                    className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
+                      p.autonomous_enabled
+                        ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                        : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
+                    } ${toggling === p.project_id ? 'opacity-50' : ''}`}
+                  >
+                    {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
+                  </button>
+                </div>
 
-              <div className="space-y-1.5">
-                {/* Circuit breaker */}
-                {p.consecutive_failures > 0 && (
-                  <div className="flex items-center gap-1.5 text-[11px]">
-                    <AlertTriangle className={`w-3 h-3 shrink-0 ${p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}`} />
-                    <span className={p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}>
-                      {p.consecutive_failures} consecutive failure{p.consecutive_failures !== 1 ? 's' : ''}
-                      {p.consecutive_failures >= 3 && ' — circuit breaker tripped'}
+                <div className="space-y-1.5">
+                  {/* Circuit breaker — enhanced with state pill when debug available */}
+                  {debug ? (
+                    <CircuitBreakerDetail cb={debug.circuit_breaker} />
+                  ) : p.consecutive_failures > 0 ? (
+                    <div className="flex items-center gap-1.5 text-[11px]">
+                      <AlertTriangle className={`w-3 h-3 shrink-0 ${p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}`} />
+                      <span className={p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}>
+                        {p.consecutive_failures} consecutive failure{p.consecutive_failures !== 1 ? 's' : ''}
+                        {p.consecutive_failures >= 3 && ' — circuit breaker tripped'}
+                      </span>
+                    </div>
+                  ) : null}
+
+                  {/* Last research */}
+                  <div className="flex items-center justify-between text-[11px] text-neutral-500">
+                    <span>Last research</span>
+                    <span className="font-mono">{p.last_research_at ? formatTimeAgo(p.last_research_at) : 'never'}</span>
+                  </div>
+
+                  {/* Rate limit usage */}
+                  <div className="flex items-center justify-between text-[11px] text-neutral-500">
+                    <span>Tasks this hour</span>
+                    <span className="font-mono">
+                      <span className={p.tasks_spawned_last_hour >= p.rate_limit ? 'text-amber-400' : ''}>
+                        {p.tasks_spawned_last_hour}
+                      </span>
+                      /{p.rate_limit}
                     </span>
                   </div>
+                </div>
+
+                {/* Debug sections — only when debug data available */}
+                {debug && (
+                  <>
+                    {/* Spawn guard diagnostics */}
+                    {debug.spawn_blocked && (
+                      <SpawnGuardDiagnostics guards={debug.blocking_guards} />
+                    )}
+
+                    {/* Lifecycle step indicator */}
+                    <LifecycleIndicator debug={debug} />
+                  </>
                 )}
-
-                {/* Last research */}
-                <div className="flex items-center justify-between text-[11px] text-neutral-500">
-                  <span>Last research</span>
-                  <span className="font-mono">{p.last_research_at ? formatTimeAgo(p.last_research_at) : 'never'}</span>
-                </div>
-
-                {/* Rate limit usage */}
-                <div className="flex items-center justify-between text-[11px] text-neutral-500">
-                  <span>Tasks this hour</span>
-                  <span className="font-mono">
-                    <span className={p.tasks_spawned_last_hour >= p.rate_limit ? 'text-amber-400' : ''}>
-                      {p.tasks_spawned_last_hour}
-                    </span>
-                    /{p.rate_limit}
-                  </span>
-                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
