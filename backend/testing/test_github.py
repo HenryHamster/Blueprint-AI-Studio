@@ -68,6 +68,61 @@ async def test_validate_fine_grained_pat_unauthorized_raises_401(mocker):
 
 
 # ---------------------------------------------------------------------------
+# Integration tests: POST /api/github/pat endpoint
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_post_github_pat_invalid_format(client, mocker):
+    """
+    A classic token (ghp_) is rejected with HTTP 400 by the endpoint.
+    """
+    mocker.patch(
+        "app.main.validate_fine_grained_pat",
+        side_effect=HTTPException(status_code=400, detail="Invalid token format"),
+    )
+
+    response = await client.post("/api/github/pat", json={"pat": "ghp_classic_token_123"})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_post_github_pat_valid(client, mocker):
+    """
+    A valid fine-grained PAT returns HTTP 200 with status=success.
+    """
+    mocker.patch(
+        "app.main.validate_fine_grained_pat",
+        return_value={"user": "testuser", "status": "valid"},
+    )
+    mocker.patch(
+        "app.main.store_user_secret",
+        return_value="projects/test/secrets/github-pat-test-user-123",
+    )
+
+    response = await client.post("/api/github/pat", json={"pat": "github_pat_valid_token_abc123"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_post_github_pat_unauthorized(client, mocker):
+    """
+    An expired or revoked PAT returns HTTP 401 from the endpoint.
+    """
+    mocker.patch(
+        "app.main.validate_fine_grained_pat",
+        side_effect=HTTPException(status_code=401, detail="Token invalid or expired"),
+    )
+
+    response = await client.post("/api/github/pat", json={"pat": "github_pat_expired_token_xyz"})
+
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # Edge-case tests: merge_pull_request, get_check_runs, rate-limiting, expiry
 # ---------------------------------------------------------------------------
 
