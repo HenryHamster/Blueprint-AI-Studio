@@ -1941,7 +1941,7 @@ async def health_check():
     # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
     orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
 
-    healthy = orchestrator_healthy and all(v for k, v in external_health.items() if k not in ("last_check", "failed_deps"))
+    healthy = orchestrator_healthy and all(v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors"))
 
     status_code = 200 if healthy else 503
     return JSONResponse(
@@ -1951,7 +1951,7 @@ async def health_check():
             "revision": _current_revision,
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,
-            "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps")},
+            "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors")},
         }
     )
 

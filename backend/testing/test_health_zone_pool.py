@@ -71,6 +71,7 @@ def all_deps_healthy():
         "db": True,
         "last_check": None,
         "failed_deps": [],
+        "errors": {},
     })
     yield
     _shared_state.external_health.clear()
