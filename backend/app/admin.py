@@ -697,6 +697,17 @@ async def modify_task(
                     )
                     if review_task:
                         changes["spawned_review"] = str(review_task.id)
+                    else:
+                        # Iteration cap reached — revert requires_approval and return error
+                        task.requires_approval = True
+                        task.status = TaskStatus.FAILED
+                        task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
+                        session.add(task)
+                        await session.commit()
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Iteration cap reached — cannot spawn follow-on task. Archive this task or reset iteration count."
+                        )
                 # Task stays COMPLETED regardless
                 if "status" in payload and TaskStatus(payload["status"]) == TaskStatus.QUEUED:
                     task.status = TaskStatus.COMPLETED

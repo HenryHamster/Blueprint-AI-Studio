@@ -316,7 +316,10 @@ async function pushAndCreatePR(
     });
     prUrl = prRes.data?.html_url || '';
     sendLog(ws, `PR created: ${prUrl}\n`);
-  } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
+  } catch (e) {
+    sendLog(ws, `Failed to create PR: ${e}\n`);
+    throw new Error(`PR creation failed: ${e}`);
+  }
 
   return prUrl;
 }

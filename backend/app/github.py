@@ -117,7 +117,7 @@ async def get_user_installations(user_token: str) -> list[dict]:
         resp = await client.get(url, headers=headers)
         if resp.status_code != 200:
             logger.error(f"Failed to fetch user installations: {resp.text}")
-            break
+            raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
         data = resp.json()
         installations.extend(data.get("installations", []))
         # Follow pagination

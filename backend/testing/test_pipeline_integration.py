@@ -1,0 +1,755 @@
+"""
+Integration tests for the review pipeline state machine.
+
+Exercises the full create → review → fix → re-review cycle via the agent
+claim and status endpoints, verifying that each step spawns the correct
+downstream task and that the review_loop context is updated correctly.
+
+All external calls (VM provisioning/deletion, GitHub API, WebSocket
+broadcasts) are mocked so no real infrastructure is required.
+"""
+import json
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+
+from app.models import Project, Task, TaskStatus
+from app.auth import create_agent_token
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _task_type(task: Task) -> str:
+    return (task.payloads or [{}])[0].get("type", "")
+
+
+def _review_loop(task: Task) -> dict:
+    return (task.context or {}).get("review_loop", {})
+
+
+async def _claim(client: AsyncClient, task: Task) -> None:
+    """Claim a task and assert it moves to IN_PROGRESS."""
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200, resp.text
+
+
+async def _status(client: AsyncClient, task: Task, **fields) -> dict:
+    """POST /api/agent/status for the given task with the provided fields."""
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    payload = {"task_id": str(task.id), **fields}
+    resp = await client.post(
+        "/api/agent/status",
+        json=payload,
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Full end-to-end pipeline test (covers the full scenario from the task spec)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
+    """
+    Full end-to-end integration test for the review/fix pipeline state machine.
+
+    1. Create a Project and a create-type Task in QUEUED state.
+    2. Call POST /api/agent/claim → task moves to IN_PROGRESS.
+    3. Call POST /api/agent/status with COMPLETED + PULL_REQUEST artifact.
+       Verify a review task is spawned with the correct review_loop context.
+    4. Claim the review task; call status with COMPLETED and a
+       verdict_json indicating REQUEST_CHANGES.
+       Verify a fix task is spawned with the review feedback in its prompt.
+    5. Claim the fix task; call status with COMPLETED.
+       Verify the fix task is COMPLETED and a new review task is spawned
+       with an incremented iteration counter.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    # ------------------------------------------------------------------
+    # Step 1: Create project + create-type task (QUEUED)
+    # ------------------------------------------------------------------
+    project = Project(name="Full Pipeline Integration Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-fp-create-001"
+    create_task = Task(
+        project_id=project.id,
+        title="Implement feature",
+        payloads=[{"type": "create", "prompt": "Build a new feature", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    assert create_task.status == TaskStatus.QUEUED
+
+    # ------------------------------------------------------------------
+    # Step 2: Claim → IN_PROGRESS
+    # ------------------------------------------------------------------
+    await _claim(client, create_task)
+    await db_session.refresh(create_task)
+    assert create_task.status == TaskStatus.IN_PROGRESS
+
+    # ------------------------------------------------------------------
+    # Step 3: Complete with PULL_REQUEST artifact → review task spawned
+    # ------------------------------------------------------------------
+    pr_url = "https://github.com/owner/repo/pull/42"
+    await _status(
+        client, create_task,
+        status="COMPLETED",
+        artifact_type="PULL_REQUEST",
+        pr_url=pr_url,
+        logs=pr_url,
+    )
+
+    await db_session.refresh(create_task)
+    assert create_task.status == TaskStatus.COMPLETED
+
+    # Query for spawned child tasks
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != create_task.id,
+        )
+    )
+    spawned = result.scalars().all()
+    review_tasks = [t for t in spawned if _task_type(t) == "review"]
+
+    assert len(review_tasks) == 1, (
+        f"Expected 1 review task, found {len(review_tasks)}: "
+        f"{[(t.id, _task_type(t)) for t in spawned]}"
+    )
+
+    review_task = review_tasks[0]
+    assert review_task.status == TaskStatus.QUEUED
+    assert review_task.vm_instance_id is not None
+
+    # Verify payload content
+    r_payload = (review_task.payloads or [{}])[0]
+    assert r_payload.get("type") == "review"
+    assert r_payload.get("pr_number") == 42
+
+    # Verify review_loop context
+    r_loop = _review_loop(review_task)
+    assert r_loop.get("pr_number") == 42
+    assert r_loop.get("iteration") == 1
+    assert r_loop.get("original_task_id") == str(create_task.id)
+
+    # ------------------------------------------------------------------
+    # Step 4: Claim review task; complete with REQUEST_CHANGES verdict
+    # ------------------------------------------------------------------
+    await _claim(client, review_task)
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.IN_PROGRESS
+
+    feedback_text = "The authentication handler is missing a null check on user.id"
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback_text})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Code review: null check missing in auth handler",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # Verify a fix task was spawned
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([create_task.id, review_task.id]),
+        )
+    )
+    new_tasks = result.scalars().all()
+    fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 1, (
+        f"Expected 1 fix task, found {len(fix_tasks)}: "
+        f"{[(t.id, _task_type(t)) for t in new_tasks]}"
+    )
+
+    fix_task = fix_tasks[0]
+    assert fix_task.status == TaskStatus.QUEUED
+    assert fix_task.vm_instance_id is not None
+
+    # Verify fix task payload
+    f_payload = (fix_task.payloads or [{}])[0]
+    assert f_payload.get("type") == "fix"
+    assert f_payload.get("pr_number") == 42
+    assert feedback_text in (f_payload.get("prompt") or ""), (
+        "Fix prompt should contain the review feedback"
+    )
+
+    # Verify fix task review_loop context
+    f_loop = _review_loop(fix_task)
+    assert f_loop.get("pr_number") == 42
+    assert f_loop.get("iteration") == 2
+    assert f_loop.get("original_task_id") == str(create_task.id)
+
+    # ------------------------------------------------------------------
+    # Step 5: Claim fix task; complete it
+    # ------------------------------------------------------------------
+    await _claim(client, fix_task)
+    await db_session.refresh(fix_task)
+    assert fix_task.status == TaskStatus.IN_PROGRESS
+
+    await _status(
+        client, fix_task,
+        status="COMPLETED",
+        logs="Added null check to authentication handler",
+    )
+
+    # ------------------------------------------------------------------
+    # Step 6: Verify fix task COMPLETED and review loop state updated
+    # ------------------------------------------------------------------
+    await db_session.refresh(fix_task)
+    assert fix_task.status == TaskStatus.COMPLETED
+
+    # A new review task should have been spawned after fix completes
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([create_task.id, review_task.id, fix_task.id]),
+        )
+    )
+    post_fix_tasks = result.scalars().all()
+    new_review_tasks = [t for t in post_fix_tasks if _task_type(t) == "review"]
+
+    assert len(new_review_tasks) == 1, (
+        f"Expected 1 new review task after fix, found {len(new_review_tasks)}: "
+        f"{[(t.id, _task_type(t)) for t in post_fix_tasks]}"
+    )
+
+    new_review_task = new_review_tasks[0]
+    assert new_review_task.status == TaskStatus.QUEUED
+
+    # The new review_loop should carry the incremented iteration
+    nr_loop = _review_loop(new_review_task)
+    assert nr_loop.get("pr_number") == 42
+    assert nr_loop.get("iteration") == 3  # create→review=1, review→fix=2, fix→review=3
+    assert nr_loop.get("original_task_id") == str(create_task.id)
+
+
+# ---------------------------------------------------------------------------
+# Focused tests for each pipeline transition
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_task_spawns_review_on_pr_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """create task COMPLETED with PULL_REQUEST artifact → review task spawned."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Spawn Review Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-sr-create-001"
+    task = Task(
+        project_id=project.id,
+        title="Create feature Y",
+        payloads=[{"type": "create", "prompt": "Build feature Y", "base_branch": "main"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _claim(client, task)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+
+    pr_url = "https://github.com/owner/repo/pull/99"
+    await _status(
+        client, task,
+        status="COMPLETED",
+        artifact_type="PULL_REQUEST",
+        pr_url=pr_url,
+        logs=pr_url,
+    )
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    children = result.scalars().all()
+    review_tasks = [t for t in children if _task_type(t) == "review"]
+
+    assert len(review_tasks) == 1
+    rt = review_tasks[0]
+    assert rt.status == TaskStatus.QUEUED
+    assert rt.vm_instance_id is not None
+
+    r_loop = _review_loop(rt)
+    assert r_loop.get("pr_number") == 99
+    assert r_loop.get("iteration") == 1
+
+
+@pytest.mark.asyncio
+async def test_review_request_changes_spawns_fix(
+    client: AsyncClient, db_session, mocker
+):
+    """review task COMPLETED with REQUEST_CHANGES verdict → fix task spawned."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Spawn Fix Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-sf-review-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #77",
+        payloads=[{
+            "type": "review",
+            "pr_number": 77,
+            "branch": "blueprint/task-aabbccdd",
+            "base_branch": "main",
+        }],
+        context={"review_loop": {
+            "pr_number": 77,
+            "branch": "blueprint/task-aabbccdd",
+            "base_branch": "main",
+            "iteration": 1,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    feedback = "Missing input validation on the /users endpoint"
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: missing input validation",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    children = result.scalars().all()
+    fix_tasks = [t for t in children if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 1
+    ft = fix_tasks[0]
+    assert ft.status == TaskStatus.QUEUED
+    assert ft.vm_instance_id is not None
+
+    f_payload = (ft.payloads or [{}])[0]
+    assert f_payload.get("pr_number") == 77
+    assert feedback in (f_payload.get("prompt") or "")
+
+    f_loop = _review_loop(ft)
+    assert f_loop.get("pr_number") == 77
+    assert f_loop.get("iteration") == 2
+
+
+@pytest.mark.asyncio
+async def test_fix_task_spawns_review_on_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """fix task COMPLETED → new review task spawned with iteration+1."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Respawn Review Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-rr-fix-001"
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix PR #55",
+        payloads=[{
+            "type": "fix",
+            "pr_number": 55,
+            "branch": "blueprint/task-11223344",
+            "base_branch": "main",
+            "prompt": "Fix the validation error",
+        }],
+        context={"review_loop": {
+            "pr_number": 55,
+            "branch": "blueprint/task-11223344",
+            "base_branch": "main",
+            "iteration": 2,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    await _status(
+        client, fix_task,
+        status="COMPLETED",
+        logs="Validation added to /users endpoint",
+    )
+
+    await db_session.refresh(fix_task)
+    assert fix_task.status == TaskStatus.COMPLETED
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != fix_task.id,
+        )
+    )
+    children = result.scalars().all()
+    review_tasks = [t for t in children if _task_type(t) == "review"]
+
+    assert len(review_tasks) == 1
+    nr = review_tasks[0]
+    assert nr.status == TaskStatus.QUEUED
+    assert nr.vm_instance_id is not None
+
+    nr_loop = _review_loop(nr)
+    assert nr_loop.get("pr_number") == 55
+    assert nr_loop.get("iteration") == 3
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_review_approve_does_not_spawn_fix(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a review task completes with APPROVE verdict, no fix task should be
+    spawned. The merge attempt fails gracefully (no GitHub integration) but
+    the review is still marked COMPLETED.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Approve No Fix Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-approve-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #10",
+        payloads=[{
+            "type": "review",
+            "pr_number": 10,
+            "branch": "blueprint/task-deadbeef",
+            "base_branch": "main",
+        }],
+        context={"review_loop": {
+            "pr_number": 10,
+            "branch": "blueprint/task-deadbeef",
+            "base_branch": "main",
+            "iteration": 1,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({"verdict": "APPROVE", "feedback": "Looks great!"})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Approved: code looks clean",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # No fix task should have been spawned
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    children = result.scalars().all()
+    fix_tasks = [t for t in children if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 0, (
+        f"APPROVE verdict should not spawn a fix task, but found: {[t.id for t in fix_tasks]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_completed_idempotency_no_duplicate_fix(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    Calling POST /api/agent/status COMPLETED twice on the same review task
+    must be idempotent — only one fix task should be spawned, and the second
+    call should return 'already_terminal'.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Idempotency Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-idem-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #20",
+        payloads=[{
+            "type": "review",
+            "pr_number": 20,
+            "branch": "blueprint/task-cafebabe",
+            "base_branch": "main",
+        }],
+        context={"review_loop": {
+            "pr_number": 20,
+            "branch": "blueprint/task-cafebabe",
+            "base_branch": "main",
+            "iteration": 1,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "Fix the typo"})
+
+    # First status call — should spawn a fix task
+    result1 = await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Typo found",
+    )
+    assert result1.get("status") == "received"
+
+    # Second identical call — task is already terminal, should be a no-op
+    result2 = await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Typo found",
+    )
+    assert result2.get("status") == "already_terminal"
+
+    # Exactly one fix task should exist
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    children = result.scalars().all()
+    fix_tasks = [t for t in children if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 1, (
+        f"Expected exactly 1 fix task after two identical COMPLETED calls, "
+        f"found {len(fix_tasks)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verdict_parsed_from_logs_when_no_verdict_json(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When verdict_json is absent, the pipeline falls back to parsing the
+    verdict from the logs field. REQUEST_CHANGES in the logs should still
+    trigger a fix task spawn.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Verdict Fallback Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-vf-review-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #33",
+        payloads=[{
+            "type": "review",
+            "pr_number": 33,
+            "branch": "blueprint/task-feedface",
+            "base_branch": "main",
+        }],
+        context={"review_loop": {
+            "pr_number": 33,
+            "branch": "blueprint/task-feedface",
+            "base_branch": "main",
+            "iteration": 1,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    # Provide a JSON verdict embedded in the logs (no top-level verdict_json field)
+    logs_with_verdict = (
+        'After reviewing the code I found several issues.\n\n'
+        '{"verdict": "REQUEST_CHANGES", "feedback": "Add error handling"}\n\n'
+        'Please address the above points.'
+    )
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        logs=logs_with_verdict,
+        # no verdict_json field
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    children = result.scalars().all()
+    fix_tasks = [t for t in children if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 1, (
+        "Verdict parsed from logs should spawn a fix task"
+    )
+    ft = fix_tasks[0]
+    assert _review_loop(ft).get("pr_number") == 33
+
+
+@pytest.mark.asyncio
+async def test_pipeline_duplicate_guard_blocks_second_review(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    _spawn_pipeline_task guards against spawning a duplicate review/fix for
+    the same PR when one is already active. If an active review task already
+    exists for PR #42, completing the fix should NOT spawn a second review.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Duplicate Guard Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-existing QUEUED review task for PR #42 — simulates an already-active review
+    existing_review = Task(
+        project_id=project.id,
+        title="Review PR #42 (existing)",
+        payloads=[{
+            "type": "review",
+            "pr_number": 42,
+            "branch": "blueprint/task-existing",
+            "base_branch": "main",
+        }],
+        context={"review_loop": {
+            "pr_number": 42,
+            "branch": "blueprint/task-existing",
+            "base_branch": "main",
+            "iteration": 1,
+        }},
+        vm_instance_id="agent-vm-existing-review",
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(existing_review)
+    await db_session.commit()
+    await db_session.refresh(existing_review)
+
+    # Fix task for the same PR
+    vm_id = "agent-vm-dg-fix-001"
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix PR #42",
+        payloads=[{
+            "type": "fix",
+            "pr_number": 42,
+            "branch": "blueprint/task-existing",
+            "base_branch": "main",
+            "prompt": "Fix the issues",
+        }],
+        context={"review_loop": {
+            "pr_number": 42,
+            "branch": "blueprint/task-existing",
+            "base_branch": "main",
+            "iteration": 2,
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    # Completing the fix should NOT spawn another review — one is already active
+    await _status(
+        client, fix_task,
+        status="COMPLETED",
+        logs="Fix applied",
+    )
+
+    await db_session.refresh(fix_task)
+    assert fix_task.status == TaskStatus.COMPLETED
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([existing_review.id, fix_task.id]),
+        )
+    )
+    extra_tasks = result.scalars().all()
+    extra_review_tasks = [t for t in extra_tasks if _task_type(t) == "review"]
+
+    assert len(extra_review_tasks) == 0, (
+        f"Duplicate guard should have blocked the review spawn, "
+        f"but found extra review tasks: {[t.id for t in extra_review_tasks]}"
+    )

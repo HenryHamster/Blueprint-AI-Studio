@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from app.models import Project, Task, TaskStatus
 from app.main import reaper_service, broadcast_to_project, project_subscribers
+from testing.conftest import TestingSessionLocal
 
 @pytest.mark.asyncio
 async def test_reaper_service(db_session, mocker):
@@ -10,6 +11,9 @@ async def test_reaper_service(db_session, mocker):
     Tests the background worker that terminates orphaned VMs.
     We mock asyncio.sleep to break the infinite loop after one iteration.
     """
+    # Redirect reaper's internal sessions to the same in-memory test database
+    mocker.patch("app.main.AsyncSessionLocal", TestingSessionLocal)
+
     # 1. Mock delete_agent_vm so we don't hit GCP
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
     
@@ -44,6 +48,179 @@ async def test_reaper_service(db_session, mocker):
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     mock_delete.assert_called_once_with("orphan-vm")
+
+@pytest.mark.asyncio
+async def test_reaper_retry_path(db_session, mocker):
+    """
+    Tests that a task with remaining retries is reset to QUEUED (not FAILED)
+    when the reaper detects a heartbeat timeout.
+    """
+    mocker.patch("app.main.AsyncSessionLocal", TestingSessionLocal)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+
+    class StopLoopException(Exception): pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Retry Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # attempt_count=1 < max_retries=3 → should retry, not fail
+    task = Task(
+        project_id=project.id,
+        payloads=[],
+        vm_instance_id="retry-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 2
+    mock_delete.assert_called_once_with("retry-vm")
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_failure(db_session, mocker):
+    """
+    Tests that a task at its retry limit is permanently marked FAILED
+    when the reaper detects a heartbeat timeout.
+    """
+    mocker.patch("app.main.AsyncSessionLocal", TestingSessionLocal)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+
+    class StopLoopException(Exception): pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Terminal Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # attempt_count=3 is NOT < max_retries=3 → should be permanently FAILED
+    task = Task(
+        project_id=project.id,
+        payloads=[],
+        vm_instance_id="final-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    mock_delete.assert_called_once_with("final-vm")
+
+
+@pytest.mark.asyncio
+async def test_reaper_five_minute_heartbeat_threshold(db_session, mocker):
+    """
+    Tests that a task whose last heartbeat was 6 minutes ago (just past the
+    5-minute threshold) is detected as orphaned and re-queued.
+    """
+    mocker.patch("app.main.AsyncSessionLocal", TestingSessionLocal)
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+
+    class StopLoopException(Exception): pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Threshold Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # last_heartbeat is 6 minutes ago — just past the 5-minute cutoff
+    task = Task(
+        project_id=project.id,
+        payloads=[],
+        vm_instance_id="threshold-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await db_session.refresh(task)
+    # attempt_count=0 < max_retries=3, so the task should be re-queued
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reaper_parent_task_reevaluation(db_session, mocker):
+    """
+    Tests that when a coordinator task (one that has spawned child sub-tasks)
+    is reaped, _requeue_parent_task is called and the coordinator is set back
+    to EVALUATING instead of being blindly re-dispatched to a new VM.
+    """
+    mocker.patch("app.main.AsyncSessionLocal", TestingSessionLocal)
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+
+    class StopLoopException(Exception): pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Parent Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Coordinator task: IN_PROGRESS with a VM, orphaned heartbeat, has child tasks
+    coordinator = Task(
+        project_id=project.id,
+        payloads=[],
+        vm_instance_id="coordinator-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    db_session.add(coordinator)
+    await db_session.commit()
+    await db_session.refresh(coordinator)
+
+    # Child sub-task belonging to the coordinator
+    child = Task(
+        project_id=project.id,
+        payloads=[],
+        parent_task_id=coordinator.id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await db_session.refresh(coordinator)
+    # _requeue_parent_task sets the coordinator back to EVALUATING
+    assert coordinator.status == TaskStatus.EVALUATING
+
 
 @pytest.mark.asyncio
 async def test_broadcast_to_project():
