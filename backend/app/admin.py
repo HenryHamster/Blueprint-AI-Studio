@@ -1709,14 +1709,11 @@ def _get_zone_health_summary() -> dict:
         return {"total_zones": 0, "available": 0, "exhausted": []}
 
 
-@router.get("/deploy-state")
-async def get_deploy_state(
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
-):
-    """Get current deployment state including monitoring status and health."""
+async def build_deploy_state_payload(session: AsyncSession) -> dict:
+    """Assemble the deploy state payload. Used by both HTTP endpoint and WS broadcasts."""
     import os
     from app.shared_state import deploy_monitoring, external_health, runtime_config
+    import app.main as _main_module
 
     state = await session.get(DeploymentState, 1)
     if not state:
@@ -1747,6 +1744,8 @@ async def get_deploy_state(
         "rollback_reason": state.rollback_reason,
         "rollback_count": state.rollback_count,
         "pause_reason": state.pause_reason,
+        "paused_at": state.paused_at.isoformat() if state.paused_at else None,
+        "pre_pause_max_vms": state.pre_pause_max_vms,
         "monitoring_window": window_progress,
         "failure_rate": round(failure_rate, 3),
         "task_results_count": len(results),
@@ -1754,7 +1753,18 @@ async def get_deploy_state(
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
         "zone_health": _get_zone_health_summary(),
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
+        "health_recovery_streak": getattr(_main_module, "_health_recovery_streak", 0),
+        "health_recovery_streak_required": 3,
     }
+
+
+@router.get("/deploy-state")
+async def get_deploy_state(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get current deployment state including monitoring status and health."""
+    return await build_deploy_state_payload(session)
 
 
 @router.post("/deploy-state/pause")
@@ -1771,12 +1781,15 @@ async def pause_pipeline(
         state.pause_reason = "Manual pause via admin"
         state.paused_at = datetime.utcnow()
         state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
+        state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
         session.add(state)
         await session.commit()
 
     old_vms = runtime_config["max_concurrent_vms"]
     runtime_config["max_concurrent_vms"] = 0
     logger.warning(f"[ADMIN] Pipeline PAUSED manually (was max_concurrent_vms={old_vms})")
+    from app.main import broadcast_deploy_state
+    await broadcast_deploy_state()
     return {"status": "paused", "previous_max_vms": old_vms}
 
 
@@ -1798,9 +1811,7 @@ async def resume_pipeline(
     if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK):
         raise HTTPException(status_code=400, detail=f"Pipeline is {state.status}, not paused — nothing to resume")
 
-    restore_vms = 5  # default
-    if state.pre_pause_max_vms is not None:
-        restore_vms = state.pre_pause_max_vms
+    restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
     state.status = DeploymentStatus.STABLE
     state.pause_reason = None
     state.paused_at = None
@@ -1813,7 +1824,56 @@ async def resume_pipeline(
     session.add(state)
     await session.commit()
     logger.warning(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
+    from app.main import broadcast_deploy_state
+    await broadcast_deploy_state()
     return {"status": "resumed", "max_concurrent_vms": restore_vms}
+
+
+@router.post("/deploy-state/reset-health")
+async def reset_deploy_health(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Force-reset health state and resume the pipeline. Emergency operator escape hatch."""
+    from app.shared_state import runtime_config, external_health
+    import app.main as _main_module
+
+    state = await session.get(DeploymentState, 1)
+    if not state:
+        raise HTTPException(status_code=404, detail="No deployment state found")
+
+    if state.status != DeploymentStatus.PAUSED:
+        raise HTTPException(status_code=400, detail=f"Pipeline is {state.status}, not PAUSED — reset-health only applies to PAUSED state")
+
+    restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
+
+    # Clear external health failures
+    external_health["failed_deps"] = []
+    for key in list(external_health.keys()):
+        if key != "failed_deps" and isinstance(external_health[key], bool):
+            external_health[key] = True
+
+    # Reset in-memory streak counters in main.py
+    try:
+        _main_module._pause_failure_streak = 0
+        _main_module._health_recovery_streak = 0
+    except Exception:
+        pass
+
+    # Restore VM count and clear pause fields
+    runtime_config["max_concurrent_vms"] = restore_vms
+    state.runtime_max_concurrent_vms = restore_vms
+    state.status = DeploymentStatus.STABLE
+    state.pause_reason = None
+    state.paused_at = None
+    state.pre_pause_max_vms = None
+    session.add(state)
+    await session.commit()
+
+    logger.warning(f"[ADMIN] Health force-reset — pipeline RESUMED (max_concurrent_vms={restore_vms})")
+    from app.main import broadcast_deploy_state
+    await broadcast_deploy_state()
+    return await build_deploy_state_payload(session)
 
 
 @router.post("/deploy-state/mark-stable")
@@ -1838,6 +1898,8 @@ async def mark_deploy_stable(
 
     deploy_monitoring["window_start"] = None
     logger.warning(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
+    from app.main import broadcast_deploy_state
+    await broadcast_deploy_state()
     return {"status": "stable", "sha": state.current_sha}
 
 
@@ -1905,6 +1967,8 @@ async def trigger_rollback(
     deploy_monitoring["window_start"] = None
 
     logger.warning(f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}")
+    from app.main import broadcast_deploy_state
+    await broadcast_deploy_state()
 
     return {
         "status": "rolled_back" if not rollback_error else "rollback_requested",

@@ -497,16 +497,18 @@ async def _check_external_health():
 
 
 _pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
+_health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
 
 async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
-    global _pause_failure_streak
+    global _pause_failure_streak, _health_recovery_streak
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
     critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "claude_api")]
 
     if critical_failures:
+        _health_recovery_streak = 0
         _pause_failure_streak += 1
         # Require 3 consecutive failures before pausing (avoid flaky single checks)
         if _pause_failure_streak < 3:
@@ -521,26 +523,35 @@ async def _check_pause_mode():
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
                     state.paused_at = datetime.utcnow()
                     state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
+                    state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
                     session.add(state)
                     await session.commit()
                     # Only set to 0 after saving pre_pause value
                     _runtime_config["max_concurrent_vms"] = 0
             logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
+            await broadcast_deploy_state()
     else:
         _pause_failure_streak = 0
         # All deps healthy — should we auto-resume?
         async with AsyncSessionLocal() as session:
             state = await session.get(DeploymentState, 1)
             if state and state.status == DeploymentStatus.PAUSED and state.pre_pause_max_vms is not None:
+                _health_recovery_streak += 1
+                if _health_recovery_streak < 3:
+                    logger.info(f"[PAUSE] Recovery streak {_health_recovery_streak}/3 — all deps healthy, waiting for confirmation")
+                    return
                 restore = state.pre_pause_max_vms
                 state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
                 state.pause_reason = None
                 state.paused_at = None
                 state.pre_pause_max_vms = None
+                state.runtime_max_concurrent_vms = restore
                 session.add(state)
                 await session.commit()
                 _runtime_config["max_concurrent_vms"] = restore
-                logger.info(f"[PAUSE] Auto-resumed pipeline — all deps healthy (max_vms={restore})")
+                _health_recovery_streak = 0
+                logger.info(f"[PAUSE] Auto-resumed pipeline — all deps healthy for 3 consecutive checks (max_vms={restore})")
+                await broadcast_deploy_state()
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -856,11 +867,26 @@ class ConnectionManager:
                     logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
                     self.disconnect(connection, project_id)
 
+    async def broadcast_to_all(self, event_type: str, data: dict):
+        """Broadcasts a message to all connected WebSocket clients across all projects."""
+        for project_id in list(self.active_connections.keys()):
+            await self.broadcast(project_id, event_type, data)
+
 manager = ConnectionManager()
 
 async def broadcast_to_project(project_id: str, event_type: str, data: dict):
     """Broadcasts a message to all WebSocket clients listening to a specific project."""
     await manager.broadcast(project_id, event_type, data)
+
+async def broadcast_deploy_state():
+    """Assemble and broadcast current deploy state to all connected WebSocket clients."""
+    try:
+        from app.admin import build_deploy_state_payload
+        async with AsyncSessionLocal() as session:
+            payload = await build_deploy_state_payload(session)
+        await manager.broadcast_to_all("deploy_state", payload)
+    except Exception as e:
+        logger.warning(f"[WS] Failed to broadcast deploy state: {e}")
 
 def verify_agent_token(x_agent_token: str = Header(..., description="Secret token for agent authentication")):
     """
@@ -2142,6 +2168,14 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         return
     try:
         await websocket.send_json({"event": "connected", "data": {"project_id": project_id}})
+        # Send current deploy state immediately so the client hydrates without waiting for polling
+        try:
+            from app.admin import build_deploy_state_payload
+            async with AsyncSessionLocal() as ds_session:
+                deploy_payload = await build_deploy_state_payload(ds_session)
+            await websocket.send_json({"event": "deploy_state", "data": deploy_payload})
+        except Exception as e:
+            logger.warning(f"[WS] Failed to send initial deploy state on connect: {e}")
         import time
         last_message_time = time.time()
         message_count = 0

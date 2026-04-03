@@ -19,10 +19,14 @@ export interface DeployState {
   rollback_reason: string | null;
   rollback_count: number;
   pause_reason: string | null;
+  paused_at: string | null;
+  pre_pause_max_vms: number | null;
   failure_rate: number;
   monitoring_window: { elapsed_seconds: number; total_seconds: number; percent: number } | null;
   task_results_count: number;
   gcp_project_id: string;
+  health_recovery_streak: number;
+  health_recovery_streak_required: number;
 }
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -752,6 +756,25 @@ export function useAppState() {
     }
   };
 
+  const handleResetHealth = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/reset-health`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail || 'Failed to reset health', 'error');
+        return;
+      }
+      addToast('Health reset — pipeline resumed', 'success');
+      const data = await res.json().catch(() => null);
+      if (data) setDeployState(data);
+      fetchTasks();
+    } catch {
+      addToast('Failed to reset health', 'error');
+    }
+  };
+
   const handleRollback = async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/rollback`, {
@@ -797,10 +820,10 @@ export function useAppState() {
     }
   };
 
-  // Fetch deploy state on mount and periodically
+  // Fetch deploy state on mount and periodically (WS push is the primary path; this is a fallback)
   useEffect(() => {
     fetchDeployState();
-    const id = setInterval(fetchDeployState, 30000);
+    const id = setInterval(fetchDeployState, 60000);
     return () => clearInterval(id);
   }, []);
 
@@ -1325,6 +1348,9 @@ export function useAppState() {
             } else if (msg.event === 'task_updated' && msg.data?.task_id === task.id) {
               setLogLines(prev => [...prev, `[Status: ${msg.data.status}]`]);
             }
+            if (msg.event === 'deploy_state') {
+              setDeployState(msg.data);
+            }
             if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
               if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
               fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
@@ -1543,7 +1569,7 @@ export function useAppState() {
     // Status bar
     apiHealthy, wsConnected, lastFetchTime,
     // Deploy state
-    deployState, handlePausePipeline, handleResumePipeline,
+    deployState, handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,
     // Zone health
     zoneHealth,

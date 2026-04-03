@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Settings, GitBranch, RotateCcw, Loader2, Shield, Play, Pause, RotateCw, Wrench, CheckCircle } from 'lucide-react';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, Play, Pause, RotateCw, Wrench, CheckCircle, Zap } from 'lucide-react';
 import type { DeployState } from '../useAppState';
 
 
@@ -65,6 +65,7 @@ interface SettingsDropdownProps {
   deployState: DeployState | null;
   onPausePipeline: () => Promise<void>;
   onResumePipeline: () => Promise<void>;
+  onResetHealth: () => Promise<void>;
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
@@ -142,6 +143,7 @@ export function SettingsDropdown({
   deployState,
   onPausePipeline,
   onResumePipeline,
+  onResetHealth,
   onRollback,
   onMarkStable,
   onRepairState,
@@ -749,6 +751,27 @@ export function SettingsDropdown({
                 {deployState.pause_reason && (
                   <p className="text-[10px] text-amber-400/80 bg-amber-950/20 rounded px-2 py-1 mt-1">{deployState.pause_reason}</p>
                 )}
+                {deployState.status === 'PAUSED' && deployState.pre_pause_max_vms != null && (
+                  <p className="text-[10px] text-neutral-400 bg-neutral-800/40 rounded px-2 py-1 mt-1">
+                    Will restore to {deployState.pre_pause_max_vms} VM{deployState.pre_pause_max_vms !== 1 ? 's' : ''}
+                  </p>
+                )}
+                {deployState.status === 'PAUSED' && (deployState.health_recovery_streak ?? 0) > 0 && (
+                  <div className="space-y-1 mt-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] text-neutral-500">Recovering</span>
+                      <span className="text-[11px] text-emerald-400 font-mono">
+                        {deployState.health_recovery_streak}/{deployState.health_recovery_streak_required ?? 3} healthy checks
+                      </span>
+                    </div>
+                    <div className="w-full bg-neutral-800 rounded-full h-1.5">
+                      <div
+                        className="bg-emerald-500 h-1.5 rounded-full transition-all duration-500"
+                        style={{ width: `${Math.min(100, (deployState.health_recovery_streak / (deployState.health_recovery_streak_required ?? 3)) * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 <div className="flex gap-1.5 mt-2">
                   {deployState.status === 'PAUSED' || deployState.status === 'HALTED' ? (
                     <button onClick={onResumePipeline}
@@ -768,6 +791,15 @@ export function SettingsDropdown({
                     </button>
                   )}
                 </div>
+                {deployState.status === 'PAUSED' && (
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => { if (window.confirm('Force-reset health and resume immediately? This bypasses the healthy-checks gate.')) onResetHealth(); }}
+                      className="flex-1 bg-orange-950/30 hover:bg-orange-900/40 text-orange-400 text-[10px] py-1 rounded transition-colors border border-orange-900/50 flex items-center justify-center gap-1">
+                      <Zap className="w-2.5 h-2.5" /> Force reset health
+                    </button>
+                  </div>
+                )}
                 <div className="flex gap-1.5">
                   <button
                     onClick={() => { if (window.confirm('Rollback to last known good revision? This will pause the pipeline.')) onRollback(); }}

@@ -344,6 +344,7 @@ export default function App() {
         deployState={s.deployState}
         onPausePipeline={s.handlePausePipeline}
         onResumePipeline={s.handleResumePipeline}
+        onResetHealth={s.handleResetHealth}
         onRollback={s.handleRollback}
         onMarkStable={s.handleMarkStable}
         onRepairState={s.handleRepairState}

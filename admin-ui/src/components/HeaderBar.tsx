@@ -80,6 +80,7 @@ export interface HeaderBarProps {
   deployState: DeployState | null;
   onPausePipeline: () => Promise<void>;
   onResumePipeline: () => Promise<void>;
+  onResetHealth: () => Promise<void>;
   onRollback: () => Promise<void>;
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
@@ -297,6 +298,7 @@ export function HeaderBar(props: HeaderBarProps) {
           deployState={props.deployState}
           onPausePipeline={props.onPausePipeline}
           onResumePipeline={props.onResumePipeline}
+          onResetHealth={props.onResetHealth}
           onRollback={props.onRollback}
           onMarkStable={props.onMarkStable}
           onRepairState={props.onRepairState}
