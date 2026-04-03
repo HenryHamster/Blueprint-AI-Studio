@@ -7,7 +7,7 @@ Tests for:
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 import app.shared_state as _shared_state
 import app.compute as _compute
@@ -81,7 +81,7 @@ def all_deps_healthy():
 async def health_client():
     """Lightweight AsyncClient for /health — no DB dependency needed.
     The health endpoint is unauthenticated and does not touch the database."""
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
 
