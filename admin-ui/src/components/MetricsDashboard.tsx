@@ -25,13 +25,14 @@ interface MetricsPoint {
 interface MetricsDashboardProps {
   metricsHistory: MetricsPoint[];
   cumulativeCost: number;
+  cumulativeVmHours: number;
   maxConcurrentVMs: number;
   tasks: Task[];
-  metricsWindow: '15m' | '30m' | '1h' | '2h' | '6h';
-  onWindowChange: (w: '15m' | '30m' | '1h' | '2h' | '6h') => void;
+  metricsWindow: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
+  onWindowChange: (w: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all') => void;
 }
 
-const WINDOW_MS: Record<'15m' | '30m' | '1h' | '2h' | '6h', number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '6h': 21600000 };
+const WINDOW_MS: Record<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all', number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
 
 const TICK_STYLE = { fill: '#737373', fontSize: 10 };
 const GRID_COLOR = '#262626';
@@ -41,8 +42,14 @@ const TOOLTIP_STYLE = {
   labelStyle: { color: '#a3a3a3' },
 };
 
-function formatTime(ts: number): string {
+function formatTime(ts: number, windowMs?: number): string {
   const d = new Date(ts);
+  if (windowMs !== undefined && windowMs >= 43200000) {
+    const month = (d.getMonth() + 1).toString().padStart(2, '0');
+    const day = d.getDate().toString().padStart(2, '0');
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `${month}/${day} ${time}`;
+  }
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
@@ -63,12 +70,12 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
     <ResponsiveContainer width="100%" height={160}>
       <AreaChart data={filtered}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts), windowMs)} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [(value as number).toFixed(2) + ' $/hr', 'Cost/hr']}
-          labelFormatter={(ts) => formatTime(Number(ts))}
+          formatter={(value: unknown) => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr']}
+          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
         />
         <Area dataKey="costPerHr" stroke="#10b981" fill="#10b981" fillOpacity={0.15} dot={false} />
       </AreaChart>
@@ -85,12 +92,12 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
     <ResponsiveContainer width="100%" height={160}>
       <AreaChart data={filtered}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts), windowMs)} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
           formatter={(value: unknown) => [String(value) + ' VMs', 'Active VMs']}
-          labelFormatter={(ts) => formatTime(Number(ts))}
+          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
         />
         <ReferenceLine y={maxConcurrentVMs} stroke="#3b82f6" strokeDasharray="4 3" strokeOpacity={0.5} />
         <Area dataKey="activeVMs" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.15} dot={false} />
@@ -127,11 +134,11 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
     <ResponsiveContainer width="100%" height={160}>
       <LineChart data={cumPoints}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts), windowMs)} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          labelFormatter={(ts) => formatTime(Number(ts))}
+          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
         />
         <Legend wrapperStyle={{ fontSize: 11, color: '#a3a3a3' }} />
         <Line dataKey="cumCompleted" stroke="#10b981" dot={false} name="Completed" />
@@ -156,12 +163,12 @@ function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; window
     <ResponsiveContainer width="100%" height={160}>
       <LineChart data={ratePoints}>
         <CartesianGrid stroke={GRID_COLOR} vertical={false} />
-        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts))} tick={TICK_STYLE} interval="preserveStartEnd" />
+        <XAxis dataKey="timestamp" tickFormatter={(ts) => formatTime(Number(ts), windowMs)} tick={TICK_STYLE} interval="preserveStartEnd" />
         <YAxis tick={TICK_STYLE} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
         <Tooltip
           {...TOOLTIP_STYLE}
           formatter={(value: unknown) => [(value as number).toFixed(1) + '%', 'Failure Rate']}
-          labelFormatter={(ts) => formatTime(Number(ts))}
+          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
         />
         <Line dataKey="failureRate" stroke="#ef4444" dot={false} name="Failure Rate" />
       </LineChart>
@@ -180,11 +187,12 @@ function getTaskCompletedTime(task: Task): number | null {
   return isNaN(ts) ? null : ts;
 }
 
-const WINDOW_OPTIONS: Array<'15m' | '30m' | '1h' | '2h' | '6h'> = ['15m', '30m', '1h', '2h', '6h'];
+const WINDOW_OPTIONS: Array<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'> = ['15m', '30m', '1h', '2h', '3h', '6h', '12h', '24h', 'all'];
 
 export default function MetricsDashboard({
   metricsHistory,
   cumulativeCost,
+  cumulativeVmHours,
   maxConcurrentVMs,
   tasks,
   metricsWindow,
@@ -259,7 +267,7 @@ export default function MetricsDashboard({
       <div className="grid grid-cols-2 gap-4">
         {/* Cost Over Time chart */}
         <div className={cardClass}>
-          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Cost / Hour</div>
+          <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">VM Cost/Hr (e2-standard-2)</div>
           <CostChart points={metricsHistory} windowMs={windowMs} />
         </div>
 
@@ -269,15 +277,18 @@ export default function MetricsDashboard({
           <VMChart points={metricsHistory} maxConcurrentVMs={maxConcurrentVMs} windowMs={windowMs} />
         </div>
 
-        {/* Session Totals card */}
+        {/* VM-Hours card */}
         <div className={cardClass}>
           <div className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
-            Est. Cumulative Cost
+            Total VM-Hours
           </div>
           <div className="text-lg font-semibold text-neutral-100 font-mono">
-            ${cumulativeCost.toFixed(2)}
+            {cumulativeVmHours.toFixed(2)}
           </div>
-          <div className="text-[10px] text-neutral-500 mt-1">since session start</div>
+          <div className="text-[10px] text-neutral-500 mt-1">
+            Cumulative VM Cost: <span className="text-neutral-300 font-mono">${cumulativeCost.toFixed(2)}</span>
+          </div>
+          <div className="text-[10px] text-neutral-500">since session start</div>
         </div>
 
         {/* Task Throughput card */}

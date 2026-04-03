@@ -280,7 +280,6 @@ export default function App() {
         globalEvaluatingCount={s.globalEvaluatingCount}
         globalQueuedCount={s.globalQueuedCount}
         maxConcurrentVMs={s.maxConcurrentVMs}
-        usingMaxPlan={s.usingMaxPlan}
         lastRefresh={s.lastRefresh}
         onRefresh={s.fetchTasks}
         viewMode={s.viewMode}
@@ -358,6 +357,7 @@ export default function App() {
         <MetricsDashboard
           metricsHistory={s.metricsHistory}
           cumulativeCost={s.cumulativeCost}
+          cumulativeVmHours={s.cumulativeVmHours}
           maxConcurrentVMs={s.maxConcurrentVMs}
           tasks={s.tasks}
           metricsWindow={s.metricsWindow}

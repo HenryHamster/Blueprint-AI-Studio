@@ -1,12 +1,11 @@
 import type { RefObject } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
-import { COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD } from '../api';
+import { COST_PER_VM_HR } from '../api';
 
 export interface MetricsBarProps {
   globalActiveCount: number;
   maxConcurrentVMs: number;
-  usingMaxPlan: boolean;
   globalEvaluatingCount: number;
   queuedTasksLength: number;
   lastRefresh: Date | null;
@@ -29,7 +28,6 @@ function formatTimeAgo(date: Date): string {
 export function MetricsBar({
   globalActiveCount,
   maxConcurrentVMs,
-  usingMaxPlan,
   globalEvaluatingCount,
   queuedTasksLength,
   lastRefresh,
@@ -59,11 +57,11 @@ export function MetricsBar({
       <div className="w-px h-8 bg-neutral-800"></div>
       <div
         className="flex flex-col items-center"
-        title={usingMaxPlan ? `Max plan: $${COST_PER_VM_MAX_PLAN}/hr per VM (VM compute only)` : `Standard plan: $${COST_PER_VM_STANDARD}/hr per VM (includes API tokens)`}
+        title={`e2-standard-2 VM cost: $${COST_PER_VM_HR}/hr per VM`}
       >
-        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Est. Cost/hr</span>
+        <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">VM Cost/hr</span>
         <span className="text-xl font-bold text-neutral-200 font-mono leading-none">
-          ${(globalActiveCount * (usingMaxPlan ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD)).toFixed(2)}<span className="text-sm text-neutral-400 font-sans">/hr</span>
+          ${(globalActiveCount * COST_PER_VM_HR).toFixed(2)}<span className="text-sm text-neutral-400 font-sans">/hr</span>
         </span>
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>

@@ -5,7 +5,7 @@ import type { MaxPlanAccount } from './components/SettingsDropdown';
 import type { Alert } from './components/AlertsBanner';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_MAX_PLAN, COST_PER_VM_STANDARD, fetchTask } from './api';
+import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_HR, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
 
@@ -119,9 +119,6 @@ export function useAppState() {
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
-  const usingMaxPlanRef = useRef(usingMaxPlan);
-  useEffect(() => { usingMaxPlanRef.current = usingMaxPlan; }, [usingMaxPlan]);
-
   // Max plan pool state
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
   const [newAccountName, setNewAccountName] = useState('');
@@ -160,9 +157,10 @@ export function useAppState() {
   const [showMetrics, setShowMetrics] = useState(false);
   const [metricsHistory, setMetricsHistory] = usePersistedState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>('metricsHistory', []);
   const [cumulativeCost, setCumulativeCost] = usePersistedState<number>('cumulativeCost', 0);
-  const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '6h'>('metricsWindow', '1h');
+  const [cumulativeVmHours, setCumulativeVmHours] = usePersistedState<number>('cumulativeVmHours', 0);
+  const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'>('metricsWindow', '1h');
   const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
-  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 21600000); }, [metricsHistory]);
+  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 86400000); }, [metricsHistory]);
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -425,17 +423,19 @@ export function useAppState() {
         // Always record metrics data points (rendering depends on showMetrics, not collection)
         const now = Date.now();
         const activeVMs = data.active_count ?? newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-        const costPerHr = activeVMs * (usingMaxPlanRef.current ? COST_PER_VM_MAX_PLAN : COST_PER_VM_STANDARD);
+        const costPerHr = activeVMs * COST_PER_VM_HR;
 
-        // Compute cumulative cost using the rate from the *previous* interval
+        // Compute cumulative cost and VM-hours using the rate from the *previous* interval
         const prevHistory = metricsHistoryRef.current;
         const lastPoint = prevHistory[prevHistory.length - 1];
         if (lastPoint) {
           const intervalMs = now - lastPoint.timestamp;
-          setCumulativeCost(c => c + lastPoint.costPerHr * (intervalMs / 3600000));
+          const intervalHrs = intervalMs / 3600000;
+          setCumulativeCost(c => c + lastPoint.costPerHr * intervalHrs);
+          setCumulativeVmHours(h => h + lastPoint.activeVMs * intervalHrs);
         }
 
-        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 21600000);
+        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 86400000);
         const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr, completedCount, failedCount }];
         metricsHistoryRef.current = newHistory;
         setMetricsHistory(newHistory);
@@ -1528,7 +1528,7 @@ export function useAppState() {
     // Directions
     showDirections, setShowDirections,
     // Metrics
-    showMetrics, setShowMetrics, metricsHistory, cumulativeCost, metricsWindow, setMetricsWindow,
+    showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive
     showArchive, setShowArchive, archiveTasks, archiveLoading,
     archivePage, setArchivePage, archivePageSize, setArchivePageSize,

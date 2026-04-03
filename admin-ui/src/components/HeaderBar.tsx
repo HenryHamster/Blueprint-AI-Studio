@@ -14,7 +14,6 @@ export interface HeaderBarProps {
   globalEvaluatingCount: number;
   globalQueuedCount: number;
   maxConcurrentVMs: number;
-  usingMaxPlan: boolean;
   lastRefresh: Date | null;
   onRefresh: () => void;
   viewMode: 'kanban' | 'pipeline';
@@ -95,7 +94,6 @@ export function HeaderBar(props: HeaderBarProps) {
     globalActiveCount,
     globalEvaluatingCount,
     maxConcurrentVMs,
-    usingMaxPlan,
     lastRefresh,
     onRefresh,
     viewMode,
@@ -193,7 +191,6 @@ export function HeaderBar(props: HeaderBarProps) {
       <MetricsBar
         globalActiveCount={globalActiveCount}
         maxConcurrentVMs={maxConcurrentVMs}
-        usingMaxPlan={usingMaxPlan}
         globalEvaluatingCount={globalEvaluatingCount}
         queuedTasksLength={queuedTasks.length}
         lastRefresh={lastRefresh}
