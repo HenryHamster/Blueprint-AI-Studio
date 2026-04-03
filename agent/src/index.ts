@@ -4,7 +4,7 @@ import WebSocket from 'ws';
 
 // ── Environment ─────────────────────────────────────────────────────────────
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-const AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
+let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 const WORKSPACE = '/tmp/workspace';
 
@@ -14,7 +14,31 @@ const apiHeaders: Record<string, string> = {
 };
 
 // ── API Helpers ─────────────────────────────────────────────────────────────
-async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 3) {
+async function tryRefreshToken(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    const res = await fetch(`${ORCHESTRATOR_URL}/api/agent/refresh-token`, {
+      method: 'POST', headers: { ...apiHeaders }, body: JSON.stringify({}), signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return false;
+    const data = await res.json() as { token?: string };
+    if (data.token) {
+      AGENT_TOKEN = data.token;
+      apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+      log('Agent token refreshed successfully');
+      return true;
+    }
+    return false;
+  } catch (e) {
+    log(`Token refresh failed: ${e}`);
+    return false;
+  }
+}
+
+async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 5) {
+  let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
@@ -25,7 +49,16 @@ async function apiPost(path: string, body: Record<string, unknown> = {}, retries
       clearTimeout(timeout);
       if (res.ok) return res.json();
       const text = await res.text();
-      // 4xx errors are not transient — fail immediately
+      // 401: attempt token refresh at most once, then retry
+      if (res.status === 401) {
+        if (tokenRefreshed) throw new Error(`POST ${path} failed (401): ${text}`);
+        log(`POST ${path} got 401 — attempting token refresh`);
+        const refreshed = await tryRefreshToken();
+        if (!refreshed) throw new Error(`POST ${path} failed (401): ${text}`);
+        tokenRefreshed = true;
+        continue;
+      }
+      // Other 4xx errors are not transient — fail immediately
       if (res.status < 500) {
         throw new Error(`POST ${path} failed (${res.status}): ${text}`);
       }
@@ -37,12 +70,13 @@ async function apiPost(path: string, body: Record<string, unknown> = {}, retries
       // Re-throw 4xx errors and final-attempt errors immediately
       if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
-    await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000)));
   }
   throw new Error(`POST ${path} failed after ${retries} retries`);
 }
 
-async function apiGet(path: string, retries = 3) {
+async function apiGet(path: string, retries = 5) {
+  let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
@@ -51,6 +85,15 @@ async function apiGet(path: string, retries = 3) {
       clearTimeout(timeout);
       if (res.ok) return res.json();
       const text = await res.text();
+      // 401: attempt token refresh at most once, then retry
+      if (res.status === 401) {
+        if (tokenRefreshed) throw new Error(`GET ${path} failed (401): ${text}`);
+        log(`GET ${path} got 401 — attempting token refresh`);
+        const refreshed = await tryRefreshToken();
+        if (!refreshed) throw new Error(`GET ${path} failed (401): ${text}`);
+        tokenRefreshed = true;
+        continue;
+      }
       if (res.status < 500) {
         throw new Error(`GET ${path} failed (${res.status}): ${text}`);
       }
@@ -60,7 +103,7 @@ async function apiGet(path: string, retries = 3) {
     } catch (e) {
       if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
-    await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000)));
   }
   throw new Error(`GET ${path} failed after ${retries} retries`);
 }
@@ -72,10 +115,27 @@ function log(msg: string) {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+function collectMetrics(): { rss_mb: number; heap_used_mb: number; disk_free_mb?: number; disk_total_mb?: number } {
+  const mem = process.memoryUsage();
+  const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
+  const heap_used_mb = Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10;
+  try {
+    const dfOut = execFileSync('df', ['-k', '/tmp'], { timeout: 5000 }).toString();
+    const line = dfOut.split('\n')[1];
+    if (line) {
+      const parts = line.trim().split(/\s+/);
+      const disk_total_mb = Math.round(parseInt(parts[1], 10) / 1024);
+      const disk_free_mb = Math.round(parseInt(parts[3], 10) / 1024);
+      return { rss_mb, heap_used_mb, disk_free_mb, disk_total_mb };
+    }
+  } catch { /* disk metrics are best-effort */ }
+  return { rss_mb, heap_used_mb };
+}
+
 function startHeartbeat(taskId: string, getMessage: () => string) {
   heartbeatTimer = setInterval(async () => {
     try {
-      await apiPost('/api/agent/heartbeat', { task_id: taskId, status_message: getMessage() });
+      await apiPost('/api/agent/heartbeat', { task_id: taskId, status_message: getMessage(), metrics: collectMetrics() });
     } catch (e) { log(`Heartbeat failed: ${e}`); }
   }, 30_000);
 }
@@ -85,6 +145,22 @@ function stopHeartbeat() {
 }
 
 // ── WebSocket Log Stream ────────────────────────────────────────────────────
+const MAX_LOG_BUFFER = 1000;
+interface LogEntry { timestamp: number; content: string; }
+const logBuffer: LogEntry[] = [];
+
+function appendToLogBuffer(content: string) {
+  if (logBuffer.length >= MAX_LOG_BUFFER) logBuffer.shift();
+  logBuffer.push({ timestamp: Date.now(), content });
+}
+
+function flushLogBuffer(ws: WebSocket) {
+  while (logBuffer.length > 0) {
+    const entry = logBuffer.shift()!;
+    try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
+  }
+}
+
 async function connectLogStream(taskId: string): Promise<WebSocket | null> {
   const wsUrl = ORCHESTRATOR_URL.replace(/^http/, 'ws');
   const maxRetries = 3;
@@ -102,7 +178,10 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
         });
         conn.on('error', () => { clearTimeout(timeout); resolve(null); });
       });
-      if (ws) return ws;
+      if (ws) {
+        flushLogBuffer(ws);
+        return ws;
+      }
     } catch {}
     if (attempt < maxRetries - 1) {
       await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt)));
@@ -130,8 +209,12 @@ function validateBranchName(branch: string, label: string): string {
 }
 
 function sendLog(ws: WebSocket | null, content: string) {
+  const sanitized = sanitize(content);
+  appendToLogBuffer(sanitized);
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify({ type: 'log', content: sanitize(content) })); } catch {}
+    try { ws.send(JSON.stringify({ type: 'log', content: sanitized })); } catch {}
+  } else {
+    process.stdout.write(sanitized);
   }
 }
 
@@ -188,8 +271,12 @@ async function pushAndCreatePR(
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is, review pipeline will handle\n`);
+      let conflictList = '';
+      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
+      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
+      sendLog(ws, `${conflictMsg}\n`);
+      throw new Error(conflictMsg);
     }
 
     // Verify no conflict markers before pushing
@@ -490,6 +577,14 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
   return { exitCode, allOutput, lastResultText };
 }
 
+// ── Task Type Hints (appended to prompts for known task types) ───────────────
+const TASK_TYPE_HINTS: Record<string, string> = {
+  'qa': 'Focus on writing tests. Run the existing test suite first to understand patterns. Do not modify production code unless fixing a test setup issue.',
+  'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
+  'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
+  'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
+};
+
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────
 async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -518,7 +613,8 @@ async function handleCreate(
   const siblingNote = (projectCtx?.sibling_tasks as unknown[] | undefined)?.length
     ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
     : '';
-  const finalPrompt = `${contextPrefix}${parentContextSection}${prompt}${siblingNote}${promptSuffix}`;
+  const taskTypeHint = TASK_TYPE_HINTS[String(payload.type || '')] ? `\n\n${TASK_TYPE_HINTS[String(payload.type || '')]}` : '';
+  const finalPrompt = `${contextPrefix}${parentContextSection}${prompt}${siblingNote}${promptSuffix}${taskTypeHint}`;
 
   // Clone and setup workspace
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'task', taskId, ws, statusRef);
@@ -547,8 +643,12 @@ async function handleCreate(
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is, review pipeline will handle\n`);
+      let conflictList = '';
+      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
+      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
+      sendLog(ws, `${conflictMsg}\n`);
+      throw new Error(conflictMsg);
     }
 
     // Verify no conflict markers before pushing
@@ -830,8 +930,18 @@ async function handleFix(
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Final rebase onto ${baseBranch} successful\n`);
     } catch {
-      sendLog(ws, `Final rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
+      let conflictList = '';
+      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
+      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
+      sendLog(ws, `${conflictMsg}\n`);
+      try {
+        await apiPost('/api/agent/github/pr-comment', {
+          task_id: taskId, owner, repo, pr_number: prNumber,
+          body: `**Blueprint Agent**: Rebase conflict detected after applying review fixes.\n\nThe branch could not be automatically rebased onto \`${baseBranch}\`. Manual resolution is required.\n\n${conflictList ? `**Conflicting files:**\n\`\`\`\n${conflictList}\n\`\`\`` : ''}`,
+        });
+      } catch (commentErr) { sendLog(ws, `Failed to post PR comment: ${commentErr}\n`); }
+      throw new Error(conflictMsg);
     }
   }
 
@@ -1061,6 +1171,59 @@ Rules:
     } else {
       const jsonMatch = allOutput.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
       logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+    }
+  }
+
+  // Try to parse plan JSON and spawn subtasks directly from the agent
+  if (exitCode === 0 && logs) {
+    try {
+      let planData: Record<string, unknown> | null = null;
+      try {
+        planData = JSON.parse(logs);
+      } catch {
+        const match = logs.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
+        if (match) planData = JSON.parse(match[0]);
+      }
+
+      const subtasks = planData?.subtasks;
+      if (Array.isArray(subtasks) && subtasks.length > 0 && subtasks.length <= 10) {
+        sendLog(ws, `Parsed ${subtasks.length} subtasks from plan output\n`);
+
+        const spawnPayloads = subtasks.map((st: Record<string, unknown>) => ({
+          title: String(st.title || 'Untitled subtask'),
+          description: String(st.prompt || ''),
+          prompt: String(st.prompt || ''),
+          type: String(st.type || 'create'),
+          scope: String(st.scope || 'small'),
+          risk: String(st.risk || 'low'),
+          base_branch: baseBranch,
+          depends_on_indices: st.depends_on_indices || [],
+          related_files: st.related_files || [],
+          ...(st.model ? { model: String(st.model) } : {}),
+          ...(st.effort ? { effort: String(st.effort) } : {}),
+          ...(st.approval_reason ? { approval_reason: String(st.approval_reason) } : {}),
+        }));
+
+        statusRef.value = 'Spawning subtasks...';
+        const spawnResult = await apiPost('/api/agent/spawn', {
+          task_id: taskId,
+          payloads: spawnPayloads,
+          requires_approval: false,
+          context: { agent_spawned: true },
+        }) as Record<string, unknown>;
+
+        const spawnedIds = (spawnResult.task_ids as string[]) || [];
+        sendLog(ws, `Spawned ${spawnedIds.length} subtasks: ${spawnedIds.join(', ')}\n`);
+
+        // Include full plan data with spawn info for backend enrichment
+        logs = JSON.stringify({
+          ...planData,
+          agent_spawned: true,
+          spawned_task_ids: spawnedIds,
+        });
+      }
+    } catch (err) {
+      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : err}, falling back to backend processing\n`);
     }
   }
 

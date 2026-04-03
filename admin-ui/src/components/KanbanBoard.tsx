@@ -67,7 +67,7 @@ function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
 interface KanbanBoardProps {
   tasks: Task[];
   columns: KanbanColumn[];
-  loading: boolean;
+  loading: boolean; // true only on first load before data is available
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   selectionMode: boolean;

@@ -66,7 +66,8 @@ export function useAppState() {
   const [globalActiveCount, setGlobalActiveCount] = useState(0);
   const [globalEvaluatingCount, setGlobalEvaluatingCount] = useState(0);
   const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = usePersistedState<number>('pageSize', 50);
@@ -103,6 +104,7 @@ export function useAppState() {
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logsConnecting, setLogsConnecting] = useState(false);
   const [wsDisconnected, setWsDisconnected] = useState(false);
+  const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   // Research browser state
@@ -159,7 +161,25 @@ export function useAppState() {
 
   // Metrics dashboard state
   const [showMetrics, setShowMetrics] = useState(false);
-  const [metricsHistory, setMetricsHistory] = usePersistedState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>('metricsHistory', []);
+  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>(() => {
+    try {
+      const stored = localStorage.getItem('blueprint-admin:metricsHistory');
+      const parsed: { timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[] = stored ? JSON.parse(stored) : [];
+      return parsed.filter(p => Date.now() - p.timestamp <= 21600000);
+    } catch { return []; }
+  });
+  useEffect(() => {
+    const toStore = metricsHistory.filter(p => Date.now() - p.timestamp <= 21600000);
+    try {
+      localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore));
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+        try {
+          localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore.slice(-100)));
+        } catch { /* storage unavailable, skip persistence */ }
+      }
+    }
+  }, [metricsHistory]);
   const [cumulativeCost, setCumulativeCost] = usePersistedState<number>('cumulativeCost', 0);
   const [cumulativeVmHours, setCumulativeVmHours] = usePersistedState<number>('cumulativeVmHours', 0);
   const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'>('metricsWindow', '1h');
@@ -259,6 +279,7 @@ export function useAppState() {
   useEffect(() => {
     if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
       setWsDisconnected(false);
+      setWsDisconnectReason(null);
     }
   }, [logTask, logTask?.status]);
 
@@ -362,6 +383,11 @@ export function useAppState() {
   }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
 
   const fetchTasks = async () => {
+    if (tasks.length === 0) {
+      setInitialLoading(true);
+    } else {
+      setRefreshing(true);
+    }
     try {
       const offset = (page - 1) * limit;
       let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
@@ -452,7 +478,8 @@ export function useAppState() {
       setError('Failed to connect to backend server.');
       setApiHealthy(false);
     } finally {
-      setLoading(false);
+      setInitialLoading(false);
+      setRefreshing(false);
     }
   };
   fetchTasksRef.current = fetchTasks;
@@ -1372,7 +1399,18 @@ export function useAppState() {
           setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
           setWsConnected(false);
           setLogsConnecting(false);
-          if (wasConnected) setWsDisconnected(true);
+          if (wasConnected) {
+            setWsDisconnected(true);
+            let reason: string;
+            if (e.code === 1008) {
+              reason = 'Authentication failed — please refresh the page';
+            } else if (e.code === 1006) {
+              reason = 'Connection lost — attempting to reconnect...';
+            } else {
+              reason = `Disconnected (code ${e.code}) — attempting to reconnect...`;
+            }
+            setWsDisconnectReason(reason);
+          }
         };
       } catch (err) {
         setLogsConnecting(false);
@@ -1389,6 +1427,7 @@ export function useAppState() {
     setWsConnected(false);
     setLogsConnecting(false);
     setWsDisconnected(false);
+    setWsDisconnectReason(null);
     setLogTask(null);
     setLogLines([]);
   };
@@ -1499,7 +1538,7 @@ export function useAppState() {
     // Auth
     user, authLoading, error, setError,
     // Tasks
-    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, loading, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, initialLoading, refreshing, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
@@ -1520,7 +1559,7 @@ export function useAppState() {
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
     // Log viewer
-    logTask, logLines, logsConnecting, wsDisconnected, handleViewLogs, closeLogViewer,
+    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     // Activity feed

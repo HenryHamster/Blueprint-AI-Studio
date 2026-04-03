@@ -8,6 +8,7 @@ interface TaskDetailDrawerProps {
   logLines: string[];
   logsConnecting?: boolean;
   wsDisconnected?: boolean;
+  wsDisconnectReason?: string | null;
   actionLoading?: string;
   gcpProjectId?: string;
   onClose: () => void;
@@ -182,6 +183,27 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpP
       {task.attempt_count != null && (
         <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>
       )}
+
+      {(() => {
+        const metrics = task.context?.last_metrics as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number } | undefined;
+        if (!metrics) return null;
+        return (
+          <>
+            <SectionHeader>System Metrics</SectionHeader>
+            {metrics.rss_mb != null && (
+              <DetailRow label="RSS Memory"><span className="font-mono text-sm">{metrics.rss_mb} MB</span></DetailRow>
+            )}
+            {metrics.heap_used_mb != null && (
+              <DetailRow label="Heap Used"><span className="font-mono text-sm">{metrics.heap_used_mb} MB</span></DetailRow>
+            )}
+            {metrics.disk_free_mb != null && metrics.disk_total_mb != null && (
+              <DetailRow label="Disk (/tmp)">
+                <span className="font-mono text-sm">{metrics.disk_free_mb} MB free / {metrics.disk_total_mb} MB total</span>
+              </DetailRow>
+            )}
+          </>
+        );
+      })()}
 
       {task.description && (
         <>
@@ -623,6 +645,7 @@ export function TaskDetailDrawer({
   logLines,
   logsConnecting = false,
   wsDisconnected = false,
+  wsDisconnectReason = null,
   actionLoading,
   gcpProjectId,
   onClose,
@@ -832,6 +855,12 @@ export function TaskDetailDrawer({
           <DetailsTab task={task} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
         ) : (
           <>
+            {wsDisconnected && (
+              <div className="flex items-center gap-2 px-4 py-2 bg-amber-950/40 border-b border-amber-800/50 text-amber-400 text-xs shrink-0">
+                <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                {wsDisconnectReason ?? 'Log stream disconnected'}
+              </div>
+            )}
             <LogsTab
               logLines={logLines}
               task={task}

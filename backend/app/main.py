@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+import ipaddress
 from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +22,7 @@ from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, Task
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
-from app.auth import get_current_user, verify_agent_jwt, create_ws_ticket, verify_ws_ticket
+from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
 from app.security import scan_pr_for_injection
@@ -815,6 +816,30 @@ async def _check_idle_research():
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
 
+def _get_websocket_client_ip(websocket: WebSocket) -> str:
+    """Return the real client IP for a WebSocket connection.
+
+    In Cloud Run, the GCP load balancer terminates external TLS and forwards
+    traffic over an internal (RFC-1918) TCP connection.  We trust
+    X-Forwarded-For only when the direct TCP peer is a private IP, because
+    external attackers cannot forge their TCP source address.  If the direct
+    connection is already from a public IP (e.g. local dev, direct access),
+    we use it as-is and ignore X-Forwarded-For to prevent spoofing.
+    """
+    if not websocket.client:
+        return "unknown"
+    direct_ip = websocket.client.host
+    try:
+        is_private = ipaddress.ip_address(direct_ip).is_private
+    except ValueError:
+        return direct_ip
+    if is_private:
+        xff = websocket.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[-1].strip()
+    return direct_ip
+
+
 # --- In-Memory Event Bus for WebSockets ---
 class ConnectionManager:
     def __init__(self):
@@ -823,7 +848,7 @@ class ConnectionManager:
         self.MAX_CONNECTIONS_PER_IP = 20
 
     async def check_and_add_ip(self, websocket: WebSocket) -> bool:
-        client_ip = websocket.headers.get("x-forwarded-for", websocket.client.host if websocket.client else "unknown").split(",")[0].strip()
+        client_ip = _get_websocket_client_ip(websocket)
         if client_ip != "unknown":
             if self.ip_connections.get(client_ip, 0) >= self.MAX_CONNECTIONS_PER_IP:
                 await websocket.close(code=1008, reason="Too many connections from this IP")
@@ -832,7 +857,7 @@ class ConnectionManager:
         return True
 
     def remove_ip(self, websocket: WebSocket):
-        client_ip = websocket.headers.get("x-forwarded-for", websocket.client.host if websocket.client else "unknown").split(",")[0].strip()
+        client_ip = _get_websocket_client_ip(websocket)
         if client_ip != "unknown" and client_ip in self.ip_connections:
             self.ip_connections[client_ip] -= 1
             if self.ip_connections[client_ip] <= 0:
@@ -946,6 +971,13 @@ async def reaper_service():
                     orphaned_tasks = verified
 
                 for task in orphaned_tasks:
+                    # Re-validate status before acting — task may have completed/been cancelled
+                    # between the initial query and now
+                    fresh_task = await session.get(Task, task.id)
+                    if fresh_task is None or fresh_task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
+                        print(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
+                        continue
+
                     # Determine why the reaper flagged this task
                     if task.last_heartbeat:
                         age = int((now - task.last_heartbeat).total_seconds())
@@ -1829,6 +1861,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
 )
 
+
 class DeployPayload(BaseModel):
     name: str
     payloads: List[Dict[str, Any]]
@@ -1852,10 +1885,18 @@ class UploadUrlRequest(BaseModel):
     task_id: uuid.UUID
     filename: str
 
+class HeartbeatMetrics(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    rss_mb: Optional[float] = None
+    heap_used_mb: Optional[float] = None
+    disk_free_mb: Optional[float] = None
+    disk_total_mb: Optional[float] = None
+
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     status_message: Optional[str] = None
+    metrics: Optional[HeartbeatMetrics] = None
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -2279,6 +2320,15 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     finally:
         manager.remove_ip(websocket)
 
+@app.post("/api/agent/refresh-token")
+async def agent_refresh_token(token: dict = Depends(verify_agent_token)):
+    """
+    Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
+    """
+    new_token = create_agent_token(token["sub"], token["vm_instance_id"])
+    return {"token": new_token}
+
+
 @app.post("/api/agent/claim")
 async def claim_task(
     session: AsyncSession = Depends(get_session),
@@ -2489,6 +2539,10 @@ async def agent_heartbeat(
     task.last_heartbeat = datetime.utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
+    if req.metrics:
+        ctx = dict(task.context or {})
+        ctx['last_metrics'] = req.metrics.model_dump(exclude_none=True)
+        task.context = ctx
 
     session.add(task)
     await session.commit()
@@ -2528,6 +2582,14 @@ async def spawn_subtask(
     if spawn_depth >= MAX_SPAWN_DEPTH:
         raise HTTPException(status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")
 
+    # When a plan agent spawns children it immediately posts a status update that triggers
+    # backend enrichment (_handle_plan_completion).  There is a window between task creation
+    # here and the enrichment commit where a worker could pick up a child with the wrong
+    # base_branch (parent's branch instead of the plan branch).  Hold children with
+    # requires_approval=True so the orchestrator ignores them until enrichment sets the
+    # correct value based on child_risk.
+    is_plan_spawn = bool((req.context or {}).get("agent_spawned"))
+
     new_tasks = []
     for payload in req.payloads:
         parent_payload = (parent_task.payloads or [{}])[0]
@@ -2545,7 +2607,9 @@ async def spawn_subtask(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
-            requires_approval=req.requires_approval,
+            # Plan-spawned children are held (requires_approval=True) until _handle_plan_completion
+            # enriches them with the correct base_branch and sets the real approval flag.
+            requires_approval=True if is_plan_spawn else req.requires_approval,
             parent_task_id=parent_task.id,
             **({"priority": req.priority} if req.priority is not None else {}),
         )
@@ -2955,6 +3019,93 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
     session.add(task)
 
+    # Check if agent already spawned children via /api/agent/spawn
+    existing_children_result = await session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
+    all_children = existing_children_result.scalars().all()
+
+    # Use spawned_task_ids from plan_data (embedded by agent) to preserve original spawn order.
+    # Relying on created_at is non-deterministic: tasks spawned in a single batch share the same
+    # timestamp and PostgreSQL returns ties in heap order, which may not match subtasks order.
+    spawned_task_ids = plan_data.get("spawned_task_ids", [])
+    if spawned_task_ids and all_children:
+        children_by_id = {str(c.id): c for c in all_children}
+        existing_children = [children_by_id[sid] for sid in spawned_task_ids if sid in children_by_id]
+    else:
+        existing_children = list(all_children)
+
+    if existing_children:
+        # Agent already spawned subtasks — enrich with branch info, dependencies, and approval
+        print(f"[PLAN] Agent already spawned {len(existing_children)} children, enriching...")
+        parent_payload = (task.payloads or [{}])[0]
+        model = parent_payload.get('model')
+        effort = parent_payload.get('effort')
+        create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+
+        for i, child in enumerate(existing_children):
+            child_payload = (child.payloads or [{}])[0]
+            child_risk = child_payload.get('risk', 'low')
+            related_files = child_payload.get('related_files', [])
+
+            # Enrich prompt with related files if not already present
+            prompt_text = child_payload.get('prompt', '')
+            if related_files and 'Key files to review or modify' not in prompt_text:
+                child_payload['prompt'] = prompt_text + "\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)
+
+            # Update base_branch to plan branch and inherit model/effort
+            child_payload['base_branch'] = plan_branch
+            if model and not child_payload.get('model'):
+                child_payload['model'] = model
+            if effort and not child_payload.get('effort'):
+                child_payload['effort'] = effort
+            if create_suffix and not child_payload.get('prompt_suffix'):
+                child_payload['prompt_suffix'] = create_suffix
+
+            # Normalize type
+            _allowed_types = {'create', 'refactor', 'migrate', 'qa'}
+            raw_type = child_payload.get('type', 'create')
+            child_payload['type'] = raw_type if raw_type in _allowed_types else 'create'
+
+            child.payloads = [child_payload]
+            child.requires_approval = child_risk == 'high'
+            child_approval_reason = child_payload.get('approval_reason') if child_risk == 'high' else None
+            child.context = {
+                **(child.context or {}),
+                "plan_branch": plan_branch,
+                "parent_base": parent_base,
+                "scope": child_payload.get('scope', 'small'),
+                "risk": child_risk,
+                "related_files": related_files,
+                **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
+            }
+            session.add(child)
+
+        # Resolve dependencies in the same pass — do NOT commit between enrichment and
+        # dependency wiring.  A mid-enrichment commit would let workers pick up children
+        # with the correct base_branch but missing depends_on, causing out-of-order execution.
+        for i, subtask_def in enumerate(subtasks):
+            if i < len(existing_children):
+                dep_indices = subtask_def.get("depends_on_indices", [])
+                existing_children[i].depends_on = [
+                    str(existing_children[j].id)
+                    for j in dep_indices
+                    if 0 <= j < len(existing_children)
+                ]
+                session.add(existing_children[i])
+
+        _log_file_overlaps(subtasks, "PLAN")
+        # Single atomic commit: base_branch, requires_approval, context, and depends_on
+        # are all written together so no worker can observe a partially-enriched child.
+        await session.commit()
+
+        for ct in existing_children:
+            await broadcast_to_project(str(task.project_id), "task_updated",
+                                       {"task_id": str(ct.id), "status": str(ct.status)})
+
+        print(f"[PLAN] Enriched {len(existing_children)} agent-spawned subtasks for plan {task.id}")
+        return
+
     # First pass: create all child tasks
     parent_payload = (task.payloads or [{}])[0]
     model = parent_payload.get('model')
@@ -3353,6 +3504,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     )).scalars().all()
     existing_titles = [t.title.lower() for t in existing_tasks]
 
+    # Query recent tasks (last 30 days) for hash-based deduplication across research cycles
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    recent_hashed_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == task.project_id,
+            Task.created_at >= thirty_days_ago,
+            Task.context["finding_hash"].astext != None,  # noqa: E711
+        )
+    )).scalars().all()
+    recent_finding_hashes = {
+        t.context["finding_hash"] for t in recent_hashed_tasks if t.context and t.context.get("finding_hash")
+    }
+
+    def _finding_hash(title: str, description: str) -> str:
+        return hashlib.sha256((title + description).encode()).hexdigest()[:16]
+
     def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
         words = set(finding_title.lower().split()) - {'the', 'a', 'an', 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
         for title in existing:
@@ -3375,6 +3542,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     skipped_duplicates = 0
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i+1}")
+        description = finding.get("description", finding.get("prompt", ""))
+        fhash = _finding_hash(title, description)
+        if fhash in recent_finding_hashes:
+            print(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched recent task")
+            skipped_duplicates += 1
+            continue
         if _is_duplicate(title, existing_titles):
             logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
@@ -3458,6 +3631,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "original_base": original_base,
                     "research_depth": research_depth + 1,
                     "related_files": related_files,
+                    "finding_hash": fhash,
                     **({"direction_id": direction_id} if direction_id else {}),
                 },
                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",

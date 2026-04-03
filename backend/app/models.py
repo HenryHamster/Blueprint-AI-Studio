@@ -128,6 +128,8 @@ class Task(SQLModel, table=True):
     
     __table_args__ = (
         Index("ix_task_status_priority", "status", "priority"),
+        Index("ix_task_status_priority_created", "status", "priority", "created_at"),
+        Index("ix_task_project_status_created", "project_id", "status", "created_at"),
     )
 
     project: Project = Relationship(back_populates="tasks")

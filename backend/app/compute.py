@@ -1,11 +1,12 @@
 import os
+import re
 import uuid
 import logging
 import asyncio
 import subprocess
 import signal
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,12 @@ _vm_zones: dict[str, str] = {}
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
-ZONE_COOLDOWN_SECONDS = 300  # 5 minutes
+ZONE_COOLDOWN_SECONDS = 300  # 5 minutes — base for exponential backoff
+
+
+def _zone_cooldown_seconds(consecutive_failures: int) -> int:
+    """Exponential backoff: 5min → 10min → 20min → ... capped at 2 hours."""
+    return min(ZONE_COOLDOWN_SECONDS * (2 ** consecutive_failures), 7200)
 
 # Zone health tracking: populated by provisioning attempts
 _zone_health: dict[str, dict] = {}
@@ -73,6 +79,19 @@ from app.auth import create_agent_token  # noqa: E402 — must be after env vars
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
+# --- Payload URI Validation ---
+_PAYLOAD_URI_RE = re.compile(r"^gs://[a-zA-Z0-9._-]+/[a-zA-Z0-9._/-]+$")
+
+
+def validate_payload_uri(payload_uri: str) -> None:
+    """Raise ValueError if payload_uri is not a safe GCS URI."""
+    if not _PAYLOAD_URI_RE.match(payload_uri):
+        raise ValueError(
+            f"Invalid payload_uri: must match gs://<bucket>/<object> with "
+            f"alphanumeric, dots, dashes, underscores, and slashes only. Got: {payload_uri!r}"
+        )
+
+
 # --- Local Mode: Track subprocesses ---
 _local_processes: dict[str, subprocess.Popen] = {}
 
@@ -85,6 +104,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
     oauth_token: Long-lived OAuth token (sk-ant-oat01-...) for Claude Code CLI.
     claude_config_json: Content of ~/.claude.json for onboarding bypass.
     """
+    if payload_uri:
+        validate_payload_uri(payload_uri)
     if LOCAL_MODE:
         return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token)
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
@@ -194,6 +215,65 @@ async def _cleanup_local(active_vm_ids: list[str]):
 
 # ─── GCP Mode Implementation ────────────────────────────────────────────────
 
+def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
+    """
+    Store agent credentials in GCP Secret Manager.
+    Returns the full resource name of the created secret version.
+    Grants the agent service account secretAccessor on this specific secret.
+    """
+    from google.cloud import secretmanager
+    from google.iam.v1 import policy_pb2
+
+    client = secretmanager.SecretManagerServiceClient()
+    secret_id = f"agent-creds-{vm_instance_id}"
+    parent = f"projects/{GCP_PROJECT_ID}"
+
+    # Create the secret
+    secret = client.create_secret(
+        request={
+            "parent": parent,
+            "secret_id": secret_id,
+            "secret": {
+                "replication": {"automatic": {}},
+                "labels": {"managed-by": "blueprint", "vm-instance": vm_instance_id},
+            },
+        }
+    )
+
+    # Add the secret version with the payload
+    version = client.add_secret_version(
+        request={
+            "parent": secret.name,
+            "payload": {"data": secret_payload.encode("utf-8")},
+        }
+    )
+
+    # Grant the agent service account secretAccessor on this specific secret only
+    policy = client.get_iam_policy(request={"resource": secret.name})
+    binding = policy_pb2.Binding(
+        role="roles/secretmanager.secretAccessor",
+        members=[f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"],
+    )
+    policy.bindings.append(binding)
+    client.set_iam_policy(request={"resource": secret.name, "policy": policy})
+
+    logger.info(f"Stored agent credentials in Secret Manager: {secret_id}")
+    return version.name
+
+
+def _delete_agent_secret(vm_instance_id: str) -> None:
+    """Delete the agent credentials secret from GCP Secret Manager (best-effort)."""
+    from google.cloud import secretmanager
+
+    client = secretmanager.SecretManagerServiceClient()
+    secret_name = f"projects/{GCP_PROJECT_ID}/secrets/agent-creds-{vm_instance_id}"
+    try:
+        client.delete_secret(request={"name": secret_name})
+        logger.info(f"Deleted agent credentials secret: agent-creds-{vm_instance_id}")
+    except Exception as e:
+        logger.warning(f"Failed to delete agent secret {secret_name}: {e}")
+
+
 async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None,
                          oauth_token: str = None, claude_config_json: str = None):
     from google.cloud import compute_v1
@@ -202,49 +282,77 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
     agent_jwt = create_agent_token(str(task_id), vm_instance_id)
 
-    # Base64-encode all secrets to prevent heredoc/shell injection
+    # Build the env file content that will be stored in Secret Manager.
+    # No credentials are embedded in the startup script metadata — all secrets
+    # (including the agent JWT) are retrieved at runtime from Secret Manager.
+    secret_env_lines = [
+        f"AGENT_SECRET_TOKEN={agent_jwt}",
+        f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}" if oauth_token else None,
+        f"ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}" if (not oauth_token and ANTHROPIC_API_KEY) else None,
+    ]
+    if claude_config_json:
+        # Store claude config as a separate secret
+        import base64 as _b64
+        # We'll embed it as base64 in the credentials secret so one Secret Manager
+        # access retrieves everything the VM needs.
+        config_b64 = _b64.b64encode(claude_config_json.encode()).decode()
+        secret_env_lines.append(f"CLAUDE_CONFIG_B64={config_b64}")
+
+    secret_env_content = "\n".join(line for line in secret_env_lines if line)
+
+    # payload_uri is validated upstream and safe to embed in the startup script
     import base64
-    config_b64 = base64.b64encode((claude_config_json or "").encode()).decode() if claude_config_json else ""
-    oauth_b64 = base64.b64encode(oauth_token.encode()).decode() if oauth_token else ""
-    apikey_b64 = base64.b64encode(ANTHROPIC_API_KEY.encode()).decode() if (not oauth_token and ANTHROPIC_API_KEY) else ""
+    payload_uri_b64 = base64.b64encode(payload_uri.encode()).decode() if payload_uri else ""
+
+    # Store credentials in Secret Manager and get the version resource name
+    secret_version_name = await asyncio.to_thread(
+        _store_agent_secret, vm_instance_id, secret_env_content
+    )
 
     startup_script = f"""#!/bin/bash
+    set -euo pipefail
     echo "Starting Agent VM Initialization..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
     (sleep 3600 && echo "Maximum TTL reached. Self-terminating..." && poweroff) &
 
-    # 2. Export environment variables needed by the agent
-    # Static values are safe in heredoc; secrets are base64-decoded separately
-    cat <<'EOF' > /etc/agent.env
+    # 2. Retrieve credentials from Secret Manager (never stored in instance metadata)
+    SECRET_VERSION="{secret_version_name}"
+    echo "Fetching agent credentials from Secret Manager..."
+    CREDS="$(gcloud secrets versions access "$SECRET_VERSION")"
+
+    # 3. Write static env vars first, then append secrets from Secret Manager
+    cat <<'STATICENV' > /etc/agent.env
 VM_INSTANCE_ID="{vm_instance_id}"
 ORCHESTRATOR_URL="{ORCHESTRATOR_URL}"
-AGENT_SECRET_TOKEN="{agent_jwt}"
-PAYLOAD_URI="{payload_uri or ''}"
-EOF
+STATICENV
 
-    # Decode secrets from base64 and append to env file (avoids shell injection via heredoc)
-    if [ -n "{oauth_b64}" ]; then
-        echo "CLAUDE_CODE_OAUTH_TOKEN=\\"$(echo '{oauth_b64}' | base64 -d)\\"" >> /etc/agent.env
-    fi
-    if [ -n "{apikey_b64}" ]; then
-        echo "ANTHROPIC_API_KEY=\\"$(echo '{apikey_b64}' | base64 -d)\\"" >> /etc/agent.env
+    # Append the credential lines retrieved from Secret Manager
+    echo "$CREDS" >> /etc/agent.env
+
+    # Add PAYLOAD_URI if present (validated safe GCS URI — no secrets)
+    if [ -n "{payload_uri_b64}" ]; then
+        echo "PAYLOAD_URI=\\"$(echo '{payload_uri_b64}' | base64 -d)\\"" >> /etc/agent.env
     fi
 
-    # 3. Claude Code onboarding bypass — write ~/.claude.json from base64-encoded blob
-    if [ -n "{config_b64}" ]; then
-        echo "{config_b64}" | base64 -d > /home/agent/.claude.json
+    # 4. Claude Code onboarding bypass — extract from env if present
+    CLAUDE_CONFIG_B64="$(grep '^CLAUDE_CONFIG_B64=' /etc/agent.env | cut -d= -f2- || true)"
+    if [ -n "$CLAUDE_CONFIG_B64" ]; then
+        echo "$CLAUDE_CONFIG_B64" | base64 -d > /home/agent/.claude.json
         chown agent:agent /home/agent/.claude.json
+        # Remove config b64 from env file (not needed at runtime)
+        sed -i '/^CLAUDE_CONFIG_B64=/d' /etc/agent.env
         echo "Claude Code config installed."
     fi
 
-    # 4. Download payload if provided
-    if [ -n "{payload_uri or ''}" ]; then
-        echo "Downloading payload from {payload_uri}..."
-        gsutil cp "{payload_uri}" /etc/agent_payload.json
+    # 5. Download payload if provided
+    if [ -n "{payload_uri_b64}" ]; then
+        PAYLOAD_URI_DECODED="$(echo '{payload_uri_b64}' | base64 -d)"
+        echo "Downloading payload from $PAYLOAD_URI_DECODED..."
+        gsutil cp "$PAYLOAD_URI_DECODED" /etc/agent_payload.json
     fi
 
-    # 5. Start the systemd service
+    # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
     systemctl daemon-reload
     systemctl restart blueprint-agent
@@ -254,7 +362,7 @@ EOF
       sleep 5
     done
 
-    # 6. Graceful self-termination
+    # 7. Graceful self-termination
     echo "Agent finished. Terminating VM..."
     poweroff
     """
@@ -293,7 +401,8 @@ EOF
     service_account.email = AGENT_SERVICE_ACCOUNT_EMAIL
     service_account.scopes = [
         "https://www.googleapis.com/auth/devstorage.read_only",
-        "https://www.googleapis.com/auth/logging.write"
+        "https://www.googleapis.com/auth/logging.write",
+        "https://www.googleapis.com/auth/cloud-platform",  # Required for Secret Manager access
     ]
     instance_config.service_accounts = [service_account]
 
@@ -304,9 +413,9 @@ EOF
         skipped_cooldown = []
 
         for zone, subnet_name in FALLBACK_ZONES:
-            # Skip zones in cooldown (recently failed)
-            last_fail = _zone_failures.get(zone)
-            if last_fail and (now - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS:
+            # Skip zones in cooldown (recently failed) — use per-zone exponential backoff expiry
+            zone_cooldown_expires = _zone_health.get(zone, {}).get("cooldown_expires_at")
+            if zone_cooldown_expires and now < zone_cooldown_expires:
                 skipped_cooldown.append(zone)
                 continue
 
@@ -339,6 +448,7 @@ EOF
                     health["last_success"] = datetime.now(timezone.utc)
                     prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
+                    health.pop("cooldown_expires_at", None)
                     was_in_cooldown = zone in _zone_failures
                     cooldown_since = _zone_failures.pop(zone, None)
 
@@ -374,13 +484,17 @@ EOF
                         reason = "RESOURCE_UNAVAILABLE"
 
                     with _zone_lock:
+                        now_fail = datetime.now(timezone.utc)
                         entering_cooldown = zone not in _zone_failures
-                        _zone_failures[zone] = datetime.now(timezone.utc)
+                        _zone_failures[zone] = now_fail
                         health = _zone_health.setdefault(zone, {})
-                        health["last_failure"] = datetime.now(timezone.utc)
-                        new_failure_count = health.get("consecutive_failures", 0) + 1
+                        health["last_failure"] = now_fail
+                        old_cf = health.get("consecutive_failures", 0)
+                        new_failure_count = old_cf + 1
                         health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
+                        cooldown_secs = _zone_cooldown_seconds(old_cf)
+                        health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
 
                     if entering_cooldown:
                         logger.warning(
@@ -410,6 +524,9 @@ EOF
     except Exception as e:
         logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
         _last_provision_error[vm_instance_id] = str(e)[:300]
+        # Clean up the credential secret that was stored before provisioning began.
+        # Without this, the secret would be orphaned if all zones are exhausted.
+        await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return False
 
 
@@ -444,6 +561,8 @@ async def _delete_gcp(vm_instance_id: str):
 
     try:
         await asyncio.to_thread(_delete_instance)
+        # Best-effort: clean up any leftover credentials secret (e.g. if VM was killed before it ran)
+        await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
     except Exception as e:
         logger.error(f"Failed to terminate VM {vm_instance_id}: {e}")
@@ -503,9 +622,9 @@ def get_zone_health() -> dict:
         for zone, _ in FALLBACK_ZONES:
             data = _zone_health.get(zone, {})
             cooldown_active = False
-            last_fail = _zone_failures.get(zone)
-            if last_fail:
-                cooldown_active = (datetime.now(timezone.utc) - last_fail).total_seconds() < ZONE_COOLDOWN_SECONDS
+            cooldown_expires = data.get("cooldown_expires_at")
+            if cooldown_expires:
+                cooldown_active = datetime.now(timezone.utc) < cooldown_expires
 
             consecutive = data.get("consecutive_failures", 0)
             if consecutive == 0:

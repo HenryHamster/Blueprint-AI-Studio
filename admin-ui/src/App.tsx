@@ -272,6 +272,11 @@ export default function App() {
 
   return (
     <div className="h-screen overflow-hidden flex flex-col bg-neutral-950 text-neutral-200 font-sans p-6">
+      {s.refreshing && (
+        <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
+          <div className="h-full w-2/5 bg-amber-500" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
+        </div>
+      )}
       <HeaderBar
         tasks={s.tasks}
         runningTasks={runningTasks}
@@ -574,7 +579,7 @@ export default function App() {
             <KanbanBoard
               tasks={filteredTasks}
               columns={visibleColumns}
-              loading={s.loading}
+              loading={s.initialLoading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
               selectionMode={s.selectionMode}
@@ -607,7 +612,6 @@ export default function App() {
             <main className="flex-1 overflow-hidden flex flex-col">
               <PipelineView
                 tasks={filteredTasks}
-                loading={s.loading}
                 hasActiveFilters={hasActiveFilters}
                 onViewLogs={s.handleViewLogs}
                 onNavigateToParent={(parentTaskId) => {
@@ -685,6 +689,7 @@ export default function App() {
           logLines={s.logLines}
           logsConnecting={s.logsConnecting}
           wsDisconnected={s.wsDisconnected}
+          wsDisconnectReason={s.wsDisconnectReason}
           actionLoading={s.actionLoadingMap[s.logTask.id]}
           gcpProjectId={s.deployState?.gcp_project_id}
           onClose={s.closeLogViewer}
