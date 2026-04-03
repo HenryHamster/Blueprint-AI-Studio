@@ -31,6 +31,7 @@ runtime_config: Dict = {
     },
     "autonomous_direction_cooldown_hours": 4,
     "autonomous_research_wave_size": 9999,
+    "min_research_interval_hours": 24,
 }
 
 # --- Autonomous Loop State ---

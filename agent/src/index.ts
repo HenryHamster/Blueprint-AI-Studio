@@ -1032,62 +1032,116 @@ async function handleFix(
 
 // ── Shared: Format project_context into a markdown section ────────────────
 function formatProjectContext(ctx: Record<string, unknown>): string {
-  const lines: string[] = [
+  const CONTEXT_BUDGET = 8000;
+
+  const header = [
     '## Project Context',
     'The following tasks are already active or completed in this project. Avoid duplicating their work.',
     '',
   ];
 
+  // Build active tasks section (always included in full)
+  const activeLines: string[] = [];
   const activeTasks = ctx.active_tasks as Array<Record<string, unknown>> | undefined;
   if (activeTasks && activeTasks.length > 0) {
-    lines.push('### Active Tasks');
+    activeLines.push('### Active Tasks');
     for (const t of activeTasks) {
-      lines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 400)}`);
+      activeLines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 400)}`);
     }
-    lines.push('');
+    activeLines.push('');
   }
 
-  const queuedTasks = ctx.queued_tasks as Array<Record<string, unknown>> | undefined;
-  if (queuedTasks && queuedTasks.length > 0) {
-    lines.push('### Queued Tasks');
-    for (const t of queuedTasks) {
-      lines.push(`- [${t.task_type}] **${t.title}** — ${String(t.prompt || '').slice(0, 400)}`);
-    }
-    lines.push('');
-  }
-
-  const recentTasks = ctx.recently_completed_tasks as Array<Record<string, unknown>> | undefined;
-  if (recentTasks && recentTasks.length > 0) {
-    lines.push('### Recently Completed Tasks');
-    for (const t of recentTasks) {
-      const pr = t.pr_url ? ` (${t.pr_url})` : '';
-      const summary = t.research_findings_summary ? ` — ${String(t.research_findings_summary).slice(0, 500)}` : '';
-      lines.push(`- [${t.task_type}] **${t.title}**${pr}${summary}`);
-    }
-    lines.push('');
-  }
-
+  // Build open PRs section (always included in full)
+  const prLines: string[] = [];
   const openPRs = ctx.open_prs as string[] | undefined;
   if (openPRs && openPRs.length > 0) {
-    lines.push('### Open PRs');
+    prLines.push('### Open PRs');
     for (const pr of openPRs) {
-      lines.push(`- ${pr}`);
+      prLines.push(`- ${pr}`);
     }
-    lines.push('');
+    prLines.push('');
   }
 
+  // Build sibling tasks section (always included in full)
+  const siblingLines: string[] = [];
   const siblingTasks = ctx.sibling_tasks as Array<Record<string, unknown>> | undefined;
   if (siblingTasks && siblingTasks.length > 0) {
-    lines.push('## Sibling Tasks (parallel tasks from the same parent — avoid duplicating their work)');
+    siblingLines.push('## Sibling Tasks (parallel tasks from the same parent — avoid duplicating their work)');
     for (const t of siblingTasks) {
       const files = (t.related_files as string[] | undefined);
       const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
-      lines.push(`- [${t.status}] ${t.title}${filesSuffix}`);
+      siblingLines.push(`- [${t.status}] ${t.title}${filesSuffix}`);
     }
-    lines.push('');
+    siblingLines.push('');
   }
 
-  return lines.join('\n');
+  const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines].join('\n');
+  let budget = CONTEXT_BUDGET - fixedContent.length;
+
+  // Build queued tasks section — fall back to one-liners if over budget
+  const queuedTasks = ctx.queued_tasks as Array<Record<string, unknown>> | undefined;
+  let queuedLines: string[] = [];
+  if (queuedTasks && queuedTasks.length > 0) {
+    const fullLines: string[] = ['### Queued Tasks'];
+    for (const t of queuedTasks) {
+      fullLines.push(`- [${t.task_type}] **${t.title}** — ${String(t.prompt || '').slice(0, 400)}`);
+    }
+    fullLines.push('');
+    const fullContent = fullLines.join('\n');
+
+    if (fullContent.length <= budget) {
+      queuedLines = fullLines;
+    } else {
+      // Reduce to one-liners
+      const shortLines: string[] = ['### Queued Tasks'];
+      for (const t of queuedTasks) {
+        shortLines.push(`- [${t.task_type}] **${t.title}**`);
+      }
+      shortLines.push('');
+      queuedLines = shortLines;
+    }
+    budget -= queuedLines.join('\n').length;
+  }
+
+  // Build recently completed section — drop oldest entries to fit budget
+  const recentTasks = ctx.recently_completed_tasks as Array<Record<string, unknown>> | undefined;
+  let recentLines: string[] = [];
+  let recentDropped = 0;
+  if (recentTasks && recentTasks.length > 0) {
+    const allEntries: string[] = [];
+    for (const t of recentTasks) {
+      const pr = t.pr_url ? ` (${t.pr_url})` : '';
+      const summary = t.research_findings_summary ? ` — ${String(t.research_findings_summary).slice(0, 500)}` : '';
+      allEntries.push(`- [${t.task_type}] **${t.title}**${pr}${summary}`);
+    }
+
+    // Keep most recent entries that fit within budget
+    const headerLine = '### Recently Completed Tasks';
+    let kept = allEntries.slice(); // most recent assumed to be last
+    while (kept.length > 0) {
+      const candidate = [headerLine, ...kept, ''].join('\n');
+      if (candidate.length <= budget) break;
+      kept.shift(); // drop oldest (first entry)
+      recentDropped++;
+    }
+    if (kept.length > 0) {
+      recentLines = [headerLine, ...kept, ''];
+      budget -= recentLines.join('\n').length;
+    } else {
+      recentDropped = allEntries.length;
+    }
+  }
+
+  // Append footer if anything was omitted
+  const footerLines: string[] = [];
+  const omittedCount = recentDropped;
+  if (omittedCount > 0) {
+    footerLines.push(`_(${omittedCount} more tasks not shown)_`);
+    footerLines.push('');
+  }
+
+  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...prLines, ...siblingLines, ...footerLines];
+  return allLines.join('\n');
 }
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -2073,6 +2127,32 @@ IMPORTANT: Always write /tmp/smoketest_result.json even if you cannot run any te
   }
 
   if (exitCode === 0 && smoketestResult) {
+    // Live endpoint checks
+    const healthCheckUrls: string[] = Array.isArray(payload.health_check_urls)
+      ? (payload.health_check_urls as string[])
+      : [];
+    if (healthCheckUrls.length > 0) {
+      sendLog(ws, '\nLive endpoint checks:\n');
+      for (const url of healthCheckUrls) {
+        let curlStatus: string;
+        let curlMessage: string;
+        try {
+          execFileSync('curl', ['-sf', '--max-time', '10', url], { encoding: 'utf-8' });
+          curlStatus = 'pass';
+          curlMessage = 'HTTP 2xx';
+          sendLog(ws, `  PASS  ${url}\n`);
+        } catch (err: unknown) {
+          curlStatus = 'fail';
+          const exitErr = err as { status?: number };
+          curlMessage = exitErr.status !== undefined ? `curl exited with code ${exitErr.status}` : 'curl failed';
+          sendLog(ws, `  FAIL  ${url} — ${curlMessage}\n`);
+        }
+        smoketestResult.tests.push({ name: `HTTP GET ${url}`, status: curlStatus, message: curlMessage });
+      }
+      // Recompute passed: true only if all tests pass or skip
+      smoketestResult.passed = smoketestResult.tests.every(t => t.status === 'pass' || t.status === 'skip');
+    }
+
     const passed = smoketestResult.passed;
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;

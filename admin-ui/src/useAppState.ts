@@ -119,9 +119,12 @@ export function useAppState() {
   const [maxRetries, setMaxRetries] = useState(3);
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
+  const [minResearchIntervalHours, setMinResearchIntervalHours] = useState(24);
   const [directionCooldownHours, setDirectionCooldownHours] = useState(4);
   const [autonomousResearchModel, setAutonomousResearchModel] = useState('');
   const [autonomousResearchEffort, setAutonomousResearchEffort] = useState('');
+  const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
+  const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -996,9 +999,12 @@ export function useAppState() {
         setMaxRetries(data.max_retries ?? 3);
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
+        setMinResearchIntervalHours(data.min_research_interval_hours ?? 24);
         setDirectionCooldownHours(data.autonomous_direction_cooldown_hours ?? 4);
         setAutonomousResearchModel(data.autonomous_research_model ?? '');
         setAutonomousResearchEffort(data.autonomous_research_effort ?? '');
+        setHealthCheckUrls(data.health_check_urls ?? []);
+        setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
@@ -1062,6 +1068,23 @@ export function useAppState() {
         addToast('Failed to start GitHub connection', 'error');
       }
     } catch (err) { console.error('Failed to start GitHub OAuth:', err); addToast('Failed to start GitHub connection', 'error'); }
+  };
+
+  const updateAgentPromptSuffixes = async (suffixes: Record<string, string>) => {
+    const prev = agentPromptSuffixes;
+    setAgentPromptSuffixes(suffixes);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ agent_prompt_suffixes: suffixes }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error('Failed to update agent prompt suffixes:', err);
+      setAgentPromptSuffixes(prev);
+      addToast('Failed to update prompt suffixes', 'error');
+    }
   };
 
   const syncTaskTypeDefaults = async () => {
@@ -1151,6 +1174,22 @@ export function useAppState() {
     }
   };
 
+  const handleUpdateMinResearchIntervalHours = async (value: number) => {
+    const v = Math.max(1, Math.min(8760, value));
+    const prev = minResearchIntervalHours;
+    setMinResearchIntervalHours(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ min_research_interval_hours: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setMinResearchIntervalHours(prev);
+      addToast('Failed to update min research interval', 'error');
+    }
+  };
+
   const handleUpdateDirectionCooldown = async (value: number) => {
     const v = Math.max(1, Math.min(168, value));
     const prev = directionCooldownHours;
@@ -1194,6 +1233,22 @@ export function useAppState() {
     } catch {
       setAutonomousResearchEffort(prev);
       addToast('Failed to update research effort', 'error');
+    }
+  };
+
+  const updateHealthCheckUrls = async (urls: string[]) => {
+    const prev = healthCheckUrls;
+    setHealthCheckUrls(urls);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ health_check_urls: urls }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      addToast('Health check URLs saved', 'success');
+    } catch {
+      setHealthCheckUrls(prev);
+      addToast('Failed to save health check URLs', 'error');
     }
   };
 
@@ -1598,9 +1653,11 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, directionCooldownHours, autonomousResearchModel, autonomousResearchEffort,
+    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownHours, autonomousResearchModel, autonomousResearchEffort,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
-    handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldown, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
+    agentPromptSuffixes, updateAgentPromptSuffixes,
+    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldown, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
+    healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,

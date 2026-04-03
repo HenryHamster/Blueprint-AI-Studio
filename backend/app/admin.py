@@ -900,10 +900,12 @@ async def get_settings(
         "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
         "task_type_models": _runtime_config.get("task_type_models", {}),
         "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
+        "health_check_urls": _runtime_config.get("health_check_urls", []),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_hours": _runtime_config.get("autonomous_direction_cooldown_hours", 4),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 10),
+        "min_research_interval_hours": _runtime_config.get("min_research_interval_hours", 24),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -1039,6 +1041,23 @@ async def update_settings(
         if not (1 <= val <= 100):
             raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 100")
         _runtime_config["autonomous_research_wave_size"] = val
+    if "min_research_interval_hours" in payload:
+        try:
+            val = int(payload["min_research_interval_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="min_research_interval_hours must be a number")
+        if not (1 <= val <= 8760):
+            raise HTTPException(status_code=400, detail="min_research_interval_hours must be between 1 and 8760")
+        _runtime_config["min_research_interval_hours"] = val
+    if "health_check_urls" in payload:
+        val = payload["health_check_urls"]
+        if not isinstance(val, list):
+            raise HTTPException(status_code=400, detail="health_check_urls must be a list")
+        if any(not isinstance(u, str) for u in val):
+            raise HTTPException(status_code=400, detail="health_check_urls entries must be strings")
+        if any(not u.startswith(("http://", "https://")) for u in val if u):
+            raise HTTPException(status_code=400, detail="health_check_urls entries must start with http:// or https://")
+        _runtime_config["health_check_urls"] = [u for u in val if u]
 
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency

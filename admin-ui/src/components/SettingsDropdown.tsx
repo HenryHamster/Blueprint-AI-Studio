@@ -36,6 +36,8 @@ interface SettingsDropdownProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
+  minResearchIntervalHours: number;
+  onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownHours: number;
   onUpdateDirectionCooldown: (value: number) => void;
   autonomousResearchModel: string;
@@ -43,6 +45,10 @@ interface SettingsDropdownProps {
   autonomousResearchEffort: string;
   onUpdateAutonomousResearchEffort: (value: string) => void;
   onSyncTaskTypeDefaults: () => void;
+  healthCheckUrls: string[];
+  onUpdateHealthCheckUrls: (urls: string[]) => void;
+  agentPromptSuffixes: Record<string, string>;
+  onUpdateAgentPromptSuffixes: (suffixes: Record<string, string>) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -97,6 +103,12 @@ const ALL_PAGE_SIZE = 10000;
 const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as const;
 type TaskType = typeof TASK_TYPES[number];
 
+const ALL_PROMPT_SUFFIX_TYPES = [
+  'create', 'review', 'fix', 'plan', 'research', 'security_audit', 'qa',
+  'docs', 'deps', 'migrate', 'smoketest', 'debug', 'perf', 'investigate',
+  'refactor', 'triage',
+] as const;
+
 export function SettingsDropdown({
   showSettings,
   onToggleSettings,
@@ -117,6 +129,8 @@ export function SettingsDropdown({
   onUpdateMaxAutonomousRate,
   autonomousResearchIntervalMinutes,
   onUpdateAutonomousResearchInterval,
+  minResearchIntervalHours,
+  onUpdateMinResearchIntervalHours,
   directionCooldownHours,
   onUpdateDirectionCooldown,
   autonomousResearchModel,
@@ -124,6 +138,10 @@ export function SettingsDropdown({
   autonomousResearchEffort,
   onUpdateAutonomousResearchEffort,
   onSyncTaskTypeDefaults,
+  healthCheckUrls,
+  onUpdateHealthCheckUrls,
+  agentPromptSuffixes,
+  onUpdateAgentPromptSuffixes,
   githubAccount,
   onConnectGitHub,
   maxPlanAccounts,
@@ -161,6 +179,9 @@ export function SettingsDropdown({
   const [vmInputVal, setVmInputVal] = useState(String(maxConcurrentVMs));
   const [retriesInputVal, setRetriesInputVal] = useState(String(maxRetries));
   const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
+  const [expandedSuffixType, setExpandedSuffixType] = useState<string | null>(null);
+  const [suffixDraft, setSuffixDraft] = useState('');
+  const [minResearchIntervalInputVal, setMinResearchIntervalInputVal] = useState(String(minResearchIntervalHours));
 
   // Global model/effort defaults
   const [defaultModel, setDefaultModel] = useState<string>(
@@ -169,6 +190,10 @@ export function SettingsDropdown({
   const [defaultEffort, setDefaultEffort] = useState<string>(
     () => JSON.parse(localStorage.getItem('blueprint-admin:defaultEffort') ?? 'null') ?? ''
   );
+
+  // Health check URLs (joined for textarea display)
+  const [healthCheckUrlsInput, setHealthCheckUrlsInput] = useState(() => healthCheckUrls.join('\n'));
+  useEffect(() => { setHealthCheckUrlsInput(healthCheckUrls.join('\n')); }, [healthCheckUrls]);
 
   // Per-task-type overrides
   const [taskTypeModels, setTaskTypeModels] = useState<Record<TaskType, string>>(() => {
@@ -328,6 +353,83 @@ export function SettingsDropdown({
             </div>
           </div>
 
+          <div className="border-t border-neutral-800 pt-3 mb-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Health Check URLs</h4>
+            <p className="text-[10px] text-neutral-500 mb-2">One URL per line. Probed with HTTP GET after each smoketest.</p>
+            <textarea
+              value={healthCheckUrlsInput}
+              onChange={e => setHealthCheckUrlsInput(e.target.value)}
+              placeholder="https://example.com/health"
+              rows={3}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-y"
+            />
+            <button
+              onClick={() => onUpdateHealthCheckUrls(healthCheckUrlsInput.split('\n').filter(Boolean))}
+              className="mt-1.5 w-full bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-2 py-1 text-xs transition-colors"
+            >
+              Save URLs
+            </button>
+          </div>
+
+          <div className="border-t border-neutral-800 pt-3 mb-3">
+            <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Prompt Suffixes</h4>
+            <p className="text-[10px] text-neutral-600 mb-2">Appended to the prompt for each task type. Keep under 500 chars.</p>
+            <div className="space-y-1">
+              {ALL_PROMPT_SUFFIX_TYPES.map(type => {
+                const isOpen = expandedSuffixType === type;
+                const savedValue = agentPromptSuffixes[type] ?? '';
+                const draft = isOpen ? suffixDraft : savedValue;
+                const charCount = draft.length;
+                return (
+                  <div key={type} className="border border-neutral-800 rounded overflow-hidden">
+                    <button
+                      className="w-full flex items-center justify-between px-2 py-1.5 bg-neutral-950 hover:bg-neutral-900 transition-colors text-left"
+                      onClick={() => {
+                        if (isOpen) {
+                          if (suffixDraft !== savedValue) {
+                            onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [type]: suffixDraft });
+                          }
+                          setExpandedSuffixType(null);
+                        } else {
+                          if (expandedSuffixType && suffixDraft !== (agentPromptSuffixes[expandedSuffixType] ?? '')) {
+                            onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [expandedSuffixType]: suffixDraft });
+                          }
+                          setExpandedSuffixType(type);
+                          setSuffixDraft(savedValue);
+                        }
+                      }}
+                    >
+                      <span className="text-[11px] text-neutral-300 capitalize">{type.replace('_', ' ')}</span>
+                      <span className="flex items-center gap-1.5">
+                        {savedValue && <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />}
+                        <span className="text-[10px] text-neutral-600">{isOpen ? '▲' : '▼'}</span>
+                      </span>
+                    </button>
+                    {isOpen && (
+                      <div className="px-2 pb-2 bg-neutral-950">
+                        <textarea
+                          value={suffixDraft}
+                          onChange={e => setSuffixDraft(e.target.value)}
+                          onBlur={() => {
+                            if (suffixDraft !== savedValue) {
+                              onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [type]: suffixDraft });
+                            }
+                          }}
+                          rows={3}
+                          className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none mt-1"
+                          placeholder={`Additional instructions for ${type} tasks…`}
+                        />
+                        <div className={`text-[10px] text-right mt-0.5 ${charCount > 500 ? 'text-red-400' : 'text-neutral-600'}`}>
+                          {charCount}/500
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="border-t border-neutral-800 pt-3 mb-4">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Settings</h4>
           </div>
@@ -397,6 +499,19 @@ export function SettingsDropdown({
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
             </div>
+          </div>
+          <div className="mb-4">
+            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Min Research Interval (hours)</label>
+            <input
+              type="number"
+              min={1}
+              max={8760}
+              value={minResearchIntervalInputVal}
+              onChange={e => setMinResearchIntervalInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(minResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 8760) onUpdateMinResearchIntervalHours(n); else setMinResearchIntervalInputVal(String(minResearchIntervalHours)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(minResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 8760) onUpdateMinResearchIntervalHours(n); else setMinResearchIntervalInputVal(String(minResearchIntervalHours)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
           </div>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Model</label>

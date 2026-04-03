@@ -49,6 +49,8 @@ export interface HeaderBarProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
+  minResearchIntervalHours: number;
+  onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownHours: number;
   onUpdateDirectionCooldown: (value: number) => void;
   autonomousResearchModel: string;
@@ -56,6 +58,10 @@ export interface HeaderBarProps {
   autonomousResearchEffort: string;
   onUpdateAutonomousResearchEffort: (value: string) => void;
   onSyncTaskTypeDefaults: () => void;
+  healthCheckUrls: string[];
+  onUpdateHealthCheckUrls: (urls: string[]) => void;
+  agentPromptSuffixes: Record<string, string>;
+  onUpdateAgentPromptSuffixes: (suffixes: Record<string, string>) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -131,6 +137,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateMaxAutonomousRate,
     autonomousResearchIntervalMinutes,
     onUpdateAutonomousResearchInterval,
+    minResearchIntervalHours,
+    onUpdateMinResearchIntervalHours,
     directionCooldownHours,
     onUpdateDirectionCooldown,
     autonomousResearchModel,
@@ -138,6 +146,8 @@ export function HeaderBar(props: HeaderBarProps) {
     autonomousResearchEffort,
     onUpdateAutonomousResearchEffort,
     onSyncTaskTypeDefaults,
+    agentPromptSuffixes,
+    onUpdateAgentPromptSuffixes,
     githubAccount,
     onConnectGitHub,
     maxPlanAccounts,
@@ -274,6 +284,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
+          minResearchIntervalHours={minResearchIntervalHours}
+          onUpdateMinResearchIntervalHours={onUpdateMinResearchIntervalHours}
           directionCooldownHours={directionCooldownHours}
           onUpdateDirectionCooldown={onUpdateDirectionCooldown}
           autonomousResearchModel={autonomousResearchModel}
@@ -281,6 +293,10 @@ export function HeaderBar(props: HeaderBarProps) {
           autonomousResearchEffort={autonomousResearchEffort}
           onUpdateAutonomousResearchEffort={onUpdateAutonomousResearchEffort}
           onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}
+          healthCheckUrls={props.healthCheckUrls}
+          onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
+          agentPromptSuffixes={agentPromptSuffixes}
+          onUpdateAgentPromptSuffixes={onUpdateAgentPromptSuffixes}
           githubAccount={githubAccount}
           onConnectGitHub={onConnectGitHub}
           maxPlanAccounts={maxPlanAccounts}

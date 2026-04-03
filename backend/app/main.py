@@ -587,17 +587,23 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
-    # Guard: must have active directions that aren't in cooldown
-    default_cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
-    active_directions = [
-        d for d in (project.directions or [])
-        if d.get("status") == "active"
-        and (
-            not d.get("last_researched_at")
-            or (datetime.utcnow() - datetime.fromisoformat(d["last_researched_at"])).total_seconds()
-               >= default_cooldown_hours * 3600
-        )
-    ]
+    # Guard: must have active directions that aren't within the min research interval
+    min_interval_hours = _runtime_config.get("min_research_interval_hours", 24)
+    now = datetime.utcnow()
+    active_directions = []
+    for d in (project.directions or []):
+        if d.get("status") != "active":
+            continue
+        last_researched = d.get("last_researched_at")
+        if last_researched:
+            hours_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 3600
+            if hours_ago < min_interval_hours:
+                print(
+                    f"[RESEARCH] Skipping direction {d.get('id')}: last researched "
+                    f"{hours_ago:.1f}h ago (min interval: {min_interval_hours}h)"
+                )
+                continue
+        active_directions.append(d)
     if not active_directions:
         return
     # Guard: no research task actively running (queued/provisioning/in_progress).
@@ -738,6 +744,8 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     task_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     task_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
+    # agent_prompt_suffixes: supported config key — dict of task_type → prompt suffix string,
+    # appended to the agent prompt for matching task types (validated in admin PATCH endpoint).
     task_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
     payload: dict = {
         "type": task_type,
@@ -3017,6 +3025,35 @@ def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN"):
                 logger.info(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
 
 
+def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None:
+    """Add depends_on_indices entries to enforce serial execution for subtasks sharing files.
+
+    For each file touched by more than one subtask, builds a chain in index order so that
+    subtask[i+1] depends on subtask[i].  Auto-generated deps are merged (union, no duplicates)
+    with any explicit depends_on_indices already present in the plan.
+    """
+    # Build file → [subtask indices] mapping
+    file_to_indices: Dict[str, List[int]] = {}
+    for idx, subtask in enumerate(subtasks):
+        for f in subtask.get("related_files", []):
+            file_to_indices.setdefault(f, []).append(idx)
+
+    # For each file group with >1 subtask, inject chain deps
+    for file_path, indices in file_to_indices.items():
+        if len(indices) < 2:
+            continue
+        # indices are already in insertion order (which matches plan order)
+        for pos in range(len(indices) - 1):
+            predecessor = indices[pos]
+            successor = indices[pos + 1]
+            existing = subtasks[successor].setdefault("depends_on_indices", [])
+            if predecessor not in existing:
+                existing.append(predecessor)
+                succ_title = subtasks[successor].get("title", f"#{successor}")
+                pred_title = subtasks[predecessor].get("title", f"#{predecessor}")
+                print(f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}")
+
+
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
     plan_data = _parse_plan_output(logs)
@@ -3210,6 +3247,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     await session.commit()
     for ct in child_tasks:
         await session.refresh(ct)
+
+    # Inject serial dependencies for subtasks that share files (additive only)
+    _inject_file_overlap_deps(subtasks, "PLAN")
 
     # Second pass: resolve depends_on_indices to actual UUIDs
     for i, subtask_def in enumerate(subtasks):
@@ -4770,10 +4810,13 @@ async def update_agent_status(
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
                                         # Spawn a smoketest after rollup merges to main
+                                        # Supported runtime_config keys for smoketest:
+                                        #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if is_rollup_merge and base_branch == "main":
                                             try:
                                                 type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
                                                 type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
+                                                health_check_urls = _runtime_config.get("health_check_urls") or []
                                                 smoketest_task = Task(
                                                     project_id=task.project_id,
                                                     title=f"Smoketest after rollup merge to {base_branch}",
@@ -4783,6 +4826,7 @@ async def update_agent_status(
                                                         "base_branch": base_branch,
                                                         **({"model": type_model} if type_model else {}),
                                                         **({"effort": type_effort} if type_effort else {}),
+                                                        **({"health_check_urls": health_check_urls} if health_check_urls else {}),
                                                     }],
                                                     vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
                                                     status=TaskStatus.QUEUED,
@@ -4804,6 +4848,70 @@ async def update_agent_status(
                                                 logger.info(f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after rollup merge to {base_branch}")
                                             except Exception as e:
                                                 logger.warning(f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}", exc_info=True)
+                                        # Spawn security rescan if merged task's parent was a security_audit
+                                        if orig.parent_task_id:
+                                            try:
+                                                audit_parent = await session.get(Task, orig.parent_task_id)
+                                                if (audit_parent and
+                                                        audit_parent.payloads and
+                                                        audit_parent.payloads[0].get("type") == "security_audit" and
+                                                        audit_parent.status == TaskStatus.COMPLETED):
+                                                    # Only rescan once per original audit
+                                                    existing_rescan = (await session.execute(
+                                                        select(Task).where(
+                                                            Task.parent_task_id == audit_parent.id,
+                                                            Task.title.ilike("%rescan%")
+                                                        )
+                                                    )).scalars().first()
+                                                    if not existing_rescan:
+                                                        try:
+                                                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                                                            changed_files = ", ".join(f["filename"] for f in pr_files)
+                                                        except Exception:
+                                                            changed_files = "(could not fetch file list)"
+                                                        audit_title = audit_parent.title
+                                                        type_model = _runtime_config.get("task_type_models", {}).get("security_audit") or None
+                                                        type_effort = _runtime_config.get("task_type_efforts", {}).get("security_audit") or None
+                                                        rescan_task = Task(
+                                                            project_id=orig.project_id,
+                                                            title=f"Security rescan: verify {audit_title} fixes",
+                                                            description=f"Verify that security fixes merged in PR #{pr_number} addressed reported vulnerabilities.",
+                                                            payloads=[{
+                                                                "type": "security_audit",
+                                                                "prompt": (
+                                                                    f"Verify that the security fixes merged in PR #{pr_number} actually addressed "
+                                                                    f"the reported vulnerabilities. Focus audit on these files: {changed_files}. "
+                                                                    f"Output only PASS or remaining FAIL findings."
+                                                                ),
+                                                                **({"model": type_model} if type_model else {}),
+                                                                **({"effort": type_effort} if type_effort else {}),
+                                                            }],
+                                                            parent_task_id=audit_parent.id,
+                                                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                                                            status=TaskStatus.QUEUED,
+                                                            requires_approval=False,
+                                                            created_by="ORCHESTRATOR",
+                                                        )
+                                                        session.add(rescan_task)
+                                                        await session.commit()
+                                                        await session.refresh(rescan_task)
+                                                        history = TaskHistory(
+                                                            task_id=rescan_task.id, action="SPAWNED",
+                                                            details={
+                                                                "spawned_by": "POST_SECURITY_FIX_MERGE",
+                                                                "pr_number": pr_number,
+                                                                "audit_parent_id": str(audit_parent.id),
+                                                            }
+                                                        )
+                                                        session.add(history)
+                                                        await session.commit()
+                                                        await broadcast_to_project(
+                                                            str(orig.project_id), "task_updated",
+                                                            {"task_id": str(rescan_task.id), "status": TaskStatus.QUEUED}
+                                                        )
+                                                        print(f"[SECURITY RESCAN] Spawned rescan task {rescan_task.id} after security fix merge PR #{pr_number}")
+                                            except Exception as e:
+                                                print(f"[SECURITY RESCAN] Failed to spawn security rescan: {e}")
                                 except Exception as e:
                                     logger.warning(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}", exc_info=True)
                             logger.info(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")

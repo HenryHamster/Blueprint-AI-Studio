@@ -319,6 +319,8 @@ export default function App() {
         onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
         autonomousResearchIntervalMinutes={s.autonomousResearchIntervalMinutes}
         onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
+        minResearchIntervalHours={s.minResearchIntervalHours}
+        onUpdateMinResearchIntervalHours={s.handleUpdateMinResearchIntervalHours}
         directionCooldownHours={s.directionCooldownHours}
         onUpdateDirectionCooldown={s.handleUpdateDirectionCooldown}
         autonomousResearchModel={s.autonomousResearchModel}
@@ -326,6 +328,10 @@ export default function App() {
         autonomousResearchEffort={s.autonomousResearchEffort}
         onUpdateAutonomousResearchEffort={s.handleUpdateAutonomousResearchEffort}
         onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}
+        healthCheckUrls={s.healthCheckUrls}
+        onUpdateHealthCheckUrls={s.updateHealthCheckUrls}
+        agentPromptSuffixes={s.agentPromptSuffixes}
+        onUpdateAgentPromptSuffixes={s.updateAgentPromptSuffixes}
         githubAccount={s.githubAccount}
         onConnectGitHub={s.connectGitHub}
         maxPlanAccounts={s.maxPlanAccounts}
