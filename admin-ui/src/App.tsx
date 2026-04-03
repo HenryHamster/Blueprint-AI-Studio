@@ -17,7 +17,6 @@ import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
 import { KanbanBoard } from './components/KanbanBoard';
-import { StatusBar } from './components/StatusBar';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
@@ -352,13 +351,6 @@ export default function App() {
         zoneHealth={s.zoneHealth}
       />
 
-      <StatusBar
-        apiHealthy={s.apiHealthy}
-        wsConnected={s.wsConnected}
-        lastFetchTime={s.lastFetchTime}
-        tasks={s.tasks}
-      />
-
       <div
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
         style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
@@ -388,7 +380,13 @@ export default function App() {
         }}
       />
 
-      <OrchestratorHealthBar health={s.orchestratorHealth} />
+      <OrchestratorHealthBar
+        health={s.orchestratorHealth}
+        apiHealthy={s.apiHealthy}
+        wsConnected={s.wsConnected}
+        lastFetchTime={s.lastFetchTime}
+        tasks={s.tasks}
+      />
 
       {s.error && (
         <div className="mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">

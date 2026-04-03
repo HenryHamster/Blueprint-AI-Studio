@@ -283,7 +283,10 @@ EOF
     metadata_item = compute_v1.Items()
     metadata_item.key = "startup-script"
     metadata_item.value = startup_script
-    metadata.items = [metadata_item]
+    serial_logging_item = compute_v1.Items()
+    serial_logging_item.key = "serial-port-logging-enable"
+    serial_logging_item.value = "TRUE"
+    metadata.items = [metadata_item, serial_logging_item]
     instance_config.metadata = metadata
 
     service_account = compute_v1.ServiceAccount()
