@@ -299,12 +299,15 @@ async def _init_deployment_state():
         state.current_revision = _current_revision
         state.current_sha = _current_sha
         state.deployed_at = datetime.utcnow()
-        state.status = DeploymentStatus.MONITORING
+        # Don't overwrite PAUSED/HALTED — those are explicit states that must
+        # be cleared by the auto-resume logic or manual action, not by deploys.
+        if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+            state.status = DeploymentStatus.MONITORING
         state.rolled_back_from_sha = None
         state.rollback_reason = None
         session.add(state)
         await session.commit()
-        logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, starting monitoring window")
+        logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window")
 
 
 def should_rollback() -> tuple:
@@ -450,9 +453,8 @@ async def _check_external_health():
     # GitHub API check — passive first, active fallback.
     # Primary: check if recent agent operations succeeded (avoids connection pool
     # contention that caused false auto-pause under load).
-    # Fallback: if no operations in 5 minutes (e.g., pipeline idle, no agents),
-    # make a dedicated active check to verify GitHub is actually reachable.
-    github_stale_threshold = 300  # 5 minutes
+    # Fallback: if no recent operations, make a dedicated active check.
+    github_stale_threshold = 120  # 2 minutes
     github_age = (now - _shared_state.last_github_success).total_seconds() if _shared_state.last_github_success else None
 
     if github_age is not None and github_age < github_stale_threshold:
