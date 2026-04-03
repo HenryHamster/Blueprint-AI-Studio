@@ -4304,6 +4304,7 @@ async def update_agent_status(
         failed_task_payload = (task.payloads or [{}])[0]
         failed_task_type = failed_task_payload.get("type", "")
         should_auto_debug = (
+            payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
             failed_task_type != "debug" and  # Don't recursively debug debug tasks
             (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
             payload.logs and
