@@ -87,6 +87,7 @@ external_health: Dict = {
     "db": True,
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
+    "errors": {},                   # dep_name -> last error message
 }
 
 # Track last successful GitHub API operation (tokens, PR comments, etc.)

@@ -588,12 +588,13 @@ async def create_pull_request(
     if response.status_code == 201:
         return response.json()
 
-    # 422 often means a PR already exists for this head->base
+    # 422 often means a PR already exists or there's nothing to merge
     if response.status_code == 422:
         data = response.json()
         errors = data.get("errors", [])
         for err in errors:
-            if "pull request already exists" in str(err.get("message", "")).lower():
+            msg = str(err.get("message", "")).lower()
+            if "pull request already exists" in msg:
                 # Return the existing PR instead of failing
                 logger.info(f"PR already exists for {head} -> {base}, fetching existing PR")
                 list_resp = await _github_request(
@@ -603,6 +604,11 @@ async def create_pull_request(
                 )
                 if list_resp.status_code == 200 and list_resp.json():
                     return list_resp.json()[0]
+            if "no commits between" in msg:
+                # Empty diff — branches are identical. Return a synthetic "merged" result
+                # so the caller can mark the task as completed instead of failed.
+                logger.info(f"[PR] No commits between {head} and {base} — empty diff")
+                return {"empty_diff": True, "merged": True, "html_url": "", "number": 0}
 
     logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
     raise HTTPException(

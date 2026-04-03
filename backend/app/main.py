@@ -445,9 +445,11 @@ async def _check_external_health():
         async with AsyncSessionLocal() as session:
             await session.execute(select(Task).limit(1))
         ext["db"] = True
+        ext["errors"].pop("db", None)
     except Exception as e:
         logger.warning(f"[HEALTH] DB health check failed: {e}", exc_info=True)
         ext["db"] = False
+        ext["errors"]["db"] = f"{type(e).__name__}: {str(e)[:200]}"
         failed.append("db")
 
     # GitHub API check — passive first, active fallback.
@@ -460,9 +462,11 @@ async def _check_external_health():
     if github_age is not None and github_age < github_stale_threshold:
         # Recent success — GitHub is healthy, no active check needed
         ext["github_api"] = True
+        ext["errors"].pop("github_api", None)
     else:
         # No recent success — either idle or actually down. Make a dedicated active check
         # using a separate short-lived client to avoid connection pool contention.
+        check_method = "passive" if github_age is not None else "active (cold start)"
         try:
             from app.github import generate_github_app_jwt
             jwt_token = generate_github_app_jwt()
@@ -471,13 +475,16 @@ async def _check_external_health():
                                                headers={"Authorization": f"Bearer {jwt_token}"})
             ext["github_api"] = resp.status_code == 200
             if ext["github_api"]:
-                _shared_state.last_github_success = now  # Update tracker on active check success
+                _shared_state.last_github_success = now
+                ext["errors"].pop("github_api", None)
             else:
                 logger.warning(f"[HEALTH] GitHub API returned {resp.status_code}")
+                ext["errors"]["github_api"] = f"HTTP {resp.status_code} (check: {check_method})"
                 failed.append("github_api")
         except Exception as e:
             logger.warning(f"[HEALTH] GitHub API health check failed: {type(e).__name__}: {e!r}")
             ext["github_api"] = False
+            ext["errors"]["github_api"] = f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
             failed.append("github_api")
 
     # Claude API — check credentials + rate limit failures
@@ -4194,6 +4201,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                 pr_result = await create_pull_request(gh_token, owner, repo,
                     title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+
+                # Empty diff — branches are identical, nothing to merge
+                if pr_result.get("empty_diff"):
+                    logger.info(f"[ROLLUP] Empty diff for {staging_branch} → {target_branch} — marking COMPLETED")
+                    parent.status = TaskStatus.COMPLETED
+                    parent.latest_status_message = f"✓ All {completed_count} subtasks completed — no new changes to merge (fixes already on {target_branch})"
+                    try:
+                        await delete_branch(gh_token, owner, repo, staging_branch)
+                    except Exception:
+                        pass
+                    session.add(parent)
+                    await session.commit()
+                    await _cleanup_branches(parent, session)
+                    await broadcast_to_project(str(parent.project_id), "task_updated",
+                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                    return
+
                 rollup_pr_url = pr_result.get("html_url", "")
                 rollup_pr_number = pr_result.get("number")
                 logger.info(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")

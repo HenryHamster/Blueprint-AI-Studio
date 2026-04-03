@@ -1798,6 +1798,8 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
         "health_recovery_streak": getattr(_main_module, "_health_recovery_streak", 0),
         "health_recovery_streak_required": 3,
+        "health_failure_streak": getattr(_main_module, "_pause_failure_streak", 0),
+        "health_failure_streak_threshold": 3,
     }
 
 

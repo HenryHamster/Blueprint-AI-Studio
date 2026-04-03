@@ -154,6 +154,8 @@ def cmd_tree(args):
         children = [t for t in all_t if (t.get("parent_task_id") or "").startswith(parent_id)]
         icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R", "COMPLETED": "D",
                  "FAILED": "F", "CANCELLED": "X", "EVALUATING": "E"}
+        # Build lookup for dep resolution
+        id_map = {t["id"]: t for t in all_t}
         print(f"Children: {len(children)}")
         for c in children:
             s = icons.get(c["status"], "?")
@@ -161,7 +163,18 @@ def cmd_tree(args):
             pr = (c.get("payloads") or [{}])[0].get("pr_number", "-")
             merged = (c.get("context") or {}).get("pr_merged", False)
             title = _safe(c["title"])
-            print(f"  [{s}] {c['id'][:8]}  [{ptype:8}]  {title:<55}  pr={pr}  merged={merged}")
+            deps = c.get("depends_on") or []
+            dep_str = ""
+            if deps:
+                parts = []
+                for d in deps:
+                    dt = id_map.get(d)
+                    if dt:
+                        parts.append(f"{d[:8]}={dt['status'][:4]}")
+                    else:
+                        parts.append(f"{d[:8]}=???")
+                dep_str = f"  deps=[{', '.join(parts)}]"
+            print(f"  [{s}] {c['id'][:8]}  [{ptype:8}]  {title:<55}  pr={pr}  merged={merged}{dep_str}")
     else:
         print(f"Parent task '{parent_id}' not found.")
 

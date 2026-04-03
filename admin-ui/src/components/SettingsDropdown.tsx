@@ -883,6 +883,46 @@ export function SettingsDropdown({
                 {deployState.pause_reason && (
                   <p className="text-[10px] text-amber-400/80 bg-amber-950/20 rounded px-2 py-1 mt-1">{deployState.pause_reason}</p>
                 )}
+                {/* External dependency health */}
+                {deployState.external_health && (
+                  <div className="mt-2 space-y-1">
+                    <div className="text-[10px] text-neutral-500 uppercase tracking-wider">Dependencies</div>
+                    {(['github_api', 'db', 'claude_api', 'gcp'] as const).map((dep) => {
+                      const healthy = deployState.external_health?.[dep];
+                      const error = (deployState.external_health?.errors as Record<string, string> | undefined)?.[dep];
+                      if (healthy === undefined) return null;
+                      return (
+                        <div key={dep} className="space-y-0.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[11px] text-neutral-400">{dep.replace('_', ' ')}</span>
+                            <span className={`text-[10px] font-semibold ${healthy ? 'text-emerald-400' : 'text-red-400'}`}>
+                              {healthy ? 'OK' : 'DOWN'}
+                            </span>
+                          </div>
+                          {error && (
+                            <p className="text-[10px] text-red-400/70 bg-red-950/20 rounded px-2 py-0.5 break-all">{String(error)}</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {typeof deployState.external_health?.last_check === 'string' && (
+                      <div className="flex items-center justify-between mt-1">
+                        <span className="text-[10px] text-neutral-600">Last check</span>
+                        <span className="text-[10px] text-neutral-500 font-mono">
+                          {new Date(deployState.external_health.last_check).toLocaleTimeString()}
+                        </span>
+                      </div>
+                    )}
+                    {(deployState.health_failure_streak ?? 0) > 0 && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-600">Failure streak</span>
+                        <span className="text-[10px] text-amber-400 font-mono">
+                          {deployState.health_failure_streak}/{deployState.health_failure_streak_threshold ?? 3} before pause
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {deployState.status === 'PAUSED' && deployState.pre_pause_max_vms != null && (
                   <p className="text-[10px] text-neutral-400 bg-neutral-800/40 rounded px-2 py-1 mt-1">
                     Will restore to {deployState.pre_pause_max_vms} VM{deployState.pre_pause_max_vms !== 1 ? 's' : ''}

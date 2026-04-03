@@ -27,6 +27,9 @@ export interface DeployState {
   gcp_project_id: string;
   health_recovery_streak: number;
   health_recovery_streak_required: number;
+  health_failure_streak: number;
+  health_failure_streak_threshold: number;
+  external_health?: Record<string, unknown>;
 }
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
