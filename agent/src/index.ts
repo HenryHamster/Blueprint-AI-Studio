@@ -276,19 +276,24 @@ async function pushAndCreatePR(
   skipRebase = false
 ): Promise<string> {
   if (!skipRebase) {
-    // Rebase onto latest base branch before push to avoid merge conflicts in the PR
+    // Rebase onto latest base branch before push to avoid merge conflicts in the PR.
+    // If rebase fails, fall back to merge. If merge fails, push as-is — the review
+    // pipeline will detect conflicts and spawn a fix task.
     statusRef.value = `Rebasing onto ${baseBranch}...`;
     try {
       git(['fetch', 'origin', baseBranch]);
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
-      let conflictList = '';
-      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
-      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
-      sendLog(ws, `${conflictMsg}\n`);
-      throw new Error(conflictMsg);
+      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — trying merge instead\n`);
+      try {
+        git(['merge', `origin/${baseBranch}`, '--no-edit']);
+        sendLog(ws, `Merged ${baseBranch} successfully\n`);
+      } catch {
+        try { git(['merge', '--abort']); } catch {}
+        sendLog(ws, `Merge also conflicted — pushing as-is, review pipeline will handle\n`);
+      }
     }
 
     // Verify no conflict markers before pushing
@@ -653,19 +658,23 @@ async function handleCreate(
     git(['add', '-A']);
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
 
-    // Rebase onto latest base branch before push to avoid merge conflicts in the PR
+    // Rebase onto latest base branch before push to avoid merge conflicts in the PR.
+    // If rebase fails, fall back to merge. If merge fails, push as-is.
     statusRef.value = `Rebasing onto ${baseBranch}...`;
     try {
       git(['fetch', 'origin', baseBranch]);
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
-      let conflictList = '';
-      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
-      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
-      sendLog(ws, `${conflictMsg}\n`);
-      throw new Error(conflictMsg);
+      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — trying merge instead\n`);
+      try {
+        git(['merge', `origin/${baseBranch}`, '--no-edit']);
+        sendLog(ws, `Merged ${baseBranch} successfully\n`);
+      } catch {
+        try { git(['merge', '--abort']); } catch {}
+        sendLog(ws, `Merge also conflicted — pushing as-is, review pipeline will handle\n`);
+      }
     }
 
     // Verify no conflict markers before pushing
@@ -940,7 +949,9 @@ async function handleFix(
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
   }
 
-  // Final rebase onto base branch to ensure no conflicts remain before push
+  // Final rebase onto base branch to ensure no conflicts remain before push.
+  // If rebase fails, fall back to merge — don't throw, let the push succeed
+  // and the review pipeline handle any remaining issues.
   if (exitCode === 0) {
     try {
       git(['fetch', 'origin', baseBranch]);
@@ -950,15 +961,16 @@ async function handleFix(
       let conflictList = '';
       try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
       try { git(['rebase', '--abort']); } catch {}
-      const conflictMsg = `Rebase conflict on base branch ${baseBranch}. Manual resolution required.${conflictList ? ' Conflicting files:\n' + conflictList : ''}`;
-      sendLog(ws, `${conflictMsg}\n`);
+      sendLog(ws, `Final rebase had conflicts — trying merge instead\n`);
       try {
-        await apiPost('/api/agent/github/pr-comment', {
-          task_id: taskId, owner, repo, pr_number: prNumber,
-          body: `**Blueprint Agent**: Rebase conflict detected after applying review fixes.\n\nThe branch could not be automatically rebased onto \`${baseBranch}\`. Manual resolution is required.\n\n${conflictList ? `**Conflicting files:**\n\`\`\`\n${conflictList}\n\`\`\`` : ''}`,
-        });
-      } catch (commentErr) { sendLog(ws, `Failed to post PR comment: ${commentErr}\n`); }
-      throw new Error(conflictMsg);
+        git(['merge', `origin/${baseBranch}`, '--no-edit']);
+        sendLog(ws, `Merge onto ${baseBranch} successful\n`);
+      } catch {
+        // Merge also conflicted — abort and push as-is.
+        // The PR will show conflicts and the review pipeline will handle it.
+        try { git(['merge', '--abort']); } catch {}
+        sendLog(ws, `Merge also conflicted (${conflictList || 'unknown files'}) — pushing as-is, review pipeline will handle\n`);
+      }
     }
   }
 
