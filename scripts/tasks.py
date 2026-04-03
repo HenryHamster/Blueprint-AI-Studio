@@ -4,6 +4,9 @@ Usage:
     python scripts/tasks.py list [--status STATUS] [--limit N] [-v]
     python scripts/tasks.py show <id_or_title>
     python scripts/tasks.py tree <parent_id>
+    python scripts/tasks.py diagnose                       — health check all active tasks (attempts, errors, memory)
+    python scripts/tasks.py complete <task_id> [--message MSG]  — mark task as COMPLETED
+    python scripts/tasks.py set-status <task_id> <status> [--message MSG]  — set arbitrary status
     python scripts/tasks.py requeue <task_id> [<task_id> ...]
     python scripts/tasks.py cancel <task_id> [<task_id> ...]
     python scripts/tasks.py cancel-all [--status STATUS]
@@ -306,11 +309,139 @@ def cmd_trigger_rollup(args):
         print(f"  Patched {len(unmerged)} children. Rollup should trigger.")
 
 
+def cmd_diagnose(args):
+    """Health check all active tasks — shows attempts, errors, memory usage."""
+    statuses = ["QUEUED", "PROVISIONING", "IN_PROGRESS"]
+    all_active = []
+    for st in statuses:
+        all_active.extend(list_tasks(status=st, limit=100))
+
+    if not all_active:
+        print("No active tasks.")
+        return
+
+    # Sort by attempt_count descending (most troubled first)
+    all_active.sort(key=lambda t: t.get("attempt_count", 0), reverse=True)
+
+    max_retries = 3
+    icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R"}
+    warn_count = 0
+
+    print(f"\n=== ACTIVE TASKS ({len(all_active)}) ===")
+    for t in all_active:
+        tid = t["id"][:8]
+        status = t["status"]
+        icon = icons.get(status, "?")
+        attempts = t.get("attempt_count", 0)
+        ttype = (t.get("payloads") or [{}])[0].get("type", t.get("task_type", "?"))
+        title = _safe(t.get("title", ""), 50)
+        msg = t.get("latest_status_message") or ""
+        error = (t.get("error_logs") or "")[:200]
+
+        # Extract memory from heartbeat message [XXmb]
+        mem = ""
+        if msg.startswith("["):
+            bracket_end = msg.find("]")
+            if bracket_end > 0:
+                mem = msg[1:bracket_end]
+
+        # Warning indicators
+        warn = ""
+        if attempts >= max_retries:
+            warn = " *** FINAL ATTEMPT"
+            warn_count += 1
+        elif attempts >= 2:
+            warn = " ** high retries"
+            warn_count += 1
+
+        print(f"  [{icon}] {tid}  [{ttype:8}]  attempt {attempts}/{max_retries}  {f'[{mem}]':>10}  {title}{warn}")
+        if error:
+            # Show first line of error
+            first_line = error.split("\n")[0][:120]
+            print(f"      ERROR: {first_line}")
+
+    # Show EVALUATING parents summary
+    parents = list_tasks(status="EVALUATING", limit=50)
+    if parents:
+        print(f"\n=== EVALUATING PARENTS ({len(parents)}) ===")
+        for p in parents:
+            pid = p["id"][:8]
+            title = _safe(p.get("title", ""), 55)
+            msg = _safe(p.get("latest_status_message") or "none", 80)
+            print(f"  {pid}  {title}")
+            print(f"           {msg}")
+
+    if warn_count:
+        print(f"\n  WARNING: {warn_count} task(s) at high retry count")
+
+
+def cmd_complete(args):
+    """Mark a task as COMPLETED with optional message."""
+    if not args:
+        print("Usage: tasks.py complete <task_id> [--message MSG]")
+        return
+    tid = args[0]
+    message = None
+    for i, a in enumerate(args):
+        if a in ("--message", "-m") and i + 1 < len(args):
+            message = args[i + 1]
+
+    t = _resolve_task(tid)
+    if not t:
+        print(f"Task '{tid}' not found.")
+        return
+
+    payload = {"status": "COMPLETED"}
+    if message:
+        payload["latest_status_message"] = message
+    try:
+        resp = patch_task(t["id"], payload)
+        print(f"  {t['id'][:8]}: {resp.get('status', 'ok')} — marked COMPLETED")
+    except Exception as e:
+        print(f"  {t['id'][:8]}: FAILED -- {e}")
+
+
+def cmd_set_status(args):
+    """Set arbitrary status on a task with optional message."""
+    if len(args) < 2:
+        print("Usage: tasks.py set-status <task_id> <STATUS> [--message MSG]")
+        print("  STATUS: QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, COMPLETED, FAILED, CANCELLED")
+        return
+    tid = args[0]
+    new_status = args[1].upper()
+    valid = {"QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING", "COMPLETED", "FAILED", "CANCELLED"}
+    if new_status not in valid:
+        print(f"Invalid status '{new_status}'. Must be one of: {', '.join(sorted(valid))}")
+        return
+
+    message = None
+    for i, a in enumerate(args):
+        if a in ("--message", "-m") and i + 1 < len(args):
+            message = args[i + 1]
+
+    t = _resolve_task(tid)
+    if not t:
+        print(f"Task '{tid}' not found.")
+        return
+
+    payload = {"status": new_status}
+    if message:
+        payload["latest_status_message"] = message
+    try:
+        resp = patch_task(t["id"], payload)
+        print(f"  {t['id'][:8]}: {t['status']} -> {resp.get('status', new_status)}")
+    except Exception as e:
+        print(f"  {t['id'][:8]}: FAILED -- {e}")
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
     "tree": cmd_tree,
     "children": cmd_children,
+    "diagnose": cmd_diagnose,
+    "complete": cmd_complete,
+    "set-status": cmd_set_status,
     "requeue": cmd_requeue,
     "cancel": cmd_cancel,
     "cancel-all": cmd_cancel_all,
