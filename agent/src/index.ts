@@ -156,12 +156,19 @@ async function setupWorkspace(
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario)
+  let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    // Branch exists on remote — delete it so fresh push works
-    git(['push', 'origin', '--delete', workBranch]);
-    sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    staleBranchExists = true;
   } catch { /* branch doesn't exist on remote — normal case */ }
+  if (staleBranchExists) {
+    try {
+      git(['push', 'origin', '--delete', workBranch]);
+      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    } catch (e) {
+      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
+    }
+  }
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
   return { workBranch, shortId };
@@ -1494,11 +1501,19 @@ async function handleQA(
 
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/task-${shortId}`;
+  let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    git(['push', 'origin', '--delete', workBranch]);
-    sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    staleBranchExists = true;
   } catch { /* branch doesn't exist on remote — normal case */ }
+  if (staleBranchExists) {
+    try {
+      git(['push', 'origin', '--delete', workBranch]);
+      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    } catch (e) {
+      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
+    }
+  }
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
 
@@ -1692,11 +1707,19 @@ async function handleMigrate(
 
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/migrate-${shortId}`;
+  let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    git(['push', 'origin', '--delete', workBranch]);
-    sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    staleBranchExists = true;
   } catch { /* branch doesn't exist on remote — normal case */ }
+  if (staleBranchExists) {
+    try {
+      git(['push', 'origin', '--delete', workBranch]);
+      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+    } catch (e) {
+      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
+    }
+  }
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
 

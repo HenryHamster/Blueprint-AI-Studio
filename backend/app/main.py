@@ -877,31 +877,48 @@ async def reaper_service():
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # FOR UPDATE SKIP LOCKED prevents split-brain double-reaping
+                # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
                 stmt = select(Task).where(
                     Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
-                ).with_for_update(skip_locked=True)
+                )
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
-                orphaned_tasks = []
                 now = datetime.utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
-                
+
+                orphaned_ids = []
                 for task in active_tasks:
-                    # Skip logical/parent tasks that have no VM assigned
                     if not task.vm_instance_id:
                         continue
                     if task.last_heartbeat:
                         if task.last_heartbeat < five_minutes_ago:
-                            orphaned_tasks.append(task)
+                            orphaned_ids.append(task.id)
                     elif task.started_at and task.started_at < ten_minutes_ago:
-                        # Allow 10 minutes for initial provisioning before requiring a heartbeat
-                        orphaned_tasks.append(task)
+                        orphaned_ids.append(task.id)
                     elif not task.started_at and task.created_at < ten_minutes_ago:
-                        # Fallback if started_at is missing for some reason
-                        orphaned_tasks.append(task)
-                
+                        orphaned_ids.append(task.id)
+
+                # Step 2: Lock ONLY orphaned rows (heartbeats on healthy tasks are never blocked)
+                orphaned_tasks = []
+                if orphaned_ids:
+                    lock_stmt = select(Task).where(
+                        Task.id.in_(orphaned_ids)
+                    ).with_for_update(skip_locked=True)
+                    orphaned_tasks = list((await session.execute(lock_stmt)).scalars().all())
+                    # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
+                    verified = []
+                    for t in orphaned_tasks:
+                        if t.last_heartbeat:
+                            if t.last_heartbeat < five_minutes_ago:
+                                verified.append(t)
+                        elif t.started_at:
+                            if t.started_at < ten_minutes_ago:
+                                verified.append(t)
+                        elif t.created_at < ten_minutes_ago:
+                            verified.append(t)
+                    orphaned_tasks = verified
+
                 for task in orphaned_tasks:
                     # Determine why the reaper flagged this task
                     if task.last_heartbeat:

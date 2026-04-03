@@ -12,8 +12,8 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=os.getenv("SQL_ECHO", "false").lower() == "true",
     future=True,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=40,
+    max_overflow=60,
     pool_timeout=30,
     pool_recycle=1800
 )
