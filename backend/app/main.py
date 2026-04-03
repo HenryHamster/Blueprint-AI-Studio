@@ -587,8 +587,8 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
-    # Guard: must have active directions that aren't within the min research interval
-    min_interval_hours = _runtime_config.get("min_research_interval_hours", 24)
+    # Guard: must have active directions that aren't in cooldown
+    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = datetime.utcnow()
     active_directions = []
     for d in (project.directions or []):
@@ -596,11 +596,11 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             continue
         last_researched = d.get("last_researched_at")
         if last_researched:
-            hours_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 3600
-            if hours_ago < min_interval_hours:
+            minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
+            if minutes_ago < cooldown_minutes:
                 print(
                     f"[RESEARCH] Skipping direction {d.get('id')}: last researched "
-                    f"{hours_ago:.1f}h ago (min interval: {min_interval_hours}h)"
+                    f"{minutes_ago:.1f}m ago (cooldown: {cooldown_minutes}m)"
                 )
                 continue
         active_directions.append(d)
@@ -3764,16 +3764,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     await session.commit()
 
-    # Update last_researched_at for each direction included in this research
-    task_directions = ((task.payloads or [{}])[0]).get("directions", [])
-    direction_ids_researched = {d["id"] for d in task_directions if d.get("id")}
-    if direction_ids_researched:
+    # Update last_researched_at only for directions that actually produced findings,
+    # not all directions in the payload. This allows directions with no findings to
+    # be re-researched sooner instead of all going on cooldown simultaneously.
+    direction_ids_with_findings = set()
+    for ct in child_tasks:
+        did = (ct.context or {}).get("direction_id")
+        if did:
+            direction_ids_with_findings.add(did)
+    if direction_ids_with_findings:
         project = await session.get(Project, task.project_id)
         if project:
             directions = list(project.directions or [])
             now_iso = datetime.utcnow().isoformat()
             for d in directions:
-                if d.get("id") in direction_ids_researched:
+                if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
             project.directions = directions
             from sqlalchemy.orm.attributes import flag_modified

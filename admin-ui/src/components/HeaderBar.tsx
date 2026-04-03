@@ -51,8 +51,8 @@ export interface HeaderBarProps {
   onUpdateAutonomousResearchInterval: (value: number) => void;
   minResearchIntervalHours: number;
   onUpdateMinResearchIntervalHours: (value: number) => void;
-  directionCooldownHours: number;
-  onUpdateDirectionCooldown: (value: number) => void;
+  directionCooldownMinutes: number;
+  onUpdateDirectionCooldownMinutes: (value: number) => void;
   autonomousResearchModel: string;
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
@@ -139,8 +139,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateAutonomousResearchInterval,
     minResearchIntervalHours,
     onUpdateMinResearchIntervalHours,
-    directionCooldownHours,
-    onUpdateDirectionCooldown,
+    directionCooldownMinutes,
+    onUpdateDirectionCooldownMinutes,
     autonomousResearchModel,
     onUpdateAutonomousResearchModel,
     autonomousResearchEffort,
@@ -286,8 +286,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
           minResearchIntervalHours={minResearchIntervalHours}
           onUpdateMinResearchIntervalHours={onUpdateMinResearchIntervalHours}
-          directionCooldownHours={directionCooldownHours}
-          onUpdateDirectionCooldown={onUpdateDirectionCooldown}
+          directionCooldownMinutes={directionCooldownMinutes}
+          onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
           autonomousResearchModel={autonomousResearchModel}
           onUpdateAutonomousResearchModel={onUpdateAutonomousResearchModel}
           autonomousResearchEffort={autonomousResearchEffort}

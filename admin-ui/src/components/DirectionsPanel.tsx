@@ -28,10 +28,10 @@ function formatRelativeTime(isoString: string): string {
   return `${Math.floor(diffHrs / 24)}d ago`;
 }
 
-function formatTimeRemaining(isoString: string, cooldownHours: number): string {
+function formatTimeRemaining(isoString: string, cooldownMinutes: number): string {
   // Ensure UTC interpretation — backend stores naive UTC timestamps without 'Z' suffix
   const elapsedMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
-  const remainingMs = cooldownHours * 3600 * 1000 - elapsedMs;
+  const remainingMs = cooldownMinutes * 60 * 1000 - elapsedMs;
   if (remainingMs <= 0) return '';
   const remainingMins = Math.ceil(remainingMs / 60000);
   if (remainingMins < 60) return `${remainingMins}m left`;
@@ -40,11 +40,11 @@ function formatTimeRemaining(isoString: string, cooldownHours: number): string {
   return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
 }
 
-function getCooldownStatus(d: Direction, cooldownHours: number): 'ready' | 'cooling' | 'never' {
+function getCooldownStatus(d: Direction, cooldownMinutes: number): 'ready' | 'cooling' | 'never' {
   if (!d.last_researched_at) return 'never';
   const ts = d.last_researched_at;
   const elapsedMs = Date.now() - new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime();
-  return elapsedMs < cooldownHours * 3600 * 1000 ? 'cooling' : 'ready';
+  return elapsedMs < cooldownMinutes * 60 * 1000 ? 'cooling' : 'ready';
 }
 
 const priorityColors: Record<string, string> = {
@@ -98,7 +98,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
   const [researchSuccessIds, setResearchSuccessIds] = useState<Record<string, boolean>>({});
 
   // Cooldown settings
-  const [cooldownHours, setCooldownHours] = useState<number>(4);
+  const [cooldownMinutes, setCooldownMinutes] = useState<number>(240);
 
   // Force-research confirmation popover
   const [forceConfirmId, setForceConfirmId] = useState<string | null>(null);
@@ -133,8 +133,8 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
       const res = await fetch(`${API_BASE_URL}/api/admin/settings`, { headers: h });
       if (!res.ok) return;
       const data = await res.json();
-      const val = data.autonomous_direction_cooldown_hours;
-      if (typeof val === 'number' && val > 0) setCooldownHours(val);
+      const val = data.autonomous_direction_cooldown_minutes;
+      if (typeof val === 'number' && val > 0) setCooldownMinutes(val);
     } catch { /* ignore */ }
   }
 
@@ -527,7 +527,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                       </>);
                                     })()}
                                     {key === 'active' && (() => {
-                                      const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                      const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
                                       const inCooldown = cooldownStatus === 'cooling';
                                       return (
                                         <div className="relative flex items-center gap-1">
@@ -587,7 +587,7 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                 </div>
                                 {/* Last researched / cooldown subtitle */}
                                 {key === 'active' && (() => {
-                                  const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                  const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
                                   if (cooldownStatus === 'never') {
                                     return <p className="text-[10px] text-neutral-600 mt-0.5">Never researched</p>;
                                   }
@@ -615,11 +615,11 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
                                   )}
                                   {/* Cooldown badge */}
                                   {key === 'active' && (() => {
-                                    const cooldownStatus = getCooldownStatus(d, cooldownHours);
+                                    const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
                                     if (cooldownStatus === 'cooling') {
                                       return (
                                         <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
-                                          Cooling down · {formatTimeRemaining(d.last_researched_at!, cooldownHours)}
+                                          Cooling down · {formatTimeRemaining(d.last_researched_at!, cooldownMinutes)}
                                         </span>
                                       );
                                     }

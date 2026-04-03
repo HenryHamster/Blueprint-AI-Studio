@@ -321,8 +321,8 @@ export default function App() {
         onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
         minResearchIntervalHours={s.minResearchIntervalHours}
         onUpdateMinResearchIntervalHours={s.handleUpdateMinResearchIntervalHours}
-        directionCooldownHours={s.directionCooldownHours}
-        onUpdateDirectionCooldown={s.handleUpdateDirectionCooldown}
+        directionCooldownMinutes={s.directionCooldownMinutes}
+        onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
         autonomousResearchModel={s.autonomousResearchModel}
         onUpdateAutonomousResearchModel={s.handleUpdateAutonomousResearchModel}
         autonomousResearchEffort={s.autonomousResearchEffort}

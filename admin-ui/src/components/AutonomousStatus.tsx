@@ -50,7 +50,7 @@ interface AutonomyDebug {
     text: string;
     status: string;
     last_researched_at: string | null;
-    cooldown_hours: number;
+    cooldown_minutes: number;
     is_eligible: boolean;
     seconds_until_eligible: number | null;
   }>;

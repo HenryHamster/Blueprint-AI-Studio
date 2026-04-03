@@ -38,8 +38,8 @@ interface SettingsDropdownProps {
   onUpdateAutonomousResearchInterval: (value: number) => void;
   minResearchIntervalHours: number;
   onUpdateMinResearchIntervalHours: (value: number) => void;
-  directionCooldownHours: number;
-  onUpdateDirectionCooldown: (value: number) => void;
+  directionCooldownMinutes: number;
+  onUpdateDirectionCooldownMinutes: (value: number) => void;
   autonomousResearchModel: string;
   onUpdateAutonomousResearchModel: (value: string) => void;
   autonomousResearchEffort: string;
@@ -131,8 +131,8 @@ export function SettingsDropdown({
   onUpdateAutonomousResearchInterval,
   minResearchIntervalHours,
   onUpdateMinResearchIntervalHours,
-  directionCooldownHours,
-  onUpdateDirectionCooldown,
+  directionCooldownMinutes,
+  onUpdateDirectionCooldownMinutes,
   autonomousResearchModel,
   onUpdateAutonomousResearchModel,
   autonomousResearchEffort,
@@ -489,13 +489,13 @@ export function SettingsDropdown({
               />
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Direction Cooldown (hrs)</label>
+              <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Direction Cooldown (min)</label>
               <input
                 type="number"
                 min={1}
-                max={168}
-                value={directionCooldownHours}
-                onChange={e => onUpdateDirectionCooldown(parseInt(e.target.value) || 4)}
+                max={10080}
+                value={directionCooldownMinutes}
+                onChange={e => onUpdateDirectionCooldownMinutes(parseInt(e.target.value) || 240)}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
             </div>

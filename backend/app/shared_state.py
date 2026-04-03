@@ -29,7 +29,7 @@ runtime_config: Dict = {
         "qa": {"interval_hours": 72, "enabled": False},               # every 3 days
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
-    "autonomous_direction_cooldown_hours": 4,
+    "autonomous_direction_cooldown_minutes": 240,
     "autonomous_research_wave_size": 9999,
     "min_research_interval_hours": 24,
 }

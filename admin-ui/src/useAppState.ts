@@ -120,7 +120,7 @@ export function useAppState() {
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
   const [minResearchIntervalHours, setMinResearchIntervalHours] = useState(24);
-  const [directionCooldownHours, setDirectionCooldownHours] = useState(4);
+  const [directionCooldownMinutes, setDirectionCooldownMinutes] = useState(240);
   const [autonomousResearchModel, setAutonomousResearchModel] = useState('');
   const [autonomousResearchEffort, setAutonomousResearchEffort] = useState('');
   const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
@@ -1000,7 +1000,7 @@ export function useAppState() {
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
         setMinResearchIntervalHours(data.min_research_interval_hours ?? 24);
-        setDirectionCooldownHours(data.autonomous_direction_cooldown_hours ?? 4);
+        setDirectionCooldownMinutes(data.autonomous_direction_cooldown_minutes ?? 240);
         setAutonomousResearchModel(data.autonomous_research_model ?? '');
         setAutonomousResearchEffort(data.autonomous_research_effort ?? '');
         setHealthCheckUrls(data.health_check_urls ?? []);
@@ -1190,18 +1190,18 @@ export function useAppState() {
     }
   };
 
-  const handleUpdateDirectionCooldown = async (value: number) => {
-    const v = Math.max(1, Math.min(168, value));
-    const prev = directionCooldownHours;
-    setDirectionCooldownHours(v);
+  const handleUpdateDirectionCooldownMinutes = async (value: number) => {
+    const v = Math.max(1, Math.min(10080, value));
+    const prev = directionCooldownMinutes;
+    setDirectionCooldownMinutes(v);
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
         method: 'PATCH', headers: await authHeaders(),
-        body: JSON.stringify({ autonomous_direction_cooldown_hours: v }),
+        body: JSON.stringify({ autonomous_direction_cooldown_minutes: v }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch {
-      setDirectionCooldownHours(prev);
+      setDirectionCooldownMinutes(prev);
       addToast('Failed to update direction cooldown', 'error');
     }
   };
@@ -1653,10 +1653,10 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownHours, autonomousResearchModel, autonomousResearchEffort,
+    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownMinutes, autonomousResearchModel, autonomousResearchEffort,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     agentPromptSuffixes, updateAgentPromptSuffixes,
-    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldown, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
+    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldownMinutes, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
     healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

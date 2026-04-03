@@ -903,7 +903,7 @@ async def get_settings(
         "health_check_urls": _runtime_config.get("health_check_urls", []),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
-        "autonomous_direction_cooldown_hours": _runtime_config.get("autonomous_direction_cooldown_hours", 4),
+        "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 10),
         "min_research_interval_hours": _runtime_config.get("min_research_interval_hours", 24),
         "github_account": github_account,
@@ -1025,14 +1025,21 @@ async def update_settings(
         for type_key, type_cfg in val.items():
             existing.setdefault(type_key, {}).update(type_cfg)
         _runtime_config["autonomous_periodic_tasks"] = existing
-    if "autonomous_direction_cooldown_hours" in payload:
+    # Accept both new (minutes) and old (hours) keys for backward compat
+    if "autonomous_direction_cooldown_minutes" in payload:
+        try:
+            val = int(payload["autonomous_direction_cooldown_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_minutes must be a number")
+        if not (1 <= val <= 525600):
+            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_minutes must be between 1 and 525600")
+        _runtime_config["autonomous_direction_cooldown_minutes"] = val
+    elif "autonomous_direction_cooldown_hours" in payload:
         try:
             val = int(payload["autonomous_direction_cooldown_hours"])
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
-        if not (1 <= val <= 8760):
-            raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be between 1 and 8760")
-        _runtime_config["autonomous_direction_cooldown_hours"] = val
+        _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
     if "autonomous_research_wave_size" in payload:
         try:
             val = int(payload["autonomous_research_wave_size"])
@@ -1545,12 +1552,12 @@ async def create_direction_research_task(
         raise HTTPException(status_code=404, detail="Direction not found")
 
     if not bypass_cooldown:
-        cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
+        cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
         last_researched_at = direction.get("last_researched_at")
         if last_researched_at:
             elapsed = (datetime.utcnow() - datetime.fromisoformat(last_researched_at)).total_seconds()
-            if elapsed < cooldown_hours * 3600:
-                remaining_minutes = int((cooldown_hours * 3600 - elapsed) / 60)
+            if elapsed < cooldown_minutes * 60:
+                remaining_minutes = int((cooldown_minutes * 60 - elapsed) / 60)
                 raise HTTPException(
                     status_code=429,
                     detail=f"Direction is in cooldown for {remaining_minutes} more minutes. Use bypass_cooldown=true to force."
@@ -2424,8 +2431,8 @@ async def get_autonomy_debug(
     }
 
     # Guard 3: no_eligible_directions
-    cooldown_hours = _runtime_config.get("autonomous_direction_cooldown_hours", 4)
-    cooldown_seconds_dir = cooldown_hours * 3600
+    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+    cooldown_seconds_dir = cooldown_minutes * 60
     directions_info = []
     for d in (project.directions or []):
         if d.get("status") != "active":
@@ -2445,7 +2452,7 @@ async def get_autonomy_debug(
             "text": d.get("text", ""),
             "status": d.get("status", "active"),
             "last_researched_at": last_researched_at,
-            "cooldown_hours": cooldown_hours,
+            "cooldown_minutes": cooldown_minutes,
             "is_eligible": is_eligible,
             "seconds_until_eligible": seconds_until_eligible,
         })
