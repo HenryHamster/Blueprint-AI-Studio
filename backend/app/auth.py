@@ -1,11 +1,14 @@
 from fastapi import Security, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
+import logging
 import jwt
 import secrets
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
+
+logger = logging.getLogger(__name__)
 
 # Initialize Firebase Admin SDK
 # In GCP Cloud Run, this automatically uses the default service account credentials.
@@ -14,8 +17,7 @@ try:
     firebase_admin.initialize_app()
 except (ValueError, Exception) as e:
     # App already initialized, or Firebase not configured yet (placeholder secrets)
-    import logging
-    logging.getLogger(__name__).warning(f"Firebase Admin SDK init: {e}")
+    logger.warning(f"Firebase Admin SDK init: {e}")
 
 # We use HTTPBearer to automatically extract the "Authorization: Bearer <token>" header
 security = HTTPBearer()
@@ -106,12 +108,26 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
             "email_verified": decoded_token.get("email_verified", False),
             "role": role,
         }
-    except Exception as e:
-        print(f"Auth Error: {e}")
+    except (
+        firebase_admin.auth.InvalidIdTokenError,
+        firebase_admin.auth.ExpiredIdTokenError,
+        firebase_admin.auth.RevokedIdTokenError,
+        firebase_admin.auth.UserDisabledError,
+        firebase_admin.auth.CertificateFetchError,
+        ValueError,
+        KeyError,
+    ) as e:
+        logger.warning(f"Auth token validation failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    except Exception as e:
+        logger.error(f"Unexpected auth error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service error",
         )
 
 def require_admin(current_user: dict = Depends(get_current_user)):

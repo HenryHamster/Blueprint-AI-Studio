@@ -607,41 +607,76 @@ const TASK_TYPE_HINTS: Record<string, string> = {
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
 };
 
-// ── Handler: Create (default — make changes, push, open PR) ─────────────────
-async function handleCreate(
-  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
-  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
-  model?: string, effort?: string
-) {
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const rawTitle = String(task.title || payload.title || 'automated changes');
-  // Include title as context so the agent understands intent even if the prompt is terse
-  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
+// ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
+function readClaudeMd(): string {
+  const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;
+  if (fs.existsSync(claudeMdPath)) {
+    return fs.readFileSync(claudeMdPath, 'utf-8').slice(0, 2000);
+  }
+  return '';
+}
 
+// ── Standard Handler Helper ───────────────────────────────────────────────
+interface StandardHandlerOpts {
+  taskId: string;
+  payload: Record<string, unknown>;
+  task: Record<string, unknown>;
+  ghToken: string;
+  owner: string;
+  repo: string;
+  ws: WebSocket | null;
+  statusRef: { value: string };
+  model?: string;
+  effort?: string;
+  branchPrefix: string;
+  buildPrompt: (context: { contextPrefix: string; parentCtx: string; rawPrompt: string }) => string;
+  commitPrefix: string;
+  prTitlePrefix: string;
+  noChangesMessage?: string;
+  runLintFix?: boolean;
+  runTestFix?: boolean;
+  lintContext?: string;
+  includeTaskTypeHints?: boolean;
+}
+
+async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
+  const {
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef,
+    model, effort, branchPrefix, buildPrompt, commitPrefix, prTitlePrefix,
+    noChangesMessage = 'No file changes.',
+    runLintFix = true,
+    runTestFix = false,
+    lintContext = 'the code you just wrote',
+    includeTaskTypeHints = false,
+  } = opts;
+
+  const rawBaseBranch = String(payload.base_branch || 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+  const rawTitle = String(task.title || payload.title || 'automated changes');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
-  if (!prompt) throw new Error('No prompt found in task payloads');
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
-  const parentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
-  const parentContextSection = parentCtx?.parent_prompt
-    ? `## Parent Task Context\nThis task is a subtask of: **${parentCtx.parent_title}**\nParent goal: ${parentCtx.parent_prompt}\n\n`
+
+  const parentCtxObj = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
+  const parentCtx = parentCtxObj?.parent_prompt
+    ? `## Parent Task Context\nThis task is a subtask of: **${parentCtxObj.parent_title}**\nParent goal: ${parentCtxObj.parent_prompt}\n\n`
     : '';
+
+  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  const siblingNote = (projectCtx?.sibling_tasks as unknown[] | undefined)?.length
-    ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
+  const taskTypeHint = includeTaskTypeHints && TASK_TYPE_HINTS[String(payload.type || '')]
+    ? `\n\n${TASK_TYPE_HINTS[String(payload.type || '')]}`
     : '';
-  const taskTypeHint = TASK_TYPE_HINTS[String(payload.type || '')] ? `\n\n${TASK_TYPE_HINTS[String(payload.type || '')]}` : '';
-  const finalPrompt = `${contextPrefix}${parentContextSection}${prompt}${siblingNote}${promptSuffix}${taskTypeHint}`;
 
-  // Clone and setup workspace
-  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'task', taskId, ws, statusRef);
+  const claudeMd = readClaudeMd();
+  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const finalPrompt = claudeMdPrefix + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + promptSuffix;
 
-  // Run Claude
+  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
+
   statusRef.value = 'Running Claude Code...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPrompt, ws, statusRef, model, effort);
 
@@ -651,63 +686,32 @@ async function handleCreate(
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing changes...\n');
-    // Run lint/build checks before committing — retry up to 3 times with Claude fixes
+
     const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-    await lintFixLoop(changedPaths, ws, statusRef, 'the code you just wrote', model, effort);
+    if (runLintFix) {
+      await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort);
+    }
+
+    let testFailuresDetected = false;
+    let testsPassed = true;
+    if (runTestFix) {
+      const result = await testFixLoop(ws, statusRef, model, effort);
+      testFailuresDetected = result.testFailuresDetected;
+      testsPassed = result.passed;
+    }
 
     git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
 
-    // Rebase onto latest base branch before push to avoid merge conflicts in the PR.
-    // If rebase fails, fall back to merge. If merge fails, push as-is.
-    statusRef.value = `Rebasing onto ${baseBranch}...`;
-    try {
-      git(['fetch', 'origin', baseBranch]);
-      git(['rebase', `origin/${baseBranch}`]);
-      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
-    } catch {
-      try { git(['rebase', '--abort']); } catch {}
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — trying merge instead\n`);
-      try {
-        git(['merge', `origin/${baseBranch}`, '--no-edit']);
-        sendLog(ws, `Merged ${baseBranch} successfully\n`);
-      } catch {
-        try { git(['merge', '--abort']); } catch {}
-        sendLog(ws, `Merge also conflicted — pushing as-is, review pipeline will handle\n`);
-      }
+    let prBody = `## Summary\n\n${lastResultText?.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
+    if (runTestFix) {
+      const testSummary = testsPassed ? '✅ Tests passed' : testFailuresDetected ? '⚠️ Test failures detected' : '⚠️ Could not run tests';
+      prBody += `## Test Results\n\n${testSummary}\n\n`;
     }
+    prBody += `---\n*Automated by Blueprint Agent*`;
 
-    // Verify no conflict markers before pushing
-    try {
-      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
-      if (markers) {
-        sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
-        try { git(['rebase', '--abort']); } catch {}
-      }
-    } catch { /* no markers found */ }
-
-    // Re-run lint after rebase — upstream changes can introduce new errors
-    try {
-      runProjectLintChecks(changedPaths, ws);
-    } catch (postRebaseLintErr: unknown) {
-      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
-      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
-      await runClaudeCode(
-        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef, model, effort
-      );
-      git(['add', '-A']);
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: fix post-rebase lint errors'], { encoding: 'utf-8' });
-    }
-
-    // Detect and run tests
-    statusRef.value = 'Running tests...';
-    sendLog(ws, '\nDetecting and running tests...\n');
-    const { passed: testsPassed, testFailuresDetected } = await testFixLoop(ws, statusRef, model, effort);
-    const testSummary = testsPassed ? '✅ Tests passed' : testFailuresDetected ? '⚠️ Test failures detected' : '⚠️ Could not run tests';
-
-    const prBody = `## Summary\n\n${lastResultText?.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n## Test Results\n\n${testSummary}\n\n---\n*Automated by Blueprint Agent*`;
-    const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `[Blueprint] ${taskTitle}`, prBody, ws, statusRef, true);
+    const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `${prTitlePrefix} ${taskTitle}`, prBody, ws, statusRef);
     const commitHash = git(['rev-parse', 'HEAD']);
 
     await apiPost('/api/agent/status', {
@@ -715,12 +719,42 @@ async function handleCreate(
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No file changes.' });
+    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
   } else {
     await apiPost('/api/agent/status', {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
     });
   }
+}
+
+// ── Handler: Create (default — make changes, push, open PR) ─────────────────
+async function handleCreate(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
+  // Include title as context so the agent understands intent even if the prompt is terse
+  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
+  if (!prompt) throw new Error('No prompt found in task payloads');
+
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const siblingNote = (projectCtx?.sibling_tasks as unknown[] | undefined)?.length
+    ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
+    : '';
+
+  await runStandardHandler({
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    branchPrefix: 'task',
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${prompt}${siblingNote}`,
+    commitPrefix: 'blueprint',
+    prTitlePrefix: '[Blueprint]',
+    noChangesMessage: 'No file changes.',
+    runLintFix: true,
+    runTestFix: true,
+    lintContext: 'the code you just wrote',
+    includeTaskTypeHints: true,
+  });
 }
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
@@ -931,6 +965,12 @@ async function handleFix(
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {
     enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${fixParentCtx.parent_title}**\nParent goal: ${fixParentCtx.parent_prompt}\n\n${enrichedPrompt}`;
+  }
+
+  // Prepend CLAUDE.md instructions
+  const fixClaudeMd = readClaudeMd();
+  if (fixClaudeMd) {
+    enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${enrichedPrompt}`;
   }
 
   // Run Claude with the review feedback as the prompt
@@ -1549,13 +1589,10 @@ async function handleDocs(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-
-  // Clone and setup workspace
-  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'docs', taskId, ws, statusRef);
-
-  const docsPrompt = `You are a documentation agent. Your job is to improve the documentation of this codebase.
+  await runStandardHandler({
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    branchPrefix: 'docs',
+    buildPrompt: () => `You are a documentation agent. Your job is to improve the documentation of this codebase.
 
 Steps:
 1. Analyze the codebase to understand what it does — read the README, key source files, API routes, configuration, and entry points.
@@ -1571,40 +1608,13 @@ Steps:
 4. Focus on accuracy — only document what actually exists in the code. Do not invent features or describe things that don't exist.
 5. Do NOT change any production code. Only modify documentation files (README, docs/, etc.) and add/update docstrings within existing source files.
 
-Be thorough but precise. Every statement in the documentation must reflect the actual code.`;
-
-  const docsPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(docsPrompt + docsPromptSuffix, ws, statusRef, model, effort);
-
-  const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
-
-  if (hasChanges && exitCode === 0) {
-    statusRef.value = 'Pushing changes...';
-    sendLog(ws, '\nCommitting and pushing changes...\n');
-
-    git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `docs: update documentation\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
-
-
-    const prBody = lastResultText
-      ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-      : `Documentation improvements\n\n---\n*Automated by Blueprint Agent*`;
-    const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, 'docs: update documentation', prBody, ws, statusRef);
-    const commitHash = git(['rev-parse', 'HEAD']);
-
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
-      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No documentation changes needed.' });
-  } else {
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-    });
-  }
+Be thorough but precise. Every statement in the documentation must reflect the actual code.`,
+    commitPrefix: 'docs',
+    prTitlePrefix: 'docs:',
+    noChangesMessage: 'No documentation changes needed.',
+    runLintFix: false,
+    runTestFix: false,
+  });
 }
 
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
@@ -1728,51 +1738,11 @@ async function handleQA(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const rawTitle = String(task.title || payload.title || 'add test coverage');
-
-  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
-
-  // Clone
-  statusRef.value = `Cloning ${owner}/${repo}...`;
-  sendLog(ws, `Cloning ${owner}/${repo}...\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
-  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
-
-  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
-  git(['config', 'user.name', 'Blueprint Agent']);
-
-  const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const workBranch = `blueprint/task-${shortId}`;
-  let staleBranchExists = false;
-  try {
-    git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    staleBranchExists = true;
-  } catch { /* branch doesn't exist on remote — normal case */ }
-  if (staleBranchExists) {
-    try {
-      git(['push', 'origin', '--delete', workBranch]);
-      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
-    } catch (e) {
-      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
-    }
-  }
-  git(['checkout', '-b', workBranch]);
-  sendLog(ws, `Working branch: ${workBranch}\n`);
-
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
-  const parentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
-  const parentContextSection = parentCtx?.parent_prompt
-    ? `## Parent Task Context\nThis task is a subtask of: **${parentCtx.parent_title}**\nParent goal: ${parentCtx.parent_prompt}\n\n`
-    : '';
-
-  const qaPrompt = `${contextPrefix}${parentContextSection}You are a QA agent. Your job is to improve test coverage for this codebase.
+  await runStandardHandler({
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    branchPrefix: 'task',
+    buildPrompt: ({ contextPrefix, parentCtx, rawPrompt }) =>
+      `${contextPrefix}${parentCtx}You are a QA agent. Your job is to improve test coverage for this codebase.
 
 ${rawPrompt ? `Task context:\n${rawPrompt}\n\n` : ''}Instructions:
 1. Analyze the existing test files to understand the test framework, patterns, and conventions used.
@@ -1786,65 +1756,13 @@ IMPORTANT RULES:
 - Do not change production source files under any circumstances
 - Each test should be self-contained and not depend on external state
 - Cover edge cases and error paths, not just happy paths
-- If a test requires mocking, use the same mocking approach as existing tests`;
-
-  // Run Claude
-  const qaPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(qaPrompt + qaPromptSuffix, ws, statusRef, model, effort);
-
-  const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
-
-  if (hasChanges && exitCode === 0) {
-    statusRef.value = 'Pushing changes...';
-    sendLog(ws, '\nCommitting and pushing changes...\n');
-
-    git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `test: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
-
-    try {
-      git(['fetch', 'origin', baseBranch]);
-      git(['rebase', `origin/${baseBranch}`]);
-      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
-    } catch {
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
-      try { git(['rebase', '--abort']); } catch {}
-    }
-
-    const commitHash = git(['rev-parse', 'HEAD']);
-
-    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
-    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    git(['push', 'origin', workBranch]);
-    sendLog(ws, `Pushed to branch: ${workBranch}\n`);
-
-    statusRef.value = 'Creating pull request...';
-    let prUrl = '';
-    try {
-      const prBody = lastResultText
-        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-        : `Test coverage improvements for: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
-      const prRes = await apiPost('/api/agent/github/pull-requests', {
-        task_id: taskId, owner, repo, title: `test: add test coverage for ${taskTitle}`,
-        head: workBranch, base: baseBranch, body: prBody,
-      });
-      prUrl = prRes.data?.html_url || '';
-      sendLog(ws, `PR created: ${prUrl}\n`);
-    } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
-
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
-      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No test files added.' });
-  } else {
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-    });
-  }
+- If a test requires mocking, use the same mocking approach as existing tests`,
+    commitPrefix: 'test',
+    prTitlePrefix: 'test: add test coverage for',
+    noChangesMessage: 'No test files added.',
+    runLintFix: false,
+    runTestFix: false,
+  });
 }
 
 // ── Handler: Deps (update dependencies to latest minor/patch versions) ─────
@@ -1853,13 +1771,10 @@ async function handleDeps(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-
-  // Clone and setup workspace
-  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'deps', taskId, ws, statusRef);
-
-  const depsPrompt = `You are a dependency update agent. Your job is to update this project's dependencies to their latest MINOR and PATCH versions — do NOT make major version bumps as those can introduce breaking changes.
+  await runStandardHandler({
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    branchPrefix: 'deps',
+    buildPrompt: () => `You are a dependency update agent. Your job is to update this project's dependencies to their latest MINOR and PATCH versions — do NOT make major version bumps as those can introduce breaking changes.
 
 Steps to follow:
 1. Detect which package managers are in use by checking for these files:
@@ -1891,39 +1806,13 @@ Steps to follow:
 
 5. Once tests pass, the dependency files should already be modified. Do NOT commit — the agent harness will handle the commit.
 
-IMPORTANT: Only update minor/patch versions. If a package would require a major version bump to get any update, skip it. Focus on security patches and bug fixes.`;
-
-  const depsPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  statusRef.value = 'Running dependency updates...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(depsPrompt + depsPromptSuffix, ws, statusRef, model, effort);
-
-  const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
-
-  if (hasChanges && exitCode === 0) {
-    statusRef.value = 'Pushing changes...';
-    sendLog(ws, '\nCommitting and pushing dependency updates...\n');
-
-    git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `chore: update dependencies to latest minor/patch versions\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
-
-    const prBody = lastResultText
-      ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-      : `Automated dependency updates: minor/patch versions only.\n\n---\n*Automated by Blueprint Agent*`;
-    const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, 'chore: update dependencies', prBody, ws, statusRef);
-    const commitHash = git(['rev-parse', 'HEAD']);
-
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
-      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No dependency updates needed.' });
-  } else {
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-    });
-  }
+IMPORTANT: Only update minor/patch versions. If a package would require a major version bump to get any update, skip it. Focus on security patches and bug fixes.`,
+    commitPrefix: 'chore',
+    prTitlePrefix: 'chore:',
+    noChangesMessage: 'No dependency updates needed.',
+    runLintFix: false,
+    runTestFix: false,
+  });
 }
 
 // ── Handler: Migrate (Alembic/SQLAlchemy database migration workflow) ────────
@@ -2007,9 +1896,11 @@ CRITICAL RULES:
 - If autogenerate produces an empty migration with no changes, verify that your model changes were saved and the alembic env.py is configured to detect them
 - Document any data loss risks prominently using inline comments in the migration file`;
 
+  const migrateClaudeMd = readClaudeMd();
+  const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running migration workflow...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migratePrompt + migratePromptSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePrompt + migratePromptSuffix, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -2186,19 +2077,13 @@ async function handleRefactor(
   model?: string, effort?: string
 ) {
   const rawPrompt = String(payload.prompt || payload.description || task.description || '');
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const rawTitle = String(task.title || payload.title || 'refactor');
-
-  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!rawPrompt) throw new Error('No prompt found in task payloads');
 
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
-
-  const refactorPrompt = `${contextPrefix}REFACTOR TASK — STRICT CONSTRAINTS:
+  await runStandardHandler({
+    taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
+    branchPrefix: 'refactor',
+    buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
+      `${contextPrefix}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).
@@ -2209,79 +2094,14 @@ async function handleRefactor(
 
 Task: ${task.title ? task.title : 'Refactor'}
 
-${rawPrompt}`;
-
-  // Clone and setup workspace
-  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, 'refactor', taskId, ws, statusRef);
-
-  // Run Claude
-  const refactorPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(refactorPrompt + refactorPromptSuffix, ws, statusRef, model, effort);
-
-  const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
-
-  if (hasChanges && exitCode === 0) {
-    statusRef.value = 'Pushing changes...';
-    sendLog(ws, '\nCommitting and pushing changes...\n');
-    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
-    await lintFixLoop(changedPaths, ws, statusRef, 'the refactored code', model, effort);
-
-    const { testFailuresDetected } = await testFixLoop(ws, statusRef, model, effort);
-
-    git(['add', '-A']);
-    const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `refactor: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
-
-    statusRef.value = `Rebasing onto ${baseBranch}...`;
-    try {
-      git(['fetch', 'origin', baseBranch]);
-      git(['rebase', `origin/${baseBranch}`]);
-      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
-    } catch {
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is, review pipeline will handle\n`);
-      try { git(['rebase', '--abort']); } catch {}
-    }
-
-    try {
-      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
-      if (markers) {
-        sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
-        try { git(['rebase', '--abort']); } catch {}
-      }
-    } catch { /* no markers found */ }
-
-    try {
-      runProjectLintChecks(changedPaths, ws);
-    } catch (postRebaseLintErr: unknown) {
-      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
-      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
-      await runClaudeCode(
-        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef, model, effort
-      );
-      git(['add', '-A']);
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'refactor: fix post-rebase lint errors'], { encoding: 'utf-8' });
-    }
-
-    const prBody = lastResultText
-      ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-      : `Refactor: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
-    const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `refactor: ${taskTitle}`, prBody, ws, statusRef, true);
-    const commitHash = git(['rev-parse', 'HEAD']);
-
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
-      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No file changes.' });
-  } else {
-    await apiPost('/api/agent/status', {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-    });
-  }
+${rp}`,
+    commitPrefix: 'refactor',
+    prTitlePrefix: 'refactor:',
+    noChangesMessage: 'No file changes.',
+    runLintFix: true,
+    runTestFix: true,
+    lintContext: 'the refactored code',
+  });
 }
 
 // ── Handler: Debug (analyze task/CI/test failures and produce root cause analysis) ──
