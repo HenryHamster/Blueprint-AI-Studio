@@ -2443,11 +2443,12 @@ async def get_autonomy_debug(
             "time_until_eligible_seconds": min_wait,
         })
 
-    # Guard 4: research_task_active
+    # Guard 4: research_task_active — only block on actively running research,
+    # not EVALUATING parents (they're just waiting on children to finish)
     active_tasks_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
     )
     active_tasks = active_tasks_result.scalars().all()
@@ -2459,7 +2460,7 @@ async def get_autonomy_debug(
     if blocking_research_task_id:
         blocking_guards.append({
             "guard": "research_task_active",
-            "reason": "A research task is already active (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)",
+            "reason": "A research task is actively running (QUEUED/PROVISIONING/IN_PROGRESS)",
             "task_id": blocking_research_task_id,
         })
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
-import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, Loader2, Gauge } from 'lucide-react';
+import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 
 interface ProjectAutonomousStatus {
@@ -67,7 +67,10 @@ const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Spawning', 'Executing', 'Cooldowns
 function getLifecyclePhase(debug: AutonomyDebug): number {
   const guards = debug.blocking_guards.map(g => g.guard);
   if (guards.includes('research_task_active')) return 3; // Executing
-  return 0; // Idle
+  if (guards.includes('no_eligible_directions') || guards.includes('rate_limit_exceeded')) return 4; // Cooldowns
+  if (guards.includes('circuit_breaker_open')) return 4; // Cooldowns
+  if (!debug.spawn_blocked) return 1; // Ready to check/spawn
+  return 0; // Idle (disabled or other block)
 }
 
 function formatSeconds(s: number): string {
@@ -103,7 +106,7 @@ function GuardIcon({ guard }: { guard: string }) {
     case 'no_eligible_directions':
       return <Clock className="w-3 h-3 shrink-0 text-amber-400" />;
     case 'research_task_active':
-      return <Loader2 className="w-3 h-3 shrink-0 text-blue-400 animate-spin" />;
+      return <PlayCircle className="w-3 h-3 shrink-0 text-blue-400" />;
     case 'rate_limit_exceeded':
       return <Gauge className="w-3 h-3 shrink-0 text-orange-400" />;
     default:
@@ -237,6 +240,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
   const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -267,6 +271,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
         }
       }
       setDebugData(newDebug);
+      setLastUpdated(new Date());
     } catch {
       // silent
     }
@@ -382,9 +387,16 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
         <div className="absolute top-full mt-2 right-0 w-96 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline</h3>
-            <button onClick={fetchStatus} className="text-neutral-500 hover:text-neutral-300 transition-colors">
-              <RefreshCw className="w-3 h-3" />
-            </button>
+            <span className="flex items-center gap-1.5">
+              {lastUpdated && (
+                <span className="text-[10px] text-neutral-600 font-mono">
+                  {lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </span>
+              )}
+              <button onClick={fetchStatus} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+                <RefreshCw className="w-3 h-3" />
+              </button>
+            </span>
           </div>
 
           {projects.length === 0 && (

@@ -583,11 +583,12 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     ]
     if not active_directions:
         return
-    # Guard: no existing research task already running/queued/evaluating
+    # Guard: no research task actively running (queued/provisioning/in_progress).
+    # EVALUATING parents are just waiting on children — they don't block new research.
     active_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
     )).scalars().all()
     for t in active_tasks:
