@@ -93,4 +93,6 @@ external_health: Dict = {
 # Track last successful GitHub API operation (tokens, PR comments, etc.)
 # Used by health check to passively verify GitHub is reachable without
 # making an active API call that competes for the shared connection pool.
-last_github_success: Optional[datetime] = None
+# Seed with current time so the first health check uses the passive path
+# instead of an active probe that can fail on cold start.
+last_github_success: Optional[datetime] = datetime.utcnow()

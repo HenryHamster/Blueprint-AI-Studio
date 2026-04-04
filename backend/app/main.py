@@ -1388,6 +1388,9 @@ async def orchestrator_worker():
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
 
                 for task in queued_tasks:
+                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
+                    if not task.vm_instance_id:
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
                     # Select Max plan account (primary) or fall back to API key
