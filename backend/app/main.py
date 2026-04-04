@@ -3781,15 +3781,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Query recent tasks (last 30 days) for hash-based deduplication across research cycles
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    recent_hashed_tasks = (await session.execute(
+    recent_tasks_for_dedup = (await session.execute(
         select(Task).where(
             Task.project_id == task.project_id,
             Task.created_at >= thirty_days_ago,
-            Task.context["finding_hash"].astext != None,  # noqa: E711
         )
     )).scalars().all()
     recent_finding_hashes = {
-        t.context["finding_hash"] for t in recent_hashed_tasks if t.context and t.context.get("finding_hash")
+        t.context["finding_hash"] for t in recent_tasks_for_dedup if t.context and t.context.get("finding_hash")
     }
 
     def _finding_hash(title: str, description: str) -> str:

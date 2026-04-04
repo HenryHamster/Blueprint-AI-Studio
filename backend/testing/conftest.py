@@ -1,3 +1,4 @@
+import os
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -5,6 +6,13 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
+
+# Set required environment variables before any app modules are imported.
+# These are dummy values used only for tests — real credentials are not needed
+# because auth dependencies are overridden below.
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-key-for-pytest")
+os.environ.setdefault("WS_TICKET_SECRET", "test-ws-ticket-secret")
 
 # SQLite does not support PostgreSQL's JSONB type.  Add a visit_JSONB method
 # to the SQLite type compiler so it renders JSONB as plain JSON when the
