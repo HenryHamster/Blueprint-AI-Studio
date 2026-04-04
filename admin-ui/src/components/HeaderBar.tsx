@@ -74,6 +74,7 @@ export interface HeaderBarProps {
   onAddAccount: () => void;
   showMetrics: boolean;
   onToggleMetrics: () => void;
+  metricsHistory: { timestamp: number; completedCount: number }[];
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -160,6 +161,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onAddAccount,
     showMetrics,
     onToggleMetrics,
+    metricsHistory,
     refreshInterval,
     onUpdateRefreshInterval,
     pageSize,
@@ -214,6 +216,7 @@ export function HeaderBar(props: HeaderBarProps) {
         onToggleMetrics={onToggleMetrics}
         wsRef={wsRef}
         onRefreshTasks={onRefresh}
+        metricsHistory={metricsHistory}
       />
 
       <div className="flex items-center gap-2">

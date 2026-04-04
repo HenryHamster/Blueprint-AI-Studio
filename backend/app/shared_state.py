@@ -79,6 +79,14 @@ deploy_monitoring: Dict = {
     "consecutive_health_failures": 0,
 }
 
+# --- Prometheus-compatible metrics counters ---
+# Gauges: updated by orchestrator each cycle
+tasks_queued_gauge: int = 0
+tasks_active_gauge: int = 0
+# Counters: cumulative totals, incremented on terminal state transitions
+tasks_completed_total: int = 0
+tasks_failed_total: int = 0
+
 # --- External Dependency Health ---
 external_health: Dict = {
     "github_api": True,

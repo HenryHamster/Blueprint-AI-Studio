@@ -22,7 +22,8 @@ export async function authGet(url: string) {
 export async function apiFetch(
   url: string,
   options?: RequestInit,
-  retries = 2
+  retries = 2,
+  timeout = 30000
 ): Promise<Response> {
   const headers = await authHeaders();
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
@@ -33,16 +34,30 @@ export async function apiFetch(
   const safeToRetry = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
   const maxAttempts = safeToRetry ? retries : 0;
 
+  const attemptFetch = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const res = await fetch(fullUrl, { ...mergedOptions, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (e) {
+      clearTimeout(timer);
+      if (e instanceof Error && e.name === 'AbortError') throw new Error('Request timed out');
+      throw e;
+    }
+  };
+
   for (let i = 0; i <= maxAttempts; i++) {
     try {
-      const res = await fetch(fullUrl, mergedOptions);
+      const res = await attemptFetch();
       if (res.ok || res.status < 500) return res;
     } catch (e) {
       if (i === maxAttempts) throw e;
     }
     await new Promise(r => setTimeout(r, 1000 * (i + 1)));
   }
-  return fetch(fullUrl, mergedOptions);
+  return attemptFetch();
 }
 
 export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {

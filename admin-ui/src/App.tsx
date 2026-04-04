@@ -22,6 +22,7 @@ import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -271,6 +272,7 @@ export default function App() {
   }
 
   return (
+    <ErrorBoundary>
     <div className="h-screen overflow-hidden flex flex-col bg-neutral-950 text-neutral-200 font-sans p-6">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
@@ -344,6 +346,7 @@ export default function App() {
         onAddAccount={s.addMaxPlanAccount}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
+        metricsHistory={s.metricsHistory}
         refreshInterval={s.refreshInterval}
         onUpdateRefreshInterval={s.setRefreshInterval}
         pageSize={s.limit}
@@ -396,6 +399,7 @@ export default function App() {
 
       <OrchestratorHealthBar
         health={s.orchestratorHealth}
+        detailedHealth={s.detailedHealth}
         apiHealthy={s.apiHealthy}
         wsConnected={s.wsConnected}
         lastFetchTime={s.lastFetchTime}
@@ -720,7 +724,7 @@ export default function App() {
         />
       )}
 
-      {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} />}
+      {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} addToast={s.addToast} />}
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
       {s.confirmDialog && (
@@ -733,5 +737,6 @@ export default function App() {
         />
       )}
     </div>
+    </ErrorBoundary>
   );
 }

@@ -111,7 +111,11 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       const params = new URLSearchParams();
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`${API_BASE_URL}/api/admin/activity?${params}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const errorBody = await res.json().catch(() => null);
+        const msg = errorBody?.detail || errorBody?.message || `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
       const data = await res.json();
       setEvents(Array.isArray(data) ? data : (data.events ?? []));
       setError(null);
@@ -225,8 +229,14 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
       {/* Error banner */}
       {error && (
-        <div className="mx-6 mt-4 px-4 py-2 bg-red-950/50 text-red-400 text-xs rounded border border-red-900/50 shrink-0">
-          Failed to load activity: {error}
+        <div className="mx-6 mt-4 px-4 py-2 bg-red-950/50 text-red-400 text-xs rounded border border-red-900/50 shrink-0 flex items-center justify-between gap-3">
+          <span>Failed to load activity: {error}</span>
+          <button
+            onClick={fetchEvents}
+            className="text-xs text-blue-400 underline shrink-0 hover:text-blue-300 transition-colors"
+          >
+            Retry
+          </button>
         </div>
       )}
 

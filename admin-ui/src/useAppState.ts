@@ -109,6 +109,8 @@ export function useAppState() {
   const [wsDisconnected, setWsDisconnected] = useState(false);
   const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const wsReconnectAttemptRef = useRef<number>(0);
+  const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Research browser state
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
@@ -182,7 +184,7 @@ export function useAppState() {
     } catch (e) {
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
         try {
-          localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore.slice(-100)));
+          localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore.slice(-50)));
         } catch { /* storage unavailable, skip persistence */ }
       }
     }
@@ -273,11 +275,11 @@ export function useAppState() {
     fetchSettings();
     fetchProjects();
     fetchAlerts();
-    const projectInterval = setInterval(fetchProjects, 60000);
+    const projectInterval = setInterval(() => fetchProjects(true), 60000);
     if (refreshInterval === 0) {
       return () => { clearInterval(projectInterval); };
     }
-    const interval = setInterval(() => { fetchTasksRef.current(); fetchAlerts(); }, refreshInterval);
+    const interval = setInterval(() => { fetchTasksRef.current(); fetchAlerts(true); }, refreshInterval);
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshInterval, user]);
@@ -472,7 +474,7 @@ export function useAppState() {
           setCumulativeVmHours(h => h + lastPoint.activeVMs * intervalHrs);
         }
 
-        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 86400000);
+        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 21600000);
         const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr, completedCount, failedCount }];
         metricsHistoryRef.current = newHistory;
         setMetricsHistory(newHistory);
@@ -491,7 +493,7 @@ export function useAppState() {
   };
   fetchTasksRef.current = fetchTasks;
 
-  const fetchProjects = async () => {
+  const fetchProjects = async (silent = false) => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/projects`);
       if (res.ok) {
@@ -500,14 +502,16 @@ export function useAppState() {
         setProjectsFetchError(null);
       } else {
         setProjectsFetchError('Failed to load projects');
+        if (!silent) addToast('Failed to load projects', 'error');
       }
     } catch (err) {
       console.error('Failed to fetch projects:', err);
       setProjectsFetchError('Failed to load projects');
+      if (!silent) addToast('Failed to load projects', 'error');
     }
   };
 
-  const fetchAlerts = async () => {
+  const fetchAlerts = async (silent = false) => {
     try {
       const url = selectedProjectId
         ? `${API_BASE_URL}/api/admin/alerts?project_id=${selectedProjectId}`
@@ -518,6 +522,7 @@ export function useAppState() {
       }
     } catch (err) {
       console.error('Failed to fetch alerts:', err);
+      if (!silent) addToast('Failed to load alerts', 'error');
     }
   };
 
@@ -752,11 +757,14 @@ export function useAppState() {
   // --- Deploy State ---
   const [deployState, setDeployState] = useState<DeployState | null>(null);
 
-  const fetchDeployState = async () => {
+  const fetchDeployState = async (silent = false) => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/deploy-state`);
       if (res.ok) setDeployState(await res.json());
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error('Failed to fetch deploy state:', err);
+      if (!silent) addToast('Failed to load deploy state', 'error');
+    }
   };
 
   const handlePausePipeline = async () => {
@@ -857,7 +865,7 @@ export function useAppState() {
   // Fetch deploy state on mount and periodically (WS push is the primary path; this is a fallback)
   useEffect(() => {
     fetchDeployState();
-    const id = setInterval(fetchDeployState, 60000);
+    const id = setInterval(() => fetchDeployState(true), 60000);
     return () => clearInterval(id);
   }, []);
 
@@ -883,6 +891,14 @@ export function useAppState() {
     queued_tasks: number;
     active_tasks: number;
     pool_info: Record<string, unknown>;
+    deploy_state?: {
+      status: string;
+      rollback_count: number;
+      rollback_reason: string | null;
+      pause_reason: string | null;
+      monitoring_since: string | null;
+      recent_outcomes: { created_at: string; status: string; failure_class: string | null }[];
+    } | null;
     deploy_monitoring?: {
       external_health?: Record<string, boolean | string | string[]>;
     };
@@ -900,6 +916,41 @@ export function useAppState() {
   useEffect(() => {
     fetchOrchestratorHealth();
     const id = setInterval(fetchOrchestratorHealth, 30000);
+    return () => clearInterval(id);
+  }, []);
+
+  // --- Detailed Health ---
+  interface CircuitBreakerState {
+    state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+    failure_count: number;
+    opened_at: string | null;
+  }
+  interface DetailedHealth {
+    circuit_breaker: { projects: Record<string, CircuitBreakerState> };
+    max_plan_pool: { total: number; available: number };
+    autonomous: { enabled: boolean; consecutive_failures: number };
+  }
+  const [detailedHealth, setDetailedHealth] = useState<DetailedHealth | null>(null);
+
+  const fetchDetailedHealth = async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/health/detailed`);
+      if (res.ok) {
+        const data = await res.json();
+        setDetailedHealth({
+          circuit_breaker: data.components?.circuit_breaker ?? { projects: {} },
+          max_plan_pool: data.components?.max_plan_pool ?? { total: 0, available: 0 },
+          autonomous: data.components?.autonomous ?? { enabled: false, consecutive_failures: 0 },
+        });
+      } else {
+        setDetailedHealth(null);
+      }
+    } catch { setDetailedHealth(null); }
+  };
+
+  useEffect(() => {
+    fetchDetailedHealth();
+    const id = setInterval(fetchDetailedHealth, 30000);
     return () => clearInterval(id);
   }, []);
 
@@ -1402,10 +1453,15 @@ export function useAppState() {
   };
 
   const handleViewLogs = useCallback((task: Task) => {
+    if (wsReconnectTimerRef.current) {
+      clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
+    wsReconnectAttemptRef.current = 0;
     setLogTask(task);
     setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
     // Fetch fresh task data in the background; show stale list data immediately
@@ -1417,7 +1473,7 @@ export function useAppState() {
 
     setLogsConnecting(true);
 
-    (async () => {
+    const connectWs = async () => {
       try {
         const ticketRes = await fetch(`${API_BASE_URL}/api/projects/${task.project_id}/ws-ticket`, {
           method: 'POST',
@@ -1437,9 +1493,11 @@ export function useAppState() {
 
         ws.onopen = () => {
           ws.send(JSON.stringify({ ticket }));
+          wsReconnectAttemptRef.current = 0;
           setLogLines(prev => [...prev, '[Connected to live log stream]']);
           setWsConnected(true);
           setLogsConnecting(false);
+          setWsDisconnected(false);
           wasConnected = true;
         };
 
@@ -1475,15 +1533,33 @@ export function useAppState() {
           setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
           setWsConnected(false);
           setLogsConnecting(false);
-          if (wasConnected) {
+
+          if (!wasConnected) return;
+
+          const isIntentional = e.code === 1000 || e.code === 1008;
+          const attemptsExhausted = wsReconnectAttemptRef.current >= 5;
+
+          if (!isIntentional && !attemptsExhausted) {
+            const attempt = wsReconnectAttemptRef.current;
+            wsReconnectAttemptRef.current = attempt + 1;
+            const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+            const delaySec = Math.round(delay / 1000);
+            setWsDisconnected(true);
+            setWsDisconnectReason(`Connection lost — reconnecting in ${delaySec}s (attempt ${attempt + 1}/5)...`);
+            wsReconnectTimerRef.current = setTimeout(() => {
+              wsReconnectTimerRef.current = null;
+              setLogsConnecting(true);
+              connectWs();
+            }, delay);
+          } else {
             setWsDisconnected(true);
             let reason: string;
             if (e.code === 1008) {
               reason = 'Authentication failed — please refresh the page';
-            } else if (e.code === 1006) {
-              reason = 'Connection lost — attempting to reconnect...';
+            } else if (attemptsExhausted) {
+              reason = 'Connection failed after 5 attempts — please refresh the page';
             } else {
-              reason = `Disconnected (code ${e.code}) — attempting to reconnect...`;
+              reason = `Disconnected (code ${e.code})`;
             }
             setWsDisconnectReason(reason);
           }
@@ -1492,10 +1568,17 @@ export function useAppState() {
         setLogsConnecting(false);
         setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
       }
-    })();
+    };
+
+    connectWs();
   }, []);
 
   const closeLogViewer = () => {
+    if (wsReconnectTimerRef.current) {
+      clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
+    wsReconnectAttemptRef.current = 0;
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -1692,5 +1775,6 @@ export function useAppState() {
     zoneHealth,
     // Orchestrator health
     orchestratorHealth,
+    detailedHealth,
   };
 }

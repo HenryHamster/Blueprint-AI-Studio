@@ -14,6 +14,33 @@ export interface MetricsBarProps {
   onToggleMetrics: () => void;
   wsRef: RefObject<WebSocket | null>;
   onRefreshTasks: () => void;
+  metricsHistory: { timestamp: number; completedCount: number }[];
+}
+
+function formatDrainTime(minutes: number): string {
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+function computeDrainMinutes(
+  metricsHistory: { timestamp: number; completedCount: number }[],
+  queued: number,
+): number | null {
+  if (queued <= 0 || metricsHistory.length < 2) return null;
+  const now = Date.now();
+  const oneHourAgo = now - 3600000;
+  const recent = metricsHistory.filter(p => p.timestamp >= oneHourAgo);
+  if (recent.length < 2) return null;
+  const oldest = recent[0];
+  const newest = recent[recent.length - 1];
+  const elapsedHr = (newest.timestamp - oldest.timestamp) / 3600000;
+  if (elapsedHr <= 0) return null;
+  const completedDelta = newest.completedCount - oldest.completedCount;
+  if (completedDelta <= 0) return null;
+  const ratePerHour = completedDelta / elapsedHr;
+  return (queued / ratePerHour) * 60;
 }
 
 function formatTimeAgo(date: Date): string {
@@ -36,7 +63,9 @@ export function MetricsBar({
   onToggleMetrics,
   wsRef,
   onRefreshTasks,
+  metricsHistory,
 }: MetricsBarProps) {
+  const drainMinutes = computeDrainMinutes(metricsHistory, queuedTasksLength);
   return (
     <div
       role="button"
@@ -73,6 +102,9 @@ export function MetricsBar({
       <div className="flex flex-col items-center">
         <span className="text-[10px] text-neutral-500 font-semibold uppercase tracking-wider mb-1">Queue</span>
         <span className="text-xl font-bold text-neutral-200 font-mono leading-none">{queuedTasksLength}</span>
+        {drainMinutes !== null && (
+          <span className="text-xs text-neutral-500 font-mono mt-0.5">Est. drain: {formatDrainTime(drainMinutes)}</span>
+        )}
       </div>
       <div className="w-px h-8 bg-neutral-800"></div>
       <button className="flex flex-col items-center group" onClick={(e) => { e.stopPropagation(); onRefresh(); }} title="Click to refresh">

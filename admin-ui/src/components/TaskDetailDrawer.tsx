@@ -113,14 +113,29 @@ function DirectionsSection({ directions }: { directions: { text: string; priorit
   );
 }
 
-function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void }) {
+function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task: Task; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void; onGoToLogs?: () => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
   const prArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url));
   const commitArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT');
   const investigationArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT');
-  const multiPR = prArtifacts.length > 1;
+  // Group PR and commit artifacts by iteration for display
+  const artifactIterations: { iteration: number; prs: typeof prArtifacts; commits: typeof commitArtifacts }[] = [];
+  if (task.artifacts && task.artifacts.length > 0) {
+    const iterSet = new Set<number>([
+      ...prArtifacts.map(a => a.iteration ?? 1),
+      ...commitArtifacts.map(a => a.iteration ?? 1),
+    ]);
+    Array.from(iterSet).sort((a, b) => a - b).forEach(iter => {
+      artifactIterations.push({
+        iteration: iter,
+        prs: prArtifacts.filter(a => (a.iteration ?? 1) === iter),
+        commits: commitArtifacts.filter(a => (a.iteration ?? 1) === iter),
+      });
+    });
+  }
+  const multiIteration = artifactIterations.length > 1;
 
   return (
     <div className="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-1">
@@ -361,7 +376,13 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpP
             {task.error_logs}
           </pre>
           {task.error_logs_truncated && (
-            <p className="text-xs text-neutral-500 mt-1 italic">Output truncated to 2000 characters. View full logs in the Logs tab.</p>
+            <p className="text-xs text-neutral-500 mt-1 italic">Output truncated to 2000 characters.{' '}
+              {onGoToLogs ? (
+                <button onClick={onGoToLogs} className="text-blue-400 underline text-xs">Go to Logs tab</button>
+              ) : (
+                'View full logs in the Logs tab.'
+              )}
+            </p>
           )}
         </>
       )}
@@ -407,40 +428,44 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpP
 
       {task.artifacts && task.artifacts.length > 0 ? (
         <>
-          {prArtifacts.length > 0 && (
+          {(prArtifacts.length > 0 || commitArtifacts.length > 0) && (
             <>
-              <SectionHeader>Pull Request{multiPR ? 's' : ''}</SectionHeader>
-              <div className="space-y-1">
-                {prArtifacts.map((a, i) => (
-                  <a
-                    key={i}
-                    href={a.pr_url!}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
-                  >
-                    {multiPR && <span className="text-xs text-neutral-500 font-mono">Iteration {a.iteration}</span>}
-                    {a.pr_url}
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                ))}
-              </div>
-            </>
-          )}
-          {commitArtifacts.length > 0 && (
-            <>
-              <SectionHeader>Git Commit{commitArtifacts.length > 1 ? 's' : ''}</SectionHeader>
-              <div className="space-y-1">
-                {commitArtifacts.map((a, i) => (
-                  <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300">
-                    {a.commit_hash && <span className="text-emerald-400">{a.commit_hash.slice(0, 8)}</span>}
-                    {a.repo_url && isSafeUrl(a.repo_url) ? (
-                      <a href={a.repo_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1">
-                        {a.repo_url}<ExternalLink className="w-3 h-3" />
-                      </a>
-                    ) : a.repo_url ? (
-                      <span className="text-neutral-400">{a.repo_url}</span>
-                    ) : null}
+              <SectionHeader>Code Output</SectionHeader>
+              <div className="space-y-3">
+                {artifactIterations.map(({ iteration, prs, commits }) => (
+                  <div key={iteration}>
+                    {multiIteration && (
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span className="text-xs text-neutral-500 font-mono">Iteration {iteration}</span>
+                        <div className="flex-1 border-t border-neutral-700" />
+                      </div>
+                    )}
+                    <div className="space-y-1">
+                      {prs.map((a, i) => (
+                        <a
+                          key={i}
+                          href={a.pr_url!}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                        >
+                          {a.pr_url}
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      ))}
+                      {commits.map((a, i) => (
+                        <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300">
+                          {a.commit_hash && <span className="text-emerald-400">{a.commit_hash.slice(0, 8)}</span>}
+                          {a.repo_url && isSafeUrl(a.repo_url) ? (
+                            <a href={a.repo_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1">
+                              {a.repo_url}<ExternalLink className="w-3 h-3" />
+                            </a>
+                          ) : a.repo_url ? (
+                            <span className="text-neutral-400">{a.repo_url}</span>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -523,6 +548,26 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask }: { task: Task; gcpP
   );
 }
 
+type LogLevel = 'all' | 'error' | 'warn' | 'status';
+
+function matchesLevel(line: string, level: LogLevel): boolean {
+  if (level === 'all') return true;
+  if (level === 'error') {
+    return (
+      line.includes('[error]') || line.includes('[stderr]') ||
+      line.includes('Error:') || line.includes('ERROR') ||
+      line.includes('Exception') || line.includes('Traceback')
+    );
+  }
+  if (level === 'warn') {
+    return line.includes('[warn]') || line.includes('WARNING') || line.includes('[warning]');
+  }
+  if (level === 'status') {
+    return line.startsWith('[Status:') || line.startsWith('Status changed:');
+  }
+  return true;
+}
+
 function highlightMatch(text: string, filter: string): ReactNode {
   if (!filter) return text;
   const filterLower = filter.toLowerCase();
@@ -549,6 +594,8 @@ function LogsTab({
   task,
   logFilter,
   setLogFilter,
+  logLevel,
+  setLogLevel,
   showLineNumbers,
   logsConnecting,
 }: {
@@ -556,22 +603,30 @@ function LogsTab({
   task: Task;
   logFilter: string;
   setLogFilter: (v: string) => void;
+  logLevel: LogLevel;
+  setLogLevel: (v: LogLevel) => void;
   showLineNumbers: boolean;
   logsConnecting: boolean;
 }) {
   const logEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (logFilter) return;
+    if (logFilter || logLevel !== 'all') return;
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logLines, logFilter]);
+  }, [logLines, logFilter, logLevel]);
 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
 
+  const errorCount = logLines.filter(l => matchesLevel(l, 'error')).length;
+  const warnCount = logLines.filter(l => matchesLevel(l, 'warn')).length;
+  const statusCount = logLines.filter(l => matchesLevel(l, 'status')).length;
+
   const indexedLines = logLines.map((line, i) => ({ line, idx: i }));
-  const filteredLines = logFilter
-    ? indexedLines.filter(({ line }) => line.toLowerCase().includes(logFilter.toLowerCase()))
-    : indexedLines;
+  const filteredLines = indexedLines.filter(({ line }) => {
+    if (logLevel !== 'all' && !matchesLevel(line, logLevel)) return false;
+    if (logFilter && !line.toLowerCase().includes(logFilter.toLowerCase())) return false;
+    return true;
+  });
 
   if (logLines.length === 0) {
     if (logsConnecting) {
@@ -589,27 +644,51 @@ function LogsTab({
     );
   }
 
+  const levelButtons: { level: LogLevel; label: string; count?: number; activeClass: string }[] = [
+    { level: 'all', label: 'ALL', activeClass: 'bg-neutral-700 text-neutral-100' },
+    { level: 'error', label: 'ERROR', count: errorCount, activeClass: 'bg-red-500/20 text-red-400 border-red-500/30' },
+    { level: 'warn', label: 'WARN', count: warnCount, activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/30' },
+    { level: 'status', label: 'STATUS', count: statusCount, activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/30' },
+  ];
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="px-4 py-2 border-b border-neutral-800 flex items-center gap-2 shrink-0">
-        <Search className="w-3.5 h-3.5 text-neutral-500 flex-shrink-0" />
-        <input
-          type="text"
-          placeholder="Filter logs..."
-          className="flex-1 bg-transparent text-xs text-neutral-300 outline-none placeholder-neutral-600"
-          value={logFilter}
-          onChange={e => setLogFilter(e.target.value)}
-        />
-        {logFilter && (
-          <span className="text-xs text-neutral-500 shrink-0">
-            {filteredLines.length} / {logLines.length} lines
-          </span>
-        )}
-        {logFilter && (
-          <button onClick={() => setLogFilter('')} aria-label="Clear filter">
-            <X className="w-3 h-3 text-neutral-500" />
-          </button>
-        )}
+      <div className="px-3 py-2 border-b border-neutral-800 flex flex-col gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {levelButtons.map(({ level, label, count, activeClass }) => (
+            <button
+              key={level}
+              onClick={() => setLogLevel(level)}
+              className={`px-2 py-0.5 rounded-full text-xs font-medium border transition-colors ${
+                logLevel === level
+                  ? `${activeClass} border-current`
+                  : 'bg-transparent text-neutral-500 border-neutral-700 hover:text-neutral-300 hover:border-neutral-600'
+              }`}
+            >
+              {label}{count !== undefined ? ` (${count})` : ''}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <Search className="w-3.5 h-3.5 text-neutral-500 flex-shrink-0" />
+          <input
+            type="text"
+            placeholder="Filter logs..."
+            className="flex-1 bg-transparent text-xs text-neutral-300 outline-none placeholder-neutral-600"
+            value={logFilter}
+            onChange={e => setLogFilter(e.target.value)}
+          />
+          {(logFilter || logLevel !== 'all') && (
+            <span className="text-xs text-neutral-500 shrink-0">
+              {filteredLines.length} / {logLines.length} lines
+            </span>
+          )}
+          {logFilter && (
+            <button onClick={() => setLogFilter('')} aria-label="Clear filter">
+              <X className="w-3 h-3 text-neutral-500" />
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto p-4 custom-scrollbar font-mono text-xs leading-relaxed">
         {filteredLines.map(({ line, idx }) => {
@@ -659,6 +738,7 @@ export function TaskDetailDrawer({
 }: TaskDetailDrawerProps) {
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
+  const [logLevel, setLogLevel] = useState<LogLevel>('all');
   const [showLineNumbers, setShowLineNumbers] = useState(false);
   const [copiedLogs, setCopiedLogs] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
@@ -672,6 +752,8 @@ export function TaskDetailDrawer({
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLogFilter('');
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLogLevel('all');
   }, [task.id]);
 
   // Clean up drag listeners on unmount
@@ -852,7 +934,7 @@ export function TaskDetailDrawer({
           </div>
         )}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
+          <DetailsTab task={task} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} onGoToLogs={() => setActiveTab('logs')} />
         ) : (
           <>
             {wsDisconnected && (
@@ -866,6 +948,8 @@ export function TaskDetailDrawer({
               task={task}
               logFilter={logFilter}
               setLogFilter={setLogFilter}
+              logLevel={logLevel}
+              setLogLevel={setLogLevel}
               showLineNumbers={showLineNumbers}
               logsConnecting={logsConnecting}
             />

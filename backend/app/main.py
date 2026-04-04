@@ -14,6 +14,7 @@ import ipaddress
 from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func as _func
 from sqlmodel import select
 import uuid
 import asyncio
@@ -52,6 +53,7 @@ from app.github import (
     get_check_runs,
     close_github_client,
 )
+import time
 import hmac
 import hashlib
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -380,6 +382,7 @@ async def _check_monitoring_window():
             async with AsyncSessionLocal() as session:
                 state = await session.get(DeploymentState, 1)
                 if state and state.status == DeploymentStatus.MONITORING:
+                    old_status = state.status
                     state.status = DeploymentStatus.STABLE
                     state.last_known_good_revision = state.current_revision
                     state.last_known_good_sha = state.current_sha
@@ -387,6 +390,11 @@ async def _check_monitoring_window():
                     session.add(state)
                     await session.commit()
                     logger.info("[DEPLOY] Monitoring idle timeout — no tasks ran, marking STABLE")
+                    logger.info('deployment_monitor_state_change', extra={
+                        'old_status': str(old_status),
+                        'new_status': str(state.status),
+                        'rollback_triggered': False,
+                    })
             deploy_monitoring["window_start"] = None
         return
 
@@ -406,6 +414,11 @@ async def _check_monitoring_window():
                 session.add(state)
                 await session.commit()
                 logger.warning(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
+                logger.info('deployment_monitor_state_change', extra={
+                    'old_status': str(state.status),
+                    'new_status': str(state.status),
+                    'rollback_triggered': True,
+                })
             else:
                 # No rollback target available — stay in MONITORING, don't promote to STABLE
                 state.rollback_reason = f"Issues detected but no rollback target: {reason}"
@@ -418,6 +431,7 @@ async def _check_monitoring_window():
             logger.info(f"[DEPLOY] External issue during monitoring: {reason}")
         else:
             # Passed monitoring window — mark stable
+            old_status = state.status
             state.status = DeploymentStatus.STABLE
             state.last_known_good_revision = state.current_revision
             state.last_known_good_sha = state.current_sha
@@ -425,6 +439,11 @@ async def _check_monitoring_window():
             session.add(state)
             await session.commit()
             logger.info(f"[DEPLOY] Monitoring window passed — marked STABLE (revision={state.current_revision})")
+            logger.info('deployment_monitor_state_change', extra={
+                'old_status': str(old_status),
+                'new_status': str(state.status),
+                'rollback_triggered': False,
+            })
 
     deploy_monitoring["window_start"] = None
 
@@ -524,12 +543,33 @@ async def _check_external_health():
     # Re-enable rate-limited accounts after cooldown
     recheck_disabled_accounts()
 
+    # Log zone health transitions (available ↔ exhausted)
+    global _last_exhausted_zones
+    zone_summary = _get_zone_health_summary()
+    current_exhausted = set(zone_summary.get("exhausted", []))
+    available_zones = zone_summary.get("available", 0)
+    total_zones = zone_summary.get("total_zones", 0)
+    for zone in current_exhausted - _last_exhausted_zones:
+        logger.warning('zone_health_exhausted', extra={
+            'zone': zone,
+            'available_zones': available_zones,
+            'total_zones': total_zones,
+        })
+    for zone in _last_exhausted_zones - current_exhausted:
+        logger.info('zone_health_recovered', extra={
+            'zone': zone,
+            'available_zones': available_zones,
+            'total_zones': total_zones,
+        })
+    _last_exhausted_zones = current_exhausted
+
     if failed:
         logger.error(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
 
 
 _pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
 _health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
+_last_exhausted_zones: set = set()  # tracks zone health for transition logging
 
 async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
@@ -1080,14 +1120,23 @@ async def reaper_service():
                     if task.last_heartbeat:
                         age = int((now - task.last_heartbeat).total_seconds())
                         reap_reason = f"No heartbeat for {age}s (last: {task.last_heartbeat.isoformat()})"
+                        reap_reason_code = 'heartbeat_timeout'
                     elif task.started_at:
                         age = int((now - task.started_at).total_seconds())
                         reap_reason = f"No heartbeat received after {age}s since provisioning"
+                        reap_reason_code = 'provision_timeout'
                     else:
                         age = int((now - task.created_at).total_seconds())
                         reap_reason = f"Never started — {age}s since creation, no heartbeat"
+                        reap_reason_code = 'never_started'
 
-                    logger.info(f"[REAPER] Terminating orphaned task {task.id} (VM: {task.vm_instance_id}) — {reap_reason}")
+                    task_type = ((task.payloads or [{}])[0]).get("type", "unknown")
+                    logger.info('reaper_task_reaped', extra={
+                        'task_id': str(task.id),
+                        'task_type': task_type,
+                        'reap_reason': reap_reason_code,
+                        'vm_instance_id': task.vm_instance_id,
+                    })
 
                     if task.vm_instance_id:
                         asyncio.create_task(delete_agent_vm(task.vm_instance_id))
@@ -1204,6 +1253,8 @@ async def orchestrator_worker():
         try:
             global _orchestrator_last_cycle
             _orchestrator_last_cycle = datetime.utcnow()
+            cycle_start = time.monotonic()
+            tasks_recovered = 0
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
@@ -1221,6 +1272,7 @@ async def orchestrator_worker():
                         t.started_at = None
                         t.vm_instance_id = None
                         session.add(t)
+                        tasks_recovered += 1
                         logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
                 if session.dirty:
                     await session.commit()
@@ -1232,7 +1284,17 @@ async def orchestrator_worker():
                 # Enforce concurrency limit
                 active_count = len(active_tasks_result)
                 slots_available = max(0, _runtime_config["max_concurrent_vms"] - active_count)
+                _shared_state.tasks_active_gauge = active_count
                 if slots_available == 0:
+                    # Update queued gauge even when we skip dispatching
+                    _shared_state.tasks_queued_gauge = (await session.execute(
+                        select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+                    )).scalar() or 0
+                    logger.info('orchestrator_cycle_complete', extra={
+                        'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
+                        'tasks_dispatched': 0,
+                        'tasks_recovered': tasks_recovered,
+                    })
                     await asyncio.sleep(5)
                     continue
 
@@ -1386,6 +1448,10 @@ async def orchestrator_worker():
                     queued_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
+                _shared_state.tasks_queued_gauge = (await session.execute(
+                    select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+                )).scalar() or 0
+                # tasks_active_gauge already set above after active_count is computed
 
                 for task in queued_tasks:
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
@@ -1658,12 +1724,19 @@ async def orchestrator_worker():
                         except Exception as e:
                             logger.error(f"[CI] Failed to update ci_task status after error for task {ci_task.id}: {e}", exc_info=True)
 
+            logger.info('orchestrator_cycle_complete', extra={
+                'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
+                'tasks_dispatched': len(queued_tasks),
+                'tasks_recovered': tasks_recovered,
+            })
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
         except Exception as e:
-            logger.error(f"[ORCHESTRATOR] Error: {e}", exc_info=True)
-            
+            logger.error('orchestrator_cycle_error', extra={
+                'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
+            }, exc_info=True)
+
         # Monitoring checks run every cycle (not just when idle)
         try:
             await _check_monitoring_window()
@@ -1774,6 +1847,8 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     try:
         state = await session.get(DeploymentState, 1)
         if state:
+            monitoring_since = _shared_state.deploy_monitoring.get("window_start")
+            recent_results = _shared_state.deploy_monitoring.get("task_results", [])[-10:]
             deploy_state = {
                 "revision": state.current_revision,
                 "sha": state.current_sha[:8] if state.current_sha else "",
@@ -1783,6 +1858,11 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
                 "rollback_count": state.rollback_count,
                 "rollback_reason": state.rollback_reason,
                 "pause_reason": state.pause_reason,
+                "monitoring_since": monitoring_since.isoformat() if monitoring_since else None,
+                "recent_outcomes": [
+                    {"created_at": ts, "status": outcome, "failure_class": fc}
+                    for ts, outcome, fc in recent_results
+                ],
             }
     except Exception as e:
         logger.warning(f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}", exc_info=True)
@@ -1957,6 +2037,64 @@ async def health_check():
             "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors")},
         }
     )
+
+_METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
+
+
+@app.get("/metrics")
+async def prometheus_metrics(request: Request):
+    """Prometheus-compatible metrics endpoint (text/plain exposition format).
+
+    Unauthenticated by default. If METRICS_TOKEN env var is set, requires
+    ?token=<value> query param matching that value.
+    """
+    if _METRICS_TOKEN:
+        token = request.query_params.get("token", "")
+        if not hmac.compare_digest(token, _METRICS_TOKEN):
+            return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    cycle_age: Optional[float] = None
+    if _orchestrator_last_cycle:
+        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+
+    active_vms = sum(a.get("active_tasks", 0) for a in _max_plan_pool)
+    consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
+
+    lines: list[str] = []
+
+    def gauge(name: str, help_text: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        label_str = ""
+        if labels:
+            label_str = "{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}"
+        lines.append(f"{name}{label_str} {value}")
+
+    def counter(name: str, help_text: str, value: float) -> None:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} counter")
+        lines.append(f"{name} {value}")
+
+    gauge("blueprint_tasks_queued", "Number of tasks currently queued", _shared_state.tasks_queued_gauge)
+    gauge("blueprint_tasks_active", "Number of tasks currently provisioning or in progress", _shared_state.tasks_active_gauge)
+    counter("blueprint_tasks_completed_total", "Cumulative number of completed tasks", _shared_state.tasks_completed_total)
+    counter("blueprint_tasks_failed_total", "Cumulative number of failed tasks", _shared_state.tasks_failed_total)
+    gauge("blueprint_orchestrator_cycle_age_seconds", "Seconds since last orchestrator cycle", cycle_age if cycle_age is not None else -1)
+    gauge("blueprint_active_vms", "Current active VM count from Max Plan pool", active_vms)
+
+    if _shared_state.circuit_breakers:
+        lines.append("# HELP blueprint_circuit_breaker_open 1 if circuit breaker is OPEN, 0 otherwise")
+        lines.append("# TYPE blueprint_circuit_breaker_open gauge")
+        for project_id, breaker in _shared_state.circuit_breakers.items():
+            is_open = 1 if breaker.get("state") == "OPEN" else 0
+            lines.append(f'blueprint_circuit_breaker_open{{project_id="{project_id}"}} {is_open}')
+
+    gauge("blueprint_autonomous_consecutive_failures", "Consecutive autonomous task failures", consecutive_failures)
+
+    body = "\n".join(lines) + "\n"
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
@@ -4603,12 +4741,14 @@ async def update_agent_status(
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-        # Record result for deployment monitoring
+        # Record result for deployment monitoring and update Prometheus counters
         if payload.status == TaskStatus.COMPLETED:
             record_task_result(success=True, task_id=str(task.id))
+            _shared_state.tasks_completed_total += 1
         else:
             failure_class = classify_failure(task, payload.logs)
             record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
+            _shared_state.tasks_failed_total += 1
 
         # Release Max plan account slot
         acct_id = (task.context or {}).get("max_plan_account_id")

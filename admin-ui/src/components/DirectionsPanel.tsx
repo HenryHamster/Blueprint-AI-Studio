@@ -67,7 +67,7 @@ const STATUS_GROUPS: Array<{ key: 'active' | 'paused' | 'completed'; label: stri
   { key: 'completed', label: 'Completed' },
 ];
 
-export function DirectionsPanel({ onClose }: { onClose: () => void }) {
+export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [directions, setDirections] = useState<Direction[]>([]);
@@ -135,7 +135,10 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
       const data = await res.json();
       const val = data.autonomous_direction_cooldown_minutes;
       if (typeof val === 'number' && val > 0) setCooldownMinutes(val);
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error('Failed to fetch cooldown setting:', err);
+      addToast('Failed to load cooldown settings', 'error');
+    }
   }
 
   async function fetchProjects() {
@@ -147,7 +150,10 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
       const list = Array.isArray(data) ? data : data.projects ?? [];
       setProjects(list);
       if (list.length > 0 && !selectedProjectId) setSelectedProjectId(list[0].id);
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error('Failed to fetch projects:', err);
+      addToast('Failed to load projects', 'error');
+    }
   }
 
   async function fetchDirections() {
@@ -166,7 +172,10 @@ export function DirectionsPanel({ onClose }: { onClose: () => void }) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error('Failed to fetch directions:', err);
+      addToast('Failed to load directions', 'error');
+    }
     setLoading(false);
   }
 
