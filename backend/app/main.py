@@ -379,10 +379,6 @@ async def _init_deployment_state():
         try:
             if state.runtime_autonomous_research_interval_minutes is not None:
                 _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
-            if state.runtime_autonomous_research_model is not None:
-                _runtime_config["autonomous_research_model"] = state.runtime_autonomous_research_model
-            if state.runtime_autonomous_research_effort is not None:
-                _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
         # Restore circuit breaker state — prevents deploy from clearing tripped breakers
@@ -939,9 +935,9 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # with parent_task_id set) correctly inherits its parent's staging branch.
     base_branch = "main"
 
-    # Use per-type defaults, fall back to autonomous-specific config
-    research_model = _runtime_config.get("task_type_models", {}).get("research") or _runtime_config.get("autonomous_research_model") or None
-    research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or _runtime_config.get("autonomous_research_effort") or None
+    # Use per-type defaults
+    research_model = _runtime_config.get("task_type_models", {}).get("research") or None
+    research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     research_payload: dict = {
         "type": "research",

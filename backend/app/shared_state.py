@@ -30,8 +30,6 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 5,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
-    "autonomous_research_model": None,
-    "autonomous_research_effort": None,
     # Per-task-type model/effort defaults (synced from frontend settings)
     # e.g. {"research": "claude-opus-4-6", "create": "claude-sonnet-4-6"}
     "task_type_models": {},

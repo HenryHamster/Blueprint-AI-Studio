@@ -106,8 +106,6 @@ export function useAppState() {
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
   const [minResearchIntervalHours, setMinResearchIntervalHours] = useState(24);
   const [directionCooldownMinutes, setDirectionCooldownMinutes] = useState(240);
-  const [autonomousResearchModel, setAutonomousResearchModel] = useState('');
-  const [autonomousResearchEffort, setAutonomousResearchEffort] = useState('');
   const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
   const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
@@ -1035,8 +1033,6 @@ export function useAppState() {
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
         setMinResearchIntervalHours(data.min_research_interval_hours ?? 24);
         setDirectionCooldownMinutes(data.autonomous_direction_cooldown_minutes ?? 240);
-        setAutonomousResearchModel(data.autonomous_research_model ?? '');
-        setAutonomousResearchEffort(data.autonomous_research_effort ?? '');
         setHealthCheckUrls(data.health_check_urls ?? []);
         setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
         setUsingMaxPlan(data.using_max_plan ?? false);
@@ -1237,36 +1233,6 @@ export function useAppState() {
     } catch {
       setDirectionCooldownMinutes(prev);
       addToast('Failed to update direction cooldown', 'error');
-    }
-  };
-
-  const handleUpdateAutonomousResearchModel = async (value: string) => {
-    const prev = autonomousResearchModel;
-    setAutonomousResearchModel(value);
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
-        method: 'PATCH', headers: await authHeaders(),
-        body: JSON.stringify({ autonomous_research_model: value }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch {
-      setAutonomousResearchModel(prev);
-      addToast('Failed to update research model', 'error');
-    }
-  };
-
-  const handleUpdateAutonomousResearchEffort = async (value: string) => {
-    const prev = autonomousResearchEffort;
-    setAutonomousResearchEffort(value);
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
-        method: 'PATCH', headers: await authHeaders(),
-        body: JSON.stringify({ autonomous_research_effort: value }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch {
-      setAutonomousResearchEffort(prev);
-      addToast('Failed to update research effort', 'error');
     }
   };
 
@@ -1719,10 +1685,10 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownMinutes, autonomousResearchModel, autonomousResearchEffort,
+    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownMinutes,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     agentPromptSuffixes, updateAgentPromptSuffixes,
-    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldownMinutes, handleUpdateAutonomousResearchModel, handleUpdateAutonomousResearchEffort,
+    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldownMinutes,
     healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

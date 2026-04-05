@@ -53,10 +53,6 @@ export interface HeaderBarProps {
   onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
-  autonomousResearchModel: string;
-  onUpdateAutonomousResearchModel: (value: string) => void;
-  autonomousResearchEffort: string;
-  onUpdateAutonomousResearchEffort: (value: string) => void;
   onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
@@ -142,10 +138,6 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateMinResearchIntervalHours,
     directionCooldownMinutes,
     onUpdateDirectionCooldownMinutes,
-    autonomousResearchModel,
-    onUpdateAutonomousResearchModel,
-    autonomousResearchEffort,
-    onUpdateAutonomousResearchEffort,
     onSyncTaskTypeDefaults,
     agentPromptSuffixes,
     onUpdateAgentPromptSuffixes,
@@ -291,10 +283,6 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMinResearchIntervalHours={onUpdateMinResearchIntervalHours}
           directionCooldownMinutes={directionCooldownMinutes}
           onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
-          autonomousResearchModel={autonomousResearchModel}
-          onUpdateAutonomousResearchModel={onUpdateAutonomousResearchModel}
-          autonomousResearchEffort={autonomousResearchEffort}
-          onUpdateAutonomousResearchEffort={onUpdateAutonomousResearchEffort}
           onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}
           healthCheckUrls={props.healthCheckUrls}
           onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}

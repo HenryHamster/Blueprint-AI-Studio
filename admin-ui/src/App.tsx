@@ -340,10 +340,6 @@ export default function App() {
         onUpdateMinResearchIntervalHours={s.handleUpdateMinResearchIntervalHours}
         directionCooldownMinutes={s.directionCooldownMinutes}
         onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
-        autonomousResearchModel={s.autonomousResearchModel}
-        onUpdateAutonomousResearchModel={s.handleUpdateAutonomousResearchModel}
-        autonomousResearchEffort={s.autonomousResearchEffort}
-        onUpdateAutonomousResearchEffort={s.handleUpdateAutonomousResearchEffort}
         onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}
         healthCheckUrls={s.healthCheckUrls}
         onUpdateHealthCheckUrls={s.updateHealthCheckUrls}

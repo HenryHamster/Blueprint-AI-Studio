@@ -1038,8 +1038,6 @@ async def get_settings(
         "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
         "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
-        "autonomous_research_model": _runtime_config.get("autonomous_research_model") or "",
-        "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
         "task_type_models": _runtime_config.get("task_type_models", {}),
         "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
@@ -1126,16 +1124,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
         _runtime_config["autonomous_research_interval_minutes"] = val
-    if "autonomous_research_model" in payload:
-        val = payload["autonomous_research_model"] or None
-        if val is not None and val not in ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"):
-            raise HTTPException(status_code=400, detail="Invalid autonomous_research_model")
-        _runtime_config["autonomous_research_model"] = val
-    if "autonomous_research_effort" in payload:
-        val = payload["autonomous_research_effort"] or None
-        if val is not None and val not in ("low", "medium", "high"):
-            raise HTTPException(status_code=400, detail="autonomous_research_effort must be low, medium, or high")
-        _runtime_config["autonomous_research_effort"] = val
     VALID_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", ""}
     VALID_EFFORTS = {"low", "medium", "high", "max", ""}
     if "task_type_models" in payload:
@@ -1229,8 +1217,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
             state.runtime_max_global_autonomous_tasks_per_hour = _runtime_config.get("max_global_autonomous_tasks_per_hour")
             state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-            state.runtime_autonomous_research_model = _runtime_config.get("autonomous_research_model")
-            state.runtime_autonomous_research_effort = _runtime_config.get("autonomous_research_effort")
             session.add(state)
             await session.commit()
             logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")

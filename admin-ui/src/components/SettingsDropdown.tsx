@@ -31,10 +31,6 @@ interface SettingsDropdownProps {
   onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
-  autonomousResearchModel: string;
-  onUpdateAutonomousResearchModel: (value: string) => void;
-  autonomousResearchEffort: string;
-  onUpdateAutonomousResearchEffort: (value: string) => void;
   onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
@@ -124,10 +120,6 @@ export function SettingsDropdown({
   onUpdateMinResearchIntervalHours,
   directionCooldownMinutes,
   onUpdateDirectionCooldownMinutes,
-  autonomousResearchModel,
-  onUpdateAutonomousResearchModel,
-  autonomousResearchEffort,
-  onUpdateAutonomousResearchEffort,
   onSyncTaskTypeDefaults,
   healthCheckUrls,
   onUpdateHealthCheckUrls,
@@ -503,32 +495,6 @@ export function SettingsDropdown({
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(minResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 8760) onUpdateMinResearchIntervalHours(n); else setMinResearchIntervalInputVal(String(minResearchIntervalHours)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
-          </div>
-          <div className="mb-4">
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Model</label>
-            <select
-              value={autonomousResearchModel}
-              onChange={e => onUpdateAutonomousResearchModel(e.target.value)}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            >
-              <option value="">Orchestrator default</option>
-              <option value="claude-opus-4-6">claude-opus-4-6</option>
-              <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-              <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
-            </select>
-          </div>
-          <div className="mb-4">
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Research Effort</label>
-            <select
-              value={autonomousResearchEffort}
-              onChange={e => onUpdateAutonomousResearchEffort(e.target.value)}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            >
-              <option value="">Orchestrator default</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-            </select>
           </div>
 
           <div className="mb-4">

@@ -396,7 +396,7 @@ function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
   if (touchesBackend) {
     sendLog(ws, 'Running backend ruff lint...\n');
     try {
-      const lintOut = execFileSync('python', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
+      const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
       sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -407,7 +407,7 @@ function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
     }
     sendLog(ws, 'Running backend ruff format check...\n');
     try {
-      const fmtOut = execFileSync('python', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
+      const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
       sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -481,11 +481,11 @@ async function testFixLoop(
 
   if (runners.length === 0) {
     if (existsSync(pytestIniPath)) {
-      runners.push({ cmd: 'python', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
+      runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
     } else if (existsSync(pyprojectPath)) {
       try {
         if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
-          runners.push({ cmd: 'python', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
+          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
         }
       } catch { /* unreadable — skip */ }
     }
@@ -502,11 +502,11 @@ async function testFixLoop(
     const agentPkg = `${WORKSPACE}/agent/package.json`;
 
     if (existsSync(backendPytestIni)) {
-      runners.push({ cmd: 'python', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
+      runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
     } else if (existsSync(backendPyproject)) {
       try {
         if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
-          runners.push({ cmd: 'python', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
+          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
         }
       } catch { /* unreadable — skip */ }
     }
@@ -2044,12 +2044,12 @@ Follow these steps:
 
    b. CURATED: Run pytest with the args from suites.curated.pytest_args.
       Working directory: backend/
-      Command: python -m pytest <pytest_args from config>
+      Command: python3 -m pytest <pytest_args from config>
       Record individual test results (name, pass/fail, error message if any).
 
    c. REGRESSION: Run pytest with the args from suites.regression.pytest_args.
       Working directory: backend/
-      Command: python -m pytest <pytest_args from config>
+      Command: python3 -m pytest <pytest_args from config>
       Record individual test results.
 
 3. Check guardrails from the config:
