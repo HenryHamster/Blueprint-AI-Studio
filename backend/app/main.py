@@ -932,10 +932,16 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
-            if minutes_ago < cooldown_minutes:
+            effective_cooldown = cooldown_minutes
+            if d.get("possibly_saturated"):
+                effective_cooldown = cooldown_minutes * 2.0
+                logger.debug(
+                    f"[RESEARCH] Direction {did} saturated — applying 2x cooldown ({cooldown_minutes*2}m)"
+                )
+            if minutes_ago < effective_cooldown:
                 logger.debug(
                     f"[RESEARCH] Skipping direction {did}: last researched "
-                    f"{minutes_ago:.1f}m ago (cooldown: {cooldown_minutes}m)"
+                    f"{minutes_ago:.1f}m ago (cooldown: {effective_cooldown}m)"
                 )
                 continue
         active_directions.append(d)
@@ -953,8 +959,12 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
         chosen_direction = random.choice(top_tier)
     else:
-        # All have been researched — pick highest priority first, then oldest researched
-        active_directions.sort(key=lambda d: (priority_rank.get(d.get("priority", "medium"), 1), d.get("last_researched_at") or ""))
+        # All have been researched — pick highest priority first, then non-saturated, then oldest researched
+        active_directions.sort(key=lambda d: (
+            priority_rank.get(d.get("priority", "medium"), 1),
+            1 if d.get("possibly_saturated") else 0,
+            d.get("last_researched_at") or ""
+        ))
         chosen_direction = active_directions[0]
 
     # Guard: no research task actively running (queued/provisioning/in_progress).
@@ -5354,6 +5364,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                                 "depth": research_depth,
                                 "tasks_created": len(child_tasks),
                                 "finding_titles": [f.get("title", "") for _, f, _ in deduplicated[:3]],
+                                "insights": [i["summary"][:150] for i in insights[:2]],  # up to 2 insights, capped
                             })
                             last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
                             history[-1] = last_entry

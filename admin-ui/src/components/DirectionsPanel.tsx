@@ -1049,7 +1049,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     </button>
                                     {historyOpenIds[d.id] && (
                                       <div className="mt-1.5 space-y-2">
-                                        {d.research_history.slice(0, 5).map((entry, i) => (
+                                        {[...d.research_history].reverse().slice(0, 5).map((entry, i) => (
                                           <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-[10px]">
                                             <div className="flex items-center justify-between mb-1">
                                               <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>

@@ -503,14 +503,23 @@ async function testFixLoop(
   if (runners.length === 0) {
     const backendPytestIni = `${WORKSPACE}/backend/pytest.ini`;
     const backendPyproject = `${WORKSPACE}/backend/pyproject.toml`;
+    const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
     const agentPkg = `${WORKSPACE}/agent/package.json`;
 
     if (existsSync(backendPytestIni)) {
-      runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
+      if (existsSync(backendTestScript)) {
+        runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend)' });
+      } else {
+        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
+      }
     } else if (existsSync(backendPyproject)) {
       try {
         if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
-          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
+          if (existsSync(backendTestScript)) {
+            runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
+          } else {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
+          }
         }
       } catch { /* unreadable — skip */ }
     }
@@ -1533,6 +1542,19 @@ ${hotspotsSection}
           ? ` [scope: ${(d.paths as string[]).join(', ')}]`
           : '';
         const history = Array.isArray(d.research_history) ? d.research_history as Array<Record<string, unknown>> : [];
+        let aggregateSection = '';
+        if (history.length >= 3) {
+          const totalTasksCreated = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0);
+          const totalPrsMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0);
+          const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0);
+          const totalCycles = history.length;
+          const zeroCycles = history.filter(h => ((h.tasks_created as number) || 0) === 0).length;
+          const parts = [`${totalCycles} cycles`, `${totalTasksCreated} tasks created`];
+          if (totalPrsMerged > 0) parts.push(`${totalPrsMerged} merged`);
+          if (totalFailed > 0) parts.push(`${totalFailed} failed`);
+          if (zeroCycles > 0) parts.push(`${zeroCycles} empty cycles`);
+          aggregateSection = `\n  Lifetime: ${parts.join(', ')}.`;
+        }
         let historySection = '';
         if (history.length > 0) {
           const entries = history.slice(-3).map((h) => {
@@ -1548,15 +1570,19 @@ ${hotspotsSection}
             const insights = Array.isArray(h.cycle_insights) && (h.cycle_insights as string[]).length > 0
               ? '\n    Insights: ' + (h.cycle_insights as string[]).join(' | ')
               : '';
-            const subNotes = (h.sub_research_notes as Array<{depth: number; tasks_created: number; finding_titles: string[]}> || []);
+            const subNotes = (h.sub_research_notes as Array<Record<string, unknown>> || []);
             const subSummary = subNotes.length > 0
-              ? '\n' + subNotes.map(s =>
-                  `    Sub-research (depth ${s.depth}): ${s.tasks_created} tasks (${s.finding_titles.join(', ')})`
-                ).join('\n')
+              ? '\n' + subNotes.map((s: Record<string, unknown>) => {
+                  const subInsights = Array.isArray(s.insights) && (s.insights as string[]).length > 0
+                    ? ' — insights: ' + (s.insights as string[]).join('; ')
+                    : '';
+                  const findingTitles = (s.finding_titles as string[] || []);
+                  return `    Sub-research (depth ${s.depth}): ${s.tasks_created} tasks (${findingTitles.join(', ')})${subInsights}`;
+                }).join('\n')
               : '';
             return `  - ${h.timestamp}: ${h.tasks_created} tasks created${outcomeStats} — ${titles}${descs}${insights}${subSummary}`;
           }).join('\n');
-          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):\n${entries}`;
+          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):${aggregateSection}\n${entries}`;
         }
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
