@@ -1,32 +1,31 @@
 import copy
+import hashlib
+import hmac
 import httpx
+import ipaddress
+import json
+import logging
 import os
 import re
-import logging
 import time
+import uuid
+import asyncio
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-import ipaddress
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from typing import List, Dict, Any, Optional
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func as _func
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
-import uuid
-import asyncio
-import json
-from datetime import datetime, timedelta, timezone
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
@@ -59,18 +58,16 @@ from app.github import (
     get_check_runs,
     close_github_client,
 )
-import time
-import hmac
-import hashlib
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
 from app.shared_state import limiter
+import app.shared_state as _shared_state
+from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
-# --- Runtime Config & Autonomous State (shared with admin.py) ---
-from app.shared_state import runtime_config as _runtime_config
-import app.shared_state as _shared_state
+
+def _utcnow() -> datetime:
+    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
@@ -303,7 +300,6 @@ async def _get_actual_gcp_vm_count() -> int:
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 # Webhook dedup: track recent GitHub delivery IDs to prevent duplicate processing
-from collections import OrderedDict, deque
 _webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
@@ -1126,7 +1122,7 @@ async def _check_autonomous_research(owner: str, repo: str):
                 select(Project).where(
                     Project.github_owner == owner,
                     Project.github_repo == repo,
-                    Project.autonomous_enabled == True,
+                    Project.autonomous_enabled.is_(True),
                 )
             )).scalars().first()
             if not project:
@@ -1159,7 +1155,7 @@ async def _check_idle_research():
             from sqlalchemy import func
 
             projects = (await session.execute(
-                select(Project).where(Project.autonomous_enabled == True)
+                select(Project).where(Project.autonomous_enabled.is_(True))
             )).scalars().all()
 
             for project in projects:
@@ -1246,7 +1242,7 @@ class ConnectionManager:
                 self.active_connections[project_id].remove(websocket)
             if not self.active_connections[project_id]:
                 del self.active_connections[project_id]
-        
+
         self.remove_ip(websocket)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):
@@ -1555,7 +1551,7 @@ async def reaper_service():
                                 await _check_and_trigger_rollup(task, session)
                             except Exception as e:
                                 logger.error(f"[REAPER] Rollup check failed for task {task.id}: {e}", exc_info=True)
-                    
+
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break
@@ -1739,7 +1735,7 @@ async def orchestrator_worker():
                 if slots_available == 0:
                     # Update queued gauge even when we skip dispatching
                     _shared_state.tasks_queued_gauge = (await session.execute(
-                        select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+                        select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
                     )).scalar() or 0
                     logger.info('orchestrator_cycle_complete', extra={
                         'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
@@ -1762,8 +1758,8 @@ async def orchestrator_worker():
                 # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
                 candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
-                    Task.requires_approval == False
-                ).order_by(Task.priority.desc(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra to account for dep/conflict filtering
+                    Task.requires_approval.is_(False)
+                ).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -1852,7 +1848,6 @@ async def orchestrator_worker():
                                     continue
                             # Verify each dep's actual DB status before clearing
                             # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
-                            candidate_ids = {t.id for t in candidate_tasks}
                             genuinely_blocked = True
                             async with AsyncSessionLocal() as check_session:
                                 for dep_id in dep_uuids:
@@ -1891,7 +1886,7 @@ async def orchestrator_worker():
                     broad_stmt = select(Task).where(
                         Task.status == TaskStatus.QUEUED,
                         Task.created_at < ten_min_ago,
-                        Task.requires_approval == False,
+                        Task.requires_approval.is_(False),
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
                     broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
@@ -1986,7 +1981,7 @@ async def orchestrator_worker():
 
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
                 _shared_state.tasks_queued_gauge = (await session.execute(
-                    select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+                    select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
                 )).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
@@ -2049,6 +2044,7 @@ async def orchestrator_worker():
                     async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
                                                     payloads: list, token: str, config_json: str,
                                                     acct_id_for_release: str):
+                        success = False
                         try:
                             payload_uri = None
                             if payloads:
@@ -2062,12 +2058,14 @@ async def orchestrator_worker():
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
                             success = False
+                        finally:
+                            # Always release the Max Plan account slot on failure, even if an
+                            # exception escapes the try/except above (e.g. from record_task_result)
+                            if not success and acct_id_for_release:
+                                await release_max_plan_account(acct_id_for_release)
                         if not success:
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
-                            # Release the Max Plan account slot
-                            if acct_id_for_release:
-                                await release_max_plan_account(acct_id_for_release)
                             # Mark as failed immediately to avoid 10 min wait
                             try:
                                 async with AsyncSessionLocal() as inner_session:
@@ -2092,7 +2090,7 @@ async def orchestrator_worker():
                         task.vm_instance_id, task.id, task.project_id,
                         task.payloads, oauth_token, claude_config_json, account_id
                     ))
-                    
+
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
@@ -2297,7 +2295,7 @@ async def orchestrator_worker():
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
-        except Exception as e:
+        except Exception:
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
             }, exc_info=True)
@@ -2343,10 +2341,10 @@ async def lifespan(app: FastAPI):
 
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
-    
+
     # Start the GCP Cleanup Service background task
     gcp_cleanup_task = asyncio.create_task(gcp_cleanup_service())
-    
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -2430,7 +2428,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     """Diagnostic endpoint: check if the orchestrator loop is alive."""
     from sqlalchemy import func
     queued = (await session.execute(
-        select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+        select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
     )).scalar() or 0
     active = (await session.execute(
         select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
@@ -2549,7 +2547,7 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         orch_status = "down"
     try:
         queued = (await session.execute(
-            select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval == False)
+            select(func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
         )).scalar() or 0
         active = (await session.execute(
             select(func.count()).select_from(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
@@ -2887,14 +2885,14 @@ def read_root():
 @limiter.limit("5/minute")
 async def deploy_blueprint(
     request: Request,
-    payload: DeployPayload, 
+    payload: DeployPayload,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     # 1. Create a new Project
     project = Project(
-        name=payload.name, 
+        name=payload.name,
         user_id=current_user["user_id"],
         status=ProjectStatus.DEPLOYING,
         github_owner=payload.github_owner,
@@ -2903,10 +2901,10 @@ async def deploy_blueprint(
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    
+
     # 2. Create Tasks based on the flexible payloads
     created_tasks = []
-    
+
     # Create a parent task for the entire deployment
     parent_task = Task(
         project_id=project.id,
@@ -2918,11 +2916,11 @@ async def deploy_blueprint(
     session.add(parent_task)
     await session.commit()
     await session.refresh(parent_task)
-    
+
     for p in payload.payloads:
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
-        
+
         task = Task(
             project_id=project.id,
             title=p.get("title", "Untitled Subtask"),
@@ -2935,12 +2933,12 @@ async def deploy_blueprint(
         )
         session.add(task)
         created_tasks.append(task)
-        
+
     await session.commit()
-    
+
     # 3. The Orchestrator Worker will automatically pick up QUEUED tasks
     # and provision the VMs in the background.
-    
+
     return {
         "status": "accepted",
         "project_id": project.id,
@@ -2965,7 +2963,7 @@ async def list_projects(
     stmt = select(Project).where(Project.user_id == current_user["user_id"])
     if status:
         stmt = stmt.where(Project.status == status)
-        
+
     stmt = stmt.order_by(Project.created_at.desc()).offset(offset).limit(limit)
     projects = (await session.execute(stmt)).scalars().all()
     return {
@@ -2990,10 +2988,10 @@ async def get_project(
     """
     stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
     project = (await session.execute(stmt)).scalars().first()
-    
+
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-        
+
     return project
 
 @app.get("/api/projects/{project_id}/tasks")
@@ -3015,22 +3013,22 @@ async def get_project_tasks(
     project = (await session.execute(project_stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-        
+
     # Fetch tasks
     tasks_stmt = select(Task).where(Task.project_id == project_id)
     if status:
         tasks_stmt = tasks_stmt.where(Task.status == status)
-        
+
     tasks_stmt = tasks_stmt.order_by(Task.created_at.asc()).offset(offset).limit(limit)
     tasks = (await session.execute(tasks_stmt)).scalars().all()
-    
+
     # Fetch artifacts for these tasks
     task_ids = [t.id for t in tasks]
     artifacts = []
     if task_ids:
         artifacts_stmt = select(Artifact).where(Artifact.task_id.in_(task_ids))
         artifacts = (await session.execute(artifacts_stmt)).scalars().all()
-        
+
     # Group artifacts by task_id
     artifacts_by_task = {}
     research_map = {}
@@ -3062,7 +3060,7 @@ async def get_project_tasks(
             "research_findings": research_map.get(t.id),
         }
         result.append(task_dict)
-        
+
     return {
         "tasks": result,
         "pagination": {
@@ -3091,7 +3089,7 @@ async def generate_ws_ticket(
     project = (await session.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-        
+
     ticket = create_ws_ticket(current_user["user_id"], str(project_id))
     return {"ticket": ticket}
 
@@ -3102,14 +3100,14 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     The frontend connects to this to receive live status changes and logs.
     """
     await websocket.accept()
-    
+
     try:
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         ticket = auth_message.get("ticket")
         if not ticket:
             await websocket.close(code=1008, reason="Missing ticket")
             return
-            
+
         payload = verify_ws_ticket(ticket)
         if payload.get("project_id") != project_id:
             await websocket.close(code=1008, reason="Project ID mismatch")
@@ -3142,7 +3140,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             if len(data) > 10000: # 10KB limit
                 await websocket.close(code=1009, reason="Message too big")
                 return
-            
+
             # Simple rate limiting: 10 messages per second
             current_time = time.time()
             if current_time - last_message_time < 1.0:
@@ -3187,7 +3185,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     WebSocket endpoint for agents to stream high-throughput logs and real-time events.
     """
     await websocket.accept()
-    
+
     # Require the client to send the token as the first message
     try:
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
@@ -3195,7 +3193,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         if not token:
             await websocket.close(code=1008, reason="Missing token")
             return
-            
+
         payload = verify_agent_jwt(token)
         if payload.get("sub") != str(task_id):
             await websocket.close(code=1008, reason="Task ID mismatch")
@@ -3228,7 +3226,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             if len(text_data) > 100000: # 100KB limit for agent logs
                 await websocket.close(code=1009, reason="Message too big")
                 return
-            
+
             # Simple rate limiting: 20 messages per second
             current_time = time.time()
             if current_time - last_message_time < 1.0:
@@ -3281,22 +3279,22 @@ async def claim_task(
     )
     result = await session.execute(stmt)
     task = result.scalars().first()
-    
+
     if not task:
         raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
-        
+
     task.status = TaskStatus.IN_PROGRESS
     session.add(task)
     await session.commit()
     await session.refresh(task)
-    
+
     # Broadcast status change to frontend
     await broadcast_to_project(
-        str(task.project_id), 
-        "task_updated", 
+        str(task.project_id),
+        "task_updated",
         {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS}
     )
-    
+
     # Strip internal fields (max_plan_account_id) from context before returning to agent
     safe_context = {k: v for k, v in (task.context or {}).items() if not k.startswith("max_plan_")}
     response = {
@@ -3444,18 +3442,18 @@ async def get_upload_url(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     stmt = select(Task).where(Task.id == req.task_id)
     task = (await session.execute(stmt)).scalars().first()
-    
+
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-        
+
     import os
     safe_filename = os.path.basename(req.filename)
     url = await generate_upload_signed_url(str(req.task_id), safe_filename)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{req.task_id}/{safe_filename}"
-    
+
     return {
         "upload_url": url,
         "storage_uri": storage_uri
@@ -3535,7 +3533,7 @@ async def spawn_subtask(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     # Get parent task
     parent_task = await session.get(Task, req.task_id)
     if not parent_task:
@@ -3590,9 +3588,9 @@ async def spawn_subtask(
         )
         session.add(new_task)
         new_tasks.append(new_task)
-        
+
     await session.commit()
-    
+
     # Log history for each new task
     for task in new_tasks:
         await session.refresh(task)
@@ -3606,7 +3604,7 @@ async def spawn_subtask(
             }
         )
         session.add(history)
-        
+
     await session.commit()
 
     return {
@@ -3767,14 +3765,7 @@ async def _spawn_pipeline_task(
             session.add(source_task)
             return t
 
-    # Per-PR iteration cap: count ALL completed review/fix tasks for this PR across all chains
-    from sqlalchemy import func as sa_func
-    pr_total = (await session.execute(
-        select(sa_func.count(Task.id)).where(
-            Task.project_id == source_task.project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-        )
-    )).scalar() or 0
+    # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
     # Filter to tasks matching this PR number (check payloads JSONB)
     pr_pipeline_tasks = (await session.execute(
         select(Task).where(
@@ -4626,6 +4617,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await session.commit()
         return
 
+    # Separate direction proposals from actionable findings — proposals become pending
+    # directions awaiting user approval, not implementation tasks.
+    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
+    findings = [f for f in findings if f.get("type") != "direction_proposal"]
+
     # Cap findings to prevent runaway task creation
     if len(findings) > 30:
         findings = findings[:30]
@@ -4710,11 +4706,35 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         title = finding.get("title", f"Research finding #{orig_i+1}")
         prompt = finding.get("prompt", finding.get("description", ""))
 
+        # Determine task type early — direction_update findings don't require a prompt
+        finding_type = finding.get("type", "improvement")
+        if finding_type == "direction_update":
+            # Process as a direction modification proposal, not a task
+            target_id = finding.get("direction_id")
+            if not target_id:
+                continue  # direction_update requires a target direction_id
+            dir_project = await session.get(Project, task.project_id)
+            if not dir_project:
+                continue
+            directions = list(dir_project.directions or [])
+            for d in directions:
+                if d.get("id") == target_id:
+                    d["pending_update"] = {
+                        "suggested_text": finding.get("suggested_text", d.get("text")),
+                        "suggested_priority": finding.get("suggested_priority", d.get("priority")),
+                        "suggested_paths": finding.get("suggested_paths", d.get("paths", [])),
+                        "rationale": finding.get("description", "")[:300],
+                        "proposed_at": _utcnow().isoformat(),
+                        "proposed_by": str(task.id),
+                    }
+                    break
+            dir_project.directions = directions
+            flag_modified(dir_project, "directions")
+            session.add(dir_project)
+            continue  # Don't create a task for direction_update findings
+
         if not prompt:
             continue
-
-        # Determine task type: research findings can spawn sub-research or specialized agents
-        finding_type = finding.get("type", "improvement")
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
         elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
@@ -4812,15 +4832,69 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
+            # Append to research_history for each direction that produced findings
+            finding_titles_by_dir: dict = {}
+            for ct in child_tasks:
+                did = (ct.context or {}).get("direction_id")
+                if did:
+                    finding_titles_by_dir.setdefault(did, []).append(ct.title)
+            for d in directions:
+                did = d.get("id")
+                if did in direction_ids_with_findings:
+                    history = d.get("research_history", [])
+                    entry = {
+                        "timestamp": now_iso,
+                        "task_id": str(task.id),
+                        "tasks_created": len([ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]),
+                        "finding_titles": finding_titles_by_dir.get(did, [])[:5],
+                    }
+                    # Keep last 10 history entries to avoid unbounded growth
+                    d["research_history"] = (history + [entry])[-10:]
             project.directions = directions
-            from sqlalchemy.orm.attributes import flag_modified
             flag_modified(project, "directions")
             session.add(project)
+
+    # Process direction proposals — add to Project.directions with status='proposed'
+    proposals_created = 0
+    if direction_proposals:
+        proposal_project = await session.get(Project, task.project_id)
+        if proposal_project:
+            proj_directions = list(proposal_project.directions or [])
+            pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
+            max_proposals = 10
+            now_iso = _utcnow().isoformat()
+            for proposal in direction_proposals[:5]:  # max 5 per research call
+                if pending_count >= max_proposals:
+                    logger.info(f"[RESEARCH] Skipping direction proposal — max {max_proposals} pending proposals reached")
+                    break
+                proposal_text = (proposal.get("prompt") or proposal.get("description") or "")[:500]
+                if not proposal_text.strip():
+                    continue
+                new_direction = {
+                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "text": proposal_text,
+                    "priority": proposal.get("priority", "medium") if proposal.get("priority") in ("high", "medium", "low") else "medium",
+                    "paths": [],
+                    "added_at": now_iso,
+                    "status": "proposed",
+                    "proposed_by": str(task.id),
+                    "proposal_rationale": (proposal.get("description") or "")[:500],
+                    "proposed_at": now_iso,
+                }
+                proj_directions.append(new_direction)
+                pending_count += 1
+                proposals_created += 1
+            if proposals_created:
+                proposal_project.directions = proj_directions
+                flag_modified(proposal_project, "directions")
+                session.add(proposal_project)
+                logger.info(f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}")
 
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (
         f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
         + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
+        + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
     )
     task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
     session.add(task)
@@ -5320,7 +5394,7 @@ async def update_agent_status(
     """
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     # 1. Fetch task — validate vm_instance_id to prevent stale agents from
     # overwriting status after a task was requeued with a new VM.
     # FOR UPDATE prevents race with reaper: without it, a stale agent's
@@ -5346,7 +5420,7 @@ async def update_agent_status(
     if payload.logs and not payload.artifact_type:
         task.latest_status_message = payload.logs[:2000]
     session.add(task)
-    
+
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
     if payload.artifact_type:
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
@@ -5380,7 +5454,7 @@ async def update_agent_status(
                 logs=payload.logs
             )
             session.add(artifact)
-        
+
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(
             str(task.project_id),
@@ -5627,10 +5701,10 @@ async def update_agent_status(
             session.add(task)
 
             await session.commit()
-            
+
             await broadcast_to_project(
-                str(task.project_id), 
-                "task_updated", 
+                str(task.project_id),
+                "task_updated",
                 {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
@@ -6517,10 +6591,10 @@ async def agent_github_get_token(
     """
     if str(task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(task_id, session)
     return {
-        "status": "success", 
+        "status": "success",
         "data": {
             "token": gh_token,
             "owner": owner,
@@ -6541,7 +6615,7 @@ async def agent_github_commit_status(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await update_commit_status(
         token=gh_token,
@@ -6568,7 +6642,7 @@ async def agent_github_pr_comment(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_pr_comment(
         token=gh_token,
@@ -6592,7 +6666,7 @@ async def agent_github_pr_review_comment(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_pr_review_comment(
         token=gh_token,
@@ -6619,7 +6693,7 @@ async def agent_github_create_issue(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_issue(
         token=gh_token,
@@ -6644,7 +6718,7 @@ async def agent_github_get_issues(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await get_issues(
         token=gh_token,
@@ -6667,7 +6741,7 @@ async def agent_github_create_branch(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_branch(
         token=gh_token,
@@ -6729,16 +6803,16 @@ async def cancel_project(
     """
     project_stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
     project = (await session.execute(project_stmt)).scalars().first()
-    
+
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-        
+
     if project.status in [ProjectStatus.COMPLETED, ProjectStatus.FAILED, ProjectStatus.CANCELLED]:
         return {"status": "ignored", "message": f"Project is already in terminal state: {project.status}"}
-        
+
     project.status = ProjectStatus.CANCELLED
     session.add(project)
-    
+
     tasks_stmt = select(Task).where(
         Task.project_id == project_id,
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
@@ -6753,11 +6827,11 @@ async def cancel_project(
             vm_ids_to_delete.append(task.vm_instance_id)
 
         await broadcast_to_project(
-            str(project_id), 
-            "task_updated", 
+            str(project_id),
+            "task_updated",
             {"task_id": str(task.id), "status": TaskStatus.CANCELLED}
         )
-        
+
     await session.commit()
     await broadcast_to_project(str(project_id), "project_updated", {"status": ProjectStatus.CANCELLED})
 
@@ -6771,27 +6845,27 @@ async def cancel_project(
 @limiter.limit("60/minute")
 async def get_project_status(
     request: Request,
-    project_id: uuid.UUID, 
+    project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Endpoint for the frontend to poll or stream the current status of the deployment 
+    Endpoint for the frontend to poll or stream the current status of the deployment
     and agent activities.
     """
     project_stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
     project = (await session.execute(project_stmt)).scalars().first()
-    
+
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-        
+
     tasks_stmt = select(Task).where(Task.project_id == project_id)
     tasks = (await session.execute(tasks_stmt)).scalars().all()
-    
+
     return {
         "project_id": project.id,
         "name": project.name,
-        "status": project.status, 
+        "status": project.status,
         "tasks": [
             {
                 "task_id": t.id,
@@ -6818,7 +6892,7 @@ async def register_github_pat(
     """
     # Validate PAT
     await validate_fine_grained_pat(req.pat)
-    
+
     # Store the PAT securely in GCP Secret Manager
     try:
         secret_name = await store_user_secret(current_user["user_id"], "github-pat", req.pat)
@@ -6828,7 +6902,7 @@ async def register_github_pat(
 
     stmt = select(UserIntegration).where(UserIntegration.user_id == current_user["user_id"])
     integration = (await session.execute(stmt)).scalars().first()
-    
+
     if integration:
         integration.github_pat = secret_name
         integration.updated_at = _utcnow()
@@ -6837,10 +6911,10 @@ async def register_github_pat(
             user_id=current_user["user_id"],
             github_pat=secret_name
         )
-    
+
     session.add(integration)
     await session.commit()
-    
+
     return {"status": "success", "message": "GitHub PAT registered successfully."}
 
 @app.get("/api/github/oauth/authorize")
@@ -6955,17 +7029,17 @@ async def github_webhook(
     signature = request.headers.get("x-hub-signature-256")
     if not signature or not GITHUB_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Missing signature or webhook secret")
-        
+
     payload = await request.body()
-    
+
     # Verify signature
     expected_signature = "sha256=" + hmac.new(
         GITHUB_WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
-    
+
     if not hmac.compare_digest(signature, expected_signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
-        
+
     # Dedup by GitHub delivery ID — prevents duplicate processing on webhook retries
     delivery_id = request.headers.get("x-github-delivery")
     if delivery_id:
@@ -7044,7 +7118,7 @@ if os.path.exists(static_dir):
     assets_dir = os.path.join(static_dir, "assets")
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-    
+
     # Serve index.html for all other non-API routes (SPA fallback)
     # Use api_route to handle all methods — prevents 405 for missing API routes
     # (a GET-only catch-all causes Starlette to return 405 for POST/PATCH/DELETE
@@ -7056,20 +7130,20 @@ if os.path.exists(static_dir):
             raise HTTPException(status_code=404, detail="API route not found")
         if request and request.headers.get("upgrade", "").lower() == "websocket":
             raise HTTPException(status_code=404, detail="WebSocket route")
-            
+
         # Check if the requested file exists (e.g., favicon.ico, robots.txt)
         file_path = os.path.abspath(os.path.join(static_dir, full_path))
-        
+
         # Ensure the resolved path is strictly within the static directory
         if not file_path.startswith(os.path.abspath(static_dir)):
             raise HTTPException(status_code=403, detail="Access denied")
-            
+
         if os.path.isfile(file_path):
             return FileResponse(file_path)
-            
+
         # Fallback to index.html for SPA routing
         index_path = os.path.join(static_dir, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path)
-            
+
         raise HTTPException(status_code=404, detail="Not found")

@@ -17,7 +17,7 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     """
     object_name = f"tasks/{task_id}/payload.json"
     logger.info(f"Uploading payload to gs://{ARTIFACT_BUCKET_NAME}/{object_name}")
-    
+
     def _upload():
         storage_client = storage.Client(project=GCP_PROJECT_ID)
         bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
@@ -27,7 +27,7 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
             content_type="application/json"
         )
         return f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
-        
+
     try:
         uri = await asyncio.to_thread(_upload)
         return uri
@@ -38,14 +38,14 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
 async def generate_upload_signed_url(task_id: str, filename: str, expiration_minutes: int = 15) -> str:
     """
     Generates a v4 signed URL for uploading an object to GCS.
-    This allows the agent VM to upload files directly to Cloud Storage 
+    This allows the agent VM to upload files directly to Cloud Storage
     without needing IAM permissions or routing heavy traffic through the API.
     """
     # Sanitize filename to prevent path traversal
     safe_filename = os.path.basename(filename)
     object_name = f"tasks/{task_id}/{safe_filename}"
     logger.info(f"Generating upload signed URL for gs://{ARTIFACT_BUCKET_NAME}/{object_name}")
-    
+
     def _generate():
         storage_client = storage.Client(project=GCP_PROJECT_ID)
         bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
@@ -56,7 +56,7 @@ async def generate_upload_signed_url(task_id: str, filename: str, expiration_min
             method="PUT",
             content_type="application/octet-stream", # Can be overridden by client
         )
-        
+
     try:
         url = await asyncio.to_thread(_generate)
         return url

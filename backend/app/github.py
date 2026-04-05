@@ -848,12 +848,12 @@ async def get_check_runs(
                     # Extract the last N lines which typically contain the error
                     lines = raw_log.strip().split("\n")
                     # Find lines with error-like content for a focused excerpt
-                    error_lines = [l for l in lines if any(kw in l.lower() for kw in ["error", "failed", "err!", "✗", "×"])]
+                    error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "×"])]
                     if error_lines:
-                        log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {l.strip()}" for l in error_lines[-30:]))
+                        log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {ln.strip()}" for ln in error_lines[-30:]))
                     else:
                         # Just take the last 30 lines
-                        log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {l.strip()}" for l in lines[-30:]))
+                        log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {ln.strip()}" for ln in lines[-30:]))
                     continue
             except Exception:
                 pass

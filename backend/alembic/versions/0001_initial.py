@@ -28,7 +28,7 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_userintegration_user_id'), 'userintegration', ['user_id'], unique=True)
-    
+
     op.create_table('project',
     sa.Column('id', sqlmodel.sql.sqltypes.GUID(), nullable=False),
     sa.Column('name', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
@@ -40,7 +40,7 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_project_user_id'), 'project', ['user_id'], unique=False)
-    
+
     op.create_table('task',
     sa.Column('id', sqlmodel.sql.sqltypes.GUID(), nullable=False),
     sa.Column('project_id', sqlmodel.sql.sqltypes.GUID(), nullable=False),
@@ -56,7 +56,7 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_task_project_id'), 'task', ['project_id'], unique=False)
     op.create_index(op.f('ix_task_vm_instance_id'), 'task', ['vm_instance_id'], unique=False)
-    
+
     op.create_table('artifact',
     sa.Column('id', sqlmodel.sql.sqltypes.GUID(), nullable=False),
     sa.Column('task_id', sqlmodel.sql.sqltypes.GUID(), nullable=False),

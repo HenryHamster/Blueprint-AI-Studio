@@ -1,6 +1,5 @@
 import pytest
 import pytest_asyncio
-import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -48,7 +47,8 @@ async def test_reaper_service(reaper_db, mocker):
     """
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
-    class StopLoopException(Exception): pass
+    class StopLoopException(Exception):
+        pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Test", user_id="user1")
@@ -85,7 +85,8 @@ async def test_reaper_retry_path(reaper_db, mocker):
     """
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
-    class StopLoopException(Exception): pass
+    class StopLoopException(Exception):
+        pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Retry Test", user_id="user1")
@@ -124,7 +125,8 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
     """
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
-    class StopLoopException(Exception): pass
+    class StopLoopException(Exception):
+        pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Terminal Test", user_id="user1")
@@ -162,7 +164,8 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
 
-    class StopLoopException(Exception): pass
+    class StopLoopException(Exception):
+        pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Threshold Test", user_id="user1")
@@ -201,7 +204,8 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
 
-    class StopLoopException(Exception): pass
+    class StopLoopException(Exception):
+        pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
 
     project = Project(name="Reaper Parent Test", user_id="user1")

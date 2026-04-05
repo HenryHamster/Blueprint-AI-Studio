@@ -21,19 +21,19 @@ async def test_deploy_blueprint(client: AsyncClient, mocker):
     """
     # Mock the background task so it doesn't actually try to provision a VM
     mocker.patch("app.main.provision_agent_vm", return_value=None)
-    
+
     payload = {
         "name": "Test Project",
         "payloads": [{"command": "echo hello"}],
         "storage_uris": []
     }
-    
+
     response = await client.post("/api/deploy", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "accepted"
     assert "project_id" in data
-    
+
     # Verify it was saved in the isolated in-memory DB
     project_id = data["project_id"]
     get_response = await client.get(f"/api/projects/{project_id}")
@@ -60,7 +60,7 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     Tests retrieving tasks and artifacts for a specific project.
     """
     mocker.patch("app.main.provision_agent_vm", return_value=None)
-    
+
     # 1. Create project
     payload = {
         "name": "Test Project Tasks",

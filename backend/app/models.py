@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String, Integer, Index, text
+from sqlalchemy import Column, String, Integer, Index, text, event
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -50,14 +50,14 @@ class UserIntegration(SQLModel, table=True):
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: str = Field(index=True, unique=True)
-    
+
     # GitHub App Installation ID
     github_installation_id: Optional[str] = None
     github_account_name: Optional[str] = None
-    
+
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
     github_pat: Optional[str] = None
-    
+
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -79,18 +79,18 @@ class Project(SQLModel, table=True):
     is_self_repo: bool = Field(default=False)
 
     tasks: List["Task"] = Relationship(
-        back_populates="project", 
+        back_populates="project",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
 
 class Task(SQLModel, table=True):
     """
-    Extensible Task model. The 'payloads' JSONB column holds a flexible list 
+    Extensible Task model. The 'payloads' JSONB column holds a flexible list
     of structured dictionaries defining the work (e.g., UI components, API routes).
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
-    
+
     # Multi-Agent & Hierarchy Fields
     title: str = Field(default="Untitled Task")
     description: str = Field(default="")
@@ -100,12 +100,12 @@ class Task(SQLModel, table=True):
 
     created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
     requires_approval: bool = Field(default=False)
-    
+
     status: TaskStatus = Field(default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED))
-    
+
     # Push Model: Orchestrator assigns this task to a specific VM
     vm_instance_id: Optional[str] = Field(default=None, index=True)
-    
+
     # Task dependency DAG: list of task UUIDs that must be COMPLETED+merged before dispatch
     depends_on: List[str] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
 
@@ -118,17 +118,17 @@ class Task(SQLModel, table=True):
 
     # Stores parsed plan output from plan-type tasks (for debugging/admin visibility)
     plan_output: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
-    
+
     # Agent Heartbeat mechanism
     last_heartbeat: Optional[datetime] = Field(default=None)
-    
+
     priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
 
     attempt_count: int = Field(default=0)
     created_at: datetime = Field(default_factory=_utcnow)
     started_at: Optional[datetime] = Field(default=None)
     archived: bool = Field(default=False)
-    
+
     __table_args__ = (
         Index("ix_task_status_priority", "status", "priority"),
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
@@ -153,16 +153,14 @@ class TaskHistory(SQLModel, table=True):
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
-    
+
     timestamp: datetime = Field(default_factory=_utcnow)
     action: str # e.g., "STATUS_CHANGE", "SPLIT", "SPAWNED_CHILD", "MODIFIED_PAYLOAD"
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
-    
+
     task: Task = Relationship(back_populates="history")
 
 # Auto-append to status_log whenever latest_status_message is set
-from sqlalchemy import event
-
 @event.listens_for(Task.latest_status_message, "set")
 def _on_status_message_set(target: Task, value, oldvalue, initiator):
     if value and value != oldvalue:
@@ -267,19 +265,19 @@ class MaxPlanAccount(SQLModel, table=True):
 class Artifact(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
-    
+
     artifact_type: ArtifactType = Field(sa_column=Column(String, nullable=False))
-    
+
     # Git-based outputs
     commit_hash: Optional[str] = None
     repo_url: Optional[str] = None
     pr_url: Optional[str] = None
-    
+
     # For visual feedback or logs
     storage_uri: Optional[str] = None
     logs: Optional[str] = None
-    
+
     iteration: int = Field(default=0)
     created_at: datetime = Field(default_factory=_utcnow)
-    
+
     task: Task = Relationship(back_populates="artifacts")

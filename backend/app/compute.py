@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 import signal
 import threading
+from collections import OrderedDict as _OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -37,9 +38,12 @@ FALLBACK_ZONES: list[tuple[str, str]] = [
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
 
-# Semaphore to cap concurrent GCP API calls — prevents thread pool starvation
-# and stays well under GCP's 20 QPS rate limit
-_gcp_semaphore = asyncio.Semaphore(10)
+# Semaphores to cap concurrent GCP API calls — prevents thread pool starvation
+# and stays well under GCP's 20 QPS rate limit.
+# Separate limits for slow insert (up to 300s) vs fast ops (list/delete/get, ~10s)
+# so long-running provisions don't starve orphan cleanup.
+_gcp_provision_semaphore = asyncio.Semaphore(6)  # insert/create — long-running (up to 300s)
+_gcp_ops_semaphore = asyncio.Semaphore(8)         # list/delete/get — fast ops (~10s)
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
@@ -182,7 +186,6 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
 
 
-from collections import OrderedDict as _OrderedDict
 _last_provision_error: _OrderedDict = _OrderedDict()
 _PROVISION_ERROR_MAX = 500
 
@@ -653,7 +656,8 @@ STATICENV
         raise last_error or Exception("All zones exhausted")
 
     try:
-        operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=360)
+        async with _gcp_provision_semaphore:
+            operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=360)
         logger.info(f"GCP Operation completed: {operation_name}")
         return True
     except Exception as e:
@@ -749,7 +753,7 @@ async def _delete_gcp(vm_instance_id: str):
         # the underlying OS thread. The thread will continue until the GCP API call
         # returns or times out on its own. This is a Python limitation; the 60s cap
         # here prevents the caller from blocking, not the thread from running.
-        async with _gcp_semaphore:
+        async with _gcp_ops_semaphore:
             deleted_zone = await asyncio.wait_for(
                 asyncio.to_thread(_find_and_delete),
                 timeout=60
@@ -759,7 +763,7 @@ async def _delete_gcp(vm_instance_id: str):
         if deleted_zone:
             async def _bg_serial():
                 try:
-                    async with _gcp_semaphore:
+                    async with _gcp_ops_semaphore:
                         tail = await asyncio.to_thread(_capture_serial_for_vm, vm_instance_id, deleted_zone)
                     if tail:
                         logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
@@ -768,7 +772,7 @@ async def _delete_gcp(vm_instance_id: str):
             asyncio.create_task(_bg_serial())
 
         # Best-effort: clean up any leftover credentials secret
-        async with _gcp_semaphore:
+        async with _gcp_ops_semaphore:
             await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
     except asyncio.TimeoutError:
@@ -807,7 +811,7 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     unique_zones = list({z for z, _ in FALLBACK_ZONES})
 
     async def _list_zone_bounded(zone: str):
-        async with _gcp_semaphore:
+        async with _gcp_ops_semaphore:
             return await asyncio.to_thread(_list_vms_in_zone, zone)
 
     list_tasks = [_list_zone_bounded(zone) for zone in unique_zones]
@@ -837,13 +841,13 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     async def _delete_orphan(name: str, zone: str, status: str):
         logger.warning(f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {status})")
         try:
-            async with _gcp_semaphore:
+            async with _gcp_ops_semaphore:
                 success = await asyncio.to_thread(_delete_single_vm, name, zone)
             if success:
                 result.deleted.append(name)
                 # Best-effort secret cleanup
                 try:
-                    async with _gcp_semaphore:
+                    async with _gcp_ops_semaphore:
                         await asyncio.to_thread(_delete_agent_secret, name)
                 except Exception:
                     pass

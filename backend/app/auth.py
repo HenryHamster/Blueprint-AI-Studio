@@ -6,7 +6,7 @@ import jwt
 import secrets
 from datetime import datetime, timedelta, timezone
 import firebase_admin
-from firebase_admin import credentials, auth as firebase_auth
+from firebase_admin import auth as firebase_auth
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +91,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
     or allow programmatic access via ADMIN_API_KEY.
     """
     token = credentials.credentials
-    
+
     admin_api_key = os.getenv("ADMIN_API_KEY")
     if admin_api_key and secrets.compare_digest(token, admin_api_key):
         return {"user_id": "admin-api-key", "email": "admin@system.local", "role": "admin"}
-        
+
     try:
         # Verify the ID token using Firebase Admin SDK
         decoded_token = firebase_auth.verify_id_token(token)

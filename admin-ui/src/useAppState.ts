@@ -104,7 +104,6 @@ export function useAppState() {
   const [maxRetries, setMaxRetries] = useState(3);
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
-  const [minResearchIntervalHours, setMinResearchIntervalHours] = useState(24);
   const [directionCooldownMinutes, setDirectionCooldownMinutes] = useState(240);
   const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
   const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
@@ -735,7 +734,7 @@ export function useAppState() {
   // --- Deploy State ---
   const [deployState, setDeployState] = useState<DeployState | null>(null);
 
-  const fetchDeployState = async (silent = false) => {
+  const fetchDeployState = useCallback(async (silent = false) => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/deploy-state`);
       if (res.ok) setDeployState(await res.json());
@@ -743,7 +742,7 @@ export function useAppState() {
       console.error('Failed to fetch deploy state:', err);
       if (!silent) addToast('Failed to load deploy state', 'error');
     }
-  };
+  }, [addToast]);
 
   const handlePausePipeline = async () => {
     try {
@@ -1032,7 +1031,6 @@ export function useAppState() {
         setMaxRetries(data.max_retries ?? 3);
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
-        setMinResearchIntervalHours(data.min_research_interval_hours ?? 24);
         setDirectionCooldownMinutes(data.autonomous_direction_cooldown_minutes ?? 240);
         setHealthCheckUrls(data.health_check_urls ?? []);
         setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
@@ -1202,22 +1200,6 @@ export function useAppState() {
     } catch {
       setAutonomousResearchIntervalMinutes(prev);
       addToast('Failed to update research interval', 'error');
-    }
-  };
-
-  const handleUpdateMinResearchIntervalHours = async (value: number) => {
-    const v = Math.max(1, Math.min(8760, value));
-    const prev = minResearchIntervalHours;
-    setMinResearchIntervalHours(v);
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
-        method: 'PATCH', headers: await authHeaders(),
-        body: JSON.stringify({ min_research_interval_hours: v }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch {
-      setMinResearchIntervalHours(prev);
-      addToast('Failed to update min research interval', 'error');
     }
   };
 
@@ -1686,10 +1668,10 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, minResearchIntervalHours, directionCooldownMinutes,
+    autonomousResearchIntervalMinutes, directionCooldownMinutes,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     agentPromptSuffixes, updateAgentPromptSuffixes,
-    handleUpdateAutonomousResearchInterval, handleUpdateMinResearchIntervalHours, handleUpdateDirectionCooldownMinutes,
+    handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes,
     healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

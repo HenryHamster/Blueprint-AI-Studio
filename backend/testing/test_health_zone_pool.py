@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from httpx import AsyncClient, ASGITransport
 
 import app.shared_state as _shared_state
-import app.compute as _compute
 import app.main as _main_module
 from app.main import (
     app,

@@ -11,7 +11,7 @@ import pytest
 import json
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import app.main as _main_module
 import app.shared_state as _shared_state

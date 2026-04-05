@@ -1044,7 +1044,6 @@ async def get_settings(
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
-        "min_research_interval_hours": _runtime_config.get("min_research_interval_hours", 24),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
@@ -1187,14 +1186,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
-    if "min_research_interval_hours" in payload:
-        try:
-            val = int(payload["min_research_interval_hours"])
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="min_research_interval_hours must be a number")
-        if not (1 <= val <= 8760):
-            raise HTTPException(status_code=400, detail="min_research_interval_hours must be between 1 and 8760")
-        _runtime_config["min_research_interval_hours"] = val
     if "autonomous_research_wave_size" in payload:
         try:
             val = int(payload["autonomous_research_wave_size"])
@@ -1717,8 +1708,8 @@ async def update_direction(
     # Validate inputs
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
         raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
-    if "status" in payload and payload["status"] not in ("active", "completed", "paused"):
-        raise HTTPException(status_code=400, detail="status must be active, completed, or paused")
+    if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed"):
+        raise HTTPException(status_code=400, detail="status must be active, completed, paused, or proposed")
     if "text" in payload:
         if not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1:
             raise HTTPException(status_code=400, detail="text must be 1-500 characters")
@@ -1738,6 +1729,8 @@ async def update_direction(
                 d["text"] = payload["text"]
             if "paths" in payload:
                 d["paths"] = payload["paths"]
+            if "pending_update" in payload:
+                d["pending_update"] = payload["pending_update"]
             updated = True
             break
 
@@ -2610,6 +2603,7 @@ async def get_autonomy_debug(
 ):
     """Return a detailed snapshot of why autonomy is or isn't spawning for a project."""
     from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
+    import app.shared_state as _shared_state_mod
 
     project = await session.get(Project, project_id)
     if not project:
@@ -2736,9 +2730,24 @@ async def get_autonomy_debug(
             "max_per_hour": max_per_hour,
         })
 
-    # next_check_at: based on autonomous_research_interval_minutes
+    # Guard 6: waiting_for_interval — interval gate hasn't elapsed since last_idle_check
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-    next_check_at = (now + timedelta(minutes=interval_minutes)).isoformat()
+    last_idle_check = _shared_state_mod.last_idle_check
+    if last_idle_check:
+        interval_elapsed = (now - last_idle_check).total_seconds() >= interval_minutes * 60
+        next_check_at = (last_idle_check + timedelta(minutes=interval_minutes)).isoformat()
+    else:
+        interval_elapsed = True
+        next_check_at = now.isoformat()
+
+    if not interval_elapsed:
+        secs_until_check = max(0, int((last_idle_check + timedelta(minutes=interval_minutes) - now).total_seconds()))
+        blocking_guards.append({
+            "guard": "waiting_for_interval",
+            "reason": f"Research interval ({interval_minutes}m) has not elapsed since last check",
+            "next_check_at": next_check_at,
+            "seconds_until_check": secs_until_check,
+        })
 
     return {
         "spawn_blocked": len(blocking_guards) > 0,

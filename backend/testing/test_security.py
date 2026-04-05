@@ -1,11 +1,9 @@
-import pytest
 from app.security import (
     scan_diff_text,
     scan_commit_messages,
     scan_pr_metadata,
     evaluate_findings,
     format_findings_report,
-    _scan_text,
     _check_base64_hidden_text,
     _deduplicate_findings,
 )

@@ -27,8 +27,6 @@ interface SettingsDropdownProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
-  minResearchIntervalHours: number;
-  onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
   onSyncTaskTypeDefaults: () => void;
@@ -117,8 +115,6 @@ export function SettingsDropdown({
   onUpdateMaxAutonomousRate,
   autonomousResearchIntervalMinutes,
   onUpdateAutonomousResearchInterval,
-  minResearchIntervalHours,
-  onUpdateMinResearchIntervalHours,
   directionCooldownMinutes,
   onUpdateDirectionCooldownMinutes,
   onSyncTaskTypeDefaults,
@@ -166,7 +162,6 @@ export function SettingsDropdown({
   const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
   const [expandedSuffixType, setExpandedSuffixType] = useState<string | null>(null);
   const [suffixDraft, setSuffixDraft] = useState('');
-  const [minResearchIntervalInputVal, setMinResearchIntervalInputVal] = useState(String(minResearchIntervalHours));
 
   // Global model/effort defaults
   const [defaultModel, setDefaultModel] = useState<string>(
@@ -485,20 +480,6 @@ export function SettingsDropdown({
               />
             </div>
           </div>
-          <div className="mb-4">
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Min Research Interval (hours)</label>
-            <input
-              type="number"
-              min={1}
-              max={8760}
-              value={minResearchIntervalInputVal}
-              onChange={e => setMinResearchIntervalInputVal(e.target.value)}
-              onBlur={() => { const n = parseInt(minResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 8760) onUpdateMinResearchIntervalHours(n); else setMinResearchIntervalInputVal(String(minResearchIntervalHours)); }}
-              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(minResearchIntervalInputVal); if (!isNaN(n) && n >= 1 && n <= 8760) onUpdateMinResearchIntervalHours(n); else setMinResearchIntervalInputVal(String(minResearchIntervalHours)); } }}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            />
-          </div>
-
           <div className="mb-4">
             <button
               disabled={restarting}

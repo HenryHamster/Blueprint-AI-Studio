@@ -24,7 +24,7 @@ def setup_telemetry(app: FastAPI, engine=None):
     # 1. Set up the Tracer Provider
     provider = TracerProvider()
     trace.set_tracer_provider(provider)
-    
+
     # 2. Configure the Exporter
     if HAS_GCP_EXPORTER and os.getenv("GCP_PROJECT_ID") and os.getenv("ENABLE_CLOUD_TRACE", "").lower() == "true":
         try:
@@ -36,10 +36,10 @@ def setup_telemetry(app: FastAPI, engine=None):
             logger.warning(f"Failed to initialize GCP Cloud Trace Exporter: {e}")
     else:
         logger.info("OpenTelemetry configured without an exporter (traces will not be sent).")
-        
+
     # 3. Instrument FastAPI
     FastAPIInstrumentor.instrument_app(app)
-    
+
     # 4. Instrument SQLAlchemy (if an engine is provided)
     if engine:
         try:

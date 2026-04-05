@@ -8,7 +8,7 @@ import os
 import asyncio
 from collections import deque
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -44,7 +44,6 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
-    "min_research_interval_hours": 24,
 }
 
 # --- Autonomous Loop State ---
@@ -71,7 +70,6 @@ def get_circuit_breaker(project_id: str) -> Dict:
     return circuit_breakers[project_id]
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
-import asyncio
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
 
 # --- Deployment Monitoring (Phase A: detect + alert) ---
