@@ -2,16 +2,71 @@
 exclude = ["alembic/"]
 
 [tool.ruff.lint]
-select = ["DTZ"]  # flake8-datetimez: catches datetime.utcnow(), datetime.now() without tz
+select = [
+    "DTZ",   # flake8-datetimez: catches datetime.utcnow() without tz
+    "F",     # pyflakes: unused imports, undefined names, redefined vars
+    "B",     # flake8-bugbear: common Python gotchas
+    "BLE",   # flake8-blind-except: bare except Exception catches
+    "E711",  # comparison to None (use `is` / `is not`)
+    "E712",  # comparison to True/False (use `is` / `is not`)
+    "E721",  # type comparison (use isinstance)
+    "UP",    # pyupgrade: modernize Python syntax
+]
+# Skip typing-modernization rules — existing code uses Optional/List/Dict from typing and a
+# mass refactor is out of scope here. New code in app/ should use built-in generics, but we
+# don't force-migrate existing files via ruff.
+# B008: FastAPI uses function calls (Query, Depends, Security, etc.) in default arguments —
+# this is the intended DI pattern and flagging it produces 160+ false positives.
+ignore = ["UP006", "UP007", "UP035", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # shared_state.py uses datetime.utcnow() at module level (can't import _utcnow due to circular dep)
 "app/shared_state.py" = ["DTZ"]
-# Test files may use datetime.utcnow() for convenience
-"testing/*" = ["DTZ"]
+# Test files use convenience patterns (broad except, datetime.utcnow, etc.)
+"testing/*" = ["DTZ", "BLE", "B"]
+# main.py has many intentional except Exception blocks for background-task error handling
+# B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
+"app/main.py" = ["BLE001", "B904"]
+# admin.py and github.py raise HTTPException inside except blocks to convert errors to HTTP responses
+"app/admin.py" = ["B904"]
+"app/github.py" = ["B904"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+no_strict_optional = true
+warn_return_any = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+exclude = [
+    "alembic/",
+    "testing/",
+]
+
+[[tool.mypy.overrides]]
+module = ["google.*", "firebase_admin.*", "slowapi.*", "opentelemetry.*"]
+ignore_missing_imports = true
+
+
+# Run type checking: python -m mypy app/models.py app/auth.py app/security.py
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+timeout = 60  # seconds; prevents hung async tests from blocking CI
+timeout_method = "thread"  # works with asyncio
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
+    "slow: Tests that take >10s (excluded from fast test runs)",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["testing/*", "alembic/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
 ]

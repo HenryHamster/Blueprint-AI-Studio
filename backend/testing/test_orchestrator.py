@@ -24,6 +24,7 @@ from app.main import (
     _handle_research_completion,
 )
 from app.models import Project, Task, TaskStatus, MaxPlanAccount
+from testing.factories import make_project, make_task
 
 
 # ── Helper: redirect AsyncSessionLocal to the test database ─────────────────
@@ -94,15 +95,14 @@ class TestReaperService:
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="Reaper FAILED test", user_id="user1")
+        project = make_project(name="Reaper FAILED test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         max_retries = _main_module._runtime_config["max_retries"]
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id="stale-vm-001",
             status=TaskStatus.IN_PROGRESS,
             # Heartbeat older than the 5-minute window
@@ -135,14 +135,13 @@ class TestReaperService:
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="Heartbeat alive", user_id="user1")
+        project = make_project(name="Heartbeat alive", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id="healthy-vm-001",
             status=TaskStatus.IN_PROGRESS,
             last_heartbeat=datetime.utcnow() - timedelta(minutes=2),  # within window
@@ -175,14 +174,13 @@ class TestReaperService:
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="Retry test", user_id="user1")
+        project = make_project(name="Retry test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id="retry-vm-001",
             status=TaskStatus.IN_PROGRESS,
             last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
@@ -214,15 +212,14 @@ class TestReaperService:
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="No-VM test", user_id="user1")
+        project = make_project(name="No-VM test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         max_retries = _main_module._runtime_config["max_retries"]
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id=None,          # no VM — logical parent task
             status=TaskStatus.IN_PROGRESS,
             last_heartbeat=datetime.utcnow() - timedelta(hours=2),
@@ -258,15 +255,14 @@ class TestReaperService:
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="Skip-locked test", user_id="user1")
+        project = make_project(name="Skip-locked test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         max_retries = _main_module._runtime_config["max_retries"]
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id="race-vm-001",
             status=TaskStatus.IN_PROGRESS,
             last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
@@ -326,14 +322,13 @@ class TestReaperService:
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
-        project = Project(name="Already-failed test", user_id="user1")
+        project = make_project(name="Already-failed test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
-        task = Task(
+        task = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id="already-failed-vm",
             status=TaskStatus.FAILED,          # terminal state
             last_heartbeat=datetime.utcnow() - timedelta(hours=2),
@@ -382,25 +377,23 @@ class TestMaxPlanPool:
         db_session.add(account)
         await db_session.commit()
 
-        project = Project(name="Pool reconcile test", user_id="user1")
+        project = make_project(name="Pool reconcile test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         # Two tasks referencing this account are IN_PROGRESS
         for _ in range(2):
-            t = Task(
+            t = make_task(
                 project_id=project.id,
-                payloads=[],
                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
                 status=TaskStatus.IN_PROGRESS,
                 context={"max_plan_account_id": str(acct_id)},
             )
             db_session.add(t)
         # One task is COMPLETED — must NOT be counted
-        completed = Task(
+        completed = make_task(
             project_id=project.id,
-            payloads=[],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.COMPLETED,
             context={"max_plan_account_id": str(acct_id)},

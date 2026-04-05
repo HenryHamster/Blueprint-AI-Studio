@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any, Dict
 
 import httpx
 from fastapi import HTTPException, status
@@ -436,7 +437,7 @@ async def create_issue(
         "X-GitHub-Api-Version": "2022-11-28"
     }
 
-    payload = {
+    payload: Dict[str, Any] = {
         "title": title,
         "body": body
     }

@@ -216,7 +216,7 @@ def _scan_text(text: str, source: str, source_type: str = "code") -> List[Dict[s
     source: identifier for where the text came from (file path, "commit_message", etc.)
     source_type: "code" (strict), "docs" (only high-severity), "metadata" (commit msg, PR body)
     """
-    findings = []
+    findings: List[Dict[str, str]] = []
     ext = _get_extension(source)
 
     if ext in BINARY_EXTENSIONS:

@@ -3,16 +3,23 @@
   "version": "2.0.0",
   "description": "Claude Code agent runner for Blueprint PVM launcher",
   "main": "src/index.ts",
+  "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix"
   },
   "dependencies": {
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/node": "^20.10.4",
     "@types/ws": "^8.5.10",
+    "eslint": "^9.0.0",
     "tsx": "^4.6.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.0.0"
   }
 }

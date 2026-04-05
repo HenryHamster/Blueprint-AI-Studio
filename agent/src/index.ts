@@ -1,4 +1,4 @@
-import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import fs from 'fs';
 import WebSocket from 'ws';
 
@@ -234,7 +234,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
         flushLogBuffer(ws);
         return ws;
       }
-    } catch {}
+    } catch { /* ignore */ }
     if (attempt < maxRetries - 1) {
       await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt)));
     }
@@ -248,8 +248,8 @@ function sanitize(text: string): string {
     .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_***')
     .replace(/ghs_[A-Za-z0-9_]+/g, 'ghs_***')
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
-    .replace(/sk-ant-[A-Za-z0-9_\-]+/g, 'sk-ant-***')
-    .replace(/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, 'eyJ***')
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
+    .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'eyJ***')
     .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')
     .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')
     .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
@@ -267,7 +267,7 @@ function sendLog(ws: WebSocket | null, content: string) {
   const sanitized = sanitize(content);
   appendToLogBuffer(sanitized);
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify({ type: 'log', content: sanitized })); } catch {}
+    try { ws.send(JSON.stringify({ type: 'log', content: sanitized })); } catch { /* ignore */ }
   } else {
     process.stdout.write(sanitized);
   }
@@ -328,13 +328,13 @@ async function pushAndCreatePR(
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
-      try { git(['rebase', '--abort']); } catch {}
+      try { git(['rebase', '--abort']); } catch { /* ignore */ }
       sendLog(ws, `Rebase onto ${baseBranch} had conflicts — trying merge instead\n`);
       try {
         git(['merge', `origin/${baseBranch}`, '--no-edit']);
         sendLog(ws, `Merged ${baseBranch} successfully\n`);
       } catch {
-        try { git(['merge', '--abort']); } catch {}
+        try { git(['merge', '--abort']); } catch { /* ignore */ }
         sendLog(ws, `Merge also conflicted — pushing as-is, review pipeline will handle\n`);
       }
     }
@@ -344,7 +344,7 @@ async function pushAndCreatePR(
       const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (markers) {
         sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
-        try { git(['rebase', '--abort']); } catch {}
+        try { git(['rebase', '--abort']); } catch { /* ignore */ }
       }
     } catch { /* no markers found */ }
   }
@@ -605,8 +605,8 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
       log('Claude Code process timed out after 30 minutes — killing process group');
       sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
       const pid = claude.pid;
-      if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch {} }
-      setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch {} } }, 5000);
+      if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ } }
+      setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
     }, CLAUDE_TIMEOUT_MS);
 
     const MAX_OUTPUT = 10_000_000; // 10MB cap — prevents unbounded memory growth
@@ -837,7 +837,9 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   const originalPrompt = String(payload.original_prompt || '');
 
   // Read review iteration from task context
-  const iteration = (task.context as any)?.review_loop?.iteration || 1;
+  const taskContext = task.context as Record<string, unknown> | undefined;
+  const reviewLoop = taskContext?.review_loop as Record<string, unknown> | undefined;
+  const iteration = (reviewLoop?.iteration as number | undefined) || 1;
 
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
@@ -983,10 +985,10 @@ async function handleFix(
     git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
     git(['rebase', `origin/${baseBranch}`]);
     sendLog(ws, `Rebase successful\n`);
-  } catch (e) {
+  } catch {
     sendLog(ws, `Rebase had conflicts — Claude will resolve them\n`);
     // Abort the failed rebase so Claude can handle it with a merge strategy
-    try { git(['rebase', '--abort']); } catch {}
+    try { git(['rebase', '--abort']); } catch { /* ignore */ }
     // Try merge instead so Claude sees conflict markers
     try {
       git(['merge', `origin/${baseBranch}`, '--no-edit']);
@@ -1066,8 +1068,8 @@ async function handleFix(
       sendLog(ws, `Final rebase onto ${baseBranch} successful\n`);
     } catch {
       let conflictList = '';
-      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch {}
-      try { git(['rebase', '--abort']); } catch {}
+      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch { /* ignore */ }
+      try { git(['rebase', '--abort']); } catch { /* ignore */ }
       sendLog(ws, `Final rebase had conflicts — trying merge instead\n`);
       try {
         git(['merge', `origin/${baseBranch}`, '--no-edit']);
@@ -1075,7 +1077,7 @@ async function handleFix(
       } catch {
         // Merge also conflicted — abort and push as-is.
         // The PR will show conflicts and the review pipeline will handle it.
-        try { git(['merge', '--abort']); } catch {}
+        try { git(['merge', '--abort']); } catch { /* ignore */ }
         sendLog(ws, `Merge also conflicted (${conflictList || 'unknown files'}) — pushing as-is, review pipeline will handle\n`);
       }
     }
@@ -1114,7 +1116,7 @@ async function handleFix(
     statusRef.value = 'Pushing fixes...';
     const localHead = git(['rev-parse', 'HEAD']);
     let remoteHead = '';
-    try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch {}
+    try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch { /* ignore */ }
 
     if (localHead !== remoteHead) {
       const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
@@ -1239,7 +1241,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
 
     // Keep most recent entries that fit within budget
     const headerLine = '### Recently Completed Tasks';
-    let kept = allEntries.slice(); // most recent assumed to be last
+    const kept = allEntries.slice(); // most recent assumed to be last
     while (kept.length > 0) {
       const candidate = [headerLine, ...kept, ''].join('\n');
       if (candidate.length <= budget) break;
@@ -1367,7 +1369,7 @@ Rules:
       logs = sanitize(fs.readFileSync(planPath, 'utf-8'));
       sendLog(ws, `Read plan output from ${planPath}\n`);
     }
-  } catch (e) {
+  } catch {
     sendLog(ws, `Failed to read ${planPath}, falling back to output parsing\n`);
   }
   if (!logs) {
@@ -1688,7 +1690,7 @@ Approach:
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
       sendLog(ws, `Read research findings from ${findingsPath}\n`);
     }
-  } catch (e) {
+  } catch {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
   }
   if (!logs) {
@@ -1837,7 +1839,7 @@ Rules:
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
       sendLog(ws, `Read security findings from ${findingsPath}\n`);
     }
-  } catch (e) {
+  } catch {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
   }
   if (!logs) {
@@ -2045,7 +2047,7 @@ CRITICAL RULES:
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
       sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
-      try { git(['rebase', '--abort']); } catch {}
+      try { git(['rebase', '--abort']); } catch { /* ignore */ }
     }
 
     const commitHash = git(['rev-parse', 'HEAD']);
@@ -2352,7 +2354,7 @@ IMPORTANT: Always write /tmp/debug_output_${taskId}.json even if you cannot dete
 
 // ── Handler: Perf (analyze codebase for performance bottlenecks, output findings) ──
 async function handlePerf(
-  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  taskId: string, payload: Record<string, unknown>, _task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
@@ -2415,7 +2417,7 @@ Rules:
       logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
       sendLog(ws, `Read perf findings from ${findingsPath}\n`);
     }
-  } catch (e) {
+  } catch {
     sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
   }
   if (!logs) {
@@ -2479,7 +2481,7 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
+  const { exitCode } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
 
 
   const reportPath = `/tmp/investigation_report_${taskId}.json`;
@@ -2605,10 +2607,10 @@ async function main() {
     stopHeartbeat();
     if (ws) ws.close();
     // Clean up workspace to avoid leaking tokens in git config
-    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch {}
+    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     // Clean up /tmp files written by Claude Code handlers (task-specific paths)
     for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report']) {
-      try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch {}
+      try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
     log('Agent shutdown complete.');
   }

@@ -43,6 +43,7 @@ type RiskFilter = 'all' | 'low' | 'medium' | 'high';
 type ScopeFilter = 'all' | 'small' | 'medium' | 'large';
 
 const RISK_ORDER: Record<string, number> = { high: 3, medium: 2, low: 1 };
+const PRIORITY_ORDER: Record<string, number> = { high: 3, medium: 2, low: 1 };
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
 
 function relativeDate(dateStr: string): string {
@@ -100,7 +101,7 @@ export function ResearchBrowser({ tasks, onClose, onLaunch }: ResearchBrowserPro
 
   const priorities = useMemo(() => {
     const set = new Set(groups.flatMap(g => g.findings.map(f => f.finding.priority)));
-    return Array.from(set).sort((a, b) => b - a);
+    return Array.from(set).sort((a, b) => (PRIORITY_ORDER[b] ?? 0) - (PRIORITY_ORDER[a] ?? 0));
   }, [groups]);
 
   const effectiveExpanded = useMemo((): Set<string> => {
@@ -125,7 +126,7 @@ export function ResearchBrowser({ tasks, onClose, onLaunch }: ResearchBrowserPro
       if (sortBy !== 'date') {
         findings = [...findings].sort((a, b) =>
           sortBy === 'priority'
-            ? b.finding.priority - a.finding.priority
+            ? (PRIORITY_ORDER[b.finding.priority] ?? 0) - (PRIORITY_ORDER[a.finding.priority] ?? 0)
             : (RISK_ORDER[b.finding.risk] || 0) - (RISK_ORDER[a.finding.risk] || 0)
         );
       }

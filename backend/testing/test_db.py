@@ -1,12 +1,13 @@
 import pytest
 from app.models import Project, Task, Artifact, ProjectStatus, TaskStatus, ArtifactType
+from testing.factories import make_project, make_task
 
 @pytest.mark.asyncio
 async def test_project_creation(db_session):
     """
     Test that a Project is created with the correct default status.
     """
-    project = Project(name="Test DB Project", user_id="user1")
+    project = make_project(name="Test DB Project", user_id="user1")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -19,12 +20,12 @@ async def test_task_cascading(db_session):
     """
     Test that a Task correctly links to a Project.
     """
-    project = Project(name="Test DB Project", user_id="user1")
+    project = make_project(name="Test DB Project", user_id="user1")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
+    task = make_task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -37,12 +38,12 @@ async def test_artifact_linking(db_session):
     """
     Test that an Artifact correctly links to a Task and stores metadata.
     """
-    project = Project(name="Test DB Project", user_id="user1")
+    project = make_project(name="Test DB Project", user_id="user1")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
+    task = make_task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="vm-1")
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)

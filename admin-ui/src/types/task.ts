@@ -8,7 +8,7 @@ export interface ResearchFinding {
   prompt: string;
   scope: 'small' | 'medium' | 'large';
   risk: 'low' | 'medium' | 'high';
-  priority: number;
+  priority: 'high' | 'medium' | 'low';
   related_files: string[];
   direction_id?: string;
 }

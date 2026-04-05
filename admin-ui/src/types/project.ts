@@ -1,3 +1,24 @@
+export interface Direction {
+  id: string;
+  text: string;
+  priority: 'high' | 'medium' | 'low';
+  added_at: string;
+  status: 'active' | 'completed' | 'paused' | 'proposed';
+  paths?: string[];
+  last_researched_at?: string | null;
+  proposed_by?: string;
+  proposal_rationale?: string;
+  proposed_at?: string;
+  pending_update?: {
+    suggested_text?: string;
+    suggested_priority?: string;
+    suggested_paths?: string[];
+    rationale: string;
+    proposed_at: string;
+    proposed_by: string;
+  };
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -5,6 +26,6 @@ export interface Project {
   github_owner: string;
   github_repo: string;
   autonomous_enabled: boolean;
-  directions: unknown[];
+  directions: Direction[];
   created_at: string;
 }
