@@ -5655,10 +5655,15 @@ async def update_agent_status(
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
-            breaker["failure_count"] += 1
-            breaker["success_count"] = 0
+            # Only CODE_ERROR and AGENT_TIMEOUT indicate code regressions; infra/rate-limit
+            # failures are transient and should not trip the breaker.
+            is_code_failure = failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
+            if is_code_failure:
+                breaker["failure_count"] += 1
+                breaker["success_count"] = 0
 
             # HALF-OPEN test task failed → back to OPEN with doubled cooldown
+            # (any failure on the test task re-opens, including infra failures)
             if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
                 breaker["state"] = "OPEN"
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
