@@ -23,6 +23,7 @@ import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
+import { CatchUpPanel } from './components/CatchUpPanel';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -155,6 +156,13 @@ export default function App() {
     document.addEventListener('keydown', handleActivityFeedShortcut);
     return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
   }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
+
+  const [activityEvents, setActivityEvents] = useState<import('./components/ActivityFeed').ActivityEvent[]>([]);
+  const newActivityCount = useMemo(() => {
+    if (!s.lastActivityFeedOpen) return 0;
+    return activityEvents.filter(e => new Date(e.timestamp).getTime() > s.lastActivityFeedOpen!).length;
+  }, [activityEvents, s.lastActivityFeedOpen]);
+
   // Backend version mismatch detection
   const [versionMismatch, setVersionMismatch] = useState(false);
   useEffect(() => {
@@ -309,6 +317,10 @@ export default function App() {
         onUpdateDefaultTaskType={s.setDefaultTaskType}
         notifyOnComplete={s.notifyOnComplete}
         onUpdateNotifyOnComplete={s.setNotifyOnComplete}
+        notifyOnFail={s.notifyOnFail}
+        onUpdateNotifyOnFail={s.setNotifyOnFail}
+        notifyOnApprovalNeeded={s.notifyOnApprovalNeeded}
+        onUpdateNotifyOnApprovalNeeded={s.setNotifyOnApprovalNeeded}
         soundOnComplete={s.soundOnComplete}
         onUpdateSoundOnComplete={s.setSoundOnComplete}
         onToggleViewMode={() => s.setViewMode(v => v === 'kanban' ? 'pipeline' : 'kanban')}
@@ -318,6 +330,7 @@ export default function App() {
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showActivityFeed={s.showActivityFeed}
         onToggleActivityFeed={() => s.setShowActivityFeed(prev => !prev)}
+        newActivityCount={newActivityCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
         onSignOut={() => signOut(auth)}
@@ -416,6 +429,19 @@ export default function App() {
         }}
       />
 
+      {!s.showArchive && !s.showActivityFeed && (
+        <CatchUpPanel
+          selectedProjectId={s.selectedProjectId}
+          lastVisitTimestamp={s.lastVisitTimestamp}
+          refreshInterval={s.refreshInterval}
+          onSelectTask={(task) => {
+            fetchTask(task.id).then(s.handleViewLogs).catch(() => {
+              s.addToast('Could not load task — it may have been deleted', 'error');
+            });
+          }}
+        />
+      )}
+
       <OrchestratorHealthBar
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
@@ -457,6 +483,8 @@ export default function App() {
             });
           }}
           onClose={() => s.setShowActivityFeed(false)}
+          lastVisitTimestamp={s.prevLastActivityFeedOpen}
+          onEventsChange={setActivityEvents}
         />
       ) : s.showArchive ? (
         <ArchiveView

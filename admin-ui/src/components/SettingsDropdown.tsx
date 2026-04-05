@@ -16,6 +16,10 @@ interface SettingsDropdownProps {
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
+  notifyOnFail: boolean;
+  onUpdateNotifyOnFail: (value: boolean) => void;
+  notifyOnApprovalNeeded: boolean;
+  onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
   // Existing
@@ -105,6 +109,10 @@ export function SettingsDropdown({
   onToggleViewMode,
   notifyOnComplete,
   onUpdateNotifyOnComplete,
+  notifyOnFail,
+  onUpdateNotifyOnFail,
+  notifyOnApprovalNeeded,
+  onUpdateNotifyOnApprovalNeeded,
   soundOnComplete,
   onUpdateSoundOnComplete,
   maxConcurrentVMs,
@@ -607,6 +615,36 @@ export function SettingsDropdown({
                 className={`relative w-8 h-4 rounded-full transition-colors ${notifyOnComplete ? 'bg-emerald-600' : 'bg-neutral-700'}`}
               >
                 <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${notifyOnComplete ? 'translate-x-4' : ''}`} />
+              </button>
+            </label>
+            <label className="flex items-center justify-between cursor-pointer mt-2">
+              <span className="text-[11px] font-medium text-neutral-400">Browser notification on failure</span>
+              <button
+                onClick={() => {
+                  const next = !notifyOnFail;
+                  if (next && 'Notification' in window && Notification.permission === 'default') {
+                    Notification.requestPermission();
+                  }
+                  onUpdateNotifyOnFail(next);
+                }}
+                className={`relative w-8 h-4 rounded-full transition-colors ${notifyOnFail ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${notifyOnFail ? 'translate-x-4' : ''}`} />
+              </button>
+            </label>
+            <label className="flex items-center justify-between cursor-pointer mt-2">
+              <span className="text-[11px] font-medium text-neutral-400">Browser notification on approval needed</span>
+              <button
+                onClick={() => {
+                  const next = !notifyOnApprovalNeeded;
+                  if (next && 'Notification' in window && Notification.permission === 'default') {
+                    Notification.requestPermission();
+                  }
+                  onUpdateNotifyOnApprovalNeeded(next);
+                }}
+                className={`relative w-8 h-4 rounded-full transition-colors ${notifyOnApprovalNeeded ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${notifyOnApprovalNeeded ? 'translate-x-4' : ''}`} />
               </button>
             </label>
             <label className="flex items-center justify-between cursor-pointer mt-2">

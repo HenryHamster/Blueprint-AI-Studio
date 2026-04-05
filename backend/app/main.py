@@ -868,6 +868,10 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
+                await _maybe_create_circuit_breaker_alert(
+                    project.id, session,
+                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
                 return  # Back to cooldown
     # Guard: must have active directions that aren't in cooldown or mid-cycle
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
@@ -1034,6 +1038,10 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
+                await _maybe_create_circuit_breaker_alert(
+                    project.id, session,
+                    f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
                 return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(task_type, {})
@@ -1294,6 +1302,71 @@ manager = ConnectionManager()
 async def broadcast_to_project(project_id: str, event_type: str, data: dict):
     """Broadcasts a message to all WebSocket clients listening to a specific project."""
     await manager.broadcast(project_id, event_type, data)
+
+
+async def _maybe_create_failure_alert(
+    task: "Task",
+    session: AsyncSession,
+    error_snippet: str | None = None,
+) -> None:
+    """Create an ERROR alert for a task failure unless it's a smoketest or retry task.
+    Deduplicates: skips if an undismissed alert already exists for this task."""
+    task_type = ((task.payloads or [{}])[0]).get("type", "")
+    if task_type == "smoketest":
+        return
+    if (task.context or {}).get("is_retry") is True:
+        return
+    existing = await session.execute(
+        select(Alert).where(Alert.task_id == task.id, Alert.dismissed_at.is_(None))
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.ERROR,
+        title=f"Task failed: {task.title or str(task.id)[:8]}",
+        message=f"Task type: {task_type}. {error_snippet or 'See task logs for details.'}",
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+    )
+
+
+async def _maybe_create_circuit_breaker_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    reason: str,
+) -> None:
+    """Create a WARNING alert when the circuit breaker opens for a project.
+    Deduplicates: skips if an undismissed circuit-breaker alert already exists."""
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == "Circuit breaker opened: autonomous tasks paused",
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title="Circuit breaker opened: autonomous tasks paused",
+        message=reason,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+
 
 async def broadcast_deploy_state():
     """Assemble and broadcast current deploy state to all connected WebSocket clients."""
@@ -1570,6 +1643,7 @@ async def reaper_service():
                         task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
                         record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                         session.add(task)
+                        await _maybe_create_failure_alert(task, session)
 
                         await broadcast_to_project(
                             str(task.project_id),
@@ -2220,6 +2294,10 @@ async def orchestrator_worker():
                                         provision_err = get_provision_error(vm_id)
                                         failed_task.latest_status_message = f"VM provisioning failed ({vm_id}): {provision_err or 'unknown error'}"
                                         inner_session.add(failed_task)
+                                        await _maybe_create_failure_alert(
+                                            failed_task, inner_session,
+                                            (provision_err or "unknown error")[:200]
+                                        )
                                         await inner_session.commit()
                                         await broadcast_to_project(
                                             str(p_id),
@@ -2268,6 +2346,10 @@ async def orchestrator_worker():
                                     ci_task.status = TaskStatus.FAILED
                                     ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
                                     session.add(ci_task)
+                                    await _maybe_create_failure_alert(
+                                        ci_task, session,
+                                        f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number}"
+                                    )
                                     await session.commit()
                                     await broadcast_to_project(str(ci_task.project_id), "task_updated",
                                                                {"task_id": str(ci_task.id), "status": ci_task.status})
@@ -2417,6 +2499,11 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
                                 logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None")
 
+                        if ci_task.status == TaskStatus.FAILED:
+                            await _maybe_create_failure_alert(
+                                ci_task, session,
+                                f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
+                            )
                         session.add(ci_task)
                         await session.commit()
                         await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -4282,6 +4369,7 @@ async def _ensure_branch(
         task.status = TaskStatus.FAILED
         task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
         session.add(task)
+        await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
         await session.commit()
         return False
 
@@ -4293,6 +4381,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         task.latest_status_message = "Plan agent produced no valid subtasks"
         task.status = TaskStatus.FAILED
         session.add(task)
+        await _maybe_create_failure_alert(task, session, "Plan agent produced no valid subtasks")
         await session.commit()
         return
 
@@ -4307,6 +4396,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         task.latest_status_message = "Plan has circular dependencies"
         task.status = TaskStatus.FAILED
         session.add(task)
+        await _maybe_create_failure_alert(task, session, "Plan has circular dependencies")
         await session.commit()
         return
 
@@ -5250,6 +5340,10 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         db_task.status = TaskStatus.FAILED
                         db_task.latest_status_message = f"PR #{pr_number} closed without merging"
                         write_session.add(db_task)
+                        await _maybe_create_failure_alert(
+                            db_task, write_session,
+                            f"PR #{pr_number} was closed without merging"
+                        )
                         await write_session.commit()
                 task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                 task.status = TaskStatus.FAILED
@@ -6075,6 +6169,10 @@ async def update_agent_status(
                 breaker["opened_at"] = _utcnow()
                 breaker["half_open_task_id"] = None
                 logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
+                await _maybe_create_circuit_breaker_alert(
+                    task.project_id, session,
+                    f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
 
             # CLOSED → OPEN after 3 consecutive failures
             elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
@@ -6084,6 +6182,10 @@ async def update_agent_status(
                 await broadcast_to_project(project_key, "autonomous_paused",
                                            {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
                 logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
+                await _maybe_create_circuit_breaker_alert(
+                    task.project_id, session,
+                    f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
+                )
             # Persist breaker state on any transition
             if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
                 await _persist_circuit_breakers()

@@ -24,6 +24,7 @@ export interface HeaderBarProps {
   onToggleArchive: () => void;
   showActivityFeed: boolean;
   onToggleActivityFeed: () => void;
+  newActivityCount: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -40,6 +41,10 @@ export interface HeaderBarProps {
   onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
+  notifyOnFail: boolean;
+  onUpdateNotifyOnFail: (value: boolean) => void;
+  notifyOnApprovalNeeded: boolean;
+  onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
   maxRetries: number;
@@ -108,6 +113,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleArchive,
     showActivityFeed,
     onToggleActivityFeed,
+    newActivityCount,
     onOpenNewTaskModal,
     onShowDirections,
     onSignOut,
@@ -123,6 +129,10 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateDefaultTaskType,
     notifyOnComplete,
     onUpdateNotifyOnComplete,
+    notifyOnFail,
+    onUpdateNotifyOnFail,
+    notifyOnApprovalNeeded,
+    onUpdateNotifyOnApprovalNeeded,
     soundOnComplete,
     onUpdateSoundOnComplete,
     maxRetries,
@@ -292,6 +302,10 @@ export function HeaderBar(props: HeaderBarProps) {
           onToggleViewMode={onToggleViewMode}
           notifyOnComplete={notifyOnComplete}
           onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
+          notifyOnFail={notifyOnFail}
+          onUpdateNotifyOnFail={onUpdateNotifyOnFail}
+          notifyOnApprovalNeeded={notifyOnApprovalNeeded}
+          onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
           soundOnComplete={soundOnComplete}
           onUpdateSoundOnComplete={onUpdateSoundOnComplete}
           maxConcurrentVMs={maxConcurrentVMs}
@@ -354,7 +368,7 @@ export function HeaderBar(props: HeaderBarProps) {
           </button>
           <button
             onClick={onToggleActivityFeed}
-            className={`p-2 rounded text-xs transition-colors border ${
+            className={`p-2 rounded text-xs transition-colors border relative ${
               showActivityFeed
                 ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
                 : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
@@ -362,6 +376,9 @@ export function HeaderBar(props: HeaderBarProps) {
             title="Toggle activity feed (A)"
           >
             <Clock className="w-4 h-4" />
+            {newActivityCount > 0 && !showActivityFeed && (
+              <span className="absolute top-0.5 right-0.5 w-2 h-2 bg-red-500 rounded-full" />
+            )}
           </button>
           <button
             onClick={onToggleResearchBrowser}
@@ -424,6 +441,11 @@ export function HeaderBar(props: HeaderBarProps) {
               >
                 <Clock className="w-4 h-4 shrink-0" />
                 <span>Activity Feed</span>
+                {newActivityCount > 0 && !showActivityFeed && (
+                  <span className="ml-auto bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                    {newActivityCount}
+                  </span>
+                )}
               </button>
               <button
                 onClick={() => { onShowDirections(); setShowMobileMenu(false); }}

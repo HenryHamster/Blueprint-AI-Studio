@@ -2327,17 +2327,19 @@ async def get_activity(
     project_id: Optional[uuid.UUID] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     event_types: Optional[List[str]] = Query(None),
+    since: Optional[datetime] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
     """Return a reverse-chronological list of recent system events."""
     seven_days_ago = _utcnow() - timedelta(days=7)
+    cutoff = since if since is not None else seven_days_ago
     events: List[Dict[str, Any]] = []
 
-    # --- 1 & 2: Completed and Failed tasks in last 7 days ---
+    # --- 1 & 2: Completed and Failed tasks in last 7 days (or since cutoff) ---
     task_filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-        Task.created_at >= seven_days_ago,
+        Task.created_at >= cutoff,
     ]
     if project_id:
         task_filters.append(Task.project_id == project_id)
@@ -2407,6 +2409,10 @@ async def get_activity(
             # fall back to created_at since Task has no updated_at column
             completed_at = t.created_at
 
+        duration_seconds = None
+        if completed_at is not None and t.started_at is not None:
+            duration_seconds = (completed_at - t.started_at).total_seconds()
+
         if t.status == TaskStatus.COMPLETED:
             events.append({
                 "id": f"task-{tid}",
@@ -2423,6 +2429,7 @@ async def get_activity(
                 "deploy_sha": None,
                 "deploy_status": None,
                 "rollback_count": None,
+                "duration_seconds": duration_seconds,
             })
         elif t.status == TaskStatus.FAILED:
             events.append({
@@ -2440,6 +2447,7 @@ async def get_activity(
                 "deploy_sha": None,
                 "deploy_status": None,
                 "rollback_count": None,
+                "duration_seconds": duration_seconds,
             })
 
         # --- 3: Research findings events (one per task) ---
@@ -2470,6 +2478,8 @@ async def get_activity(
     ]
     if project_id:
         inprogress_filters.append(Task.project_id == project_id)
+    if since is not None:
+        inprogress_filters.append(Task.created_at >= since)
 
     inprogress_result = await session.execute(
         select(Task).where(*inprogress_filters)
@@ -3060,4 +3070,133 @@ async def get_global_diagnostics(
         "projects": project_summaries,
         "circuit_breakers": all_circuit_breakers,
         "zone_health": zone_health,
+    }
+
+
+@router.get("/digest")
+async def get_digest(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: Optional[uuid.UUID] = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Return a catch-up digest of activity within the requested time window."""
+    window_start = _utcnow() - timedelta(hours=hours)
+
+    # --- Query all tasks created in window ---
+    task_filters = [Task.created_at >= window_start]
+    if project_id:
+        task_filters.append(Task.project_id == project_id)
+
+    tasks_result = await session.execute(select(Task).where(*task_filters))
+    all_tasks = tasks_result.scalars().all()
+
+    completed_tasks = [t for t in all_tasks if t.status == TaskStatus.COMPLETED]
+    failed_tasks = [t for t in all_tasks if t.status == TaskStatus.FAILED]
+    approval_tasks = [
+        t for t in all_tasks
+        if t.requires_approval and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+    ]
+
+    # research_cycles: completed tasks with task_type == 'research'
+    research_cycles = sum(
+        1 for t in completed_tasks
+        if ((t.payloads or [{}])[0]).get("type", "create") == "research"
+    )
+
+    # --- Batch artifact query ---
+    all_task_ids = [t.id for t in all_tasks]
+    pr_count = 0
+    pr_artifact_map: Dict[str, str] = {}   # task_id -> pr_url
+    error_log_map: Dict[str, str] = {}     # task_id -> truncated error snippet
+
+    if all_task_ids:
+        artifacts_result = await session.execute(
+            select(Artifact)
+            .where(
+                Artifact.task_id.in_(all_task_ids),
+                Artifact.artifact_type.in_([
+                    ArtifactType.PULL_REQUEST,
+                    ArtifactType.ERROR_LOG,
+                ])
+            )
+            .order_by(Artifact.created_at.asc())
+        )
+        for a in artifacts_result.scalars().all():
+            tid = str(a.task_id)
+            if a.artifact_type == ArtifactType.PULL_REQUEST:
+                if a.created_at >= window_start:
+                    pr_count += 1
+                pr_artifact_map[tid] = a.pr_url or ""
+            elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in error_log_map:
+                error_log_map[tid] = a.logs[:200]
+
+    def _derive_completed_at(t: Task):
+        if t.status_log:
+            try:
+                return datetime.fromisoformat(t.status_log[-1]["t"])
+            except (KeyError, ValueError):
+                pass
+        return t.created_at
+
+    # --- needs_attention: failed + pending approval ---
+    needs_attention = []
+    for t in failed_tasks:
+        tid = str(t.id)
+        needs_attention.append({
+            "task_id": tid,
+            "title": t.title or "Failed task",
+            "reason": "failed",
+            "error_snippet": error_log_map.get(tid),
+            "pr_url": pr_artifact_map.get(tid),
+        })
+    for t in approval_tasks:
+        tid = str(t.id)
+        needs_attention.append({
+            "task_id": tid,
+            "title": t.title or "Pending approval",
+            "reason": "approval_required",
+            "error_snippet": None,
+            "pr_url": pr_artifact_map.get(tid),
+        })
+
+    # --- recent_failures (up to 10, desc) ---
+    sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
+    recent_failures = []
+    for t in sorted_failures[:10]:
+        tid = str(t.id)
+        ts = _derive_completed_at(t)
+        recent_failures.append({
+            "task_id": tid,
+            "title": t.title or "Failed task",
+            "failed_at": ts.isoformat() if ts else None,
+            "error_snippet": error_log_map.get(tid),
+        })
+
+    # --- recent_completions (up to 10, desc) ---
+    sorted_completions = sorted(completed_tasks, key=_derive_completed_at, reverse=True)
+    recent_completions = []
+    for t in sorted_completions[:10]:
+        tid = str(t.id)
+        ts = _derive_completed_at(t)
+        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        recent_completions.append({
+            "task_id": tid,
+            "title": t.title or "Completed task",
+            "completed_at": ts.isoformat() if ts else None,
+            "pr_url": pr_artifact_map.get(tid),
+            "task_type": task_type,
+        })
+
+    return {
+        "window_hours": hours,
+        "generated_at": _utcnow().isoformat(),
+        "completed_count": len(completed_tasks),
+        "failed_count": len(failed_tasks),
+        "pending_approval_count": len(approval_tasks),
+        "research_cycles": research_cycles,
+        "prs_opened": pr_count,
+        "needs_attention": needs_attention,
+        "recent_failures": recent_failures,
+        "recent_completions": recent_completions,
     }

@@ -97,6 +97,19 @@ export function useAppState() {
 
   // Activity feed state
   const [showActivityFeed, setShowActivityFeed] = useState(false);
+  const [lastActivityFeedOpen, setLastActivityFeedOpen] = useState<number | null>(() => {
+    const stored = localStorage.getItem('blueprint-admin:lastActivityFeedOpen');
+    return stored ? parseInt(stored, 10) : null;
+  });
+  const [prevLastActivityFeedOpen, setPrevLastActivityFeedOpen] = useState<number | null>(null);
+  useEffect(() => {
+    if (showActivityFeed) {
+      const now = Date.now();
+      setPrevLastActivityFeedOpen(lastActivityFeedOpen);
+      setLastActivityFeedOpen(now);
+      localStorage.setItem('blueprint-admin:lastActivityFeedOpen', String(now));
+    }
+  }, [showActivityFeed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Settings state
   const [showSettings, setShowSettings] = useState(false);
@@ -122,10 +135,16 @@ export function useAppState() {
   // Defaults
   const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('defaultTaskType', 'create');
   const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
+  const [notifyOnFail, setNotifyOnFail] = usePersistedState<boolean>('notifyOnFail', false);
+  const [notifyOnApprovalNeeded, setNotifyOnApprovalNeeded] = usePersistedState<boolean>('notifyOnApprovalNeeded', false);
   const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
   const prevTasksRef = useRef<Task[]>([]);
   const notifyRef = useRef(notifyOnComplete);
   useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
+  const notifyOnFailRef = useRef(notifyOnFail);
+  useEffect(() => { notifyOnFailRef.current = notifyOnFail; }, [notifyOnFail]);
+  const notifyOnApprovalNeededRef = useRef(notifyOnApprovalNeeded);
+  useEffect(() => { notifyOnApprovalNeededRef.current = notifyOnApprovalNeeded; }, [notifyOnApprovalNeeded]);
   const soundOnCompleteRef = useRef(soundOnComplete);
   useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
 
@@ -171,6 +190,17 @@ export function useAppState() {
   const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'>('metricsWindow', '1h');
   const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
   useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 86400000); }, [metricsHistory]);
+
+  // Last visit timestamp — captures when the user previously loaded the app
+  const [lastVisitTimestamp] = useState<number | null>(() => {
+    try {
+      const stored = localStorage.getItem('blueprint-admin:lastVisitTimestamp');
+      const ts = stored ? parseInt(stored, 10) : null;
+      // Update stored timestamp to now for next visit
+      localStorage.setItem('blueprint-admin:lastVisitTimestamp', String(Date.now()));
+      return ts && !isNaN(ts) ? ts : null;
+    } catch { return null; }
+  });
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -398,16 +428,32 @@ export function useAppState() {
         // Browser notifications for completed/failed tasks
         if (prevTasksRef.current.length > 0) {
           const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          const prevApprovalMap = new Map(prevTasksRef.current.map(t => [t.id, t.requires_approval]));
           let didTransition = false;
           for (const t of newTasks) {
             const prev = prevMap.get(t.id);
             if (prev && prev !== t.status && (t.status === 'COMPLETED' || t.status === 'FAILED')) {
-              if (notifyRef.current && Notification.permission === 'granted') {
-                new Notification(`Task ${t.status.toLowerCase()}`, {
+              if (t.status === 'COMPLETED' && notifyRef.current && Notification.permission === 'granted') {
+                new Notification('Task completed', {
+                  body: t.title || t.id,
+                });
+              }
+              if (t.status === 'FAILED' && notifyOnFailRef.current && Notification.permission === 'granted') {
+                new Notification('Task failed', {
                   body: t.title || t.id,
                 });
               }
               didTransition = true;
+            }
+            // Approval-needed notification: task newly requires approval and is not in a terminal state
+            const prevApproval = prevApprovalMap.get(t.id);
+            const nonTerminal = t.status !== 'COMPLETED' && t.status !== 'FAILED' && t.status !== 'CANCELLED';
+            if (!prevApproval && t.requires_approval && nonTerminal) {
+              if (notifyOnApprovalNeededRef.current && Notification.permission === 'granted') {
+                new Notification('Task requires approval', {
+                  body: t.title || t.id,
+                });
+              }
             }
           }
           if (didTransition && soundOnCompleteRef.current) {
@@ -1651,7 +1697,7 @@ export function useAppState() {
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
     // Activity feed
-    showActivityFeed, setShowActivityFeed,
+    showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     // New task modal
     showNewTaskModal, setShowNewTaskModal,
     newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
@@ -1664,6 +1710,8 @@ export function useAppState() {
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,
+    notifyOnFail, setNotifyOnFail,
+    notifyOnApprovalNeeded, setNotifyOnApprovalNeeded,
     soundOnComplete, setSoundOnComplete,
     // Settings
     showSettings, settingsRef, handleToggleSettings,
@@ -1693,6 +1741,7 @@ export function useAppState() {
     archiveTotalTasks, fetchArchiveTasks,
     archiveSortOrder, setArchiveSortOrder,
     // Misc
+    lastVisitTimestamp,
     lastRefresh, wsRef,
     showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,
     // Status bar

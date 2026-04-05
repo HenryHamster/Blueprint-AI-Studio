@@ -23,6 +23,7 @@ export interface ActivityEvent {
   commit_hash?: string;
   repo_url?: string;
   status?: string;
+  duration_seconds?: number;
 }
 
 interface ActivityFeedProps {
@@ -30,6 +31,8 @@ interface ActivityFeedProps {
   refreshInterval: number;
   onSelectTask: (task: Task) => void;
   onClose: () => void;
+  lastVisitTimestamp?: number | null;
+  onEventsChange?: (events: ActivityEvent[]) => void;
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -48,6 +51,16 @@ function formatRelativeTime(dateStr: string): string {
 
 function formatFullDatetime(dateStr: string): string {
   return new Date(dateStr).toLocaleString();
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem > 0 ? `${h}h ${rem}m` : `${h}h`;
 }
 
 const EVENT_ICON: Record<ActivityEventType, ReactElement> = {
@@ -99,17 +112,38 @@ const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[
   { label: 'Deploy', value: 'DEPLOY_EVENT', activeClass: 'bg-purple-500/20 text-purple-400 border-purple-500/40' },
 ];
 
-export default function ActivityFeed({ selectedProjectId, refreshInterval, onSelectTask, onClose }: ActivityFeedProps) {
+type TimeRangeOption = '6h' | '24h' | 'week' | 'all';
+
+const TIME_RANGE_PILLS: { label: string; value: TimeRangeOption }[] = [
+  { label: 'Last 6h', value: '6h' },
+  { label: 'Last 24h', value: '24h' },
+  { label: 'This Week', value: 'week' },
+  { label: 'All', value: 'all' },
+];
+
+function getTimeRangeSince(range: TimeRangeOption): string | null {
+  if (range === 'all') return null;
+  const now = Date.now();
+  if (range === '6h') return new Date(now - 6 * 3600 * 1000).toISOString();
+  if (range === '24h') return new Date(now - 24 * 3600 * 1000).toISOString();
+  // 'week' = last 7 days
+  return new Date(now - 7 * 24 * 3600 * 1000).toISOString();
+}
+
+export default function ActivityFeed({ selectedProjectId, refreshInterval, onSelectTask, onClose, lastVisitTimestamp, onEventsChange }: ActivityFeedProps) {
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [activeFilter, setActiveFilter] = useState<FilterOption>('ALL');
+  const [timeRange, setTimeRange] = useState<TimeRangeOption>('all');
 
   const fetchEvents = useCallback(async () => {
     try {
       const params = new URLSearchParams();
       if (selectedProjectId) params.set('project_id', selectedProjectId);
+      const since = getTimeRangeSince(timeRange);
+      if (since) params.set('since', since);
       const res = await apiFetch(`${API_BASE_URL}/api/admin/activity?${params}`);
       if (!res.ok) {
         const errorBody = await res.json().catch(() => null);
@@ -117,14 +151,16 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
         throw new Error(msg);
       }
       const data = await res.json();
-      setEvents(Array.isArray(data) ? data : (data.events ?? []));
+      const loaded: ActivityEvent[] = Array.isArray(data) ? data : (data.events ?? []);
+      setEvents(loaded);
+      onEventsChange?.(loaded);
       setError(null);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId]);
+  }, [selectedProjectId, timeRange, onEventsChange]);
 
   useEffect(() => {
     setLoading(true);
@@ -177,20 +213,37 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       </div>
 
       {/* Filter pills */}
-      <div className="px-6 py-2 border-b border-neutral-800 flex items-center gap-1.5 flex-wrap shrink-0">
-        {FILTER_PILLS.map(pill => (
-          <button
-            key={pill.value}
-            onClick={() => setActiveFilter(pill.value)}
-            className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
-              activeFilter === pill.value
-                ? pill.activeClass
-                : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
-            }`}
-          >
-            {pill.label}
-          </button>
-        ))}
+      <div className="px-6 pt-2 pb-1.5 border-b border-neutral-800 flex flex-col gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {FILTER_PILLS.map(pill => (
+            <button
+              key={pill.value}
+              onClick={() => setActiveFilter(pill.value)}
+              className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                activeFilter === pill.value
+                  ? pill.activeClass
+                  : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
+              }`}
+            >
+              {pill.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap pb-0.5">
+          {TIME_RANGE_PILLS.map(pill => (
+            <button
+              key={pill.value}
+              onClick={() => setTimeRange(pill.value)}
+              className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                timeRange === pill.value
+                  ? 'bg-neutral-700 text-neutral-200 border-neutral-500'
+                  : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
+              }`}
+            >
+              {pill.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Summary bar */}
@@ -271,14 +324,31 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
             else groups[3].events.push(event);
           }
 
+          // Determine if we need a last-visit divider and track whether it's been inserted
+          const hasNewAndOld = lastVisitTimestamp != null &&
+            filteredEvents.some(e => new Date(e.timestamp).getTime() > lastVisitTimestamp) &&
+            filteredEvents.some(e => new Date(e.timestamp).getTime() <= lastVisitTimestamp);
+          let dividerInserted = false;
+
           return groups.flatMap(({ label, events: groupEvents }) => {
             if (groupEvents.length === 0) return [];
             return [
               <div key={`header-${label}`} className="pt-2 pb-1 first:pt-0 sticky top-0 z-10 bg-neutral-950/90 backdrop-blur-sm">
                 <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{label}</span>
               </div>,
-              ...groupEvents.map(event => (
-            <div
+              ...groupEvents.flatMap(event => {
+              const isOld = lastVisitTimestamp != null && new Date(event.timestamp).getTime() <= lastVisitTimestamp;
+              const showDivider = hasNewAndOld && isOld && !dividerInserted;
+              if (showDivider) dividerInserted = true;
+              return [
+                ...(showDivider ? [
+                  <div key="last-visit-divider" className="flex items-center gap-2 py-1">
+                    <div className="flex-1 h-px bg-amber-500/30" />
+                    <span className="text-[10px] font-semibold text-amber-500/80 uppercase tracking-wider whitespace-nowrap">New since your last visit</span>
+                    <div className="flex-1 h-px bg-amber-500/30" />
+                  </div>
+                ] : []),
+                <div
               key={event.id}
               onClick={() => handleRowClick(event)}
               className={`bg-neutral-900 border border-neutral-800 border-l-2 ${EVENT_BORDER[event.type]} rounded-lg px-4 py-3 ${event.task_id ? 'hover:bg-neutral-800/50 cursor-pointer' : ''} transition-colors`}
@@ -390,6 +460,10 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
                     </a>
                   )}
 
+                  {/* Duration label for completed/failed tasks */}
+                  {(event.type === 'TASK_COMPLETED' || event.type === 'TASK_FAILED') && event.duration_seconds != null && (
+                    <span className="text-[10px] text-neutral-600 font-mono">ran {formatDuration(event.duration_seconds)}</span>
+                  )}
                   {/* Relative timestamp */}
                   <span
                     className="text-xs text-neutral-500 font-mono whitespace-nowrap"
@@ -400,7 +474,8 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
                 </div>
               </div>
             </div>
-              ))
+              ];
+            })
             ];
           });
         })()
