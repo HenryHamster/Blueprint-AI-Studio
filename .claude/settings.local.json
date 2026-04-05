@@ -1,4 +1,7 @@
 {
+  "env": {
+    "PATH": "/home/agent/.local/bin:/home/agent/bin:/opt/agent/node_modules/.bin:/opt/node_modules/.bin:/node_modules/.bin:/usr/lib/node_modules/npm/node_modules/@npmcli/run-script/lib/node-gyp-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+  },
   "permissions": {
     "allow": [
       "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/admin.py''\\).read\\(\\)\\); print\\(''OK: admin.py''\\)\")",

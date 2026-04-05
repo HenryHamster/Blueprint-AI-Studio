@@ -264,7 +264,7 @@ export default function MetricsDashboard({
         ))}
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {/* Cost Over Time chart */}
         <div className={cardClass}>
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">VM Cost/Hr (e2-standard-2)</div>
@@ -325,7 +325,7 @@ export default function MetricsDashboard({
         </div>
 
         {/* Task Outcomes chart — full width */}
-        <div className={`${cardClass} col-span-2`}>
+        <div className={`${cardClass} sm:col-span-2`}>
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Task Outcomes</div>
           <TaskOutcomesChart points={metricsHistory} tasks={tasks} windowMs={windowMs} />
         </div>

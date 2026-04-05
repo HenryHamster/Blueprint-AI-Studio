@@ -288,7 +288,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-    <div className="h-screen overflow-hidden flex flex-col bg-neutral-950 text-neutral-200 font-sans p-6">
+    <div className="flex flex-col bg-neutral-950 text-neutral-200 font-sans p-3 md:p-6 min-h-screen md:h-screen md:overflow-hidden">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
           <div className="h-full w-2/5 bg-amber-500" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
@@ -428,7 +428,7 @@ export default function App() {
       />
 
       {s.error && (
-        <div className="mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
+        <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
           <p>{s.error}</p>
         </div>

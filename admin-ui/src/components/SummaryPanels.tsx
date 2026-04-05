@@ -36,7 +36,7 @@ export function SummaryPanels({ actionRequiredTasks, runningTasks, completedRece
         )}
       </button>
       {!collapsed && (
-    <div className="grid grid-cols-3 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4 flex flex-col gap-3 min-h-[120px] max-h-[200px]">
         <div className="flex items-center justify-between">
           <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-2">

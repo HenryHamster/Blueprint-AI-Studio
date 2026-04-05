@@ -107,7 +107,7 @@ export function NewTaskModal({
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-neutral-900 rounded-xl shadow-2xl w-full max-w-lg overflow-hidden border border-neutral-800">
+      <div className="bg-neutral-900 rounded-xl shadow-2xl w-full max-w-lg mx-3 sm:mx-auto overflow-y-auto max-h-[90vh] border border-neutral-800">
         <div className="flex justify-between items-center p-5 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
             <GitBranch className="w-4 h-4 text-neutral-400" />
@@ -335,14 +335,14 @@ export function NewTaskModal({
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-1.5 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
+              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={submitting}
-              className="px-4 py-1.5 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
+              className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
               {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}
               Launch

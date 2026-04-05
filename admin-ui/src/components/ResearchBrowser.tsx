@@ -140,7 +140,7 @@ export function ResearchBrowser({ tasks, onClose, onLaunch }: ResearchBrowserPro
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-black/40" onClick={onClose} />
-      <div className="w-[680px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+      <div className="w-full max-w-[680px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl overflow-y-auto">
         {/* Header */}
         <div className="flex justify-between items-center p-4 border-b border-neutral-800 shrink-0">
           <div>

@@ -377,11 +377,11 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
 
       {/* Panel */}
-      <div className="relative ml-auto w-full max-w-lg h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden">
+      <div className="relative ml-auto w-full sm:max-w-lg h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-neutral-800 shrink-0">
           <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Directions</h2>
-          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
+          <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -548,7 +548,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
               <button
                 onClick={addDirection}
                 disabled={!newText.trim()}
-                className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700"
+                className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 min-h-[44px] sm:min-h-0 rounded text-xs transition-colors border border-neutral-700 flex items-center"
               >
                 <Plus className="w-3.5 h-3.5" />
               </button>

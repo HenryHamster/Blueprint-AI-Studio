@@ -66,6 +66,8 @@ interface SettingsDropdownProps {
   onRepairState: () => Promise<void>;
   // Zone health
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
+  // Optional class name for the trigger button (e.g. to hide it on mobile)
+  triggerClassName?: string;
 }
 
 function relativeTime(ms: number): string {
@@ -152,6 +154,7 @@ export function SettingsDropdown({
   onMarkStable,
   onRepairState,
   zoneHealth,
+  triggerClassName,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -204,7 +207,7 @@ export function SettingsDropdown({
     <div className="relative" ref={settingsRef}>
       <button
         onClick={onToggleSettings}
-        className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700"
+        className={`bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700${triggerClassName ? ` ${triggerClassName}` : ''}`}
         title="Settings"
       >
         <Settings className="w-4 h-4" />

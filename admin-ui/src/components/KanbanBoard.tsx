@@ -332,6 +332,7 @@ export function KanbanBoard({
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
+  const [activeColumnId, setActiveColumnId] = useState<string | null>(null);
 
   // Persist order changes
   useEffect(() => {
@@ -387,6 +388,15 @@ export function KanbanBoard({
     }
     return map;
   }, [tasks, columns, sortBy, columnOrder]);
+
+  const defaultActiveColId = useMemo(() => {
+    for (const col of columns) {
+      if ((tasksByColumn[col.id] ?? []).length > 0) return col.id;
+    }
+    return columns.find(c => c.id === 'QUEUED')?.id ?? columns[0]?.id ?? 'QUEUED';
+  }, [columns, tasksByColumn]);
+
+  const effectiveActiveColId = activeColumnId ?? defaultActiveColId;
 
   // Map from task id to column id for quick lookup during drag
   const taskColumnMap = useMemo(() => {
@@ -512,7 +522,203 @@ export function KanbanBoard({
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
     >
-      <main className="flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
+      {/* Mobile: tab bar + single active column */}
+      <div className="flex flex-col flex-1 overflow-hidden md:hidden">
+        <div className="flex gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-neutral-950 px-2 pt-2 shrink-0">
+          {columns.map(col => {
+            const count = (tasksByColumn[col.id] ?? []).length;
+            const isActive = effectiveActiveColId === col.id;
+            return (
+              <button
+                key={col.id}
+                onClick={() => setActiveColumnId(col.id)}
+                className={`flex items-center gap-1.5 px-3 rounded-lg text-xs font-semibold whitespace-nowrap min-h-[44px] transition-colors ${
+                  isActive
+                    ? 'bg-neutral-700 text-neutral-100'
+                    : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'
+                }`}
+              >
+                <span>{col.label}</span>
+                <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isActive ? 'bg-neutral-600 text-neutral-200' : 'bg-neutral-800 text-neutral-500'}`}>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {columns.map((col, colIdx) => {
+          if (col.id !== effectiveActiveColId) return null;
+          const columnTasks = tasksByColumn[col.id] ?? [];
+          const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
+          const taskIds = columnTasks.map(t => t.id);
+
+          let mobileContent: React.ReactNode;
+          if (groupBy === 'type') {
+            const groups = new Map<string, Task[]>();
+            for (const task of columnTasks) {
+              const type = task.task_type || 'create';
+              if (!groups.has(type)) groups.set(type, []);
+              groups.get(type)!.push(task);
+            }
+            const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+            const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
+            mobileContent = sorted.length === 0 && !loading ? (
+              <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
+            ) : (
+              <>
+                {sorted.map(([type, typeTasks]) => {
+                  const style = TASK_TYPE_STYLES[type];
+                  const label = style?.label ?? type.toUpperCase();
+                  return (
+                    <div key={type} className="mb-3">
+                      <div className={`sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider border ${style ? `${style.bg} ${style.text}` : 'bg-neutral-800/50 border-neutral-700/50 text-neutral-400'}`}>
+                        <span>{label}</span>
+                        <span className="opacity-60">({typeTasks.length})</span>
+                      </div>
+                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                        {typeTasks.map(task => {
+                          const flatIdx = taskFlatIndex.get(task.id) ?? 0;
+                          return (
+                            <TaskItem
+                              key={task.id}
+                              task={task}
+                              {...taskProps}
+                              colIdx={colIdx}
+                              cardIdx={flatIdx}
+                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              onNavigate={handleNavigate}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            );
+          } else if (groupBy === 'project') {
+            const groups = new Map<string, Task[]>();
+            for (const task of columnTasks) {
+              const key = task.project_id ?? '__none__';
+              if (!groups.has(key)) groups.set(key, []);
+              groups.get(key)!.push(task);
+            }
+            const sorted = [...groups.entries()].sort((a, b) => {
+              if (a[0] === '__none__') return 1;
+              if (b[0] === '__none__') return -1;
+              const nameA = projectMap[a[0]] ?? a[0];
+              const nameB = projectMap[b[0]] ?? b[0];
+              return nameA.localeCompare(nameB);
+            });
+            const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
+            mobileContent = sorted.length === 0 && !loading ? (
+              <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
+            ) : (
+              <>
+                {sorted.map(([projectId, projectTasks]) => {
+                  const name = projectId === '__none__' ? 'No Project' : (projectMap[projectId] ?? projectId);
+                  return (
+                    <div key={projectId} className="mb-3">
+                      <div className="sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider bg-neutral-800/50 border border-neutral-700/50 text-neutral-400">
+                        <span className="truncate max-w-[200px]" title={name}>{name}</span>
+                        <span className="opacity-60 shrink-0">({projectTasks.length})</span>
+                      </div>
+                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                        {projectTasks.map(task => {
+                          const flatIdx = taskFlatIndex.get(task.id) ?? 0;
+                          return (
+                            <TaskItem
+                              key={task.id}
+                              task={task}
+                              {...taskProps}
+                              colIdx={colIdx}
+                              cardIdx={flatIdx}
+                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              onNavigate={handleNavigate}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            );
+          } else {
+            mobileContent = (
+              <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
+                  {columnTasks.map((task, cardIdx) => (
+                    <SortableCard
+                      key={task.id}
+                      task={task}
+                      maxRetries={maxRetries}
+                      actionLoadingMap={actionLoadingMap}
+                      selectionMode={selectionMode}
+                      selectedTaskIds={selectedTaskIds}
+                      onToggleTaskSelection={onToggleTaskSelection}
+                      compact={compact}
+                      colIdx={colIdx}
+                      cardIdx={cardIdx}
+                      cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}
+                      onNavigate={handleNavigate}
+                      onApprove={onApprove}
+                      onRequestChanges={onRequestChanges}
+                      onCancel={onCancel}
+                      onRetry={onRetry}
+                      onEditPrompt={onEditPrompt}
+                      onDismiss={onDismiss}
+                      onArchive={onArchive}
+                      onViewLogs={onViewLogs}
+                    />
+                  ))}
+                </SortableContext>
+                {columnTasks.length === 0 && !loading && (
+                  <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
+                    No tasks
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          return (
+            <div key={col.id} className="flex-1 overflow-y-auto p-3 custom-scrollbar">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
+                <div className="flex items-center gap-1.5">
+                  {selectionMode && columnTasks.length > 0 && (
+                    <ColumnSelectCheckbox
+                      columnTasks={columnTasks}
+                      selectedTaskIds={selectedTaskIds}
+                      onBulkToggle={onBulkToggle}
+                    />
+                  )}
+                  <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
+                    <ArrowDownUp className="w-3 h-3" />
+                  </span>
+                  <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                    {columnTasks.length}
+                  </span>
+                  {isArchivable && columnTasks.length > 0 && (
+                    <button
+                      onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
+                      title={`Archive all ${col.label} tasks`}
+                      className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
+                    >
+                      <Archive className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              {mobileContent}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Desktop: existing multi-column horizontal layout */}
+      <main className="hidden md:flex justify-center gap-4 overflow-x-auto overflow-y-hidden pb-4 flex-1 custom-scrollbar">
         {/* eslint-disable-next-line react-hooks/refs */}
         {columns.map((col, colIdx) => {
           const columnTasks = tasksByColumn[col.id] ?? [];
@@ -520,7 +726,6 @@ export function KanbanBoard({
           if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
           const isCollapsed = collapsedColumns.has(col.id);
           const taskIds = columnTasks.map(t => t.id);
-
 
           let content: React.ReactNode;
 
@@ -556,7 +761,7 @@ export function KanbanBoard({
                               {...taskProps}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -604,7 +809,7 @@ export function KanbanBoard({
                               {...taskProps}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -631,7 +836,7 @@ export function KanbanBoard({
                       compact={compact}
                       colIdx={colIdx}
                       cardIdx={cardIdx}
-                      cardRef={(el) => { columnRefs.current[colIdx][cardIdx] = el; }}
+                      cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}
                       onNavigate={handleNavigate}
                       onApprove={onApprove}
                       onRequestChanges={onRequestChanges}
@@ -652,7 +857,6 @@ export function KanbanBoard({
               </div>
             );
           }
-
 
           return (
             <div
