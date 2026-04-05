@@ -1662,10 +1662,15 @@ Rules for avoiding duplication:
 - If a recently completed task partially addressed an issue and more work remains, you MAY propose a follow-up but must reference the prior work in your description.
 
 Instructions:
-1. Explore the codebase thoroughly. Read key files, understand the architecture, find patterns.
-2. Based on the user's directions, identify specific, actionable improvements. For each direction, ask yourself: "what would it take for this direction to be DONE?" — then work backward from that goal. Don't just find easy wins; find the gaps that matter most.
-3. For each finding, assess scope and risk.
-4. Output your findings as a JSON array as the VERY LAST thing in your response:
+1. Use ALL of your tools aggressively to explore the codebase and research solutions:
+   - Spawn subagents (Agent tool) to explore different parts of the codebase in parallel
+   - Use WebSearch to research best practices, patterns, and how other projects solve similar problems
+   - Use WebFetch to read relevant documentation, GitHub issues, or API references
+   - Use TodoWrite to track what you've explored and what gaps remain — don't stop at the first few easy finds
+   - For each active direction, ask yourself: "what would it take for this direction to be DONE?" Then work backward from that goal to find the gaps that matter most.
+2. Based on your exploration and external research, identify specific, actionable improvements. Prefer medium and large scope findings that close real gaps over small tweaks. For each finding, assess scope and risk.
+3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. Have it evaluate each finding: does this meaningfully advance the goal? Is the scope right? Are trivial items bundled? Have the reviewer rewrite the findings file if improvements are needed.
+4. Output your final findings as a JSON array as the VERY LAST thing in your response:
 
 [
   {
@@ -1701,16 +1706,16 @@ Valid values:
 - priority: high, medium, low
 
 Rules:
-- IMPORTANT: Balance your findings. A good research cycle produces a MIX of substantial work (features, refactors, architectural improvements) AND small fixes. Do not fill an entire cycle with only lint tweaks, config changes, or cosmetic fixes. If the direction calls for improvement, find things that users or developers will actually notice.
-- Bundle all small/low-risk fixes (lint rules, typos, config tweaks, single-line fixes) into ONE combined finding with scope=small. Do not create separate findings for each small fix — each finding spawns a VM + PR, so trivial individual findings waste significant resources.
+- Trivial findings (lint tweaks, config changes, single-line fixes) should be bundled into ONE combined finding. Focus your effort on medium and large scope improvements. Each finding spawns a VM + PR — make them count.
+- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough — use WebSearch and subagents to dig further.
 - When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
 - A finding should be ONE PR-sized unit of work (scope=small for bundled small changes, scope=medium for multi-file work, scope=large for architectural changes)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
 - Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
-- Limit to 30 findings maximum, prioritized by impact
-- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough.
+- Limit to 15 findings maximum. Aim for 5-10 high-impact findings.
+- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough — use WebSearch and subagents to dig further.
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
 - For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
 - For type=security_audit findings, the prompt should describe the audit scope/focus — it will spawn a dedicated security audit agent
@@ -1776,7 +1781,10 @@ Approach:
 - This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. Changes that touch one layer usually need corresponding changes in other layers.
 - Prefer extensible, data-driven designs over copy-paste. If adding a new instance of something (a new type, a new endpoint, a new UI panel), first check if the pattern should be generalized.
 - Frontend changes are just as important as backend changes. Every new backend capability needs corresponding UI to be useful.
-- Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.`;
+- Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.
+- Use WebSearch to find prior art and best practices before proposing solutions. A finding backed by "here's how other projects solve this" is far more valuable than guessing at an implementation.
+- Spawn subagents liberally — for exploring code, for web research, for reviewing your own work. You have Opus-level capability; use it to its full potential.
+- Use TodoWrite to maintain a checklist of areas explored and gaps found. Don't stop exploring when you find the first few easy wins.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running codebase research...';

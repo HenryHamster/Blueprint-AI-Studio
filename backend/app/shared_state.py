@@ -32,8 +32,8 @@ runtime_config: Dict = {
     "autonomous_research_interval_minutes": 30,
     # Per-task-type model/effort defaults (synced from frontend settings)
     # e.g. {"research": "claude-opus-4-6", "create": "claude-sonnet-4-6"}
-    "task_type_models": {},
-    "task_type_efforts": {},
+    "task_type_models": {"research": "claude-opus-4-6"},
+    "task_type_efforts": {"research": "max"},
     # Per-type extra instructions appended to the agent's base prompt
     # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
     "agent_prompt_suffixes": {},

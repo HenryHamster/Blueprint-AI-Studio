@@ -5045,8 +5045,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
 
     # Cap findings to prevent runaway task creation
-    if len(findings) > 30:
-        findings = findings[:30]
+    if len(findings) > 15:
+        findings = findings[:15]
 
     original_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
