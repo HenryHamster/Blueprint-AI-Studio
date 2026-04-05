@@ -722,7 +722,7 @@ async def _check_external_health():
         failed.append("claude_api")
     else:
         # Check for rate limit burst — 3+ RATE_LIMIT failures in last 5 results means API is exhausted
-        recent_results = _shared_state.deploy_monitoring["task_results"][-5:]
+        recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
         rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
         if rate_limit_count >= 3:
             ext["claude_api"] = False
@@ -737,7 +737,7 @@ async def _check_external_health():
                          if r[2] == "PROVISION_FAILURE"]
     if len(recent_provisions) >= 3:
         # Check if ALL recent failures are provision failures (guard against empty filter)
-        recent_all = _shared_state.deploy_monitoring["task_results"][-5:]
+        recent_all = list(_shared_state.deploy_monitoring["task_results"])[-5:]
         recent_failures = [r for r in recent_all if r[1] == "failure"]
         if recent_failures and all(r[2] == "PROVISION_FAILURE" for r in recent_failures):
             ext["gcp"] = False
@@ -2405,7 +2405,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         state = await session.get(DeploymentState, 1)
         if state:
             monitoring_since = _shared_state.deploy_monitoring.get("window_start")
-            recent_results = _shared_state.deploy_monitoring.get("task_results", [])[-10:]
+            recent_results = list(_shared_state.deploy_monitoring.get("task_results", []))[-10:]
             deploy_state = {
                 "revision": state.current_revision,
                 "sha": state.current_sha[:8] if state.current_sha else "",
