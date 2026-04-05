@@ -1,6 +1,15 @@
 [tool.ruff]
 exclude = ["alembic/"]
 
+[tool.ruff.lint]
+select = ["DTZ"]  # flake8-datetimez: catches datetime.utcnow(), datetime.now() without tz
+
+[tool.ruff.lint.per-file-ignores]
+# shared_state.py uses datetime.utcnow() at module level (can't import _utcnow due to circular dep)
+"app/shared_state.py" = ["DTZ"]
+# Test files may use datetime.utcnow() for convenience
+"testing/*" = ["DTZ"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
