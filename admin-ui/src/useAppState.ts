@@ -845,6 +845,7 @@ export function useAppState() {
     fetchDeployState();
     const id = setInterval(() => fetchDeployState(true), 60000);
     return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // --- Zone Health ---

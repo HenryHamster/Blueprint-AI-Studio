@@ -752,7 +752,6 @@ export function TaskDetailDrawer({
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLogFilter('');
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLogLevel('all');
   }, [task.id]);
 
