@@ -26,6 +26,9 @@ interface BlockingGuard {
   // rate_limit_exceeded
   tasks_this_hour?: number;
   max_per_hour?: number;
+  // waiting_for_interval
+  next_check_at?: string;
+  seconds_until_check?: number;
 }
 
 interface CircuitBreakerInfo {
@@ -69,6 +72,7 @@ function getLifecyclePhase(debug: AutonomyDebug): number {
   if (guards.includes('research_task_active')) return 3; // Executing
   if (guards.includes('no_eligible_directions') || guards.includes('rate_limit_exceeded')) return 4; // Cooldowns
   if (guards.includes('circuit_breaker_open')) return 4; // Cooldowns
+  if (guards.includes('waiting_for_interval')) return 0; // Idle — waiting for next check window
   if (!debug.spawn_blocked) return 1; // Ready to check/spawn
   return 0; // Idle (disabled or other block)
 }
@@ -109,6 +113,8 @@ function GuardIcon({ guard }: { guard: string }) {
       return <PlayCircle className="w-3 h-3 shrink-0 text-blue-400" />;
     case 'rate_limit_exceeded':
       return <Gauge className="w-3 h-3 shrink-0 text-orange-400" />;
+    case 'waiting_for_interval':
+      return <Clock className="w-3 h-3 shrink-0 text-neutral-400" />;
     default:
       return <AlertTriangle className="w-3 h-3 shrink-0 text-neutral-400" />;
   }
@@ -121,6 +127,7 @@ function guardColor(guard: string): string {
     case 'no_eligible_directions': return 'text-amber-400';
     case 'research_task_active': return 'text-blue-400';
     case 'rate_limit_exceeded': return 'text-orange-400';
+    case 'waiting_for_interval': return 'text-neutral-400';
     default: return 'text-neutral-400';
   }
 }
@@ -141,20 +148,27 @@ function guardLabel(g: BlockingGuard): string {
       return 'Research task already running';
     case 'rate_limit_exceeded':
       return `Rate limit: ${g.tasks_this_hour ?? '?'}/${g.max_per_hour ?? '?'} tasks this hour`;
+    case 'waiting_for_interval': {
+      const secs = g.seconds_until_check ?? (g.next_check_at ? secondsUntil(g.next_check_at) : 0);
+      if (secs <= 0) return 'Research eligible, waiting for VM slot';
+      return `Next research check in ${formatSeconds(secs)}`;
+    }
     default:
       return g.reason;
   }
 }
 
 function SpawnGuardDiagnostics({ guards }: { guards: BlockingGuard[] }) {
-  if (guards.length === 0) return null;
+  // waiting_for_interval is normal operation — shown in the lifecycle indicator instead
+  const errorGuards = guards.filter(g => g.guard !== 'waiting_for_interval');
+  if (errorGuards.length === 0) return null;
   return (
     <div className="mt-2 rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
       <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">
         Why autonomy isn't spawning
       </p>
       <ul className="space-y-1">
-        {guards.map((g, i) => (
+        {errorGuards.map((g, i) => (
           <li key={i} className="flex items-start gap-1.5">
             <span className="mt-px"><GuardIcon guard={g.guard} /></span>
             <span className={`text-[11px] leading-tight ${guardColor(g.guard)}`}>
@@ -190,7 +204,10 @@ function CircuitBreakerDetail({ cb }: { cb: CircuitBreakerInfo }) {
 
 function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
   const activeStep = getLifecyclePhase(debug);
-  const nextCheckSecs = secondsUntil(debug.next_check_at);
+  const intervalGuard = debug.blocking_guards.find(g => g.guard === 'waiting_for_interval');
+  const nextCheckSecs = intervalGuard
+    ? (intervalGuard.seconds_until_check ?? secondsUntil(intervalGuard.next_check_at ?? debug.next_check_at))
+    : secondsUntil(debug.next_check_at);
 
   return (
     <div className="mt-2">

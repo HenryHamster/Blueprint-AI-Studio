@@ -2601,6 +2601,7 @@ async def get_autonomy_debug(
 ):
     """Return a detailed snapshot of why autonomy is or isn't spawning for a project."""
     from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
+    import app.shared_state as _shared_state_mod
 
     project = await session.get(Project, project_id)
     if not project:
@@ -2727,9 +2728,24 @@ async def get_autonomy_debug(
             "max_per_hour": max_per_hour,
         })
 
-    # next_check_at: based on autonomous_research_interval_minutes
+    # Guard 6: waiting_for_interval — interval gate hasn't elapsed since last_idle_check
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-    next_check_at = (now + timedelta(minutes=interval_minutes)).isoformat()
+    last_idle_check = _shared_state_mod.last_idle_check
+    if last_idle_check:
+        interval_elapsed = (now - last_idle_check).total_seconds() >= interval_minutes * 60
+        next_check_at = (last_idle_check + timedelta(minutes=interval_minutes)).isoformat()
+    else:
+        interval_elapsed = True
+        next_check_at = now.isoformat()
+
+    if not interval_elapsed:
+        secs_until_check = max(0, int((last_idle_check + timedelta(minutes=interval_minutes) - now).total_seconds()))
+        blocking_guards.append({
+            "guard": "waiting_for_interval",
+            "reason": f"Research interval ({interval_minutes}m) has not elapsed since last check",
+            "next_check_at": next_check_at,
+            "seconds_until_check": secs_until_check,
+        })
 
     return {
         "spawn_blocked": len(blocking_guards) > 0,
