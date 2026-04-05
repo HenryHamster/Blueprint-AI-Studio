@@ -74,7 +74,7 @@ import app.shared_state as _shared_state
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0020"
+EXPECTED_SCHEMA_REVISION = "0021"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
