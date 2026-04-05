@@ -1120,15 +1120,15 @@ async def _check_autonomous_research(owner: str, repo: str):
             if not project:
                 return
 
-            # Spawn if there are available VM slots (don't wait for empty queue)
+            # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
             from sqlalchemy import func
-            active_count = (await session.execute(
+            vm_consuming = (await session.execute(
                 select(func.count()).select_from(Task).where(
-                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                 )
             )).scalar() or 0
 
-            if active_count < _runtime_config["max_concurrent_vms"]:
+            if vm_consuming < _runtime_config["max_concurrent_vms"]:
                 await _spawn_research_task(project, session)
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
@@ -1155,14 +1155,15 @@ async def _check_idle_research():
                 if not active_directions:
                     continue
 
-                # Spawn if there are available VM slots (don't wait for empty queue)
-                active_count = (await session.execute(
+                # Spawn if VM slots are available — count only tasks consuming VMs,
+                # not QUEUED tasks blocked on dependencies
+                vm_consuming = (await session.execute(
                     select(func.count()).select_from(Task).where(
-                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                        Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                     )
                 )).scalar() or 0
 
-                if active_count < _runtime_config["max_concurrent_vms"]:
+                if vm_consuming < _runtime_config["max_concurrent_vms"]:
                     await _spawn_research_task(project, session)
 
                     for task_type in ("security_audit", "qa", "deps"):
@@ -2277,11 +2278,12 @@ async def orchestrator_worker():
         # Sleep based on whether we found tasks
         try:
             if queued_tasks:
-                await asyncio.sleep(0.5) # Yield control briefly if we are processing a backlog
+                await asyncio.sleep(0.5)
             else:
-                await asyncio.sleep(5) # Sleep longer if queue is empty
-                # Check for idle autonomous research when nothing is queued
-                await _check_idle_research()
+                await asyncio.sleep(5)
+            # Check autonomous research every cycle — interval gate inside handles throttling.
+            # Spawns only when VM slots are available (not tied to queue being empty).
+            await _check_idle_research()
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
