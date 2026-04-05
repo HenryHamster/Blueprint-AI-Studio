@@ -13,9 +13,20 @@ interface Direction {
   text: string;
   priority: 'high' | 'medium' | 'low';
   added_at: string;
-  status: 'active' | 'completed' | 'paused';
+  status: 'active' | 'completed' | 'paused' | 'proposed';
   paths?: string[];
   last_researched_at?: string | null;
+  proposed_by?: string;
+  proposal_rationale?: string;
+  proposed_at?: string;
+  pending_update?: {
+    suggested_text?: string;
+    suggested_priority?: string;
+    suggested_paths?: string[];
+    rationale: string;
+    proposed_at: string;
+    proposed_by: string;
+  };
 }
 
 function formatRelativeTime(isoString: string): string {
@@ -57,11 +68,13 @@ const statusColors: Record<string, string> = {
   active: 'bg-emerald-950/40 text-emerald-400 border-emerald-900/50',
   completed: 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50',
   paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
+  proposed: 'bg-purple-950/40 text-purple-400 border-purple-900/50',
 };
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-const STATUS_GROUPS: Array<{ key: 'active' | 'paused' | 'completed'; label: string }> = [
+const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'; label: string }> = [
+  { key: 'proposed', label: 'Proposed by Agent' },
   { key: 'active', label: 'Active' },
   { key: 'paused', label: 'Paused' },
   { key: 'completed', label: 'Completed' },
@@ -88,7 +101,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused'>('active');
+  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed'>('active');
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');
 
@@ -274,6 +287,72 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     }
   }
 
+  async function approveProposal(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ status: 'active' }),
+      });
+      if (!res.ok) throw new Error('Failed to approve proposal');
+      addToast('Direction approved and activated', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to approve proposal. Please try again.');
+    }
+  }
+
+  async function rejectProposal(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'DELETE', headers: h,
+      });
+      if (!res.ok) throw new Error('Failed to reject proposal');
+      addToast('Direction proposal rejected', 'info');
+      fetchDirections();
+    } catch {
+      setError('Failed to reject proposal. Please try again.');
+    }
+  }
+
+  async function applyDirectionUpdate(d: Direction) {
+    if (!d.pending_update) return;
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const updated: Record<string, unknown> = { pending_update: null };
+      if (d.pending_update.suggested_text) updated.text = d.pending_update.suggested_text;
+      if (d.pending_update.suggested_priority) updated.priority = d.pending_update.suggested_priority;
+      if (d.pending_update.suggested_paths) updated.paths = d.pending_update.suggested_paths;
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${d.id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify(updated),
+      });
+      if (!res.ok) throw new Error('Failed to apply direction update');
+      fetchDirections();
+    } catch {
+      setError('Failed to apply direction update. Please try again.');
+    }
+  }
+
+  async function dismissDirectionUpdate(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ pending_update: null }),
+      });
+      if (!res.ok) throw new Error('Failed to dismiss direction update');
+      fetchDirections();
+    } catch {
+      setError('Failed to dismiss direction update. Please try again.');
+    }
+  }
+
   async function deleteDirection(id: string) {
     if (!window.confirm('Are you sure you want to delete this direction?')) return;
     setError(null);
@@ -315,7 +394,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     setError(null);
     try {
       const h = await authHeaders();
-      // Full reorder: active in new order, then non-active in original order
+      // Full reorder: active in new order, then non-active (proposed/paused/completed) in original order
       const nonActive = previousDirections.filter(d => d.status !== 'active');
       const allOrdered = [...newOrder, ...nonActive];
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/reorder`, {
@@ -371,6 +450,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
           .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]),
   }));
 
+  const proposedCount = directions.filter(d => d.status === 'proposed').length;
+
   return (
     <div className="fixed inset-0 z-50 flex">
       {/* Backdrop */}
@@ -380,7 +461,14 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       <div className="relative ml-auto w-full sm:max-w-lg h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-neutral-800 shrink-0">
-          <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Directions</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Directions</h2>
+            {proposedCount > 0 && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-purple-950/60 text-purple-400 border border-purple-900/50">
+                {proposedCount} pending
+              </span>
+            )}
+          </div>
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>
@@ -626,8 +714,49 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     {!isCollapsed && (
                       <div className="space-y-2">
                         {items.map(d => (
-                          <div key={d.id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-                            {editingId === d.id ? (
+                          <div key={d.id} className={`border rounded-lg p-3 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+                            {d.status === 'proposed' ? (
+                              /* Proposed direction — approve or reject */
+                              <div>
+                                <div className="flex items-start gap-2">
+                                  <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <button
+                                      onClick={() => approveProposal(d.id)}
+                                      title="Approve — activate this direction"
+                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
+                                    >
+                                      Approve
+                                    </button>
+                                    <button
+                                      onClick={() => rejectProposal(d.id)}
+                                      title="Reject — remove this proposal"
+                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
+                                    >
+                                      Reject
+                                    </button>
+                                  </div>
+                                </div>
+                                {d.proposal_rationale && (
+                                  <blockquote className="mt-2 border-l-2 border-purple-800/50 pl-2 text-[11px] text-purple-300/80 italic leading-relaxed">
+                                    {d.proposal_rationale}
+                                  </blockquote>
+                                )}
+                                <div className="flex items-center gap-2 mt-2">
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
+                                    {d.priority}
+                                  </span>
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.proposed}`}>
+                                    Proposed by agent
+                                  </span>
+                                  {d.proposed_at && (
+                                    <span className="text-[10px] text-neutral-600 ml-auto">
+                                      {formatRelativeTime(d.proposed_at)}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : editingId === d.id ? (
                               /* Edit mode */
                               <div className="space-y-2">
                                 <input
@@ -850,6 +979,24 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                         {p}
                                       </span>
                                     ))}
+                                  </div>
+                                )}
+                                {d.pending_update && (
+                                  <div className="mt-2 p-2 bg-amber-950/20 border border-amber-900/30 rounded text-xs">
+                                    <div className="text-amber-400 font-medium mb-1">Agent suggests update:</div>
+                                    {d.pending_update.suggested_text && d.pending_update.suggested_text !== d.text && (
+                                      <div className="text-neutral-300">Text: &ldquo;{d.pending_update.suggested_text.slice(0, 150)}&rdquo;</div>
+                                    )}
+                                    {d.pending_update.suggested_priority && d.pending_update.suggested_priority !== d.priority && (
+                                      <div className="text-neutral-400">Priority: {d.priority} → {d.pending_update.suggested_priority}</div>
+                                    )}
+                                    {d.pending_update.rationale && (
+                                      <div className="text-neutral-500 italic mt-1">{d.pending_update.rationale}</div>
+                                    )}
+                                    <div className="flex gap-2 mt-2">
+                                      <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
+                                      <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
+                                    </div>
                                   </div>
                                 )}
                               </div>

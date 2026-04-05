@@ -1508,7 +1508,16 @@ ${hotspotsSection}
         const pathScope = Array.isArray(d.paths) && (d.paths as string[]).length > 0
           ? ` [scope: ${(d.paths as string[]).join(', ')}]`
           : '';
-        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})`;
+        const history = Array.isArray(d.research_history) ? d.research_history as Array<Record<string, unknown>> : [];
+        let historySection = '';
+        if (history.length > 0) {
+          const entries = history.slice(-3).map((h) => {
+            const titles = Array.isArray(h.finding_titles) ? (h.finding_titles as string[]).join(', ') : 'none';
+            return `  - ${h.timestamp}: ${h.tasks_created} tasks (${titles})`;
+          }).join('\n');
+          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):\n${entries}`;
+        }
+        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}`;
       }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
@@ -1559,7 +1568,7 @@ Instructions:
 ]
 
 Valid values:
-- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate, perf
+- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate, perf, direction_proposal, direction_update
   (use "research" when an area needs deeper investigation before implementation)
   (use "security_audit" when the finding involves security vulnerabilities that need a dedicated audit)
   (use "qa" when the finding is about missing test coverage)
@@ -1567,6 +1576,8 @@ Valid values:
   (use "docs" when the finding is about missing or outdated documentation)
   (use "migrate" when the finding requires a database schema migration via Alembic)
   (use "perf" when the finding involves performance bottlenecks — database queries, API latency, frontend bundle size)
+  (use "direction_proposal" when you discover a strategic area warranting a permanent standing research direction — see Direction Proposals section below)
+  (use "direction_update" when an existing direction is too vague, mis-prioritized, or could benefit from a path scope — see below)
 - scope: small (single file, under 50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural, orchestrator/model/agent/security changes — anything that could break the system if done wrong)
 - risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
 - priority: high, medium, low
@@ -1598,7 +1609,35 @@ How your findings get routed (you control this via type and scope):
 - type=research → spawns another **research** agent for deeper investigation before any implementation
 - type=improvement/bug/refactor/feature/test with scope=large → spawns a **plan** agent that decomposes into subtasks
 - type=improvement/bug/refactor/feature/test with scope=small or medium → spawns a **create** agent (single PR)
+- type=direction_proposal → does NOT spawn a task; instead creates a **pending direction** awaiting user approval in the Directions panel
+- type=direction_update → proposes a refinement to an existing direction (no task spawned, requires user review)
+  - direction_id: the id of the direction to update (from the directions list above)
+  - suggested_text: improved direction text (or omit to keep current)
+  - suggested_priority: "high"|"medium"|"low" (or omit to keep current)
+  - suggested_paths: array of path prefixes to scope the direction (or omit)
+  - description: rationale for why this update improves the direction
+  - Use this when a direction is too vague, incorrectly scoped, or mis-prioritized. Propose at most 1 direction_update per research cycle.
 - IMPORTANT: Write your findings JSON array to /tmp/research_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+
+## Direction Proposals
+If you discover a strategic area that clearly warrants ongoing research over multiple cycles — not just a one-time fix — you may propose it as a new standing direction. Use type=direction_proposal with this structure:
+{
+  "type": "direction_proposal",
+  "title": "direction: <short name>",
+  "description": "<rationale for why this should be a permanent direction, not a one-time task>",
+  "prompt": "<the direction text as it should appear to future research agents — be specific and actionable>",
+  "priority": "high|medium|low",
+  "scope": "small",
+  "risk": "low",
+  "related_files": [],
+  "depends_on_indices": []
+}
+Rules for direction proposals:
+- Propose at most 2 per research cycle
+- Only propose when the area clearly needs multiple research cycles to address fully
+- Do NOT propose if a similar active direction already exists
+- The "prompt" field becomes the direction text shown to users — write it as a concise goal statement
+- Direction proposals are held for user review and never auto-approved
 
 Context — you are part of an autonomous pipeline:
 - You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.

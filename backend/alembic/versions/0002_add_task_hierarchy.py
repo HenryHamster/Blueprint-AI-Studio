@@ -24,7 +24,7 @@ def upgrade() -> None:
     op.add_column('task', sa.Column('latest_status_message', sqlmodel.sql.sqltypes.AutoString(), nullable=True))
     op.add_column('task', sa.Column('created_by', sqlmodel.sql.sqltypes.AutoString(), nullable=False, server_default='USER'))
     op.add_column('task', sa.Column('requires_approval', sa.Boolean(), nullable=False, server_default='false'))
-    
+
     op.create_foreign_key('fk_task_parent_task_id', 'task', 'task', ['parent_task_id'], ['id'])
     op.create_index(op.f('ix_task_parent_task_id'), 'task', ['parent_task_id'], unique=False)
 
@@ -43,10 +43,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index(op.f('ix_taskhistory_task_id'), table_name='taskhistory')
     op.drop_table('taskhistory')
-    
+
     op.drop_index(op.f('ix_task_parent_task_id'), table_name='task')
     op.drop_constraint('fk_task_parent_task_id', 'task', type_='foreignkey')
-    
+
     op.drop_column('task', 'requires_approval')
     op.drop_column('task', 'created_by')
     op.drop_column('task', 'latest_status_message')

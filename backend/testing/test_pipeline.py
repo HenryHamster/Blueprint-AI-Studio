@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 from app.main import (
     _parse_research_findings,
     _validate_plan_dependencies,
-    _log_file_overlaps,
     classify_failure,
     record_task_result,
     should_rollback,
@@ -550,7 +549,7 @@ class TestGCPHealthCheck:
 
     def test_no_failures_means_healthy(self):
         """When all recent results are successes, GCP should be healthy."""
-        from app.shared_state import deploy_monitoring, external_health
+        from app.shared_state import deploy_monitoring
         # All successes
         deploy_monitoring["task_results"] = [
             (datetime.utcnow().isoformat(), "success", ""),

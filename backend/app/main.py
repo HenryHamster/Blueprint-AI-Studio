@@ -1,30 +1,31 @@
 import copy
-import hmac
 import hashlib
+import hmac
 import httpx
+import ipaddress
+import json
+import logging
 import os
 import re
-import logging
 import time
+import uuid
+import asyncio
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
-import uuid
-import asyncio
-import json
-import ipaddress
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func as _func
-from sqlmodel import select
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func as _func
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
@@ -58,8 +59,8 @@ from app.github import (
     close_github_client,
 )
 from app.shared_state import limiter
-from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
+from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -3725,6 +3726,7 @@ async def _spawn_pipeline_task(
             session.add(source_task)
             return t
 
+    # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
     # Filter to tasks matching this PR number (check payloads JSONB)
     pr_pipeline_tasks = (await session.execute(
         select(Task).where(
@@ -4576,6 +4578,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await session.commit()
         return
 
+    # Separate direction proposals from actionable findings — proposals become pending
+    # directions awaiting user approval, not implementation tasks.
+    direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
+    findings = [f for f in findings if f.get("type") != "direction_proposal"]
+
     # Cap findings to prevent runaway task creation
     if len(findings) > 30:
         findings = findings[:30]
@@ -4660,11 +4667,35 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         title = finding.get("title", f"Research finding #{orig_i+1}")
         prompt = finding.get("prompt", finding.get("description", ""))
 
+        # Determine task type early — direction_update findings don't require a prompt
+        finding_type = finding.get("type", "improvement")
+        if finding_type == "direction_update":
+            # Process as a direction modification proposal, not a task
+            target_id = finding.get("direction_id")
+            if not target_id:
+                continue  # direction_update requires a target direction_id
+            dir_project = await session.get(Project, task.project_id)
+            if not dir_project:
+                continue
+            directions = list(dir_project.directions or [])
+            for d in directions:
+                if d.get("id") == target_id:
+                    d["pending_update"] = {
+                        "suggested_text": finding.get("suggested_text", d.get("text")),
+                        "suggested_priority": finding.get("suggested_priority", d.get("priority")),
+                        "suggested_paths": finding.get("suggested_paths", d.get("paths", [])),
+                        "rationale": finding.get("description", "")[:300],
+                        "proposed_at": _utcnow().isoformat(),
+                        "proposed_by": str(task.id),
+                    }
+                    break
+            dir_project.directions = directions
+            flag_modified(dir_project, "directions")
+            session.add(dir_project)
+            continue  # Don't create a task for direction_update findings
+
         if not prompt:
             continue
-
-        # Determine task type: research findings can spawn sub-research or specialized agents
-        finding_type = finding.get("type", "improvement")
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
         elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
@@ -4762,15 +4793,69 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
+            # Append to research_history for each direction that produced findings
+            finding_titles_by_dir: dict = {}
+            for ct in child_tasks:
+                did = (ct.context or {}).get("direction_id")
+                if did:
+                    finding_titles_by_dir.setdefault(did, []).append(ct.title)
+            for d in directions:
+                did = d.get("id")
+                if did in direction_ids_with_findings:
+                    history = d.get("research_history", [])
+                    entry = {
+                        "timestamp": now_iso,
+                        "task_id": str(task.id),
+                        "tasks_created": len([ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]),
+                        "finding_titles": finding_titles_by_dir.get(did, [])[:5],
+                    }
+                    # Keep last 10 history entries to avoid unbounded growth
+                    d["research_history"] = (history + [entry])[-10:]
             project.directions = directions
-            from sqlalchemy.orm.attributes import flag_modified
             flag_modified(project, "directions")
             session.add(project)
+
+    # Process direction proposals — add to Project.directions with status='proposed'
+    proposals_created = 0
+    if direction_proposals:
+        proposal_project = await session.get(Project, task.project_id)
+        if proposal_project:
+            proj_directions = list(proposal_project.directions or [])
+            pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
+            max_proposals = 10
+            now_iso = _utcnow().isoformat()
+            for proposal in direction_proposals[:5]:  # max 5 per research call
+                if pending_count >= max_proposals:
+                    logger.info(f"[RESEARCH] Skipping direction proposal — max {max_proposals} pending proposals reached")
+                    break
+                proposal_text = (proposal.get("prompt") or proposal.get("description") or "")[:500]
+                if not proposal_text.strip():
+                    continue
+                new_direction = {
+                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "text": proposal_text,
+                    "priority": proposal.get("priority", "medium") if proposal.get("priority") in ("high", "medium", "low") else "medium",
+                    "paths": [],
+                    "added_at": now_iso,
+                    "status": "proposed",
+                    "proposed_by": str(task.id),
+                    "proposal_rationale": (proposal.get("description") or "")[:500],
+                    "proposed_at": now_iso,
+                }
+                proj_directions.append(new_direction)
+                pending_count += 1
+                proposals_created += 1
+            if proposals_created:
+                proposal_project.directions = proj_directions
+                flag_modified(proposal_project, "directions")
+                session.add(proposal_project)
+                logger.info(f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}")
 
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (
         f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
         + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
+        + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
     )
     task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
     session.add(task)

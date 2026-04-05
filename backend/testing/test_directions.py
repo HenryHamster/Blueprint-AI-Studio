@@ -452,6 +452,86 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
     assert len(child_tasks) == 0
 
 
+@pytest.mark.asyncio
+async def test_handle_research_completion_direction_update_sets_pending_update(db_session, mocker):
+    """A direction_update finding stores pending_update on the target direction and creates no task."""
+    direction_id = "d-dupdate1"
+    direction = {
+        "id": direction_id,
+        "text": "Old direction text",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+
+    project = Project(
+        name="Direction Update Test",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Old direction text",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch("app.main.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
+    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.main._log_file_overlaps", return_value=None)
+    mocker.patch(
+        "app.main._parse_research_findings",
+        return_value=[{
+            "type": "direction_update",
+            "direction_id": direction_id,
+            "title": "Refine direction scope",
+            "description": "The direction is too broad; narrow it to authentication only.",
+            "suggested_text": "Focus on authentication module",
+            "suggested_priority": "high",
+            "suggested_paths": ["backend/app/auth.py"],
+            "prompt": "",  # direction_update findings have no task prompt
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    # Reload from DB
+    await db_session.refresh(project)
+    updated_directions = project.directions
+    target = next((d for d in updated_directions if d["id"] == direction_id), None)
+    assert target is not None
+
+    # pending_update should be set
+    assert "pending_update" in target, "pending_update should be written to the direction"
+    pu = target["pending_update"]
+    assert pu["suggested_text"] == "Focus on authentication module"
+    assert pu["suggested_priority"] == "high"
+    assert pu["suggested_paths"] == ["backend/app/auth.py"]
+    assert "rationale" in pu
+    assert "proposed_at" in pu
+
+    # No child task should have been created
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "direction_update findings must not create child tasks"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Task-Counts Endpoint
 # ─────────────────────────────────────────────────────────────────────────────

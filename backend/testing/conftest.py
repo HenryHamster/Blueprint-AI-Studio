@@ -25,9 +25,9 @@ def _sqlite_visit_JSONB(self, type_, **kw):
 
 _SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB
 
-from app.main import app
-from app.database import get_session
-from app.auth import get_current_user, require_admin
+from app.main import app  # noqa: E402
+from app.database import get_session  # noqa: E402
+from app.auth import get_current_user, require_admin  # noqa: E402
 
 # --- Database engine selection ---
 # CI explicitly sets USE_TEST_POSTGRES=true to use real PostgreSQL.

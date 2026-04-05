@@ -1708,8 +1708,8 @@ async def update_direction(
     # Validate inputs
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
         raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
-    if "status" in payload and payload["status"] not in ("active", "completed", "paused"):
-        raise HTTPException(status_code=400, detail="status must be active, completed, or paused")
+    if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed"):
+        raise HTTPException(status_code=400, detail="status must be active, completed, paused, or proposed")
     if "text" in payload:
         if not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1:
             raise HTTPException(status_code=400, detail="text must be 1-500 characters")
@@ -1729,6 +1729,8 @@ async def update_direction(
                 d["text"] = payload["text"]
             if "paths" in payload:
                 d["paths"] = payload["paths"]
+            if "pending_update" in payload:
+                d["pending_update"] = payload["pending_update"]
             updated = True
             break
 

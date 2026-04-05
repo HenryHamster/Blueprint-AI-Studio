@@ -6,9 +6,7 @@ modified by agents. If an agent changes a safety value, CI catches it.
 
 Run with: pytest testing/test_invariants.py -v --noconftest
 """
-import re
 import os
-import pytest
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
