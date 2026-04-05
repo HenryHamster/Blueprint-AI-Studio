@@ -174,9 +174,23 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       });
     } catch (e: unknown) {
       log(`Heartbeat failed: ${e}`);
-      // 409 = row temporarily locked (skip_locked), retry next cycle — NOT fatal
+      // 409 = row temporarily locked (skip_locked) — retry once after 5s.
+      // Silently dropping heartbeats can let last_heartbeat go stale if the
+      // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
       if (e instanceof Error && /failed \(409\)/.test(e.message)) {
-        log('Heartbeat skipped (row locked), will retry next cycle');
+        log('Heartbeat skipped (row locked), retrying in 5s');
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          const retryMetrics = collectMetrics();
+          await apiPost('/api/agent/heartbeat', {
+            task_id: taskId,
+            status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
+            metrics: retryMetrics,
+          });
+          log('Heartbeat retry succeeded');
+        } catch (retryErr: any) {
+          log(`Heartbeat retry also failed: ${retryErr}`);
+        }
         return;
       }
       // Other 4xx = task reassigned to new VM (404) or other client error — graceful shutdown
@@ -1655,14 +1669,14 @@ Instructions:
 
 [
   {
-    "type": "improvement",
-    "title": "Short title (under 60 chars, conventional commit style)",
-    "description": "1-3 sentence description of the change",
+    "type": "feature",
+    "title": "feat: short title (under 60 chars, conventional commit style)",
+    "description": "1-3 sentence description of the change and why it matters",
     "prompt": "The exact prompt to give to an implementing agent. Must be self-contained.",
-    "scope": "small",
-    "risk": "low",
+    "scope": "medium",
+    "risk": "medium",
     "priority": "high",
-    "related_files": ["path/to/file1.py"],
+    "related_files": ["path/to/file1.py", "path/to/file2.tsx"],
     "depends_on_indices": [],
     "direction_id": "d-1 or null if self-discovered",
     "model": "claude-opus-4-6 | claude-sonnet-4-6 | null (use project default)",
@@ -1687,14 +1701,16 @@ Valid values:
 - priority: high, medium, low
 
 Rules:
+- IMPORTANT: Balance your findings. A good research cycle produces a MIX of substantial work (features, refactors, architectural improvements) AND small fixes. Do not fill an entire cycle with only lint tweaks, config changes, or cosmetic fixes. If the direction calls for improvement, find things that users or developers will actually notice.
+- Bundle all small/low-risk fixes (lint rules, typos, config tweaks, single-line fixes) into ONE combined finding with scope=small. Do not create separate findings for each small fix — each finding spawns a VM + PR, so trivial individual findings waste significant resources.
 - When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
-- Group related small changes into ONE finding when they touch the same area (e.g. 3 small fixes in the same file = 1 finding with scope=small, not 3 separate findings). Each finding = 1 VM + 1 PR, so grouping saves significant overhead.
-- A finding should be ONE PR-sized unit of work (scope=small for grouped small changes or single changes, scope=medium for multi-file work, scope=large for architectural changes)
+- A finding should be ONE PR-sized unit of work (scope=small for bundled small changes, scope=medium for multi-file work, scope=large for architectural changes)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
 - Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
 - Limit to 30 findings maximum, prioritized by impact
+- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough.
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
 - For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
 - For type=security_audit findings, the prompt should describe the audit scope/focus — it will spawn a dedicated security audit agent
@@ -1751,9 +1767,10 @@ Rules for direction proposals:
 
 Context — you are part of an autonomous pipeline:
 - You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
-- Think iteratively. You don't need to solve everything in one pass. Prefer laying clean foundations that future research cycles can build on over shipping everything at once.
+- Think iteratively, but think big. You don't need to solve everything in one pass, but each cycle should move the needle meaningfully. A cycle that produces 3 impactful findings is far more valuable than one with 10 trivial fixes.
 - Keep the codebase clean. Other agents will read and modify the same code after you. Messy patterns multiply — extensible patterns compound.
 - Use type=research findings for areas that need deeper investigation before implementation. This spawns a sub-research agent to dig in further. Don't rush to implement something you're uncertain about.
+- For genuinely complex improvements that span multiple components, use scope=large — this routes to a planning agent that decomposes it into safe subtasks. Don't shy away from proposing large-scope work; the pipeline handles the complexity for you.
 
 Approach:
 - This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. Changes that touch one layer usually need corresponding changes in other layers.

@@ -4587,7 +4587,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             child_payload['type'] = raw_type if raw_type in _allowed_types else 'create'
 
             child.payloads = [child_payload]
-            child.requires_approval = child_risk == 'high'
+            child.requires_approval = False  # high-risk children execute freely; approval gates the final rollup merge
             child_approval_reason = child_payload.get('approval_reason') if child_risk == 'high' else None
             existing_ctx = child.context or {}
             child.context = {
@@ -5873,6 +5873,26 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Guard: concurrent sibling may have created a different rollup PR in the gap
                 if parent_ctx.get("rollup_pr_number") != rollup_pr_number:
                     logger.info(f"[ROLLUP] Concurrent sibling created rollup PR for parent {parent.id} — yielding")
+                    return
+
+                # Check if any child task was high-risk — if so, require approval on the final merge
+                has_high_risk_child = any(
+                    (c.context or {}).get("risk") == "high"
+                    for c in children
+                    if c.status == TaskStatus.COMPLETED
+                )
+                if has_high_risk_child and not is_target_intermediate:
+                    parent.requires_approval = True
+                    parent.latest_status_message = (
+                        f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting approval "
+                        f"(contains high-risk changes)"
+                    )
+                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                    session.add(parent)
+                    await session.commit()
+                    await broadcast_to_project(str(parent.project_id), "task_updated",
+                                               {"task_id": str(parent.id), "status": parent.status})
+                    logger.info(f"[ROLLUP] PR #{rollup_pr_number} has high-risk children — requires approval before merge to {target_branch}")
                     return
 
                 # Auto-merge small rollups on intermediate branches; review large ones

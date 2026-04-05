@@ -304,19 +304,27 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     secret_id = f"agent-creds-{vm_instance_id}"
     parent = f"projects/{GCP_PROJECT_ID}"
 
-    # Create the secret
-    secret = client.create_secret(
-        request={
-            "parent": parent,
-            "secret_id": secret_id,
-            "secret": {
-                "replication": {"automatic": {}},
-                "labels": {"managed-by": "blueprint", "vm-instance": vm_instance_id},
-            },
-        }
-    )
+    # Create the secret (or reuse if it already exists from a previous attempt)
+    secret_name = f"{parent}/secrets/{secret_id}"
+    try:
+        secret = client.create_secret(
+            request={
+                "parent": parent,
+                "secret_id": secret_id,
+                "secret": {
+                    "replication": {"automatic": {}},
+                    "labels": {"managed-by": "blueprint", "vm-instance": vm_instance_id},
+                },
+            }
+        )
+    except Exception as e:
+        if "AlreadyExists" in str(type(e).__name__) or "409" in str(e):
+            logger.info(f"Secret {secret_id} already exists — reusing")
+            secret = type('Secret', (), {'name': secret_name})()
+        else:
+            raise
 
-    # Add the secret version with the payload
+    # Add the secret version with the payload (overwrites any stale version)
     version = client.add_secret_version(
         request={
             "parent": secret.name,
