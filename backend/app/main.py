@@ -379,6 +379,8 @@ async def _init_deployment_state():
         try:
             if state.runtime_autonomous_research_interval_minutes is not None:
                 _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
+            if getattr(state, 'runtime_autonomous_direction_cooldown_minutes', None) is not None:
+                _runtime_config["autonomous_direction_cooldown_minutes"] = state.runtime_autonomous_direction_cooldown_minutes
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
         # Restore circuit breaker state — prevents deploy from clearing tripped breakers
@@ -882,12 +884,16 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # active_directions preserves UI drag-order (index 0 = highest priority).
     # Among eligible directions, prefer those never researched or oldest researched.
     import random
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
     never_researched = [d for d in active_directions if not d.get("last_researched_at")]
     if never_researched:
-        chosen_direction = random.choice(never_researched)
+        # Pick from the highest priority tier among never-researched
+        best_pri = min(priority_rank.get(d.get("priority", "medium"), 1) for d in never_researched)
+        top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
+        chosen_direction = random.choice(top_tier)
     else:
-        # All have been researched before — pick the one researched longest ago
-        active_directions.sort(key=lambda d: d.get("last_researched_at") or "")
+        # All have been researched — pick highest priority first, then oldest researched
+        active_directions.sort(key=lambda d: (priority_rank.get(d.get("priority", "medium"), 1), d.get("last_researched_at") or ""))
         chosen_direction = active_directions[0]
 
     # Guard: no research task actively running (queued/provisioning/in_progress).

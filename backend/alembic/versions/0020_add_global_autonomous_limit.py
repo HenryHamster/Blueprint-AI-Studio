@@ -1,4 +1,4 @@
-"""add_global_autonomous_limit
+"""add_global_autonomous_limit_and_direction_cooldown
 
 Revision ID: 0020
 Revises: 0019
@@ -18,7 +18,9 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column('deploymentstate', sa.Column('runtime_max_global_autonomous_tasks_per_hour', sa.Integer(), nullable=True))
+    op.add_column('deploymentstate', sa.Column('runtime_autonomous_direction_cooldown_minutes', sa.Integer(), nullable=True))
 
 
 def downgrade() -> None:
+    op.drop_column('deploymentstate', 'runtime_autonomous_direction_cooldown_minutes')
     op.drop_column('deploymentstate', 'runtime_max_global_autonomous_tasks_per_hour')
