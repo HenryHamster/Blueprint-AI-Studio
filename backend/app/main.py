@@ -1519,14 +1519,15 @@ async def reaper_service():
                         orphaned_ids.append(task.id)
 
                 # Step 2: Lock ONLY orphaned rows (heartbeats on healthy tasks are never blocked)
-                # populate_existing=True forces SQLAlchemy to overwrite cached identity map
-                # objects with fresh DB values — without this, step 1's stale last_heartbeat
-                # persists through the re-verification and causes false reaps.
+                # expire_all() nukes the identity map so step 2 MUST read fresh from DB.
+                # populate_existing=True was tried but doesn't reliably refresh with
+                # with_for_update(skip_locked=True) on async sessions.
                 orphaned_tasks = []
                 if orphaned_ids:
+                    session.expire_all()
                     lock_stmt = select(Task).where(
                         Task.id.in_(orphaned_ids)
-                    ).with_for_update(skip_locked=True).execution_options(populate_existing=True)
+                    ).with_for_update(skip_locked=True)
                     orphaned_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
                     # Track tasks skipped by skip_locked — force-reap after 3 consecutive skips
@@ -1540,9 +1541,10 @@ async def reaper_service():
                     force_lock_ids = [lid for lid, count in _reaper_skip_counts.items() if count >= 3]
                     if force_lock_ids:
                         try:
+                            session.expire_all()
                             force_stmt = select(Task).where(
                                 Task.id.in_(force_lock_ids)
-                            ).with_for_update().execution_options(populate_existing=True)
+                            ).with_for_update()
                             force_locked = list((await session.execute(force_stmt)).scalars().all())
                             for t in force_locked:
                                 _reaper_skip_counts.pop(t.id, None)
@@ -1562,7 +1564,7 @@ async def reaper_service():
                             del _reaper_skip_counts[tid]
 
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
-                    # populate_existing ensures these objects have fresh DB values
+                    # expire_all() above ensures these objects have fresh DB values
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
                     five_minutes_ago = now - timedelta(minutes=5)
                     ten_minutes_ago = now - timedelta(minutes=10)
@@ -2303,6 +2305,7 @@ async def orchestrator_worker():
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
+                    task.last_heartbeat = _utcnow()  # Reset stale-recovery clock from dispatch
                     _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
                     try:
@@ -2335,6 +2338,18 @@ async def orchestrator_worker():
 
                             success = await provision_agent_vm(vm_id, t_id, payload_uri,
                                                                oauth_token=token, claude_config_json=config_json)
+                            if success:
+                                # Touch last_heartbeat so stale recovery (5-min threshold)
+                                # doesn't requeue while the VM is still booting.
+                                try:
+                                    async with AsyncSessionLocal() as hb_session:
+                                        hb_task = await hb_session.get(Task, t_id)
+                                        if hb_task and hb_task.status == TaskStatus.PROVISIONING:
+                                            hb_task.last_heartbeat = _utcnow()
+                                            hb_session.add(hb_task)
+                                            await hb_session.commit()
+                                except Exception as e:
+                                    logger.warning(f"[ORCHESTRATOR] Failed to touch heartbeat after provision for {t_id}: {e}")
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
                             success = False
@@ -3614,6 +3629,7 @@ async def claim_task(
         raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
 
     task.status = TaskStatus.IN_PROGRESS
+    task.last_heartbeat = _utcnow()  # Immediate heartbeat — don't wait 30s for agent interval
     session.add(task)
     await session.commit()
     await session.refresh(task)
