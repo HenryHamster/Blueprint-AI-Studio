@@ -1,12 +1,14 @@
 import os
 import re
 import uuid
+import time
 import logging
 import asyncio
 import subprocess
 import signal
 import threading
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,10 @@ FALLBACK_ZONES: list[tuple[str, str]] = [
 
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
+
+# Semaphore to cap concurrent GCP API calls — prevents thread pool starvation
+# and stays well under GCP's 20 QPS rate limit
+_gcp_semaphore = asyncio.Semaphore(10)
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
@@ -75,6 +81,48 @@ AGENT_SERVICE_ACCOUNT_EMAIL = os.getenv(
 # Agent source directory for local mode
 AGENT_DIR = os.getenv("AGENT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "agent"))
 
+def _validate_env_config() -> None:
+    """Fail fast if placeholder env vars are still set."""
+    if GCP_PROJECT_ID == "your-gcp-project-id":
+        raise RuntimeError("GCP_PROJECT_ID is not configured (still set to placeholder)")
+    if ORCHESTRATOR_URL == "http://localhost:8080" and not LOCAL_MODE:
+        raise RuntimeError("ORCHESTRATOR_URL is not configured (still set to localhost)")
+    if "your-gcp-project-id" in AGENT_SERVICE_ACCOUNT_EMAIL and not LOCAL_MODE:
+        raise RuntimeError("AGENT_SERVICE_ACCOUNT_EMAIL is not configured (still contains placeholder)")
+
+
+def _validate_image_family() -> None:
+    """Verify the agent VM image family exists in GCP. Prevents all-zone cascading failure."""
+    from google.cloud import compute_v1
+    try:
+        client = compute_v1.ImagesClient()
+        # get_from_family raises NotFound if family doesn't exist
+        family_name = AGENT_IMAGE_FAMILY.split("/")[-1]
+        project = GCP_PROJECT_ID
+        if AGENT_IMAGE_FAMILY.startswith("projects/"):
+            parts = AGENT_IMAGE_FAMILY.split("/")
+            project = parts[1]
+        client.get_from_family(project=project, family=family_name)
+        logger.info(f"[STARTUP] Image family '{family_name}' validated in project '{project}'")
+    except Exception as e:
+        logger.error(f"[STARTUP] Image family validation failed: {e}")
+        raise RuntimeError(f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}")
+
+_image_family_valid: Optional[bool] = None  # None = not yet checked, True/False = result
+_image_family_last_check: float = 0.0
+_IMAGE_FAMILY_RECHECK_INTERVAL: float = 300.0  # Retry validation every 5 min if failed
+
+if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run — skip in dev/test
+    _validate_env_config()
+    try:
+        _validate_image_family()
+        _image_family_valid = True
+        _image_family_last_check = time.time()
+    except Exception as e:
+        _image_family_valid = False
+        _image_family_last_check = time.time()
+        logger.error(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s: {e}")
+
 from app.auth import create_agent_token  # noqa: E402 — must be after env vars
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
@@ -106,12 +154,37 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
     """
     if payload_uri:
         validate_payload_uri(payload_uri)
+    # Block provisioning if image family is invalid. Retry validation periodically
+    # so a transient startup failure doesn't permanently disable provisioning.
+    global _image_family_valid, _image_family_last_check
+    if _image_family_valid is False and not LOCAL_MODE:
+        now = time.time()
+        if now - _image_family_last_check >= _IMAGE_FAMILY_RECHECK_INTERVAL:
+            try:
+                _validate_image_family()
+                _image_family_valid = True
+                _image_family_last_check = now
+                logger.info("[COMPUTE] Image family re-validation succeeded — provisioning re-enabled")
+            except Exception as e:
+                _image_family_last_check = now
+                logger.error(f"[COMPUTE] Image family re-validation still failing: {e}")
+                raise RuntimeError(
+                    f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
+                    f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
+                )
+        else:
+            raise RuntimeError(
+                f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
+                f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
+            )
     if LOCAL_MODE:
         return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token)
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
 
 
-_last_provision_error: dict[str, str] = {}
+from collections import OrderedDict as _OrderedDict
+_last_provision_error: _OrderedDict = _OrderedDict()
+_PROVISION_ERROR_MAX = 500
 
 def get_provision_error(vm_instance_id: str) -> str:
     """Get and clear the last provisioning error for a VM."""
@@ -314,7 +387,17 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     echo "Starting Agent VM Initialization..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
-    (sleep 3600 && echo "Maximum TTL reached. Self-terminating..." && poweroff) &
+    # Graceful: stop the service first (SIGTERM), wait 30s for cleanup, then poweroff
+    TTL_SECONDS=3600
+    (
+      sleep $TTL_SECONDS
+      echo "TTL reached ($TTL_SECONDS s). Gracefully stopping agent service..."
+      systemctl stop blueprint-agent 2>/dev/null || true
+      sleep 30
+      echo "Force terminating VM..."
+      poweroff
+    ) &
+    TTL_PID=$!
 
     # 2. Retrieve credentials from Secret Manager (never stored in instance metadata)
     SECRET_VERSION="{secret_version_name}"
@@ -355,14 +438,22 @@ STATICENV
     # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
     systemctl daemon-reload
-    systemctl restart blueprint-agent
+    timeout 60 systemctl restart blueprint-agent || {{ echo "Service start failed, powering off"; poweroff; }}
 
-    # Wait for the service to finish
+    # Wait for the service to finish (with TTL guard)
+    POLL_START=$(date +%s)
     while systemctl is-active --quiet blueprint-agent; do
       sleep 5
+      ELAPSED=$(( $(date +%s) - POLL_START ))
+      if [ $ELAPSED -gt $TTL_SECONDS ]; then
+        echo "Service exceeded TTL, stopping..."
+        systemctl stop blueprint-agent 2>/dev/null || true
+        break
+      fi
     done
 
-    # 7. Graceful self-termination
+    # 7. Cancel TTL watchdog (service finished early) and self-terminate
+    kill $TTL_PID 2>/dev/null || true
     echo "Agent finished. Terminating VM..."
     poweroff
     """
@@ -437,7 +528,7 @@ STATICENV
                     instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
                     logger.info(f"Deleting stale VM {vm_instance_id} in {zone} before re-provisioning")
                     del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                    del_op.result()
+                    del_op.result(timeout=300)
                 except Exception as e:
                     if "was not found" not in str(e) and "404" not in str(e):
                         logger.warning(f"Failed to clean stale VM {vm_instance_id} in {zone}: {e}")
@@ -447,7 +538,7 @@ STATICENV
                     zone=zone,
                     instance_resource=instance_config
                 )
-                operation.result()
+                operation.result(timeout=300)
 
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
@@ -516,35 +607,121 @@ STATICENV
         if skipped_cooldown:
             logger.warning(f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}")
         if not last_error and len(skipped_cooldown) == len(FALLBACK_ZONES):
-            logger.critical(
-                f"ALL {len(FALLBACK_ZONES)} zones are in cooldown simultaneously — "
-                f"no capacity available, retry after {ZONE_COOLDOWN_SECONDS}s. "
-                f"Zones: {[z for z, _ in FALLBACK_ZONES]}"
-            )
-            raise Exception(f"All {len(FALLBACK_ZONES)} zones in cooldown — retry after {ZONE_COOLDOWN_SECONDS}s")
+            # All zones in cooldown — find the one expiring soonest and wait (up to 2 min)
+            now_check = datetime.now(timezone.utc)
+            soonest_zone = None
+            soonest_wait = float('inf')
+            for z, sn in FALLBACK_ZONES:
+                expires = _zone_health.get(z, {}).get("cooldown_expires_at")
+                if expires:
+                    remaining = (expires - now_check).total_seconds()
+                    if remaining < soonest_wait:
+                        soonest_wait = remaining
+                        soonest_zone = (z, sn)
+            if soonest_zone and soonest_wait <= 120:
+                wait_zone, wait_subnet = soonest_zone
+                logger.warning(
+                    f"All zones in cooldown — waiting {soonest_wait:.0f}s for {wait_zone} to exit cooldown"
+                )
+                import time as _time
+                _time.sleep(max(0, soonest_wait) + 1)  # Safe to block — already in thread
+                # Retry the soonest zone
+                try:
+                    instance_config.machine_type = f"zones/{wait_zone}/machineTypes/{MACHINE_TYPE}"
+                    zone_region = "-".join(wait_zone.split("-")[:-1])
+                    network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
+                    operation = instance_client.insert(project=GCP_PROJECT_ID, zone=wait_zone, instance_resource=instance_config)
+                    operation.result(timeout=300)
+                    with _zone_lock:
+                        _vm_zones[vm_instance_id] = wait_zone
+                        health = _zone_health.setdefault(wait_zone, {})
+                        health["last_success"] = datetime.now(timezone.utc)
+                        health["consecutive_failures"] = 0
+                        health.pop("cooldown_expires_at", None)
+                        _zone_failures.pop(wait_zone, None)
+                    logger.info(f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)")
+                    return operation.name
+                except Exception as retry_err:
+                    logger.error(f"Retry after cooldown wait failed for {wait_zone}: {retry_err}")
+                    raise
+            else:
+                logger.critical(
+                    f"ALL {len(FALLBACK_ZONES)} zones in cooldown, soonest expires in {soonest_wait:.0f}s (>120s cap) — "
+                    f"failing this provision attempt"
+                )
+                raise Exception(f"All zones in cooldown — soonest: {soonest_wait:.0f}s")
         raise last_error or Exception("All zones exhausted")
 
     try:
-        operation_name = await asyncio.to_thread(_insert_instance)
+        operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=360)
         logger.info(f"GCP Operation completed: {operation_name}")
         return True
     except Exception as e:
         logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
         _last_provision_error[vm_instance_id] = str(e)[:300]
+        if len(_last_provision_error) > _PROVISION_ERROR_MAX:
+            _last_provision_error.popitem(last=False)
         # Clean up the credential secret that was stored before provisioning began.
         # Without this, the secret would be orphaned if all zones are exhausted.
         await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return False
 
 
-async def _delete_gcp(vm_instance_id: str):
-    from google.cloud import compute_v1
+# ─── Shared VM Helpers (used by both delete and cleanup paths) ────────────
 
+def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
+    """Best-effort serial capture. Returns tail or None."""
+    from google.cloud import compute_v1
+    try:
+        client = compute_v1.InstancesClient()
+        serial = client.get_serial_port_output(
+            project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10
+        )
+        return (serial.contents or "")[-2000:]
+    except Exception:
+        return None
+
+
+def _delete_single_vm(vm_name: str, zone: str) -> bool:
+    """Delete a single VM. No serial capture. Returns True on success."""
+    from google.cloud import compute_v1
+    try:
+        client = compute_v1.InstancesClient()
+        operation = client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_name)
+        operation.result(timeout=300)
+        return True
+    except Exception as e:
+        if "was not found" in str(e) or "404" in str(e):
+            return True  # Already gone
+        logger.error(f"[VM DELETE] Failed to delete {vm_name} in {zone}: {e}")
+        return False
+
+
+def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
+    """List all agent-vm-* instances in a single zone. Returns [(name, zone, status)]."""
+    from google.cloud import compute_v1
+    results = []
+    try:
+        client = compute_v1.InstancesClient()
+        request = compute_v1.ListInstancesRequest(
+            project=GCP_PROJECT_ID, zone=zone, filter='name:agent-vm-'
+        )
+        for instance in client.list(request=request):
+            results.append((instance.name, zone, instance.status))
+    except Exception as e:
+        logger.error(f"[GCP CLEANUP] Failed to list VMs in zone {zone}: {e}")
+    return results
+
+
+# ─── Individual VM Deletion ───────────────────────────────────────────────
+
+async def _delete_gcp(vm_instance_id: str):
+    """Delete a single VM. Deletes first, captures serial after (non-blocking forensics)."""
     logger.info(f"Issuing external kill command for VM: {vm_instance_id}")
 
-    def _capture_serial_and_delete():
+    def _find_and_delete():
+        from google.cloud import compute_v1
         instance_client = compute_v1.InstancesClient()
-        # Check known zone first, then try all fallback zones
         zones_to_try = []
         with _zone_lock:
             known_zone = _vm_zones.pop(vm_instance_id, None)
@@ -555,93 +732,140 @@ async def _delete_gcp(vm_instance_id: str):
         for zone in zones_to_try:
             try:
                 instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-
-                # Capture serial console output before deletion — this is the only
-                # forensic evidence of agent crashes (OOM, segfaults, unhandled errors)
-                try:
-                    serial = instance_client.get_serial_port_output(
-                        project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id,
-                        timeout=10
-                    )
-                    tail = (serial.contents or "")[-2000:]
-                    logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
-                except Exception as serial_err:
-                    logger.warning(f"[VM-SERIAL] Could not fetch serial for {vm_instance_id}: {serial_err}")
-
+                # Found it — delete immediately (don't block on serial first)
                 operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                operation.result()
+                operation.result(timeout=300)
                 logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
-                return operation.name
+                return zone  # Return zone for post-delete serial capture
             except Exception as e:
                 if "was not found" in str(e) or "404" in str(e):
                     continue
                 raise
         logger.warning(f"VM {vm_instance_id} not found in any zone")
-        return "not_found"
+        return None
 
     try:
-        await asyncio.to_thread(_capture_serial_and_delete)
-        # Best-effort: clean up any leftover credentials secret (e.g. if VM was killed before it ran)
-        await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
+        # Note: asyncio.wait_for cancels the awaitable on timeout but cannot kill
+        # the underlying OS thread. The thread will continue until the GCP API call
+        # returns or times out on its own. This is a Python limitation; the 60s cap
+        # here prevents the caller from blocking, not the thread from running.
+        async with _gcp_semaphore:
+            deleted_zone = await asyncio.wait_for(
+                asyncio.to_thread(_find_and_delete),
+                timeout=60
+            )
+
+        # Fire-and-forget serial capture (non-blocking forensics)
+        if deleted_zone:
+            async def _bg_serial():
+                try:
+                    async with _gcp_semaphore:
+                        tail = await asyncio.to_thread(_capture_serial_for_vm, vm_instance_id, deleted_zone)
+                    if tail:
+                        logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
+                except Exception as e:
+                    logger.warning(f"[VM-SERIAL] Could not fetch serial for {vm_instance_id}: {e}")
+            asyncio.create_task(_bg_serial())
+
+        # Best-effort: clean up any leftover credentials secret
+        async with _gcp_semaphore:
+            await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout deleting VM {vm_instance_id} (>60s)")
+        return False
     except Exception as e:
         logger.error(f"Failed to terminate VM {vm_instance_id}: {e}")
         return False
 
 
-async def _cleanup_gcp(active_vm_ids: list[str]):
-    from google.cloud import compute_v1
+# ─── Bulk Orphan Cleanup ──────────────────────────────────────────────────
 
-    logger.info("Scanning for orphaned VMs in GCP...")
+class CleanupResult:
+    """Structured result from orphan cleanup."""
+    __slots__ = ("total_gcp_vms", "orphan_count", "deleted", "failed")
 
-    def _list_and_delete():
-        instance_client = compute_v1.InstancesClient()
-        orphaned_count = 0
+    def __init__(self):
+        self.total_gcp_vms: int = 0
+        self.orphan_count: int = 0
+        self.deleted: list[str] = []
+        self.failed: list[str] = []
 
-        for zone, _ in FALLBACK_ZONES:
-            try:
-                request = compute_v1.ListInstancesRequest(
-                    project=GCP_PROJECT_ID,
-                    zone=zone,
-                    filter='name:agent-vm-'
-                )
-                for instance in instance_client.list(request=request):
-                    if instance.name not in active_vm_ids:
-                        logger.warning(f"Found orphaned VM in GCP: {instance.name} ({zone}). Terminating...")
-                        # Capture serial console before deletion — orphans are the most
-                        # suspicious VMs (likely crash victims), forensic evidence is critical
-                        try:
-                            serial = instance_client.get_serial_port_output(
-                                project=GCP_PROJECT_ID, zone=zone, instance=instance.name,
-                                timeout=10
-                            )
-                            tail = (serial.contents or "")[-2000:]
-                            logger.info(f"[VM-SERIAL] orphan {instance.name} last output:\n{tail}")
-                        except Exception as serial_err:
-                            logger.warning(f"[VM-SERIAL] Could not fetch serial for orphan {instance.name}: {serial_err}")
-                        try:
-                            operation = instance_client.delete(
-                                project=GCP_PROJECT_ID,
-                                zone=zone,
-                                instance=instance.name
-                            )
-                            operation.result()
-                            orphaned_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to delete orphaned VM {instance.name}: {e}")
-            except Exception as e:
-                logger.error(f"Failed to list VMs in zone {zone}: {e}")
 
-        return orphaned_count
+async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
+    """Scan all zones for orphaned VMs and delete them.
 
-    try:
-        count = await asyncio.to_thread(_list_and_delete)
-        if count > 0:
-            logger.info(f"Successfully cleaned up {count} orphaned VMs.")
-        return count
-    except Exception as e:
-        logger.error(f"Failed to run orphaned VM cleanup: {e}")
-        return 0
+    Three-phase approach:
+    1. Parallel zone listing
+    2. Classify orphans (set lookup)
+    3. Parallel deletion (no serial capture for TERMINATED)
+    """
+    result = CleanupResult()
+    active_set = set(active_vm_ids)
+
+    # Phase 1: Parallel zone listing (semaphore-bounded)
+    unique_zones = list({z for z, _ in FALLBACK_ZONES})
+
+    async def _list_zone_bounded(zone: str):
+        async with _gcp_semaphore:
+            return await asyncio.to_thread(_list_vms_in_zone, zone)
+
+    list_tasks = [_list_zone_bounded(zone) for zone in unique_zones]
+    zone_results = await asyncio.gather(*list_tasks, return_exceptions=True)
+
+    # Phase 2: Classify
+    all_vms: list[tuple[str, str, str]] = []
+    for zr in zone_results:
+        if isinstance(zr, Exception):
+            logger.error(f"[GCP CLEANUP] Zone listing failed: {zr}")
+            continue
+        all_vms.extend(zr)
+
+    result.total_gcp_vms = len(all_vms)
+    orphans = [(name, zone, status) for name, zone, status in all_vms if name not in active_set]
+    result.orphan_count = len(orphans)
+
+    logger.info(
+        f"[GCP CLEANUP] GCP inventory: {result.total_gcp_vms} VMs, "
+        f"DB active: {len(active_vm_ids)}, orphans: {result.orphan_count}"
+    )
+
+    if not orphans:
+        return result
+
+    # Phase 3: Parallel deletion (no blocking serial capture)
+    async def _delete_orphan(name: str, zone: str, status: str):
+        logger.warning(f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {status})")
+        try:
+            async with _gcp_semaphore:
+                success = await asyncio.to_thread(_delete_single_vm, name, zone)
+            if success:
+                result.deleted.append(name)
+                # Best-effort secret cleanup
+                try:
+                    async with _gcp_semaphore:
+                        await asyncio.to_thread(_delete_agent_secret, name)
+                except Exception:
+                    pass
+            else:
+                result.failed.append(name)
+        except asyncio.TimeoutError:
+            result.failed.append(name)
+            logger.error(f"[GCP CLEANUP] Timeout deleting orphan {name}")
+        except Exception as e:
+            result.failed.append(name)
+            logger.error(f"[GCP CLEANUP] Exception deleting orphan {name}: {e}")
+
+    delete_tasks = [_delete_orphan(name, zone, status) for name, zone, status in orphans]
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    if result.deleted or result.failed:
+        logger.info(
+            f"[GCP CLEANUP] Done: {len(result.deleted)} deleted, "
+            f"{len(result.failed)} failed out of {result.orphan_count} orphans"
+        )
+
+    return result
 
 
 # ─── Zone Health API ───────────────────────────────────────────────────────

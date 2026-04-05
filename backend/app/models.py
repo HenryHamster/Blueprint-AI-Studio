@@ -111,7 +111,7 @@ class Task(SQLModel, table=True):
 
     # Flexible Payloads: A list of structured dictionaries defining the work.
     # E.g., [{"interface": "ui_component_v1", "data": {...}}]
-    payloads: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB))
+    payloads: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")))
 
     # Shared memory/context for the agent during execution
     context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")))
@@ -133,6 +133,8 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority", "status", "priority"),
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
+        Index("ix_task_context_gin", "context", postgresql_using="gin"),
+        Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
     )
 
     project: Project = Relationship(back_populates="tasks")
@@ -164,8 +166,8 @@ from sqlalchemy import event
 @event.listens_for(Task.latest_status_message, "set")
 def _on_status_message_set(target: Task, value, oldvalue, initiator):
     if value and value != oldvalue:
-        entry = {"t": datetime.utcnow().isoformat(), "msg": str(value)[:500]}
-        target.status_log = (target.status_log or []) + [entry]
+        entry = {"t": _utcnow().isoformat(), "msg": str(value)[:500]}
+        target.status_log = ((target.status_log or []) + [entry])[-90:]
 
 # Callbacks invoked when a task reaches a terminal state.
 # main.py registers _terminated_task_ids.add here to revoke agent JWTs.
@@ -174,8 +176,8 @@ _on_task_terminal_callbacks: list = []
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
-        entry = {"t": datetime.utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
-        target.status_log = (target.status_log or []) + [entry]
+        entry = {"t": _utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
+        target.status_log = ((target.status_log or []) + [entry])[-90:]
         # Notify JWT revocation when task reaches terminal state
         if value in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
             task_id = str(target.id)
@@ -232,9 +234,16 @@ class DeploymentState(SQLModel, table=True):
     runtime_max_concurrent_vms: Optional[int] = Field(default=None)
     runtime_max_retries: Optional[int] = Field(default=None)
     runtime_max_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
+    runtime_max_global_autonomous_tasks_per_hour: Optional[int] = Field(default=None)
     runtime_autonomous_research_interval_minutes: Optional[int] = Field(default=None)
     runtime_autonomous_research_model: Optional[str] = Field(default=None)
     runtime_autonomous_research_effort: Optional[str] = Field(default=None)
+    # Persisted circuit breaker states — survives restarts/deploys
+    circuit_breaker_states: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Persisted zone health/cooldown — prevents retry storms after restart
+    zone_health_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Timestamp when HALTED state was entered — used for auto-recovery timer
+    halted_at: Optional[datetime] = Field(default=None)
 
 
 class MaxPlanAccount(SQLModel, table=True):
@@ -245,7 +254,7 @@ class MaxPlanAccount(SQLModel, table=True):
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
-    oauth_token: str  # Long-lived OAuth token from `claude setup-token` (sk-ant-oat01-...)
+    oauth_token: str  # Secret Manager resource name (or raw token for backward compat)
     claude_config_json: Optional[str] = Field(default=None)  # ~/.claude.json content for onboarding bypass
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
@@ -256,7 +265,7 @@ class MaxPlanAccount(SQLModel, table=True):
 
 class Artifact(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    task_id: uuid.UUID = Field(foreign_key="task.id")
+    task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
     
     artifact_type: ArtifactType = Field(sa_column=Column(String, nullable=False))
     

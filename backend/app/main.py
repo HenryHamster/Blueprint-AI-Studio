@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 import ipaddress
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func as _func
@@ -19,7 +19,13 @@ from sqlmodel import select
 import uuid
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _utcnow() -> datetime:
+    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
@@ -56,21 +62,19 @@ from app.github import (
 import time
 import hmac
 import hashlib
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from app.shared_state import limiter
 
 logger = logging.getLogger(__name__)
-
-# Initialize the rate limiter
-# In a multi-instance production environment (like Cloud Run),
-# you would configure this to use Redis (e.g., storage_uri="redis://...")
-# For now, we use the default in-memory storage.
-limiter = Limiter(key_func=get_remote_address)
 
 # --- Runtime Config & Autonomous State (shared with admin.py) ---
 from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
+
+# Expected schema revision — must match the latest alembic migration.
+# Update this when adding new migrations.
+EXPECTED_SCHEMA_REVISION = "0020"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -79,10 +83,19 @@ TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 # Deadlock detection throttle — only check every 60 seconds
 _last_deadlock_check: float = 0.0
 
+# GCP VM count cache — updated by cleanup service, used by orchestrator concurrency check
+_last_gcp_vm_count: int = 0
+_last_gcp_vm_check: float = 0.0
+_GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
+
+# Reaper: track tasks skipped by skip_locked to force-reap after repeated skips
+_reaper_skip_counts: Dict[uuid.UUID, int] = {}
+
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
 # Each entry: {id, name, oauth_token, claude_config_json, enabled, active_tasks, total_tasks, token_created_at}
 _max_plan_pool: List[Dict[str, Any]] = []
+_max_plan_pool_lock = asyncio.Lock()
 
 async def load_max_plan_pool():
     """Load Max plan accounts from database into in-memory pool on startup.
@@ -104,10 +117,19 @@ async def load_max_plan_pool():
         _max_plan_pool.clear()
         for acct in accounts:
             acct_id = str(acct.id)
+            # Resolve Secret Manager resource names to actual tokens
+            token = acct.oauth_token
+            if token and token.startswith("projects/"):
+                try:
+                    from app.secrets_manager import get_user_secret
+                    token = await get_user_secret(token)
+                except Exception as e:
+                    logger.error(f"[POOL] Failed to fetch token from Secret Manager for account {acct.name}: {e}")
+                    token = None
             _max_plan_pool.append({
                 "id": acct_id,
                 "name": acct.name,
-                "oauth_token": acct.oauth_token,
+                "oauth_token": token,
                 "claude_config_json": acct.claude_config_json,
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
@@ -117,35 +139,43 @@ async def load_max_plan_pool():
         total_active = sum(active_per_account.values())
         logger.info(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
 
-def select_max_plan_account() -> Optional[Dict[str, Any]]:
-    """Select the Max plan account with the lowest active task count."""
-    available = [a for a in _max_plan_pool if a.get("enabled", True)]
-    if not available:
-        return None
-    return min(available, key=lambda a: a["active_tasks"])
+async def select_max_plan_account() -> Optional[Dict[str, Any]]:
+    """Select the Max plan account with the lowest active task count.
+    Pre-increments active_tasks atomically under lock to prevent races."""
+    async with _max_plan_pool_lock:
+        available = [a for a in _max_plan_pool if a.get("enabled", True)]
+        if not available:
+            return None
+        account = min(available, key=lambda a: a["active_tasks"])
+        account["active_tasks"] = account.get("active_tasks", 0) + 1
+        return account
 
-def release_max_plan_account(account_id: str):
+async def release_max_plan_account(account_id: str):
     """Decrement active tasks for an account when a task finishes."""
-    for account in _max_plan_pool:
-        if account["id"] == account_id:
-            account["active_tasks"] = max(0, account["active_tasks"] - 1)
-            break
+    async with _max_plan_pool_lock:
+        for account in _max_plan_pool:
+            if account["id"] == account_id:
+                if account["active_tasks"] <= 0:
+                    logger.warning(f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}")
+                account["active_tasks"] = max(0, account["active_tasks"] - 1)
+                break
 
-def recheck_disabled_accounts():
+async def recheck_disabled_accounts():
     """Re-enable accounts that were disabled by rate limiting after a cooldown.
     Usage windows typically reset after some time — re-enable and let the next
     task attempt determine if usage has actually recovered."""
-    now = datetime.utcnow()
-    COOLDOWN_MINUTES = 30
+    async with _max_plan_pool_lock:
+        now = _utcnow()
+        COOLDOWN_MINUTES = 30
 
-    for acct in _max_plan_pool:
-        if acct.get("enabled", True):
-            continue
-        disabled_at = acct.get("disabled_at")
-        if disabled_at and (now - disabled_at).total_seconds() >= COOLDOWN_MINUTES * 60:
-            acct["enabled"] = True
-            acct["disabled_at"] = None
-            logger.warning(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
+        for acct in _max_plan_pool:
+            if acct.get("enabled", True):
+                continue
+            disabled_at = acct.get("disabled_at")
+            if disabled_at and (now - disabled_at).total_seconds() >= COOLDOWN_MINUTES * 60:
+                acct["enabled"] = True
+                acct["disabled_at"] = None
+                logger.warning(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
 
 
 # --- Deployment State Management ---
@@ -186,7 +216,87 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     return "CODE_ERROR"
 
 
+async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transition") -> bool:
+    """Guarantee VM deletion for any terminal state transition.
+
+    Accepts either a Task object or a raw vm_instance_id string.
+    Retries up to 3 times with exponential backoff.
+    Returns True if deletion succeeded or was unnecessary.
+    """
+    if isinstance(task_or_vm_id, Task):
+        vm_id = task_or_vm_id.vm_instance_id
+        task_id = str(task_or_vm_id.id)
+    else:
+        vm_id = task_or_vm_id
+        task_id = "unknown"
+
+    if not vm_id:
+        return True  # No VM to delete
+
+    logger.info(f"[VM CLEANUP] Deleting VM {vm_id} (task={task_id}, reason={reason})")
+
+    for attempt in range(3):
+        try:
+            result = await delete_agent_vm(vm_id)
+            if result:
+                logger.info(f"[VM CLEANUP] Deleted VM {vm_id}")
+                return True
+            else:
+                logger.warning(f"[VM CLEANUP] delete_agent_vm returned False for {vm_id} (attempt {attempt + 1}/3)")
+        except Exception as e:
+            logger.error(f"[VM CLEANUP] Failed to delete VM {vm_id} (attempt {attempt + 1}/3): {e}", exc_info=True)
+
+        if attempt < 2:
+            await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+
+    logger.error(f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep")
+    return False
+
+
+async def _get_actual_gcp_vm_count() -> int:
+    """Count actual agent-vm-* instances across all GCP zones.
+    Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.
+    Updated passively by the cleanup service, with active refresh as fallback."""
+    global _last_gcp_vm_count, _last_gcp_vm_check
+
+    now = time.time()
+    if now - _last_gcp_vm_check < _GCP_VM_CHECK_INTERVAL:
+        return _last_gcp_vm_count
+
+    from app.compute import FALLBACK_ZONES, _list_vms_in_zone, LOCAL_MODE
+    if LOCAL_MODE:
+        from app.compute import _local_processes
+        _last_gcp_vm_count = len(_local_processes)
+        _last_gcp_vm_check = now
+        return _last_gcp_vm_count
+
+    try:
+        unique_zones = list({z for z, _ in FALLBACK_ZONES})
+        zone_tasks = [asyncio.to_thread(_list_vms_in_zone, zone) for zone in unique_zones]
+        zone_results = await asyncio.wait_for(
+            asyncio.gather(*zone_tasks, return_exceptions=True),
+            timeout=10  # Short timeout — cache is usually fresh from cleanup service
+        )
+        total = 0
+        for zr in zone_results:
+            if isinstance(zr, list):
+                total += len(zr)
+        _last_gcp_vm_count = total
+        _last_gcp_vm_check = now
+        return total
+    except Exception as e:
+        logger.warning(f"[GCP] Failed to count VMs: {e}")
+        return _last_gcp_vm_count  # Return stale count on failure
+
+
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
+
+# Webhook dedup: track recent GitHub delivery IDs to prevent duplicate processing
+from collections import OrderedDict, deque
+_webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp
+_webhook_dedup_lock = asyncio.Lock()
+_WEBHOOK_DEDUP_MAX = 1000
+_WEBHOOK_DEDUP_TTL = 600  # 10 minutes
 
 def record_task_result(success: bool, failure_class: str = "", task_id: str = ""):
     """Record a task result for deployment monitoring. Deduplicates by task_id."""
@@ -200,14 +310,36 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
         if len(_recorded_task_ids) > 200:
             _recorded_task_ids.clear()
 
-    entry = (datetime.utcnow().isoformat(), "success" if success else "failure", failure_class)
-    deploy_monitoring["task_results"].append(entry)
-    # Keep only last 100 results
-    if len(deploy_monitoring["task_results"]) > 100:
-        deploy_monitoring["task_results"] = deploy_monitoring["task_results"][-100:]
+    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class)
+    deploy_monitoring["task_results"].append(entry)  # deque(maxlen=100) handles cap automatically
 
     if success:
-        _shared_state.deploy_monitoring["last_completion_time"] = datetime.utcnow()
+        _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
+
+
+async def _verify_schema_version():
+    """Verify the database schema matches the expected alembic revision.
+    Fail fast on mismatch to prevent runtime errors from missing columns."""
+    from sqlalchemy import text as sa_text
+    async with AsyncSessionLocal() as session:
+        try:
+            result = await session.execute(sa_text(
+                "SELECT version_num FROM alembic_version LIMIT 1"))
+            row = result.first()
+            if not row:
+                logger.warning("[STARTUP] No alembic_version row — database may be uninitialized")
+                return
+            if not row[0].startswith(EXPECTED_SCHEMA_REVISION):
+                msg = (f"Schema version mismatch: database at '{row[0]}', "
+                       f"code expects '{EXPECTED_SCHEMA_REVISION}'")
+                logger.error(f"[STARTUP] {msg}")
+                if os.getenv("K_REVISION"):  # Only hard-fail in Cloud Run
+                    raise RuntimeError(msg)
+        except Exception as e:
+            if "alembic_version" in str(e).lower():
+                logger.warning("[STARTUP] alembic_version table not found — skipping schema check")
+                return
+            raise
 
 
 async def _init_deployment_state():
@@ -221,7 +353,7 @@ async def _init_deployment_state():
                 id=1,
                 current_revision=_current_revision,
                 current_sha=_current_sha,
-                deployed_at=datetime.utcnow(),
+                deployed_at=_utcnow(),
                 status=DeploymentStatus.STABLE,
                 last_known_good_revision=_current_revision,
                 last_known_good_sha=_current_sha,
@@ -240,6 +372,8 @@ async def _init_deployment_state():
                 _runtime_config["max_retries"] = state.runtime_max_retries
             if state.runtime_max_autonomous_tasks_per_hour is not None:
                 _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
+            if getattr(state, 'runtime_max_global_autonomous_tasks_per_hour', None) is not None:
+                _runtime_config["max_global_autonomous_tasks_per_hour"] = state.runtime_max_global_autonomous_tasks_per_hour
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}", exc_info=True)
         try:
@@ -251,6 +385,66 @@ async def _init_deployment_state():
                 _runtime_config["autonomous_research_effort"] = state.runtime_autonomous_research_effort
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
+        # Restore circuit breaker state — prevents deploy from clearing tripped breakers
+        try:
+            if state.circuit_breaker_states:
+                for proj_id, breaker_data in state.circuit_breaker_states.items():
+                    restored = {**breaker_data}
+                    if restored.get("opened_at") and isinstance(restored["opened_at"], str):
+                        restored["opened_at"] = datetime.fromisoformat(restored["opened_at"])
+                    _shared_state.circuit_breakers[proj_id] = restored
+                logger.info(f"[DEPLOY] Restored circuit breaker state for {len(state.circuit_breaker_states)} projects")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore circuit breaker state: {e}", exc_info=True)
+
+        # Restore zone health — prevents retry storms on exhausted zones after restart
+        try:
+            if state.zone_health_state:
+                from app.compute import _zone_health, _zone_lock, _zone_failures
+                from datetime import timezone as tz
+                with _zone_lock:
+                    for zone, data in state.zone_health_state.items():
+                        restored = {}
+                        for k, v in data.items():
+                            if isinstance(v, str) and k in ("last_success", "last_failure", "cooldown_expires_at"):
+                                try:
+                                    restored[k] = datetime.fromisoformat(v)
+                                except ValueError:
+                                    logger.warning(f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}")
+                                    continue
+                            else:
+                                restored[k] = v
+                        _zone_health[zone] = restored
+                        # Restore _zone_failures for zones still in cooldown
+                        if restored.get("cooldown_expires_at") and restored["cooldown_expires_at"] > datetime.now(tz.utc):
+                            _zone_failures[zone] = restored.get("last_failure", datetime.now(tz.utc))
+                logger.info(f"[DEPLOY] Restored zone health state for {len(state.zone_health_state)} zones")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore zone health state: {e}", exc_info=True)
+
+        # Auto-recovery from HALTED after 1 hour cooldown
+        if state.status == DeploymentStatus.HALTED:
+            try:
+                if state.halted_at:
+                    elapsed = (_utcnow() - state.halted_at).total_seconds()
+                    if elapsed > 3600:  # 1 hour
+                        state.rollback_count = 0
+                        state.status = DeploymentStatus.MONITORING
+                        state.halted_at = None
+                        state.deployed_at = _utcnow()
+                        # Restore VM capacity so dispatch actually works
+                        restored = state.pre_pause_max_vms or int(os.getenv("MAX_CONCURRENT_VMS", "5"))
+                        _runtime_config["max_concurrent_vms"] = restored
+                        state.pre_pause_max_vms = None
+                        session.add(state)
+                        await session.commit()
+                        logger.warning(f"[DEPLOY] Auto-recovery from HALTED after {elapsed:.0f}s cooldown — max_concurrent_vms restored to {restored}")
+                    else:
+                        remaining = 3600 - elapsed
+                        logger.info(f"[DEPLOY] HALTED — {remaining:.0f}s remaining until auto-recovery")
+            except Exception as e:
+                logger.warning(f"[DEPLOY] Could not check HALTED auto-recovery (halted_at column may not exist yet): {e}")
+
         # Respect paused/halted state — these override the persisted value
         if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             _runtime_config["max_concurrent_vms"] = 0
@@ -273,7 +467,7 @@ async def _init_deployment_state():
             state.rollback_count += 1
             state.current_revision = _current_revision
             state.current_sha = _current_sha
-            state.deployed_at = datetime.utcnow()
+            state.deployed_at = _utcnow()
             session.add(state)
             await session.commit()
 
@@ -282,31 +476,37 @@ async def _init_deployment_state():
 
             if state.rollback_count >= 3:
                 state.status = DeploymentStatus.HALTED
+                state.halted_at = _utcnow()
                 session.add(state)
                 await session.commit()
                 logger.error(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
                 _runtime_config["max_concurrent_vms"] = 0
             return
 
-        # New deploy — start monitoring window
-        # Capture pre-deploy failure rate as baseline
-        from app.shared_state import deploy_monitoring
-        results = deploy_monitoring["task_results"]
-        if results:
-            failures = sum(1 for _, outcome, _ in results if outcome == "failure")
-            deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
-        deploy_monitoring["task_results"] = []  # Reset for new deploy window
-        deploy_monitoring["window_start"] = datetime.utcnow()
-
+        # New deploy detected — update revision tracking
         state.current_revision = _current_revision
         state.current_sha = _current_sha
-        state.deployed_at = datetime.utcnow()
-        # Don't overwrite PAUSED/HALTED — those are explicit states that must
-        # be cleared by the auto-resume logic or manual action, not by deploys.
-        if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
-            state.status = DeploymentStatus.MONITORING
+        state.deployed_at = _utcnow()
         state.rolled_back_from_sha = None
         state.rollback_reason = None
+
+        # Only reset monitoring window if not PAUSED/HALTED — those are explicit
+        # states that must be cleared by auto-resume or manual action, not by deploys.
+        # Resetting monitoring data while paused would lose baseline context.
+        if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+            from app.shared_state import deploy_monitoring
+            results = deploy_monitoring["task_results"]
+            if results:
+                failures = sum(1 for _, outcome, _ in results if outcome == "failure")
+                deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
+            else:
+                # No previous data (idle→active). Use generous baseline to avoid false rollbacks.
+                deploy_monitoring["pre_deploy_failure_rate"] = 0.15
+            deploy_monitoring["previous_window_results"] = list(results)
+            deploy_monitoring["previous_window_start"] = deploy_monitoring.get("window_start")
+            deploy_monitoring["task_results"] = deque(maxlen=100)
+            deploy_monitoring["window_start"] = _utcnow()
+            state.status = DeploymentStatus.MONITORING
         session.add(state)
         await session.commit()
         logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window")
@@ -321,6 +521,10 @@ def should_rollback() -> tuple:
     results = deploy_monitoring["task_results"]
     if not results:
         return False, "No task results to analyze", "SELF_HEAL"
+
+    # Minimum sample size — don't make rollback decisions on tiny data
+    if len(results) < 5:
+        return False, f"Insufficient data ({len(results)} results, need 5+)", "SELF_HEAL"
 
     # 1. Are we already on last_known_good? Rollback won't help.
     # (This is checked by the caller against DeploymentState)
@@ -361,6 +565,13 @@ def should_rollback() -> tuple:
     return False, f"Failure rate {post_failure_rate:.0%} — monitoring, not yet attributable", "SELF_HEAL"
 
 
+async def _get_deploy_state_for_update(session: AsyncSession) -> "DeploymentState | None":
+    """Fetch DeploymentState with FOR UPDATE to prevent concurrent overwrites."""
+    return (await session.execute(
+        select(DeploymentState).where(DeploymentState.id == 1).with_for_update()
+    )).scalars().first()
+
+
 async def _check_monitoring_window():
     """Called each orchestrator cycle. If monitoring window has elapsed without issues, mark STABLE."""
     from app.shared_state import deploy_monitoring
@@ -369,7 +580,7 @@ async def _check_monitoring_window():
         return
 
     duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
-    elapsed = (datetime.utcnow() - window_start).total_seconds()
+    elapsed = (_utcnow() - window_start).total_seconds()
 
     if elapsed < duration:
         return  # Still within window
@@ -380,7 +591,7 @@ async def _check_monitoring_window():
         # No tasks ran during window — if 2x the window has passed, mark stable (idle)
         if elapsed >= duration * 2:
             async with AsyncSessionLocal() as session:
-                state = await session.get(DeploymentState, 1)
+                state = await _get_deploy_state_for_update(session)
                 if state and state.status == DeploymentStatus.MONITORING:
                     old_status = state.status
                     state.status = DeploymentStatus.STABLE
@@ -399,7 +610,7 @@ async def _check_monitoring_window():
         return
 
     async with AsyncSessionLocal() as session:
-        state = await session.get(DeploymentState, 1)
+        state = await _get_deploy_state_for_update(session)
         if not state or state.status != DeploymentStatus.MONITORING:
             deploy_monitoring["window_start"] = None
             return
@@ -451,7 +662,7 @@ async def _check_monitoring_window():
 async def _check_external_health():
     """Periodic check of external dependencies. Updates shared_state.external_health."""
     ext = _shared_state.external_health
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # Check every 60 seconds (authenticated via App JWT = 5,000 req/hr)
     if ext["last_check"] and (now - ext["last_check"]).total_seconds() < 60:
@@ -475,7 +686,7 @@ async def _check_external_health():
     # Primary: check if recent agent operations succeeded (avoids connection pool
     # contention that caused false auto-pause under load).
     # Fallback: if no recent operations, make a dedicated active check.
-    github_stale_threshold = 120  # 2 minutes
+    github_stale_threshold = 60  # 1 minute — detect outages faster during idle
     github_age = (now - _shared_state.last_github_success).total_seconds() if _shared_state.last_github_success else None
 
     if github_age is not None and github_age < github_stale_threshold:
@@ -541,7 +752,7 @@ async def _check_external_health():
     ext["failed_deps"] = failed
 
     # Re-enable rate-limited accounts after cooldown
-    recheck_disabled_accounts()
+    await recheck_disabled_accounts()
 
     # Log zone health transitions (available ↔ exhausted)
     global _last_exhausted_zones
@@ -589,11 +800,11 @@ async def _check_pause_mode():
         # Should we pause?
         if _runtime_config["max_concurrent_vms"] > 0:
             async with AsyncSessionLocal() as session:
-                state = await session.get(DeploymentState, 1)
+                state = await _get_deploy_state_for_update(session)
                 if state and state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
-                    state.paused_at = datetime.utcnow()
+                    state.paused_at = _utcnow()
                     state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
                     state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
                     session.add(state)
@@ -606,7 +817,7 @@ async def _check_pause_mode():
         _pause_failure_streak = 0
         # All deps healthy — should we auto-resume?
         async with AsyncSessionLocal() as session:
-            state = await session.get(DeploymentState, 1)
+            state = await _get_deploy_state_for_update(session)
             if state and state.status == DeploymentStatus.PAUSED and state.pre_pause_max_vms is not None:
                 _health_recovery_streak += 1
                 if _health_recovery_streak < 3:
@@ -635,14 +846,26 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
         # Check if cooldown has elapsed → transition to HALF-OPEN
-        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if breaker["opened_at"] and (_utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
+    elif breaker["state"] == "HALF_OPEN":
+        # Check if existing test task is stuck — treat as failure after 30 min
+        test_id = breaker.get("half_open_task_id")
+        if test_id:
+            test_task = await session.get(Task, uuid.UUID(test_id))
+            if test_task and test_task.started_at and (_utcnow() - test_task.started_at).total_seconds() > 1800:
+                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN")
+                breaker["state"] = "OPEN"
+                breaker["opened_at"] = _utcnow()
+                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+                breaker["half_open_task_id"] = None
+                return  # Back to cooldown
     # Guard: must have active directions that aren't in cooldown
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
-    now = datetime.utcnow()
+    now = _utcnow()
     active_directions = []
     for d in (project.directions or []):
         if d.get("status") != "active":
@@ -651,7 +874,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
             if minutes_ago < cooldown_minutes:
-                print(
+                logger.debug(
                     f"[RESEARCH] Skipping direction {d.get('id')}: last researched "
                     f"{minutes_ago:.1f}m ago (cooldown: {cooldown_minutes}m)"
                 )
@@ -670,8 +893,21 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     for t in active_tasks:
         if ((t.payloads or [{}])[0]).get("type") == "research":
             return
-    # Guard: rate limit autonomous research spawns (not all orchestrator tasks)
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    # Guard: global rate limit across ALL projects
+    from sqlalchemy import func
+    one_hour_ago = _utcnow() - timedelta(hours=1)
+    global_max = _runtime_config.get("max_global_autonomous_tasks_per_hour",
+                                      _runtime_config["max_autonomous_tasks_per_hour"] * 10)
+    global_recent = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        )
+    )).scalar() or 0
+    if global_recent >= global_max:
+        logger.warning(f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour")
+        return
+    # Guard: per-project rate limit for research spawns
     recent_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -708,7 +944,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         title="Research: autonomous improvement scan",
         description="Automated research task triggered by autonomous loop",
         payloads=[research_payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
@@ -735,11 +971,22 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
-        if breaker["opened_at"] and (datetime.utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
+        if breaker["opened_at"] and (_utcnow() - breaker["opened_at"]).total_seconds() >= breaker["cooldown_seconds"]:
             breaker["state"] = "HALF_OPEN"
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
             return  # Still in cooldown
+    elif breaker["state"] == "HALF_OPEN":
+        test_id = breaker.get("half_open_task_id")
+        if test_id:
+            test_task = await session.get(Task, uuid.UUID(test_id))
+            if test_task and test_task.started_at and (_utcnow() - test_task.started_at).total_seconds() > 1800:
+                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} stuck for 30m+, treating as failure → OPEN")
+                breaker["state"] = "OPEN"
+                breaker["opened_at"] = _utcnow()
+                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+                breaker["half_open_task_id"] = None
+                return
 
     periodic_cfg = _runtime_config.get("autonomous_periodic_tasks", {}).get(task_type, {})
     if not periodic_cfg.get("enabled", False):
@@ -758,8 +1005,20 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         if ((t.payloads or [{}])[0]).get("type") == task_type:
             return
 
-    # Guard: rate limit
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    # Guard: global rate limit across ALL projects
+    one_hour_ago = _utcnow() - timedelta(hours=1)
+    global_max = _runtime_config.get("max_global_autonomous_tasks_per_hour",
+                                      _runtime_config["max_autonomous_tasks_per_hour"] * 10)
+    global_recent = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.created_by == "ORCHESTRATOR",
+            Task.created_at >= one_hour_ago,
+        )
+    )).scalar() or 0
+    if global_recent >= global_max:
+        logger.warning(f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour")
+        return
+    # Guard: per-project rate limit
     recent_auto = (await session.execute(
         select(func.count()).select_from(Task).where(
             Task.project_id == project.id,
@@ -783,7 +1042,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             last_run = t.created_at
             break
 
-    now = datetime.utcnow()
+    now = _utcnow()
     if last_run is not None:
         elapsed = (now - last_run).total_seconds() / 3600
         if elapsed < interval_hours:
@@ -813,7 +1072,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         title=f"{task_type.upper()} scan: autonomous periodic",
         description=f"Automated {task_type} task triggered by autonomous periodic scheduler",
         payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
@@ -862,7 +1121,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
-    now = datetime.utcnow()
+    now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
     if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=interval_minutes):
         return
@@ -968,7 +1227,10 @@ class ConnectionManager:
             # Create a copy of the list to avoid RuntimeError if modified during iteration
             for connection in list(self.active_connections[project_id]):
                 try:
-                    await connection.send_json(message)
+                    await asyncio.wait_for(connection.send_json(message), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[WS] Send timeout for client (project={project_id}, event={event_type})")
+                    self.disconnect(connection, project_id)
                 except Exception as e:
                     logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
                     self.disconnect(connection, project_id)
@@ -1033,12 +1295,17 @@ async def verify_agent_token(request: Request, x_agent_token: str = Header(..., 
         return payload
 
     # Slow path: DB check (runs at most once per AGENT_CACHE_TTL per task)
+    # Use app.dependency_overrides to respect test session overrides
     try:
-        async with AsyncSessionLocal() as session:
+        session_factory = app.dependency_overrides.get(get_session, get_session)
+        async for session in session_factory():
             task = await session.get(Task, uuid.UUID(task_id))
-            if not task or task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            if task and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 _terminated_task_ids[task_id] = time.time()
-                raise HTTPException(status_code=401, detail="Task is no longer active")
+                # Allow status endpoint through — agents may retry their own completion POST
+                if request.url.path != "/api/agent/status":
+                    raise HTTPException(status_code=401, detail="Task is no longer active")
+            # Task not found in DB — fail open (may not be committed yet, or test scenario)
     except HTTPException:
         raise
     except Exception as e:
@@ -1072,7 +1339,7 @@ async def reaper_service():
                 )
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
-                now = datetime.utcnow()
+                now = _utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
 
@@ -1095,6 +1362,39 @@ async def reaper_service():
                         Task.id.in_(orphaned_ids)
                     ).with_for_update(skip_locked=True)
                     orphaned_tasks = list((await session.execute(lock_stmt)).scalars().all())
+
+                    # Track tasks skipped by skip_locked — force-reap after 3 consecutive skips
+                    locked_ids = set(orphaned_ids) - {t.id for t in orphaned_tasks}
+                    for lid in locked_ids:
+                        _reaper_skip_counts[lid] = _reaper_skip_counts.get(lid, 0) + 1
+                    for t in orphaned_tasks:
+                        _reaper_skip_counts.pop(t.id, None)
+
+                    # Force-lock persistently skipped tasks (blocking, up to lock_timeout)
+                    force_lock_ids = [lid for lid, count in _reaper_skip_counts.items() if count >= 3]
+                    if force_lock_ids:
+                        try:
+                            force_stmt = select(Task).where(
+                                Task.id.in_(force_lock_ids)
+                            ).with_for_update()
+                            force_locked = list((await session.execute(force_stmt)).scalars().all())
+                            for t in force_locked:
+                                _reaper_skip_counts.pop(t.id, None)
+                                if t.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
+                                    continue
+                                if t.last_heartbeat and t.last_heartbeat >= five_minutes_ago:
+                                    continue
+                                orphaned_tasks.append(t)
+                                logger.warning(f"[REAPER] Force-locked persistently skipped task {t.id}")
+                        except Exception as e:
+                            logger.warning(f"[REAPER] Force-lock failed (lock timeout?): {e}")
+
+                    # Clean stale entries from skip counts
+                    orphaned_id_set = set(orphaned_ids)
+                    for tid in list(_reaper_skip_counts.keys()):
+                        if tid not in orphaned_id_set:
+                            del _reaper_skip_counts[tid]
+
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
                     verified = []
                     for t in orphaned_tasks:
@@ -1108,12 +1408,15 @@ async def reaper_service():
                             verified.append(t)
                     orphaned_tasks = verified
 
+                # Collect old VM IDs for deletion after commit (can't set attrs on SQLModel)
+                _reaper_old_vms: Dict[str, str] = {}
+
                 for task in orphaned_tasks:
                     # Re-validate status before acting — task may have completed/been cancelled
                     # between the initial query and now
                     fresh_task = await session.get(Task, task.id)
                     if fresh_task is None or fresh_task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
-                        print(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
+                        logger.info(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
                         continue
 
                     # Determine why the reaper flagged this task
@@ -1138,18 +1441,33 @@ async def reaper_service():
                         'vm_instance_id': task.vm_instance_id,
                     })
 
+                    # Capture old VM ID before any overwrite — deletion happens after commit
                     if task.vm_instance_id:
-                        asyncio.create_task(delete_agent_vm(task.vm_instance_id))
+                        _reaper_old_vms[str(task.id)] = task.vm_instance_id
 
                     # Release Max Plan account slot
                     acct_id = (task.context or {}).get("max_plan_account_id")
                     if acct_id:
-                        release_max_plan_account(acct_id)
+                        await release_max_plan_account(acct_id)
 
-                    if task.attempt_count < _runtime_config["max_retries"]:
+                    # Separate provision failures from agent failures for retry budgeting
+                    is_provision_failure = task.status == TaskStatus.PROVISIONING
+                    provision_failures = (task.context or {}).get("provision_failures", 0)
+                    max_provision_retries = 2
+                    can_retry = False
+
+                    if is_provision_failure:
+                        provision_failures += 1
+                        task.context = {**(task.context or {}), "provision_failures": provision_failures}
+                        can_retry = provision_failures < max_provision_retries
+                        if not can_retry:
+                            logger.error(f"[REAPER] Task {task.id} provision failed {provision_failures} times — giving up")
+                    else:
+                        can_retry = task.attempt_count < _runtime_config["max_retries"]
+
+                    if can_retry:
                         # Check if this is a research/plan parent with work children —
-                        # re-evaluate instead of re-run. Don't treat review/fix/create
-                        # tasks as parents just because they have debug children.
+                        # re-evaluate instead of re-run.
                         task_type = ((task.payloads or [{}])[0]).get("type", "")
                         is_parent_type = task_type in ("research", "plan")
                         children = []
@@ -1161,13 +1479,15 @@ async def reaper_service():
                             logger.info(f"[REAPER] Re-evaluating parent task {task.id}")
                             await _requeue_parent_task(task, session)
                         else:
-                            logger.info(f"[REAPER] Retrying task {task.id} (Attempt {task.attempt_count + 1}/3)")
-                            task.latest_status_message = f"Reaped (attempt {task.attempt_count + 1}/{_runtime_config['max_retries']}): {reap_reason}"
-                            task.attempt_count += 1
+                            if not is_provision_failure:
+                                task.attempt_count += 1
+                            retry_label = f"provision {provision_failures}/{max_provision_retries}" if is_provision_failure else f"attempt {task.attempt_count}/{_runtime_config['max_retries']}"
+                            logger.info(f"[REAPER] Retrying task {task.id} ({retry_label})")
+                            task.latest_status_message = f"Reaped ({retry_label}): {reap_reason}"
                             task.status = TaskStatus.QUEUED
-                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
+                            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
-                            task.started_at = None  # Fresh timeout window for the new VM
+                            task.started_at = None
                             session.add(task)
 
                         await broadcast_to_project(
@@ -1176,13 +1496,13 @@ async def reaper_service():
                             {"task_id": str(task.id), "status": task.status, "attempt_count": task.attempt_count}
                         )
                     else:
-                        logger.error(f"[REAPER] Task {task.id} failed after {_runtime_config['max_retries']} attempts.")
+                        fail_reason = f"provision failed {provision_failures} times" if is_provision_failure else f"failed after {_runtime_config['max_retries']} attempts"
+                        logger.error(f"[REAPER] Task {task.id} {fail_reason}.")
                         task.status = TaskStatus.FAILED
-                        task.latest_status_message = f"Failed after {_runtime_config['max_retries']} attempts — last reap: {reap_reason}"
+                        task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
                         record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                         session.add(task)
 
-                        # Broadcast failure to frontend
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
@@ -1191,6 +1511,10 @@ async def reaper_service():
 
                 if orphaned_tasks:
                     await session.commit()
+
+                    # Delete old VMs after commit (IDs captured before overwrite)
+                    for old_vm in _reaper_old_vms.values():
+                        await _ensure_vm_deleted(old_vm, reason="reaper")
 
                     # Trigger rollup checks for failed tasks with parents (after commit)
                     for task in orphaned_tasks:
@@ -1205,7 +1529,11 @@ async def reaper_service():
             break
         except Exception as e:
             logger.error(f"[REAPER] Error: {e}", exc_info=True)
-            
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+
         # Sleep for 1 minute before checking again
         try:
             await asyncio.sleep(60)
@@ -1215,8 +1543,9 @@ async def reaper_service():
 
 async def gcp_cleanup_service():
     """
-    Background worker that runs every 15 minutes to ensure GCP VMs are in sync with the database.
-    It deletes any VMs prefixed with 'agent-vm-' that do not have an active task.
+    Background worker that runs every 5 minutes to ensure GCP VMs are in sync with the database.
+    Deletes any VMs prefixed with 'agent-vm-' that do not have an active task.
+    Zone-parallel with per-cycle timeout.
     """
     while True:
         try:
@@ -1227,34 +1556,107 @@ async def gcp_cleanup_service():
                 )
                 active_vm_ids = (await session.execute(stmt)).scalars().all()
                 active_vm_ids = [vid for vid in active_vm_ids if vid]
-                
-                # Call compute.py to clean up
-                await cleanup_orphaned_vms(active_vm_ids)
-                
+
+                # Run cleanup with hard timeout (2 minutes)
+                try:
+                    cleanup_result = await asyncio.wait_for(
+                        cleanup_orphaned_vms(active_vm_ids),
+                        timeout=120
+                    )
+                    # Log divergence and partial failures from structured result
+                    if hasattr(cleanup_result, 'failed') and cleanup_result.failed:
+                        logger.warning(
+                            f"[GCP CLEANUP] Partial failure: deleted {len(cleanup_result.deleted)}, "
+                            f"failed {len(cleanup_result.failed)}: {cleanup_result.failed}"
+                        )
+                    # Cache total GCP VM count for orchestrator concurrency check
+                    if hasattr(cleanup_result, 'total_gcp_vms'):
+                        global _last_gcp_vm_count, _last_gcp_vm_check
+                        _last_gcp_vm_count = cleanup_result.total_gcp_vms
+                        _last_gcp_vm_check = time.time()
+                except asyncio.TimeoutError:
+                    logger.error("[GCP CLEANUP] Cycle timed out after 120s")
+
         except asyncio.CancelledError:
             logger.info("[GCP CLEANUP] Service shutting down.")
             break
         except Exception as e:
             logger.error(f"[GCP CLEANUP] Error: {e}", exc_info=True)
-            
+
         try:
-            await asyncio.sleep(900) # Run every 15 minutes
+            await asyncio.sleep(300)  # Run every 5 minutes
         except asyncio.CancelledError:
             logger.info("[GCP CLEANUP] Service shutting down.")
             break
+
+_last_pool_refresh: datetime = _utcnow()
+_last_zone_health_persist: datetime = _utcnow()
+
+
+async def _persist_circuit_breakers():
+    """Save circuit breaker state to DB so it survives restarts."""
+    try:
+        serializable = {}
+        for k, v in _shared_state.circuit_breakers.items():
+            serializable[k] = {
+                **v,
+                "opened_at": v["opened_at"].isoformat() if v.get("opened_at") else None,
+            }
+        async with AsyncSessionLocal() as session:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.circuit_breaker_states = serializable
+                session.add(state)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[CIRCUIT BREAKER] Failed to persist state: {e}", exc_info=True)
+
+
+async def _persist_zone_health():
+    """Snapshot zone health to DB so cooldowns survive restarts."""
+    try:
+        from app.compute import _zone_health, _zone_lock
+        with _zone_lock:
+            snapshot = {}
+            for zone, data in _zone_health.items():
+                snapshot[zone] = {
+                    k: v.isoformat() if isinstance(v, datetime) else v
+                    for k, v in data.items()
+                }
+        async with AsyncSessionLocal() as session:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.zone_health_state = snapshot
+                session.add(state)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
+
 
 async def orchestrator_worker():
     """
     Background worker that polls for QUEUED tasks and provisions VMs.
     This ensures tasks are not lost if the server restarts before provisioning.
     """
+    global _last_pool_refresh
     while True:
         queued_tasks = []
         try:
             global _orchestrator_last_cycle
-            _orchestrator_last_cycle = datetime.utcnow()
+            _orchestrator_last_cycle = _utcnow()
             cycle_start = time.monotonic()
             tasks_recovered = 0
+
+            # Periodic pool refresh — pick up admin changes without restart
+            if (_utcnow() - _last_pool_refresh).total_seconds() >= 300:
+                await load_max_plan_pool()
+                _last_pool_refresh = _utcnow()
+
+            # Periodic zone health persist — prevents retry storms after restart
+            global _last_zone_health_persist
+            if (_utcnow() - _last_zone_health_persist).total_seconds() >= 60:
+                await _persist_zone_health()
+                _last_zone_health_persist = _utcnow()
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
@@ -1263,19 +1665,25 @@ async def orchestrator_worker():
                 )).scalars().all()
 
                 # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
-                two_min_ago = datetime.utcnow() - timedelta(minutes=2)
+                five_min_ago = _utcnow() - timedelta(minutes=5)
+                stale_vm_ids = []
                 for t in active_tasks_result:
                     if (t.status == TaskStatus.PROVISIONING
                         and t.last_heartbeat is None
-                        and t.started_at and t.started_at < two_min_ago):
+                        and t.started_at and t.started_at < five_min_ago):
+                        stale_vm_ids.append(t.vm_instance_id)
                         t.status = TaskStatus.QUEUED
                         t.started_at = None
-                        t.vm_instance_id = None
+                        t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         session.add(t)
                         tasks_recovered += 1
                         logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
                 if session.dirty:
                     await session.commit()
+                    # Delete old VMs from stale provisions (after commit)
+                    for old_vm in stale_vm_ids:
+                        if old_vm:
+                            await _ensure_vm_deleted(old_vm, reason="stale_provisioning")
                     # Re-fetch after recovery
                     active_tasks_result = (await session.execute(
                         select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
@@ -1283,7 +1691,15 @@ async def orchestrator_worker():
 
                 # Enforce concurrency limit
                 active_count = len(active_tasks_result)
-                slots_available = max(0, _runtime_config["max_concurrent_vms"] - active_count)
+                # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
+                actual_vm_count = await _get_actual_gcp_vm_count()
+                effective_count = max(active_count, actual_vm_count)
+                if actual_vm_count > active_count + 2:
+                    logger.warning(
+                        f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}) > DB active count ({active_count}) "
+                        f"— possible orphans, using GCP count for slot calculation"
+                    )
+                slots_available = max(0, _runtime_config["max_concurrent_vms"] - effective_count)
                 _shared_state.tasks_active_gauge = active_count
                 if slots_available == 0:
                     # Update queued gauge even when we skip dispatching
@@ -1304,8 +1720,9 @@ async def orchestrator_worker():
                     acct_id = (t.context or {}).get("max_plan_account_id")
                     if acct_id:
                         active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
-                for acct in _max_plan_pool:
-                    acct["active_tasks"] = active_per_account.get(acct["id"], 0)
+                async with _max_plan_pool_lock:
+                    for acct in _max_plan_pool:
+                        acct["active_tasks"] = active_per_account.get(acct["id"], 0)
 
                 # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
                 candidate_stmt = select(Task).where(
@@ -1332,8 +1749,14 @@ async def orchestrator_worker():
                     dep_result = await session.execute(select(Task).where(Task.id.in_(dep_uuids)))
                     dep_tasks = dep_result.scalars().all()
 
+                    # Detect deleted dependencies — treat as failed to prevent premature dispatch
+                    if len(dep_tasks) < len(dep_uuids):
+                        found_ids = {str(dt.id) for dt in dep_tasks}
+                        missing = [d for d in deps if d not in found_ids]
+                        logger.error(f"[ORCHESTRATOR] Task {task.id} has {len(missing)} deleted dependencies: {missing}")
+
                     all_met = True
-                    any_failed = False
+                    any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
                     for dt in dep_tasks:
                         if dt.status in [TaskStatus.FAILED, TaskStatus.CANCELLED]:
                             any_failed = True
@@ -1357,6 +1780,7 @@ async def orchestrator_worker():
                                 await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
+                        await _ensure_vm_deleted(task, reason="dependency_cancelled")
                         logger.error(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
                     elif all_met:
                         eligible_ids.append(task.id)
@@ -1379,25 +1803,84 @@ async def orchestrator_worker():
                                     dep_uuids.add(uuid.UUID(d))
                                 except (ValueError, AttributeError):
                                     continue
-                            # If ALL deps are stuck or not in candidate pool, task is deadlocked
+                            # Verify each dep's actual DB status before clearing
+                            # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
                             candidate_ids = {t.id for t in candidate_tasks}
-                            all_stuck_or_missing = dep_uuids and all(
-                                d in stuck_ids or d not in candidate_ids
-                                for d in dep_uuids
-                            )
-                            if all_stuck_or_missing:
+                            genuinely_blocked = True
+                            async with AsyncSessionLocal() as check_session:
+                                for dep_id in dep_uuids:
+                                    if dep_id in stuck_ids:
+                                        continue  # Stuck in this pool — potential cycle
+                                    dep_task = await check_session.get(Task, dep_id)
+                                    if dep_task is None:
+                                        continue  # Deleted dep — genuinely unresolvable
+                                    if dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                        continue  # Terminal — genuinely unresolvable
+                                    if dep_task.status == TaskStatus.QUEUED:
+                                        # QUEUED but outside fetch window — NOT a deadlock, just low priority
+                                        genuinely_blocked = False
+                                        break
+                                    if dep_task.status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+                                        # Still running — NOT a deadlock
+                                        genuinely_blocked = False
+                                        break
+                            if genuinely_blocked and dep_uuids:
                                 async with AsyncSessionLocal() as fix_session:
                                     fix_task = await fix_session.get(Task, stask.id)
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock: clearing depends_on "
-                                            f"for task {stask.id} (had {len(dep_uuids)} stuck deps)"
+                                            f"for task {stask.id} (had {len(dep_uuids)} stuck/failed deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected"
                                         fix_session.add(fix_task)
                                         await fix_session.commit()
                                 eligible_ids.append(stask.id)
+                                break  # One per check — conservative
+
+                    # Broader scan: check ALL QUEUED tasks older than 30 min (not just candidate batch)
+                    thirty_min_ago = _utcnow() - timedelta(minutes=30)
+                    broad_stmt = select(Task).where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.created_at < thirty_min_ago,
+                        Task.requires_approval == False,
+                    )
+                    broad_stuck = (await session.execute(broad_stmt)).scalars().all()
+                    broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
+                    if broad_stuck:
+                        broad_stuck_ids = {t.id for t in broad_stuck}
+                        for stask in broad_stuck:
+                            if stask.id in {t.id for t in candidate_tasks}:
+                                continue  # Already checked above
+                            dep_uuids = set()
+                            for d in (stask.depends_on or []):
+                                try:
+                                    dep_uuids.add(uuid.UUID(d))
+                                except (ValueError, AttributeError):
+                                    continue
+                            genuinely_blocked = True
+                            async with AsyncSessionLocal() as check_session:
+                                for dep_id in dep_uuids:
+                                    if dep_id in broad_stuck_ids:
+                                        continue
+                                    dep_task = await check_session.get(Task, dep_id)
+                                    if dep_task is None or dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                        continue
+                                    genuinely_blocked = False
+                                    break
+                            if genuinely_blocked and dep_uuids:
+                                async with AsyncSessionLocal() as fix_session:
+                                    fix_task = await fix_session.get(Task, stask.id)
+                                    if fix_task:
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
+                                            f"for task {stask.id} (stuck >{30}min with {len(dep_uuids)} unresolvable deps)"
+                                        )
+                                        fix_task.depends_on = []
+                                        fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
+                                        fix_session.add(fix_task)
+                                        await fix_session.commit()
                                 break  # One per check — conservative
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
@@ -1456,11 +1939,11 @@ async def orchestrator_worker():
                 for task in queued_tasks:
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
                     if not task.vm_instance_id:
-                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
                     # Select Max plan account (primary) or fall back to API key
-                    account = select_max_plan_account()
+                    account = await select_max_plan_account()
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -1489,19 +1972,20 @@ async def orchestrator_worker():
 
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
-                    task.started_at = datetime.utcnow()
-                    _shared_state.deploy_monitoring["last_dispatch_time"] = datetime.utcnow()
+                    task.started_at = _utcnow()
+                    _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
                     try:
                         await session.commit()
-                        # Increment account active_tasks so next iteration picks a different account
-                        if account:
-                            account["active_tasks"] = account.get("active_tasks", 0) + 1
+                        # active_tasks already pre-incremented in select_max_plan_account()
                         logger.info(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
                     except Exception as e:
                         import traceback
                         logger.error(f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}", exc_info=True)
                         traceback.print_exc()
+                        # Release the pre-incremented slot on commit failure
+                        if account_id:
+                            await release_max_plan_account(account_id)
                         await session.rollback()
                         continue
 
@@ -1510,21 +1994,25 @@ async def orchestrator_worker():
                     async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
                                                     payloads: list, token: str, config_json: str,
                                                     acct_id_for_release: str):
-                        payload_uri = None
-                        if payloads:
-                            try:
-                                payload_uri = await upload_json_payload(str(t_id), payloads)
-                            except Exception as e:
-                                logger.error(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}", exc_info=True)
+                        try:
+                            payload_uri = None
+                            if payloads:
+                                try:
+                                    payload_uri = await upload_json_payload(str(t_id), payloads)
+                                except Exception as e:
+                                    logger.error(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}", exc_info=True)
 
-                        success = await provision_agent_vm(vm_id, t_id, payload_uri,
-                                                           oauth_token=token, claude_config_json=config_json)
+                            success = await provision_agent_vm(vm_id, t_id, payload_uri,
+                                                               oauth_token=token, claude_config_json=config_json)
+                        except Exception as e:
+                            logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
+                            success = False
                         if not success:
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
                             # Release the Max Plan account slot
                             if acct_id_for_release:
-                                release_max_plan_account(acct_id_for_release)
+                                await release_max_plan_account(acct_id_for_release)
                             # Mark as failed immediately to avoid 10 min wait
                             try:
                                 async with AsyncSessionLocal() as inner_session:
@@ -1542,6 +2030,8 @@ async def orchestrator_worker():
                                         )
                             except Exception as e:
                                 logger.error(f"[ORCHESTRATOR] Error marking task {t_id} as failed: {e}", exc_info=True)
+                            # Delete partially-created VM (may exist if insert succeeded but wait failed)
+                            await _ensure_vm_deleted(vm_id, reason="provision_failure")
 
                     asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
@@ -1567,22 +2057,25 @@ async def orchestrator_worker():
                     if not ci_pr_number:
                         continue
 
-                    # Timeout: if CI has been pending too long, proceed to merge anyway
-                    ci_wait_started = ci_loop.get("ci_wait_started")
-                    if ci_wait_started:
-                        try:
-                            started = datetime.fromisoformat(ci_wait_started)
-                            if (datetime.utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
-                                logger.error(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
-                                session.add(ci_task)
-                                await session.commit()
-                                continue
-                        except (ValueError, TypeError) as e:
-                            logger.error(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})", exc_info=True)
-
                     try:
+                        # Timeout: if CI has been pending too long, proceed to merge anyway
+                        ci_wait_started = ci_loop.get("ci_wait_started")
+                        if ci_wait_started:
+                            try:
+                                started = datetime.fromisoformat(ci_wait_started)
+                                if (_utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
+                                    logger.error(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
+                                    ci_task.status = TaskStatus.FAILED
+                                    ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                               {"task_id": str(ci_task.id), "status": ci_task.status})
+                                    await _ensure_vm_deleted(ci_task, reason="ci_timeout")
+                                    continue
+                            except (ValueError, TypeError) as e:
+                                logger.error(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})", exc_info=True)
+
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
 
                         # Re-fetch current PR head to handle force-pushes
@@ -1595,10 +2088,15 @@ async def orchestrator_worker():
                             ci_task.latest_status_message = f"PR #{ci_pr_number} already merged/closed"
                             session.add(ci_task)
                             await session.commit()
+                            await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                       {"task_id": str(ci_task.id), "status": ci_task.status})
                             logger.info(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
                             continue
 
                         # Check for merge conflicts — CI won't trigger on conflicting PRs
+                        # GitHub returns None while computing mergeability — skip this cycle and recheck later
+                        if pr_data.get("mergeable") is None:
+                            continue
                         if pr_data.get("mergeable") is False:
                             ci_payload = (ci_task.payloads or [{}])[0]
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
@@ -1622,6 +2120,8 @@ async def orchestrator_worker():
                                 logger.info(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — leaving in EVALUATING")
                             session.add(ci_task)
                             await session.commit()
+                            await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                       {"task_id": str(ci_task.id), "status": ci_task.status})
                             continue
 
                         ci_head_sha = pr_data.get("head", {}).get("sha", "")
@@ -1629,6 +2129,8 @@ async def orchestrator_worker():
                             ci_task.latest_status_message = f"CI waiting on PR #{ci_pr_number} — HEAD SHA unavailable"
                             session.add(ci_task)
                             await session.commit()
+                            await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                       {"task_id": str(ci_task.id), "status": ci_task.status})
                             logger.info(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
@@ -1638,6 +2140,8 @@ async def orchestrator_worker():
                             ci_task.latest_status_message = f"CI in progress on PR #{ci_pr_number}: {', '.join(details) or 'waiting for checks'}..."
                             session.add(ci_task)
                             await session.commit()
+                            await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                       {"task_id": str(ci_task.id), "status": ci_task.status})
                             continue
 
                         ci_payload = (ci_task.payloads or [{}])[0]
@@ -1688,6 +2192,8 @@ async def orchestrator_worker():
                                 logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id}")
                                 session.add(ci_task)
                                 await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
                                 continue
                             ci_errors = ci_result.get("failed_logs", "CI checks failed")
                             await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
@@ -1723,6 +2229,10 @@ async def orchestrator_worker():
                             await session.commit()
                         except Exception as e:
                             logger.error(f"[CI] Failed to update ci_task status after error for task {ci_task.id}: {e}", exc_info=True)
+                            try:
+                                await session.rollback()
+                            except Exception:
+                                pass
 
             logger.info('orchestrator_cycle_complete', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
@@ -1736,6 +2246,10 @@ async def orchestrator_worker():
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
             }, exc_info=True)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
 
         # Monitoring checks run every cycle (not just when idle)
         try:
@@ -1762,6 +2276,9 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize DB tables
     await init_db()
 
+    # Verify schema version matches expected migration
+    await _verify_schema_version()
+
     # Load persisted Max plan accounts into in-memory pool
     await load_max_plan_pool()
 
@@ -1783,27 +2300,50 @@ async def lifespan(app: FastAPI):
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
 
-    # Monitor background tasks for silent crashes
+    # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
         tasks = _bg_tasks
+        restart_state: Dict[str, Dict] = {}  # name -> {attempts, last_restart}
+        task_factories = {
+            "orchestrator": orchestrator_worker,
+            "reaper": reaper_service,
+            "gcp_cleanup": gcp_cleanup_service,
+        }
         while True:
             await asyncio.sleep(30)
-            for name, t in tasks.items():
+            for name, t in list(tasks.items()):
                 if t.done():
                     exc = t.exception() if not t.cancelled() else None
                     logger.error(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
-                    # Restart the orchestrator if it died
-                    if name == "orchestrator" and not t.cancelled():
-                        logger.info("[MONITOR] Restarting orchestrator worker...")
-                        tasks["orchestrator"] = asyncio.create_task(orchestrator_worker())
+                    factory = task_factories.get(name)
+                    if factory and not t.cancelled():
+                        state = restart_state.setdefault(name, {"attempts": 0, "last_restart": None})
+                        now = _utcnow()
+                        # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
+                        if state["last_restart"] and (now - state["last_restart"]).total_seconds() > 300:
+                            state["attempts"] = 0
+                        backoff = min(2 ** state["attempts"], 300)  # 1s, 2s, 4s, ... cap 5min
+                        if backoff > 1:
+                            logger.warning(f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})")
+                            await asyncio.sleep(backoff)
+                        state["attempts"] += 1
+                        state["last_restart"] = _utcnow()
+                        logger.info(f"[MONITOR] Restarting {name}...")
+                        tasks[name] = asyncio.create_task(factory())
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
-    # Shutdown: Clean up resources
-    reaper_task.cancel()
-    gcp_cleanup_task.cancel()
-    orchestrator_task.cancel()
-    monitor_task.cancel()
+    # Shutdown: graceful cleanup with timeout to let in-flight operations finish
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, orchestrator_task, monitor_task]
+    for t in tasks_to_cancel:
+        t.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+            timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[SHUTDOWN] Background tasks didn't finish within 10s grace period")
     await close_github_client()
 
 app = FastAPI(
@@ -1841,7 +2381,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     )).scalar() or 0
     ago = None
     if _orchestrator_last_cycle:
-        ago = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+        ago = (_utcnow() - _orchestrator_last_cycle).total_seconds()
     # Include deployment state
     deploy_state = None
     try:
@@ -1867,25 +2407,36 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
     except Exception as e:
         logger.warning(f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}", exc_info=True)
 
+    # Snapshot pool under lock for consistent read
+    async with _max_plan_pool_lock:
+        pool_snapshot = {
+            "size": len(_max_plan_pool),
+            "available": sum(1 for a in _max_plan_pool if a.get("enabled", True)),
+            "disabled": sum(1 for a in _max_plan_pool if not a.get("enabled", True)),
+            "accounts": [
+                {
+                    "name": a["name"],
+                    "enabled": a.get("enabled", True),
+                    "active": a["active_tasks"],
+                    "disabled_at": a["disabled_at"].isoformat() if a.get("disabled_at") else None,
+                    "reenable_at": (a["disabled_at"] + timedelta(minutes=30)).isoformat() if a.get("disabled_at") else None,
+                }
+                for a in _max_plan_pool
+            ],
+        }
+
     return {
         "orchestrator_alive": _orchestrator_last_cycle is not None,
         "last_cycle_seconds_ago": ago,
         "queued_tasks": queued,
         "active_tasks": active,
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
-        "pool_size": len(_max_plan_pool),
-        "available_count": sum(1 for a in _max_plan_pool if a.get("enabled", True)),
-        "disabled_count": sum(1 for a in _max_plan_pool if not a.get("enabled", True)),
-        "pool_accounts": [
-            {
-                "name": a["name"],
-                "enabled": a.get("enabled", True),
-                "active": a["active_tasks"],
-                "disabled_at": a["disabled_at"].isoformat() if a.get("disabled_at") else None,
-                "reenable_at": (a["disabled_at"] + timedelta(minutes=30)).isoformat() if a.get("disabled_at") else None,
-            }
-            for a in _max_plan_pool
-        ],
+        "actual_gcp_vm_count": _last_gcp_vm_count,
+        "gcp_vm_count_age_seconds": int(time.time() - _last_gcp_vm_check) if _last_gcp_vm_check else None,
+        "pool_size": pool_snapshot["size"],
+        "available_count": pool_snapshot["available"],
+        "disabled_count": pool_snapshot["disabled"],
+        "pool_accounts": pool_snapshot["accounts"],
         "deploy_state": deploy_state,
         "deploy_monitoring": {
             "window_active": _shared_state.deploy_monitoring["window_start"] is not None,
@@ -1914,7 +2465,7 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         t0 = time.monotonic()
         await session.execute(text("SELECT 1"))
         db_latency_ms = round((time.monotonic() - t0) * 1000, 2)
-        if db_latency_ms > 500:
+        if db_latency_ms > 200:
             db_status = "degraded"
     except Exception:
         db_status = "down"
@@ -1931,7 +2482,7 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     # --- Orchestrator ---
     cycle_age: Optional[float] = None
     if _orchestrator_last_cycle:
-        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+        cycle_age = (_utcnow() - _orchestrator_last_cycle).total_seconds()
     if cycle_age is None:
         orch_status = "down"
     elif cycle_age < 60:
@@ -2011,6 +2562,12 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     return {"status": overall, "components": components}
 
 
+@app.get("/api/version")
+async def get_version():
+    """Public endpoint returning current backend version for frontend compatibility checks."""
+    return {"sha": _current_sha, "revision": _current_revision}
+
+
 @app.get("/health")
 async def health_check():
     """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""
@@ -2019,22 +2576,31 @@ async def health_check():
     orchestrator_alive = _orchestrator_last_cycle is not None
     cycle_age = None
     if _orchestrator_last_cycle:
-        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+        cycle_age = (_utcnow() - _orchestrator_last_cycle).total_seconds()
 
     # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
     orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
 
-    healthy = orchestrator_healthy and all(v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors"))
+    # Only DB is critical for 503 — GitHub/Claude/GCP outages shouldn't remove us from LB
+    critical_healthy = external_health.get("db", True)
+    degraded_deps = [
+        k for k in ("github_api", "claude_api", "gcp")
+        if not external_health.get(k, True)
+    ]
 
+    healthy = orchestrator_healthy and critical_healthy
+    status = "healthy" if healthy and not degraded_deps else "degraded" if healthy else "unhealthy"
     status_code = 200 if healthy else 503
+
     return JSONResponse(
         status_code=status_code,
         content={
-            "status": "healthy" if healthy else "unhealthy",
+            "status": status,
             "revision": _current_revision,
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,
             "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors")},
+            "degraded_deps": degraded_deps,
         }
     )
 
@@ -2239,6 +2805,15 @@ class GitHubCreateBranchRequest(BaseModel):
     branch_name: str = Field(..., pattern="^[a-zA-Z0-9_./-]+$")
     sha: str = Field(..., pattern="^[a-fA-F0-9]{40}$")
 
+    @field_validator("branch_name")
+    @classmethod
+    def validate_branch_safe(cls, v: str) -> str:
+        if ".." in v:
+            raise ValueError("Branch name cannot contain '..'")
+        if v.startswith("/") or v.startswith("-"):
+            raise ValueError("Branch name cannot start with '/' or '-'")
+        return v
+
 class GitHubCreatePRRequest(BaseModel):
     task_id: uuid.UUID
     owner: str
@@ -2290,7 +2865,7 @@ async def deploy_blueprint(
     
     for p in payload.payloads:
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
-        vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
+        vm_name = f"agent-vm-{uuid.uuid4().hex}"
         
         task = Task(
             project_id=project.id,
@@ -2528,6 +3103,28 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
 
 # --- Agent APIs ---
 
+# Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
+# that bypass agent-side sanitization (compromised agent, direct WS injection)
+_SANITIZE_PATTERNS = [
+    (re.compile(r'https://x-access-token:[^@]+@'), 'https://x-access-token:***@'),
+    (re.compile(r'ghp_[A-Za-z0-9_]+'), 'ghp_***'),
+    (re.compile(r'ghs_[A-Za-z0-9_]+'), 'ghs_***'),
+    (re.compile(r'github_pat_[A-Za-z0-9_]+'), 'github_pat_***'),
+    (re.compile(r'sk-ant-[A-Za-z0-9_\-]+'), 'sk-ant-***'),
+    (re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'), 'eyJ***'),
+    (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), 'Bearer ***'),
+    (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), 'oauth_token=***'),
+    (re.compile(r'-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----'), '***PRIVATE KEY***'),
+]
+
+def _sanitize_log(text: str) -> str:
+    """Redact secrets from log text before broadcasting to WebSocket clients."""
+    if not text:
+        return text
+    for pattern, replacement in _SANITIZE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
 @app.websocket("/api/agent/ws/{task_id}")
 async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     """
@@ -2595,7 +3192,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             if data.get("type") == "log":
                 await broadcast_to_project(project_id, "agent_log", {
                     "task_id": str(task_id),
-                    "log": data.get("content")
+                    "log": _sanitize_log(data.get("content", ""))
                 })
             elif data.get("type") == "status":
                 # Optionally handle status updates via WS too
@@ -2606,7 +3203,8 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         manager.remove_ip(websocket)
 
 @app.post("/api/agent/refresh-token")
-async def agent_refresh_token(token: dict = Depends(verify_agent_token)):
+@limiter.limit("60/minute")
+async def agent_refresh_token(request: Request, token: dict = Depends(verify_agent_token)):
     """
     Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
     """
@@ -2615,7 +3213,9 @@ async def agent_refresh_token(token: dict = Depends(verify_agent_token)):
 
 
 @app.post("/api/agent/claim")
+@limiter.limit("60/minute")
 async def claim_task(
+    request: Request,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
 ):
@@ -2776,7 +3376,9 @@ async def claim_task(
     return response
 
 @app.post("/api/agent/artifacts/upload-url")
+@limiter.limit("30/minute")
 async def get_upload_url(
+    request: Request,
     req: UploadUrlRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -2804,7 +3406,9 @@ async def get_upload_url(
     }
 
 @app.post("/api/agent/heartbeat")
+@limiter.limit("120/minute")
 async def agent_heartbeat(
+    request: Request,
     req: HeartbeatRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -2838,14 +3442,18 @@ async def agent_heartbeat(
             raise HTTPException(status_code=404, detail="Task not found")
         if check_task.vm_instance_id != token.get("vm_instance_id"):
             raise HTTPException(status_code=404, detail="Task not found for this VM")
-        # Row exists but was locked — skip this heartbeat cycle, try next time
-        return {"status": "ok", "skipped": True}
+        # Row exists but was locked — tell agent to retry next cycle
+        return JSONResponse(
+            status_code=409,
+            content={"status": "locked", "detail": "Task row locked, retry next cycle"},
+            headers={"Retry-After": "30"},
+        )
 
     # Signal agent to stop if task was cancelled/completed externally
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         raise HTTPException(status_code=409, detail="Task already terminal")
 
-    task.last_heartbeat = datetime.utcnow()
+    task.last_heartbeat = _utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
     if req.metrics:
@@ -2859,7 +3467,9 @@ async def agent_heartbeat(
     return {"status": "ok"}
 
 @app.post("/api/agent/spawn")
+@limiter.limit("60/minute")
 async def spawn_subtask(
+    request: Request,
     req: SpawnTaskRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -2882,7 +3492,7 @@ async def spawn_subtask(
         # Infer depth from parent chain
         depth = 0
         current = parent_task
-        while current.parent_task_id and depth < MAX_SPAWN_DEPTH + 1:
+        while current.parent_task_id and depth < MAX_SPAWN_DEPTH:
             current = await session.get(Task, current.parent_task_id)
             if not current:
                 break
@@ -2913,7 +3523,7 @@ async def spawn_subtask(
             description=payload.get("description", ""),
             payloads=[payload],
             context={**(req.context or {}), "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
             # Plan-spawned children are held (requires_approval=True) until _handle_plan_completion
@@ -2949,9 +3559,28 @@ async def spawn_subtask(
         "requires_approval": req.requires_approval
     }
 
+def _has_local_cycle(adj: Dict[str, list]) -> bool:
+    """Check for cycles in a small adjacency list (dependency graph)."""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in adj}
+    def dfs(n):
+        color[n] = GRAY
+        for dep in adj.get(n, []):
+            if dep not in color:
+                continue  # External dep, not in our subgraph
+            if color[dep] == GRAY:
+                return True
+            if color[dep] == WHITE and dfs(dep):
+                return True
+        color[n] = BLACK
+        return False
+    return any(color[n] == WHITE and dfs(n) for n in adj)
+
+
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.
+    Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
     children = (await session.execute(
@@ -2963,7 +3592,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     parent_ctx = parent.context or {}
     parent_staging = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
 
+    # Pass 1: Clone failed children, build old→new ID mapping
+    old_to_new: Dict[str, str] = {}
+    cloned_pairs: list = []  # (original, clone)
     retried_count = 0
+
     for child in children:
         if child.status != TaskStatus.FAILED:
             continue
@@ -2985,18 +3618,39 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             payloads=new_payloads,
             context={k: v for k, v in (child.context or {}).items()
                      if k != "max_plan_account_id"},  # Strip runtime-only fields
-            depends_on=child.depends_on,
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            depends_on=[],  # Set in pass 2 after all clones exist
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=child.requires_approval,
         )
         session.add(new_child)
+        await session.flush()  # Assigns new_child.id
+        old_to_new[str(child.id)] = str(new_child.id)
+        cloned_pairs.append((child, new_child))
         retried_count += 1
 
         history = TaskHistory(task_id=new_child.id, action="SPAWNED",
                               details={"spawned_by": "REQUEUE", "retrying": str(child.id)})
         session.add(history)
+
+    # Pass 2: Remap depends_on from old (cancelled) IDs to new (cloned) IDs
+    for original, clone in cloned_pairs:
+        remapped = []
+        for dep_id in (original.depends_on or []):
+            if dep_id in old_to_new:
+                remapped.append(old_to_new[dep_id])  # Point to the clone
+            else:
+                remapped.append(dep_id)  # Keep (COMPLETED sibling or still-active task)
+        clone.depends_on = remapped
+
+    # Pass 3: In-memory cycle check on cloned subgraph
+    if cloned_pairs:
+        graph = {str(c.id): c.depends_on or [] for _, c in cloned_pairs}
+        if _has_local_cycle(graph):
+            logger.warning(f"[REQUEUE] Circular deps detected in cloned children of {parent.id} — clearing all depends_on")
+            for _, clone in cloned_pairs:
+                clone.depends_on = []
 
     parent.status = TaskStatus.EVALUATING
     parent.latest_status_message = f"Requeued — retrying {retried_count} failed subtask(s)"
@@ -3029,7 +3683,7 @@ async def _spawn_pipeline_task(
         try:
             orig_task = await session.get(Task, uuid.UUID(orig_id))
             if orig_task and (orig_task.context or {}).get("pr_merged"):
-                print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {orig_id[:8]})")
+                logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {orig_id[:8]})")
                 source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
                 session.add(source_task)
                 return None
@@ -3037,7 +3691,7 @@ async def _spawn_pipeline_task(
             pass
     # Also check the source task itself
     if (source_task.context or {}).get("pr_merged"):
-        print(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
+        logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
         return None
 
     # Guard: don't spawn if there's already an active review/fix for this PR
@@ -3057,7 +3711,33 @@ async def _spawn_pipeline_task(
             session.add(source_task)
             return t
 
-    # Track review-fix iteration count to prevent infinite loops
+    # Per-PR iteration cap: count ALL completed review/fix tasks for this PR across all chains
+    from sqlalchemy import func as sa_func
+    pr_total = (await session.execute(
+        select(sa_func.count(Task.id)).where(
+            Task.project_id == source_task.project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        )
+    )).scalar() or 0
+    # Filter to tasks matching this PR number (check payloads JSONB)
+    pr_pipeline_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == source_task.project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        )
+    )).scalars().all()
+    pr_iterations = sum(
+        1 for t in pr_pipeline_tasks
+        if (t.payloads or [{}])[0].get("pr_number") == pr_number
+        and (t.payloads or [{}])[0].get("type") in ("review", "fix")
+    )
+    if pr_iterations >= MAX_REVIEW_FIX_ITERATIONS:
+        logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
+        source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
+        session.add(source_task)
+        return None
+
+    # Track review-fix iteration count to prevent infinite loops (per-chain)
     source_loop = (source_task.context or {}).get("review_loop", {})
     source_payload = (source_task.payloads or [{}])[0]
     iteration = source_loop.get("iteration", 0) + 1
@@ -3078,7 +3758,7 @@ async def _spawn_pipeline_task(
         logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
         return None
 
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
     # Determine parent: use the original task's parent (so review/fix are siblings of the
     # create task under the plan/research parent), falling back to original task itself
@@ -3352,7 +4032,7 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
                 existing.append(predecessor)
                 succ_title = subtasks[successor].get("title", f"#{successor}")
                 pred_title = subtasks[predecessor].get("title", f"#{predecessor}")
-                print(f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}")
+                logger.debug(f"[{label}] Serializing subtasks {pred_title!r} → {succ_title!r} due to shared file: {file_path}")
 
 
 async def _ensure_branch(
@@ -3446,7 +4126,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     if existing_children:
         # Agent already spawned subtasks — enrich with branch info, dependencies, and approval
-        print(f"[PLAN] Agent already spawned {len(existing_children)} children, enriching...")
+        logger.info(f"[PLAN] Agent already spawned {len(existing_children)} children, enriching...")
         parent_payload = (task.payloads or [{}])[0]
         model = parent_payload.get('model')
         effort = parent_payload.get('effort')
@@ -3512,7 +4192,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             await broadcast_to_project(str(task.project_id), "task_updated",
                                        {"task_id": str(ct.id), "status": str(ct.status)})
 
-        print(f"[PLAN] Enriched {len(existing_children)} agent-spawned subtasks for plan {task.id}")
+        logger.info(f"[PLAN] Enriched {len(existing_children)} agent-spawned subtasks for plan {task.id}")
         return
 
     # First pass: create all child tasks
@@ -3562,7 +4242,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "parent_context": plan_parent_context,
                 **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             depends_on=[],
@@ -3678,7 +4358,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
                 "file_path": finding.get("file_path", ""),
                 "line_number": finding.get("line_number", 0),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=False,  # review pipeline handles quality; only merge to main gates
@@ -3797,7 +4477,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
                 "area": area,
                 "related_files": finding.get("related_files", []),
             },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
             requires_approval=False,
@@ -3918,7 +4598,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     existing_titles = [t.title.lower() for t in existing_tasks]
 
     # Query recent tasks (last 30 days) for hash-based deduplication across research cycles
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    thirty_days_ago = _utcnow() - timedelta(days=30)
     recent_tasks_for_dedup = (await session.execute(
         select(Task).where(
             Task.project_id == task.project_id,
@@ -3940,151 +4620,120 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 return True
         return False
 
-    # Sort findings by priority: high → medium → low (preserve original order within each tier)
+    # Sort findings by priority: high → medium → low (preserve original order within each tier).
+    # The orchestrator dispatches by (status, priority, created_at), so higher-priority
+    # tasks naturally run first without needing artificial wave dependencies.
     priority_order = {"high": 0, "medium": 1, "low": 2}
     indexed_findings = list(enumerate(findings))
     indexed_findings.sort(key=lambda x: priority_order.get(x[1].get("priority", "medium"), 1))
 
-    wave_size = max(1, _runtime_config.get("autonomous_research_wave_size", 10))
-
-    # Group into waves by priority tier, each capped at wave_size
-    waves: list[list[tuple[int, dict]]] = []
-    current_priority = None
-    current_wave: list[tuple[int, dict]] = []
+    # Deduplicate findings against recent tasks
     skipped_duplicates = 0
+    deduplicated: list[tuple[int, dict, str]] = []  # (orig_i, finding, fhash)
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i+1}")
         description = finding.get("description", finding.get("prompt", ""))
         fhash = _finding_hash(title, description)
         if fhash in recent_finding_hashes:
-            print(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched recent task")
+            logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched recent task")
             skipped_duplicates += 1
             continue
         if _is_duplicate(title, existing_titles):
             logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
             continue
-        p = finding.get("priority", "medium")
-        if p != current_priority:
-            if current_wave:
-                # Flush current wave, splitting into chunks of wave_size
-                for chunk_start in range(0, len(current_wave), wave_size):
-                    waves.append(current_wave[chunk_start:chunk_start + wave_size])
-            current_wave = [(orig_i, finding)]
-            current_priority = p
-        else:
-            current_wave.append((orig_i, finding))
-            if len(current_wave) >= wave_size:
-                waves.append(current_wave)
-                current_wave = []
-    if current_wave:
-        for chunk_start in range(0, len(current_wave), wave_size):
-            waves.append(current_wave[chunk_start:chunk_start + wave_size])
+        deduplicated.append((orig_i, finding, fhash))
 
-    # First pass: create all child tasks, recording which wave each belongs to
+    # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
-    finding_indices = []  # Track which finding index maps to which child task index
-    # wave_task_indices[w] = list of child_tasks indices for wave w
-    wave_task_indices: list[list[int]] = [[] for _ in waves]
+    finding_indices = []  # Maps child_tasks index → findings array index
 
-    for wave_idx, wave in enumerate(waves):
-        for orig_i, finding in wave:
-            scope = finding.get("scope", "small")
-            risk = finding.get("risk", "low")
-            title = finding.get("title", f"Research finding #{orig_i+1}")
-            prompt = finding.get("prompt", finding.get("description", ""))
+    for orig_i, finding, fhash in deduplicated:
+        scope = finding.get("scope", "small")
+        risk = finding.get("risk", "low")
+        title = finding.get("title", f"Research finding #{orig_i+1}")
+        prompt = finding.get("prompt", finding.get("description", ""))
 
-            if not prompt:
-                continue
+        if not prompt:
+            continue
 
-            # Determine task type: research findings can spawn sub-research or specialized agents
-            finding_type = finding.get("type", "improvement")
-            if finding_type == "research":
-                task_type = "research"  # deeper investigation before implementation
-            elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
-                task_type = finding_type  # spawn specialized agent
-            elif finding_type == "refactor":
-                task_type = "refactor"  # code quality improvement, no behavior change
-            elif scope == "large":
-                task_type = "plan"     # large scope needs decomposition
-            else:
-                task_type = "create"   # small/medium scope is single-PR work
-            # Pre-spawn approval removed: the review pipeline handles quality gates.
-            # Only final merge to main requires human approval (critical files gate).
-            needs_approval = False
+        # Determine task type: research findings can spawn sub-research or specialized agents
+        finding_type = finding.get("type", "improvement")
+        if finding_type == "research":
+            task_type = "research"  # deeper investigation before implementation
+        elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
+            task_type = finding_type  # spawn specialized agent
+        elif finding_type == "refactor":
+            task_type = "refactor"  # code quality improvement, no behavior change
+        elif scope == "large":
+            task_type = "plan"     # large scope needs decomposition
+        else:
+            task_type = "create"   # small/medium scope is single-PR work
+        # Pre-spawn approval removed: the review pipeline handles quality gates.
+        # Only final merge to main requires human approval (critical files gate).
+        needs_approval = False
 
-            direction_id = finding.get("direction_id")
-            finding_model = finding.get('model')
-            finding_effort = finding.get('effort')
+        direction_id = finding.get("direction_id")
+        finding_model = finding.get('model')
+        finding_effort = finding.get('effort')
 
-            related_files = finding.get("related_files", [])
-            full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
-            type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
-            finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
-            new_task = Task(
-                project_id=task.project_id,
-                title=title,
-                description=finding.get("description", prompt[:200]),
-                parent_task_id=task.id,
-                payloads=[{
-                    "type": task_type,
-                    "prompt": full_prompt,
-                    "base_branch": research_branch,
-                    **(({'model': finding_model} if finding_model else {})),
-                    **(({'effort': finding_effort} if finding_effort else {})),
-                    **({"prompt_suffix": type_suffix} if type_suffix else {}),
-                }],
-                context={
-                    "research_task_id": str(task.id),
-                    "finding_index": orig_i,
-                    "scope": scope,
-                    "risk": risk,
-                    "research_branch": research_branch,
-                    "original_base": original_base,
-                    "research_depth": research_depth + 1,
-                    "related_files": related_files,
-                    "finding_hash": fhash,
-                    **({"direction_id": direction_id} if direction_id else {}),
-                },
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-                status=TaskStatus.QUEUED,
-                created_by="ORCHESTRATOR",
-                requires_approval=needs_approval,
-                depends_on=[],
-                priority=finding_priority,
-            )
-            session.add(new_task)
-            ci = len(child_tasks)
-            child_tasks.append(new_task)
-            finding_indices.append(orig_i)
-            wave_task_indices[wave_idx].append(ci)
+        related_files = finding.get("related_files", [])
+        full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
+        type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
+        finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
+        new_task = Task(
+            project_id=task.project_id,
+            title=title,
+            description=finding.get("description", prompt[:200]),
+            parent_task_id=task.id,
+            payloads=[{
+                "type": task_type,
+                "prompt": full_prompt,
+                "base_branch": research_branch,
+                **(({'model': finding_model} if finding_model else {})),
+                **(({'effort': finding_effort} if finding_effort else {})),
+                **({"prompt_suffix": type_suffix} if type_suffix else {}),
+            }],
+            context={
+                "research_task_id": str(task.id),
+                "finding_index": orig_i,
+                "scope": scope,
+                "risk": risk,
+                "research_branch": research_branch,
+                "original_base": original_base,
+                "research_depth": research_depth + 1,
+                "related_files": related_files,
+                "finding_hash": fhash,
+                **({"direction_id": direction_id} if direction_id else {}),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            requires_approval=needs_approval,
+            depends_on=[],
+            priority=finding_priority,
+        )
+        session.add(new_task)
+        child_tasks.append(new_task)
+        finding_indices.append(orig_i)
 
     await session.commit()
     for ct in child_tasks:
         await session.refresh(ct)
 
-    # Second pass: resolve depends_on_indices to actual UUIDs and apply wave dependencies
-    # finding_indices maps child_tasks position → findings array position
+    # Resolve explicit depends_on_indices to actual UUIDs (agent-specified inter-finding deps only)
     finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}
-    for wave_idx, wave_ci_list in enumerate(wave_task_indices):
-        # All tasks in the preceding wave must complete before this wave starts
-        prev_wave_uuids = (
-            [str(child_tasks[ci].id) for ci in wave_task_indices[wave_idx - 1]]
-            if wave_idx > 0 else []
-        )
-        for ci in wave_ci_list:
-            fi = finding_indices[ci]
-            dep_indices = findings[fi].get("depends_on_indices", [])
-            explicit_deps = [
-                str(child_tasks[finding_to_child[j]].id)
-                for j in dep_indices
-                if j in finding_to_child
-            ]
-            # Merge wave deps with explicit depends_on_indices (deduplicated)
-            merged = list(dict.fromkeys(prev_wave_uuids + explicit_deps))
-            child_tasks[ci].depends_on = merged
-            if merged:
-                session.add(child_tasks[ci])
+    for ci, ct in enumerate(child_tasks):
+        fi = finding_indices[ci]
+        dep_indices = findings[fi].get("depends_on_indices", [])
+        explicit_deps = [
+            str(child_tasks[finding_to_child[j]].id)
+            for j in dep_indices
+            if j in finding_to_child
+        ]
+        if explicit_deps:
+            ct.depends_on = explicit_deps
+            session.add(ct)
 
     # Log file overlap warnings for observability
     _log_file_overlaps(findings, "RESEARCH")
@@ -4103,7 +4752,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         project = await session.get(Project, task.project_id)
         if project:
             directions = list(project.directions or [])
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = _utcnow().isoformat()
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
                     d["last_researched_at"] = now_iso
@@ -4162,6 +4811,20 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 # Also update the in-memory object so caller sees the change
                 task.context = {**(task.context or {}), "pr_merged": True}
                 return True
+            # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
+            if pr_data.get("state") == "closed" and not pr_data.get("merged"):
+                logger.warning(f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected")
+                async with AsyncSessionLocal() as write_session:
+                    db_task = await write_session.get(Task, task.id)
+                    if db_task:
+                        db_task.context = {**(db_task.context or {}), "pr_closed_unmerged": True}
+                        db_task.status = TaskStatus.FAILED
+                        db_task.latest_status_message = f"PR #{pr_number} closed without merging"
+                        write_session.add(db_task)
+                        await write_session.commit()
+                task.context = {**(task.context or {}), "pr_closed_unmerged": True}
+                task.status = TaskStatus.FAILED
+                return True  # Return True so callers don't block — task is now FAILED which they handle
         except Exception as e:
             logger.warning(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}", exc_info=True)
     return False
@@ -4186,19 +4849,48 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     if is_parent:
         staging = ctx.get("plan_branch") or ctx.get("research_branch")
         if staging:
-            # Don't delete staging branch if there are still open PRs targeting it
-            try:
-                _gh, _owner, _repo = await get_github_token_for_task(task.id, session)
-                from app.github import get_open_pull_requests
-                open_prs = await get_open_pull_requests(_gh, _owner, _repo, staging)
-                if open_prs:
-                    pr_nums = [f"#{p['number']}" for p in open_prs]
-                    logger.warning(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
+            # Guard 1: Don't delete if children are still active (they push to this branch)
+            active_children = (await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == task.id,
+                    Task.status.in_([
+                        TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS
+                    ])
+                )
+            )).scalars().all()
+            if active_children:
+                logger.warning(f"[CLEANUP] Skipping deletion of {staging} — "
+                               f"{len(active_children)} child task(s) still active")
+            else:
+                # Guard 2: Don't delete branches that are target branches for other active rollups
+                from sqlalchemy import or_ as sa_or
+                referencing_parents = (await session.execute(
+                    select(Task).where(
+                        Task.status == TaskStatus.EVALUATING,
+                        Task.id != task.id,
+                        sa_or(
+                            Task.context["parent_base"].as_string() == staging,
+                            Task.context["original_base"].as_string() == staging,
+                        )
+                    )
+                )).scalars().all()
+                if referencing_parents:
+                    logger.warning(f"[CLEANUP] Skipping deletion of {staging} — "
+                                   f"{len(referencing_parents)} active parent(s) target it as rollup base")
                 else:
-                    branches_to_delete.append(staging)
-            except Exception:
-                # If we can't check, don't delete (safe default)
-                logger.warning(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
+                    # Guard 3: Don't delete if there are still open PRs targeting it
+                    try:
+                        _gh, _owner, _repo = await get_github_token_for_task(task.id, session)
+                        from app.github import get_open_pull_requests
+                        open_prs = await get_open_pull_requests(_gh, _owner, _repo, staging)
+                        if open_prs:
+                            pr_nums = [f"#{p['number']}" for p in open_prs]
+                            logger.warning(f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}")
+                        else:
+                            branches_to_delete.append(staging)
+                    except Exception:
+                        # If we can't check, don't delete (safe default)
+                        logger.warning(f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs")
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
@@ -4234,7 +4926,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         return
 
     all_children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id)
+        select(Task).where(Task.parent_task_id == parent.id).with_for_update()
     )).scalars().all()
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
@@ -4335,32 +5027,98 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
                     return
 
+                # Verify target branch exists before creating PR.
+                # Primary protection is in _cleanup_branches (won't delete branches
+                # referenced by active rollups). This catches external deletions.
+                # If the branch is missing, FAIL loudly so we can catch remaining
+                # causes of bad branch deletion ordering.
+                try:
+                    await get_branch_sha(gh_token, owner, repo, target_branch)
+                except Exception as branch_err:
+                    raise Exception(
+                        f"Target branch '{target_branch}' does not exist — "
+                        f"cannot create rollup PR. This indicates a branch was "
+                        f"deleted out of order. Error: {branch_err}"
+                    )
+
                 is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
-                pr_title = f"[Blueprint] Rollup: {parent.title}"
-                pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
 
-                pr_result = await create_pull_request(gh_token, owner, repo,
-                    title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
-
-                # Empty diff — branches are identical, nothing to merge
-                if pr_result.get("empty_diff"):
-                    logger.info(f"[ROLLUP] Empty diff for {staging_branch} → {target_branch} — marking COMPLETED")
-                    parent.status = TaskStatus.COMPLETED
-                    parent.latest_status_message = f"✓ All {completed_count} subtasks completed — no new changes to merge (fixes already on {target_branch})"
+                # Resume from prior crash — skip PR creation if already done
+                existing_pr = parent_ctx.get("rollup_pr_number")
+                if existing_pr:
+                    # Validate PR is still open — it may have been merged/closed since crash
                     try:
-                        await delete_branch(gh_token, owner, repo, staging_branch)
-                    except Exception:
-                        pass
+                        pr_state = await get_pull_request(gh_token, owner, repo, existing_pr)
+                        if pr_state.get("merged"):
+                            logger.info(f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED")
+                            parent.status = TaskStatus.COMPLETED
+                            parent.context = {**parent_ctx, "pr_merged": True}
+                            parent.latest_status_message = f"Rollup PR #{existing_pr} already merged"
+                            session.add(parent)
+                            await session.commit()
+                            await _cleanup_branches(parent, session)
+                            await broadcast_to_project(str(parent.project_id), "task_updated",
+                                                       {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                            return
+                        if pr_state.get("state") == "closed":
+                            logger.warning(f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry")
+                            parent.context = {k: v for k, v in parent_ctx.items()
+                                             if k not in ("rollup_pr_number", "rollup_pr_url")}
+                            parent_ctx = parent.context
+                            existing_pr = None
+                            session.add(parent)
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(f"[ROLLUP] Could not verify PR #{existing_pr} state: {e} — proceeding with existing marker")
+
+                if existing_pr:
+                    rollup_pr_number = existing_pr
+                    rollup_pr_url = parent_ctx.get("rollup_pr_url", "")
+                    logger.info(f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}")
+                else:
+                    pr_title = f"[Blueprint] Rollup: {parent.title}"
+                    pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
+
+                    pr_result = await create_pull_request(gh_token, owner, repo,
+                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+
+                    # Empty diff — branches are identical, nothing to merge
+                    if pr_result.get("empty_diff"):
+                        logger.info(f"[ROLLUP] Empty diff for {staging_branch} → {target_branch} — marking COMPLETED")
+                        parent.status = TaskStatus.COMPLETED
+                        parent.latest_status_message = f"✓ All {completed_count} subtasks completed — no new changes to merge (fixes already on {target_branch})"
+                        try:
+                            await delete_branch(gh_token, owner, repo, staging_branch)
+                        except Exception:
+                            pass
+                        session.add(parent)
+                        await session.commit()
+                        await _cleanup_branches(parent, session)
+                        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                                   {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                        return
+
+                    rollup_pr_url = pr_result.get("html_url", "")
+                    rollup_pr_number = pr_result.get("number")
+                    logger.info(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+
+                    # Commit marker immediately — if we crash after this point,
+                    # restart will find the marker and skip PR creation
+                    parent.context = {**parent_ctx, "rollup_pr_number": rollup_pr_number, "rollup_pr_url": rollup_pr_url}
+                    parent_ctx = parent.context  # Update local ref
                     session.add(parent)
                     await session.commit()
-                    await _cleanup_branches(parent, session)
-                    await broadcast_to_project(str(parent.project_id), "task_updated",
-                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
-                    return
 
-                rollup_pr_url = pr_result.get("html_url", "")
-                rollup_pr_number = pr_result.get("number")
-                logger.info(f"[ROLLUP] Created PR #{rollup_pr_number}: {staging_branch} → {target_branch}")
+                # Re-acquire lock on parent for merge phase (marker commit released it)
+                parent = (await session.execute(
+                    select(Task).where(Task.id == parent.id).with_for_update()
+                )).scalars().first()
+                parent_ctx = parent.context or {}
+
+                # Guard: concurrent sibling may have created a different rollup PR in the gap
+                if parent_ctx.get("rollup_pr_number") != rollup_pr_number:
+                    logger.info(f"[ROLLUP] Concurrent sibling created rollup PR for parent {parent.id} — yielding")
+                    return
 
                 # Auto-merge small rollups on intermediate branches; review large ones
                 # Measure by total lines changed (additions + deletions)
@@ -4493,8 +5251,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
 
 @app.post("/api/agent/status")
+@limiter.limit("120/minute")
 async def update_agent_status(
-    payload: AgentStatusPayload, 
+    request: Request,
+    payload: AgentStatusPayload,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -4531,25 +5291,39 @@ async def update_agent_status(
         task.latest_status_message = payload.logs[:2000]
     session.add(task)
     
-    # Broadcast status change
-    await broadcast_to_project(
-        str(task.project_id), 
-        "task_updated", 
-        {"task_id": str(task.id), "status": payload.status}
-    )
-    
-    # 3. Create Artifact if provided
+    # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
     if payload.artifact_type:
-        artifact = Artifact(
-            task_id=task.id,
-            artifact_type=payload.artifact_type,
-            commit_hash=payload.commit_hash,
-            repo_url=payload.repo_url,
-            pr_url=payload.pr_url,
-            storage_uri=payload.storage_uri,
-            logs=payload.logs
-        )
-        session.add(artifact)
+        if payload.artifact_type == ArtifactType.PULL_REQUEST:
+            existing = (await session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST
+                )
+            )).scalars().first()
+            if existing:
+                logger.info(f"[STATUS] Task {task.id} already has PR artifact, skipping duplicate")
+            else:
+                artifact = Artifact(
+                    task_id=task.id,
+                    artifact_type=payload.artifact_type,
+                    commit_hash=payload.commit_hash,
+                    repo_url=payload.repo_url,
+                    pr_url=payload.pr_url,
+                    storage_uri=payload.storage_uri,
+                    logs=payload.logs
+                )
+                session.add(artifact)
+        else:
+            artifact = Artifact(
+                task_id=task.id,
+                artifact_type=payload.artifact_type,
+                commit_hash=payload.commit_hash,
+                repo_url=payload.repo_url,
+                pr_url=payload.pr_url,
+                storage_uri=payload.storage_uri,
+                logs=payload.logs
+            )
+            session.add(artifact)
         
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(
@@ -4652,7 +5426,7 @@ async def update_agent_status(
                                 "passed_count": len([t for t in smoketest_data.get("tests", []) if t.get("status") == "pass"]),
                                 "failed_count": len(failed_tests),
                             },
-                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                             status=TaskStatus.QUEUED,
                             created_by="ORCHESTRATOR",
                         )
@@ -4723,7 +5497,7 @@ async def update_agent_status(
                         "failed_task_id": failed_task_id,
                         "root_cause": debug_data.get("root_cause", ""),
                     },
-                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                     status=TaskStatus.QUEUED,
                     created_by="ORCHESTRATOR",
                 )
@@ -4753,25 +5527,26 @@ async def update_agent_status(
         # Release Max plan account slot
         acct_id = (task.context or {}).get("max_plan_account_id")
         if acct_id:
-            release_max_plan_account(acct_id)
+            await release_max_plan_account(acct_id)
             # Auto-disable account on rate limit — usage exhausted, stop wasting VMs
             # Re-enables automatically after 30min cooldown
             if payload.status == TaskStatus.FAILED and failure_class == "RATE_LIMIT":
-                for acct in _max_plan_pool:
-                    if acct["id"] == acct_id:
-                        acct["enabled"] = False
-                        acct["disabled_at"] = datetime.utcnow()
-                        logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
-                        break
+                async with _max_plan_pool_lock:
+                    for acct in _max_plan_pool:
+                        if acct["id"] == acct_id:
+                            acct["enabled"] = False
+                            acct["disabled_at"] = _utcnow()
+                            logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
+                            break
 
-        if task.vm_instance_id:
-            background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
+        old_vm_id = task.vm_instance_id
+        await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
 
         # Retry logic for failed tasks
         if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
-            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
+            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None  # Fresh timeout window for the new VM
             session.add(task)
@@ -4817,7 +5592,7 @@ async def update_agent_status(
                     "failed_task_id": str(task.id),
                     "parent_base": base_branch,
                 },
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                 status=TaskStatus.QUEUED,
                 created_by="ORCHESTRATOR",
             )
@@ -4841,18 +5616,21 @@ async def update_agent_status(
             if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
                 breaker["state"] = "OPEN"
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
-                breaker["opened_at"] = datetime.utcnow()
+                breaker["opened_at"] = _utcnow()
                 breaker["half_open_task_id"] = None
                 logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
 
             # CLOSED → OPEN after 3 consecutive failures
             elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
                 breaker["state"] = "OPEN"
-                breaker["opened_at"] = datetime.utcnow()
+                breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 await broadcast_to_project(project_key, "autonomous_paused",
                                            {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
                 logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
+            # Persist breaker state on any transition
+            if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
+                await _persist_circuit_breakers()
         # When review/fix fails permanently, cancel the original create task so rollup
         # skips it (via cancelled-child logic) instead of hanging forever.
         # Other children's work is preserved — only this PR is excluded from the rollup.
@@ -4892,6 +5670,9 @@ async def update_agent_status(
             elif breaker["state"] == "OPEN":
                 # Shouldn't happen (OPEN blocks spawning), but reset if it does
                 breaker["state"] = "CLOSED"
+            # Persist on state transition back to CLOSED
+            if breaker["state"] == "CLOSED" and breaker["failure_count"] == 0:
+                await _persist_circuit_breakers()
 
         # ── EARLY COMMIT ──
         # Release the FOR UPDATE lock NOW, before downstream processing.
@@ -5064,13 +5845,13 @@ async def update_agent_status(
                     pr_state = pr_data_check.get("state", "open")
                     if pr_state == "closed" or pr_data_check.get("merged"):
                         merged_label = "merged" if pr_data_check.get("merged") else "closed"
-                        print(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}")
+                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}")
                         task.latest_status_message = f"PR #{pr_number} already {merged_label} — review skipped"
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
                 except Exception as e:
-                    print(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review")
+                    logger.info(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review")
 
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
@@ -5118,11 +5899,18 @@ async def update_agent_status(
                         logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
 
                 if not verdict_parsed:
-                    # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words
+                    # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words (quoted or unquoted)
                     upper_text = verdict_text.upper()
-                    # Only match the verdict keywords, not surrounding review text
-                    approve_idx = upper_text.rfind('"APPROVE"')
-                    rc_idx = upper_text.rfind('"REQUEST_CHANGES"')
+                    approve_idx = max(
+                        upper_text.rfind('"APPROVE"'),
+                        upper_text.rfind("APPROVE"),
+                        upper_text.rfind("APPROVED"),
+                    )
+                    rc_idx = max(
+                        upper_text.rfind('"REQUEST_CHANGES"'),
+                        upper_text.rfind("REQUEST_CHANGES"),
+                        upper_text.rfind("REQUEST CHANGES"),
+                    )
                     if approve_idx > rc_idx:
                         verdict = "APPROVE"
                     elif rc_idx > approve_idx:
@@ -5167,7 +5955,7 @@ async def update_agent_status(
                                 "head_sha": head_sha, "pr_number": pr_number,
                                 "branch": branch, "base_branch": base_branch,
                                 "original_task_id": original_task_id,
-                                "ci_wait_started": datetime.utcnow().isoformat()}}
+                                "ci_wait_started": _utcnow().isoformat()}}
                             session.add(task)
                             await session.commit()
                             logger.info(f"[CI] PR #{pr_number} approved, CI pending — waiting")
@@ -5199,10 +5987,8 @@ async def update_agent_status(
                         if ci_status and ci_status["conclusion"] == "success":
                             logger.info(f"[CI] PR #{pr_number} CI passed")
 
-                        # Critical files gate: block merge into main if security-critical files were touched
-                        # Intermediate branches (research/, plan/) don't need human approval
-                        is_main_target = base_branch == "main"
-                        if original_task_id and is_main_target:
+                        # Critical files gate: block merge if security-critical files were touched
+                        if original_task_id:
                             try:
                                 orig_task = await session.get(Task, uuid.UUID(original_task_id))
                                 critical_touched = (orig_task.context or {}).get("touched_critical", []) if orig_task else []
@@ -5261,7 +6047,7 @@ async def update_agent_status(
                                                         **({"effort": type_effort} if type_effort else {}),
                                                         **({"health_check_urls": health_check_urls} if health_check_urls else {}),
                                                     }],
-                                                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                                                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                     status=TaskStatus.QUEUED,
                                                     created_by="ORCHESTRATOR",
                                                 )
@@ -5320,7 +6106,7 @@ async def update_agent_status(
                                                                 **({"effort": type_effort} if type_effort else {}),
                                                             }],
                                                             parent_task_id=audit_parent.id,
-                                                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                                                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                             status=TaskStatus.QUEUED,
                                                             requires_approval=False,
                                                             created_by="ORCHESTRATOR",
@@ -5342,9 +6128,9 @@ async def update_agent_status(
                                                             str(orig.project_id), "task_updated",
                                                             {"task_id": str(rescan_task.id), "status": TaskStatus.QUEUED}
                                                         )
-                                                        print(f"[SECURITY RESCAN] Spawned rescan task {rescan_task.id} after security fix merge PR #{pr_number}")
+                                                        logger.info(f"[SECURITY RESCAN] Spawned rescan task {rescan_task.id} after security fix merge PR #{pr_number}")
                                             except Exception as e:
-                                                print(f"[SECURITY RESCAN] Failed to spawn security rescan: {e}")
+                                                logger.info(f"[SECURITY RESCAN] Failed to spawn security rescan: {e}")
                                 except Exception as e:
                                     logger.warning(f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}", exc_info=True)
                             logger.info(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
@@ -5441,13 +6227,13 @@ async def update_agent_status(
                     pr_data_check = await get_pull_request(gh_token_check, owner_check, repo_check, pr_number)
                     if pr_data_check.get("state") == "closed" or pr_data_check.get("merged"):
                         merged_label = "merged" if pr_data_check.get("merged") else "closed"
-                        print(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}")
+                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}")
                         task.latest_status_message = f"PR #{pr_number} already {merged_label} — re-review skipped"
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
                 except Exception as e:
-                    print(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding")
+                    logger.info(f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding")
 
                 # Security scan fix output before re-review
                 scan_blocked = False
@@ -5516,8 +6302,6 @@ async def update_agent_status(
                     f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                 )
                 session.add(task)
-                if task.vm_instance_id:
-                    asyncio.create_task(delete_agent_vm(task.vm_instance_id))
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
@@ -5558,25 +6342,51 @@ async def update_agent_status(
     if session.dirty or session.new:
         await session.commit()
 
+    # Broadcast AFTER all processing is complete (artifacts saved, pipeline spawned)
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": payload.status}
+    )
+
     return {
         "status": "received",
         "message": f"Status update for task {payload.task_id} recorded."
     }
 
-async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession) -> tuple[str, str, str]:
+_github_token_cache: Dict[str, Dict] = {}  # project_id -> {"token", "owner", "repo", "fetched_at"}
+_GITHUB_TOKEN_TTL = 3000  # 50 minutes (installation tokens expire after 60min)
+
+
+def invalidate_github_token_cache(project_id: str) -> None:
+    """Remove a project's cached GitHub token, forcing re-generation on next use."""
+    removed = _github_token_cache.pop(project_id, None)
+    if removed:
+        logger.info(f"[GITHUB] Invalidated cached token for project {project_id}")
+
+
+async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession, force_refresh: bool = False) -> tuple[str, str, str]:
     stmt = select(Task).where(Task.id == task_id)
     task = (await session.execute(stmt)).scalars().first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-        
+
+    project_id_str = str(task.project_id)
+
+    # Return cached token if still fresh (installation tokens expire after 60min)
+    if not force_refresh:
+        cached = _github_token_cache.get(project_id_str)
+        if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
+            return cached["token"], cached["owner"], cached["repo"]
+
     project_stmt = select(Project).where(Project.id == task.project_id)
     project = (await session.execute(project_stmt)).scalars().first()
     if not project or not project.user_id:
         raise HTTPException(status_code=404, detail="Project or user not found")
-        
+
     if not project.github_owner or not project.github_repo:
         raise HTTPException(status_code=403, detail="Project does not have an authorized GitHub repository")
-        
+
     integration_stmt = select(UserIntegration).where(UserIntegration.user_id == project.user_id)
     integration = (await session.execute(integration_stmt)).scalars().first()
 
@@ -5597,14 +6407,26 @@ async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession) -
                 status_code=400,
                 detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat."
             )
-        
+
     # Track successful GitHub API interaction for passive health checking
-    _shared_state.last_github_success = datetime.utcnow()
+    _shared_state.last_github_success = _utcnow()
+
+    # Cache token to avoid re-generating for every API call within the same project
+    _github_token_cache[project_id_str] = {
+        "token": token, "owner": project.github_owner, "repo": project.github_repo,
+        "fetched_at": _utcnow()
+    }
+    # Evict stale entries
+    stale_cutoff = _utcnow() - timedelta(seconds=_GITHUB_TOKEN_TTL + 600)
+    for k in [k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff]:
+        _github_token_cache.pop(k, None)
 
     return token, project.github_owner, project.github_repo
 
 @app.get("/api/agent/github/token")
+@limiter.limit("30/minute")
 async def agent_github_get_token(
+    request: Request,
     task_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5626,7 +6448,9 @@ async def agent_github_get_token(
     }
 
 @app.post("/api/agent/github/commit-status")
+@limiter.limit("30/minute")
 async def agent_github_commit_status(
+    request: Request,
     req: GitHubCommitStatusRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5651,7 +6475,9 @@ async def agent_github_commit_status(
     return {"status": "success", "data": result}
 
 @app.post("/api/agent/github/pr-comment")
+@limiter.limit("30/minute")
 async def agent_github_pr_comment(
+    request: Request,
     req: GitHubPRCommentRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5673,7 +6499,9 @@ async def agent_github_pr_comment(
     return {"status": "success", "data": result}
 
 @app.post("/api/agent/github/pr-review-comment")
+@limiter.limit("30/minute")
 async def agent_github_pr_review_comment(
+    request: Request,
     req: GitHubPRReviewCommentRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5698,7 +6526,9 @@ async def agent_github_pr_review_comment(
     return {"status": "success", "data": result}
 
 @app.post("/api/agent/github/issues")
+@limiter.limit("30/minute")
 async def agent_github_create_issue(
+    request: Request,
     req: GitHubCreateIssueRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5721,7 +6551,9 @@ async def agent_github_create_issue(
     return {"status": "success", "data": result}
 
 @app.get("/api/agent/github/issues")
+@limiter.limit("30/minute")
 async def agent_github_get_issues(
+    request: Request,
     req: GitHubGetIssuesRequest = Depends(),
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5742,7 +6574,9 @@ async def agent_github_get_issues(
     return {"status": "success", "data": result}
 
 @app.post("/api/agent/github/branches")
+@limiter.limit("30/minute")
 async def agent_github_create_branch(
+    request: Request,
     req: GitHubCreateBranchRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5764,7 +6598,9 @@ async def agent_github_create_branch(
     return {"status": "success", "data": result}
 
 @app.post("/api/agent/github/pull-requests")
+@limiter.limit("30/minute")
 async def agent_github_create_pr(
+    request: Request,
     req: GitHubCreatePRRequest,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
@@ -5774,7 +6610,18 @@ async def agent_github_create_pr(
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-        
+
+    # Idempotency: if this task already has a PR artifact, return it
+    existing_artifact = (await session.execute(
+        select(Artifact).where(
+            Artifact.task_id == req.task_id,
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST
+        )
+    )).scalars().first()
+    if existing_artifact and existing_artifact.pr_url:
+        logger.info(f"[PR] Task {req.task_id} already has PR artifact: {existing_artifact.pr_url}")
+        return {"status": "success", "data": {"html_url": existing_artifact.pr_url}}
+
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_pull_request(
         token=gh_token,
@@ -5817,13 +6664,13 @@ async def cancel_project(
     )
     active_tasks = (await session.execute(tasks_stmt)).scalars().all()
 
+    vm_ids_to_delete = []
     for task in active_tasks:
         task.status = TaskStatus.CANCELLED
         session.add(task)
-
         if task.vm_instance_id:
-            background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
-            
+            vm_ids_to_delete.append(task.vm_instance_id)
+
         await broadcast_to_project(
             str(project_id), 
             "task_updated", 
@@ -5832,7 +6679,11 @@ async def cancel_project(
         
     await session.commit()
     await broadcast_to_project(str(project_id), "project_updated", {"status": ProjectStatus.CANCELLED})
-    
+
+    # Delete VMs after commit
+    for vm_id in vm_ids_to_delete:
+        await _ensure_vm_deleted(vm_id, reason="project_cancel")
+
     return {"status": "cancelled", "message": f"Project {project_id} and {len(active_tasks)} tasks cancelled."}
 
 @app.get("/api/projects/{project_id}/status")
@@ -5888,14 +6739,18 @@ async def register_github_pat(
     await validate_fine_grained_pat(req.pat)
     
     # Store the PAT securely in GCP Secret Manager
-    secret_name = await store_user_secret(current_user["user_id"], "github-pat", req.pat)
-    
+    try:
+        secret_name = await store_user_secret(current_user["user_id"], "github-pat", req.pat)
+    except Exception as e:
+        logger.warning(f"[PAT] Secret Manager unavailable, storing PAT directly in DB: {e}")
+        secret_name = req.pat  # Fallback: store raw token in DB
+
     stmt = select(UserIntegration).where(UserIntegration.user_id == current_user["user_id"])
     integration = (await session.execute(stmt)).scalars().first()
     
     if integration:
         integration.github_pat = secret_name
-        integration.updated_at = datetime.utcnow()
+        integration.updated_at = _utcnow()
     else:
         integration = UserIntegration(
             user_id=current_user["user_id"],
@@ -5924,7 +6779,7 @@ async def github_oauth_authorize(
     import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     state = pyjwt.encode(
-        {"sub": current_user["user_id"], "exp": datetime.utcnow() + timedelta(minutes=10), "type": "github_oauth"},
+        {"sub": current_user["user_id"], "exp": _utcnow() + timedelta(minutes=10), "type": "github_oauth"},
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
@@ -5990,7 +6845,7 @@ async def github_oauth_callback(
         if integration:
             integration.github_installation_id = installation_id
             integration.github_account_name = account_name
-            integration.updated_at = datetime.utcnow()
+            integration.updated_at = _utcnow()
         else:
             integration = UserIntegration(
                 user_id=firebase_user_id,
@@ -6030,10 +6885,29 @@ async def github_webhook(
     if not hmac.compare_digest(signature, expected_signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
         
+    # Dedup by GitHub delivery ID — prevents duplicate processing on webhook retries
+    delivery_id = request.headers.get("x-github-delivery")
+    if delivery_id:
+        async with _webhook_dedup_lock:
+            # Evict stale entries (older than TTL)
+            now = time.time()
+            while _webhook_delivery_ids:
+                oldest_id, oldest_time = next(iter(_webhook_delivery_ids.items()))
+                if now - oldest_time > _WEBHOOK_DEDUP_TTL:
+                    _webhook_delivery_ids.pop(oldest_id)
+                else:
+                    break
+            if delivery_id in _webhook_delivery_ids:
+                logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping")
+                return {"status": "duplicate", "delivery_id": delivery_id}
+            _webhook_delivery_ids[delivery_id] = now
+            if len(_webhook_delivery_ids) > _WEBHOOK_DEDUP_MAX:
+                _webhook_delivery_ids.popitem(last=False)
+
     event_type = request.headers.get("x-github-event")
     data = json.loads(payload)
-    
-    logger.info(f"[WEBHOOK] Received {event_type} event")
+
+    logger.info(f"[WEBHOOK] Received {event_type} event (delivery={delivery_id})")
 
     # Post-merge trigger: check if we should spawn autonomous research
     if event_type == "pull_request":

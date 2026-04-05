@@ -134,16 +134,18 @@ class TestHealthEndpoint:
             _shared_state.external_health["failed_deps"] = []
 
     @pytest.mark.asyncio
-    async def test_health_github_api_failure_returns_503(
+    async def test_health_github_api_failure_returns_degraded(
         self, health_client: AsyncClient, healthy_orchestrator, all_deps_healthy
     ):
-        """Returns 503 and status=unhealthy when GitHub API health flag is False."""
+        """Returns 200 with status=degraded when GitHub API is down (non-critical dep)."""
         _shared_state.external_health["github_api"] = False
         _shared_state.external_health["failed_deps"] = ["github_api"]
         try:
             resp = await health_client.get("/health")
-            assert resp.status_code == 503
-            assert resp.json()["status"] == "unhealthy"
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "degraded"
+            assert "github_api" in data["degraded_deps"]
         finally:
             _shared_state.external_health["github_api"] = True
             _shared_state.external_health["failed_deps"] = []
@@ -411,83 +413,93 @@ class TestZoneHealth:
 class TestMaxPlanAccountPool:
     """Unit tests for Max Plan account selection, cooldown, and re-enable logic."""
 
-    def test_select_max_plan_account_empty_pool_returns_none(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_empty_pool_returns_none(self, clean_max_plan_pool):
         """Returns None when the pool is empty."""
-        assert select_max_plan_account() is None
+        assert await select_max_plan_account() is None
 
-    def test_select_max_plan_account_all_disabled_returns_none(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_all_disabled_returns_none(self, clean_max_plan_pool):
         """Returns None when all pool accounts are disabled."""
         _max_plan_pool.extend([
             {"id": "a1", "name": "acct1", "enabled": False, "active_tasks": 0},
             {"id": "a2", "name": "acct2", "enabled": False, "active_tasks": 0},
         ])
-        assert select_max_plan_account() is None
+        assert await select_max_plan_account() is None
 
-    def test_select_max_plan_account_selects_lowest_active_tasks(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_selects_lowest_active_tasks(self, clean_max_plan_pool):
         """Selects the enabled account with the fewest active tasks."""
         _max_plan_pool.extend([
             {"id": "a1", "name": "busy",   "enabled": True, "active_tasks": 5},
             {"id": "a2", "name": "idle",   "enabled": True, "active_tasks": 1},
             {"id": "a3", "name": "medium", "enabled": True, "active_tasks": 3},
         ])
-        result = select_max_plan_account()
+        result = await select_max_plan_account()
         assert result is not None
         assert result["id"] == "a2"
 
-    def test_select_max_plan_account_skips_disabled_accounts(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_skips_disabled_accounts(self, clean_max_plan_pool):
         """Skips disabled accounts even when they have zero active tasks."""
         _max_plan_pool.extend([
             {"id": "a1", "name": "disabled_idle", "enabled": False, "active_tasks": 0},
             {"id": "a2", "name": "enabled_busy",  "enabled": True,  "active_tasks": 10},
         ])
-        result = select_max_plan_account()
+        result = await select_max_plan_account()
         assert result is not None
         assert result["id"] == "a2"
 
-    def test_select_max_plan_account_single_enabled_account(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_single_enabled_account(self, clean_max_plan_pool):
         """Returns the only enabled account when there is just one."""
         _max_plan_pool.append(
             {"id": "a1", "name": "only", "enabled": True, "active_tasks": 2}
         )
-        result = select_max_plan_account()
+        result = await select_max_plan_account()
         assert result is not None
         assert result["id"] == "a1"
 
-    def test_select_max_plan_account_defaults_missing_enabled_key_to_true(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_defaults_missing_enabled_key_to_true(self, clean_max_plan_pool):
         """An account without an 'enabled' key is treated as enabled (default=True)."""
         _max_plan_pool.append(
             {"id": "a1", "name": "no_key", "active_tasks": 0}
             # deliberately omit "enabled"
         )
-        result = select_max_plan_account()
+        result = await select_max_plan_account()
         assert result is not None
         assert result["id"] == "a1"
 
-    def test_release_max_plan_account_decrements_active_tasks(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_release_max_plan_account_decrements_active_tasks(self, clean_max_plan_pool):
         """Releasing an account decrements its active_tasks by one."""
         _max_plan_pool.append(
             {"id": "a1", "name": "acct", "enabled": True, "active_tasks": 3}
         )
-        release_max_plan_account("a1")
+        await release_max_plan_account("a1")
         assert _max_plan_pool[0]["active_tasks"] == 2
 
-    def test_release_max_plan_account_no_underflow(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_release_max_plan_account_no_underflow(self, clean_max_plan_pool):
         """active_tasks is clamped at zero — never goes negative."""
         _max_plan_pool.append(
             {"id": "a1", "name": "acct", "enabled": True, "active_tasks": 0}
         )
-        release_max_plan_account("a1")
+        await release_max_plan_account("a1")
         assert _max_plan_pool[0]["active_tasks"] == 0
 
-    def test_release_max_plan_account_unknown_id_is_noop(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_release_max_plan_account_unknown_id_is_noop(self, clean_max_plan_pool):
         """Releasing an unknown account ID neither raises nor modifies other accounts."""
         _max_plan_pool.append(
             {"id": "a1", "name": "acct", "enabled": True, "active_tasks": 2}
         )
-        release_max_plan_account("does-not-exist")
+        await release_max_plan_account("does-not-exist")
         assert _max_plan_pool[0]["active_tasks"] == 2
 
-    def test_recheck_disabled_accounts_re_enables_after_30min_cooldown(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_disabled_accounts_re_enables_after_30min_cooldown(self, clean_max_plan_pool):
         """An account disabled more than 30 minutes ago is re-enabled."""
         _max_plan_pool.append({
             "id": "a1",
@@ -496,11 +508,12 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             "disabled_at": datetime.utcnow() - timedelta(minutes=31),
         })
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is True
         assert _max_plan_pool[0]["disabled_at"] is None
 
-    def test_recheck_disabled_accounts_stays_disabled_before_cooldown(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_disabled_accounts_stays_disabled_before_cooldown(self, clean_max_plan_pool):
         """An account disabled less than 30 minutes ago remains disabled."""
         _max_plan_pool.append({
             "id": "a1",
@@ -509,10 +522,11 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             "disabled_at": datetime.utcnow() - timedelta(minutes=10),
         })
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is False
 
-    def test_recheck_disabled_accounts_exactly_at_boundary_re_enables(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_disabled_accounts_exactly_at_boundary_re_enables(self, clean_max_plan_pool):
         """An account disabled exactly 30 minutes ago is re-enabled (condition uses >=)."""
         _max_plan_pool.append({
             "id": "a1",
@@ -521,11 +535,12 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             "disabled_at": datetime.utcnow() - timedelta(minutes=30),
         })
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         # recheck_disabled_accounts uses >= COOLDOWN_MINUTES * 60, so exactly 30 min qualifies
         assert _max_plan_pool[0]["enabled"] is True
 
-    def test_recheck_disabled_accounts_ignores_enabled_accounts(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_disabled_accounts_ignores_enabled_accounts(self, clean_max_plan_pool):
         """recheck_disabled_accounts does not modify accounts that are already enabled."""
         _max_plan_pool.append({
             "id": "a1",
@@ -533,10 +548,11 @@ class TestMaxPlanAccountPool:
             "enabled": True,
             "active_tasks": 1,
         })
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is True
 
-    def test_recheck_disabled_accounts_skips_missing_disabled_at(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_disabled_accounts_skips_missing_disabled_at(self, clean_max_plan_pool):
         """A disabled account without a disabled_at timestamp is left alone."""
         _max_plan_pool.append({
             "id": "a1",
@@ -545,10 +561,11 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             # no "disabled_at" key — simulates an old record before the field was added
         })
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is False
 
-    def test_rate_limit_disables_account_and_cooldown_re_enables(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_rate_limit_disables_account_and_cooldown_re_enables(self, clean_max_plan_pool):
         """Full cycle: account disabled on rate limit, cooldown expires, re-enabled."""
         _max_plan_pool.append({
             "id": "a1",
@@ -566,15 +583,16 @@ class TestMaxPlanAccountPool:
         assert _max_plan_pool[0]["enabled"] is False
 
         # Cooldown not yet elapsed — still disabled
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is False
 
         # Fast-forward: simulate 31 minutes passing
         _max_plan_pool[0]["disabled_at"] = datetime.utcnow() - timedelta(minutes=31)
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         assert _max_plan_pool[0]["enabled"] is True
 
-    def test_recheck_multiple_accounts_re_enables_only_eligible(self, clean_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_recheck_multiple_accounts_re_enables_only_eligible(self, clean_max_plan_pool):
         """Only accounts past their cooldown are re-enabled; others remain disabled."""
         _max_plan_pool.extend([
             {
@@ -592,7 +610,7 @@ class TestMaxPlanAccountPool:
                 "disabled_at": datetime.utcnow() - timedelta(minutes=5),
             },
         ])
-        recheck_disabled_accounts()
+        await recheck_disabled_accounts()
         pool = {a["id"]: a for a in _max_plan_pool}
         assert pool["a1"]["enabled"] is True   # cooldown expired
         assert pool["a2"]["enabled"] is False  # still in cooldown

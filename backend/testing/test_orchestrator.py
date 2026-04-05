@@ -434,7 +434,8 @@ class TestMaxPlanPool:
 
     # ── Test 3: select_max_plan_account returns lowest active count ──────────
 
-    def test_select_max_plan_account_returns_account_with_lowest_active_count(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_returns_account_with_lowest_active_count(self, reset_max_plan_pool):
         """select_max_plan_account() must pick the enabled account with the fewest active tasks."""
         _main_module._max_plan_pool.extend([
             {"id": "aaa", "name": "busy",   "oauth_token": "t1", "enabled": True, "active_tasks": 5},
@@ -442,68 +443,74 @@ class TestMaxPlanPool:
             {"id": "ccc", "name": "medium", "oauth_token": "t3", "enabled": True, "active_tasks": 3},
         ])
 
-        chosen = select_max_plan_account()
+        chosen = await select_max_plan_account()
         assert chosen is not None
         assert chosen["name"] == "idle"
 
     # ── Test 4: disabled accounts are skipped ────────────────────────────────
 
-    def test_select_max_plan_account_skips_disabled_accounts(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_skips_disabled_accounts(self, reset_max_plan_pool):
         """Disabled accounts (enabled=False) must never be selected."""
         _main_module._max_plan_pool.extend([
             {"id": "aaa", "name": "disabled-low", "oauth_token": "t1", "enabled": False, "active_tasks": 0},
             {"id": "bbb", "name": "enabled-high", "oauth_token": "t2", "enabled": True,  "active_tasks": 9},
         ])
 
-        chosen = select_max_plan_account()
+        chosen = await select_max_plan_account()
         assert chosen is not None
         assert chosen["name"] == "enabled-high", "Must pick enabled account even if it has more tasks"
 
     # ── Test 5: all accounts disabled → None ────────────────────────────────
 
-    def test_select_max_plan_account_returns_none_when_all_disabled(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_returns_none_when_all_disabled(self, reset_max_plan_pool):
         """When no enabled accounts exist, select_max_plan_account() returns None."""
         _main_module._max_plan_pool.extend([
             {"id": "aaa", "name": "acct-a", "oauth_token": "t1", "enabled": False, "active_tasks": 0},
             {"id": "bbb", "name": "acct-b", "oauth_token": "t2", "enabled": False, "active_tasks": 0},
         ])
-        assert select_max_plan_account() is None
+        assert await select_max_plan_account() is None
 
     # ── Test 6: empty pool → None ────────────────────────────────────────────
 
-    def test_select_max_plan_account_returns_none_for_empty_pool(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_returns_none_for_empty_pool(self, reset_max_plan_pool):
         """Empty pool returns None without raising."""
         assert len(_main_module._max_plan_pool) == 0
-        assert select_max_plan_account() is None
+        assert await select_max_plan_account() is None
 
     # ── Test 7: release decrements active_tasks ──────────────────────────────
 
-    def test_release_max_plan_account_decrements_active_tasks(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_release_max_plan_account_decrements_active_tasks(self, reset_max_plan_pool):
         """release_max_plan_account() must decrement active_tasks for the given account."""
         acct_id = "test-release-id"
         _main_module._max_plan_pool.append(
             {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 3}
         )
 
-        release_max_plan_account(acct_id)
+        await release_max_plan_account(acct_id)
 
         entry = _main_module._max_plan_pool[0]
         assert entry["active_tasks"] == 2
 
     # ── Test 8: release never goes below zero ────────────────────────────────
 
-    def test_release_max_plan_account_floors_at_zero(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_release_max_plan_account_floors_at_zero(self, reset_max_plan_pool):
         """active_tasks should not go negative — floor at 0 on release."""
         acct_id = "floor-test-id"
         _main_module._max_plan_pool.append(
             {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 0}
         )
-        release_max_plan_account(acct_id)
+        await release_max_plan_account(acct_id)
         assert _main_module._max_plan_pool[0]["active_tasks"] == 0
 
     # ── Test 9: concurrency limit — select respects in-flight task count ──────
 
-    def test_select_max_plan_account_respects_concurrency_by_returning_least_loaded(self, reset_max_plan_pool):
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_respects_concurrency_by_returning_least_loaded(self, reset_max_plan_pool):
         """
         When all accounts are busy, select_max_plan_account() still returns the
         least-loaded one (the caller is responsible for enforcing a hard limit).
@@ -514,7 +521,7 @@ class TestMaxPlanPool:
             {"id": "x2", "name": "a2", "oauth_token": "t2", "enabled": True, "active_tasks": 7},
             {"id": "x3", "name": "a3", "oauth_token": "t3", "enabled": True, "active_tasks": 10},
         ])
-        chosen = select_max_plan_account()
+        chosen = await select_max_plan_account()
         assert chosen["id"] == "x2"
 
 
@@ -572,6 +579,54 @@ class TestResearchSpawning:
         from sqlmodel import select as sql_select
         tasks = (await db_session.execute(sql_select(Task).where(Task.project_id == project.id))).scalars().all()
         assert len(tasks) == 0, "No task should be spawned while circuit breaker is OPEN"
+
+    # ── Test 2b: HALF_OPEN stuck test task → reverts to OPEN ────
+
+    @pytest.mark.asyncio
+    async def test_half_open_stuck_task_reverts_to_open(self, db_session, reset_circuit_breakers):
+        """If the HALF_OPEN test task is stuck for >30 min, breaker reverts to OPEN with doubled cooldown."""
+        project = Project(
+            name="CB half-open test",
+            user_id="user1",
+            autonomous_enabled=True,
+            directions=[{"id": "d1", "status": "active", "text": "improve coverage"}],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Create a "stuck" test task that started 45 minutes ago
+        stuck_task = Task(
+            project_id=project.id,
+            title="Research: half-open test task",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            started_at=datetime.utcnow() - timedelta(minutes=45),
+        )
+        db_session.add(stuck_task)
+        await db_session.commit()
+        await db_session.refresh(stuck_task)
+
+        # Set breaker to HALF_OPEN with the stuck task as the test task
+        breaker = _shared_state.get_circuit_breaker(str(project.id))
+        breaker["state"] = "HALF_OPEN"
+        breaker["half_open_task_id"] = str(stuck_task.id)
+        breaker["cooldown_seconds"] = 1800  # 30 min base
+
+        await _spawn_research_task(project, db_session)
+
+        # Breaker should have reverted to OPEN with doubled cooldown
+        assert breaker["state"] == "OPEN", "Stuck HALF_OPEN should revert to OPEN"
+        assert breaker["cooldown_seconds"] == 3600, "Cooldown should double from 1800 to 3600"
+        assert breaker["half_open_task_id"] is None, "Test task ID should be cleared"
+
+        # No new task should have been spawned (breaker is now OPEN)
+        from sqlmodel import select as sql_select
+        all_tasks = (await db_session.execute(sql_select(Task).where(Task.project_id == project.id))).scalars().all()
+        new_queued = [t for t in all_tasks if t.status == TaskStatus.QUEUED]
+        assert len(new_queued) == 0, "No new task should be spawned when breaker reverts to OPEN"
 
     # ── Test 3: existing research task in progress → no duplicate spawned ────
 
@@ -804,24 +859,26 @@ class TestResearchCompletion:
     # ── Test 7: wave-based ordering — low-priority tasks depend on high-priority ─
 
     @pytest.mark.asyncio
-    async def test_wave_ordering_low_priority_tasks_depend_on_high_priority_wave(self, db_session, mocker):
+    async def test_priority_ordering_no_artificial_wave_dependencies(self, db_session, mocker):
         """
-        Findings are sorted into priority waves: high → medium → low.
-        Tasks in wave N must have depends_on set to all UUIDs in wave N-1.
+        Findings get priority values (high=30, medium=50, low=70) but NO
+        inter-wave dependencies. The orchestrator's priority-based dispatch
+        naturally runs high-priority tasks first without blocking low-priority
+        ones behind artificial dependency chains.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
 
-        project = Project(name="Wave ordering test", user_id="user1")
+        project = Project(name="Priority ordering test", user_id="user1")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         research_task = Task(
             project_id=project.id,
-            title="Research: wave test",
+            title="Research: priority test",
             payloads=[{"type": "research", "base_branch": "main"}],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.IN_PROGRESS,
@@ -831,8 +888,6 @@ class TestResearchCompletion:
         await db_session.commit()
         await db_session.refresh(research_task)
 
-        # High-priority finding → wave 0
-        # Low-priority finding → wave 1 (must depend on wave 0)
         logs = self._findings_json(
             {
                 "title": "critical security patch",
@@ -858,11 +913,11 @@ class TestResearchCompletion:
         task_high = next(t for t in children if "security" in t.title.lower() or "critical" in t.title.lower())
         task_low = next(t for t in children if "documentation" in t.title.lower() or "improve" in t.title.lower())
 
-        # The low-priority task (wave 1) must depend on the high-priority task (wave 0)
-        assert task_low.depends_on is not None and len(task_low.depends_on) > 0, (
-            "Low-priority task must depend on all high-priority tasks"
-        )
-        assert str(task_high.id) in task_low.depends_on
+        # Both tasks are independent — no artificial wave dependencies
+        assert not task_high.depends_on, "High-priority task should have no dependencies"
+        assert not task_low.depends_on, "Low-priority task should have no wave dependencies"
 
-        # High-priority task (first wave) has no predecessors
-        assert not task_high.depends_on
+        # Priority values reflect finding priority (high=100, low=0)
+        assert task_high.priority > task_low.priority, (
+            f"High-priority task ({task_high.priority}) should have higher numeric priority than low ({task_low.priority})"
+        )

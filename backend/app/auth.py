@@ -64,7 +64,7 @@ def create_agent_token(task_id: str, vm_instance_id: str) -> str:
     """
     Generate a short-lived JWT for a specific agent VM.
     """
-    expire = datetime.now(timezone.utc) + timedelta(hours=8) # Token valid for 8 hours
+    expire = datetime.now(timezone.utc) + timedelta(hours=2)  # VM TTL is 1h, 2h gives margin
     to_encode = {
         "sub": str(task_id),
         "vm_instance_id": vm_instance_id,

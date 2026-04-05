@@ -18,6 +18,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: deploy-blueprint
+  cancel-in-progress: false
+
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   REGION: us-central1
@@ -83,8 +87,8 @@ jobs:
         working-directory: ./backend
         run: |
           IMAGE_URI="${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}"
-          docker build -t "${IMAGE_URI}:${{ github.sha }}" -t "${IMAGE_URI}:latest" .
-          docker push "${IMAGE_URI}" --all-tags
+          docker build -t "${IMAGE_URI}:${{ github.sha }}" .
+          docker push "${IMAGE_URI}:${{ github.sha }}"
 
   deploy-backend:
     name: Backend
@@ -107,31 +111,23 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      - name: Verify GCP permissions
+        run: |
+          echo "Verifying Compute Engine access..."
+          gcloud compute zones list --limit 1 --format="value(name)" > /dev/null 2>&1 \
+            || { echo "::error::Service account lacks compute.zones.list permission"; exit 1; }
+          echo "Verifying Secret Manager access..."
+          gcloud secrets list --project ${{ env.PROJECT_ID }} --limit 1 > /dev/null 2>&1 \
+            || { echo "::error::Service account lacks secretmanager.secrets.list permission"; exit 1; }
+          echo "All permission checks passed."
+
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy blueprint-orchestrator \
             --image "${{ env.AR_REGISTRY }}/${{ env.PROJECT_ID }}/blueprint-repo/${{ env.IMAGE }}:${{ github.sha }}" \
-            --region ${{ env.REGION }}
-
-      - name: Smoke test
-        continue-on-error: true
-        run: |
-          SERVICE_URL=$(gcloud run services describe blueprint-orchestrator --region ${{ env.REGION }} --format 'value(status.url)')
-          echo "Service URL: $SERVICE_URL"
-          echo "Waiting 30s for revision cold start..."
-          sleep 30
-          for attempt in 1 2 3 4 5; do
-            echo "Health check attempt $attempt/5..."
-            sleep 10
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -L "$SERVICE_URL/health" || echo "000")
-            echo "HTTP status: $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed on attempt $attempt"
-              exit 0
-            fi
-          done
-          echo "Health check failed after 5 attempts (non-blocking)"
-          exit 1
+            --region ${{ env.REGION }} \
+            --max-instances 3 \
+            --concurrency 20
 
   run-migrations:
     name: Migrations
@@ -153,6 +149,13 @@ jobs:
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify GCP permissions
+        run: |
+          echo "Verifying Cloud Run Jobs access..."
+          gcloud run jobs list --region ${{ env.REGION }} --limit 1 --format="value(name)" > /dev/null 2>&1 \
+            || { echo "::error::Service account lacks run.jobs.list permission"; exit 1; }
+          echo "Permission check passed."
 
       - name: Update migration job image
         if: needs.build-backend.result == 'success'
@@ -199,13 +202,14 @@ jobs:
           VITE_FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
           VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
           VITE_FIREBASE_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          VITE_EXPECTED_BACKEND_SHA: ${{ github.sha }}
         run: |
           npm ci
           npm run build
 
       - name: Deploy to Firebase Hosting
         run: |
-          npm install -g firebase-tools
+          npm install -g firebase-tools@13
           firebase target:clear hosting admin --project ${{ env.PROJECT_ID }}
           firebase target:apply hosting admin ${{ secrets.FIREBASE_HOSTING_SITE }} --project ${{ env.PROJECT_ID }}
           firebase deploy --only hosting:admin --project ${{ env.PROJECT_ID }}

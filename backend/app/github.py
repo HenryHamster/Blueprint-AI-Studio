@@ -61,6 +61,23 @@ async def _github_request(
                 )
                 await asyncio.sleep(retry_after)
                 continue
+            # Proactive rate limit check — back off before hitting 429
+            remaining = response.headers.get("X-RateLimit-Remaining")
+            if remaining is not None:
+                try:
+                    if int(remaining) < 10:
+                        reset_ts = response.headers.get("X-RateLimit-Reset")
+                        if reset_ts:
+                            wait = max(0, int(reset_ts) - int(time.time())) + 1
+                            logger.warning(f"[GITHUB] Rate limit critical: {remaining} calls left, waiting {wait}s until reset")
+                            await asyncio.sleep(min(wait, 120))  # cap at 2min
+                except (ValueError, TypeError):
+                    pass  # Malformed header, skip rate limit check
+            if response.status_code == 401:
+                logger.warning(
+                    f"[GITHUB] {method} {url} returned 401 Unauthorized — "
+                    f"token may be expired or revoked"
+                )
             if response.status_code < 500 or attempt == max_retries - 1:
                 if attempt > 0 and response.status_code >= 500:
                     logger.error(
@@ -536,6 +553,21 @@ async def get_branch_sha(
     return response.json()["object"]["sha"]
 
 
+async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
+    """Get the repository's default branch name (usually 'main' or 'master')."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}", headers
+    )
+    if response.status_code != 200:
+        return "main"  # Safe fallback
+    return response.json().get("default_branch", "main")
+
+
 async def delete_branch(
     token: str, owner: str, repo: str, branch: str
 ) -> bool:
@@ -574,10 +606,10 @@ async def create_pull_request(
     }
 
     payload = {
-        "title": title,
+        "title": title[:256],
         "head": head,
         "base": base,
-        "body": body
+        "body": body[:65536]
     }
 
     response = await _github_request(

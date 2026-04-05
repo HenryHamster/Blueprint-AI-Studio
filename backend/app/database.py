@@ -14,7 +14,8 @@ def _make_engine():
         pool_size=40,
         max_overflow=60,
         pool_timeout=30,
-        pool_recycle=1800,
+        pool_recycle=3600,
+        pool_pre_ping=True,
         connect_args={
             "server_settings": {
                 "lock_timeout": "30000",  # 30s — prevents indefinite lock waits on FOR UPDATE

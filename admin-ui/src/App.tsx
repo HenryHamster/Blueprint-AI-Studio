@@ -1,4 +1,5 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
@@ -155,6 +156,21 @@ export default function App() {
     document.addEventListener('keydown', handleActivityFeedShortcut);
     return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
   }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
+  // Backend version mismatch detection
+  const [versionMismatch, setVersionMismatch] = useState(false);
+  useEffect(() => {
+    const expectedSha = import.meta.env.VITE_EXPECTED_BACKEND_SHA;
+    if (!expectedSha) return; // Dev mode or not configured
+    fetch('/api/version')
+      .then(r => r.json())
+      .then(data => {
+        if (data.sha && data.sha !== expectedSha) {
+          setVersionMismatch(true);
+        }
+      })
+      .catch(() => {}); // Silently ignore if backend unreachable
+  }, []);
+
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
 
   const zoneHealthAlerts = useMemo(() => {
@@ -371,18 +387,28 @@ export default function App() {
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
         style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
       >
-        <MetricsDashboard
-          metricsHistory={s.metricsHistory}
-          cumulativeCost={s.cumulativeCost}
-          cumulativeVmHours={s.cumulativeVmHours}
-          maxConcurrentVMs={s.maxConcurrentVMs}
-          tasks={s.tasks}
-          metricsWindow={s.metricsWindow}
-          onWindowChange={s.setMetricsWindow}
-        />
+        <ErrorBoundary level="panel">
+          <MetricsDashboard
+            metricsHistory={s.metricsHistory}
+            cumulativeCost={s.cumulativeCost}
+            cumulativeVmHours={s.cumulativeVmHours}
+            maxConcurrentVMs={s.maxConcurrentVMs}
+            tasks={s.tasks}
+            metricsWindow={s.metricsWindow}
+            onWindowChange={s.setMetricsWindow}
+          />
+        </ErrorBoundary>
       </div>
 
       <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} onSelectTask={s.handleViewLogs} onApproveTask={s.handleApprove} />
+
+      {versionMismatch && (
+        <div className="mx-4 mb-2 p-3 bg-yellow-900/50 border border-yellow-700 rounded-lg text-yellow-200 text-sm flex items-center gap-2">
+          <AlertCircle size={16} />
+          <span>Backend version mismatch — some features may not work as expected. Try refreshing the page.</span>
+          <button onClick={() => setVersionMismatch(false)} className="ml-auto text-yellow-400 hover:text-yellow-200">&times;</button>
+        </div>
+      )}
 
       <AlertsBanner
         alerts={[...zoneHealthAlerts, ...s.alerts]}
@@ -588,6 +614,7 @@ export default function App() {
           </div>
 
           {s.viewMode === 'kanban' ? (
+            <ErrorBoundary level="panel">
             <KanbanBoard
               tasks={filteredTasks}
               columns={visibleColumns}
@@ -620,7 +647,9 @@ export default function App() {
               onArchive={s.handleArchiveTask}
               onViewLogs={s.handleViewLogs}
             />
+            </ErrorBoundary>
           ) : (
+            <ErrorBoundary level="panel">
             <main className="flex-1 overflow-hidden flex flex-col">
               <PipelineView
                 tasks={filteredTasks}
@@ -636,6 +665,7 @@ export default function App() {
                 onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
               />
             </main>
+            </ErrorBoundary>
           )}
 
           <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
@@ -696,6 +726,7 @@ export default function App() {
       )}
 
       {s.logTask && (
+        <ErrorBoundary level="panel">
         <TaskDetailDrawer
           task={s.logTask}
           logLines={s.logLines}
@@ -722,6 +753,7 @@ export default function App() {
             }
           }}
         />
+        </ErrorBoundary>
       )}
 
       {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} addToast={s.addToast} />}

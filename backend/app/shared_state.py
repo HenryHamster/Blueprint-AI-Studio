@@ -5,14 +5,30 @@ endpoints need to read or mutate autonomous-loop / runtime-config state.
 """
 
 import os
+import asyncio
+from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+# Rate limiter — shared between main.py and admin.py
+# Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
+limiter = Limiter(
+    key_func=get_remote_address,
+    enabled=bool(os.getenv("K_REVISION")),
+)
+
+# Lock for multi-key runtime config updates (prevents reading partial state between two assignments)
+runtime_config_lock = asyncio.Lock()
 
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
     "max_autonomous_tasks_per_hour": 5,
+    "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
     "autonomous_research_model": None,
     "autonomous_research_effort": None,
@@ -30,7 +46,6 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
-    "autonomous_research_wave_size": 9999,
     "min_research_interval_hours": 24,
 }
 
@@ -67,7 +82,7 @@ deploy_monitoring: Dict = {
     "window_duration": 900,         # 15 minutes default
     "extended_window": 1800,        # 30 min for large/infra changes
     "is_extended": False,           # set True when infra files are touched
-    "task_results": [],             # list of (timestamp_iso, "success"|"failure", failure_class)
+    "task_results": deque(maxlen=100),  # (timestamp_iso, "success"|"failure", failure_class)
     "pre_deploy_failure_rate": 0.0, # baseline from before deploy
     "health_checks": {
         "dispatch_working": True,   # orchestrator picked up a task in last 5 min
@@ -103,4 +118,4 @@ external_health: Dict = {
 # making an active API call that competes for the shared connection pool.
 # Seed with current time so the first health check uses the passive path
 # instead of an active probe that can fail on cold start.
-last_github_success: Optional[datetime] = datetime.utcnow()
+last_github_success: Optional[datetime] = datetime.utcnow()  # Module-level init, _utcnow not available here

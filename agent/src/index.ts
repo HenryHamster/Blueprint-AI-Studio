@@ -15,26 +15,31 @@ const apiHeaders: Record<string, string> = {
 
 // ── API Helpers ─────────────────────────────────────────────────────────────
 async function tryRefreshToken(): Promise<boolean> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30_000);
-    const res = await fetch(`${ORCHESTRATOR_URL}/api/agent/refresh-token`, {
-      method: 'POST', headers: { ...apiHeaders }, body: JSON.stringify({}), signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) return false;
-    const data = await res.json() as { token?: string };
-    if (data.token) {
-      AGENT_TOKEN = data.token;
-      apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
-      log('Agent token refreshed successfully');
-      return true;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const res = await fetch(`${ORCHESTRATOR_URL}/api/agent/refresh-token`, {
+        method: 'POST', headers: { ...apiHeaders }, body: JSON.stringify({}), signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = await res.json() as { token?: string };
+        if (data.token) {
+          AGENT_TOKEN = data.token;
+          apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+          log('Agent token refreshed successfully');
+          return true;
+        }
+      }
+      // Don't retry client errors (4xx) — only transient/network failures
+      if (res.status >= 400 && res.status < 500) return false;
+    } catch (e) {
+      log(`Token refresh attempt ${attempt + 1}/3 failed: ${e}`);
     }
-    return false;
-  } catch (e) {
-    log(`Token refresh failed: ${e}`);
-    return false;
+    if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s backoff
   }
+  return false;
 }
 
 async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 5) {
@@ -169,10 +174,19 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       });
     } catch (e: any) {
       log(`Heartbeat failed: ${e}`);
-      // 4xx = task reassigned to new VM (404) or cancelled (409) — exit immediately
+      // 409 = row temporarily locked (skip_locked), retry next cycle — NOT fatal
+      if (e instanceof Error && /failed \(409\)/.test(e.message)) {
+        log('Heartbeat skipped (row locked), will retry next cycle');
+        return;
+      }
+      // Other 4xx = task reassigned to new VM (404) or other client error — graceful shutdown
       if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
-        log('Task no longer assigned to this VM — self-terminating');
-        process.exit(0);
+        log('Task no longer assigned to this VM — self-terminating gracefully');
+        stopHeartbeat();
+        // Allow 5s for in-flight operations to wind down before hard exit.
+        // VM TTL self-destruct (1hr) is the ultimate backstop.
+        setTimeout(() => process.exit(0), 5000);
+        return;
       }
     }
   }, 30_000);
@@ -235,7 +249,10 @@ function sanitize(text: string): string {
     .replace(/ghs_[A-Za-z0-9_]+/g, 'ghs_***')
     .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
     .replace(/sk-ant-[A-Za-z0-9_\-]+/g, 'sk-ant-***')
-    .replace(/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, 'eyJ***');
+    .replace(/eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, 'eyJ***')
+    .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')
+    .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')
+    .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
 }
 
 function validateBranchName(branch: string, label: string): string {

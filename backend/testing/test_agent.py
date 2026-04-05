@@ -63,7 +63,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     Tests an agent updating task status and creating an artifact.
     Also verifies that completing the last task completes the project.
     """
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     project = Project(name="Agent Status Test", user_id="test-user-123")
     db_session.add(project)
@@ -324,6 +324,7 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
 
     # Prevent startup coroutines from trying to connect to a real database
     mocker.patch.object(main_module, "load_max_plan_pool", new_callable=AsyncMock)
+    mocker.patch.object(main_module, "_verify_schema_version", new_callable=AsyncMock)
     mocker.patch.object(main_module, "_init_deployment_state", new_callable=AsyncMock)
     # Background task coroutines must also be no-ops so the task loop doesn't
     # block the test event loop or attempt DB queries

@@ -46,7 +46,7 @@ async def test_reaper_service(reaper_db, mocker):
     Tests the background worker that terminates orphaned VMs.
     We mock asyncio.sleep to break the infinite loop after one iteration.
     """
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     class StopLoopException(Exception): pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
@@ -83,7 +83,7 @@ async def test_reaper_retry_path(reaper_db, mocker):
     Tests that a task with remaining retries is reset to QUEUED (not FAILED)
     when the reaper detects a heartbeat timeout.
     """
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     class StopLoopException(Exception): pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
@@ -122,7 +122,7 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
     Tests that a task at its retry limit is permanently marked FAILED
     when the reaper detects a heartbeat timeout.
     """
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     class StopLoopException(Exception): pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
@@ -160,7 +160,7 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
     Tests that a task whose last heartbeat was 6 minutes ago (just past the
     5-minute threshold) is detected as orphaned and re-queued.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     class StopLoopException(Exception): pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
@@ -199,7 +199,7 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
     is reaped, _requeue_parent_task is called and the coordinator is set back
     to EVALUATING instead of being blindly re-dispatched to a new VM.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
 
     class StopLoopException(Exception): pass
     mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))

@@ -3,8 +3,8 @@ import { useMemo } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
-import type { DeployState } from '../useAppState';
-import type { Task } from './TaskCard';
+import type { DeployState } from '../types/settings';
+import type { Task } from '../types/task';
 
 export interface HeaderBarProps {
   tasks: Task[];

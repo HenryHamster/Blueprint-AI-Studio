@@ -1,6 +1,9 @@
 import re
 import base64
+import logging
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 # GitHub imports are deferred to scan_pr_for_injection() so pure functions
 # (scan_diff_text, evaluate_findings, etc.) can be used without app.github.
 
@@ -465,7 +468,7 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
             all_findings.extend(scan_diff_text(diff_text))
             scanned.append("diff")
     except Exception as e:
-        print(f"[SECURITY] Failed to fetch diff for PR #{pr_number}: {e}")
+        logger.warning(f"[SECURITY] Failed to fetch diff for PR #{pr_number}: {e}")
 
     # 2. Scan commit messages
     try:
@@ -474,7 +477,7 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
             all_findings.extend(scan_commit_messages(commits))
             scanned.append("commits")
     except Exception as e:
-        print(f"[SECURITY] Failed to fetch commits for PR #{pr_number}: {e}")
+        logger.warning(f"[SECURITY] Failed to fetch commits for PR #{pr_number}: {e}")
 
     # 3. Scan PR title and body
     try:
@@ -483,7 +486,7 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
             all_findings.extend(scan_pr_metadata(pr_data))
             scanned.append("pr_metadata")
     except Exception as e:
-        print(f"[SECURITY] Failed to fetch PR data for PR #{pr_number}: {e}")
+        logger.warning(f"[SECURITY] Failed to fetch PR data for PR #{pr_number}: {e}")
 
     # If we couldn't scan anything, don't block but flag it
     if not scanned:

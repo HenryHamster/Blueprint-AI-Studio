@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any, List
@@ -13,9 +13,10 @@ from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert
+from app.shared_state import limiter
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
 from app.auth import get_current_user, require_admin
-from app.compute import delete_agent_vm
+
 from app.github import generate_installation_access_token
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ router = APIRouter(
     tags=["admin"],
     dependencies=[Depends(require_admin)]
 )
+
 
 @router.get("/projects")
 async def get_all_projects(
@@ -43,7 +45,9 @@ class ProjectUpdate(BaseModel):
 
 
 @router.patch("/projects/{project_id}")
+@limiter.limit("30/minute")
 async def update_project(
+    request: Request,
     project_id: uuid.UUID,
     payload: ProjectUpdate,
     session: AsyncSession = Depends(get_session),
@@ -76,6 +80,52 @@ async def update_project(
     await session.commit()
     await session.refresh(project)
     return project
+
+
+@router.delete("/projects/{project_id}")
+async def delete_project_admin(
+    project_id: uuid.UUID,
+    force: bool = Query(False),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a project and cascade to tasks/artifacts/history.
+    Refuses if active tasks exist unless force=true."""
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
+    active_tasks = (await session.execute(
+        select(Task.id).where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+    )).scalars().all()
+
+    if active_tasks and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Project has {len(active_tasks)} active task(s). Cancel them first, or pass ?force=true."
+        )
+
+    if active_tasks and force:
+        # Force: cancel active tasks and delete their VMs
+        from app.main import _ensure_vm_deleted
+        for task_id in active_tasks:
+            task = await session.get(Task, task_id)
+            if task:
+                task.status = TaskStatus.CANCELLED
+                task.latest_status_message = "Project force-deleted"
+                session.add(task)
+                await _ensure_vm_deleted(task, reason="project_force_delete")
+        await session.commit()
+
+    await session.delete(project)
+    await session.commit()
+
+    # Evict from GitHub token cache
+    from app.main import _github_token_cache
+    _github_token_cache.pop(str(project_id), None)
+
+    return {"message": f"Project {project_id} deleted", "active_tasks_cancelled": len(active_tasks) if active_tasks else 0}
 
 
 @router.post("/autonomous/pause-all")
@@ -404,17 +454,33 @@ async def get_task(
 class CreateTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
-    prompt: str = Field(..., min_length=1)
-    base_branch: str = Field(default="main", pattern=r"^[a-zA-Z0-9_./-]+$")
+    prompt: str = Field(..., min_length=1, max_length=50000)
+    base_branch: str = Field(default="main", max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
     task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix|security_audit|qa|deps|docs)$")
     pr_number: Optional[int] = None
-    branch: Optional[str] = None
+    branch: Optional[str] = Field(default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
     model: Optional[str] = Field(default=None, min_length=1)
     effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high)$")
 
+    @field_validator("base_branch", "branch")
+    @classmethod
+    def validate_branch_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        for part in v.split("/"):
+            if part in (".git", ".lock"):
+                raise ValueError(f"Branch name contains reserved component: {part}")
+            if part.startswith("."):
+                raise ValueError(f"Branch component cannot start with a dot: {part}")
+            if ".." in part:
+                raise ValueError(f"Branch component cannot contain '..': {part}")
+        return v
+
 
 @router.post("/tasks")
+@limiter.limit("60/minute")
 async def create_task_manually(
+    request: Request,
     payload: CreateTaskPayload,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
@@ -444,7 +510,7 @@ async def create_task_manually(
         await session.refresh(project)
 
     # Auto-generate VM instance ID so orchestrator worker picks up the task
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
     # Build payload based on task type
     task_payload = {
@@ -592,10 +658,13 @@ async def unarchive_task(
 
 
 @router.patch("/tasks/{task_id}")
+@limiter.limit("60/minute")
 async def modify_task(
+    request: Request,
     task_id: uuid.UUID,
     payload: Dict[str, Any],
     background_tasks: BackgroundTasks,
+    force_kill: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -614,13 +683,41 @@ async def modify_task(
             if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
                 task.requires_approval = False
 
-            # Delete VM and release account when cancelling an active task
-            if new_status == TaskStatus.CANCELLED and task.vm_instance_id:
-                background_tasks.add_task(delete_agent_vm, task.vm_instance_id)
+            # Delete VM and release account when moving to terminal state
+            if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED) and task.vm_instance_id:
+                from app.main import _ensure_vm_deleted
+                if not force_kill:
+                    # Graceful: commit terminal status first so agent's next heartbeat
+                    # returns 4xx, triggering graceful shutdown (5s wind-down)
+                    session.add(task)
+                    await session.commit()
+                    await asyncio.sleep(5)
+                await _ensure_vm_deleted(task, reason="admin_terminal")
                 acct_id = (task.context or {}).get("max_plan_account_id")
                 if acct_id:
                     from app.main import release_max_plan_account
-                    release_max_plan_account(acct_id)
+                    await release_max_plan_account(acct_id)
+
+            # Cascade cancellation to active children
+            if new_status == TaskStatus.CANCELLED:
+                from app.main import _ensure_vm_deleted as _cancel_vm, release_max_plan_account as _cancel_release
+                active_children = (await session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == task.id,
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+                    )
+                )).scalars().all()
+                for child in active_children:
+                    child.status = TaskStatus.CANCELLED
+                    child.requires_approval = False
+                    if child.vm_instance_id:
+                        await _cancel_vm(child, reason="parent_cancelled")
+                    child_acct = (child.context or {}).get("max_plan_account_id")
+                    if child_acct:
+                        _cancel_release(child_acct)
+                    session.add(child)
+                if active_children:
+                    logger.info(f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}")
 
             # Reset retry state when manually re-queuing a task
             if new_status == TaskStatus.QUEUED:
@@ -640,11 +737,13 @@ async def modify_task(
                     changes["status"] = TaskStatus.EVALUATING
                     changes["retried_children"] = retried
                 else:
+                    old_vm_id = task.vm_instance_id
                     task.attempt_count = 0
-                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex[:16]}"
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
                     changes["attempt_count"] = 0
                     changes["vm_instance_id"] = task.vm_instance_id
+                    changes["_old_vm_to_delete"] = old_vm_id
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status")
 
@@ -731,11 +830,47 @@ async def modify_task(
         changes["parent_task_id"] = str(task.parent_task_id)
 
     if "context" in payload and isinstance(payload["context"], dict):
-        task.context = {**(task.context or {}), **payload["context"]}
+        merged = {**(task.context or {}), **payload["context"]}
+        if len(json.dumps(merged)) > 102400:
+            raise HTTPException(status_code=400, detail="Merged context exceeds 100KB limit")
+        task.context = merged
         changes["context"] = "updated"
 
     if "depends_on" in payload:
-        task.depends_on = payload["depends_on"] if isinstance(payload["depends_on"], list) else []
+        new_deps = payload["depends_on"] if isinstance(payload["depends_on"], list) else []
+        # Validate: all dependency UUIDs must exist and not create cycles
+        if new_deps:
+            try:
+                dep_uuids = [uuid.UUID(d) for d in new_deps]
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=400, detail="Invalid UUID in depends_on")
+            # Check all referenced tasks exist
+            existing = (await session.execute(
+                select(Task.id).where(Task.id.in_(dep_uuids))
+            )).scalars().all()
+            if len(existing) != len(dep_uuids):
+                raise HTTPException(status_code=400, detail="One or more depends_on task IDs do not exist")
+            # Cycle detection: walk depends_on graph from each dep to see if we reach task.id
+            task_id_str = str(task.id)
+            async def _has_path_to(start_id: str, target_id: str, visited: set, depth: int = 0) -> bool:
+                if depth > 50:
+                    return False  # DAG too deep, treat as no cycle
+                if start_id == target_id:
+                    return True
+                if start_id in visited:
+                    return False
+                visited.add(start_id)
+                dep_task = await session.get(Task, uuid.UUID(start_id))
+                if not dep_task:
+                    return False
+                for d in (dep_task.depends_on or []):
+                    if await _has_path_to(d, target_id, visited, depth + 1):
+                        return True
+                return False
+            for dep_id in new_deps:
+                if await _has_path_to(dep_id, task_id_str, set()):
+                    raise HTTPException(status_code=400, detail=f"Circular dependency detected: {dep_id} eventually depends on {task_id_str}")
+        task.depends_on = new_deps
         changes["depends_on"] = task.depends_on
 
     if changes:
@@ -749,6 +884,12 @@ async def modify_task(
         session.add(history)
         await session.commit()
         await session.refresh(task)
+
+        # Delete old VM if a requeue overwrote vm_instance_id
+        old_vm = changes.pop("_old_vm_to_delete", None)
+        if old_vm:
+            from app.main import _ensure_vm_deleted
+            await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 
         # Trigger rollup check if child status/context changed
         from app.main import _check_and_trigger_rollup, _cleanup_branches
@@ -895,6 +1036,7 @@ async def get_settings(
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
         "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
+        "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
         "autonomous_research_model": _runtime_config.get("autonomous_research_model") or "",
         "autonomous_research_effort": _runtime_config.get("autonomous_research_effort") or "",
@@ -904,7 +1046,6 @@ async def get_settings(
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
-        "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 10),
         "min_research_interval_hours": _runtime_config.get("min_research_interval_hours", 24),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
@@ -918,12 +1059,21 @@ async def get_settings(
 
 
 @router.patch("/settings")
+@limiter.limit("30/minute")
 async def update_settings(
+    request: Request,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.shared_state import runtime_config as _runtime_config
+    from app.shared_state import runtime_config as _runtime_config, runtime_config_lock
+    async with runtime_config_lock:
+        return await _apply_settings(payload, session, _runtime_config)
+
+async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runtime_config: Dict):
+    # Snapshot config so we can restore on DB commit failure
+    _config_snapshot = dict(_runtime_config)
+
     if "max_concurrent_vms" in payload:
         try:
             val = int(payload["max_concurrent_vms"])
@@ -960,6 +1110,14 @@ async def update_settings(
         if not (1 <= val <= 50):
             raise HTTPException(status_code=400, detail="max_autonomous_tasks_per_hour must be between 1 and 50")
         _runtime_config["max_autonomous_tasks_per_hour"] = val
+    if "max_global_autonomous_tasks_per_hour" in payload:
+        try:
+            val = int(payload["max_global_autonomous_tasks_per_hour"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_global_autonomous_tasks_per_hour must be a number")
+        if not (1 <= val <= 500):
+            raise HTTPException(status_code=400, detail="max_global_autonomous_tasks_per_hour must be between 1 and 500")
+        _runtime_config["max_global_autonomous_tasks_per_hour"] = val
     if "autonomous_research_interval_minutes" in payload:
         try:
             val = int(payload["autonomous_research_interval_minutes"])
@@ -1040,14 +1198,6 @@ async def update_settings(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
-    if "autonomous_research_wave_size" in payload:
-        try:
-            val = int(payload["autonomous_research_wave_size"])
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be a number")
-        if not (1 <= val <= 100):
-            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 100")
-        _runtime_config["autonomous_research_wave_size"] = val
     if "min_research_interval_hours" in payload:
         try:
             val = int(payload["min_research_interval_hours"])
@@ -1068,17 +1218,28 @@ async def update_settings(
 
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
-    state = await session.get(DeploymentState, 1)
-    if state:
-        state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
-        state.runtime_max_retries = _runtime_config["max_retries"]
-        state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
-        state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
-        state.runtime_autonomous_research_model = _runtime_config.get("autonomous_research_model")
-        state.runtime_autonomous_research_effort = _runtime_config.get("autonomous_research_effort")
-        session.add(state)
-        await session.commit()
-        logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
+    try:
+        # FOR UPDATE prevents concurrent settings writes from racing (multi-instance)
+        state = (await session.execute(
+            select(DeploymentState).where(DeploymentState.id == 1).with_for_update()
+        )).scalars().first()
+        if state:
+            state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
+            state.runtime_max_retries = _runtime_config["max_retries"]
+            state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
+            state.runtime_max_global_autonomous_tasks_per_hour = _runtime_config.get("max_global_autonomous_tasks_per_hour")
+            state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
+            state.runtime_autonomous_research_model = _runtime_config.get("autonomous_research_model")
+            state.runtime_autonomous_research_effort = _runtime_config.get("autonomous_research_effort")
+            session.add(state)
+            await session.commit()
+            logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
+    except Exception as e:
+        # Restore in-memory config to pre-change state on DB failure
+        _runtime_config.update(_config_snapshot)
+        logger.error(f"[SETTINGS] DB persist failed, rolling back in-memory config: {e}")
+        await session.rollback()
+        raise HTTPException(status_code=500, detail="Failed to persist settings")
 
     return _runtime_config
 
@@ -1086,7 +1247,9 @@ async def update_settings(
 # --- Max Plan Account Pool ---
 
 @router.post("/max-plan-accounts")
+@limiter.limit("10/minute")
 async def add_max_plan_account(
+    request: Request,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
@@ -1112,10 +1275,10 @@ async def add_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
 
-    now = datetime.utcnow()
+    now = _utcnow()
     db_account = MaxPlanAccount(
         name=name,
-        oauth_token=oauth_token,
+        oauth_token=oauth_token,  # Raw token saved temporarily for ID generation
         claude_config_json=claude_config_json,
         token_created_at=now,
     )
@@ -1123,23 +1286,40 @@ async def add_max_plan_account(
     await session.commit()
     await session.refresh(db_account)
 
-    # Sync to in-memory pool
-    _max_plan_pool.append({
-        "id": str(db_account.id),
-        "name": db_account.name,
-        "oauth_token": db_account.oauth_token,
-        "claude_config_json": db_account.claude_config_json,
-        "enabled": db_account.enabled,
-        "active_tasks": 0,
-        "total_tasks": db_account.total_tasks,
-        "token_created_at": now.isoformat(),
-    })
+    # Store token in Secret Manager, save resource name in DB
+    try:
+        from app.secrets_manager import store_user_secret
+        secret_name = f"maxplan-{db_account.id}"
+        resource_name = await store_user_secret("system", secret_name, oauth_token)
+        db_account.oauth_token = resource_name
+        session.add(db_account)
+        await session.commit()
+    except Exception as e:
+        logger.warning(f"[POOL] Secret Manager unavailable, token stored in DB directly: {e}")
+        # Fallback: raw token stays in DB (backward compat)
+
+    # Sync to in-memory pool (always use the raw token for runtime)
+    from app.main import _max_plan_pool_lock
+    async with _max_plan_pool_lock:
+        _max_plan_pool.append({
+            "id": str(db_account.id),
+            "name": db_account.name,
+            "oauth_token": oauth_token,  # In-memory pool always holds the resolved token
+            "claude_config_json": db_account.claude_config_json,
+            "enabled": db_account.enabled,
+            "active_tasks": 0,
+            "total_tasks": db_account.total_tasks,
+            "token_created_at": now.isoformat(),
+        })
     return {"id": str(db_account.id), "name": db_account.name, "message": "Account added to pool"}
 
 
 @router.delete("/max-plan-accounts/{account_id}")
+@limiter.limit("10/minute")
 async def remove_max_plan_account(
+    request: Request,
     account_id: str,
+    force: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -1153,11 +1333,28 @@ async def remove_max_plan_account(
     db_account = await session.get(MaxPlanAccount, acct_uuid)
     if not db_account:
         raise HTTPException(status_code=404, detail="Account not found")
+
+    # Check for active tasks using this account
+    active_using = (await session.execute(
+        select(Task.id).where(
+            Task.status == TaskStatus.IN_PROGRESS,
+            Task.context["max_plan_account_id"].as_string() == account_id
+        )
+    )).scalars().all()
+    if active_using and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Account has {len(active_using)} active task(s). "
+                   f"Pass ?force=true to remove anyway (tasks will fail on next token refresh)."
+        )
+
     await session.delete(db_account)
     await session.commit()
 
     # Remove from in-memory pool
-    _max_plan_pool[:] = [a for a in _max_plan_pool if a["id"] != account_id]
+    from app.main import _max_plan_pool_lock
+    async with _max_plan_pool_lock:
+        _max_plan_pool[:] = [a for a in _max_plan_pool if a["id"] != account_id]
     return {"message": "Account removed"}
 
 
@@ -1183,6 +1380,7 @@ async def update_max_plan_account(
         db_account.enabled = bool(payload["enabled"])
     if "name" in payload:
         db_account.name = payload["name"]
+    _raw_new_token = None  # Track raw token for in-memory pool sync
     if "oauth_token" in payload:
         new_token = payload["oauth_token"]
         if not new_token.startswith("sk-ant-"):
@@ -1190,8 +1388,17 @@ async def update_max_plan_account(
         import re
         if not re.fullmatch(r'sk-ant-[A-Za-z0-9_\-]+', new_token):
             raise HTTPException(status_code=400, detail="oauth_token contains invalid characters")
-        db_account.oauth_token = new_token
-        db_account.token_created_at = datetime.utcnow()
+        _raw_new_token = new_token
+        # Store in Secret Manager, save resource name in DB
+        try:
+            from app.secrets_manager import store_user_secret
+            secret_name = f"maxplan-{account_id}"
+            resource_name = await store_user_secret("system", secret_name, new_token)
+            db_account.oauth_token = resource_name
+        except Exception as e:
+            logger.warning(f"[POOL] Secret Manager unavailable, token stored in DB directly: {e}")
+            db_account.oauth_token = new_token
+        db_account.token_created_at = _utcnow()
     if "claude_config_json" in payload:
         import json as _json
         try:
@@ -1199,22 +1406,24 @@ async def update_max_plan_account(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="claude_config_json must be valid JSON")
         db_account.claude_config_json = payload["claude_config_json"]
-    db_account.updated_at = datetime.utcnow()
+    db_account.updated_at = _utcnow()
     session.add(db_account)
     await session.commit()
 
     # Sync to in-memory pool
-    mem_account = next((a for a in _max_plan_pool if a["id"] == account_id), None)
-    if mem_account:
-        if "enabled" in payload:
-            mem_account["enabled"] = db_account.enabled
-        if "name" in payload:
-            mem_account["name"] = db_account.name
-        if "oauth_token" in payload:
-            mem_account["oauth_token"] = db_account.oauth_token
-            mem_account["token_created_at"] = db_account.token_created_at.isoformat() if db_account.token_created_at else None
-        if "claude_config_json" in payload:
-            mem_account["claude_config_json"] = db_account.claude_config_json
+    from app.main import _max_plan_pool_lock
+    async with _max_plan_pool_lock:
+        mem_account = next((a for a in _max_plan_pool if a["id"] == account_id), None)
+        if mem_account:
+            if "enabled" in payload:
+                mem_account["enabled"] = db_account.enabled
+            if "name" in payload:
+                mem_account["name"] = db_account.name
+            if "oauth_token" in payload:
+                mem_account["oauth_token"] = _raw_new_token  # In-memory pool holds resolved token, not resource name
+                mem_account["token_created_at"] = db_account.token_created_at.isoformat() if db_account.token_created_at else None
+            if "claude_config_json" in payload:
+                mem_account["claude_config_json"] = db_account.claude_config_json
 
     return {"id": account_id, "name": db_account.name, "enabled": db_account.enabled}
 
@@ -1375,7 +1584,7 @@ async def add_direction(
         "text": payload.text,
         "priority": payload.priority,
         "paths": payload.paths or [],
-        "added_at": datetime.utcnow().isoformat(),
+        "added_at": _utcnow().isoformat(),
         "status": "active",
     }
     directions = list(project.directions or [])
@@ -1405,11 +1614,13 @@ async def replace_directions(
         if not entry.get("id"):
             entry["id"] = f"d-{uuid.uuid4().hex[:8]}"
         if not entry.get("added_at"):
-            entry["added_at"] = datetime.utcnow().isoformat()
+            entry["added_at"] = _utcnow().isoformat()
         if entry.get("priority") not in ("high", "medium", "low"):
             raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
         if not isinstance(entry.get("text"), str) or not entry["text"].strip():
             raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
+        if len(entry["text"]) > 500:
+            raise HTTPException(status_code=400, detail="Direction text must not exceed 500 characters")
         if "status" not in entry:
             entry["status"] = "active"
         normalized.append(entry)
@@ -1445,14 +1656,23 @@ async def remove_direction(
         )
     )
     cancelled_tasks = cancelled_result.scalars().all()
+    vm_ids_to_delete = []
     for t in cancelled_tasks:
         t.status = TaskStatus.CANCELLED
         t.latest_status_message = f"Cancelled: direction {direction_id} was removed"
         session.add(t)
+        if t.vm_instance_id:
+            vm_ids_to_delete.append(t.vm_instance_id)
 
     project.directions = directions
     session.add(project)
     await session.commit()
+
+    # Delete VMs for cancelled tasks (after commit)
+    for vm_id in vm_ids_to_delete:
+        from app.main import _ensure_vm_deleted
+        await _ensure_vm_deleted(vm_id, reason="direction_removed")
+
     return {"message": "Direction removed", "cancelled_tasks": len(cancelled_tasks)}
 
 
@@ -1555,7 +1775,7 @@ async def create_direction_research_task(
         cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
         last_researched_at = direction.get("last_researched_at")
         if last_researched_at:
-            elapsed = (datetime.utcnow() - datetime.fromisoformat(last_researched_at)).total_seconds()
+            elapsed = (_utcnow() - datetime.fromisoformat(last_researched_at)).total_seconds()
             if elapsed < cooldown_minutes * 60:
                 remaining_minutes = int((cooldown_minutes * 60 - elapsed) / 60)
                 raise HTTPException(
@@ -1568,7 +1788,7 @@ async def create_direction_research_task(
     if bypass_cooldown:
         description = f"[cooldown bypassed manually] {direction_text}"
 
-    vm_name = f"agent-vm-{uuid.uuid4().hex[:16]}"
+    vm_name = f"agent-vm-{uuid.uuid4().hex}"
     task_payload = {
         "type": "research",
         "directions": [direction],
@@ -1676,7 +1896,7 @@ async def get_autonomous_status(
         select(Project).order_by(Project.created_at.desc())
     )).scalars().all()
 
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    one_hour_ago = _utcnow() - timedelta(hours=1)
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
     auto_tasks = (await session.execute(
@@ -1766,7 +1986,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     window_progress = None
     if deploy_monitoring["window_start"]:
         duration = deploy_monitoring["extended_window"] if deploy_monitoring["is_extended"] else deploy_monitoring["window_duration"]
-        elapsed = (datetime.utcnow() - deploy_monitoring["window_start"]).total_seconds()
+        elapsed = (_utcnow() - deploy_monitoring["window_start"]).total_seconds()
         window_progress = {"elapsed_seconds": int(elapsed), "total_seconds": duration, "percent": min(100, int(elapsed / duration * 100))}
 
     # Calculate recent failure rate
@@ -1824,7 +2044,7 @@ async def pause_pipeline(
     if state:
         state.status = DeploymentStatus.PAUSED
         state.pause_reason = "Manual pause via admin"
-        state.paused_at = datetime.utcnow()
+        state.paused_at = _utcnow()
         state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
         state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
         session.add(state)
@@ -2036,7 +2256,7 @@ async def repair_state(
     repairs = []
 
     # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
-    fifteen_min_ago = datetime.utcnow() - timedelta(minutes=15)
+    fifteen_min_ago = _utcnow() - timedelta(minutes=15)
     stuck_tasks = (await session.execute(
         select(Task).where(
             Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
@@ -2056,12 +2276,8 @@ async def repair_state(
 
             # Clean up VM
             if t.vm_instance_id:
-                try:
-                    from app.compute import delete_agent_vm
-                    import asyncio
-                    asyncio.create_task(delete_agent_vm(t.vm_instance_id))
-                except Exception:
-                    pass
+                from app.main import _ensure_vm_deleted
+                await _ensure_vm_deleted(t, reason="admin_repair")
 
     # 2. EVALUATING tasks where all children are terminal but parent not updated
     evaluating_tasks = (await session.execute(
@@ -2112,7 +2328,7 @@ async def get_activity(
     current_user: dict = Depends(get_current_user)
 ):
     """Return a reverse-chronological list of recent system events."""
-    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    seven_days_ago = _utcnow() - timedelta(days=7)
     events: List[Dict[str, Any]] = []
 
     # --- 1 & 2: Completed and Failed tasks in last 7 days ---
@@ -2342,6 +2558,8 @@ async def get_zone_health_endpoint(
 async def get_alerts(
     project_id: Optional[str] = None,
     include_dismissed: bool = False,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2350,6 +2568,7 @@ async def get_alerts(
         query = query.where(Alert.project_id == uuid.UUID(project_id))
     if not include_dismissed:
         query = query.where(Alert.dismissed_at.is_(None))
+    query = query.limit(limit).offset(offset)
     result = await session.execute(query)
     alerts = result.scalars().all()
     return [
@@ -2376,7 +2595,7 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    alert.dismissed_at = datetime.utcnow()
+    alert.dismissed_at = _utcnow()
     session.add(alert)
     await session.commit()
     return {"status": "dismissed"}
@@ -2397,7 +2616,7 @@ async def get_autonomy_debug(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    now = datetime.utcnow()
+    now = _utcnow()
     blocking_guards = []
 
     # Guard 1: autonomous_disabled

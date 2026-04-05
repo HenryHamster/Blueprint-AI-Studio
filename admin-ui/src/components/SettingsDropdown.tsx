@@ -1,16 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, Play, Pause, RotateCw, Wrench, CheckCircle, Zap } from 'lucide-react';
-import type { DeployState } from '../useAppState';
-
-
-export interface MaxPlanAccount {
-  id: string;
-  name: string;
-  enabled: boolean;
-  active_tasks: number;
-  total_tasks: number;
-  token_created_at: string | null;
-}
+export type { MaxPlanAccount } from '../types/settings';
+import type { DeployState, MaxPlanAccount } from '../types/settings';
 
 
 interface SettingsDropdownProps {

@@ -1,15 +1,7 @@
 import { AlertTriangle, X, ExternalLink } from 'lucide-react';
 
-export interface Alert {
-  id: string;
-  project_id: string;
-  severity: 'INFO' | 'WARNING' | 'ERROR';
-  title: string;
-  message: string;
-  task_id: string | null;
-  created_at: string;
-  dismissed_at: string | null;
-}
+export type { Alert } from '../types/alert';
+import type { Alert } from '../types/alert';
 
 const severityStyles: Record<Alert['severity'], string> = {
   ERROR: 'bg-red-950/50 border-red-900/50 text-red-400',

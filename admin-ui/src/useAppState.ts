@@ -1,36 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import type { Task } from './components/TaskCard';
-import type { Project } from './components/ProjectDashboard';
-import type { MaxPlanAccount } from './components/SettingsDropdown';
-import type { Alert } from './components/AlertsBanner';
+import type { Task } from './types/task';
+import type { Project } from './types/project';
+import type { MaxPlanAccount } from './types/settings';
+import type { Alert } from './types/alert';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
 import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_HR, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
 
-export interface DeployState {
-  status: string;
-  current_revision: string;
-  current_sha: string;
-  deployed_at: string;
-  last_known_good_revision: string;
-  last_known_good_sha: string;
-  rollback_reason: string | null;
-  rollback_count: number;
-  pause_reason: string | null;
-  paused_at: string | null;
-  pre_pause_max_vms: number | null;
-  failure_rate: number;
-  monitoring_window: { elapsed_seconds: number; total_seconds: number; percent: number } | null;
-  task_results_count: number;
-  gcp_project_id: string;
-  health_recovery_streak: number;
-  health_recovery_streak_required: number;
-  health_failure_streak: number;
-  health_failure_streak_threshold: number;
-  external_health?: Record<string, unknown>;
-}
+export type { DeployState } from './types/settings';
+import type { DeployState } from './types/settings';
 
 function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
   const [state, setState] = useState<T>(() => {

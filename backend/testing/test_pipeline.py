@@ -208,8 +208,13 @@ class TestDeploymentMonitoring:
         assert fclass == "CODE_ERROR"
 
     def test_record_caps_at_100(self):
+        from collections import deque
         import app.shared_state as ss
-        ss.deploy_monitoring["task_results"] = [("ts", "success", "") for _ in range(105)]
+        # deque(maxlen=100) automatically caps — fill with 105 via extend, then add one more
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        for _ in range(105):
+            ss.deploy_monitoring["task_results"].append(("ts", "success", ""))
+        assert len(ss.deploy_monitoring["task_results"]) == 100
         record_task_result(success=True)
         assert len(ss.deploy_monitoring["task_results"]) == 100
 
@@ -354,7 +359,7 @@ class TestCausationAnalysis:
         assert response == "ROLLBACK"
 
     def test_100_percent_failure_rollback(self):
-        results = [("ts", "failure", "CODE_ERROR")] * 3
+        results = [("ts", "failure", "CODE_ERROR")] * 5
         self._setup_monitoring(results)
         do_rb, _, response = should_rollback()
         assert do_rb
@@ -525,6 +530,8 @@ class TestMonitoringWindowEdgeCases:
         must check revision equality."""
         from app.shared_state import deploy_monitoring
         deploy_monitoring["task_results"] = [
+            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
             (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
             (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
             (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),

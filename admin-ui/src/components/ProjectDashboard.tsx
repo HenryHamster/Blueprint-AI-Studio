@@ -2,16 +2,8 @@ import { useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass } from 'lucide-react';
 import type { Task } from './TaskCard';
 
-export interface Project {
-  id: string;
-  name: string;
-  status: string;
-  github_owner: string;
-  github_repo: string;
-  autonomous_enabled: boolean;
-  directions: unknown[];
-  created_at: string;
-}
+export type { Project } from '../types/project';
+import type { Project } from '../types/project';
 
 interface ProjectDashboardProps {
   projects: Project[];

@@ -2,17 +2,8 @@
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal } from 'lucide-react';
 
-export interface ResearchFinding {
-  type?: string;
-  title: string;
-  description: string;
-  prompt: string;
-  scope: 'small' | 'medium' | 'large';
-  risk: 'low' | 'medium' | 'high';
-  priority: number;
-  related_files: string[];
-  direction_id?: string;
-}
+export type { ResearchFinding } from '../types/task';
+import type { ResearchFinding } from '../types/task';
 
 export function isSafeUrl(url: string): boolean {
   try {
@@ -57,40 +48,8 @@ export function linkifyStatusMessage(msg: string, prUrl?: string): React.ReactNo
   return <>{parts}</>;
 }
 
-export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'refactor' | 'docs' | 'security_audit' | 'qa' | 'deps' | 'migrate' | 'investigate';
-
-export interface Task {
-  id: string;
-  project_id?: string;
-  title: string;
-  description: string;
-  status: TaskStatus;
-  task_type?: TaskType;
-  vm_instance_id?: string;
-  latest_status_message?: string;
-  status_log?: { t: string; msg: string }[];
-  created_by: string;
-  requires_approval: boolean;
-  parent_task_id?: string;
-  depends_on?: string[];
-  plan_output?: Record<string, unknown>;
-  created_at: string;
-  started_at?: string;
-  last_heartbeat?: string;
-  attempt_count?: number;
-  payloads?: Record<string, unknown>[];
-  artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
-  pr_url?: string;
-  commit_hash?: string;
-  repo_url?: string;
-  error_logs?: string;
-  error_logs_truncated?: boolean;
-  research_findings?: ResearchFinding[] | null;
-  context?: Record<string, unknown>;
-  history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
-  child_task_ids?: string[];
-}
+export type { Task, TaskStatus, TaskType } from '../types/task';
+import type { Task, TaskStatus, TaskType } from '../types/task';
 
 export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {
   plan: { bg: 'bg-purple-500/10 border-purple-500/20', text: 'text-purple-400', icon: GitFork, label: 'Plan' },

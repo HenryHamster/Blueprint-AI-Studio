@@ -10,6 +10,13 @@
 - Backend: Python, FastAPI, SQLAlchemy/SQLModel, async/await
 - Agent: TypeScript, Node.js
 
+## Testing
+- Backend: `bash scripts/test-backend.sh` (builds Docker image, runs import check + full suite)
+  - Specific file: `bash scripts/test-backend.sh testing/test_agent.py`
+  - Standalone only (no DB): `bash scripts/test-backend.sh --standalone`
+- Frontend: `cd admin-ui && npm run build && npx eslint .`
+- Agent: `cd agent && npx tsc --noEmit`
+
 ## Test Guidelines
 - When fixing test failures, first diagnose: is the failure in the CODE or the TEST?
 - Do NOT delete or skip tests just to make them pass
