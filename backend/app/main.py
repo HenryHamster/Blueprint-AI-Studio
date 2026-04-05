@@ -1666,11 +1666,13 @@ async def _recover_orphaned_tasks():
     try:
         async with AsyncSessionLocal() as session:
             five_min_ago = _utcnow() - timedelta(minutes=5)
+            one_hour_ago = _utcnow() - timedelta(hours=1)
             candidates = (await session.execute(
                 select(Task).where(
                     Task.status == TaskStatus.COMPLETED,
                     Task.created_by == "ORCHESTRATOR",
                     Task.created_at <= five_min_ago,
+                    Task.created_at >= one_hour_ago,  # Only check recent tasks, not entire history
                 )
             )).scalars().all()
 
@@ -5915,8 +5917,9 @@ async def update_agent_status(
                 is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
                 scope = (task.context or {}).get("scope", "unknown")
 
-                if is_intermediate and scope == "small":
-                    # Small scope on intermediate branch → security scan then auto-merge, skip review
+                if is_intermediate and scope in ("small", "medium"):
+                    # Small/medium scope on intermediate branch → security scan then auto-merge, skip review
+                    # The rollup PR to main gets the full review — intermediate merges don't need it
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
 

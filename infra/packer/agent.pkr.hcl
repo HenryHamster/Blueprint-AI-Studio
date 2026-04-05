@@ -38,8 +38,12 @@ build {
       "sudo npm install -g @anthropic-ai/claude-code",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
-      "sudo mkdir -p /opt/agent",
-      "sudo chown -R packer:packer /opt/agent"
+      "sudo mkdir -p /opt/agent /tmp/workspace",
+      "sudo chown -R packer:packer /opt/agent",
+      "# Pre-create workspace and install gcloud/gsutil for faster startup",
+      "sudo apt-get install -y apt-transport-https ca-certificates jq",
+      "# Pre-warm Claude Code by running setup (caches binary downloads)",
+      "claude --version || true"
     ]
   }
 

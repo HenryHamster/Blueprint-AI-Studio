@@ -819,8 +819,7 @@ async function handleCreate(
 }
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
-async function handleReview(
-  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+async function handleReview(  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
@@ -838,7 +837,9 @@ async function handleReview(
   sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  // Shallow clone — review/fix don't need full history
+  execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  git(['fetch', 'origin', branch, '--depth', '50']);
   git(['checkout', branch]);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
@@ -963,7 +964,9 @@ async function handleFix(
   sendLog(ws, `Fixing PR #${prNumber} on branch ${branch}\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  // Shallow clone — review/fix don't need full history
+  execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  git(['fetch', 'origin', branch, '--depth', '50']);
   git(['checkout', branch]);
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
@@ -1262,7 +1265,7 @@ async function handlePlan(
   sendLog(ws, `Planning task decomposition for: ${prompt.slice(0, 200)}\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
@@ -1585,7 +1588,8 @@ Valid values:
 Rules:
 - When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
-- Each finding should be ONE PR-sized unit of work (scope=small) or a plannable initiative (scope=medium/large)
+- Group related small changes into ONE finding when they touch the same area (e.g. 3 small fixes in the same file = 1 finding with scope=small, not 3 separate findings). Each finding = 1 VM + 1 PR, so grouping saves significant overhead.
+- A finding should be ONE PR-sized unit of work (scope=small for grouped small changes or single changes, scope=medium for multi-file work, scope=large for architectural changes)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
 - Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
@@ -1730,7 +1734,7 @@ async function handleSecurityAudit(
   sendLog(ws, `Starting security audit...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
@@ -2331,7 +2335,7 @@ async function handlePerf(
   sendLog(ws, `Starting performance analysis...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
@@ -2417,7 +2421,7 @@ async function handleInvestigate(
   sendLog(ws, `Starting investigation...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 
