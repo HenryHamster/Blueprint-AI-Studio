@@ -367,7 +367,7 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=None)
+    mocker.patch("app.main._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.main._parse_research_findings",
         return_value=[{
@@ -492,7 +492,7 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=None)
+    mocker.patch("app.main._log_file_overlaps", return_value=[])
     mocker.patch(
         "app.main._parse_research_findings",
         return_value=[{

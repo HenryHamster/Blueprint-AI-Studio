@@ -1,7 +1,8 @@
 import uuid
 import pytest
 from httpx import AsyncClient
-from app.models import Project, ProjectStatus
+from app.models import Project, ProjectStatus, Task, TaskStatus
+from app.auth import create_agent_token
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
@@ -242,3 +243,43 @@ async def test_ws_ticket_nonexistent_project_returns_404(client: AsyncClient):
     fake_id = str(uuid.uuid4())
     response = await client.post(f"/api/projects/{fake_id}/ws-ticket")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fix_task_receives_project_context(client: AsyncClient, db_session):
+    """
+    Claiming a fix-type task should include project_context in the response,
+    the same as research/plan/create tasks.
+    """
+    project = Project(
+        name="Fix Context Test Project",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "test-vm-fix-001"
+    task = Task(
+        project_id=project.id,
+        title="Fix a bug",
+        status=TaskStatus.QUEUED,
+        vm_instance_id=vm_id,
+        payloads=[{"type": "fix", "prompt": "Fix the null pointer exception"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm_id)
+    response = await client.post(
+        "/api/agent/claim",
+        headers={"X-Agent-Token": token},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "project_context" in data
+    assert "active_tasks" in data["project_context"]
+    assert "sibling_tasks" in data["project_context"]
+    assert "open_prs" in data["project_context"]

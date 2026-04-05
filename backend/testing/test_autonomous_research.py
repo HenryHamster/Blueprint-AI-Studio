@@ -60,7 +60,7 @@ def _patch_research_externals(mocker):
     mocker.patch("app.main._ensure_branch", new=AsyncMock(return_value=True))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=None)
+    mocker.patch("app.main._log_file_overlaps", return_value=[])
 
 
 def _make_finding(

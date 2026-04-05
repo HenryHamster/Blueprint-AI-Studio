@@ -3464,7 +3464,7 @@ async def claim_task(
     }
 
     task_type = (task.payloads or [{}])[0].get("type", "")
-    if task_type in ("research", "plan", "create"):
+    if task_type in ("research", "plan", "create", "fix", "refactor"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project
         active_stmt = select(Task).where(
             Task.project_id == task.project_id,
@@ -3481,6 +3481,7 @@ async def claim_task(
                 "task_type": p.get("type", ""),
                 "status": t.status,
                 "prompt": p.get("prompt", p.get("description", "")),
+                "related_files": (t.context or {}).get("related_files", []),
             })
 
         # Queued tasks in the same project
@@ -4201,8 +4202,12 @@ def _validate_plan_dependencies(subtasks: List[Dict]) -> bool:
     return not any(has_cycle(i) for i in range(n) if i not in visited)
 
 
-def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN"):
-    """Log warnings when subtasks share related_files (for observability)."""
+def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN") -> List[tuple]:
+    """Log warnings when subtasks share related_files (for observability).
+
+    Returns a list of (i, j, overlapping_files) tuples for each overlapping pair.
+    """
+    overlaps = []
     for i, a in enumerate(subtasks):
         a_files = set(a.get("related_files", []))
         if not a_files:
@@ -4216,6 +4221,8 @@ def _log_file_overlaps(subtasks: List[Dict], label: str = "PLAN"):
                 a_title = a.get("title", f"#{i}")
                 b_title = b.get("title", f"#{j}")
                 logger.info(f"[{label}] File overlap: '{a_title}' and '{b_title}' share {', '.join(sorted(overlap))}")
+                overlaps.append((i, j, overlap))
+    return overlaps
 
 
 def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None:
@@ -4343,6 +4350,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         model = parent_payload.get('model')
         effort = parent_payload.get('effort')
         create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+        parent_direction_id = (task.context or {}).get('direction_id')
+        parent_research_task_id = (task.context or {}).get('research_task_id')
 
         for i, child in enumerate(existing_children):
             child_payload = (child.payloads or [{}])[0]
@@ -4371,14 +4380,18 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             child.payloads = [child_payload]
             child.requires_approval = child_risk == 'high'
             child_approval_reason = child_payload.get('approval_reason') if child_risk == 'high' else None
+            existing_ctx = child.context or {}
             child.context = {
-                **(child.context or {}),
+                **existing_ctx,
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
                 "scope": child_payload.get('scope', 'small'),
                 "risk": child_risk,
                 "related_files": related_files,
                 **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
+                # Inherit direction_id from plan parent if present and not overridden by finding
+                **({"direction_id": parent_direction_id} if parent_direction_id and not existing_ctx.get('direction_id') else {}),
+                **({"research_task_id": parent_research_task_id} if parent_research_task_id and not existing_ctx.get('research_task_id') else {}),
             }
             session.add(child)
 
@@ -4395,7 +4408,17 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 ]
                 session.add(existing_children[i])
 
-        _log_file_overlaps(subtasks, "PLAN")
+        overlaps = _log_file_overlaps(subtasks, "PLAN")
+        for (i, j, shared_files) in overlaps:
+            for idx in (i, j):
+                if idx < len(existing_children):
+                    ctx = dict(existing_children[idx].context or {})
+                    warnings = ctx.get('file_overlap_warnings', [])
+                    other_title = subtasks[j if idx == i else i].get('title', f'#{j if idx == i else i}')
+                    warnings.append({'shared_files': sorted(shared_files), 'with_task': other_title})
+                    ctx['file_overlap_warnings'] = warnings
+                    existing_children[idx].context = ctx
+                    session.add(existing_children[idx])
         # Single atomic commit: base_branch, requires_approval, context, and depends_on
         # are all written together so no worker can observe a partially-enriched child.
         await session.commit()
@@ -4416,6 +4439,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         "parent_title": task.title,
         "parent_prompt": (parent_payload.get("prompt") or parent_payload.get("description") or "")[:500]
     }
+    parent_direction_id = (task.context or {}).get('direction_id')
+    parent_research_task_id = (task.context or {}).get('research_task_id')
     child_tasks = []
     for subtask_def in subtasks:
         related_files = subtask_def.get("related_files", [])
@@ -4453,6 +4478,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 "related_files": related_files,
                 "parent_context": plan_parent_context,
                 **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
+                # Inherit direction_id from plan parent if present and not overridden by finding
+                **({"direction_id": parent_direction_id} if parent_direction_id else {}),
+                **({"research_task_id": parent_research_task_id} if parent_research_task_id else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -4814,17 +4842,51 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     )).scalars().all()
     existing_titles = [t.title.lower() for t in existing_tasks]
 
-    # Query recent tasks (last 30 days) for hash-based deduplication across research cycles
-    thirty_days_ago = _utcnow() - timedelta(days=30)
+    # Query recent tasks (last 90 days) for hash-based deduplication across research cycles
+    ninety_days_ago = _utcnow() - timedelta(days=90)
     recent_tasks_for_dedup = (await session.execute(
         select(Task).where(
             Task.project_id == task.project_id,
-            Task.created_at >= thirty_days_ago,
+            Task.created_at >= ninety_days_ago,
         )
     )).scalars().all()
     recent_finding_hashes = {
         t.context["finding_hash"] for t in recent_tasks_for_dedup if t.context and t.context.get("finding_hash")
     }
+    # Build a map of finding_hash -> outcome for failed/cancelled tasks for better logging
+    failed_hashes = {
+        t.context["finding_hash"]: t.status
+        for t in recent_tasks_for_dedup
+        if t.context and t.context.get("finding_hash")
+        and t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+    }
+    # Also suppress tasks that have an active suppress_until field (set on user-cancelled low-priority tasks)
+    now_iso = _utcnow().isoformat()
+    for t in recent_tasks_for_dedup:
+        if t.context and t.context.get("suppress_until") and t.context["suppress_until"] > now_iso:
+            fhash = t.context.get("finding_hash")
+            if fhash:
+                recent_finding_hashes.add(fhash)
+                failed_hashes.setdefault(fhash, "suppressed")
+
+    # Query open PR artifacts to detect file-scope conflicts with in-flight work
+    open_pr_stmt = (
+        select(Artifact.pr_url, Artifact.logs, Task.context)
+        .join(Task, Artifact.task_id == Task.id)
+        .where(
+            Task.project_id == task.project_id,
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            Artifact.pr_url.isnot(None),
+            Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+        )
+        .limit(20)
+    )
+    open_pr_rows = (await session.execute(open_pr_stmt)).all()
+    open_pr_files: set[str] = set()
+    for _, _, task_ctx in open_pr_rows:
+        if task_ctx:
+            for f in (task_ctx.get('related_files') or []):
+                open_pr_files.add(f)
 
     def _finding_hash(title: str, description: str) -> str:
         return hashlib.sha256((title + description).encode()).hexdigest()[:16]
@@ -4852,11 +4914,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         description = finding.get("description", finding.get("prompt", ""))
         fhash = _finding_hash(title, description)
         if fhash in recent_finding_hashes:
-            logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched recent task")
+            outcome = failed_hashes.get(fhash, "prior")
+            logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {outcome} task")
             skipped_duplicates += 1
             continue
         if _is_duplicate(title, existing_titles):
             logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
+            skipped_duplicates += 1
+            continue
+        # Skip if all related_files for this finding are already covered by open PRs
+        finding_files = set(finding.get('related_files', []))
+        if finding_files and finding_files.issubset(open_pr_files):
+            logger.info(f"[RESEARCH] Skipping finding '{title}' — all related files already have open PRs")
             skipped_duplicates += 1
             continue
         deduplicated.append((orig_i, finding, fhash))
@@ -4921,7 +4990,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         related_files = finding.get("related_files", [])
         full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
         type_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get(task_type)
+
+        # For sub-research tasks, enrich prompt with parent context to avoid duplication
+        if task_type == "research":
+            sibling_titles = [
+                f.get('title', '') for _, f, _ in deduplicated
+                if f.get('title') and f != finding
+            ][:5]
+            if sibling_titles:
+                parent_summary = (
+                    '\n\nContext from parent research task: '
+                    f'This sub-research is part of a broader investigation (task {str(task.id)[:8]}) '
+                    f'that also produced these parallel findings:\n' +
+                    '\n'.join(f'- {t}' for t in sibling_titles) +
+                    '\nFocus your investigation on the specific area described above without duplicating these parallel efforts.'
+                )
+                full_prompt = full_prompt + parent_summary
+
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
+        # Inherit parent direction_id if the finding doesn't specify one
+        parent_direction_id = (task.context or {}).get("direction_id")
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -4937,6 +5025,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             }],
             context={
                 "research_task_id": str(task.id),
+                "parent_research_task_id": str(task.id),
                 "finding_index": orig_i,
                 "scope": scope,
                 "risk": risk,
@@ -4945,7 +5034,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
                 "finding_hash": fhash,
-                **({"direction_id": direction_id} if direction_id else {}),
+                **({"direction_id": direction_id} if direction_id else ({"direction_id": parent_direction_id} if parent_direction_id else {})),
+                **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -4976,8 +5066,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ct.depends_on = explicit_deps
             session.add(ct)
 
-    # Log file overlap warnings for observability
-    _log_file_overlaps(findings, "RESEARCH")
+    # Log file overlap warnings for observability and surface them to agents
+    overlaps = _log_file_overlaps(findings, "RESEARCH")
+    for (i, j, shared_files) in overlaps:
+        for fi in (i, j):
+            ci = finding_to_child.get(fi)
+            if ci is not None and ci < len(child_tasks):
+                ctx = dict(child_tasks[ci].context or {})
+                warnings = ctx.get('file_overlap_warnings', [])
+                other_fi = j if fi == i else i
+                other_title = findings[other_fi].get('title', f'#{other_fi}')
+                warnings.append({'shared_files': sorted(shared_files), 'with_task': other_title})
+                ctx['file_overlap_warnings'] = warnings
+                child_tasks[ci].context = ctx
+                session.add(child_tasks[ci])
 
     await session.commit()
 
@@ -4999,10 +5101,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     d["last_researched_at"] = now_iso
             # Append to research_history for each direction that produced findings
             finding_titles_by_dir: dict = {}
-            for ct in child_tasks:
-                did = (ct.context or {}).get("direction_id")
+            finding_descriptions_by_dir: dict = {}
+            for orig_i, finding, fhash in deduplicated:
+                did = finding.get("direction_id")
                 if did:
-                    finding_titles_by_dir.setdefault(did, []).append(ct.title)
+                    finding_titles_by_dir.setdefault(did, []).append(
+                        finding.get("title", f"Research finding #{orig_i+1}")
+                    )
+                    finding_descriptions_by_dir.setdefault(did, []).append(
+                        (finding.get("description", finding.get("prompt", "")))[:200]
+                    )
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -5012,6 +5120,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "task_id": str(task.id),
                         "tasks_created": len([ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]),
                         "finding_titles": finding_titles_by_dir.get(did, [])[:5],
+                        "key_finding_descriptions": finding_descriptions_by_dir.get(did, [])[:5],
                     }
                     # Keep last 10 history entries to avoid unbounded growth
                     d["research_history"] = (history + [entry])[-10:]
@@ -5054,6 +5163,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 flag_modified(proposal_project, "directions")
                 session.add(proposal_project)
                 logger.info(f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}")
+
+    # Store a human-readable research summary artifact
+    if child_tasks:
+        direction_texts = []
+        payload0 = (task.payloads or [{}])[0]
+        if payload0.get('directions'):
+            direction_texts = [payload0['directions'][0].get('text', 'general improvement')]
+        summary_lines = [
+            f'# Research Summary',
+            f'**Direction**: {direction_texts[0][:200] if direction_texts else "general"}',
+            f'**Tasks Created**: {len(child_tasks)} ({skipped_duplicates} duplicates skipped)',
+            f'',
+            f'## Findings:',
+        ]
+        for ct in child_tasks[:10]:
+            p = (ct.payloads or [{}])[0]
+            summary_lines.append(f'- [{p.get("type", "?")}] {ct.title}: {(ct.description or "")[:150]}')
+        summary = '\n'.join(summary_lines)
+
+        summary_artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.INVESTIGATION_REPORT,
+            logs=summary,
+        )
+        session.add(summary_artifact)
 
     task.status = TaskStatus.EVALUATING
     task.latest_status_message = (

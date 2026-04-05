@@ -804,10 +804,17 @@ async function handleCreate(
     ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
     : '';
 
+  const overlapWarnings = (task.context as Record<string, unknown>)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
+  const overlapWarningText = overlapWarnings && overlapWarnings.length > 0
+    ? overlapWarnings.map(w =>
+        `WARNING: This task shares files (${w.shared_files.join(', ')}) with parallel task "${w.with_task}". Coordinate carefully or check if that task already addressed this area.`
+      ).join('\n') + '\n\n'
+    : '';
+
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${overlapWarningText}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -1130,6 +1137,19 @@ async function handleFix(
   }
 }
 
+function parseResearchSummary(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw);
+    const items = Array.isArray(parsed) ? parsed : (parsed?.logs ?? []);
+    if (Array.isArray(items) && items.length > 0) {
+      return items.slice(0, 3)
+        .map((f: Record<string, unknown>) => `${f.title || '?'}: ${String(f.description || f.prompt || '').slice(0, 120)}`)
+        .join(' | ');
+    }
+  } catch { /* ignore */ }
+  return raw.slice(0, 400);
+}
+
 // ── Shared: Format project_context into a markdown section ────────────────
 function formatProjectContext(ctx: Record<string, unknown>): string {
   const CONTEXT_BUDGET = 8000;
@@ -1146,7 +1166,9 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
   if (activeTasks && activeTasks.length > 0) {
     activeLines.push('### Active Tasks');
     for (const t of activeTasks) {
-      activeLines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 400)}`);
+      const files = (t.related_files as string[] | undefined);
+      const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
+      activeLines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 400)}${filesSuffix}`);
     }
     activeLines.push('');
   }
@@ -1211,7 +1233,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     const allEntries: string[] = [];
     for (const t of recentTasks) {
       const pr = t.pr_url ? ` (${t.pr_url})` : '';
-      const summary = t.research_findings_summary ? ` — ${String(t.research_findings_summary).slice(0, 500)}` : '';
+      const summary = t.research_findings_summary ? ` — ${parseResearchSummary(String(t.research_findings_summary))}` : '';
       allEntries.push(`- [${t.task_type}] **${t.title}**${pr}${summary}`);
     }
 
@@ -1512,7 +1534,10 @@ ${hotspotsSection}
         if (history.length > 0) {
           const entries = history.slice(-3).map((h) => {
             const titles = Array.isArray(h.finding_titles) ? (h.finding_titles as string[]).join(', ') : 'none';
-            return `  - ${h.timestamp}: ${h.tasks_created} tasks (${titles})`;
+            const descs = Array.isArray(h.key_finding_descriptions)
+              ? '\n    Key findings: ' + (h.key_finding_descriptions as string[]).map(d => d.slice(0, 150)).join(' | ')
+              : '';
+            return `  - ${h.timestamp}: ${h.tasks_created} tasks (${titles})${descs}`;
           }).join('\n');
           historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):\n${entries}`;
         }
@@ -2189,11 +2214,18 @@ async function handleRefactor(
   const rawPrompt = String(payload.prompt || payload.description || task.description || '');
   if (!rawPrompt) throw new Error('No prompt found in task payloads');
 
+  const refactorOverlapWarnings = (task.context as Record<string, unknown>)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
+  const refactorOverlapWarningText = refactorOverlapWarnings && refactorOverlapWarnings.length > 0
+    ? refactorOverlapWarnings.map(w =>
+        `WARNING: This task shares files (${w.shared_files.join(', ')}) with parallel task "${w.with_task}". Coordinate carefully or check if that task already addressed this area.`
+      ).join('\n') + '\n\n'
+    : '';
+
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

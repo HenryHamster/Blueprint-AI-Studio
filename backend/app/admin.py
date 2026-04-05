@@ -698,6 +698,17 @@ async def modify_task(
                     from app.main import release_max_plan_account
                     await release_max_plan_account(acct_id)
 
+            # For low-priority tasks cancelled by user, store suppress_until so the
+            # orchestrator can skip re-proposals for 180 days without expanding the dedup window
+            if new_status == TaskStatus.CANCELLED and task.context and task.context.get("finding_hash"):
+                task_priority = task.priority if task.priority is not None else 50
+                if task_priority == 0:  # low priority tasks map to 0 in TASK_PRIORITY_MAP
+                    from app.main import _utcnow
+                    suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
+                    task.context = {**task.context, "suppress_until": suppress_until}
+                    flag_modified(task, "context")
+                    logger.info(f"[ADMIN] Set suppress_until={suppress_until} on cancelled low-priority task {task.id}")
+
             # Cascade cancellation to active children
             if new_status == TaskStatus.CANCELLED:
                 from app.main import _ensure_vm_deleted as _cancel_vm, release_max_plan_account as _cancel_release
@@ -2345,6 +2356,7 @@ async def get_activity(
     artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> artifact info
     research_artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> research artifact
     error_log_map: Dict[str, str] = {}  # task_id -> truncated error logs
+    investigation_report_map: Dict[str, str] = {}  # task_id -> summary text
 
     if task_ids:
         artifacts_result = await session.execute(
@@ -2355,6 +2367,7 @@ async def get_activity(
                     ArtifactType.PULL_REQUEST,
                     ArtifactType.ERROR_LOG,
                     ArtifactType.RESEARCH_FINDINGS,
+                    ArtifactType.INVESTIGATION_REPORT,
                 ])
             )
             .order_by(Artifact.created_at.asc())
@@ -2374,6 +2387,8 @@ async def get_activity(
                     "artifact_created_at": a.created_at,
                     "finding_count": _count_research_findings(a.logs),
                 }
+            elif a.artifact_type == ArtifactType.INVESTIGATION_REPORT and a.logs:
+                investigation_report_map[tid] = a.logs[:2000]
 
     for t in recent_tasks:
         tid = str(t.id)
@@ -2443,6 +2458,7 @@ async def get_activity(
                 "commit_hash": None,
                 "error_summary": None,
                 "finding_count": ra["finding_count"],
+                "investigation_summary": investigation_report_map.get(tid),
                 "deploy_sha": None,
                 "deploy_status": None,
                 "rollback_count": None,

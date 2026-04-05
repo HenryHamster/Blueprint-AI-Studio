@@ -307,6 +307,99 @@ async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_
     _terminated_task_ids.pop(task_id_str, None)
 
 
+@pytest.mark.asyncio
+async def test_agent_claim_active_tasks_include_related_files(client: AsyncClient, db_session):
+    """
+    Tests that the project_context returned from /api/agent/claim includes
+    related_files in each active_tasks entry when the active task has related_files
+    in its context.
+    """
+    project = Project(name="Related Files Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # An already-IN_PROGRESS task with related_files in its context
+    active_task = Task(
+        project_id=project.id,
+        title="Active sibling task",
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["backend/app/main.py", "agent/src/index.ts"]},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+    await db_session.refresh(active_task)
+
+    # The task being claimed (research type so active_tasks are included)
+    claim_task = Task(
+        project_id=project.id,
+        title="Claiming task",
+        payloads=[{"type": "research", "prompt": "Investigate things"}],
+        vm_instance_id="agent-vm-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_context = data.get("project_context", {})
+    active_tasks = project_context.get("active_tasks", [])
+
+    assert len(active_tasks) == 1
+    entry = active_tasks[0]
+    assert entry["title"] == "Active sibling task"
+    assert entry["related_files"] == ["backend/app/main.py", "agent/src/index.ts"]
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_active_tasks_related_files_defaults_to_empty(client: AsyncClient, db_session):
+    """
+    Tests that active_tasks entries have an empty related_files list when
+    the active task has no related_files in its context.
+    """
+    project = Project(name="No Related Files Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_task = Task(
+        project_id=project.id,
+        title="Active task no files",
+        payloads=[{"type": "create", "prompt": "Do stuff"}],
+        vm_instance_id="agent-vm-nofiles",
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+    await db_session.refresh(active_task)
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer task",
+        payloads=[{"type": "research", "prompt": "Research things"}],
+        vm_instance_id="agent-vm-claimer2",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-claimer2")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    active_tasks = data.get("project_context", {}).get("active_tasks", [])
+    assert len(active_tasks) == 1
+    assert active_tasks[0]["related_files"] == []
+
+
 def test_agent_ws_invalid_token_closes_with_1008(mocker):
     """
     Tests that connecting to the agent WebSocket without a valid token causes
