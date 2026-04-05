@@ -869,19 +869,44 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
                 breaker["half_open_task_id"] = None
                 return  # Back to cooldown
-    # Guard: must have active directions that aren't in cooldown
+    # Guard: must have active directions that aren't in cooldown or mid-cycle
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
+
+    # Build set of direction IDs that still have an unrolled research cycle
+    # (EVALUATING parent = children still running/merging, not rolled up yet)
+    busy_direction_ids: set = set()
+    evaluating_research = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.EVALUATING,
+        )
+    )).scalars().all()
+    for t in evaluating_research:
+        payload = (t.payloads or [{}])[0]
+        if payload.get("type") == "research":
+            for direction in payload.get("directions", []):
+                did = direction.get("id")
+                if did:
+                    busy_direction_ids.add(did)
+
     active_directions = []
     for d in (project.directions or []):
         if d.get("status") != "active":
+            continue
+        did = d.get("id")
+        # Skip directions with an unrolled research cycle still in progress
+        if did and did in busy_direction_ids:
+            logger.debug(
+                f"[RESEARCH] Skipping direction {did}: previous research cycle not yet rolled up"
+            )
             continue
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
             if minutes_ago < cooldown_minutes:
                 logger.debug(
-                    f"[RESEARCH] Skipping direction {d.get('id')}: last researched "
+                    f"[RESEARCH] Skipping direction {did}: last researched "
                     f"{minutes_ago:.1f}m ago (cooldown: {cooldown_minutes}m)"
                 )
                 continue
@@ -1805,11 +1830,19 @@ async def orchestrator_worker():
                 # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
                 five_min_ago = _utcnow() - timedelta(minutes=5)
                 stale_vm_ids = []
+                cancelled_provision_ids = []
                 for t in active_tasks_result:
                     if (t.status == TaskStatus.PROVISIONING
                         and (t.last_heartbeat is None or t.last_heartbeat < five_min_ago)
                         and t.started_at and t.started_at < five_min_ago):
                         stale_vm_ids.append(t.vm_instance_id)
+                        # Cancel the zombie provision coroutine to free the semaphore slot.
+                        # Without this, the coroutine holds a slot for up to 360s, starving
+                        # new provisions and creating a cascading vm_id mismatch failure.
+                        zombie = _provision_coroutines.pop(str(t.id), None)
+                        if zombie and not zombie.done():
+                            zombie.cancel()
+                            cancelled_provision_ids.append(str(t.id))
                         t.status = TaskStatus.QUEUED
                         t.started_at = None
                         t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -1819,6 +1852,8 @@ async def orchestrator_worker():
                             logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (no heartbeat, started_at={t.started_at})")
                         else:
                             logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (stale heartbeat={t.last_heartbeat}, started_at={t.started_at})")
+                if cancelled_provision_ids:
+                    logger.warning(f"[ORCHESTRATOR] Cancelled {len(cancelled_provision_ids)} zombie provision coroutine(s): {cancelled_provision_ids}")
                 if session.dirty:
                     await session.commit()
                     # Delete old VMs from stale provisions (after commit)
@@ -2196,10 +2231,12 @@ async def orchestrator_worker():
                             # Delete partially-created VM (may exist if insert succeeded but wait failed)
                             await _ensure_vm_deleted(vm_id, reason="provision_failure")
 
-                    asyncio.create_task(_provision_and_handle(
+                    provision_coro = asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
                         task.payloads, oauth_token, claude_config_json, account_id
                     ))
+                    _provision_coroutines[str(task.id)] = provision_coro
+                    provision_coro.add_done_callback(lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None))
 
                     await broadcast_to_project(
                         str(task.project_id),
@@ -2528,6 +2565,12 @@ app.include_router(admin_router)
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: Optional[datetime] = None
+
+# Track in-flight provision coroutines so stale recovery can cancel them.
+# Without cancellation, zombie provisions hold semaphore slots for up to 360s,
+# starving new provisions and creating a cascading failure where no VM can
+# claim its task (the reaper assigns a new vm_instance_id before the VM boots).
+_provision_coroutines: Dict[str, asyncio.Task] = {}
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""
