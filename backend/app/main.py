@@ -1468,6 +1468,21 @@ async def reaper_service():
                     max_provision_retries = 2
                     can_retry = False
 
+                    # Rate-limited tasks: requeue without burning retry budget
+                    msg_lower = (task.latest_status_message or "").lower()
+                    is_rate_limited = any(kw in msg_lower for kw in ["rate limit", "usage exhausted", "rate_limit"])
+                    if is_rate_limited and not is_provision_failure:
+                        logger.info(f"[REAPER] Task {task.id} rate-limited — requeuing without burning retry")
+                        task.status = TaskStatus.QUEUED
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        task.last_heartbeat = None
+                        task.started_at = None
+                        task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
+                        session.add(task)
+                        await broadcast_to_project(str(task.project_id), "task_updated",
+                            {"task_id": str(task.id), "status": TaskStatus.QUEUED})
+                        continue
+
                     if is_provision_failure:
                         provision_failures += 1
                         task.context = {**(task.context or {}), "provision_failures": provision_failures}
@@ -1603,6 +1618,7 @@ async def gcp_cleanup_service():
 
 _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
+_last_orphan_check: datetime = _utcnow()
 
 
 async def _persist_circuit_breakers():
@@ -1643,6 +1659,98 @@ async def _persist_zone_health():
                 await session.commit()
     except Exception as e:
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
+
+
+async def _recover_orphaned_tasks():
+    """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
+    try:
+        async with AsyncSessionLocal() as session:
+            five_min_ago = _utcnow() - timedelta(minutes=5)
+            candidates = (await session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at <= five_min_ago,
+                )
+            )).scalars().all()
+
+            for task in candidates:
+                task_type = (task.payloads or [{}])[0].get("type", "")
+                if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
+                    continue
+
+                # Check if PR artifact exists
+                has_artifact = (await session.execute(
+                    select(Artifact.id).where(
+                        Artifact.task_id == task.id,
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    ).limit(1)
+                )).first()
+                if has_artifact:
+                    continue
+
+                # Check if review child exists
+                children = (await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )).scalars().all()
+                if any((t.payloads or [{}])[0].get("type") == "review" for t in children):
+                    continue
+
+                # Orphaned — try to find PR on GitHub
+                try:
+                    gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                except Exception:
+                    continue
+
+                short_id = str(task.id).replace('-', '')[:8]
+                type_prefix = {"docs": "docs", "deps": "deps", "migrate": "migrate", "refactor": "refactor"}.get(task_type, "task")
+                branch = f"blueprint/{type_prefix}-{short_id}"
+
+                try:
+                    from app.github import _github_request
+                    headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github.v3+json", "X-GitHub-Api-Version": "2022-11-28"}
+                    resp = await _github_request("GET",
+                        f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open",
+                        headers)
+                    prs = resp.json() if resp.status_code == 200 else []
+                except Exception:
+                    continue
+
+                if not prs:
+                    continue
+
+                pr = prs[0]
+                pr_url = pr["html_url"]
+                pr_number = pr["number"]
+                base_branch = (task.payloads or [{}])[0].get("base_branch", "main")
+
+                # Create the missing artifact
+                artifact = Artifact(task_id=task.id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url)
+                session.add(artifact)
+
+                # Spawn review
+                original_prompt = (task.payloads or [{}])[0].get("prompt", task.description or "")
+                review_task = await _spawn_pipeline_task(
+                    task, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(task.id)
+                )
+
+                # Create alert
+                alert = Alert(
+                    project_id=task.project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Auto-recovered orphaned PR #{pr_number}",
+                    message=f"Task {str(task.id)[:8]} completed with PR #{pr_number} but review was never spawned. Auto-recovered.",
+                    task_id=task.id,
+                )
+                session.add(alert)
+                await session.commit()
+
+                await broadcast_to_project(str(task.project_id), "alert_created",
+                    {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                logger.warning(f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
+    except Exception as e:
+        logger.error(f"[RECOVERY] Orphaned task sweep failed: {e}", exc_info=True)
 
 
 async def orchestrator_worker():
@@ -2270,6 +2378,11 @@ async def orchestrator_worker():
             await _check_monitoring_window()
             await _check_external_health()
             await _check_pause_mode()
+            # Orphaned task recovery — every 120s
+            global _last_orphan_check
+            if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
+                _last_orphan_check = _utcnow()
+                await _recover_orphaned_tasks()
         except Exception as e:
             logger.error(f"[ORCHESTRATOR] Monitoring check error: {e}", exc_info=True)
 
@@ -3598,6 +3711,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
+    # Don't resurrect a cancelled parent
+    if parent.status == TaskStatus.CANCELLED:
+        logger.info(f"[REQUEUE] Skipping requeue — parent {parent.id} is CANCELLED")
+        return 0
+
     children = (await session.execute(
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
@@ -3681,7 +3799,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     return retried_count
 
 
-MAX_REVIEW_FIX_ITERATIONS = 30
+MAX_REVIEW_FIX_ITERATIONS = 5
 
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
@@ -3709,7 +3827,9 @@ async def _spawn_pipeline_task(
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
         return None
 
-    # Guard: don't spawn if there's already an active review/fix for this PR
+    # Guard: don't spawn if there's already an ACTIVE same-type task for this PR.
+    # This prevents duplicate concurrent spawns (race window between commit and pipeline spawn)
+    # but allows the intentional review→fix→review cycle to continue.
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -3718,10 +3838,10 @@ async def _spawn_pipeline_task(
     )).scalars().all()
     for t in active_pipeline:
         if t.id == source_task.id:
-            continue  # Don't block on ourselves
+            continue
         t_payload = (t.payloads or [{}])[0]
-        if t_payload.get("pr_number") == pr_number and t_payload.get("type") in ("review", "fix"):
-            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id} ({t_payload.get('type')})")
+        if t_payload.get("pr_number") == pr_number and t_payload.get("type") == task_type:
+            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id}")
             source_task.latest_status_message = f"{task_type.title()} already active for PR #{pr_number} → task {str(t.id)[:8]}"
             session.add(source_task)
             return t
@@ -5697,7 +5817,9 @@ async def update_agent_status(
             logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
 
         # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
-        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
+        # Only count code errors toward the breaker — rate limits and provision failures aren't code quality issues
+        _cb_failure_class = classify_failure(task, payload.logs)
+        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR" and _cb_failure_class not in ("RATE_LIMIT", "PROVISION_FAILURE"):
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
             breaker["failure_count"] += 1
