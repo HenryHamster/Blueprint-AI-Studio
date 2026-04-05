@@ -1,45 +1,88 @@
-import { Component, type ReactNode } from 'react';
+import { Component, type ErrorInfo, type ReactNode } from 'react';
+import { AlertTriangle, RefreshCw } from 'lucide-react';
 
-interface Props {
+interface ErrorBoundaryProps {
   children: ReactNode;
-  fallback?: ReactNode;
+  fallback?: ReactNode | ((error: Error, reset: () => void) => ReactNode);
+  level?: 'app' | 'panel' | 'widget';
+  onError?: (error: Error, errorInfo: ErrorInfo) => void;
 }
 
-interface State {
+interface ErrorBoundaryState {
   error: Error | null;
 }
 
-export class ErrorBoundary extends Component<Props, State> {
-  state: State = { error: null };
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
     return { error };
   }
 
-  componentDidCatch(error: Error, info: { componentStack: string }) {
-    console.error('[ErrorBoundary] Caught error:', error, info.componentStack);
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error(`[ErrorBoundary] Caught error:`, error, errorInfo);
+    this.props.onError?.(error, errorInfo);
   }
 
+  reset = () => {
+    this.setState({ error: null });
+  };
+
   render() {
-    if (this.state.error) {
-      if (this.props.fallback) return this.props.fallback;
+    if (!this.state.error) return this.props.children;
+
+    if (this.props.fallback) {
+      return typeof this.props.fallback === 'function'
+        ? this.props.fallback(this.state.error, this.reset)
+        : this.props.fallback;
+    }
+
+    const level = this.props.level ?? 'panel';
+
+    if (level === 'app') {
       return (
-        <div className="h-screen flex items-center justify-center bg-neutral-900">
-          <div className="bg-neutral-800 border border-neutral-700 rounded-xl p-8 text-center max-w-md">
-            <h2 className="text-lg font-semibold text-neutral-100 mb-2">Something went wrong</h2>
-            <p className="text-xs text-neutral-400 mb-6 font-mono break-all">
-              {this.state.error.message}
-            </p>
+        <div className="min-h-screen bg-neutral-950 flex items-center justify-center p-8">
+          <div className="max-w-md w-full bg-neutral-900 border border-red-900/50 rounded-lg p-6 text-center">
+            <AlertTriangle className="w-12 h-12 text-red-400 mx-auto mb-4" />
+            <h1 className="text-xl font-semibold text-neutral-200 mb-2">Something went wrong</h1>
+            <p className="text-sm text-neutral-400 mb-4">{this.state.error.message}</p>
             <button
               onClick={() => window.location.reload()}
-              className="bg-amber-500 hover:bg-amber-400 text-neutral-950 px-6 py-2 rounded text-sm font-semibold transition-colors"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-red-900/30 hover:bg-red-900/50 text-red-300 rounded-md text-sm transition-colors"
             >
-              Reload
+              <RefreshCw className="w-4 h-4" />
+              Reload page
             </button>
           </div>
         </div>
       );
     }
-    return this.props.children;
+
+    if (level === 'widget') {
+      return (
+        <div className="border border-red-900/50 rounded-md p-2 text-center bg-red-950/20">
+          <p className="text-xs text-red-400">Error rendering</p>
+          <button onClick={this.reset} className="text-xs text-red-300 underline mt-1">Retry</button>
+        </div>
+      );
+    }
+
+    // panel level (default)
+    return (
+      <div className="border border-red-900/50 rounded-lg p-4 bg-red-950/20">
+        <div className="flex items-center gap-2 mb-2">
+          <AlertTriangle className="w-5 h-5 text-red-400" />
+          <h3 className="text-sm font-medium text-red-300">Something went wrong</h3>
+        </div>
+        <p className="text-xs text-neutral-400 mb-3">{this.state.error.message}</p>
+        <button
+          onClick={this.reset}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-900/30 hover:bg-red-900/50 text-red-300 rounded-md text-xs transition-colors"
+        >
+          <RefreshCw className="w-3 h-3" />
+          Retry
+        </button>
+      </div>
+    );
   }
 }

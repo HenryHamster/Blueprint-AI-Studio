@@ -23,7 +23,6 @@ import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
-import { ErrorBoundary } from './components/ErrorBoundary';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
