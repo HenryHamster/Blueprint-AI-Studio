@@ -92,8 +92,7 @@ type TaskType = typeof TASK_TYPES[number];
 
 const ALL_PROMPT_SUFFIX_TYPES = [
   'create', 'review', 'fix', 'plan', 'research', 'security_audit', 'qa',
-  'docs', 'deps', 'migrate', 'smoketest', 'debug', 'perf', 'investigate',
-  'refactor', 'triage',
+  'docs', 'deps', 'smoketest', 'debug', 'perf', 'refactor', 'migrate',
 ] as const;
 
 export function SettingsDropdown({

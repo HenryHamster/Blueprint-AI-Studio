@@ -13,9 +13,9 @@ suites:
   startup:
     description: "Verify app can import and basic modules load"
     commands:
-      - "python -c \"from app.main import app; print(f'OK: {len(app.routes)} routes')\""
-      - "python -c \"from app.compute import FALLBACK_ZONES; print(f'OK: {len(FALLBACK_ZONES)} zones')\""
-      - "python -c \"from app.github import validate_fine_grained_pat; print('OK: github module')\""
+      - "python3 -c \"from app.main import app; print(f'OK: {len(app.routes)} routes')\""
+      - "python3 -c \"from app.compute import FALLBACK_ZONES; print(f'OK: {len(FALLBACK_ZONES)} zones')\""
+      - "python3 -c \"from app.github import validate_fine_grained_pat; print('OK: github module')\""
     fail_action: "critical"
 
   curated:
