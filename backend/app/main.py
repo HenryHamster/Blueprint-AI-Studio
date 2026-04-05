@@ -5213,8 +5213,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs_approval = False
 
         direction_id = finding.get("direction_id")
+        # Apply per-type model/effort overrides — take the higher of finding vs config
+        _model_rank = {"claude-opus-4-6": 3, "claude-sonnet-4-6": 2, "claude-haiku-4-5-20251001": 1}
+        _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
         finding_model = finding.get('model')
+        config_model = _runtime_config.get("task_type_models", {}).get(task_type)
+        if finding_model and config_model:
+            finding_model = finding_model if _model_rank.get(finding_model, 0) >= _model_rank.get(config_model, 0) else config_model
+        elif config_model:
+            finding_model = config_model
         finding_effort = finding.get('effort')
+        config_effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
+        if finding_effort and config_effort:
+            finding_effort = finding_effort if _effort_rank.get(finding_effort, 0) >= _effort_rank.get(config_effort, 0) else config_effort
+        elif config_effort:
+            finding_effort = config_effort
 
         related_files = finding.get("related_files", [])
         full_prompt = prompt + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt
