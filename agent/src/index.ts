@@ -838,8 +838,10 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone — review/fix don't need full history
+  // --single-branch is implied by --depth, so we must use an explicit refspec
+  // to create the remote tracking ref for the PR branch
   execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
-  git(['fetch', 'origin', branch, '--depth', '50']);
+  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`, '--depth', '50']);
   git(['checkout', branch]);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
@@ -965,8 +967,10 @@ async function handleFix(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone — review/fix don't need full history
+  // --single-branch is implied by --depth, so we must use an explicit refspec
+  // to create the remote tracking ref for the PR branch
   execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
-  git(['fetch', 'origin', branch, '--depth', '50']);
+  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`, '--depth', '50']);
   git(['checkout', branch]);
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
@@ -977,7 +981,7 @@ async function handleFix(
   sendLog(ws, `Rebasing ${branch} onto origin/${baseBranch}...\n`);
   let hasConflicts = false;
   try {
-    git(['fetch', 'origin', baseBranch]);
+    git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
     git(['rebase', `origin/${baseBranch}`]);
     sendLog(ws, `Rebase successful\n`);
   } catch (e) {
@@ -1058,7 +1062,7 @@ async function handleFix(
   // and the review pipeline handle any remaining issues.
   if (exitCode === 0) {
     try {
-      git(['fetch', 'origin', baseBranch]);
+      git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Final rebase onto ${baseBranch} successful\n`);
     } catch {
