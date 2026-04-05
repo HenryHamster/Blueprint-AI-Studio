@@ -1663,7 +1663,7 @@ Rules for avoiding duplication:
 
 Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find patterns.
-2. Based on the user's directions, identify specific, actionable improvements.
+2. Based on the user's directions, identify specific, actionable improvements. For each direction, ask yourself: "what would it take for this direction to be DONE?" — then work backward from that goal. Don't just find easy wins; find the gaps that matter most.
 3. For each finding, assess scope and risk.
 4. Output your findings as a JSON array as the VERY LAST thing in your response:
 
