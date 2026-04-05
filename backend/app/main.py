@@ -1744,7 +1744,7 @@ async def orchestrator_worker():
                 candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval == False
-                ).order_by(Task.priority.desc(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra to account for dep/conflict filtering
+                ).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
