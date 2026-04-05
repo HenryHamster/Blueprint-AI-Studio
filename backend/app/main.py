@@ -218,7 +218,7 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
 
     # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
     if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "billing",
-                                      "usage limit", "token limit exceeded",
+                                      "usage limit", "usage exhausted", "token limit exceeded",
                                       "too many requests", "resource_exhausted", "daily limit",
                                       "context_length_exceeded", "tokens per minute"]):
         return "RATE_LIMIT"
@@ -6328,22 +6328,38 @@ async def update_agent_status(
             record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
             _shared_state.tasks_failed_total += 1
 
+            # Rate-limited tasks: requeue instead of permanently failing
+            if failure_class == "RATE_LIMIT":
+                acct_id = (task.context or {}).get("max_plan_account_id")
+                if acct_id:
+                    await release_max_plan_account(acct_id)
+                    async with _max_plan_pool_lock:
+                        for acct in _max_plan_pool:
+                            if acct["id"] == acct_id:
+                                acct["enabled"] = False
+                                acct["disabled_at"] = _utcnow()
+                                acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+                                cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                                logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
+                                break
+                task.status = TaskStatus.QUEUED
+                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                task.last_heartbeat = None
+                task.started_at = None
+                task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
+                session.add(task)
+                await session.commit()
+                old_vm_id_rl = (task.context or {}).get("_prev_vm_id") or payload.logs[:50] if payload.logs else ""
+                await broadcast_to_project(str(task.project_id), "task_updated",
+                    {"task_id": str(task.id), "status": TaskStatus.QUEUED})
+                logger.info(f"[AGENT STATUS] Task {task.id} rate-limited — requeued without burning retry")
+                await _ensure_vm_deleted(task.vm_instance_id, reason="rate_limit_requeue")
+                return {"status": "accepted"}
+
         # Release Max plan account slot
         acct_id = (task.context or {}).get("max_plan_account_id")
         if acct_id:
             await release_max_plan_account(acct_id)
-            # Auto-disable account on rate limit — usage exhausted, stop wasting VMs
-            # Re-enables automatically after exponential cooldown (30/60/120/240 min)
-            if payload.status == TaskStatus.FAILED and failure_class == "RATE_LIMIT":
-                async with _max_plan_pool_lock:
-                    for acct in _max_plan_pool:
-                        if acct["id"] == acct_id:
-                            acct["enabled"] = False
-                            acct["disabled_at"] = _utcnow()
-                            acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
-                            cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
-                            logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
-                            break
 
         old_vm_id = task.vm_instance_id
         await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
