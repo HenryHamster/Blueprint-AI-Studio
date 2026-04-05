@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
 import type { MaxPlanAccount } from './types/settings';
@@ -1668,11 +1668,19 @@ export function useAppState() {
     fetchArchiveTasks(1, undefined, undefined, undefined, undefined, order);
   };
 
+  const needsAttentionCount = useMemo(() => {
+    return tasks.filter(t =>
+      t.status === 'FAILED' ||
+      (t.requires_approval && t.status !== 'COMPLETED' && t.status !== 'CANCELLED')
+    ).length;
+  }, [tasks]);
+
   return {
     // Auth
     user, authLoading, error, setError,
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, initialLoading, refreshing, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    needsAttentionCount,
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,

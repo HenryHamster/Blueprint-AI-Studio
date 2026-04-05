@@ -331,6 +331,7 @@ export default function App() {
         showActivityFeed={s.showActivityFeed}
         onToggleActivityFeed={() => s.setShowActivityFeed(prev => !prev)}
         newActivityCount={newActivityCount}
+        needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
         onSignOut={() => signOut(auth)}

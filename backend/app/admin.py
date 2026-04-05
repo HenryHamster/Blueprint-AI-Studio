@@ -3178,25 +3178,35 @@ async def get_digest(
         return t.created_at
 
     # --- needs_attention: failed + pending approval ---
+    _now = _utcnow()
     needs_attention = []
     for t in failed_tasks:
         tid = str(t.id)
+        waiting_since = _derive_completed_at(t)
+        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Failed task",
             "reason": "failed",
             "error_snippet": error_log_map.get(tid),
             "pr_url": pr_artifact_map.get(tid),
+            "waiting_since": waiting_since.isoformat() if waiting_since else None,
+            "waiting_hours": waiting_hours,
         })
     for t in approval_tasks:
         tid = str(t.id)
+        waiting_since = _derive_completed_at(t)
+        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Pending approval",
             "reason": "approval_required",
             "error_snippet": None,
             "pr_url": pr_artifact_map.get(tid),
+            "waiting_since": waiting_since.isoformat() if waiting_since else None,
+            "waiting_hours": waiting_hours,
         })
+    needs_attention.sort(key=lambda x: x["waiting_hours"] or 0, reverse=True)
 
     # --- recent_failures (up to 10, desc) ---
     sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
@@ -3204,11 +3214,14 @@ async def get_digest(
     for t in sorted_failures[:10]:
         tid = str(t.id)
         ts = _derive_completed_at(t)
+        waiting_since = _derive_completed_at(t)
+        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
         recent_failures.append({
             "task_id": tid,
             "title": t.title or "Failed task",
             "failed_at": ts.isoformat() if ts else None,
             "error_snippet": error_log_map.get(tid),
+            "waiting_hours": waiting_hours,
         })
 
     # --- recent_completions (up to 10, desc) ---

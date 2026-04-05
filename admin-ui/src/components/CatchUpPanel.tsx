@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 import { apiFetch } from '../api';
-import { isSafeUrl } from './TaskCard';
+import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
+import type { TaskType } from './TaskCard';
 
 interface NeedsAttentionItem {
   task_id: string;
@@ -9,6 +10,8 @@ interface NeedsAttentionItem {
   reason: 'failed' | 'approval_required';
   error_snippet: string | null;
   pr_url: string | null;
+  waiting_since?: string;
+  waiting_hours?: number;
 }
 
 interface RecentFailure {
@@ -16,6 +19,7 @@ interface RecentFailure {
   title: string;
   failed_at: string | null;
   error_snippet: string | null;
+  waiting_hours?: number;
 }
 
 interface RecentCompletion {
@@ -71,6 +75,48 @@ function formatRelativeTime(isoString: string | null): string {
   const diffHrs = Math.floor(diffMins / 60);
   if (diffHrs < 24) return `${diffHrs}h ago`;
   return `${Math.floor(diffHrs / 24)}d ago`;
+}
+
+function WaitingBadge({ hours }: { hours: number | undefined }) {
+  if (hours === undefined || hours === null) return null;
+  const label = hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
+  const color = hours > 24
+    ? 'bg-red-500/15 text-red-400 border-red-500/20'
+    : hours >= 6
+      ? 'bg-amber-500/15 text-amber-400 border-amber-500/20'
+      : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30';
+  return (
+    <span className={`shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded border ${color}`}>
+      {label}
+    </span>
+  );
+}
+
+function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask: (task: { id: string }) => void }) {
+  return (
+    <div
+      className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+      onClick={() => onSelectTask({ id: c.task_id })}
+    >
+      <span className="flex-1 truncate text-neutral-400">{c.title}</span>
+      <div className="shrink-0 flex items-center gap-2">
+        {c.pr_url && isSafeUrl(c.pr_url) && (
+          <a
+            href={c.pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={e => e.stopPropagation()}
+            className="text-[9px] text-emerald-400 hover:text-emerald-300 font-medium"
+          >
+            PR
+          </a>
+        )}
+        {c.completed_at && (
+          <span className="text-[10px] text-neutral-600 font-mono">{formatRelativeTime(c.completed_at)}</span>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function SkeletonRow() {
@@ -248,6 +294,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                           }`}>
                             {item.reason === 'failed' ? 'Failed' : 'Approval required'}
                           </span>
+                          <WaitingBadge hours={item.waiting_hours} />
                         </div>
                         {item.error_snippet && (
                           <div className="px-2">
@@ -301,47 +348,68 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               )}
 
               {/* Recent completions */}
-              {digest!.recent_completions.length > 0 && (
-                <div>
-                  <button
-                    onClick={() => setCompletionsExpanded(v => !v)}
-                    className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
-                  >
-                    {completionsExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                    <CheckCircle className="w-3 h-3 text-emerald-500" />
-                    Recent completions ({digest!.recent_completions.length})
-                  </button>
-                  {completionsExpanded && (
-                    <div className="flex flex-col gap-1.5">
-                      {digest!.recent_completions.map(c => (
-                        <div
-                          key={c.task_id}
-                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
-                          onClick={() => onSelectTask({ id: c.task_id })}
-                        >
-                          <span className="flex-1 truncate text-neutral-400">{c.title}</span>
-                          <div className="shrink-0 flex items-center gap-2">
-                            {c.pr_url && isSafeUrl(c.pr_url) && (
-                              <a
-                                href={c.pr_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                onClick={e => e.stopPropagation()}
-                                className="text-[9px] text-emerald-400 hover:text-emerald-300 font-medium"
-                              >
-                                PR
-                              </a>
-                            )}
-                            {c.completed_at && (
-                              <span className="text-[10px] text-neutral-600 font-mono">{formatRelativeTime(c.completed_at)}</span>
-                            )}
-                          </div>
+              {digest!.recent_completions.length > 0 && (() => {
+                const completions = digest!.recent_completions;
+                // Group by task_type, preserving insertion order
+                const groups = new Map<string, RecentCompletion[]>();
+                for (const c of completions) {
+                  const key = c.task_type || 'other';
+                  if (!groups.has(key)) groups.set(key, []);
+                  groups.get(key)!.push(c);
+                }
+                const groupEntries = Array.from(groups.entries());
+                const allSameType = groupEntries.length === 1;
+
+                return (
+                  <div>
+                    <button
+                      onClick={() => setCompletionsExpanded(v => !v)}
+                      className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
+                    >
+                      {completionsExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                      <CheckCircle className="w-3 h-3 text-emerald-500" />
+                      Recent completions ({completions.length})
+                    </button>
+                    {completionsExpanded && (
+                      <div className="flex flex-col gap-2">
+                        {/* Type summary line */}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {groupEntries.map(([type, items], idx) => {
+                            const style = TASK_TYPE_STYLES[type];
+                            return (
+                              <span key={type} className="flex items-center gap-1 text-[10px]">
+                                {idx > 0 && <span className="text-neutral-700">·</span>}
+                                <span className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider`}>
+                                  {items.length} {style?.label ?? type}
+                                </span>
+                              </span>
+                            );
+                          })}
                         </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
+                        {/* Grouped completion rows */}
+                        {allSameType ? (
+                          <div className="flex flex-col gap-1.5">
+                            {completions.map(c => (
+                              <CompletionRow key={c.task_id} c={c} onSelectTask={onSelectTask} />
+                            ))}
+                          </div>
+                        ) : (
+                          groupEntries.map(([type, items]) => (
+                            <div key={type} className="flex flex-col gap-1.5">
+                              <div className="flex items-center gap-1.5">
+                                <TaskTypeBadge taskType={type as TaskType} />
+                              </div>
+                              {items.map(c => (
+                                <CompletionRow key={c.task_id} c={c} onSelectTask={onSelectTask} />
+                              ))}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>

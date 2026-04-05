@@ -112,7 +112,7 @@ const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[
   { label: 'Deploy', value: 'DEPLOY_EVENT', activeClass: 'bg-purple-500/20 text-purple-400 border-purple-500/40' },
 ];
 
-type TimeRangeOption = '6h' | '24h' | 'week' | 'all';
+type TimeRangeOption = '6h' | '24h' | 'week' | 'all' | 'last_visit';
 
 const TIME_RANGE_PILLS: { label: string; value: TimeRangeOption }[] = [
   { label: 'Last 6h', value: '6h' },
@@ -121,8 +121,13 @@ const TIME_RANGE_PILLS: { label: string; value: TimeRangeOption }[] = [
   { label: 'All', value: 'all' },
 ];
 
-function getTimeRangeSince(range: TimeRangeOption): string | null {
+function getTimeRangeSince(range: TimeRangeOption, lastVisitTimestamp?: number | null): string | null {
   if (range === 'all') return null;
+  if (range === 'last_visit') {
+    if (lastVisitTimestamp != null) return new Date(lastVisitTimestamp).toISOString();
+    // fall back to 24h ago if no last-visit timestamp
+    return new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  }
   const now = Date.now();
   if (range === '6h') return new Date(now - 6 * 3600 * 1000).toISOString();
   if (range === '24h') return new Date(now - 24 * 3600 * 1000).toISOString();
@@ -136,13 +141,13 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   const [error, setError] = useState<string | null>(null);
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [activeFilter, setActiveFilter] = useState<FilterOption>('ALL');
-  const [timeRange, setTimeRange] = useState<TimeRangeOption>('all');
+  const [timeRange, setTimeRange] = useState<TimeRangeOption>(lastVisitTimestamp != null ? 'last_visit' : 'all');
 
   const fetchEvents = useCallback(async () => {
     try {
       const params = new URLSearchParams();
       if (selectedProjectId) params.set('project_id', selectedProjectId);
-      const since = getTimeRangeSince(timeRange);
+      const since = getTimeRangeSince(timeRange, lastVisitTimestamp);
       if (since) params.set('since', since);
       const res = await apiFetch(`${API_BASE_URL}/api/admin/activity?${params}`);
       if (!res.ok) {
@@ -160,7 +165,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId, timeRange, onEventsChange]);
+  }, [selectedProjectId, timeRange, lastVisitTimestamp, onEventsChange]);
 
   useEffect(() => {
     setLoading(true);
@@ -230,6 +235,18 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           ))}
         </div>
         <div className="flex items-center gap-1.5 flex-wrap pb-0.5">
+          {lastVisitTimestamp != null && (
+            <button
+              onClick={() => setTimeRange('last_visit')}
+              className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                timeRange === 'last_visit'
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
+                  : 'bg-transparent text-neutral-500 border-neutral-700 hover:border-neutral-600 hover:text-neutral-400'
+              }`}
+            >
+              Last Visit
+            </button>
+          )}
           {TIME_RANGE_PILLS.map(pill => (
             <button
               key={pill.value}

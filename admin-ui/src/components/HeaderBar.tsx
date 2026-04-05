@@ -25,6 +25,7 @@ export interface HeaderBarProps {
   showActivityFeed: boolean;
   onToggleActivityFeed: () => void;
   newActivityCount: number;
+  needsAttentionCount: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
   onSignOut: () => void;
@@ -114,6 +115,7 @@ export function HeaderBar(props: HeaderBarProps) {
     showActivityFeed,
     onToggleActivityFeed,
     newActivityCount,
+    needsAttentionCount,
     onOpenNewTaskModal,
     onShowDirections,
     onSignOut,
@@ -495,6 +497,13 @@ export function HeaderBar(props: HeaderBarProps) {
             </div>
           )}
         </div>
+
+        {/* Needs attention badge — always visible when count > 0 */}
+        {needsAttentionCount > 0 && (
+          <span className="bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-2 py-1 rounded-full leading-none whitespace-nowrap" title={`${needsAttentionCount} task${needsAttentionCount !== 1 ? 's' : ''} need${needsAttentionCount === 1 ? 's' : ''} attention`}>
+            {needsAttentionCount} need{needsAttentionCount !== 1 ? '' : 's'} attention
+          </span>
+        )}
 
         {/* New Task — always visible (primary action) */}
         <button
