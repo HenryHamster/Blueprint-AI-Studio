@@ -1509,11 +1509,14 @@ async def reaper_service():
                         orphaned_ids.append(task.id)
 
                 # Step 2: Lock ONLY orphaned rows (heartbeats on healthy tasks are never blocked)
+                # populate_existing=True forces SQLAlchemy to overwrite cached identity map
+                # objects with fresh DB values — without this, step 1's stale last_heartbeat
+                # persists through the re-verification and causes false reaps.
                 orphaned_tasks = []
                 if orphaned_ids:
                     lock_stmt = select(Task).where(
                         Task.id.in_(orphaned_ids)
-                    ).with_for_update(skip_locked=True)
+                    ).with_for_update(skip_locked=True).execution_options(populate_existing=True)
                     orphaned_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
                     # Track tasks skipped by skip_locked — force-reap after 3 consecutive skips
@@ -1529,7 +1532,7 @@ async def reaper_service():
                         try:
                             force_stmt = select(Task).where(
                                 Task.id.in_(force_lock_ids)
-                            ).with_for_update()
+                            ).with_for_update().execution_options(populate_existing=True)
                             force_locked = list((await session.execute(force_stmt)).scalars().all())
                             for t in force_locked:
                                 _reaper_skip_counts.pop(t.id, None)
@@ -1549,6 +1552,10 @@ async def reaper_service():
                             del _reaper_skip_counts[tid]
 
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
+                    # populate_existing ensures these objects have fresh DB values
+                    now = _utcnow()  # Refresh now — time passed during lock acquisition
+                    five_minutes_ago = now - timedelta(minutes=5)
+                    ten_minutes_ago = now - timedelta(minutes=10)
                     verified = []
                     for t in orphaned_tasks:
                         if t.last_heartbeat and t.last_heartbeat < five_minutes_ago:

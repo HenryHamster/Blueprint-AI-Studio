@@ -19,6 +19,7 @@ def _make_engine():
         connect_args={
             "server_settings": {
                 "lock_timeout": "30000",  # 30s — prevents indefinite lock waits on FOR UPDATE
+                "timezone": "UTC",  # Ensure naive timestamps are interpreted as UTC
             }
         },
     )
