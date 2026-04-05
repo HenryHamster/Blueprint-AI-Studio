@@ -438,7 +438,14 @@ STATICENV
         gsutil cp "$PAYLOAD_URI_DECODED" /etc/agent_payload.json
     fi
 
-    # 6. Start the systemd service
+    # 6. Pull latest agent source from GCS (hotfix: deploys with orchestrator, no Packer rebuild needed)
+    echo "Pulling latest agent source from GCS..."
+    gsutil -q cp gs://{ARTIFACT_BUCKET_NAME}/agent-hotfix/index.ts /opt/agent/src/index.ts 2>/dev/null && {{
+        chown agent:agent /opt/agent/src/index.ts
+        echo "Agent source updated from GCS hotfix."
+    }} || echo "No GCS hotfix found, using baked-in agent source."
+
+    # 7. Start the systemd service
     echo "Starting blueprint-agent service..."
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{ echo "Service start failed, powering off"; poweroff; }}

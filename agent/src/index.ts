@@ -837,12 +837,8 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  // Shallow clone — review/fix don't need full history
-  // --single-branch is implied by --depth, so we must use an explicit refspec
-  // to create the remote tracking ref for the PR branch
-  execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
-  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`, '--depth', '50']);
-  git(['checkout', branch]);
+  // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
+  execFileSync('git', ['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -966,12 +962,8 @@ async function handleFix(
   sendLog(ws, `Fixing PR #${prNumber} on branch ${branch}\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  // Shallow clone — review/fix don't need full history
-  // --single-branch is implied by --depth, so we must use an explicit refspec
-  // to create the remote tracking ref for the PR branch
-  execFileSync('git', ['clone', '--depth', '50', cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
-  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`, '--depth', '50']);
-  git(['checkout', branch]);
+  // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
+  execFileSync('git', ['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
