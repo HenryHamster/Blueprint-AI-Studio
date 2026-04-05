@@ -196,24 +196,31 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     logs_lower = (logs or "").lower()
     combined = status_msg + " " + logs_lower
 
-    # Provision failures — GCP quota, network, VM issues
+    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors
     if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
-                                      "vm failed to start", "failed to provision"]):
+                                      "vm failed to start", "failed to provision",
+                                      "connection refused", "connection reset by peer",
+                                      "timed out waiting for operation", "sshd", "startup script"]):
         return "PROVISION_FAILURE"
 
-    # Rate limit — Claude API usage exhausted
+    # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
     if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "billing",
-                                      "usage limit", "token limit exceeded"]):
+                                      "usage limit", "token limit exceeded",
+                                      "too many requests", "resource_exhausted", "daily limit",
+                                      "context_length_exceeded", "tokens per minute"]):
         return "RATE_LIMIT"
 
-    # External API failures — GitHub, Claude API outages
+    # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
     if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "502 bad gateway", "503 service unavailable",
-                                      "github api error", "claude api"]):
+                                      "github api error", "claude api",
+                                      "connection timed out", "name resolution failed",
+                                      "ssl", "certificate"]):
         return "EXTERNAL_API"
 
-    # Agent timeout — reaped by heartbeat timeout
-    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out"]):
+    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator
+    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
+                                      "execution timed out", "killed", "sigterm"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error
