@@ -8,6 +8,7 @@ Tests two areas:
 
 import pytest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 from app.admin import _classify_stuck_failure, _build_stuck_tasks
 from app.models import Project, Task, TaskStatus
@@ -54,7 +55,7 @@ class TestClassifyStuckFailure:
     """Pure unit tests — no DB needed."""
 
     def _task_with_message(self, msg: str) -> Task:
-        t = Task.__new__(Task)
+        t = MagicMock(spec=Task)
         t.latest_status_message = msg
         return t
 
@@ -81,7 +82,7 @@ class TestClassifyStuckFailure:
         assert _classify_stuck_failure(self._task_with_message("task completed successfully")) is None
 
     def test_none_message_returns_none(self):
-        t = Task.__new__(Task)
+        t = MagicMock(spec=Task)
         t.latest_status_message = None
         assert _classify_stuck_failure(t) is None
 
