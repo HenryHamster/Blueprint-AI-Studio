@@ -2,7 +2,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from app.models import Task, Project, TaskStatus
+from app.models import Alert, Task, TaskHistory, Project, TaskStatus
 
 
 def _utcnow() -> datetime:
@@ -39,3 +39,28 @@ def make_task(project_id=None, **kwargs) -> Task:
     )
     defaults.update(kwargs)
     return Task(**defaults)
+
+
+def make_alert(project_id: uuid.UUID, task_id: uuid.UUID | None = None, **kwargs) -> Alert:
+    defaults: dict = dict(
+        project_id=project_id,
+        task_id=task_id,
+        severity="ERROR",
+        title="Test alert",
+        message="Test alert",
+        dismissed_at=None,
+        created_at=_utcnow(),
+    )
+    defaults.update(kwargs)
+    return Alert(**defaults)
+
+
+def make_task_history(task_id: uuid.UUID, **kwargs) -> TaskHistory:
+    defaults: dict = dict(
+        task_id=task_id,
+        action="status_change",
+        details={},
+        timestamp=_utcnow(),
+    )
+    defaults.update(kwargs)
+    return TaskHistory(**defaults)

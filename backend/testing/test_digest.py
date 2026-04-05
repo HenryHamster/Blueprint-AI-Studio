@@ -1,5 +1,5 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 import pytest_asyncio
@@ -7,12 +7,7 @@ from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 from app.models import TaskStatus
-from testing.factories import make_project, make_task
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp matching the model's internal helper."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+from testing.factories import make_project, make_task, _utcnow
 
 
 # ---------------------------------------------------------------------------

@@ -557,8 +557,9 @@ export function KanbanBoard({
             const groups = new Map<string, Task[]>();
             for (const task of columnTasks) {
               const type = task.task_type || 'create';
-              if (!groups.has(type)) groups.set(type, []);
-              groups.get(type)!.push(task);
+              const list = groups.get(type) ?? [];
+              list.push(task);
+              groups.set(type, list);
             }
             const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
             const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
@@ -600,8 +601,9 @@ export function KanbanBoard({
             const groups = new Map<string, Task[]>();
             for (const task of columnTasks) {
               const key = task.project_id ?? '__none__';
-              if (!groups.has(key)) groups.set(key, []);
-              groups.get(key)!.push(task);
+              const list = groups.get(key) ?? [];
+              list.push(task);
+              groups.set(key, list);
             }
             const sorted = [...groups.entries()].sort((a, b) => {
               if (a[0] === '__none__') return 1;
@@ -733,8 +735,9 @@ export function KanbanBoard({
             const groups = new Map<string, Task[]>();
             for (const task of columnTasks) {
               const type = task.task_type || 'create';
-              if (!groups.has(type)) groups.set(type, []);
-              groups.get(type)!.push(task);
+              const list = groups.get(type) ?? [];
+              list.push(task);
+              groups.set(type, list);
             }
             const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
             const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
@@ -776,8 +779,9 @@ export function KanbanBoard({
             const groups = new Map<string, Task[]>();
             for (const task of columnTasks) {
               const key = task.project_id ?? '__none__';
-              if (!groups.has(key)) groups.set(key, []);
-              groups.get(key)!.push(task);
+              const list = groups.get(key) ?? [];
+              list.push(task);
+              groups.set(key, list);
             }
             const sorted = [...groups.entries()].sort((a, b) => {
               if (a[0] === '__none__') return 1;

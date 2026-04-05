@@ -1,8 +1,10 @@
 import os
+import uuid
 import pytest
 import pytest_asyncio
 import sqlalchemy
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -177,3 +179,47 @@ def mock_delete_vm(mocker):
 def mock_broadcast(mocker):
     from unittest.mock import AsyncMock
     return mocker.patch('app.main.broadcast_to_project', new_callable=AsyncMock)
+
+
+async def assert_alert_exists(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    severity: str,
+    contains_text: str | None = None,
+):
+    """Assert at least one undismissed alert exists for task_id+severity, return it."""
+    from app.models import Alert
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task_id,
+            Alert.severity == severity,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    alerts = result.scalars().all()
+    assert alerts, f"Expected an alert with severity={severity!r} for task {task_id}, but none found"
+    if contains_text is not None:
+        assert any(contains_text in a.message for a in alerts), (
+            f"No alert message contains {contains_text!r}; messages: {[a.message for a in alerts]}"
+        )
+    return alerts[0]
+
+
+async def assert_no_alert(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    severity: str,
+) -> None:
+    """Assert no undismissed alert exists for task_id+severity."""
+    from app.models import Alert
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task_id,
+            Alert.severity == severity,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    alerts = result.scalars().all()
+    assert not alerts, (
+        f"Expected no alert with severity={severity!r} for task {task_id}, but found {len(alerts)}"
+    )

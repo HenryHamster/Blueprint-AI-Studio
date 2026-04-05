@@ -1504,7 +1504,6 @@ export function useAppState() {
         };
 
         ws.onclose = (e) => {
-          console.log('[WS] closed:', e.code, e.reason);
           setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
           setWsConnected(false);
           setLogsConnecting(false);

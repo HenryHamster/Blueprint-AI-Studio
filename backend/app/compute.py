@@ -282,7 +282,7 @@ async def _delete_local(vm_instance_id: str):
 
 
 async def _cleanup_local(active_vm_ids: list[str]):
-    orphaned = [vid for vid in list(_local_processes.keys()) if vid not in active_vm_ids]
+    orphaned = [vid for vid in _local_processes if vid not in active_vm_ids]
     for vid in orphaned:
         logger.warning(f"[LOCAL] Cleaning up orphaned agent: {vid}")
         await _delete_local(vid)
@@ -725,8 +725,7 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
         request = compute_v1.ListInstancesRequest(
             project=GCP_PROJECT_ID, zone=zone, filter='name:agent-vm-'
         )
-        for instance in client.list(request=request):
-            results.append((instance.name, zone, instance.status))
+        results = [(instance.name, zone, instance.status) for instance in client.list(request=request)]
     except Exception as e:
         logger.error(f"[GCP CLEANUP] Failed to list VMs in zone {zone}: {e}")
     return results

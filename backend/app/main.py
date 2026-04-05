@@ -1320,7 +1320,7 @@ class ConnectionManager:
         if project_id in self.active_connections:
             message = {"event": event_type, "data": data}
             # Create a copy of the list to avoid RuntimeError if modified during iteration
-            for connection in list(self.active_connections[project_id]):
+            for connection in list(self.active_connections[project_id]):  # noqa: PERF101 — disconnect() mutates the list mid-iteration
                 try:
                     await asyncio.wait_for(connection.send_json(message), timeout=5.0)
                 except asyncio.TimeoutError:
@@ -1332,7 +1332,7 @@ class ConnectionManager:
 
     async def broadcast_to_all(self, event_type: str, data: dict):
         """Broadcasts a message to all connected WebSocket clients across all projects."""
-        for project_id in list(self.active_connections.keys()):
+        for project_id in list(self.active_connections.keys()):  # noqa: PERF101 — broadcast() can remove entries via disconnect()
             await self.broadcast(project_id, event_type, data)
 
 manager = ConnectionManager()
@@ -1557,7 +1557,7 @@ async def reaper_service():
 
                     # Clean stale entries from skip counts
                     orphaned_id_set = set(orphaned_ids)
-                    for tid in list(_reaper_skip_counts.keys()):
+                    for tid in list(_reaper_skip_counts.keys()):  # noqa: PERF101 — deletes from dict during iteration
                         if tid not in orphaned_id_set:
                             del _reaper_skip_counts[tid]
 

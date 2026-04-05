@@ -2114,7 +2114,7 @@ async def reset_deploy_health(
 
     # Clear external health failures
     external_health["failed_deps"] = []
-    for key in list(external_health.keys()):
+    for key in external_health:
         if key != "failed_deps" and isinstance(external_health[key], bool):
             external_health[key] = True
 

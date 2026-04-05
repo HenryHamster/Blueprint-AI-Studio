@@ -21,6 +21,7 @@ export default defineConfig([
     },
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'warn',
+      'no-console': ['warn', { allow: ['warn', 'error'] }],
     },
   },
 ])

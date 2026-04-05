@@ -182,36 +182,36 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 <div
                   className="flex items-center gap-1.5"
                   title={[
-                    deployState!.rollback_count > 0 ? `${deployState!.rollback_count} rollback${deployState!.rollback_count !== 1 ? 's' : ''}` : null,
-                    deployState!.rollback_reason ? `Reason: ${deployState!.rollback_reason}` : null,
-                    deployState!.pause_reason ? `Paused: ${deployState!.pause_reason}` : null,
-                    deployState!.monitoring_since ? `Monitoring for ${monitoringDuration(deployState!.monitoring_since, now)}` : null,
+                    (deployState?.rollback_count ?? 0) > 0 ? `${deployState?.rollback_count ?? 0} rollback${(deployState?.rollback_count ?? 0) !== 1 ? 's' : ''}` : null,
+                    deployState?.rollback_reason ? `Reason: ${deployState?.rollback_reason}` : null,
+                    deployState?.pause_reason ? `Paused: ${deployState?.pause_reason}` : null,
+                    deployState?.monitoring_since ? `Monitoring for ${monitoringDuration(deployState?.monitoring_since, now)}` : null,
                   ].filter(Boolean).join(' · ') || undefined}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    deployState!.status === 'HALTED' ? 'bg-red-500 animate-pulse' :
-                    deployState!.status === 'ROLLED_BACK' ? 'bg-amber-400' :
-                    deployState!.status === 'MONITORING' ? 'bg-blue-400 animate-pulse' :
+                    deployState?.status === 'HALTED' ? 'bg-red-500 animate-pulse' :
+                    deployState?.status === 'ROLLED_BACK' ? 'bg-amber-400' :
+                    deployState?.status === 'MONITORING' ? 'bg-blue-400 animate-pulse' :
                     'bg-neutral-500'
                   }`} />
                   <span className={`${
-                    deployState!.status === 'HALTED' ? 'text-red-400' :
-                    deployState!.status === 'ROLLED_BACK' ? 'text-amber-400' :
-                    deployState!.status === 'MONITORING' ? 'text-blue-400' :
+                    deployState?.status === 'HALTED' ? 'text-red-400' :
+                    deployState?.status === 'ROLLED_BACK' ? 'text-amber-400' :
+                    deployState?.status === 'MONITORING' ? 'text-blue-400' :
                     'text-neutral-400'
                   }`}>
-                    {deployState!.status === 'MONITORING' && deployState!.monitoring_since
-                      ? `Monitoring ${monitoringDuration(deployState!.monitoring_since, now)}`
-                      : deployState!.status === 'ROLLED_BACK'
+                    {deployState?.status === 'MONITORING' && deployState?.monitoring_since
+                      ? `Monitoring ${monitoringDuration(deployState?.monitoring_since, now)}`
+                      : deployState?.status === 'ROLLED_BACK'
                       ? 'Rolled back'
-                      : deployState!.status === 'HALTED'
+                      : deployState?.status === 'HALTED'
                       ? 'Halted'
-                      : deployState!.status}
-                    {deployState!.rollback_count > 0 && ` ×${deployState!.rollback_count}`}
+                      : deployState?.status}
+                    {(deployState?.rollback_count ?? 0) > 0 && ` ×${deployState?.rollback_count ?? 0}`}
                   </span>
-                  {deployState!.pause_reason && (
-                    <span className="text-neutral-500 max-w-[160px] truncate" title={deployState!.pause_reason}>
-                      — {deployState!.pause_reason}
+                  {deployState?.pause_reason && (
+                    <span className="text-neutral-500 max-w-[160px] truncate" title={deployState?.pause_reason}>
+                      — {deployState?.pause_reason}
                     </span>
                   )}
                 </div>
