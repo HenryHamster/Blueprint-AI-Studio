@@ -1449,6 +1449,7 @@ async function handleResearch(
   model?: string, effort?: string
 ) {
   const directions = payload.directions as Array<Record<string, unknown>> || [];
+  const currentDirectionId = payload.current_direction_id as string | undefined;
   const baseBranch = String(payload.base_branch || 'main');
   const userPrompt = String(payload.prompt || payload.description || task.description || '');
 
@@ -1539,13 +1540,56 @@ ${hotspotsSection}
             const descs = Array.isArray(h.key_finding_descriptions)
               ? '\n    Key findings: ' + (h.key_finding_descriptions as string[]).map(d => d.slice(0, 150)).join(' | ')
               : '';
-            return `  - ${h.timestamp}: ${h.tasks_created} tasks (${titles})${descs}`;
+            const outcomeParts: string[] = [];
+            if (typeof h.prs_merged === 'number' && h.prs_merged > 0) outcomeParts.push(`${h.prs_merged} merged`);
+            if (typeof h.tasks_failed === 'number' && h.tasks_failed > 0) outcomeParts.push(`${h.tasks_failed} failed`);
+            if (typeof h.tasks_cancelled === 'number' && h.tasks_cancelled > 0) outcomeParts.push(`${h.tasks_cancelled} cancelled`);
+            const outcomeStats = outcomeParts.length > 0 ? ` (${outcomeParts.join(', ')})` : '';
+            const insights = Array.isArray(h.cycle_insights) && (h.cycle_insights as string[]).length > 0
+              ? '\n    Insights: ' + (h.cycle_insights as string[]).join(' | ')
+              : '';
+            const subNotes = (h.sub_research_notes as Array<{depth: number; tasks_created: number; finding_titles: string[]}> || []);
+            const subSummary = subNotes.length > 0
+              ? '\n' + subNotes.map(s =>
+                  `    Sub-research (depth ${s.depth}): ${s.tasks_created} tasks (${s.finding_titles.join(', ')})`
+                ).join('\n')
+              : '';
+            return `  - ${h.timestamp}: ${h.tasks_created} tasks created${outcomeStats} — ${titles}${descs}${insights}${subSummary}`;
           }).join('\n');
           historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):\n${entries}`;
         }
-        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}`;
+        const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
+        let notesSection = '';
+        if (notes.length > 0) {
+          const recent = notes.slice(-3).map(n => `  • ${n.text.slice(0, 120)}`).join('\n');
+          notesSection = `\n  Agent notes (last ${Math.min(notes.length, 3)}):\n${recent}`;
+        }
+        const saturationNote = d.possibly_saturated
+          ? '\n  ⚠ SATURATION SIGNAL: Last 3 cycles produced ≤1 finding each. Consider proposing a direction_update to narrow the scope, or a direction_proposal for a related but more specific area. Avoid reproposing previously attempted work.'
+          : '';
+        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}${notesSection}${saturationNote}`;
       }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
+
+  // Build cross-direction context from OTHER active directions
+  const otherDirections = currentDirectionId
+    ? directions.filter(d => d.id !== currentDirectionId && d.status === 'active')
+    : [];
+  let crossDirSection = '';
+  if (otherDirections.length > 0) {
+    const snippets = otherDirections
+      .filter(d => Array.isArray(d.research_history) && (d.research_history as unknown[]).length > 0)
+      .map(d => {
+        const history = d.research_history as Array<Record<string, unknown>>;
+        const lastCycle = history[history.length - 1];
+        const titles = (Array.isArray(lastCycle.finding_titles) ? lastCycle.finding_titles as string[] : []).slice(0, 3).join(', ');
+        return `- "${String(d.text).slice(0, 80)}": ${lastCycle.tasks_created} tasks (${titles || 'none'})`;
+      })
+      .slice(0, 3);  // max 3 other directions
+    if (snippets.length > 0) {
+      crossDirSection = `\n\nOther active directions (recent activity — avoid duplicating):\n${snippets.join('\n')}`;
+    }
+  }
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
@@ -1553,17 +1597,24 @@ ${hotspotsSection}
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
 
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
-    ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string}>)
+    ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string, status?: string}>)
     : [];
 
   const researchPrompt = `${contextPrefix}${codebaseSummary}${fileTreeSection}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
 ${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
-${directionsText}
+${directionsText}${crossDirSection}
 
 Recently completed tasks (DO NOT re-propose these — they were already implemented):
 ${recentlyCompleted.length > 0
-  ? recentlyCompleted.map(t => `- [${t.task_type}] ${t.title}`).join('\n')
+  ? recentlyCompleted.map(t => {
+      const status = t.status ?? 'completed';
+      let label: string;
+      if (status === 'failed') label = '(FAILED — avoid reproposing)';
+      else if (status === 'cancelled') label = '(cancelled)';
+      else label = '(merged)';
+      return `- [${t.task_type}] ${t.title} ${label}`;
+    }).join('\n')
   : '(none yet)'}
 
 Rules for avoiding duplication:
@@ -1594,7 +1645,7 @@ Instructions:
 ]
 
 Valid values:
-- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate, perf, direction_proposal, direction_update
+- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate, perf, direction_proposal, direction_update, direction_note
   (use "research" when an area needs deeper investigation before implementation)
   (use "security_audit" when the finding involves security vulnerabilities that need a dedicated audit)
   (use "qa" when the finding is about missing test coverage)
@@ -1604,6 +1655,7 @@ Valid values:
   (use "perf" when the finding involves performance bottlenecks — database queries, API latency, frontend bundle size)
   (use "direction_proposal" when you discover a strategic area warranting a permanent standing research direction — see Direction Proposals section below)
   (use "direction_update" when an existing direction is too vague, mis-prioritized, or could benefit from a path scope — see below)
+  (use "direction_note" when you observe something important about a direction's scope, constraints, or promising areas that doesn't warrant a full direction_update — see below)
 - scope: small (single file, under 50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural, orchestrator/model/agent/security changes — anything that could break the system if done wrong)
 - risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
 - priority: high, medium, low
@@ -1644,7 +1696,12 @@ How your findings get routed (you control this via type and scope):
   - suggested_paths: array of path prefixes to scope the direction (or omit)
   - description: rationale for why this update improves the direction
   - Use this when a direction is too vague, incorrectly scoped, or mis-prioritized. Propose at most 1 direction_update per research cycle.
+- type=direction_note → appends a persistent note to a direction (no task created, no user review needed)
+  - direction_id: the id of the direction to annotate (from the directions list above)
+  - description: the note text (max 500 chars) — observations about scope, constraints, dead ends, or promising areas for future research
+  - Use this when you observe something worth preserving for future research cycles that doesn't warrant a full direction_update. Notes are shown to future research agents in the directions list.
 - IMPORTANT: Write your findings JSON array to /tmp/research_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- OPTIONAL: You may also write a research insights file to /tmp/research_insights_${taskId}.json containing architectural observations, blockers, or recommendations for future research cycles. These are NOT tasks to implement — they are notes about the codebase state that will appear in the history context for future agents. Format: [{"summary": "concise observation under 200 chars", "area": "path/to/relevant/file"}]. Omit this file if you have no significant observations beyond your findings.
 
 ## Direction Proposals
 If you discover a strategic area that clearly warrants ongoing research over multiple cycles — not just a one-time fix — you may propose it as a new standing direction. Use type=direction_proposal with this structure:

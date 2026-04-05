@@ -8,6 +8,17 @@ interface Project {
   [key: string]: unknown;
 }
 
+interface ResearchHistoryEntry {
+  timestamp: string;
+  task_id: string;
+  tasks_created: number;
+  finding_titles: string[];
+  key_finding_descriptions: string[];
+  tasks_completed?: number;
+  tasks_failed?: number;
+  cycle_insights?: string[];
+}
+
 interface Direction {
   id: string;
   text: string;
@@ -19,6 +30,8 @@ interface Direction {
   proposed_by?: string;
   proposal_rationale?: string;
   proposed_at?: string;
+  research_history?: ResearchHistoryEntry[];
+  possibly_saturated?: boolean;
   pending_update?: {
     suggested_text?: string;
     suggested_priority?: string;
@@ -27,6 +40,11 @@ interface Direction {
     proposed_at: string;
     proposed_by: string;
   };
+  notes?: Array<{
+    text: string;
+    added_at: string;
+    added_by_task: string;
+  }>;
 }
 
 function formatRelativeTime(isoString: string): string {
@@ -107,6 +125,9 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
   // Collapsible sections — all expanded by default
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  // Research history open state per direction
+  const [historyOpenIds, setHistoryOpenIds] = useState<Record<string, boolean>>({});
 
   // Autonomous config settings (global)
   const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
@@ -981,6 +1002,14 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     ))}
                                   </div>
                                 )}
+                                {d.notes && d.notes.length > 0 && (
+                                  <div className="mt-2 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
+                                    <div className="text-neutral-500 font-medium mb-1">Agent notes ({d.notes.length}):</div>
+                                    {d.notes.slice(-3).map((n, ni) => (
+                                      <div key={ni} className="text-neutral-500 leading-relaxed">• {n.text.slice(0, 120)}</div>
+                                    ))}
+                                  </div>
+                                )}
                                 {d.pending_update && (
                                   <div className="mt-2 p-2 bg-amber-950/20 border border-amber-900/30 rounded text-xs">
                                     <div className="text-amber-400 font-medium mb-1">Agent suggests update:</div>
@@ -997,6 +1026,70 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                       <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
                                       <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
                                     </div>
+                                  </div>
+                                )}
+                                {d.research_history && d.research_history.length > 0 && (
+                                  <div className="mt-2">
+                                    <button
+                                      onClick={() => setHistoryOpenIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
+                                      className="flex items-center gap-1.5 w-full text-left group"
+                                    >
+                                      {historyOpenIds[d.id]
+                                        ? <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                                        : <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                                      }
+                                      <span className="text-[10px] font-medium text-neutral-500 uppercase tracking-wider group-hover:text-neutral-400 transition-colors flex-1">
+                                        Research History ({d.research_history.length})
+                                      </span>
+                                      {d.possibly_saturated && (
+                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
+                                          possibly saturated
+                                        </span>
+                                      )}
+                                    </button>
+                                    {historyOpenIds[d.id] && (
+                                      <div className="mt-1.5 space-y-2">
+                                        {d.research_history.slice(0, 5).map((entry, i) => (
+                                          <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-[10px]">
+                                            <div className="flex items-center justify-between mb-1">
+                                              <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>
+                                              <div className="flex items-center gap-1.5 text-neutral-600">
+                                                <span>{entry.tasks_created} created</span>
+                                                {entry.tasks_completed != null && (
+                                                  <span className="text-emerald-600">{entry.tasks_completed} done</span>
+                                                )}
+                                                {entry.tasks_failed != null && entry.tasks_failed > 0 && (
+                                                  <span className="text-red-600">{entry.tasks_failed} failed</span>
+                                                )}
+                                              </div>
+                                            </div>
+                                            {entry.finding_titles.length > 0 && (
+                                              <p className="text-neutral-500 leading-relaxed">
+                                                {entry.finding_titles.join(', ')}
+                                              </p>
+                                            )}
+                                            {entry.key_finding_descriptions.length > 0 && (
+                                              <div className="mt-1 space-y-0.5">
+                                                {entry.key_finding_descriptions.map((desc, j) => (
+                                                  <p key={j} className="text-neutral-600 leading-relaxed">
+                                                    {desc.length > 100 ? desc.slice(0, 100) + '…' : desc}
+                                                  </p>
+                                                ))}
+                                              </div>
+                                            )}
+                                            {entry.cycle_insights && entry.cycle_insights.length > 0 && (
+                                              <div className="mt-1 space-y-0.5 border-t border-neutral-800/60 pt-1">
+                                                {entry.cycle_insights.map((insight, j) => (
+                                                  <p key={j} className="text-blue-500/70 leading-relaxed italic">
+                                                    {insight}
+                                                  </p>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                               </div>

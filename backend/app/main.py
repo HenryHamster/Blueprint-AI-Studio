@@ -907,10 +907,16 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     for t in evaluating_research:
         payload = (t.payloads or [{}])[0]
         if payload.get("type") == "research":
-            for direction in payload.get("directions", []):
-                did = direction.get("id")
-                if did:
-                    busy_direction_ids.add(did)
+            # New-format tasks include all active directions but only one is targeted
+            current_did = payload.get("current_direction_id")
+            if current_did:
+                busy_direction_ids.add(current_did)
+            else:
+                # Legacy format: single direction in list
+                for direction in payload.get("directions", []):
+                    did = direction.get("id")
+                    if did:
+                        busy_direction_ids.add(did)
 
     active_directions = []
     for d in (project.directions or []):
@@ -1000,9 +1006,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
     research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
+    # Include all active directions so the agent can see cross-direction context,
+    # but mark which one is the current research target.
+    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
     research_payload: dict = {
         "type": "research",
-        "directions": [chosen_direction],
+        "directions": all_active_directions,
+        "current_direction_id": chosen_direction.get("id"),
         "base_branch": base_branch,
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
@@ -3646,13 +3656,21 @@ async def claim_task(
                 "prompt": p.get("prompt", p.get("description", "")),
             })
 
-        # Recently completed tasks (10 most recent)
+        # Recently completed tasks (10 most recent): completed first, then failed/cancelled
         completed_stmt = select(Task).where(
             Task.project_id == task.project_id,
             Task.id != task.id,
             Task.status == TaskStatus.COMPLETED
         ).order_by(Task.created_at.desc()).limit(10)
-        completed_tasks_rows = (await session.execute(completed_stmt)).scalars().all()
+        completed_tasks_rows = list((await session.execute(completed_stmt)).scalars().all())
+
+        failed_cancelled_stmt = select(Task).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED])
+        ).order_by(Task.created_at.desc()).limit(max(0, 15 - len(completed_tasks_rows)))
+        failed_cancelled_rows = (await session.execute(failed_cancelled_stmt)).scalars().all()
+        completed_tasks_rows = completed_tasks_rows + list(failed_cancelled_rows)
 
         completed_task_ids = [t.id for t in completed_tasks_rows]
         completed_artifacts: list = []
@@ -3686,6 +3704,7 @@ async def claim_task(
                 "id": str(t.id),
                 "title": t.title,
                 "task_type": p.get("type", ""),
+                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
                 "pr_url": pr_url,
                 "research_findings_summary": research_findings_summary,
             })
@@ -4281,6 +4300,14 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
     return None
 
 
+def _compute_saturation(history: list) -> bool:
+    """Return True if last 3 cycles all produced 0 or 1 tasks."""
+    if len(history) < 3:
+        return False
+    recent = history[-3:]
+    return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
+
+
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
     """Extract structured research findings JSON array from agent output text."""
     json_str = _extract_json_array(text, "title", "prompt")
@@ -4324,6 +4351,22 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
                 except json.JSONDecodeError:
                     pass
     return None
+
+
+def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
+    """Read structured research insights from the agent's /tmp output file."""
+    insights_path = f"/tmp/research_insights_{task_id}.json"
+    try:
+        if not os.path.exists(insights_path):
+            return []
+        with open(insights_path, "r") as f:
+            raw = f.read(200_000)
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [i for i in data if isinstance(i, dict) and "summary" in i]
+    except Exception as e:
+        logger.warning(f"[RESEARCH] Failed to read insights file {insights_path}: {e}")
+    return []
 
 
 def _validate_plan_dependencies(subtasks: List[Dict]) -> bool:
@@ -4945,6 +4988,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)
+    parent_research_task_id = (task.context or {}).get("parent_research_task_id")
     if research_depth >= MAX_RESEARCH_DEPTH:
         task.latest_status_message = f"Research depth limit ({MAX_RESEARCH_DEPTH}) reached — not spawning further tasks"
         session.add(task)
@@ -4953,16 +4997,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
 
     findings = _parse_research_findings(logs)
+    insights = _parse_research_insights(str(task.id))
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         session.add(task)
         await session.commit()
         return
 
-    # Separate direction proposals from actionable findings — proposals become pending
-    # directions awaiting user approval, not implementation tasks.
+    # Separate direction proposals and notes from actionable findings — these are processed
+    # separately and must not enter the hash-based deduplication loop (they never create tasks,
+    # so their hashes would never be stored, allowing identical entries to accumulate).
     direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
-    findings = [f for f in findings if f.get("type") != "direction_proposal"]
+    direction_notes = [f for f in findings if f.get("type") == "direction_note"]
+    findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
 
     # Cap findings to prevent runaway task creation
     if len(findings) > 30:
@@ -5264,18 +5311,76 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 did = d.get("id")
                 if did in direction_ids_with_findings:
                     history = d.get("research_history", [])
+                    dir_child_tasks = [ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
-                        "tasks_created": len([ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]),
+                        "tasks_created": len(dir_child_tasks),
+                        "child_task_ids": [str(ct.id) for ct in dir_child_tasks],
                         "finding_titles": finding_titles_by_dir.get(did, [])[:5],
                         "key_finding_descriptions": finding_descriptions_by_dir.get(did, [])[:5],
+                        "cycle_insights": [i["summary"][:200] for i in insights[:3]],
                     }
                     # Keep last 10 history entries to avoid unbounded growth
-                    d["research_history"] = [*history, entry][-10:]
+                    d["research_history"] = (history + [entry])[-10:]
+                    d["possibly_saturated"] = _compute_saturation(d["research_history"])
             project.directions = directions
             flag_modified(project, "directions")
             session.add(project)
+
+            # If this is a sub-research task (depth > 0), also annotate the parent direction's
+            # most recent research_history entry with a note about sub-research findings.
+            if research_depth > 0 and parent_research_task_id and direction_ids_with_findings:
+                parent_project = await session.get(Project, task.project_id)
+                if parent_project and parent_project.directions:
+                    parent_dirs = list(parent_project.directions)
+                    for d in parent_dirs:
+                        did = d.get("id")
+                        if did not in direction_ids_with_findings:
+                            continue
+                        history = d.get("research_history", [])
+                        if history:
+                            last_entry = history[-1]
+                            sub_notes = last_entry.get("sub_research_notes", [])
+                            sub_notes.append({
+                                "sub_task_id": str(task.id),
+                                "depth": research_depth,
+                                "tasks_created": len(child_tasks),
+                                "finding_titles": [f.get("title", "") for _, f, _ in deduplicated[:3]],
+                            })
+                            last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
+                            history[-1] = last_entry
+                            d["research_history"] = history
+                    parent_project.directions = parent_dirs
+                    flag_modified(parent_project, "directions")
+                    session.add(parent_project)
+
+    # Process direction notes — append to the target direction's notes list
+    if direction_notes:
+        note_project = await session.get(Project, task.project_id)
+        if note_project:
+            note_directions = list(note_project.directions or [])
+            changed = False
+            for note_finding in direction_notes:
+                target_id = note_finding.get("direction_id")
+                note_text = (note_finding.get("description") or note_finding.get("prompt") or "")[:500]
+                if not note_text or not target_id:
+                    continue
+                for d in note_directions:
+                    if d.get("id") == target_id:
+                        notes = d.get("notes", [])
+                        notes.append({
+                            "text": note_text,
+                            "added_at": _utcnow().isoformat(),
+                            "added_by_task": str(task.id),
+                        })
+                        d["notes"] = notes[-20:]  # keep last 20 notes
+                        changed = True
+                        break
+            if changed:
+                note_project.directions = note_directions
+                flag_modified(note_project, "directions")
+                session.add(note_project)
 
     # Process direction proposals — add to Project.directions with status='proposed'
     proposals_created = 0
@@ -5351,6 +5456,56 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
     logger.info(f"[RESEARCH] Created {len(child_tasks)} tasks from research {task.id}")
+
+
+async def _update_direction_research_outcomes(
+    project_id: uuid.UUID, direction_id: str, research_task_id: str, session: AsyncSession
+) -> None:
+    """Update a direction's research_history entry with child task outcome counts.
+
+    Called whenever a child task of a research cycle reaches a terminal status so
+    that research_history entries accumulate live outcome statistics.
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        return
+    directions = list(project.directions or [])
+    updated = False
+    for d in directions:
+        if d.get("id") != direction_id:
+            continue
+        history = d.get("research_history", [])
+        for entry in history:
+            if entry.get("task_id") != research_task_id:
+                continue
+            child_ids = entry.get("child_task_ids", [])
+            if not child_ids:
+                break
+            child_uuids = []
+            for cid in child_ids:
+                try:
+                    child_uuids.append(uuid.UUID(cid))
+                except ValueError:
+                    pass
+            if not child_uuids:
+                break
+            child_tasks_stmt = select(Task).where(Task.id.in_(child_uuids))
+            child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
+            entry["tasks_completed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED)
+            entry["tasks_failed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED)
+            entry["tasks_cancelled"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED)
+            entry["prs_merged"] = sum(
+                1 for ct in child_tasks_rows
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+            )
+            updated = True
+            break
+        if updated:
+            break
+    if updated:
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
 
 
 # --- Rollup & Branch Cleanup Helpers ---
@@ -6950,6 +7105,25 @@ async def update_agent_status(
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
             await _check_and_trigger_rollup(task, session)
+
+        # 6b. Update direction research history outcomes for child tasks of a research cycle
+        _task_ctx = task.context or {}
+        if (
+            _task_ctx.get("direction_id")
+            and _task_ctx.get("research_task_id")
+            and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        ):
+            try:
+                await _update_direction_research_outcomes(
+                    task.project_id,
+                    _task_ctx["direction_id"],
+                    _task_ctx["research_task_id"],
+                    session,
+                )
+            except Exception as _outcome_exc:
+                logger.warning(
+                    f"[RESEARCH] Failed to update direction research outcomes for task {task.id}: {_outcome_exc!r}"
+                )
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.

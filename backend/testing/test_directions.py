@@ -532,6 +532,83 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     assert len(child_tasks) == 0, "direction_update findings must not create child tasks"
 
 
+
+@pytest.mark.asyncio
+async def test_handle_research_completion_direction_note_appends_note(db_session, mocker):
+    """A direction_note finding appends a note to the target direction and creates no task."""
+    direction_id = "d-dnote01"
+    direction = {
+        "id": direction_id,
+        "text": "Improve logging coverage",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+
+    project = Project(
+        name="Direction Note Test",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Improve logging coverage",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch("app.main.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
+    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.main._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.main._parse_research_findings",
+        return_value=[{
+            "type": "direction_note",
+            "direction_id": direction_id,
+            "title": "Logging observation",
+            "description": "Found that request errors are not logged at the middleware level.",
+            "prompt": "",  # direction_note findings have no task prompt
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    # Reload from DB
+    await db_session.refresh(project)
+    updated_directions = project.directions
+    target = next((d for d in updated_directions if d["id"] == direction_id), None)
+    assert target is not None
+
+    # Note should be appended
+    assert "notes" in target, "notes list should be written to the direction"
+    assert len(target["notes"]) == 1
+    note = target["notes"][0]
+    assert note["text"] == "Found that request errors are not logged at the middleware level."
+    assert "added_at" in note
+    assert "added_by_task" in note
+
+    # No child task should have been created
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "direction_note findings must not create child tasks"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Task-Counts Endpoint
 # ─────────────────────────────────────────────────────────────────────────────

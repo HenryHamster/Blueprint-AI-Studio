@@ -1846,10 +1846,16 @@ async def get_direction_task_counts(
         payload = (task.payloads or [{}])[0]
         if payload.get("type") != "research":
             continue
-        for direction in payload.get("directions", []):
-            d_id = direction.get("id")
-            if d_id:
-                counts[d_id] = counts.get(d_id, 0) + 1
+        # New-format tasks have current_direction_id pointing to the targeted direction
+        current_did = payload.get("current_direction_id")
+        if current_did:
+            counts[current_did] = counts.get(current_did, 0) + 1
+        else:
+            # Legacy format: count all directions in the list
+            for direction in payload.get("directions", []):
+                d_id = direction.get("id")
+                if d_id:
+                    counts[d_id] = counts.get(d_id, 0) + 1
 
     return {"counts": counts}
 
