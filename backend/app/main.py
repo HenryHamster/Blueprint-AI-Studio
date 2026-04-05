@@ -1840,6 +1840,7 @@ async def orchestrator_worker():
                                    if t.id not in eligible_ids
                                    and (t.depends_on or [])
                                    and t.status == TaskStatus.QUEUED]
+                    narrow_broken = 0
                     if stuck_tasks:
                         stuck_ids = {t.id for t in stuck_tasks}
                         for stask in stuck_tasks:
@@ -1883,7 +1884,7 @@ async def orchestrator_worker():
                                         fix_session.add(fix_task)
                                         await fix_session.commit()
                                 eligible_ids.append(stask.id)
-                                break  # One per check — conservative
+                                narrow_broken += 1
 
                     # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
@@ -1894,6 +1895,7 @@ async def orchestrator_worker():
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
                     broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
+                    broad_broken = 0
                     if broad_stuck:
                         broad_stuck_ids = {t.id for t in broad_stuck}
                         for stask in broad_stuck:
@@ -1927,7 +1929,13 @@ async def orchestrator_worker():
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
                                         fix_session.add(fix_task)
                                         await fix_session.commit()
-                                break  # One per check — conservative
+                                broad_broken += 1
+                    total_broken = narrow_broken + broad_broken
+                    if total_broken > 0:
+                        logger.warning(
+                            f"[ORCHESTRATOR] Deadlock resolution cycle complete: "
+                            f"{narrow_broken} narrow + {broad_broken} broad = {total_broken} deadlock(s) broken"
+                        )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 # Build a set of files currently being modified by IN_PROGRESS tasks
