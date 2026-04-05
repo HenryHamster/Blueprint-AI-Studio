@@ -9,7 +9,7 @@ import httpx
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
@@ -2613,6 +2613,21 @@ async def dismiss_alert(
     return {"status": "dismissed"}
 
 
+@router.post("/alerts/dismiss-all")
+async def dismiss_all_alerts(
+    project_id: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    stmt = update(Alert).where(Alert.dismissed_at.is_(None))
+    if project_id:
+        stmt = stmt.where(Alert.project_id == project_id)
+    stmt = stmt.values(dismissed_at=_utcnow())
+    result = await session.execute(stmt)
+    await session.commit()
+    return {"dismissed_count": result.rowcount}
+
+
 # ── Autonomy Debug ────────────────────────────────────────────────────────────
 
 @router.get("/projects/{project_id}/autonomy-debug")
@@ -3112,21 +3127,56 @@ async def get_digest(
 ):
     """Return a catch-up digest of activity within the requested time window."""
     window_start = _utcnow() - timedelta(hours=hours)
+    # Extend lookback to capture long-running tasks that completed within the window
+    lookback_start = _utcnow() - timedelta(hours=min(hours * 2, 24 * 7))
 
-    # --- Query all tasks created in window ---
-    task_filters = [Task.created_at >= window_start]
+    def _derive_completed_at(t: Task):
+        if t.status_log:
+            try:
+                return datetime.fromisoformat(t.status_log[-1]["t"])
+            except (KeyError, ValueError):
+                pass
+        return t.created_at
+
+    # --- Query tasks from extended lookback window ---
+    task_filters = [Task.created_at >= lookback_start]
     if project_id:
         task_filters.append(Task.project_id == project_id)
 
     tasks_result = await session.execute(select(Task).where(*task_filters))
     all_tasks = tasks_result.scalars().all()
 
-    completed_tasks = [t for t in all_tasks if t.status == TaskStatus.COMPLETED]
-    failed_tasks = [t for t in all_tasks if t.status == TaskStatus.FAILED]
+    # Post-filter completed/failed by completion timestamp, not creation time
+    completed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.COMPLETED and _derive_completed_at(t) >= window_start
+    ]
+    failed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
+    ]
+    # Approval tasks use created_at (they haven't completed yet)
     approval_tasks = [
         t for t in all_tasks
-        if t.requires_approval and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        if t.requires_approval
+        and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        and t.created_at >= window_start
     ]
+
+    # --- Query active tasks (not filtered by window — they may have started before it) ---
+    _active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    active_filters = [Task.status.in_(_active_statuses)]
+    if project_id:
+        active_filters.append(Task.project_id == project_id)
+    active_result = await session.execute(
+        select(Task).where(*active_filters).order_by(Task.started_at.asc().nullsfirst())
+    )
+    active_tasks_all = active_result.scalars().all()
 
     # research_cycles: completed tasks with task_type == 'research'
     research_cycles = sum(
@@ -3160,14 +3210,6 @@ async def get_digest(
                 pr_artifact_map[tid] = a.pr_url or ""
             elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in error_log_map:
                 error_log_map[tid] = a.logs[:200]
-
-    def _derive_completed_at(t: Task):
-        if t.status_log:
-            try:
-                return datetime.fromisoformat(t.status_log[-1]["t"])
-            except (KeyError, ValueError):
-                pass
-        return t.created_at
 
     # --- needs_attention: failed + pending approval ---
     _now = _utcnow()
@@ -3231,6 +3273,18 @@ async def get_digest(
             "task_type": task_type,
         })
 
+    # --- active_tasks list (up to 5, oldest started first) ---
+    active_tasks_list = [
+        {
+            "task_id": str(t.id),
+            "title": t.title or "Active task",
+            "status": t.status.value if hasattr(t.status, "value") else t.status,
+            "task_type": ((t.payloads or [{}])[0]).get("type", "create"),
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+        }
+        for t in active_tasks_all[:5]
+    ]
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -3239,6 +3293,8 @@ async def get_digest(
         "pending_approval_count": len(approval_tasks),
         "research_cycles": research_cycles,
         "prs_opened": pr_count,
+        "active_count": len(active_tasks_all),
+        "active_tasks": active_tasks_list,
         "needs_attention": needs_attention,
         "recent_failures": recent_failures,
         "recent_completions": recent_completions,

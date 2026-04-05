@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
+import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2 } from 'lucide-react';
 import { apiFetch } from '../api';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
 import type { TaskType } from './TaskCard';
@@ -30,6 +30,14 @@ interface RecentCompletion {
   task_type: string;
 }
 
+interface ActiveTask {
+  task_id: string;
+  title: string;
+  status: string;
+  task_type: string;
+  started_at: string | null;
+}
+
 interface DigestData {
   window_hours: number;
   generated_at: string;
@@ -38,6 +46,8 @@ interface DigestData {
   pending_approval_count: number;
   research_cycles: number;
   prs_opened: number;
+  active_count: number;
+  active_tasks: ActiveTask[];
   needs_attention: NeedsAttentionItem[];
   recent_failures: RecentFailure[];
   recent_completions: RecentCompletion[];
@@ -48,6 +58,7 @@ export interface CatchUpPanelProps {
   lastVisitTimestamp: number | null;
   refreshInterval: number;
   onSelectTask: (task: { id: string }) => void;
+  onOpenActivityFeed?: () => void;
 }
 
 type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
@@ -128,13 +139,14 @@ function SkeletonRow() {
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed }: CatchUpPanelProps) {
   const [collapsed, setCollapsed] = useState(() =>
     localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true'
   );
   const [activeWindow, setActiveWindow] = useState<TimeWindow>('last_visit');
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [activeExpanded, setActiveExpanded] = useState(false);
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
@@ -191,7 +203,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     digest.failed_count > 0 ||
     digest.pending_approval_count > 0 ||
     digest.research_cycles > 0 ||
-    digest.prs_opened > 0
+    digest.prs_opened > 0 ||
+    digest.active_count > 0
   );
 
   // Failures not already in needs_attention
@@ -268,7 +281,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   <span>{digest!.research_cycles} research cycle{digest!.research_cycles !== 1 ? 's' : ''}</span>
                 )}
                 {digest!.prs_opened > 0 && (
-                  <span>{digest!.prs_opened} PR{digest!.prs_opened !== 1 ? 's' : ''} merged</span>
+                  <span>{digest!.prs_opened} PR{digest!.prs_opened !== 1 ? 's' : ''} opened</span>
+                )}
+                {digest!.active_count > 0 && (
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 text-neutral-500 animate-spin" />
+                    {digest!.active_count} running
+                  </span>
                 )}
               </div>
 
@@ -314,6 +333,44 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* In progress */}
+              {digest!.active_count > 0 && (
+                <div>
+                  <button
+                    onClick={() => setActiveExpanded(v => !v)}
+                    className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
+                  >
+                    {activeExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                    <Loader2 className="w-3 h-3 text-neutral-500" />
+                    In progress ({digest!.active_count})
+                  </button>
+                  {activeExpanded && (
+                    <div className="flex flex-col gap-1.5">
+                      {digest!.active_tasks.map(t => (
+                        <div
+                          key={t.task_id}
+                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                          onClick={() => onSelectTask({ id: t.task_id })}
+                        >
+                          <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                          <span className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500">
+                            {t.status}
+                          </span>
+                          {t.started_at && (
+                            <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{formatRelativeTime(t.started_at)}</span>
+                          )}
+                        </div>
+                      ))}
+                      {digest!.active_count > digest!.active_tasks.length && (
+                        <div className="text-[10px] text-neutral-600 px-2">
+                          +{digest!.active_count - digest!.active_tasks.length} more
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -410,6 +467,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </div>
                 );
               })()}
+              {onOpenActivityFeed && (
+                <button
+                  onClick={onOpenActivityFeed}
+                  className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors mt-1 self-end"
+                >
+                  View full activity ↗
+                </button>
+              )}
             </div>
           )}
         </div>

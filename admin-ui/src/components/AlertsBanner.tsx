@@ -18,14 +18,25 @@ const iconColors: Record<Alert['severity'], string> = {
 interface AlertsBannerProps {
   alerts: Alert[];
   onDismiss: (id: string) => void;
+  onDismissAll?: () => void;
   onViewTask?: (taskId: string) => void;
 }
 
-export function AlertsBanner({ alerts, onDismiss, onViewTask }: AlertsBannerProps) {
+export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask }: AlertsBannerProps) {
   if (alerts.length === 0) return null;
 
   return (
     <div className="mb-4 flex flex-col gap-2 shrink-0">
+      {alerts.length > 1 && onDismissAll && (
+        <div className="flex justify-end">
+          <button
+            onClick={onDismissAll}
+            className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors"
+          >
+            Dismiss all
+          </button>
+        </div>
+      )}
       {alerts.map(alert => (
         <div
           key={alert.id}

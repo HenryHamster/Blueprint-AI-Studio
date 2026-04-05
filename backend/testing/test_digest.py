@@ -39,6 +39,8 @@ async def test_digest_empty_window(client: AsyncClient):
     assert data["pending_approval_count"] == 0
     assert data["research_cycles"] == 0
     assert data["prs_opened"] == 0
+    assert data["active_count"] == 0
+    assert data["active_tasks"] == []
     assert data["needs_attention"] == []
     assert data["recent_failures"] == []
     assert data["recent_completions"] == []
@@ -220,6 +222,73 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     titles = [c["title"] for c in data["recent_completions"]]
     assert "Task A" in titles
     assert "Task B" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_active_count(client: AsyncClient, db_session):
+    """In-progress tasks appear in active_count/active_tasks and not in completed_count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_task = make_task(
+        project_id=project.id,
+        title="Active Task",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    completed_task = make_task(
+        project_id=project.id,
+        title="Done Task",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(active_task)
+    db_session.add(completed_task)
+    await db_session.commit()
+    await db_session.refresh(active_task)
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["active_count"] >= 1
+    assert data["completed_count"] == 1
+
+    active_ids = {t["task_id"] for t in data["active_tasks"]}
+    assert str(active_task.id) in active_ids
+
+    # active task should not bleed into completed_count
+    completed_titles = [c["title"] for c in data["recent_completions"]]
+    assert "Active Task" not in completed_titles
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_long_running_completed_task(client: AsyncClient, db_session):
+    """A task created before the window but completed within it appears in completed_count."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task created 30 hours ago (outside 24h window) but completed 1 hour ago (inside window)
+    completion_time = _utcnow() - timedelta(hours=1)
+    long_running = make_task(
+        project_id=project.id,
+        title="Long Running Task",
+        status=TaskStatus.COMPLETED,
+        created_at=_utcnow() - timedelta(hours=30),
+        status_log=[{"t": completion_time.isoformat(), "status": "completed"}],
+    )
+    db_session.add(long_running)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest?hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["completed_count"] == 1
+    titles = [c["title"] for c in data["recent_completions"]]
+    assert "Long Running Task" in titles
 
 
 @pytest.mark.smoketest

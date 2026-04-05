@@ -565,6 +565,25 @@ export function useAppState() {
     }
   };
 
+  const dismissAllAlerts = async () => {
+    const prev = alerts;
+    setAlerts([]);
+    try {
+      const url = selectedProjectId
+        ? `${API_BASE_URL}/api/admin/alerts/dismiss-all?project_id=${selectedProjectId}`
+        : `${API_BASE_URL}/api/admin/alerts/dismiss-all`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error('Failed to dismiss all alerts:', err);
+      setAlerts(prev);
+      addToast('Failed to dismiss all alerts', 'error');
+    }
+  };
+
   const handlePauseAllAutonomous = async () => {
     const res = await fetch(`${API_BASE_URL}/api/admin/autonomous/pause-all`, {
       method: 'POST',
@@ -1688,7 +1707,7 @@ export function useAppState() {
     // Toasts
     toasts, addToast, dismissToast,
     // Alerts
-    alerts, dismissAlert,
+    alerts, dismissAlert, dismissAllAlerts,
     // View
     viewMode, setViewMode,
     compactMode, setCompactMode,

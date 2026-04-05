@@ -423,6 +423,10 @@ export default function App() {
           if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
           else s.dismissAlert(id);
         }}
+        onDismissAll={() => {
+          setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+          s.dismissAllAlerts();
+        }}
         onViewTask={(taskId) => {
           const task = s.tasks.find(t => t.id === taskId);
           if (task) s.handleViewLogs(task);
@@ -440,6 +444,7 @@ export default function App() {
               s.addToast('Could not load task — it may have been deleted', 'error');
             });
           }}
+          onOpenActivityFeed={() => s.setShowActivityFeed(true)}
         />
       )}
 
