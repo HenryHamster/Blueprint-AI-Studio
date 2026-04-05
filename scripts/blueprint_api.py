@@ -156,6 +156,13 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.command == "create_task":
+        # fix and review types require --branch and --pr-number (they operate on existing PRs)
+        if args.task_type in ("fix", "review") and not args.branch:
+            print(f"Error: --branch is required for task type '{args.task_type}'", file=sys.stderr)
+            sys.exit(1)
+        if args.task_type in ("fix", "review") and not args.pr_number:
+            print(f"Error: --pr-number is required for task type '{args.task_type}'", file=sys.stderr)
+            sys.exit(1)
         result = create_task(
             title=args.title, prompt=args.prompt, task_type=args.task_type,
             base_branch=args.base_branch, pr_number=args.pr_number, branch=args.branch,

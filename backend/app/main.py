@@ -882,6 +882,18 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         active_directions.append(d)
     if not active_directions:
         return
+    # Pick ONE direction per research task to avoid putting all on cooldown at once.
+    # active_directions preserves UI drag-order (index 0 = highest priority).
+    # Among eligible directions, prefer those never researched or oldest researched.
+    import random
+    never_researched = [d for d in active_directions if not d.get("last_researched_at")]
+    if never_researched:
+        chosen_direction = random.choice(never_researched)
+    else:
+        # All have been researched before — pick the one researched longest ago
+        active_directions.sort(key=lambda d: d.get("last_researched_at") or "")
+        chosen_direction = active_directions[0]
+
     # Guard: no research task actively running (queued/provisioning/in_progress).
     # EVALUATING parents are just waiting on children — they don't block new research.
     active_tasks = (await session.execute(
@@ -933,16 +945,17 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     research_payload: dict = {
         "type": "research",
-        "directions": active_directions,
+        "directions": [chosen_direction],
         "base_branch": base_branch,
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
     }
+    direction_text = (chosen_direction.get("text") or "general improvement")[:80]
     new_task = Task(
         project_id=project.id,
-        title="Research: autonomous improvement scan",
-        description="Automated research task triggered by autonomous loop",
+        title=f"Research: {direction_text}",
+        description=f"Autonomous research for direction: {direction_text}",
         payloads=[research_payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
