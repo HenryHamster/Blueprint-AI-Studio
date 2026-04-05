@@ -1867,11 +1867,11 @@ async def orchestrator_worker():
                                 eligible_ids.append(stask.id)
                                 break  # One per check — conservative
 
-                    # Broader scan: check ALL QUEUED tasks older than 30 min (not just candidate batch)
-                    thirty_min_ago = _utcnow() - timedelta(minutes=30)
+                    # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
+                    ten_min_ago = _utcnow() - timedelta(minutes=10)
                     broad_stmt = select(Task).where(
                         Task.status == TaskStatus.QUEUED,
-                        Task.created_at < thirty_min_ago,
+                        Task.created_at < ten_min_ago,
                         Task.requires_approval == False,
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
@@ -1903,7 +1903,7 @@ async def orchestrator_worker():
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
-                                            f"for task {stask.id} (stuck >{30}min with {len(dep_uuids)} unresolvable deps)"
+                                            f"for task {stask.id} (stuck >{10}min with {len(dep_uuids)} unresolvable deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
