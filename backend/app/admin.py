@@ -2788,6 +2788,44 @@ async def get_autonomy_debug(
     }
 
 
+@router.post("/projects/{project_id}/circuit-breaker/reset")
+async def reset_circuit_breaker(
+    project_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """Manually reset a project's circuit breaker to CLOSED state."""
+    import app.shared_state as _shared_state
+    from app.main import _persist_circuit_breakers, broadcast_to_project
+
+    key = str(project_id)
+    breaker = _shared_state.circuit_breakers.get(key)
+    if not breaker:
+        raise HTTPException(status_code=404, detail="No circuit breaker state found for this project")
+
+    base_cooldown = breaker.get("base_cooldown", 1800)
+    breaker["state"] = "CLOSED"
+    breaker["failure_count"] = 0
+    breaker["cooldown_seconds"] = base_cooldown
+    breaker["opened_at"] = None
+    breaker["half_open_task_id"] = None
+
+    await _persist_circuit_breakers()
+
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(f"[ADMIN] Circuit breaker manually reset for project {project_id} by {user_email}")
+
+    await broadcast_to_project(key, "autonomy_updated", {"project_id": key, "circuit_breaker_reset": True})
+
+    return {
+        "project_id": key,
+        "state": breaker["state"],
+        "failure_count": breaker["failure_count"],
+        "cooldown_seconds": breaker["cooldown_seconds"],
+        "opened_at": None,
+        "half_open_task_id": None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics helpers
 # ---------------------------------------------------------------------------

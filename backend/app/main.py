@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import time
 import uuid
@@ -164,19 +165,24 @@ async def release_max_plan_account(account_id: str):
 async def recheck_disabled_accounts():
     """Re-enable accounts that were disabled by rate limiting after a cooldown.
     Usage windows typically reset after some time — re-enable and let the next
-    task attempt determine if usage has actually recovered."""
+    task attempt determine if usage has actually recovered.
+    Repeat offenders get exponentially longer cooldowns (capped at 4 hours)."""
     async with _max_plan_pool_lock:
         now = _utcnow()
-        COOLDOWN_MINUTES = 30
 
         for acct in _max_plan_pool:
             if acct.get("enabled", True):
                 continue
             disabled_at = acct.get("disabled_at")
-            if disabled_at and (now - disabled_at).total_seconds() >= COOLDOWN_MINUTES * 60:
+            if not disabled_at:
+                continue
+            rl_hit_count = acct.get("rl_hit_count", 1)
+            # Exponential cooldown: 30min * 2^(n-1), capped at 4 hours
+            cooldown_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
+            if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
                 acct["enabled"] = True
                 acct["disabled_at"] = None
-                logger.warning(f"[POOL] Re-enabled account {acct['name']} after {COOLDOWN_MINUTES}min cooldown")
+                logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
 
 
 # --- Deployment State Management ---
@@ -193,11 +199,21 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     logs_lower = (logs or "").lower()
     combined = status_msg + " " + logs_lower
 
-    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors
+    # Database / internal service unavailable — checked before provision failures because
+    # PostgreSQL errors like "could not connect to server: Connection refused" contain
+    # "connection refused" which would otherwise be misclassified as PROVISION_FAILURE.
+    if any(kw in combined for kw in ["could not connect to server", "connection to server",
+                                      "database connection", "psycopg", "asyncpg",
+                                      "operator does not exist"]):
+        return "EXTERNAL_API"
+
+    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion
     if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
                                       "vm failed to start", "failed to provision",
                                       "connection refused", "connection reset by peer",
-                                      "timed out waiting for operation", "sshd", "startup script"]):
+                                      "timed out waiting for operation", "sshd", "startup script",
+                                      "no space left on device", "disk quota exceeded",
+                                      "filesystem is full"]):
         return "PROVISION_FAILURE"
 
     # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
@@ -215,9 +231,11 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "ssl", "certificate"]):
         return "EXTERNAL_API"
 
-    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator
+    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
-                                      "execution timed out", "killed", "sigterm"]):
+                                      "execution timed out", "killed", "sigterm",
+                                      "out of memory", "oom-kill", "memory limit exceeded",
+                                      "cannot allocate memory"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error
@@ -1629,6 +1647,11 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
+                            if is_provision_failure:
+                                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75–6.25 minutes
+                                reaper_ctx = dict(task.context or {})
+                                reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
+                                task.context = reaper_ctx
                             session.add(task)
 
                         await broadcast_to_project(
@@ -1640,7 +1663,21 @@ async def reaper_service():
                         fail_reason = f"provision failed {provision_failures} times" if is_provision_failure else f"failed after {_runtime_config['max_retries']} attempts"
                         logger.error(f"[REAPER] Task {task.id} {fail_reason}.")
                         task.status = TaskStatus.FAILED
-                        task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
+                        if is_provision_failure:
+                            ctx = task.context or {}
+                            provision_zone = ctx.get("provision_zone", "unknown zone")
+                            blacklisted_accounts = ctx.get("blacklisted_accounts", [])
+                            acct_id = ctx.get("max_plan_account_id", "no account")
+                            gcp_error = get_provision_error(task.vm_instance_id or "") or "no GCP error captured"
+                            gcp_error_short = gcp_error[:200]
+                            task.latest_status_message = (
+                                f"Provision failed {provision_failures}x — "
+                                f"zone: {provision_zone}, acct: {acct_id}. "
+                                f"GCP error: {gcp_error_short}. "
+                                f"Last reap: {reap_reason}"
+                            )
+                        else:
+                            task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
                         record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                         session.add(task)
                         await _maybe_create_failure_alert(task, session)
@@ -2452,9 +2489,32 @@ async def orchestrator_worker():
                                         logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
                                 logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged")
                             else:
-                                ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"CI passed but merge blocked: {merge_result.get('message', 'unknown')}"
-                                logger.error(f"[CI] PR #{ci_pr_number} CI passed but merge blocked")
+                                for attempt in range(3):
+                                    await asyncio.sleep(5 * (3 ** attempt))  # 5s, 15s, 45s
+                                    merge_result = await merge_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                                    if merge_result.get('merged'):
+                                        break
+                                if merge_result.get('merged'):
+                                    await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                        "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
+                                    ci_task.status = TaskStatus.COMPLETED
+                                    ci_task.latest_status_message = f"CI passed, PR #{ci_pr_number} merged (after retry)"
+                                    if ci_orig_id:
+                                        try:
+                                            orig = await session.get(Task, uuid.UUID(ci_orig_id))
+                                            if orig:
+                                                orig.context = {**(orig.context or {}), "pr_merged": True}
+                                                if orig.status == TaskStatus.EVALUATING and not (orig.context or {}).get("review_loop", {}).get("ci_waiting"):
+                                                    orig.status = TaskStatus.COMPLETED
+                                                    orig.latest_status_message = "Rollup PR merged"
+                                                session.add(orig)
+                                        except Exception as e:
+                                            logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
+                                    logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged after retry")
+                                else:
+                                    ci_task.status = TaskStatus.FAILED
+                                    ci_task.latest_status_message = f"CI passed but merge blocked after 4 attempts: {merge_result.get('message', 'unknown')}"
+                                    logger.error(f"[CI] PR #{ci_pr_number} merge blocked after retries: {merge_result}")
                         else:
                             # CI failed — check for existing active fix before spawning
                             active_tasks = (await session.execute(
@@ -6052,14 +6112,16 @@ async def update_agent_status(
         if acct_id:
             await release_max_plan_account(acct_id)
             # Auto-disable account on rate limit — usage exhausted, stop wasting VMs
-            # Re-enables automatically after 30min cooldown
+            # Re-enables automatically after exponential cooldown (30/60/120/240 min)
             if payload.status == TaskStatus.FAILED and failure_class == "RATE_LIMIT":
                 async with _max_plan_pool_lock:
                     for acct in _max_plan_pool:
                         if acct["id"] == acct_id:
                             acct["enabled"] = False
                             acct["disabled_at"] = _utcnow()
-                            logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (will retry in 30min)")
+                            acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+                            cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                            logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
                             break
 
         old_vm_id = task.vm_instance_id
@@ -6075,9 +6137,19 @@ async def update_agent_status(
             # Add retry delay for transient failures to avoid hammering exhausted resources
             ctx = dict(task.context or {})
             if failure_class == "RATE_LIMIT":
-                retry_after = (_utcnow() + timedelta(minutes=30)).isoformat()
+                # Track per-account rate-limit hit count for exponential backoff
+                rl_counts = dict(ctx.get("rate_limit_counts") or {})
+                if acct_id:
+                    rl_counts[str(acct_id)] = rl_counts.get(str(acct_id), 0) + 1
+                ctx["rate_limit_counts"] = rl_counts
+
+                rl_hit_count = rl_counts.get(str(acct_id), 1) if acct_id else 1
+                # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
+                base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
+                delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
+                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
                 ctx["retry_after"] = retry_after
-                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited — holding back 30min (retry_after={retry_after})")
+                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
                 # Blacklist rate-limited account so the retry picks a different one
                 if acct_id:
                     blacklisted = list(ctx.get("blacklisted_accounts") or [])
@@ -6085,9 +6157,10 @@ async def update_agent_status(
                         blacklisted.append(acct_id)
                     ctx["blacklisted_accounts"] = blacklisted
             elif failure_class == "PROVISION_FAILURE":
-                retry_after = (_utcnow() + timedelta(minutes=5)).isoformat()
+                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75–6.25 minutes
+                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
                 ctx["retry_after"] = retry_after
-                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back 5min (retry_after={retry_after})")
+                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
             else:
                 ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
             task.context = ctx
@@ -6101,6 +6174,18 @@ async def update_agent_status(
                 {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
             )
             return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
+
+        else:
+            # Retries exhausted — annotate the final status message with context
+            if payload.status == TaskStatus.FAILED:
+                max_r = _runtime_config["max_retries"]
+                existing_msg = task.latest_status_message or ""
+                if "retries exhausted" not in existing_msg:
+                    task.latest_status_message = (
+                        f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r}). "
+                        + existing_msg[:300]
+                    ).strip()
+                    session.add(task)
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = (task.payloads or [{}])[0]
@@ -6860,6 +6945,7 @@ async def update_agent_status(
                 task.latest_status_message = (
                     f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                 )
+                task.status = TaskStatus.FAILED
                 session.add(task)
 
         # 6. Parent task rollup — delegated to shared function

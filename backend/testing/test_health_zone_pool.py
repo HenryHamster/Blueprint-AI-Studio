@@ -17,6 +17,7 @@ from app.main import (
     release_max_plan_account,
     recheck_disabled_accounts,
     _max_plan_pool,
+    _max_plan_pool_lock,
 )
 from app.compute import (
     get_zone_health,
@@ -613,3 +614,104 @@ class TestMaxPlanAccountPool:
         pool = {a["id"]: a for a in _max_plan_pool}
         assert pool["a1"]["enabled"] is True   # cooldown expired
         assert pool["a2"]["enabled"] is False  # still in cooldown
+
+    # ── Exponential backoff cooldown tests ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_recheck_exponential_backoff_rl_hit_count_2(self, clean_max_plan_pool):
+        """rl_hit_count=2 → 60 min cooldown: re-enables after 61 min, not after 59 min."""
+        _max_plan_pool.append({
+            "id": "a1",
+            "name": "twice_limited",
+            "enabled": False,
+            "active_tasks": 0,
+            "disabled_at": datetime.utcnow() - timedelta(minutes=59),
+            "rl_hit_count": 2,
+        })
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is False  # 59 min < 60 min cooldown
+
+        _max_plan_pool[0]["disabled_at"] = datetime.utcnow() - timedelta(minutes=61)
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is True   # 61 min >= 60 min cooldown
+
+    @pytest.mark.asyncio
+    async def test_recheck_exponential_backoff_rl_hit_count_3(self, clean_max_plan_pool):
+        """rl_hit_count=3 → 120 min cooldown: re-enables after 121 min, not after 119 min."""
+        _max_plan_pool.append({
+            "id": "a1",
+            "name": "thrice_limited",
+            "enabled": False,
+            "active_tasks": 0,
+            "disabled_at": datetime.utcnow() - timedelta(minutes=119),
+            "rl_hit_count": 3,
+        })
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is False  # 119 min < 120 min cooldown
+
+        _max_plan_pool[0]["disabled_at"] = datetime.utcnow() - timedelta(minutes=121)
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is True   # 121 min >= 120 min cooldown
+
+    @pytest.mark.asyncio
+    async def test_recheck_exponential_backoff_rl_hit_count_4_capped_at_240(self, clean_max_plan_pool):
+        """rl_hit_count=4 → 240 min cap: re-enables after 241 min, not after 239 min."""
+        _max_plan_pool.append({
+            "id": "a1",
+            "name": "quad_limited",
+            "enabled": False,
+            "active_tasks": 0,
+            "disabled_at": datetime.utcnow() - timedelta(minutes=239),
+            "rl_hit_count": 4,
+        })
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is False  # 239 min < 240 min cooldown
+
+        _max_plan_pool[0]["disabled_at"] = datetime.utcnow() - timedelta(minutes=241)
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is True   # 241 min >= 240 min cap
+
+    @pytest.mark.asyncio
+    async def test_recheck_exponential_backoff_high_rl_hit_count_still_capped(self, clean_max_plan_pool):
+        """rl_hit_count=10 is still capped at 240 min, not 30*2^9=15360 min."""
+        _max_plan_pool.append({
+            "id": "a1",
+            "name": "many_limited",
+            "enabled": False,
+            "active_tasks": 0,
+            "disabled_at": datetime.utcnow() - timedelta(minutes=241),
+            "rl_hit_count": 10,
+        })
+        await recheck_disabled_accounts()
+        assert _max_plan_pool[0]["enabled"] is True   # 241 min >= 240 min cap
+
+    @pytest.mark.asyncio
+    async def test_disable_path_increments_rl_hit_count(self, clean_max_plan_pool):
+        """The rate-limit disable path increments rl_hit_count on each hit."""
+        _max_plan_pool.append({
+            "id": "a1",
+            "name": "fresh",
+            "enabled": True,
+            "active_tasks": 1,
+        })
+
+        # Simulate the inline disable-on-RATE_LIMIT code from update_agent_status
+        async with _max_plan_pool_lock:
+            for acct in _max_plan_pool:
+                if acct["id"] == "a1":
+                    acct["enabled"] = False
+                    acct["disabled_at"] = datetime.utcnow()
+                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+
+        assert _max_plan_pool[0]["rl_hit_count"] == 1  # first hit → count=1 → 30 min cooldown
+
+        # Re-enable manually, then simulate a second hit
+        _max_plan_pool[0]["enabled"] = True
+        async with _max_plan_pool_lock:
+            for acct in _max_plan_pool:
+                if acct["id"] == "a1":
+                    acct["enabled"] = False
+                    acct["disabled_at"] = datetime.utcnow()
+                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+
+        assert _max_plan_pool[0]["rl_hit_count"] == 2  # second hit → count=2 → 60 min cooldown

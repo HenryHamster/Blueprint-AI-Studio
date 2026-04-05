@@ -257,6 +257,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
   const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [resettingBreaker, setResettingBreaker] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -343,6 +344,20 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
       if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
     };
   }, [wsRef, fetchStatus]);
+
+  const resetCircuitBreaker = async (projectId: string) => {
+    setResettingBreaker(projectId);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${projectId}/circuit-breaker/reset`, { method: 'POST' });
+      if (res.ok) {
+        await fetchStatus();
+      }
+    } catch {
+      // silent
+    } finally {
+      setResettingBreaker(null);
+    }
+  };
 
   const toggleAutonomy = async (projectId: string, enabled: boolean) => {
     setToggling(projectId);
@@ -443,7 +458,20 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
                 <div className="space-y-1.5">
                   {/* Circuit breaker — enhanced with state pill when debug available */}
                   {debug ? (
-                    <CircuitBreakerDetail cb={debug.circuit_breaker} />
+                    <>
+                      <CircuitBreakerDetail cb={debug.circuit_breaker} />
+                      {(debug.circuit_breaker.state === 'OPEN' || debug.circuit_breaker.state === 'HALF_OPEN') && (
+                        <div className="flex justify-end">
+                          <button
+                            onClick={() => resetCircuitBreaker(p.project_id)}
+                            disabled={resettingBreaker === p.project_id}
+                            className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors bg-red-500/10 text-red-400 hover:bg-red-500/20 ${resettingBreaker === p.project_id ? 'opacity-50' : ''}`}
+                          >
+                            {resettingBreaker === p.project_id ? 'Resetting…' : 'Reset Circuit Breaker'}
+                          </button>
+                        </div>
+                      )}
+                    </>
                   ) : p.consecutive_failures > 0 ? (
                     <div className="flex items-center gap-1.5 text-[11px]">
                       <AlertTriangle className={`w-3 h-3 shrink-0 ${p.consecutive_failures >= 3 ? 'text-red-400' : 'text-amber-400'}`} />

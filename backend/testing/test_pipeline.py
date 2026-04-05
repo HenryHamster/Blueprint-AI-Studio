@@ -181,6 +181,58 @@ class TestFailureClassification:
         task = self._make_task("")
         assert classify_failure(task) == "CODE_ERROR"
 
+    def test_provision_failure_disk_exhaustion(self):
+        task = self._make_task("no space left on device")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_provision_failure_disk_quota(self):
+        task = self._make_task("disk quota exceeded")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_agent_timeout_oom_kill(self):
+        task = self._make_task("oom-kill event in container")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_out_of_memory(self):
+        task = self._make_task("out of memory: killed process")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_sigterm(self):
+        task = self._make_task("process received SIGTERM")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_external_api_db_connection(self):
+        task = self._make_task("database connection failed")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_psycopg(self):
+        task = self._make_task("psycopg2.OperationalError: could not connect")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_asyncpg(self):
+        task = self._make_task("asyncpg.exceptions.ConnectionFailureError")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_provision_failure_filesystem_full(self):
+        task = self._make_task("filesystem is full")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_agent_timeout_cannot_allocate_memory(self):
+        task = self._make_task("cannot allocate memory")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_memory_limit_exceeded(self):
+        task = self._make_task("memory limit exceeded for container")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_external_api_could_not_connect_to_server(self):
+        task = self._make_task("could not connect to server: Connection refused")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_operator_does_not_exist(self):
+        task = self._make_task("operator does not exist: text = jsonb")
+        assert classify_failure(task) == "EXTERNAL_API"
+
     def test_logs_override_status_msg(self):
         """Logs are checked alongside status message."""
         task = self._make_task("some generic error")
