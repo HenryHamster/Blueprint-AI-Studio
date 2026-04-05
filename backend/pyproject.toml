@@ -11,6 +11,9 @@ select = [
     "E712",  # comparison to True/False (use `is` / `is not`)
     "E721",  # type comparison (use isinstance)
     "UP",    # pyupgrade: modernize Python syntax
+    "RUF",   # ruff-specific rules: unused noqa, mutable defaults, etc.
+    "C4",    # flake8-comprehensions: replace map/filter with comprehensions
+    "SIM",   # flake8-simplify: simplifiable code patterns (nested if, ternary, etc.)
 ]
 # Skip typing-modernization rules — existing code uses Optional/List/Dict from typing and a
 # mass refactor is out of scope here. New code in app/ should use built-in generics, but we

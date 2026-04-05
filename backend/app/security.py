@@ -372,7 +372,7 @@ def evaluate_findings(findings: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     high = [f for f in findings if f["severity"] == "high"]
     medium = [f for f in findings if f["severity"] == "medium"]
-    high_categories = sorted(set(f["category"] for f in high))
+    high_categories = sorted({f["category"] for f in high})
 
     has_encoded_injection = any(f["category"] == "encoded_injection" for f in findings)
     medium_escalation = len(medium) >= 20  # sustained medium signals suggest coordinated evasion

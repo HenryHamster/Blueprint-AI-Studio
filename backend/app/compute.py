@@ -127,7 +127,7 @@ if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run �
         _image_family_last_check = time.time()
         logger.error(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s: {e}")
 
-from app.auth import create_agent_token  # noqa: E402 — must be after env vars
+from app.auth import create_agent_token  # must be after env vars are loaded above
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
@@ -148,8 +148,8 @@ def validate_payload_uri(payload_uri: str) -> None:
 _local_processes: dict[str, subprocess.Popen] = {}
 
 
-async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None,
-                              oauth_token: str = None, claude_config_json: str = None):
+async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
+                              oauth_token: str | None = None, claude_config_json: str | None = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -215,7 +215,7 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
 
 # ─── Local Mode Implementation ──────────────────────────────────────────────
 
-async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None, oauth_token: str = None):
+async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None, oauth_token: str | None = None):
     logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
 
     agent_jwt = create_agent_token(str(task_id), vm_instance_id)
@@ -258,7 +258,7 @@ async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri:
                 _local_processes.pop(vm_instance_id, None)
                 logger.info(f"[LOCAL] Agent subprocess exited (PID: {proc.pid}, code: {proc.returncode})")
 
-        asyncio.create_task(_monitor())
+        asyncio.create_task(_monitor())  # noqa: RUF006 — fire-and-forget monitor; lives for the subprocess lifetime
         return True
     except Exception as e:
         logger.error(f"[LOCAL] Failed to spawn agent: {e}")
@@ -350,8 +350,8 @@ def _delete_agent_secret(vm_instance_id: str) -> None:
         logger.warning(f"Failed to delete agent secret {secret_name}: {e}")
 
 
-async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str = None,
-                         oauth_token: str = None, claude_config_json: str = None):
+async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
+                         oauth_token: str | None = None, claude_config_json: str | None = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
@@ -776,7 +776,7 @@ async def _delete_gcp(vm_instance_id: str):
                         logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
                 except Exception as e:
                     logger.warning(f"[VM-SERIAL] Could not fetch serial for {vm_instance_id}: {e}")
-            asyncio.create_task(_bg_serial())
+            asyncio.create_task(_bg_serial())  # noqa: RUF006 — fire-and-forget background serial fetch
 
         # Best-effort: clean up any leftover credentials secret
         async with _gcp_ops_semaphore:
@@ -794,7 +794,7 @@ async def _delete_gcp(vm_instance_id: str):
 
 class CleanupResult:
     """Structured result from orphan cleanup."""
-    __slots__ = ("total_gcp_vms", "orphan_count", "deleted", "failed")
+    __slots__ = ("deleted", "failed", "orphan_count", "total_gcp_vms")
 
     def __init__(self):
         self.total_gcp_vms: int = 0

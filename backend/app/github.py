@@ -200,7 +200,7 @@ async def get_github_user(user_token: str) -> dict:
     return resp.json()
 
 
-async def generate_installation_access_token(installation_id: str, repositories: list[str] = None) -> str:
+async def generate_installation_access_token(installation_id: str, repositories: list[str] | None = None) -> str:
     """
     Exchanges the GitHub App JWT for a short-lived Installation Access Token.
     """
@@ -238,7 +238,7 @@ async def generate_installation_access_token(installation_id: str, repositories:
 
     return response.json().get("token")
 
-async def validate_fine_grained_pat(token: str, target_repo: str = None) -> dict:
+async def validate_fine_grained_pat(token: str, target_repo: str | None = None) -> dict:
     """
     Validates that a GitHub Personal Access Token is:
     1. A Fine-Grained PAT (starts with github_pat_)
@@ -426,7 +426,7 @@ async def create_issue(
     repo: str,
     title: str,
     body: str = "",
-    assignees: list = None
+    assignees: list | None = None
 ) -> dict:
     """
     Creates a new issue in the specified repository.
@@ -813,10 +813,7 @@ async def get_check_runs(
 
     # Aggregate status
     statuses = [cr.get("status", "") for cr in check_runs]
-    if any(s in ("queued", "in_progress") for s in statuses):
-        agg_status = "in_progress"
-    else:
-        agg_status = "completed"
+    agg_status = "in_progress" if any(s in ("queued", "in_progress") for s in statuses) else "completed"
 
     # Aggregate conclusion — "skipped" and "neutral" are non-failures
     conclusions = [cr.get("conclusion") for cr in check_runs if cr.get("status") == "completed"]
@@ -849,7 +846,7 @@ async def get_check_runs(
                     # Extract the last N lines which typically contain the error
                     lines = raw_log.strip().split("\n")
                     # Find lines with error-like content for a focused excerpt
-                    error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "×"])]
+                    error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "\u00d7"])]  # \u00d7 matches multiplication sign used as error marker in some CI tools
                     if error_lines:
                         log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {ln.strip()}" for ln in error_lines[-30:]))
                     else:
@@ -881,10 +878,7 @@ async def get_check_runs(
             if summary:
                 log_lines.append(f"  [{name}] {summary[:500]}")
 
-        if log_lines:
-            failed_logs = "\n".join(log_lines)
-        else:
-            failed_logs = "CI checks failed: " + ", ".join(failed_names)
+        failed_logs = "\n".join(log_lines) if log_lines else "CI checks failed: " + ", ".join(failed_names)
 
     return {
         "status": agg_status,

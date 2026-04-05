@@ -161,3 +161,19 @@ async def client(override_get_session, override_get_current_user):
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
+
+
+@pytest.fixture
+def mock_provision_vm(mocker):
+    return mocker.patch('app.main.provision_agent_vm', return_value=None)
+
+
+@pytest.fixture
+def mock_delete_vm(mocker):
+    return mocker.patch('app.main.delete_agent_vm', return_value=None)
+
+
+@pytest.fixture
+def mock_broadcast(mocker):
+    from unittest.mock import AsyncMock
+    return mocker.patch('app.main.broadcast_to_project', new_callable=AsyncMock)

@@ -172,7 +172,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
       });
-    } catch (e: any) {
+    } catch (e: unknown) {
       log(`Heartbeat failed: ${e}`);
       // 409 = row temporarily locked (skip_locked), retry next cycle — NOT fatal
       if (e instanceof Error && /failed \(409\)/.test(e.message)) {

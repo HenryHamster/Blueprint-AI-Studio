@@ -332,10 +332,7 @@ async def bulk_archive_tasks(
                 session.add(task)
                 archived.append(task)
     elif request.filter in ('completed', 'terminal'):
-        if request.filter == 'completed':
-            statuses = [TaskStatus.COMPLETED]
-        else:
-            statuses = TERMINAL_STATUSES
+        statuses = [TaskStatus.COMPLETED] if request.filter == 'completed' else TERMINAL_STATUSES
         query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses))
         result = await session.execute(query)
         archived = result.scalars().all()
@@ -600,7 +597,7 @@ async def request_changes(
     base_branch = task_payload.get("base_branch", "main")
 
     from app.main import _spawn_pipeline_task
-    if payload.action == "fix":
+    if payload.action == "fix":  # noqa: SIM108 — two distinct multi-line async calls, ternary unreadable
         spawned = await _spawn_pipeline_task(
             task, "fix", session, pr_number, branch, base_branch,
             fix_prompt=f"Human reviewer requested changes:\n\n{payload.feedback}",
@@ -834,10 +831,7 @@ async def modify_task(
         changes["payloads"] = "updated"
 
     if "parent_task_id" in payload:
-        if payload["parent_task_id"]:
-            task.parent_task_id = uuid.UUID(payload["parent_task_id"])
-        else:
-            task.parent_task_id = None
+        task.parent_task_id = uuid.UUID(payload["parent_task_id"]) if payload["parent_task_id"] else None
         changes["parent_task_id"] = str(task.parent_task_id)
 
     if "context" in payload and isinstance(payload["context"], dict):
@@ -914,10 +908,9 @@ async def modify_task(
                 ctx = task.context or {}
                 if ctx.get("plan_branch") or ctx.get("research_branch"):
                     await _cleanup_branches(task, session)
-        if "context" in payload and task.parent_task_id:
+        if "context" in payload and task.parent_task_id and isinstance(payload["context"], dict) and payload["context"].get("pr_merged"):
             # pr_merged was set via admin → trigger rollup
-            if isinstance(payload["context"], dict) and payload["context"].get("pr_merged"):
-                should_check_rollup = True
+            should_check_rollup = True
         if should_check_rollup:
             await _check_and_trigger_rollup(task, session)
 
@@ -1721,12 +1714,10 @@ async def update_direction(
         raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
     if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed"):
         raise HTTPException(status_code=400, detail="status must be active, completed, paused, or proposed")
-    if "text" in payload:
-        if not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1:
-            raise HTTPException(status_code=400, detail="text must be 1-500 characters")
-    if "paths" in payload:
-        if not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"]):
-            raise HTTPException(status_code=400, detail="paths must be a list of strings")
+    if "text" in payload and (not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1):
+        raise HTTPException(status_code=400, detail="text must be 1-500 characters")
+    if "paths" in payload and (not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"])):
+        raise HTTPException(status_code=400, detail="paths must be a list of strings")
 
     directions = list(project.directions or [])
     updated = False
@@ -2304,7 +2295,7 @@ async def repair_state(
             repairs.append(f"Re-triggered rollup for {parent.id}")
 
     # 3. Tasks with parent_task_id pointing to non-existent tasks
-    all_task_ids = set(str(t.id) for t in (await session.execute(select(Task.id))).scalars().all())
+    all_task_ids = {str(t.id) for t in (await session.execute(select(Task.id))).scalars().all()}
     orphan_children = (await session.execute(
         select(Task).where(Task.parent_task_id.isnot(None))
     )).scalars().all()
@@ -2349,10 +2340,7 @@ async def get_activity(
     )
     recent_tasks = tasks_result.scalars().all()
 
-    if not recent_tasks:
-        task_ids = []
-    else:
-        task_ids = [t.id for t in recent_tasks]
+    task_ids = [t.id for t in recent_tasks] if recent_tasks else []
 
     # Fetch relevant artifacts in one query
     artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> artifact info
@@ -2908,19 +2896,17 @@ async def _build_stuck_tasks(
         stuck_for_seconds = 0
         unresolvable_deps: List[str] = []
 
-        if task.status == TaskStatus.PROVISIONING:
-            if task.last_heartbeat is None and task.started_at is not None:
-                age = (now - task.started_at).total_seconds()
-                if age > provision_timeout_secs:
-                    stuck_reason = "provision_timeout"
-                    stuck_for_seconds = int(age - provision_timeout_secs)
+        if task.status == TaskStatus.PROVISIONING and task.last_heartbeat is None and task.started_at is not None:
+            age = (now - task.started_at).total_seconds()
+            if age > provision_timeout_secs:
+                stuck_reason = "provision_timeout"
+                stuck_for_seconds = int(age - provision_timeout_secs)
 
-        elif task.status == TaskStatus.IN_PROGRESS:
-            if task.last_heartbeat is not None:
-                heartbeat_age = (now - task.last_heartbeat).total_seconds()
-                if heartbeat_age > no_heartbeat_secs:
-                    stuck_reason = "no_heartbeat"
-                    stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
+        elif task.status == TaskStatus.IN_PROGRESS and task.last_heartbeat is not None:
+            heartbeat_age = (now - task.last_heartbeat).total_seconds()
+            if heartbeat_age > no_heartbeat_secs:
+                stuck_reason = "no_heartbeat"
+                stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
 
         elif task.status == TaskStatus.QUEUED:
             created_age = (now - task.created_at).total_seconds()

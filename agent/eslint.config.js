@@ -7,7 +7,7 @@ export default tseslint.config(
   {
     files: ['src/**/*.ts'],
     rules: {
-      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
       'no-console': 'off',  // agent uses console.log for structured logging
     },

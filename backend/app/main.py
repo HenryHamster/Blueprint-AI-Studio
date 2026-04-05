@@ -1491,9 +1491,8 @@ async def reaper_service():
                     if task.status == TaskStatus.PROVISIONING and task.started_at and task.started_at < fifteen_minutes_ago:
                         orphaned_ids.append(task.id)  # PROVISIONING timeout regardless of heartbeat
                         logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
-                    elif task.last_heartbeat:
-                        if task.last_heartbeat < five_minutes_ago:
-                            orphaned_ids.append(task.id)
+                    elif task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
+                        orphaned_ids.append(task.id)
                     elif task.started_at and task.started_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
                     elif not task.started_at and task.created_at < ten_minutes_ago:
@@ -1542,12 +1541,10 @@ async def reaper_service():
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
                     verified = []
                     for t in orphaned_tasks:
-                        if t.last_heartbeat:
-                            if t.last_heartbeat < five_minutes_ago:
-                                verified.append(t)
-                        elif t.started_at:
-                            if t.started_at < ten_minutes_ago:
-                                verified.append(t)
+                        if t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
+                            verified.append(t)
+                        elif t.started_at and t.started_at < ten_minutes_ago:
+                            verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)
                     orphaned_tasks = verified
@@ -1648,7 +1645,7 @@ async def reaper_service():
                             task.last_heartbeat = None
                             task.started_at = None
                             if is_provision_failure:
-                                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75–6.25 minutes
+                                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
                                 reaper_ctx = dict(task.context or {})
                                 reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
                                 task.context = reaper_ctx
@@ -3387,10 +3384,11 @@ async def generate_ws_ticket(
     Generates a short-lived ticket for authenticating WebSocket connections.
     """
     # Admins can access any project's WebSocket
-    if current_user.get("role") == "admin":
-        stmt = select(Project).where(Project.id == project_id)
-    else:
-        stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
+    stmt = (
+        select(Project).where(Project.id == project_id)
+        if current_user.get("role") == "admin"
+        else select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
+    )
     project = (await session.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
@@ -3922,7 +3920,7 @@ async def spawn_subtask(
 def _has_local_cycle(adj: Dict[str, list]) -> bool:
     """Check for cycles in a small adjacency list (dependency graph)."""
     WHITE, GRAY, BLACK = 0, 1, 2
-    color = {n: WHITE for n in adj}
+    color = dict.fromkeys(adj, WHITE)
     def dfs(n):
         color[n] = GRAY
         for dep in adj.get(n, []):
@@ -4181,10 +4179,11 @@ async def _spawn_pipeline_task(
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix
     prev_review_history = source_loop.get("review_history", [])
-    if task_type == "fix" and current_feedback:
-        new_review_history = prev_review_history + [{"iteration": iteration - 1, "feedback": current_feedback}]
-    else:
-        new_review_history = prev_review_history
+    new_review_history = (
+        [*prev_review_history, {"iteration": iteration - 1, "feedback": current_feedback}]
+        if task_type == "fix" and current_feedback
+        else prev_review_history
+    )
 
     new_task = Task(
         project_id=source_task.project_id,
@@ -5273,7 +5272,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "key_finding_descriptions": finding_descriptions_by_dir.get(did, [])[:5],
                     }
                     # Keep last 10 history entries to avoid unbounded growth
-                    d["research_history"] = (history + [entry])[-10:]
+                    d["research_history"] = [*history, entry][-10:]
             project.directions = directions
             flag_modified(project, "directions")
             session.add(project)
@@ -6157,7 +6156,7 @@ async def update_agent_status(
                         blacklisted.append(acct_id)
                     ctx["blacklisted_accounts"] = blacklisted
             elif failure_class == "PROVISION_FAILURE":
-                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75–6.25 minutes
+                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
                 retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
                 ctx["retry_after"] = retry_after
                 logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
