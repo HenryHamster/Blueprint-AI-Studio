@@ -139,11 +139,15 @@ async def load_max_plan_pool():
         total_active = sum(active_per_account.values())
         logger.info(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
 
-async def select_max_plan_account() -> Optional[Dict[str, Any]]:
+async def select_max_plan_account(blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count.
-    Pre-increments active_tasks atomically under lock to prevent races."""
+    Pre-increments active_tasks atomically under lock to prevent races.
+    Accounts in blacklist are excluded even if not yet disabled in the pool."""
     async with _max_plan_pool_lock:
-        available = [a for a in _max_plan_pool if a.get("enabled", True)]
+        available = [
+            a for a in _max_plan_pool
+            if a.get("enabled", True) and (not blacklist or a["id"] not in blacklist)
+        ]
         if not available:
             return None
         account = min(available, key=lambda a: a["active_tasks"])
@@ -1960,7 +1964,8 @@ async def orchestrator_worker():
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
                     # Select Max plan account (primary) or fall back to API key
-                    account = await select_max_plan_account()
+                    _blacklist = (task.context or {}).get("blacklisted_accounts")
+                    account = await select_max_plan_account(blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -5567,6 +5572,14 @@ async def update_agent_status(
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None  # Fresh timeout window for the new VM
+            # Blacklist rate-limited account so the retry picks a different one
+            if failure_class == "RATE_LIMIT" and acct_id:
+                ctx = dict(task.context or {})
+                blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                if acct_id not in blacklisted:
+                    blacklisted.append(acct_id)
+                ctx["blacklisted_accounts"] = blacklisted
+                task.context = ctx
             session.add(task)
 
             await session.commit()
