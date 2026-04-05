@@ -2004,6 +2004,7 @@ async def orchestrator_worker():
                     async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
                                                     payloads: list, token: str, config_json: str,
                                                     acct_id_for_release: str):
+                        success = False
                         try:
                             payload_uri = None
                             if payloads:
@@ -2017,12 +2018,14 @@ async def orchestrator_worker():
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
                             success = False
+                        finally:
+                            # Always release the Max Plan account slot on failure, even if an
+                            # exception escapes the try/except above (e.g. from record_task_result)
+                            if not success and acct_id_for_release:
+                                await release_max_plan_account(acct_id_for_release)
                         if not success:
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
                             record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
-                            # Release the Max Plan account slot
-                            if acct_id_for_release:
-                                await release_max_plan_account(acct_id_for_release)
                             # Mark as failed immediately to avoid 10 min wait
                             try:
                                 async with AsyncSessionLocal() as inner_session:
