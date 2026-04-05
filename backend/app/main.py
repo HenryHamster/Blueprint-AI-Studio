@@ -1364,11 +1364,15 @@ async def reaper_service():
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
 
+                fifteen_minutes_ago = now - timedelta(minutes=15)
                 orphaned_ids = []
                 for task in active_tasks:
                     if not task.vm_instance_id:
                         continue
-                    if task.last_heartbeat:
+                    if task.status == TaskStatus.PROVISIONING and task.started_at and task.started_at < fifteen_minutes_ago:
+                        orphaned_ids.append(task.id)  # PROVISIONING timeout regardless of heartbeat
+                        logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
+                    elif task.last_heartbeat:
                         if task.last_heartbeat < five_minutes_ago:
                             orphaned_ids.append(task.id)
                     elif task.started_at and task.started_at < ten_minutes_ago:
@@ -1690,7 +1694,7 @@ async def orchestrator_worker():
                 stale_vm_ids = []
                 for t in active_tasks_result:
                     if (t.status == TaskStatus.PROVISIONING
-                        and t.last_heartbeat is None
+                        and (t.last_heartbeat is None or t.last_heartbeat < five_min_ago)
                         and t.started_at and t.started_at < five_min_ago):
                         stale_vm_ids.append(t.vm_instance_id)
                         t.status = TaskStatus.QUEUED
@@ -1698,7 +1702,10 @@ async def orchestrator_worker():
                         t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         session.add(t)
                         tasks_recovered += 1
-                        logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
+                        if t.last_heartbeat is None:
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (no heartbeat, started_at={t.started_at})")
+                        else:
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (stale heartbeat={t.last_heartbeat}, started_at={t.started_at})")
                 if session.dirty:
                     await session.commit()
                     # Delete old VMs from stale provisions (after commit)
