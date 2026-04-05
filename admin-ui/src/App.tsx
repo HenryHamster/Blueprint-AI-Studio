@@ -336,8 +336,6 @@ export default function App() {
         onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
         autonomousResearchIntervalMinutes={s.autonomousResearchIntervalMinutes}
         onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
-        minResearchIntervalHours={s.minResearchIntervalHours}
-        onUpdateMinResearchIntervalHours={s.handleUpdateMinResearchIntervalHours}
         directionCooldownMinutes={s.directionCooldownMinutes}
         onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
         onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}

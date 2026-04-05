@@ -49,8 +49,6 @@ export interface HeaderBarProps {
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
-  minResearchIntervalHours: number;
-  onUpdateMinResearchIntervalHours: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
   onSyncTaskTypeDefaults: () => void;
@@ -134,8 +132,6 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateMaxAutonomousRate,
     autonomousResearchIntervalMinutes,
     onUpdateAutonomousResearchInterval,
-    minResearchIntervalHours,
-    onUpdateMinResearchIntervalHours,
     directionCooldownMinutes,
     onUpdateDirectionCooldownMinutes,
     onSyncTaskTypeDefaults,
@@ -306,8 +302,6 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
-          minResearchIntervalHours={minResearchIntervalHours}
-          onUpdateMinResearchIntervalHours={onUpdateMinResearchIntervalHours}
           directionCooldownMinutes={directionCooldownMinutes}
           onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
           onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}

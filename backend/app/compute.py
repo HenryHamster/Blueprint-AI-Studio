@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 import signal
 import threading
+from collections import OrderedDict as _OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -182,7 +183,6 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
 
 
-from collections import OrderedDict as _OrderedDict
 _last_provision_error: _OrderedDict = _OrderedDict()
 _PROVISION_ERROR_MAX = 500
 

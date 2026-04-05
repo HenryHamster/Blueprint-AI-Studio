@@ -1,7 +1,7 @@
 import re
 import base64
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
 # GitHub imports are deferred to scan_pr_for_injection() so pure functions
