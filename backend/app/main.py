@@ -2675,7 +2675,7 @@ async def prometheus_metrics(request: Request):
 
     cycle_age: Optional[float] = None
     if _orchestrator_last_cycle:
-        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+        cycle_age = (_utcnow() - _orchestrator_last_cycle).total_seconds()
 
     active_vms = sum(a.get("active_tasks", 0) for a in _max_plan_pool)
     consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0

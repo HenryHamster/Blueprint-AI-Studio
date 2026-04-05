@@ -17,7 +17,8 @@ from app.models import Project, Task, TaskStatus
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    """Naive UTC timestamp — matches DB convention (TIMESTAMP WITHOUT TIME ZONE)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _make_task(

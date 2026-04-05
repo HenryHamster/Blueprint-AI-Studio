@@ -2823,7 +2823,7 @@ async def _build_stuck_tasks(
     all_dep_uuids: set[uuid.UUID] = set()
     for task in tasks:
         if task.status == TaskStatus.QUEUED:
-            created_age = (now - task.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+            created_age = (now - task.created_at).total_seconds()
             if (task.depends_on or []) and created_age > stuck_deps_secs:
                 for d in task.depends_on:
                     try:
@@ -2846,20 +2846,20 @@ async def _build_stuck_tasks(
 
         if task.status == TaskStatus.PROVISIONING:
             if task.last_heartbeat is None and task.started_at is not None:
-                age = (now - task.started_at.replace(tzinfo=timezone.utc)).total_seconds()
+                age = (now - task.started_at).total_seconds()
                 if age > provision_timeout_secs:
                     stuck_reason = "provision_timeout"
                     stuck_for_seconds = int(age - provision_timeout_secs)
 
         elif task.status == TaskStatus.IN_PROGRESS:
             if task.last_heartbeat is not None:
-                heartbeat_age = (now - task.last_heartbeat.replace(tzinfo=timezone.utc)).total_seconds()
+                heartbeat_age = (now - task.last_heartbeat).total_seconds()
                 if heartbeat_age > no_heartbeat_secs:
                     stuck_reason = "no_heartbeat"
                     stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
 
         elif task.status == TaskStatus.QUEUED:
-            created_age = (now - task.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+            created_age = (now - task.created_at).total_seconds()
             dep_ids = task.depends_on or []
 
             if dep_ids and created_age > stuck_deps_secs:
@@ -2909,7 +2909,7 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
     opened_at = cb.get("opened_at")
     cooldown_remaining = None
     if opened_at and cb.get("state") == "OPEN":
-        elapsed = (datetime.now(tz=timezone.utc) - opened_at.replace(tzinfo=timezone.utc)).total_seconds()
+        elapsed = (_utcnow() - opened_at).total_seconds()
         cooldown_remaining = max(0, int(cb.get("cooldown_seconds", 1800) - elapsed))
     return {
         "state": cb.get("state", "CLOSED"),
@@ -2938,7 +2938,7 @@ async def get_project_diagnostics(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    now = datetime.now(tz=timezone.utc)
+    now = _utcnow()
 
     active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
     active_result = await session.execute(
@@ -2986,7 +2986,7 @@ async def get_global_diagnostics(
     from app.shared_state import get_circuit_breaker, circuit_breakers
     from app.compute import get_zone_health_summary
 
-    now = datetime.now(tz=timezone.utc)
+    now = _utcnow()
 
     active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
     active_result = await session.execute(
