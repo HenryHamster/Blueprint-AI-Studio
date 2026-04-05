@@ -829,9 +829,10 @@ async def _check_pause_mode():
                 state.runtime_max_concurrent_vms = restore
                 session.add(state)
                 await session.commit()
-                _runtime_config["max_concurrent_vms"] = restore
+                initial_vms = min(2, restore)
+                _runtime_config["max_concurrent_vms"] = initial_vms
                 _health_recovery_streak = 0
-                logger.info(f"[PAUSE] Auto-resumed pipeline — all deps healthy for 3 consecutive checks (max_vms={restore})")
+                logger.info(f"[PAUSE] Auto-resumed pipeline with {initial_vms} VMs (target: {restore})")
                 await broadcast_deploy_state()
 
 
