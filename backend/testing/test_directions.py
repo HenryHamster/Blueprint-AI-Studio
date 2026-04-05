@@ -1,0 +1,669 @@
+"""
+Integration tests for the directions system.
+
+Tests cover:
+- CRUD: create, update (priority/status/text/paths), delete (cancels QUEUED tasks)
+- Cooldown filter: directions within/past the cooldown window in _spawn_research_task
+- last_researched_at update: after _handle_research_completion runs
+- task-counts endpoint: counts research tasks per direction
+- Status/priority validation: invalid values return 400
+"""
+import uuid
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+
+from app.models import Project, Task, TaskStatus
+from app.main import _spawn_research_task, _handle_research_completion
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _deploy_project(client: AsyncClient, mocker, name: str = "Test Project") -> str:
+    """Create a project via the deploy API and return its project_id string."""
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+    resp = await client.post(
+        "/api/deploy",
+        json={"name": name, "payloads": [{"command": "setup"}], "storage_uris": []},
+    )
+    assert resp.status_code == 200
+    return resp.json()["project_id"]
+
+
+async def _add_direction(
+    client: AsyncClient,
+    project_id: str,
+    *,
+    text: str = "Improve test coverage",
+    priority: str = "medium",
+    paths: list | None = None,
+) -> dict:
+    """POST a direction to a project and return the created direction dict."""
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": text, "priority": priority, "paths": paths or []},
+    )
+    assert resp.status_code == 200
+    return resp.json()["direction"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CRUD
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_directions_empty(client: AsyncClient, mocker):
+    """GET on a fresh project returns an empty directions list."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["directions"] == []
+    assert "autonomous_enabled" in data
+
+
+@pytest.mark.asyncio
+async def test_create_direction(client: AsyncClient, mocker):
+    """POST creates a direction with an auto-generated id and default active status."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Improve test coverage", "priority": "high", "paths": ["src/"]},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert d["text"] == "Improve test coverage"
+    assert d["priority"] == "high"
+    assert d["paths"] == ["src/"]
+    assert d["status"] == "active"
+    assert d["id"].startswith("d-")
+    assert "added_at" in d
+
+
+@pytest.mark.asyncio
+async def test_get_directions_returns_created(client: AsyncClient, mocker):
+    """GET returns directions that were previously POSTed."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction A", priority="low")
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    directions = resp.json()["directions"]
+    assert len(directions) == 1
+    assert directions[0]["id"] == direction["id"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_priority(client: AsyncClient, mocker):
+    """PATCH updates direction priority."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, priority="low")
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"priority": "high"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["direction"]["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_status(client: AsyncClient, mocker):
+    """PATCH updates direction status to paused."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "paused"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["direction"]["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_text(client: AsyncClient, mocker):
+    """PATCH updates direction text."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Original text")
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"text": "Updated text"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["direction"]["text"] == "Updated text"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_paths(client: AsyncClient, mocker):
+    """PATCH updates direction paths."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, paths=["old/path"])
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"paths": ["new/path1", "new/path2"]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["direction"]["paths"] == ["new/path1", "new/path2"]
+
+
+@pytest.mark.asyncio
+async def test_delete_direction_removes_it(client: AsyncClient, mocker):
+    """DELETE removes the direction from the project."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.delete(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["message"] == "Direction removed"
+
+    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    ids = [d["id"] for d in get_resp.json()["directions"]]
+    assert direction["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_delete_direction_cancels_queued_tasks(client: AsyncClient, db_session, mocker):
+    """DELETE cancels QUEUED tasks whose context.direction_id matches the deleted direction."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction to delete")
+    direction_id = direction["id"]
+
+    # Create a QUEUED task that references this direction in its context
+    task = Task(
+        project_id=uuid.UUID(project_id),
+        title="Autonomous research task",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.delete(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cancelled_tasks"] == 1
+
+    # Verify the task status is now CANCELLED
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Cooldown Filter (_spawn_research_task)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cooldown_filter_excludes_recently_researched_direction(db_session):
+    """A direction researched 1 hour ago (within 4-hour cooldown) should not trigger a task."""
+    project = Project(
+        name="Cooldown Test — Recent",
+        autonomous_enabled=True,
+        directions=[{
+            "id": "d-recent01",
+            "text": "Researched recently",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "last_researched_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        }],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 0, "No task should be spawned for a recently-researched direction"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
+    """A direction researched 5 hours ago (past 4-hour cooldown) should trigger a task."""
+    project = Project(
+        name="Cooldown Test — Past",
+        autonomous_enabled=True,
+        directions=[{
+            "id": "d-past0001",
+            "text": "Researched long ago",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+        }],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    research_tasks = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research_tasks) == 1, "A research task should be spawned when past cooldown"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_filter_includes_direction_never_researched(db_session):
+    """A direction with no last_researched_at is always eligible for research."""
+    project = Project(
+        name="Cooldown Test — Never",
+        autonomous_enabled=True,
+        directions=[{
+            "id": "d-never001",
+            "text": "Never been researched",
+            "status": "active",
+            "priority": "high",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            # no last_researched_at key
+        }],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    research_tasks = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research_tasks) == 1, "A research task should be spawned for a never-researched direction"
+
+
+@pytest.mark.asyncio
+async def test_spawn_skipped_when_autonomous_disabled(db_session):
+    """_spawn_research_task does nothing when autonomous_enabled is False."""
+    project = Project(
+        name="Autonomous Disabled",
+        autonomous_enabled=False,
+        directions=[{
+            "id": "d-dis00001",
+            "text": "Should not be researched",
+            "status": "active",
+            "priority": "high",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        }],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. last_researched_at Update (_handle_research_completion)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_research_completion_updates_last_researched_at(db_session, mocker):
+    """After _handle_research_completion runs, the researched direction gets last_researched_at set."""
+    direction_id = "d-resrch01"
+    direction = {
+        "id": direction_id,
+        "text": "Improve logging",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+
+    project = Project(
+        name="Research Completion Test",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Improve logging",
+        payloads=[{
+            "type": "research",
+            "directions": [direction],
+            "base_branch": "main",
+        }],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Mock all external calls made inside _handle_research_completion
+    mocker.patch(
+        "app.main.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.main._log_file_overlaps", return_value=None)
+    mocker.patch(
+        "app.main._parse_research_findings",
+        return_value=[{
+            "title": "Add unit tests for directions",
+            "description": "Improve coverage of the directions module",
+            "prompt": "Write unit tests for the directions CRUD endpoints",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+    before = datetime.utcnow()
+    await _handle_research_completion(task, "", db_session)
+
+    # Reload project from DB to get the updated directions
+    await db_session.refresh(project)
+    updated_directions = project.directions
+    assert updated_directions is not None
+
+    researched = next((d for d in updated_directions if d["id"] == direction_id), None)
+    assert researched is not None, "Direction should still exist after research completion"
+    assert "last_researched_at" in researched, "last_researched_at should be set after completion"
+
+    last_ts = datetime.fromisoformat(researched["last_researched_at"])
+    assert last_ts >= before, "last_researched_at should be set to a time after the test started"
+
+
+@pytest.mark.asyncio
+async def test_handle_research_completion_no_findings_skips_update(db_session, mocker):
+    """When there are no findings, last_researched_at is NOT updated and no tasks are created."""
+    direction_id = "d-nofind01"
+    direction = {
+        "id": direction_id,
+        "text": "Direction with no findings",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+
+    project = Project(
+        name="No Findings Test",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Direction with no findings",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch("app.main._parse_research_findings", return_value=[])  # no findings
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    directions = project.directions
+    researched = next(d for d in directions if d["id"] == direction_id)
+    assert "last_researched_at" not in researched, (
+        "last_researched_at should NOT be set when there are no findings"
+    )
+
+    # No child tasks should have been created
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Task-Counts Endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_task_counts_empty(client: AsyncClient, mocker):
+    """task-counts returns an empty dict when no research tasks exist."""
+    project_id = await _deploy_project(client, mocker)
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    assert resp.json()["counts"] == {}
+
+
+@pytest.mark.asyncio
+async def test_task_counts_single_direction(client: AsyncClient, mocker):
+    """task-counts returns count=1 after one research task is triggered for a direction."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction for research")
+    direction_id = direction["id"]
+
+    research_resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert research_resp.status_code == 200
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    counts = resp.json()["counts"]
+    assert counts.get(direction_id, 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_counts_multiple_directions(client: AsyncClient, mocker):
+    """task-counts tracks counts independently per direction."""
+    project_id = await _deploy_project(client, mocker)
+    dir_a = await _add_direction(client, project_id, text="Direction A")
+    dir_b = await _add_direction(client, project_id, text="Direction B")
+
+    await client.post(f"/api/admin/projects/{project_id}/directions/{dir_a['id']}/research")
+    await client.post(f"/api/admin/projects/{project_id}/directions/{dir_b['id']}/research")
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    counts = resp.json()["counts"]
+    assert counts[dir_a["id"]] == 1
+    assert counts[dir_b["id"]] == 1
+
+
+@pytest.mark.asyncio
+async def test_task_counts_ignores_non_research_tasks(client: AsyncClient, mocker):
+    """task-counts does not count tasks whose payload type is not 'research'."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction C")
+    direction_id = direction["id"]
+
+    # The initial deploy task has type != "research" — it should not be counted
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    counts = resp.json()["counts"]
+    assert counts.get(direction_id, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_task_counts_excludes_cancelled_and_failed(client: AsyncClient, db_session, mocker):
+    """task-counts must not count CANCELLED or FAILED research tasks."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction for cancelled test")
+    direction_id = direction["id"]
+
+    # Insert a CANCELLED research task directly into the DB
+    cancelled_task = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: cancelled",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.CANCELLED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    # Insert a FAILED research task directly into the DB
+    failed_task = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: failed",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(cancelled_task)
+    db_session.add(failed_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    counts = resp.json()["counts"]
+    assert counts.get(direction_id, 0) == 0, (
+        "CANCELLED and FAILED tasks must not be included in task-counts"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_counts_project_not_found(client: AsyncClient):
+    """task-counts returns 404 for a nonexistent project."""
+    fake_id = str(uuid.uuid4())
+    resp = await client.get(f"/api/admin/projects/{fake_id}/directions/task-counts")
+    assert resp.status_code == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Status and Priority Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_update_direction_invalid_status_returns_400(client: AsyncClient, mocker):
+    """PATCH with an unrecognised status value returns 400."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"status": "invalid_status"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_invalid_priority_returns_400(client: AsyncClient, mocker):
+    """PATCH with an unrecognised priority value returns 400."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"priority": "urgent"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_empty_text_returns_400(client: AsyncClient, mocker):
+    """PATCH with empty text returns 400."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"text": ""},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_not_found_returns_404(client: AsyncClient, mocker):
+    """PATCH on a nonexistent direction_id returns 404."""
+    project_id = await _deploy_project(client, mocker)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-notexist",
+        json={"priority": "low"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_directions_project_not_found(client: AsyncClient):
+    """GET directions for a nonexistent project returns 404."""
+    resp = await client.get(f"/api/admin/projects/{uuid.uuid4()}/directions")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_nonexistent_direction_returns_404(client: AsyncClient, mocker):
+    """DELETE a direction that does not exist returns 404."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.delete(
+        f"/api/admin/projects/{project_id}/directions/d-notexist"
+    )
+    assert resp.status_code == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. autonomous_research_wave_size settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_settings_returns_wave_size_default(client: AsyncClient):
+    """GET /api/admin/settings returns autonomous_research_wave_size with default 3."""
+    resp = await client.get("/api/admin/settings")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "autonomous_research_wave_size" in data
+    assert data["autonomous_research_wave_size"] == 3
+
+
+@pytest.mark.asyncio
+async def test_patch_settings_wave_size_persists(client: AsyncClient):
+    """PATCH /api/admin/settings with autonomous_research_wave_size updates the value."""
+    resp = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 10})
+    assert resp.status_code == 200
+
+    resp2 = await client.get("/api/admin/settings")
+    assert resp2.status_code == 200
+    assert resp2.json()["autonomous_research_wave_size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_patch_settings_wave_size_invalid_returns_400(client: AsyncClient):
+    """PATCH /api/admin/settings with out-of-range wave_size returns 400."""
+    resp = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 0})
+    assert resp.status_code == 400
+
+    resp2 = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 51})
+    assert resp2.status_code == 400

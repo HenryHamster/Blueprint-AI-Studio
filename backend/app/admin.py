@@ -1045,6 +1045,7 @@ async def get_settings(
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
         "min_research_interval_hours": _runtime_config.get("min_research_interval_hours", 24),
+        "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
         "github_account": github_account,
         "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -1194,6 +1195,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 8760):
             raise HTTPException(status_code=400, detail="min_research_interval_hours must be between 1 and 8760")
         _runtime_config["min_research_interval_hours"] = val
+    if "autonomous_research_wave_size" in payload:
+        try:
+            val = int(payload["autonomous_research_wave_size"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 50")
+        _runtime_config["autonomous_research_wave_size"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -1758,6 +1767,7 @@ async def create_direction_research_task(
         raise HTTPException(status_code=404, detail="Direction not found")
 
     if not bypass_cooldown:
+        from app.shared_state import runtime_config as _runtime_config
         cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
         last_researched_at = direction.get("last_researched_at")
         if last_researched_at:
@@ -1816,6 +1826,7 @@ async def create_direction_research_task(
     }
 
 
+
 @router.get("/projects/{project_id}/directions/task-counts")
 async def get_direction_task_counts(
     project_id: uuid.UUID,
@@ -1829,6 +1840,7 @@ async def get_direction_task_counts(
     result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
+            Task.status.not_in([TaskStatus.CANCELLED, TaskStatus.FAILED]),
         )
     )
     tasks = result.scalars().all()

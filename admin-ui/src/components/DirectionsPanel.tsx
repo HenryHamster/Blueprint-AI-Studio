@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Zap } from 'lucide-react';
+import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Settings, Zap } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
 
 interface Project {
@@ -78,7 +78,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   // Add form
   const [newText, setNewText] = useState('');
   const [newPriority, setNewPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [newPaths, setNewPaths] = useState('');
+  const [newPathTags, setNewPathTags] = useState<string[]>([]);
+  const [newPathInput, setNewPathInput] = useState('');
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -88,10 +89,19 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
   const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused'>('active');
-  const [editPaths, setEditPaths] = useState('');
+  const [editPathTags, setEditPathTags] = useState<string[]>([]);
+  const [editPathInput, setEditPathInput] = useState('');
 
   // Collapsible sections — all expanded by default
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  // Autonomous config settings (global)
+  const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
+  const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
+  const [configWaveSize, setConfigWaveSize] = useState<number>(3);
+  const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
+  const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
+  const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
 
   // Research button state
   const [researchingIds, setResearchingIds] = useState<Record<string, boolean>>({});
@@ -123,7 +133,10 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   }, [forceConfirmId]);
 
   useEffect(() => {
-    if (selectedProjectId) fetchDirections();
+    if (selectedProjectId) {
+      fetchDirections();
+      fetchSettings();
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
 
@@ -156,6 +169,36 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     }
   }
 
+  async function fetchSettings() {
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, { headers: h });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.autonomous_direction_cooldown_minutes != null) setConfigCooldownHours(data.autonomous_direction_cooldown_minutes / 60);
+      if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
+      if (data.autonomous_research_wave_size != null) setConfigWaveSize(data.autonomous_research_wave_size);
+      if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
+    } catch { /* ignore */ }
+  }
+
+  async function saveConfigField(field: string, value: number) {
+    setSavingConfigField(field);
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ [field]: value }),
+      });
+      if (!res.ok) throw new Error('Failed to save setting');
+    } catch {
+      setError('Failed to save setting. Please try again.');
+    } finally {
+      setSavingConfigField(null);
+    }
+  }
+
   async function fetchDirections() {
     setLoading(true);
     try {
@@ -182,17 +225,17 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   async function addDirection() {
     if (!newText.trim() || !selectedProjectId) return;
     setError(null);
-    const paths = newPaths.split(',').map(p => p.trim()).filter(Boolean);
     try {
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST', headers: h,
-        body: JSON.stringify({ text: newText.trim(), priority: newPriority, paths }),
+        body: JSON.stringify({ text: newText.trim(), priority: newPriority, paths: newPathTags }),
       });
       if (!res.ok) throw new Error('Failed to add direction');
       setNewText('');
       setNewPriority('medium');
-      setNewPaths('');
+      setNewPathTags([]);
+      setNewPathInput('');
       fetchDirections();
     } catch {
       setError('Failed to add direction. Please try again.');
@@ -201,12 +244,11 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
   async function updateDirection(id: string) {
     setError(null);
-    const paths = editPaths.split(',').map(p => p.trim()).filter(Boolean);
     try {
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH', headers: h,
-        body: JSON.stringify({ text: editText, priority: editPriority, status: editStatus, paths }),
+        body: JSON.stringify({ text: editText, priority: editPriority, status: editStatus, paths: editPathTags }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       setEditingId(null);
@@ -310,7 +352,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     setEditText(d.text);
     setEditPriority(d.priority);
     setEditStatus(d.status);
-    setEditPaths((d.paths ?? []).join(', '));
+    setEditPathTags(d.paths ?? []);
+    setEditPathInput('');
   }
 
   function toggleSection(key: string) {
@@ -373,6 +416,111 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
               <p className="text-xs text-neutral-500 leading-relaxed">
                 Active directions guide the research agent. Only Active directions are included in new tasks.
               </p>
+
+              {/* Autonomous Config collapsible */}
+              <div>
+                <button
+                  onClick={() => setAutonomousConfigOpen(v => !v)}
+                  className="flex items-center gap-1.5 w-full text-left group"
+                >
+                  <Settings className="w-3 h-3 text-neutral-500 group-hover:text-neutral-400 transition-colors" />
+                  <span className="text-[11px] font-medium text-neutral-500 uppercase tracking-wider group-hover:text-neutral-400 transition-colors flex-1">
+                    Autonomous Config
+                  </span>
+                  {autonomousConfigOpen
+                    ? <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                    : <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
+                  }
+                </button>
+
+                {autonomousConfigOpen && (
+                  <div className="mt-2 space-y-2">
+                    {/* Cooldown (hours) */}
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Cooldown (hours)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={720}
+                        value={configCooldownHours}
+                        onChange={e => setConfigCooldownHours(Number(e.target.value))}
+                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      />
+                      <button
+                        onClick={() => saveConfigField('autonomous_direction_cooldown_hours', configCooldownHours)}
+                        disabled={savingConfigField === 'autonomous_direction_cooldown_hours'}
+                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+                        title="Save"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {/* Poll interval (min) */}
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Poll interval (min)</label>
+                      <input
+                        type="number"
+                        min={5}
+                        max={1440}
+                        value={configIntervalMinutes}
+                        onChange={e => setConfigIntervalMinutes(Number(e.target.value))}
+                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      />
+                      <button
+                        onClick={() => saveConfigField('autonomous_research_interval_minutes', configIntervalMinutes)}
+                        disabled={savingConfigField === 'autonomous_research_interval_minutes'}
+                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+                        title="Save"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {/* Wave size */}
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Wave size</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={configWaveSize}
+                        onChange={e => setConfigWaveSize(Number(e.target.value))}
+                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      />
+                      <button
+                        onClick={() => saveConfigField('autonomous_research_wave_size', configWaveSize)}
+                        disabled={savingConfigField === 'autonomous_research_wave_size'}
+                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+                        title="Save"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {/* Max tasks/hour */}
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Max tasks/hour</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={configMaxTasksPerHour}
+                        onChange={e => setConfigMaxTasksPerHour(Number(e.target.value))}
+                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      />
+                      <button
+                        onClick={() => saveConfigField('max_autonomous_tasks_per_hour', configMaxTasksPerHour)}
+                        disabled={savingConfigField === 'max_autonomous_tasks_per_hour'}
+                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+                        title="Save"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -405,12 +553,36 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                 <Plus className="w-3.5 h-3.5" />
               </button>
             </div>
-            <input
-              value={newPaths}
-              onChange={e => setNewPaths(e.target.value)}
-              placeholder="Path scope (optional, comma-separated, e.g. backend/, frontend/src/)"
-              className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
-            />
+            <div className="mt-1.5 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
+              {newPathTags.map(tag => (
+                <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+                  {tag}
+                  <button
+                    type="button"
+                    onClick={() => setNewPathTags(prev => prev.filter(t => t !== tag))}
+                    className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none"
+                  >
+                    <X className="w-2.5 h-2.5" />
+                  </button>
+                </span>
+              ))}
+              <input
+                value={newPathInput}
+                onChange={e => setNewPathInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' || e.key === ',') {
+                    e.preventDefault();
+                    const val = newPathInput.trim();
+                    if (val && !newPathTags.includes(val)) setNewPathTags(prev => [...prev, val]);
+                    setNewPathInput('');
+                  } else if (e.key === 'Backspace' && !newPathInput && newPathTags.length > 0) {
+                    setNewPathTags(prev => prev.slice(0, -1));
+                  }
+                }}
+                placeholder={newPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
+                className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
+              />
+            </div>
           </div>
         )}
 
@@ -463,12 +635,36 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                   onChange={e => setEditText(e.target.value)}
                                   className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
                                 />
-                                <input
-                                  value={editPaths}
-                                  onChange={e => setEditPaths(e.target.value)}
-                                  placeholder="Path scope (comma-separated, e.g. backend/, frontend/src/)"
-                                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
-                                />
+                                <div className="bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
+                                  {editPathTags.map(tag => (
+                                    <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+                                      {tag}
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditPathTags(prev => prev.filter(t => t !== tag))}
+                                        className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none"
+                                      >
+                                        <X className="w-2.5 h-2.5" />
+                                      </button>
+                                    </span>
+                                  ))}
+                                  <input
+                                    value={editPathInput}
+                                    onChange={e => setEditPathInput(e.target.value)}
+                                    onKeyDown={e => {
+                                      if (e.key === 'Enter' || e.key === ',') {
+                                        e.preventDefault();
+                                        const val = editPathInput.trim();
+                                        if (val && !editPathTags.includes(val)) setEditPathTags(prev => [...prev, val]);
+                                        setEditPathInput('');
+                                      } else if (e.key === 'Backspace' && !editPathInput && editPathTags.length > 0) {
+                                        setEditPathTags(prev => prev.slice(0, -1));
+                                      }
+                                    }}
+                                    placeholder={editPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
+                                    className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
+                                  />
+                                </div>
                                 <div className="flex items-center gap-2">
                                   <select
                                     value={editPriority}

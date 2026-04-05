@@ -27,7 +27,7 @@ _SQLiteTypeCompiler.visit_JSONB = _sqlite_visit_JSONB
 
 from app.main import app
 from app.database import get_session
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 
 # --- Database engine selection ---
 # CI explicitly sets USE_TEST_POSTGRES=true to use real PostgreSQL.
@@ -117,12 +117,41 @@ def override_get_session(db_session):
 def override_get_current_user():
     """
     Overrides the authentication dependency so we don't need real tokens.
+    Returns an admin user so the /api/admin/* endpoints are accessible.
     """
     async def _override_get_current_user():
-        return {"user_id": "test-user-123", "email": "test@example.com"}
+        return {"user_id": "test-user-123", "email": "test@example.com", "role": "admin"}
     app.dependency_overrides[get_current_user] = _override_get_current_user
+    # Also bypass the require_admin router-level dependency directly
+    app.dependency_overrides[require_admin] = lambda: None
     yield
     app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(require_admin, None)
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """
+    Reset the slowapi in-memory rate-limit counters before every test so that
+    repeated calls to the same endpoint don't trigger 429 errors.
+
+    slowapi's Limiter stores rate-limit data via limiter._limiter.storage
+    (a limits.MemoryStorage instance), not at limiter._storage directly.
+    """
+    from app.main import limiter
+    # slowapi wraps a limits strategy object; the storage is one level deeper
+    underlying = getattr(limiter, '_limiter', None)
+    storage = getattr(underlying, 'storage', None) if underlying is not None else None
+    if storage is not None:
+        if hasattr(storage, 'reset'):
+            storage.reset()
+        else:
+            # Fallback: clear whichever internal dict the storage uses
+            for attr in ('_storage', 'storage', '_data', 'data'):
+                bucket = getattr(storage, attr, None)
+                if isinstance(bucket, dict):
+                    bucket.clear()
+                    break
+    yield
 
 
 @pytest_asyncio.fixture(scope="function")
