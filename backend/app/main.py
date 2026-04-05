@@ -1769,6 +1769,17 @@ async def orchestrator_worker():
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
                 eligible_ids = []
                 for task in candidate_tasks:
+                    # Skip tasks held back due to retry_after delay
+                    retry_after_str = (task.context or {}).get("retry_after")
+                    if retry_after_str:
+                        try:
+                            retry_after_dt = datetime.fromisoformat(retry_after_str)
+                            if retry_after_dt > _utcnow():
+                                logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
+                                continue
+                        except (ValueError, TypeError):
+                            pass  # Malformed retry_after — let it through
+
                     deps = task.depends_on or []
                     if not deps:
                         eligible_ids.append(task.id)
@@ -5586,14 +5597,25 @@ async def update_agent_status(
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None  # Fresh timeout window for the new VM
-            # Blacklist rate-limited account so the retry picks a different one
-            if failure_class == "RATE_LIMIT" and acct_id:
-                ctx = dict(task.context or {})
-                blacklisted = list(ctx.get("blacklisted_accounts") or [])
-                if acct_id not in blacklisted:
-                    blacklisted.append(acct_id)
-                ctx["blacklisted_accounts"] = blacklisted
-                task.context = ctx
+            # Add retry delay for transient failures to avoid hammering exhausted resources
+            ctx = dict(task.context or {})
+            if failure_class == "RATE_LIMIT":
+                retry_after = (_utcnow() + timedelta(minutes=30)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited — holding back 30min (retry_after={retry_after})")
+                # Blacklist rate-limited account so the retry picks a different one
+                if acct_id:
+                    blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                    if acct_id not in blacklisted:
+                        blacklisted.append(acct_id)
+                    ctx["blacklisted_accounts"] = blacklisted
+            elif failure_class == "PROVISION_FAILURE":
+                retry_after = (_utcnow() + timedelta(minutes=5)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back 5min (retry_after={retry_after})")
+            else:
+                ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
+            task.context = ctx
             session.add(task)
 
             await session.commit()
