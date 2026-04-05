@@ -399,7 +399,9 @@ function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
       const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
       sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      const errCode = (err as NodeJS.ErrnoException).code;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
         sendLog(ws, 'ruff not installed, skipping backend lint.\n');
       } else {
         throw err;
@@ -410,7 +412,9 @@ function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
       const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
       sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
     } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      const errCode = (err as NodeJS.ErrnoException).code;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
         sendLog(ws, 'ruff not installed, skipping backend format check.\n');
       } else {
         throw err;
