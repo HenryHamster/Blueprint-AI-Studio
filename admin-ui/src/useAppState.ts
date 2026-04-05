@@ -844,7 +844,8 @@ export function useAppState() {
     fetchDeployState();
     const id = setInterval(() => fetchDeployState(true), 60000);
     return () => clearInterval(id);
-  }, [fetchDeployState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Zone Health ---
   const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);

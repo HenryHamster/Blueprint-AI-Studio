@@ -136,11 +136,15 @@ async def load_max_plan_pool():
         total_active = sum(active_per_account.values())
         logger.info(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
 
-async def select_max_plan_account() -> Optional[Dict[str, Any]]:
+async def select_max_plan_account(blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count.
-    Pre-increments active_tasks atomically under lock to prevent races."""
+    Pre-increments active_tasks atomically under lock to prevent races.
+    Accounts in blacklist are excluded even if not yet disabled in the pool."""
     async with _max_plan_pool_lock:
-        available = [a for a in _max_plan_pool if a.get("enabled", True)]
+        available = [
+            a for a in _max_plan_pool
+            if a.get("enabled", True) and (not blacklist or a["id"] not in blacklist)
+        ]
         if not available:
             return None
         account = min(available, key=lambda a: a["active_tasks"])
@@ -189,24 +193,31 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     logs_lower = (logs or "").lower()
     combined = status_msg + " " + logs_lower
 
-    # Provision failures — GCP quota, network, VM issues
+    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors
     if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
-                                      "vm failed to start", "failed to provision"]):
+                                      "vm failed to start", "failed to provision",
+                                      "connection refused", "connection reset by peer",
+                                      "timed out waiting for operation", "sshd", "startup script"]):
         return "PROVISION_FAILURE"
 
-    # Rate limit — Claude API usage exhausted
+    # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
     if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "billing",
-                                      "usage limit", "token limit exceeded"]):
+                                      "usage limit", "token limit exceeded",
+                                      "too many requests", "resource_exhausted", "daily limit",
+                                      "context_length_exceeded", "tokens per minute"]):
         return "RATE_LIMIT"
 
-    # External API failures — GitHub, Claude API outages
+    # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
     if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "502 bad gateway", "503 service unavailable",
-                                      "github api error", "claude api"]):
+                                      "github api error", "claude api",
+                                      "connection timed out", "name resolution failed",
+                                      "ssl", "certificate"]):
         return "EXTERNAL_API"
 
-    # Agent timeout — reaped by heartbeat timeout
-    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out"]):
+    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator
+    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
+                                      "execution timed out", "killed", "sigterm"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error
@@ -825,9 +836,10 @@ async def _check_pause_mode():
                 state.runtime_max_concurrent_vms = restore
                 session.add(state)
                 await session.commit()
-                _runtime_config["max_concurrent_vms"] = restore
+                initial_vms = min(2, restore)
+                _runtime_config["max_concurrent_vms"] = initial_vms
                 _health_recovery_streak = 0
-                logger.info(f"[PAUSE] Auto-resumed pipeline — all deps healthy for 3 consecutive checks (max_vms={restore})")
+                logger.info(f"[PAUSE] Auto-resumed pipeline with {initial_vms} VMs (target: {restore})")
                 await broadcast_deploy_state()
 
 
@@ -1355,11 +1367,15 @@ async def reaper_service():
                 five_minutes_ago = now - timedelta(minutes=5)
                 ten_minutes_ago = now - timedelta(minutes=10)
 
+                fifteen_minutes_ago = now - timedelta(minutes=15)
                 orphaned_ids = []
                 for task in active_tasks:
                     if not task.vm_instance_id:
                         continue
-                    if task.last_heartbeat:
+                    if task.status == TaskStatus.PROVISIONING and task.started_at and task.started_at < fifteen_minutes_ago:
+                        orphaned_ids.append(task.id)  # PROVISIONING timeout regardless of heartbeat
+                        logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
+                    elif task.last_heartbeat:
                         if task.last_heartbeat < five_minutes_ago:
                             orphaned_ids.append(task.id)
                     elif task.started_at and task.started_at < ten_minutes_ago:
@@ -1791,7 +1807,7 @@ async def orchestrator_worker():
                 stale_vm_ids = []
                 for t in active_tasks_result:
                     if (t.status == TaskStatus.PROVISIONING
-                        and t.last_heartbeat is None
+                        and (t.last_heartbeat is None or t.last_heartbeat < five_min_ago)
                         and t.started_at and t.started_at < five_min_ago):
                         stale_vm_ids.append(t.vm_instance_id)
                         t.status = TaskStatus.QUEUED
@@ -1799,7 +1815,10 @@ async def orchestrator_worker():
                         t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         session.add(t)
                         tasks_recovered += 1
-                        logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED")
+                        if t.last_heartbeat is None:
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (no heartbeat, started_at={t.started_at})")
+                        else:
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (stale heartbeat={t.last_heartbeat}, started_at={t.started_at})")
                 if session.dirty:
                     await session.commit()
                     # Delete old VMs from stale provisions (after commit)
@@ -1856,6 +1875,17 @@ async def orchestrator_worker():
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
                 eligible_ids = []
                 for task in candidate_tasks:
+                    # Skip tasks held back due to retry_after delay
+                    retry_after_str = (task.context or {}).get("retry_after")
+                    if retry_after_str:
+                        try:
+                            retry_after_dt = datetime.fromisoformat(retry_after_str)
+                            if retry_after_dt > _utcnow():
+                                logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
+                                continue
+                        except (ValueError, TypeError):
+                            pass  # Malformed retry_after — let it through
+
                     deps = task.depends_on or []
                     if not deps:
                         eligible_ids.append(task.id)
@@ -1916,6 +1946,7 @@ async def orchestrator_worker():
                                    if t.id not in eligible_ids
                                    and (t.depends_on or [])
                                    and t.status == TaskStatus.QUEUED]
+                    narrow_broken = 0
                     if stuck_tasks:
                         stuck_ids = {t.id for t in stuck_tasks}
                         for stask in stuck_tasks:
@@ -1958,17 +1989,18 @@ async def orchestrator_worker():
                                         fix_session.add(fix_task)
                                         await fix_session.commit()
                                 eligible_ids.append(stask.id)
-                                break  # One per check — conservative
+                                narrow_broken += 1
 
-                    # Broader scan: check ALL QUEUED tasks older than 30 min (not just candidate batch)
-                    thirty_min_ago = _utcnow() - timedelta(minutes=30)
+                    # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
+                    ten_min_ago = _utcnow() - timedelta(minutes=10)
                     broad_stmt = select(Task).where(
                         Task.status == TaskStatus.QUEUED,
-                        Task.created_at < thirty_min_ago,
+                        Task.created_at < ten_min_ago,
                         Task.requires_approval.is_(False),
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
                     broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
+                    broad_broken = 0
                     if broad_stuck:
                         broad_stuck_ids = {t.id for t in broad_stuck}
                         for stask in broad_stuck:
@@ -1996,13 +2028,19 @@ async def orchestrator_worker():
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
-                                            f"for task {stask.id} (stuck >{30}min with {len(dep_uuids)} unresolvable deps)"
+                                            f"for task {stask.id} (stuck >{10}min with {len(dep_uuids)} unresolvable deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
                                         fix_session.add(fix_task)
                                         await fix_session.commit()
-                                break  # One per check — conservative
+                                broad_broken += 1
+                    total_broken = narrow_broken + broad_broken
+                    if total_broken > 0:
+                        logger.warning(
+                            f"[ORCHESTRATOR] Deadlock resolution cycle complete: "
+                            f"{narrow_broken} narrow + {broad_broken} broad = {total_broken} deadlock(s) broken"
+                        )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 # Build a set of files currently being modified by IN_PROGRESS tasks
@@ -2064,7 +2102,8 @@ async def orchestrator_worker():
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
                     # Select Max plan account (primary) or fall back to API key
-                    account = await select_max_plan_account()
+                    _blacklist = (task.context or {}).get("blacklisted_accounts")
+                    account = await select_max_plan_account(blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -2751,7 +2790,7 @@ async def prometheus_metrics(request: Request):
 
     cycle_age: Optional[float] = None
     if _orchestrator_last_cycle:
-        cycle_age = (datetime.utcnow() - _orchestrator_last_cycle).total_seconds()
+        cycle_age = (_utcnow() - _orchestrator_last_cycle).total_seconds()
 
     active_vms = sum(a.get("active_tasks", 0) for a in _max_plan_pool)
     consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
@@ -5762,6 +5801,25 @@ async def update_agent_status(
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None  # Fresh timeout window for the new VM
+            # Add retry delay for transient failures to avoid hammering exhausted resources
+            ctx = dict(task.context or {})
+            if failure_class == "RATE_LIMIT":
+                retry_after = (_utcnow() + timedelta(minutes=30)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited — holding back 30min (retry_after={retry_after})")
+                # Blacklist rate-limited account so the retry picks a different one
+                if acct_id:
+                    blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                    if acct_id not in blacklisted:
+                        blacklisted.append(acct_id)
+                    ctx["blacklisted_accounts"] = blacklisted
+            elif failure_class == "PROVISION_FAILURE":
+                retry_after = (_utcnow() + timedelta(minutes=5)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back 5min (retry_after={retry_after})")
+            else:
+                ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
+            task.context = ctx
             session.add(task)
 
             await session.commit()
@@ -5784,7 +5842,8 @@ async def update_agent_status(
             failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
             (
                 (task.context or {}).get("auto_debug") is True or
-                task.parent_task_id is not None  # Part of a pipeline (plan/research subtask)
+                task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
+                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
             )
         )
         if should_auto_debug:
@@ -5824,10 +5883,15 @@ async def update_agent_status(
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR" and _cb_failure_class not in ("RATE_LIMIT", "PROVISION_FAILURE"):
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
-            breaker["failure_count"] += 1
-            breaker["success_count"] = 0
+            # Only CODE_ERROR and AGENT_TIMEOUT indicate code regressions; infra/rate-limit
+            # failures are transient and should not trip the breaker.
+            is_code_failure = failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
+            if is_code_failure:
+                breaker["failure_count"] += 1
+                breaker["success_count"] = 0
 
             # HALF-OPEN test task failed → back to OPEN with doubled cooldown
+            # (any failure on the test task re-opens, including infra failures)
             if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
                 breaker["state"] = "OPEN"
                 breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours

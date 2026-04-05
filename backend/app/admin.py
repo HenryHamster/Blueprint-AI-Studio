@@ -2,13 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, R
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TypedDict
 import uuid
 import json
 import httpx
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -2759,4 +2759,289 @@ async def get_autonomy_debug(
         },
         "directions": directions_info,
         "next_check_at": next_check_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics helpers
+# ---------------------------------------------------------------------------
+
+class StuckTaskInfo(TypedDict):
+    task_id: str
+    title: str
+    status: TaskStatus
+    stuck_reason: str
+    stuck_for_seconds: int
+    attempt_count: int
+    failure_class: Optional[str]
+    unresolvable_deps: List[str]
+
+
+class CircuitBreakerInfo(TypedDict):
+    state: str
+    failure_count: int
+    cooldown_seconds: int
+    cooldown_remaining_seconds: Optional[int]
+    opened_at: Optional[str]
+
+
+class ProjectSummary(TypedDict):
+    project_id: str
+    stuck_count: int
+    queued_count: int
+    in_progress_count: int
+    circuit_breaker_state: str
+
+
+def _classify_stuck_failure(task: Task) -> Optional[str]:
+    """Lightweight failure classifier for stuck tasks based on status message."""
+    msg = (task.latest_status_message or "").lower()
+    if any(kw in msg for kw in ["provision", "quota", "vm failed", "connection refused", "ssh", "startup script"]):
+        return "PROVISION_FAILURE"
+    if any(kw in msg for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "too many requests"]):
+        return "RATE_LIMIT"
+    if any(kw in msg for kw in ["api.github.com", "api.anthropic.com", "502", "503", "ssl", "certificate"]):
+        return "EXTERNAL_API"
+    if any(kw in msg for kw in ["no heartbeat", "reaped", "timed out", "killed", "sigterm"]):
+        return "AGENT_TIMEOUT"
+    return None
+
+
+async def _build_stuck_tasks(
+    tasks: List[Task],
+    now: datetime,
+    session: AsyncSession,
+) -> List[StuckTaskInfo]:
+    """Detect stuck tasks and build the diagnostics list."""
+    stuck: List[StuckTaskInfo] = []
+    provision_timeout_secs = 5 * 60
+    no_heartbeat_secs = 5 * 60
+    long_queued_secs = 30 * 60
+    stuck_deps_secs = 10 * 60
+
+    # Pre-fetch all dependency statuses in a single batch query to avoid N+1
+    all_dep_uuids: set[uuid.UUID] = set()
+    for task in tasks:
+        if task.status == TaskStatus.QUEUED:
+            created_age = (now - task.created_at).total_seconds()
+            if (task.depends_on or []) and created_age > stuck_deps_secs:
+                for d in task.depends_on:
+                    try:
+                        all_dep_uuids.add(uuid.UUID(d))
+                    except (ValueError, AttributeError):
+                        pass
+
+    dep_status_map: Dict[str, TaskStatus] = {}
+    if all_dep_uuids:
+        dep_result = await session.execute(
+            select(Task.id, Task.status).where(Task.id.in_(all_dep_uuids))
+        )
+        for row in dep_result.all():
+            dep_status_map[str(row.id)] = row.status
+
+    for task in tasks:
+        stuck_reason = None
+        stuck_for_seconds = 0
+        unresolvable_deps: List[str] = []
+
+        if task.status == TaskStatus.PROVISIONING:
+            if task.last_heartbeat is None and task.started_at is not None:
+                age = (now - task.started_at).total_seconds()
+                if age > provision_timeout_secs:
+                    stuck_reason = "provision_timeout"
+                    stuck_for_seconds = int(age - provision_timeout_secs)
+
+        elif task.status == TaskStatus.IN_PROGRESS:
+            if task.last_heartbeat is not None:
+                heartbeat_age = (now - task.last_heartbeat).total_seconds()
+                if heartbeat_age > no_heartbeat_secs:
+                    stuck_reason = "no_heartbeat"
+                    stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
+
+        elif task.status == TaskStatus.QUEUED:
+            created_age = (now - task.created_at).total_seconds()
+            dep_ids = task.depends_on or []
+
+            if dep_ids and created_age > stuck_deps_secs:
+                # Check whether all deps are terminal-failure using pre-fetched map
+                valid_dep_uuids = []
+                for d in dep_ids:
+                    try:
+                        valid_dep_uuids.append(uuid.UUID(d))
+                    except (ValueError, AttributeError):
+                        pass
+                if valid_dep_uuids:
+                    known_rows = [
+                        (str(uid), dep_status_map[str(uid)])
+                        for uid in valid_dep_uuids
+                        if str(uid) in dep_status_map
+                    ]
+                    failed_dep_ids = [
+                        dep_id
+                        for dep_id, status in known_rows
+                        if status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                    ]
+                    if failed_dep_ids and len(failed_dep_ids) == len(known_rows):
+                        stuck_reason = "stuck_deps"
+                        stuck_for_seconds = int(created_age - stuck_deps_secs)
+                        unresolvable_deps = failed_dep_ids
+
+            elif not dep_ids and created_age > long_queued_secs:
+                stuck_reason = "long_queued"
+                stuck_for_seconds = int(created_age - long_queued_secs)
+
+        if stuck_reason:
+            stuck.append({
+                "task_id": str(task.id),
+                "title": task.title,
+                "status": task.status,
+                "stuck_reason": stuck_reason,
+                "stuck_for_seconds": stuck_for_seconds,
+                "attempt_count": task.attempt_count,
+                "failure_class": _classify_stuck_failure(task),
+                "unresolvable_deps": unresolvable_deps,
+            })
+
+    return stuck
+
+
+def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
+    opened_at = cb.get("opened_at")
+    cooldown_remaining = None
+    if opened_at and cb.get("state") == "OPEN":
+        elapsed = (_utcnow() - opened_at).total_seconds()
+        cooldown_remaining = max(0, int(cb.get("cooldown_seconds", 1800) - elapsed))
+    return {
+        "state": cb.get("state", "CLOSED"),
+        "failure_count": cb.get("failure_count", 0),
+        "cooldown_seconds": cb.get("cooldown_seconds", 1800),
+        "cooldown_remaining_seconds": cooldown_remaining,
+        "opened_at": opened_at.isoformat() if opened_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/projects/{project_id}/diagnostics
+# ---------------------------------------------------------------------------
+
+@router.get("/projects/{project_id}/diagnostics")
+async def get_project_diagnostics(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a structured health snapshot for a single project's pipeline."""
+    from app.shared_state import get_circuit_breaker
+    from app.compute import get_zone_health_summary
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    now = _utcnow()
+
+    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+    active_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_(active_statuses),
+            Task.archived.is_(False),
+        )
+    )
+    active_tasks = active_result.scalars().all()
+
+    stuck_tasks = await _build_stuck_tasks(active_tasks, now, session)
+
+    queued_count = sum(1 for t in active_tasks if t.status == TaskStatus.QUEUED)
+    in_progress_count = sum(1 for t in active_tasks if t.status == TaskStatus.IN_PROGRESS)
+
+    cb_raw = get_circuit_breaker(str(project_id))
+    circuit_breaker = _format_circuit_breaker(cb_raw)
+
+    try:
+        zone_health = get_zone_health_summary()
+    except Exception:
+        zone_health = {"available": 0, "exhausted": []}
+
+    return {
+        "project_id": str(project_id),
+        "stuck_tasks": stuck_tasks,
+        "circuit_breaker": circuit_breaker,
+        "queued_count": queued_count,
+        "in_progress_count": in_progress_count,
+        "zone_health": zone_health,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/diagnostics  (aggregated across all projects)
+# ---------------------------------------------------------------------------
+
+@router.get("/diagnostics")
+async def get_global_diagnostics(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Aggregate pipeline diagnostics across all projects."""
+    from app.shared_state import get_circuit_breaker, circuit_breakers
+    from app.compute import get_zone_health_summary
+
+    now = _utcnow()
+
+    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+    active_result = await session.execute(
+        select(Task).where(
+            Task.status.in_(active_statuses),
+            Task.archived.is_(False),
+        )
+    )
+    active_tasks = active_result.scalars().all()
+
+    # Group tasks by project
+    by_project: Dict[str, List[Task]] = {}
+    for task in active_tasks:
+        pid = str(task.project_id)
+        by_project.setdefault(pid, []).append(task)
+
+    all_stuck: List[StuckTaskInfo] = []
+    project_summaries: List[ProjectSummary] = []
+    total_queued = 0
+    total_in_progress = 0
+
+    for pid, tasks in by_project.items():
+        stuck = await _build_stuck_tasks(tasks, now, session)
+        queued = sum(1 for t in tasks if t.status == TaskStatus.QUEUED)
+        in_prog = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
+        total_queued += queued
+        total_in_progress += in_prog
+        all_stuck.extend(stuck)
+
+        cb_raw = get_circuit_breaker(pid)
+        project_summaries.append({
+            "project_id": pid,
+            "stuck_count": len(stuck),
+            "queued_count": queued,
+            "in_progress_count": in_prog,
+            "circuit_breaker_state": cb_raw.get("state", "CLOSED"),
+        })
+
+    # All known circuit breakers (includes projects with no active tasks)
+    all_circuit_breakers = {
+        pid: _format_circuit_breaker(cb)
+        for pid, cb in circuit_breakers.items()
+    }
+
+    try:
+        zone_health = get_zone_health_summary()
+    except Exception:
+        zone_health = {"available": 0, "exhausted": []}
+
+    return {
+        "stuck_tasks": all_stuck,
+        "total_stuck_count": len(all_stuck),
+        "queued_count": total_queued,
+        "in_progress_count": total_in_progress,
+        "projects": project_summaries,
+        "circuit_breakers": all_circuit_breakers,
+        "zone_health": zone_health,
     }
