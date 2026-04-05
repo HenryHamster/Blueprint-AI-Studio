@@ -5609,7 +5609,8 @@ async def update_agent_status(
             failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
             (
                 (task.context or {}).get("auto_debug") is True or
-                task.parent_task_id is not None  # Part of a pipeline (plan/research subtask)
+                task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
+                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
             )
         )
         if should_auto_debug:
