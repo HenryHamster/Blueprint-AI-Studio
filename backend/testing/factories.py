@@ -2,7 +2,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from app.models import Alert, Task, TaskHistory, Project, TaskStatus
+from app.models import Alert, Task, TaskHistory, Project, ProjectMember, TaskStatus
 
 
 def _utcnow() -> datetime:
@@ -20,6 +20,11 @@ def make_project(**kwargs) -> Project:
     )
     defaults.update(kwargs)
     return Project(**defaults)
+
+
+def make_membership(project_id, user_id="test-user-123", role="owner") -> ProjectMember:
+    """Create a ProjectMember (owner by default) for test projects."""
+    return ProjectMember(project_id=project_id, user_id=user_id, role=role)
 
 
 def make_task(project_id=None, **kwargs) -> Task:

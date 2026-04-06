@@ -928,11 +928,12 @@ export function useAppState() {
 
   // Fetch deploy state on mount and periodically (WS push is the primary path; this is a fallback)
   useEffect(() => {
+    if (!user) return;
     fetchDeployState();
     const id = setInterval(() => fetchDeployState(true), 60000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [user]);
 
   // --- Zone Health ---
   const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);
@@ -945,10 +946,11 @@ export function useAppState() {
   };
 
   useEffect(() => {
+    if (!user) return;
     fetchZoneHealth();
     const id = setInterval(fetchZoneHealth, 30000);
     return () => clearInterval(id);
-  }, []);
+  }, [user]);
 
   // --- Orchestrator Health ---
   interface OrchestratorHealth {
@@ -979,10 +981,11 @@ export function useAppState() {
   };
 
   useEffect(() => {
+    if (!user) return;
     fetchOrchestratorHealth();
     const id = setInterval(fetchOrchestratorHealth, 30000);
     return () => clearInterval(id);
-  }, []);
+  }, [user]);
 
   // --- Detailed Health ---
   interface CircuitBreakerState {
@@ -1014,10 +1017,11 @@ export function useAppState() {
   };
 
   useEffect(() => {
+    if (!user) return;
     fetchDetailedHealth();
     const id = setInterval(fetchDetailedHealth, 30000);
     return () => clearInterval(id);
-  }, []);
+  }, [user]);
 
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
@@ -1761,6 +1765,50 @@ export function useAppState() {
     await fetchAllowedUsers();
   }, [fetchAllowedUsers]);
 
+  // ── Project members ─────────────────────────────────────────────────────
+  type ProjectMemberEntry = { id: string; user_id: string; email?: string; role: string; created_at: string | null };
+  const [projectMembers, setProjectMembers] = useState<ProjectMemberEntry[]>([]);
+
+  const fetchProjectMembers = useCallback(async (projectId: string) => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/projects/${projectId}/members`);
+      if (res.ok) setProjectMembers(await res.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  const addProjectMember = useCallback(async (projectId: string, email: string, role: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${projectId}/members`, {
+      method: 'POST', body: JSON.stringify({ email, role }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      throw new Error(data.error?.message || data.detail || 'Failed to add member');
+    }
+    await fetchProjectMembers(projectId);
+  }, [fetchProjectMembers]);
+
+  const updateProjectMemberRole = useCallback(async (projectId: string, memberId: string, role: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${projectId}/members/${memberId}`, {
+      method: 'PATCH', body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      throw new Error(data.error?.message || data.detail || 'Failed to update role');
+    }
+    await fetchProjectMembers(projectId);
+  }, [fetchProjectMembers]);
+
+  const removeProjectMember = useCallback(async (projectId: string, memberId: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${projectId}/members/${memberId}`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      throw new Error(data.error?.message || data.detail || 'Failed to remove member');
+    }
+    await fetchProjectMembers(projectId);
+  }, [fetchProjectMembers]);
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -1851,5 +1899,7 @@ export function useAppState() {
     // User management
     allowedUsers, showUserManagement, setShowUserManagement,
     addAllowedUser, updateAllowedUserRole, removeAllowedUser,
+    // Project members
+    projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
   };
 }

@@ -7,7 +7,7 @@ from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 from app.models import TaskStatus
-from testing.factories import make_project, make_task, _utcnow
+from testing.factories import make_project, make_task, make_membership, _utcnow
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +314,8 @@ async def test_activity_basic(client: AsyncClient, db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
 
     completed = make_task(
         project_id=project.id,
@@ -349,6 +351,8 @@ async def test_activity_since_filter(client: AsyncClient, db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
 
     old_task = make_task(
         project_id=project.id,
@@ -386,6 +390,8 @@ async def test_activity_limit(client: AsyncClient, db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
 
     for i in range(5):
         task = make_task(

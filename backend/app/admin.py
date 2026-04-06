@@ -14,7 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
 from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
@@ -28,27 +28,83 @@ router = APIRouter(
 )
 
 
+_ROLE_LEVEL = {"viewer": 0, "member": 1, "owner": 2}
+
+
 def _user_project_ids(user_id: str):
-    """Subquery returning project IDs owned by user_id."""
-    return select(Project.id).where(Project.user_id == user_id)
+    """Subquery returning project IDs the user is a member of (any role)."""
+    return select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
 
 
 async def _get_user_project(project_id: uuid.UUID, user_id: str, session: AsyncSession) -> Project:
-    """Fetch a project ensuring it belongs to the given user. Raises 404 if not found."""
+    """Fetch a project ensuring the user is a member. Raises 404 if not found."""
     project = await session.get(Project, project_id)
-    if not project or project.user_id != user_id:
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    member = (await session.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not member:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
 
+async def _get_user_project_with_role(
+    project_id: uuid.UUID, user_id: str, session: AsyncSession, min_role: str = "viewer"
+) -> Project:
+    """Fetch a project ensuring the user has at least min_role. Raises 403 if insufficient."""
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    member = (await session.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL[min_role]:
+        raise HTTPException(status_code=403, detail=f"Requires {min_role} role on this project")
+    return project
+
+
 async def _get_user_task(task_id: uuid.UUID, user_id: str, session: AsyncSession) -> Task:
-    """Fetch a task ensuring its project belongs to the given user. Raises 404 if not found."""
+    """Fetch a task ensuring the user is a member of its project. Raises 404 if not found."""
     task = await session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    project = await session.get(Project, task.project_id)
-    if not project or project.user_id != user_id:
+    member = (await session.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == task.project_id,
+            ProjectMember.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not member:
         raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+async def _get_user_task_with_role(
+    task_id: uuid.UUID, user_id: str, session: AsyncSession, min_role: str = "member"
+) -> Task:
+    """Fetch a task ensuring the user has at least min_role on its project."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    member = (await session.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == task.project_id,
+            ProjectMember.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL[min_role]:
+        raise HTTPException(status_code=403, detail=f"Requires {min_role} role on this project")
     return task
 
 
@@ -57,10 +113,32 @@ async def get_all_projects(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    query = select(Project).where(Project.user_id == current_user["user_id"]).order_by(Project.created_at.desc())
-    result = await session.execute(query)
-    projects = result.scalars().all()
-    return projects
+    # Join projects with membership to get user's role on each project
+    query = (
+        select(Project, ProjectMember.role)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(ProjectMember.user_id == current_user["user_id"])
+        .order_by(Project.created_at.desc())
+    )
+    rows = (await session.execute(query)).all()
+    result = []
+    for project, role in rows:
+        # Serialize project and add my_role
+        data = {
+            "id": str(project.id),
+            "name": project.name,
+            "user_id": project.user_id,
+            "status": project.status,
+            "github_owner": project.github_owner,
+            "github_repo": project.github_repo,
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "directions": project.directions,
+            "autonomous_enabled": project.autonomous_enabled,
+            "is_self_repo": project.is_self_repo,
+            "my_role": role,
+        }
+        result.append(data)
+    return result
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
@@ -77,7 +155,7 @@ async def update_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     if payload.name is not None:
         project.name = payload.name
@@ -113,7 +191,7 @@ async def delete_project_admin(
 ):
     """Delete a project and cascade to tasks/artifacts/history.
     Refuses if active tasks exist unless force=true."""
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
 
     ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_tasks = (await session.execute(
@@ -154,7 +232,9 @@ async def pause_all_autonomous(
     current_user: dict = Depends(get_current_user)
 ):
     """Disable autonomous mode on all projects at once."""
-    projects = (await session.execute(select(Project).where(Project.user_id == current_user["user_id"]))).scalars().all()
+    projects = (await session.execute(
+        select(Project).where(Project.id.in_(_user_project_ids(current_user["user_id"])))
+    )).scalars().all()
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()
@@ -349,9 +429,11 @@ async def bulk_archive_tasks(
             except (ValueError, AttributeError):
                 continue
             if task and task.status in TERMINAL_STATUSES and not task.archived:
-                # Verify task belongs to user's project
-                project = await session.get(Project, task.project_id)
-                if not project or project.user_id != current_user["user_id"]:
+                # Verify task belongs to user's project (via membership)
+                member = (await session.execute(
+                    select(ProjectMember).where(ProjectMember.project_id == task.project_id, ProjectMember.user_id == current_user["user_id"])
+                )).scalar_one_or_none()
+                if not member:
                     continue
                 task.archived = True
                 session.add(task)
@@ -511,11 +593,11 @@ async def create_task_manually(
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    # Find or create project for this repo (scoped to current user)
+    # Find project for this repo where user is a member (or create new)
     stmt = select(Project).where(
         Project.github_owner == github_owner,
         Project.github_repo == github_repo,
-        Project.user_id == current_user["user_id"],
+        Project.id.in_(_user_project_ids(current_user["user_id"])),
     )
     project = (await session.execute(stmt)).scalars().first()
 
@@ -529,6 +611,9 @@ async def create_task_manually(
         session.add(project)
         await session.commit()
         await session.refresh(project)
+        # Auto-add owner membership
+        session.add(ProjectMember(project_id=project.id, user_id=current_user["user_id"], role="owner"))
+        await session.commit()
 
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
@@ -572,6 +657,7 @@ async def create_task_manually(
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="USER",
+        launched_by_user_id=current_user["user_id"],
         requires_approval=False,
     )
     session.add(new_task)
@@ -612,7 +698,7 @@ async def request_changes(
     current_user: dict = Depends(get_current_user)
 ):
     """Request changes on a task awaiting approval. Spawns a fix or re-review task."""
-    task = await _get_user_task(task_id, current_user["user_id"], session)
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
     if not task.requires_approval:
         raise HTTPException(status_code=400, detail="Task is not awaiting approval")
 
@@ -658,7 +744,7 @@ async def archive_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await _get_user_task(task_id, current_user["user_id"], session)
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
     if task.status not in TERMINAL_STATUSES:
         raise HTTPException(status_code=400, detail=f"Cannot archive task with status '{task.status}'. Only terminal tasks (COMPLETED, FAILED, CANCELLED) can be archived.")
     task.archived = True
@@ -674,7 +760,7 @@ async def unarchive_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await _get_user_task(task_id, current_user["user_id"], session)
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
     task.archived = False
     session.add(task)
     await session.commit()
@@ -693,7 +779,7 @@ async def modify_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await _get_user_task(task_id, current_user["user_id"], session)
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
 
     _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
@@ -970,7 +1056,7 @@ async def clear_wave_deps(
     current_user: dict = Depends(get_current_user)
 ):
     """Clear depends_on on all QUEUED tasks in a project to unblock wave-gated tasks."""
-    await _get_user_project(project_id, current_user["user_id"], session)
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
     result = await session.execute(
         select(Task).where(Task.project_id == project_id, Task.status == TaskStatus.QUEUED)
     )
@@ -995,7 +1081,7 @@ async def trigger_rollup(
     from app.main import get_github_token_for_task, _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 
-    task = await _get_user_task(task_id, current_user["user_id"], session)
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
     if task.status != TaskStatus.EVALUATING:
         raise HTTPException(status_code=400, detail=f"Task is {task.status}, not EVALUATING")
 
@@ -1613,11 +1699,7 @@ async def add_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
-    )).scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     direction = {
         "id": f"d-{uuid.uuid4().hex[:8]}",
@@ -1644,11 +1726,7 @@ async def replace_directions(
     current_user: dict = Depends(get_current_user)
 ):
     """Replace the entire directions array for a project."""
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
-    )).scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     normalized = []
     for d in payload:
@@ -1681,11 +1759,7 @@ async def remove_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
-    )).scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     directions = [d for d in (project.directions or []) if d.get("id") != direction_id]
     if len(directions) == len(project.directions or []):
@@ -1727,11 +1801,7 @@ async def reorder_directions(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
-    )).scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     direction_ids = payload.get("direction_ids")
     if not isinstance(direction_ids, list):
@@ -1760,11 +1830,7 @@ async def update_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = (await session.execute(
-        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
-    )).scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     # Validate inputs
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
@@ -1811,7 +1877,7 @@ async def create_direction_research_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
     direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
     if not direction:
@@ -1921,7 +1987,7 @@ async def toggle_autonomous(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
 
     if "enabled" not in payload:
         raise HTTPException(status_code=400, detail="'enabled' field required")
@@ -1944,7 +2010,7 @@ async def get_autonomous_status(
     from app.shared_state import autonomous_failure_counts, runtime_config
 
     projects = (await session.execute(
-        select(Project).where(Project.user_id == current_user["user_id"]).order_by(Project.created_at.desc())
+        select(Project).where(Project.id.in_(_user_project_ids(current_user["user_id"]))).order_by(Project.created_at.desc())
     )).scalars().all()
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
@@ -2690,9 +2756,11 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    # Verify alert belongs to user's project
-    project = await session.get(Project, alert.project_id)
-    if not project or project.user_id != current_user["user_id"]:
+    # Verify alert belongs to user's project (via membership)
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == alert.project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.dismissed_at = _utcnow()
     session.add(alert)
@@ -2889,7 +2957,7 @@ async def reset_circuit_breaker(
     current_user: dict = Depends(get_current_user),
 ):
     """Manually reset a project's circuit breaker to CLOSED state."""
-    await _get_user_project(project_id, current_user["user_id"], session)
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
     import app.shared_state as _shared_state
     from app.main import _persist_circuit_breakers, broadcast_to_project
 
@@ -3391,6 +3459,146 @@ async def get_digest(
         "recent_failures": recent_failures,
         "recent_completions": recent_completions,
     }
+
+
+# ── Project Member Management ────────────────────────────────────────────────
+
+
+class MemberCreate(BaseModel):
+    email: str
+    role: str = "member"
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in ("member", "viewer"):
+            raise ValueError("Role must be 'member' or 'viewer'")
+        return v
+
+
+class MemberUpdate(BaseModel):
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in ("member", "viewer"):
+            raise ValueError("Role must be 'member' or 'viewer'")
+        return v
+
+
+@router.get("/projects/{project_id}/members")
+async def list_project_members(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List members of a project. Any member/viewer can see."""
+    await _get_user_project(project_id, current_user["user_id"], session)
+    result = await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id).order_by(ProjectMember.created_at.asc())
+    )
+    members = result.scalars().all()
+    return [
+        {
+            "id": str(m.id),
+            "user_id": m.user_id,
+            "role": m.role,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in members
+    ]
+
+
+@router.post("/projects/{project_id}/members", status_code=201)
+async def add_project_member(
+    project_id: uuid.UUID,
+    payload: MemberCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Add a member to a project. Owner-only."""
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+
+    # Look up user by email in AllowedUser table
+    allowed = (await session.execute(
+        select(AllowedUser).where(AllowedUser.email == payload.email.strip().lower())
+    )).scalar_one_or_none()
+    if not allowed:
+        raise HTTPException(status_code=404, detail="User not found. They must be added to the system first.")
+    target_user_id = allowed.firebase_uid
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail="User has not signed in yet (no Firebase UID linked)")
+
+    # Check if already a member
+    existing = (await session.execute(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == target_user_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="User is already a member of this project")
+
+    member = ProjectMember(project_id=project_id, user_id=target_user_id, role=payload.role)
+    session.add(member)
+    await session.commit()
+    await session.refresh(member)
+    return {
+        "id": str(member.id),
+        "user_id": member.user_id,
+        "email": allowed.email,
+        "role": member.role,
+        "created_at": member.created_at.isoformat() if member.created_at else None,
+    }
+
+
+@router.patch("/projects/{project_id}/members/{member_id}")
+async def update_project_member(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    payload: MemberUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update a member's role. Owner-only. Cannot change owner's own role."""
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+
+    member = await session.get(ProjectMember, member_id)
+    if not member or member.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == "owner":
+        raise HTTPException(status_code=400, detail="Cannot change the owner's role")
+
+    member.role = payload.role
+    session.add(member)
+    await session.commit()
+    return {"id": str(member.id), "user_id": member.user_id, "role": member.role}
+
+
+@router.delete("/projects/{project_id}/members/{member_id}")
+async def remove_project_member(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Remove a member from a project. Owner-only (except members can remove themselves)."""
+    member = await session.get(ProjectMember, member_id)
+    if not member or member.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    # Owner cannot be removed
+    if member.role == "owner":
+        raise HTTPException(status_code=400, detail="Cannot remove the project owner")
+
+    # Non-owners can only remove themselves (leave)
+    if member.user_id != current_user["user_id"]:
+        await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+
+    await session.delete(member)
+    await session.commit()
+    return {"message": "Member removed"}
 
 
 # ── User Management ──────────────────────────────────────────────────────────

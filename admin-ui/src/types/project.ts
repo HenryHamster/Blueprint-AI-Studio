@@ -28,4 +28,13 @@ export interface Project {
   autonomous_enabled: boolean;
   directions: Direction[];
   created_at: string;
+  my_role?: 'owner' | 'member' | 'viewer';
+}
+
+export interface ProjectMemberEntry {
+  id: string;
+  user_id: string;
+  email?: string;
+  role: 'owner' | 'member' | 'viewer';
+  created_at: string | null;
 }

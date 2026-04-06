@@ -1,7 +1,7 @@
 import uuid
 import pytest
 from httpx import AsyncClient
-from app.models import Project, ProjectStatus, Task, TaskStatus
+from app.models import Project, ProjectMember, ProjectStatus, Task, TaskStatus
 from app.auth import create_agent_token
 
 @pytest.mark.smoketest
@@ -225,6 +225,10 @@ async def test_list_projects_status_filter(client: AsyncClient, db_session):
     db_session.add(completed_project)
     db_session.add(deploying_project)
     db_session.add(failed_project)
+    await db_session.commit()
+    for p in [completed_project, deploying_project, failed_project]:
+        await db_session.refresh(p)
+        db_session.add(ProjectMember(project_id=p.id, user_id="test-user-123", role="owner"))
     await db_session.commit()
 
     response = await client.get("/api/projects?status=COMPLETED")

@@ -29,7 +29,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
+from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, reconcile_orphaned_secrets
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -73,7 +73,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0023"
+EXPECTED_SCHEMA_REVISION = "0024"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2520,8 +2520,9 @@ async def orchestrator_worker():
                     # Select Max plan account from task owner's pool
                     _blacklist = (task.context or {}).get("blacklisted_accounts")
                     task_project = await session.get(Project, task.project_id)
-                    task_owner_id = task_project.user_id if task_project else ""
-                    account = await select_max_plan_account(user_id=task_owner_id, blacklist=_blacklist)
+                    # Launcher pays; fall back to project owner for autonomous tasks
+                    dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
+                    account = await select_max_plan_account(user_id=dispatch_user_id, blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -3553,6 +3554,9 @@ async def deploy_blueprint(
     session.add(project)
     await session.flush()  # Assign project.id without committing
 
+    # Auto-add owner membership
+    session.add(ProjectMember(project_id=project.id, user_id=current_user["user_id"], role="owner"))
+
     # 2. Create Tasks based on the flexible payloads
     created_tasks = []
 
@@ -3562,7 +3566,8 @@ async def deploy_blueprint(
         title=f"Deploy {payload.name}",
         description="Parent task orchestrating the deployment.",
         status=TaskStatus.IN_PROGRESS,
-        created_by="USER"
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
     )
     session.add(parent_task)
     await session.flush()  # Assign parent_task.id without committing
@@ -3579,7 +3584,8 @@ async def deploy_blueprint(
             payloads=[p],
             vm_instance_id=vm_name,
             status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR"
+            created_by="ORCHESTRATOR",
+            launched_by_user_id=current_user["user_id"],
         )
         session.add(task)
         created_tasks.append(task)
@@ -3610,7 +3616,9 @@ async def list_projects(
     """
     List all projects for the authenticated user.
     """
-    stmt = select(Project).where(Project.user_id == current_user["user_id"])
+    stmt = select(Project).where(Project.id.in_(
+        select(ProjectMember.project_id).where(ProjectMember.user_id == current_user["user_id"])
+    ))
     if status:
         stmt = stmt.where(Project.status == status)
 
@@ -3636,9 +3644,14 @@ async def get_project(
     """
     Get a specific project's details.
     """
-    stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    project = (await session.execute(stmt)).scalars().first()
+    # Check membership
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
+    project = await session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
@@ -3658,9 +3671,13 @@ async def get_project_tasks(
     """
     Get all tasks and their artifacts for a specific project.
     """
-    # Verify project exists and belongs to user
-    project_stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    project = (await session.execute(project_stmt)).scalars().first()
+    # Verify project membership
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+    project = await session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
@@ -3731,9 +3748,10 @@ async def generate_ws_ticket(
     """
     Generates a short-lived ticket for authenticating WebSocket connections.
     """
-    stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    project = (await session.execute(stmt)).scalars().first()
-    if not project:
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
     ticket = create_ws_ticket(current_user["user_id"], str(project_id))
@@ -7921,9 +7939,12 @@ async def cancel_project(
     """
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
-    project_stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    project = (await session.execute(project_stmt)).scalars().first()
-
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+    project = await session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
@@ -7973,8 +7994,12 @@ async def get_project_status(
     Endpoint for the frontend to poll or stream the current status of the deployment
     and agent activities.
     """
-    project_stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    project = (await session.execute(project_stmt)).scalars().first()
+    member = (await session.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+    project = await session.get(Project, project_id)
 
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")

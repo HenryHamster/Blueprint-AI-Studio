@@ -97,6 +97,19 @@ class Project(SQLModel, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
 
+
+class ProjectMember(SQLModel, table=True):
+    """
+    Many-to-many membership linking users to projects with roles.
+    Roles: 'owner' (full control + invites), 'member' (tasks + directions), 'viewer' (read-only).
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    user_id: str = Field(index=True)
+    role: str = Field(default="member")  # "owner", "member", "viewer"
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -113,6 +126,7 @@ class Task(SQLModel, table=True):
     status_log: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")))
 
     created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
+    launched_by_user_id: Optional[str] = Field(default=None)  # Firebase UID of the user who launched this task (for launcher-pays billing)
     requires_approval: bool = Field(default=False)
 
     status: TaskStatus = Field(default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED))

@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown } from 'lucide-react';
+import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown, UserPlus } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { SummaryPanels } from './components/SummaryPanels';
@@ -23,6 +23,7 @@ import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
 import { UserManagement } from './components/UserManagement';
+import { ProjectMembers } from './components/ProjectMembers';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { CatchUpPanel } from './components/CatchUpPanel';
 
@@ -157,6 +158,20 @@ export default function App() {
     document.addEventListener('keydown', handleActivityFeedShortcut);
     return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
   }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
+
+  // Project members panel
+  const [showProjectMembers, setShowProjectMembers] = useState(false);
+  const selectedProject = useMemo(
+    () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
+    [s.projects, s.selectedProjectId],
+  );
+
+  // Fetch project members when panel opens or project changes
+  useEffect(() => {
+    if (showProjectMembers && s.selectedProjectId) {
+      s.fetchProjectMembers(s.selectedProjectId);
+    }
+  }, [showProjectMembers, s.selectedProjectId, s.fetchProjectMembers]);
 
   const [activityEvents, setActivityEvents] = useState<import('./components/ActivityFeed').ActivityEvent[]>([]);
   const newActivityCount = useMemo(() => {
@@ -504,12 +519,40 @@ export default function App() {
         </div>
       )}
 
-      <ProjectDashboard
-        projects={s.projects}
-        tasks={s.tasks}
-        selectedProjectId={s.selectedProjectId}
-        onSelectProject={s.setSelectedProjectId}
-      />
+      <div className="flex items-start gap-3">
+        <div className="flex-1">
+          <ProjectDashboard
+            projects={s.projects}
+            tasks={s.tasks}
+            selectedProjectId={s.selectedProjectId}
+            onSelectProject={s.setSelectedProjectId}
+          />
+        </div>
+        {s.selectedProjectId && (
+          <button
+            onClick={() => setShowProjectMembers(prev => !prev)}
+            className={`mt-1 p-2 rounded text-xs transition-colors border shrink-0 ${
+              showProjectMembers
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            }`}
+            title="Project Members"
+          >
+            <UserPlus className="w-4 h-4" />
+          </button>
+        )}
+      </div>
+
+      {showProjectMembers && s.selectedProjectId && selectedProject && (
+        <ProjectMembers
+          projectId={s.selectedProjectId}
+          members={s.projectMembers}
+          myRole={selectedProject.my_role || 'viewer'}
+          onAdd={(email, role) => s.addProjectMember(s.selectedProjectId!, email, role)}
+          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(s.selectedProjectId!, memberId, role)}
+          onRemove={(memberId) => s.removeProjectMember(s.selectedProjectId!, memberId)}
+        />
+      )}
 
       {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
