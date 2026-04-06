@@ -105,7 +105,18 @@ async def get_current_user(
 
     admin_api_key = os.getenv("ADMIN_API_KEY")
     if admin_api_key and secrets.compare_digest(token, admin_api_key):
-        return {"user_id": "admin-api-key", "email": "admin@system.local", "role": "admin"}
+        # Resolve real admin UID so API key has same data access as the admin user
+        admin_uid = "admin-api-key"
+        try:
+            result = await session.execute(
+                select(AllowedUser).where(AllowedUser.role == "admin").order_by(AllowedUser.created_at.asc())
+            )
+            admin_user = result.scalars().first()
+            if admin_user and admin_user.firebase_uid:
+                admin_uid = admin_user.firebase_uid
+        except Exception:
+            pass  # Fall back to literal if DB unavailable
+        return {"user_id": admin_uid, "email": "admin@system.local", "role": "admin"}
 
     try:
         decoded_token = firebase_auth.verify_id_token(token)
