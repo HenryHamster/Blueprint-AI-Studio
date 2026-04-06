@@ -8,6 +8,7 @@ import json
 import httpx
 import logging
 import asyncio
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
@@ -1178,7 +1179,12 @@ async def get_settings(
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
              "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
-             "token_created_at": a.get("token_created_at")}
+             "token_created_at": a.get("token_created_at"),
+             "rl_hit_count": a.get("rl_hit_count", 0),
+             "disabled_models": {
+                 model: {"hits": info.get("hits", 0), "at": info["at"].isoformat() if info.get("at") else None}
+                 for model, info in a.get("disabled_models", {}).items()
+             }}
             for a in user_pool
         ],
     }
@@ -2243,6 +2249,18 @@ async def reset_deploy_health(
     except Exception:
         pass
 
+    # Reset zone health — clear cooldowns so all zones are available
+    try:
+        from app.compute import _zone_failures, _zone_health
+        _zone_failures.clear()
+        _zone_health.clear()
+    except Exception:
+        pass
+
+    # Clear failure history so failure_rate resets to 0
+    from app.shared_state import deploy_monitoring
+    deploy_monitoring["task_results"] = deque(maxlen=100)
+
     # Restore VM count and clear pause fields
     runtime_config["max_concurrent_vms"] = restore_vms
     state.runtime_max_concurrent_vms = restore_vms
@@ -2280,7 +2298,8 @@ async def mark_deploy_stable(
     await session.commit()
 
     deploy_monitoring["window_start"] = None
-    logger.warning(f"[ADMIN] Deploy manually marked STABLE (sha={state.current_sha[:8]})")
+    deploy_monitoring["task_results"] = deque(maxlen=100)
+    logger.warning(f"[ADMIN] Deploy manually marked STABLE — failure history cleared (sha={state.current_sha[:8]})")
     from app.main import broadcast_deploy_state
     await broadcast_deploy_state()
     return {"status": "stable", "sha": state.current_sha}

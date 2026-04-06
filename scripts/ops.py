@@ -162,14 +162,14 @@ def cmd_settings(args):
 
 
 def cmd_pool(_args):
-    """Show Max Plan account pool status."""
+    """Show Max Plan account pool status with per-model rate-limit info."""
     try:
-        h = api("GET", "/api/health/detailed")
-        pool = h.get('components', {}).get('max_plan_pool', {})
+        s = api("GET", "/api/admin/settings")
+        accounts = s.get('max_plan_accounts', [])
         print("=== MAX PLAN POOL ===")
-        print(f"  Total:     {pool.get('total', '?')}")
-        print(f"  Available: {pool.get('available', '?')}")
-        accounts = pool.get('accounts', [])
+        print(f"  Total:     {len(accounts)}")
+        enabled_count = sum(1 for a in accounts if a.get('enabled', True))
+        print(f"  Enabled:   {enabled_count}")
         if accounts:
             for a in accounts:
                 name = a.get('name', a.get('id', '?')[:8])
@@ -179,6 +179,12 @@ def cmd_pool(_args):
                 rl = a.get('rl_hit_count', 0)
                 suffix = f" (rate-limited x{rl})" if rl else ""
                 print(f"  {name:20}: active={active} {status}{suffix}")
+                dm = a.get('disabled_models', {})
+                if dm:
+                    for model, info in dm.items():
+                        hits = info.get('hits', 0)
+                        at = (info.get('at') or '')[:19]
+                        print(f"    {model}: BLOCKED (hit #{hits}, since {at})")
     except Exception as e:
         print(f"Pool: error ({e})")
 
