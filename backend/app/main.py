@@ -147,15 +147,33 @@ async def load_max_plan_pool():
         total_active = sum(active_per_account.values())
         logger.info(f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)")
 
-async def select_max_plan_account(user_id: str, blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+def _account_available_for_model(acct: dict, model: Optional[str]) -> bool:
+    """Check if an account is available for the given model."""
+    if not acct.get("enabled", True):
+        return False  # Entirely disabled (legacy path)
+    if not model:
+        return True   # No model specified, any enabled account works
+    dm = acct.get("disabled_models", {})
+    return model not in dm
+
+
+def _extract_task_model(task: Task) -> Optional[str]:
+    """Extract which model a task uses from its payload."""
+    payloads = task.payloads or []
+    if payloads:
+        return payloads[0].get("model")
+    return None
+
+
+async def select_max_plan_account(user_id: str, model: Optional[str] = None, blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Select the Max plan account with the lowest active task count for a specific user.
-    Pre-increments active_tasks atomically under lock to prevent races.
-    Accounts in blacklist are excluded even if not yet disabled in the pool."""
+    Filters by model availability — accounts with a specific model disabled are skipped.
+    Pre-increments active_tasks atomically under lock to prevent races."""
     async with _max_plan_pool_lock:
         user_pool = _max_plan_pools.get(user_id, [])
         available = [
             a for a in user_pool
-            if a.get("enabled", True) and (not blacklist or a["id"] not in blacklist)
+            if _account_available_for_model(a, model) and (not blacklist or a["id"] not in blacklist)
         ]
         if not available:
             return None
@@ -173,26 +191,35 @@ async def release_max_plan_account(account_id: str):
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
 
 async def recheck_disabled_accounts():
-    """Re-enable accounts that were disabled by rate limiting after a cooldown.
-    Usage windows typically reset after some time — re-enable and let the next
-    task attempt determine if usage has actually recovered.
-    Repeat offenders get exponentially longer cooldowns (capped at 4 hours)."""
+    """Re-enable accounts/models that were disabled by rate limiting after cooldown.
+    Checks both per-model disables and legacy full-account disables."""
     async with _max_plan_pool_lock:
         now = _utcnow()
 
         for acct in _account_by_id.values():
-            if acct.get("enabled", True):
-                continue
-            disabled_at = acct.get("disabled_at")
-            if not disabled_at:
-                continue
-            rl_hit_count = acct.get("rl_hit_count", 1)
-            # Exponential cooldown: 30min * 2^(n-1), capped at 4 hours
-            cooldown_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
-            if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
-                acct["enabled"] = True
-                acct["disabled_at"] = None
-                logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
+            # Per-model cooldown checks
+            dm = acct.get("disabled_models", {})
+            for model_name, info in list(dm.items()):
+                disabled_at = info.get("at")
+                if not disabled_at:
+                    continue
+                hits = info.get("hits", 1)
+                cooldown_minutes = min(30 * (2 ** (hits - 1)), 240)
+                if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
+                    del dm[model_name]
+                    logger.warning(f"[POOL] Re-enabled account {acct['name']} model {model_name} after {cooldown_minutes:.0f}min cooldown (hit #{hits})")
+
+            # Legacy full-account disable (backward compat)
+            if not acct.get("enabled", True):
+                disabled_at = acct.get("disabled_at")
+                if not disabled_at:
+                    continue
+                rl_hit_count = acct.get("rl_hit_count", 1)
+                cooldown_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
+                if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
+                    acct["enabled"] = True
+                    acct["disabled_at"] = None
+                    logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
 
 
 # --- Deployment State Management ---
@@ -2517,12 +2544,17 @@ async def orchestrator_worker():
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
-                    # Select Max plan account from task owner's pool
+                    # Select Max plan account from task owner's pool, filtered by model
                     _blacklist = (task.context or {}).get("blacklisted_accounts")
                     task_project = await session.get(Project, task.project_id)
                     # Launcher pays; fall back to project owner for autonomous tasks
                     dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
-                    account = await select_max_plan_account(user_id=dispatch_user_id, blacklist=_blacklist)
+                    # Resolve which model this task needs
+                    task_model = _extract_task_model(task)
+                    if not task_model:
+                        task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
+                        task_model = _runtime_config.get("task_type_models", {}).get(task_type)
+                    account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -7396,25 +7428,52 @@ async def update_agent_status(
                 record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
                 _shared_state.tasks_failed_total += 1
 
-                # Rate-limited tasks: requeue instead of permanently failing
-                if failure_class == "RATE_LIMIT":
+                # Rate-limited or transient API failures: requeue instead of permanently failing
+                if failure_class in ("RATE_LIMIT", "EXTERNAL_API"):
                     acct_id = (task.context or {}).get("max_plan_account_id")
+                    model = _extract_task_model(task)
                     if acct_id:
                         await release_max_plan_account(acct_id)
-                        async with _max_plan_pool_lock:
-                            acct = _account_by_id.get(acct_id)
-                            if acct:
-                                acct["enabled"] = False
-                                acct["disabled_at"] = _utcnow()
-                                acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
-                                cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
-                                logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
+                        if failure_class == "RATE_LIMIT":
+                            # Disable only the specific model on this account
+                            async with _max_plan_pool_lock:
+                                acct = _account_by_id.get(acct_id)
+                                if acct and model:
+                                    dm = acct.setdefault("disabled_models", {})
+                                    info = dm.setdefault(model, {"hits": 0})
+                                    info["hits"] += 1
+                                    info["at"] = _utcnow()
+                                    cooldown = min(30 * (2 ** (info["hits"] - 1)), 240)
+                                    # Disable top-level only if ALL known models are disabled
+                                    logger.warning(f"[POOL] Account {acct['name']} model {model} disabled (hit #{info['hits']}, cooldown {cooldown:.0f}min)")
+                                elif acct:
+                                    # No model info — fall back to disabling entire account
+                                    acct["enabled"] = False
+                                    acct["disabled_at"] = _utcnow()
+                                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+                                    cooldown = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                                    logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown:.0f}min)")
+                        # EXTERNAL_API: don't disable account (transient outage)
+
+                    # Track API failure retries to prevent infinite loops
+                    ctx = dict(task.context or {})
+                    if failure_class == "EXTERNAL_API":
+                        api_retries = ctx.get("_api_failure_retries", 0) + 1
+                        if api_retries > 3:
+                            logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — giving up")
+                        else:
+                            ctx["_api_failure_retries"] = api_retries
+
                     old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
                     task.status = TaskStatus.QUEUED
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
                     task.started_at = None
-                    task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
+                    task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
+                    # Clear stale retry_after so dispatcher picks it up immediately
+                    ctx.pop("retry_after", None)
+                    ctx.pop("blacklisted_accounts", None)
+                    task.context = ctx
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(str(task.project_id), "task_updated",
