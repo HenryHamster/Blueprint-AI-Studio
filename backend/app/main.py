@@ -3804,6 +3804,7 @@ async def claim_task(
                 "status": t.status,
                 "prompt": p.get("prompt", p.get("description", "")),
                 "related_files": (t.context or {}).get("related_files", []),
+                "direction_id": (t.context or {}).get("direction_id"),
             })
 
         # Queued tasks in the same project
@@ -3821,6 +3822,8 @@ async def claim_task(
                 "title": t.title,
                 "task_type": p.get("type", ""),
                 "prompt": p.get("prompt", p.get("description", "")),
+                "related_files": (t.context or {}).get("related_files", []),
+                "direction_id": (t.context or {}).get("direction_id"),
             })
 
         # Recently completed tasks (10 most recent): completed first, then failed/cancelled

@@ -1550,6 +1550,14 @@ ${hotspotsSection}
     ? `## Repository File Tree (first 150 files)\n\`\`\`\n${fileTree}\n\`\`\`\n\n`
     : '';
 
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  const activeTasks = Array.isArray(projectCtx?.active_tasks)
+    ? (projectCtx!.active_tasks as Array<Record<string, unknown>>)
+    : [];
+  const queuedTasks = Array.isArray(projectCtx?.queued_tasks)
+    ? (projectCtx!.queued_tasks as Array<Record<string, unknown>>)
+    : [];
+
   const directionsText = directions.length > 0
     ? directions.map((d, i) => {
         const pathScope = Array.isArray(d.paths) && (d.paths as string[]).length > 0
@@ -1607,7 +1615,19 @@ ${hotspotsSection}
         const saturationNote = d.possibly_saturated
           ? '\n  ⚠ SATURATION SIGNAL: Last 3 cycles produced ≤1 finding each. Consider proposing a direction_update to narrow the scope, or a direction_proposal for a related but more specific area. Avoid reproposing previously attempted work.'
           : '';
-        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}${notesSection}${saturationNote}`;
+        let activeForDirNote = '';
+        if (d.id === currentDirectionId) {
+          const dirActiveTasks = activeTasks.filter(t => t['direction_id'] === d.id);
+          const dirQueuedTasks = queuedTasks.filter(t => t['direction_id'] === d.id);
+          if (dirActiveTasks.length > 0 || dirQueuedTasks.length > 0) {
+            const lines = [
+              ...dirActiveTasks.map(t => `  [${t['task_type']} IN_PROGRESS] ${t['title']}`),
+              ...dirQueuedTasks.map(t => `  [${t['task_type']} QUEUED] ${t['title']}`),
+            ];
+            activeForDirNote = `\n  Active tasks for this direction:\n${lines.join('\n')}`;
+          }
+        }
+        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
       }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
@@ -1631,7 +1651,6 @@ ${hotspotsSection}
     }
   }
 
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   }) ? formatProjectContext(projectCtx) + '\n\n' : '';
