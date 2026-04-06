@@ -96,6 +96,7 @@ export interface HeaderBarProps {
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
+  userRole: 'admin' | 'user' | null;
 }
 
 
@@ -356,10 +357,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onMarkStable={props.onMarkStable}
           onRepairState={props.onRepairState}
           zoneHealth={props.zoneHealth}
+          userRole={props.userRole}
         />
 
         {/* More secondary buttons — desktop only */}
         <div className="hidden md:flex items-center gap-2">
+          {props.userRole === 'admin' && (
           <button
             onClick={props.onToggleUserManagement}
             className={`p-2 rounded text-xs transition-colors border ${
@@ -371,6 +374,7 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <Users className="w-4 h-4" />
           </button>
+          )}
           <button
             onClick={onToggleArchive}
             className={`p-2 rounded text-xs transition-colors border ${

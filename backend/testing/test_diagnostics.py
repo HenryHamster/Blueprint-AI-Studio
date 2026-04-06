@@ -104,7 +104,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_provision_timeout_detected(self, db_session):
         """PROVISIONING task with no heartbeat and started >5 min ago is detected."""
-        project = Project(name="diag-test", user_id="u1")
+        project = Project(name="diag-test", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -125,7 +125,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_provision_timeout_not_triggered_when_too_young(self, db_session):
         """PROVISIONING task started only 3 min ago must NOT be flagged."""
-        project = Project(name="diag-test2", user_id="u1")
+        project = Project(name="diag-test2", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -142,7 +142,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_provision_timeout_not_triggered_when_heartbeat_present(self, db_session):
         """PROVISIONING task that already has a heartbeat must NOT be flagged."""
-        project = Project(name="diag-test3", user_id="u1")
+        project = Project(name="diag-test3", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -161,7 +161,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_no_heartbeat_detected(self, db_session):
         """IN_PROGRESS task with last heartbeat >5 min ago is detected."""
-        project = Project(name="diag-hb", user_id="u1")
+        project = Project(name="diag-hb", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -181,7 +181,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_no_heartbeat_not_triggered_when_fresh(self, db_session):
         """IN_PROGRESS task with recent heartbeat must NOT be flagged."""
-        project = Project(name="diag-hb2", user_id="u1")
+        project = Project(name="diag-hb2", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -197,7 +197,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_no_heartbeat_not_triggered_when_no_heartbeat_field(self, db_session):
         """IN_PROGRESS task that never set a heartbeat is not classified as no_heartbeat."""
-        project = Project(name="diag-hb3", user_id="u1")
+        project = Project(name="diag-hb3", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -215,7 +215,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_long_queued_detected(self, db_session):
         """QUEUED task with no deps created >30 min ago is detected."""
-        project = Project(name="diag-lq", user_id="u1")
+        project = Project(name="diag-lq", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -234,7 +234,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_long_queued_not_triggered_when_young(self, db_session):
         """QUEUED task created only 10 min ago must NOT be flagged as long_queued."""
-        project = Project(name="diag-lq2", user_id="u1")
+        project = Project(name="diag-lq2", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -252,7 +252,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_stuck_deps_detected_when_all_deps_failed(self, db_session):
         """QUEUED task whose every dep is FAILED and is old enough → stuck_deps."""
-        project = Project(name="diag-sd", user_id="u1")
+        project = Project(name="diag-sd", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -282,7 +282,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_stuck_deps_detected_when_all_deps_cancelled(self, db_session):
         """CANCELLED deps also count as terminal failures for stuck_deps detection."""
-        project = Project(name="diag-sd-cancel", user_id="u1")
+        project = Project(name="diag-sd-cancel", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -311,7 +311,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_stuck_deps_not_triggered_when_dep_still_running(self, db_session):
         """QUEUED task with an IN_PROGRESS dep must NOT be flagged as stuck_deps."""
-        project = Project(name="diag-sd2", user_id="u1")
+        project = Project(name="diag-sd2", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -338,7 +338,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_stuck_deps_not_triggered_when_task_too_young(self, db_session):
         """QUEUED task with failed deps but created only 5 min ago is NOT stuck yet."""
-        project = Project(name="diag-sd3", user_id="u1")
+        project = Project(name="diag-sd3", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -365,7 +365,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_stuck_deps_not_triggered_when_only_some_deps_failed(self, db_session):
         """Task with one FAILED dep and one QUEUED dep must NOT be flagged."""
-        project = Project(name="diag-sd4", user_id="u1")
+        project = Project(name="diag-sd4", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -401,7 +401,7 @@ class TestBuildStuckTasks:
         When multiple QUEUED tasks have dependencies, all dep statuses should be
         fetched in a single query rather than one per task (N+1 prevention).
         """
-        project = Project(name="diag-batch", user_id="u1")
+        project = Project(name="diag-batch", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -446,7 +446,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_output_contains_all_required_fields(self, db_session):
         """Each stuck entry must contain the documented set of fields."""
-        project = Project(name="diag-fields", user_id="u1")
+        project = Project(name="diag-fields", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -471,7 +471,7 @@ class TestBuildStuckTasks:
     @pytest.mark.asyncio
     async def test_non_stuck_tasks_return_empty(self, db_session):
         """A mix of healthy tasks produces an empty result."""
-        project = Project(name="diag-healthy", user_id="u1")
+        project = Project(name="diag-healthy", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)

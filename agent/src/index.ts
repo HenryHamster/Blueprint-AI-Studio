@@ -1723,6 +1723,28 @@ Rules for avoiding duplication:
 - Do not propose findings that are substantially the same as any recently completed task above.
 - If a recently completed task partially addressed an issue and more work remains, you MAY propose a follow-up but must reference the prior work in your description.
 
+## Quality bar — READ THIS FIRST
+Each finding you produce spawns a cloud VM, an implementing agent, a review cycle, and a PR. That costs real money and time. Ask yourself for EVERY finding: "Would a senior engineer mass-produce this as a standalone PR, or would they roll their eyes?" If the latter, cut it or bundle it.
+
+BAD findings (do NOT produce these):
+- "add a badge/indicator/icon to the UI" — cosmetic polish that doesn't unlock new capability
+- "add field X to endpoint Y" — trivial data plumbing with no architectural significance
+- "add tests for X" as a standalone finding — bundle test gaps into the feature that needs them
+- "config tweak", "lint rule", "rename for clarity" — bundle ALL of these into one finding or skip them
+- ANY finding where the description is "add X to Y" and the whole change is <50 lines
+
+GOOD findings look like:
+- New subsystems or capabilities (e.g., a knowledge persistence layer, a new agent type, a retry strategy overhaul)
+- Architectural improvements that make the system more extensible or reliable
+- Cross-cutting changes that affect multiple components and unlock future work
+- Performance or reliability fixes for real bottlenecks that affect production behavior
+
+## Maturity escalation
+Look at the prior research cycles below for each direction. The MORE cycles a direction has had, the BIGGER your findings should be:
+- Cycles 1-2: Finding surface-level gaps is fine. Small/medium scope OK.
+- Cycles 3-4: You should be past surface issues. Findings must be medium or large scope. Think about what's MISSING as a system, not what's slightly wrong.
+- Cycles 5+: Only large-scope, architectural, or new-capability findings are acceptable. If you can only find small things, the direction is either done or you're not looking deep enough. Propose a direction_update to evolve the goal, or a direction_note marking it near-complete.
+
 Instructions:
 1. Use ALL of your tools aggressively to explore the codebase and research solutions:
    - Spawn subagents (Agent tool) to explore different parts of the codebase in parallel
@@ -1730,8 +1752,13 @@ Instructions:
    - Use WebFetch to read relevant documentation, GitHub issues, or API references
    - Use TodoWrite to track what you've explored and what gaps remain — don't stop at the first few easy finds
    - For each active direction, ask yourself: "what would it take for this direction to be DONE?" Then work backward from that goal to find the gaps that matter most.
-2. Based on your exploration and external research, identify specific, actionable improvements. Prefer medium and large scope findings that close real gaps over small tweaks. For each finding, assess scope and risk.
-3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. Have it evaluate each finding: does this meaningfully advance the goal? Is the scope right? Are trivial items bundled? Have the reviewer rewrite the findings file if improvements are needed.
+   - Think about what the system CAN'T do today, not what it does slightly wrong. Missing capabilities > polish.
+2. Based on your exploration and external research, identify specific, actionable improvements. Findings must be medium or large scope — small-scope findings are only acceptable when bundled together. For each finding, assess scope and risk.
+3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. The reviewer must reject any finding that is:
+   - Cosmetic or polish (badges, indicators, UI tweaks that don't unlock capability)
+   - Trivially small (<50 lines, single file, could be done in 5 minutes)
+   - "Add X to Y" without architectural significance
+   Have the reviewer rewrite the findings file, CUTTING weak findings ruthlessly. 3 strong findings > 8 mediocre ones.
 4. Output your final findings as a JSON array as the VERY LAST thing in your response:
 
 [
@@ -1768,23 +1795,21 @@ Valid values:
 - priority: high, medium, low
 
 Rules:
-- Trivial findings (lint tweaks, config changes, single-line fixes) should be bundled into ONE combined finding. Focus your effort on medium and large scope improvements. Each finding spawns a VM + PR — make them count.
-- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough — use WebSearch and subagents to dig further.
+- ALL findings must be scope=medium or scope=large. The ONLY exception: you may have ONE scope=small finding that bundles multiple trivial fixes together. If you can only find small fixes, you haven't explored deeply enough.
+- Limit to 15 findings maximum. Aim for 5-10 high-impact findings.
 - When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
-- A finding should be ONE PR-sized unit of work (scope=small for bundled small changes, scope=medium for multi-file work, scope=large for architectural changes)
+- A finding should be ONE PR-sized unit of work (scope=medium for multi-file work, scope=large for architectural changes)
 - The prompt field must be self-contained — the implementing agent knows nothing about this research
 - depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
 - Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
-- Limit to 15 findings maximum. Aim for 5-10 high-impact findings.
-- At least half of your findings should be scope=medium or scope=large. If you can only find small fixes, you haven't explored deeply enough — use WebSearch and subagents to dig further.
 - For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
 - For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
 - For type=security_audit findings, the prompt should describe the audit scope/focus — it will spawn a dedicated security audit agent
 - For type=qa findings, the prompt should describe what to test — it will spawn a dedicated QA agent
 - For type=deps findings, the prompt can be minimal (e.g. 'Update dependencies') — it will spawn a dedicated dependency update agent
 - For type=docs findings, the prompt can be minimal (e.g. 'Update documentation') — it will spawn a dedicated documentation agent
-- Use model=claude-opus-4-6 and effort=high only for complex architectural changes. Leave null for most findings to use the project default.
+- Use model=claude-opus-4-6 and effort=high for complex architectural changes. Use it for scope=large findings. Leave null for medium scope.
 - Do NOT propose findings that duplicate recently completed tasks listed above.
 
 How your findings get routed (you control this via type and scope):
@@ -1834,19 +1859,20 @@ Rules for direction proposals:
 
 Context — you are part of an autonomous pipeline:
 - You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
-- Think iteratively, but think big. You don't need to solve everything in one pass, but each cycle should move the needle meaningfully. A cycle that produces 3 impactful findings is far more valuable than one with 10 trivial fixes.
+- Think BIG. Each finding spawns a full VM, an implementing agent, a review cycle, and a PR merge. That pipeline exists to handle complexity — use it. A cycle that produces 2-3 substantial findings (new subsystems, architectural refactors, cross-cutting capabilities) is worth 10x more than one with 8 small UI tweaks.
 - Keep the codebase clean. Other agents will read and modify the same code after you. Messy patterns multiply — extensible patterns compound.
 - Use type=research findings for areas that need deeper investigation before implementation. This spawns a sub-research agent to dig in further. Don't rush to implement something you're uncertain about.
-- For genuinely complex improvements that span multiple components, use scope=large — this routes to a planning agent that decomposes it into safe subtasks. Don't shy away from proposing large-scope work; the pipeline handles the complexity for you.
+- PREFER scope=large findings. The pipeline has a planning agent that decomposes large work into safe subtasks. Don't shy away from proposing ambitious work — propose the thing that actually matters, not a watered-down version of it.
 
 Approach:
-- This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. Changes that touch one layer usually need corresponding changes in other layers.
+- This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. The best findings often span multiple layers.
+- Think about what the system CANNOT do today. Missing capabilities are more valuable than improvements to existing ones. Ask: what would make this system fundamentally more powerful?
 - Prefer extensible, data-driven designs over copy-paste. If adding a new instance of something (a new type, a new endpoint, a new UI panel), first check if the pattern should be generalized.
-- Frontend changes are just as important as backend changes. Every new backend capability needs corresponding UI to be useful.
 - Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.
 - Use WebSearch to find prior art and best practices before proposing solutions. A finding backed by "here's how other projects solve this" is far more valuable than guessing at an implementation.
 - Spawn subagents liberally — for exploring code, for web research, for reviewing your own work. You have Opus-level capability; use it to its full potential.
-- Use TodoWrite to maintain a checklist of areas explored and gaps found. Don't stop exploring when you find the first few easy wins.`;
+- Use TodoWrite to maintain a checklist of areas explored and gaps found. Don't stop exploring when you find the first few easy wins.
+- When a direction has had 3+ prior cycles, STOP looking for surface-level gaps. Instead, think about what NEW CAPABILITY or ARCHITECTURAL CHANGE would make the direction's goal trivially achievable. That's the finding worth proposing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
   statusRef.value = 'Running codebase research...';

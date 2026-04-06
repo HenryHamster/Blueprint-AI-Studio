@@ -125,7 +125,7 @@ def override_get_current_user():
         return {"user_id": "test-user-123", "email": "test@example.com", "role": "admin"}
     app.dependency_overrides[get_current_user] = _override_get_current_user
     # Also bypass the require_admin router-level dependency directly
-    app.dependency_overrides[require_admin] = lambda: None
+    app.dependency_overrides[require_admin] = lambda: {"user_id": "test-user-123", "email": "test@example.com", "role": "admin"}
     yield
     app.dependency_overrides.pop(get_current_user, None)
     app.dependency_overrides.pop(require_admin, None)

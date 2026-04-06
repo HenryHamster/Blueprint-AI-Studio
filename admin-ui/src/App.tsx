@@ -419,6 +419,7 @@ export default function App() {
         zoneHealth={s.zoneHealth}
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
+        userRole={s.userRole}
       />
 
       <div
@@ -510,7 +511,7 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
       />
 
-      {s.showUserManagement ? (
+      {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
           users={s.allowedUsers}
           currentUserEmail={s.user?.email || ''}

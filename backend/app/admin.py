@@ -24,8 +24,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin"],
-    dependencies=[Depends(require_admin)]
+    dependencies=[Depends(get_current_user)]
 )
+
+
+def _user_project_ids(user_id: str):
+    """Subquery returning project IDs owned by user_id."""
+    return select(Project.id).where(Project.user_id == user_id)
+
+
+async def _get_user_project(project_id: uuid.UUID, user_id: str, session: AsyncSession) -> Project:
+    """Fetch a project ensuring it belongs to the given user. Raises 404 if not found."""
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+async def _get_user_task(task_id: uuid.UUID, user_id: str, session: AsyncSession) -> Task:
+    """Fetch a task ensuring its project belongs to the given user. Raises 404 if not found."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    project = await session.get(Project, task.project_id)
+    if not project or project.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
 
 @router.get("/projects")
@@ -33,7 +57,7 @@ async def get_all_projects(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    query = select(Project).order_by(Project.created_at.desc())
+    query = select(Project).where(Project.user_id == current_user["user_id"]).order_by(Project.created_at.desc())
     result = await session.execute(query)
     projects = result.scalars().all()
     return projects
@@ -53,9 +77,7 @@ async def update_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     if payload.name is not None:
         project.name = payload.name
@@ -91,9 +113,7 @@ async def delete_project_admin(
 ):
     """Delete a project and cascade to tasks/artifacts/history.
     Refuses if active tasks exist unless force=true."""
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_tasks = (await session.execute(
@@ -134,7 +154,7 @@ async def pause_all_autonomous(
     current_user: dict = Depends(get_current_user)
 ):
     """Disable autonomous mode on all projects at once."""
-    projects = (await session.execute(select(Project))).scalars().all()
+    projects = (await session.execute(select(Project).where(Project.user_id == current_user["user_id"]))).scalars().all()
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()
@@ -156,7 +176,7 @@ async def get_all_tasks(
     current_user: dict = Depends(get_current_user)
 ):
     # Build shared filter conditions
-    filters = []
+    filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
     if status:
         filters.append(Task.status.in_(status))
     elif terminal_only:
@@ -320,6 +340,7 @@ async def bulk_archive_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
+    user_project_ids = _user_project_ids(current_user["user_id"])
     if request.task_ids is not None:
         archived = []
         for raw_id in request.task_ids:
@@ -328,12 +349,16 @@ async def bulk_archive_tasks(
             except (ValueError, AttributeError):
                 continue
             if task and task.status in TERMINAL_STATUSES and not task.archived:
+                # Verify task belongs to user's project
+                project = await session.get(Project, task.project_id)
+                if not project or project.user_id != current_user["user_id"]:
+                    continue
                 task.archived = True
                 session.add(task)
                 archived.append(task)
     elif request.filter in ('completed', 'terminal'):
         statuses = [TaskStatus.COMPLETED] if request.filter == 'completed' else TERMINAL_STATUSES
-        query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses))
+        query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses), Task.project_id.in_(user_project_ids))
         result = await session.execute(query)
         archived = result.scalars().all()
         for task in archived:
@@ -357,9 +382,7 @@ async def get_task(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await session.get(Task, tid)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(tid, current_user["user_id"], session)
 
     # Fetch all artifacts for this task (all types, not just last per type)
     artifact_stmt = select(Artifact).where(Artifact.task_id == tid).order_by(Artifact.created_at.asc())
@@ -488,10 +511,11 @@ async def create_task_manually(
     # Parse owner/repo
     github_owner, github_repo = payload.github_repo.split("/", 1)
 
-    # Find or create project for this repo
+    # Find or create project for this repo (scoped to current user)
     stmt = select(Project).where(
         Project.github_owner == github_owner,
-        Project.github_repo == github_repo
+        Project.github_repo == github_repo,
+        Project.user_id == current_user["user_id"],
     )
     project = (await session.execute(stmt)).scalars().first()
 
@@ -588,9 +612,7 @@ async def request_changes(
     current_user: dict = Depends(get_current_user)
 ):
     """Request changes on a task awaiting approval. Spawns a fix or re-review task."""
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(task_id, current_user["user_id"], session)
     if not task.requires_approval:
         raise HTTPException(status_code=400, detail="Task is not awaiting approval")
 
@@ -636,9 +658,7 @@ async def archive_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(task_id, current_user["user_id"], session)
     if task.status not in TERMINAL_STATUSES:
         raise HTTPException(status_code=400, detail=f"Cannot archive task with status '{task.status}'. Only terminal tasks (COMPLETED, FAILED, CANCELLED) can be archived.")
     task.archived = True
@@ -654,9 +674,7 @@ async def unarchive_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(task_id, current_user["user_id"], session)
     task.archived = False
     session.add(task)
     await session.commit()
@@ -675,9 +693,7 @@ async def modify_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(task_id, current_user["user_id"], session)
 
     _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
@@ -954,6 +970,7 @@ async def clear_wave_deps(
     current_user: dict = Depends(get_current_user)
 ):
     """Clear depends_on on all QUEUED tasks in a project to unblock wave-gated tasks."""
+    await _get_user_project(project_id, current_user["user_id"], session)
     result = await session.execute(
         select(Task).where(Task.project_id == project_id, Task.status == TaskStatus.QUEUED)
     )
@@ -978,9 +995,7 @@ async def trigger_rollup(
     from app.main import get_github_token_for_task, _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_user_task(task_id, current_user["user_id"], session)
     if task.status != TaskStatus.EVALUATING:
         raise HTTPException(status_code=400, detail=f"Task is {task.status}, not EVALUATING")
 
@@ -1048,7 +1063,7 @@ async def get_settings(
     current_user: dict = Depends(get_current_user)
 ):
     from app.shared_state import runtime_config as _runtime_config
-    from app.main import _max_plan_pool
+    from app.main import _max_plan_pools
     from app.models import UserIntegration
 
     # Check if the user has a GitHub integration
@@ -1058,6 +1073,7 @@ async def get_settings(
     if integration and integration.github_account_name:
         github_account = integration.github_account_name
 
+    user_pool = _max_plan_pools.get(current_user["user_id"], [])
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -1072,12 +1088,12 @@ async def get_settings(
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
         "github_account": github_account,
-        "using_max_plan": len([a for a in _max_plan_pool if a.get("enabled", True)]) > 0,
+        "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
              "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
              "token_created_at": a.get("token_created_at")}
-            for a in _max_plan_pool
+            for a in user_pool
         ],
     }
 
@@ -1088,7 +1104,7 @@ async def update_settings(
     request: Request,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     from app.shared_state import runtime_config as _runtime_config, runtime_config_lock
     async with runtime_config_lock:
@@ -1269,7 +1285,7 @@ async def add_max_plan_account(
 ):
     """Add a Max plan account. Provide 'name' and 'oauth_token' (sk-ant-oat01-... from `claude setup-token`).
     Optionally provide 'claude_config_json' (content of ~/.claude.json for onboarding bypass)."""
-    from app.main import _max_plan_pool
+    from app.main import _max_plan_pools, _account_by_id
     name = payload.get("name")
     oauth_token = payload.get("oauth_token")
     if not name or not oauth_token:
@@ -1294,6 +1310,7 @@ async def add_max_plan_account(
         oauth_token=oauth_token,  # Raw token saved temporarily for ID generation
         claude_config_json=claude_config_json,
         token_created_at=now,
+        user_id=current_user["user_id"],
     )
     session.add(db_account)
     await session.commit()
@@ -1313,17 +1330,20 @@ async def add_max_plan_account(
 
     # Sync to in-memory pool (always use the raw token for runtime)
     from app.main import _max_plan_pool_lock
+    entry = {
+        "id": str(db_account.id),
+        "user_id": current_user["user_id"],
+        "name": db_account.name,
+        "oauth_token": oauth_token,  # In-memory pool always holds the resolved token
+        "claude_config_json": db_account.claude_config_json,
+        "enabled": db_account.enabled,
+        "active_tasks": 0,
+        "total_tasks": db_account.total_tasks,
+        "token_created_at": now.isoformat(),
+    }
     async with _max_plan_pool_lock:
-        _max_plan_pool.append({
-            "id": str(db_account.id),
-            "name": db_account.name,
-            "oauth_token": oauth_token,  # In-memory pool always holds the resolved token
-            "claude_config_json": db_account.claude_config_json,
-            "enabled": db_account.enabled,
-            "active_tasks": 0,
-            "total_tasks": db_account.total_tasks,
-            "token_created_at": now.isoformat(),
-        })
+        _max_plan_pools.setdefault(current_user["user_id"], []).append(entry)
+        _account_by_id[str(db_account.id)] = entry
     return {"id": str(db_account.id), "name": db_account.name, "message": "Account added to pool"}
 
 
@@ -1336,7 +1356,7 @@ async def remove_max_plan_account(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _max_plan_pool
+    from app.main import _max_plan_pools, _account_by_id
 
     # Delete from database
     try:
@@ -1345,6 +1365,8 @@ async def remove_max_plan_account(
         raise HTTPException(status_code=400, detail="Invalid account ID")
     db_account = await session.get(MaxPlanAccount, acct_uuid)
     if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if db_account.user_id != current_user["user_id"]:
         raise HTTPException(status_code=404, detail="Account not found")
 
     # Check for active tasks using this account
@@ -1367,7 +1389,10 @@ async def remove_max_plan_account(
     # Remove from in-memory pool
     from app.main import _max_plan_pool_lock
     async with _max_plan_pool_lock:
-        _max_plan_pool[:] = [a for a in _max_plan_pool if a["id"] != account_id]
+        user_id = current_user["user_id"]
+        if user_id in _max_plan_pools:
+            _max_plan_pools[user_id] = [a for a in _max_plan_pools[user_id] if a["id"] != account_id]
+        _account_by_id.pop(account_id, None)
     return {"message": "Account removed"}
 
 
@@ -1378,7 +1403,7 @@ async def update_max_plan_account(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _max_plan_pool
+    from app.main import _account_by_id
 
     # Update in database
     try:
@@ -1387,6 +1412,8 @@ async def update_max_plan_account(
         raise HTTPException(status_code=400, detail="Invalid account ID")
     db_account = await session.get(MaxPlanAccount, acct_uuid)
     if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if db_account.user_id != current_user["user_id"]:
         raise HTTPException(status_code=404, detail="Account not found")
 
     if "enabled" in payload:
@@ -1426,7 +1453,7 @@ async def update_max_plan_account(
     # Sync to in-memory pool
     from app.main import _max_plan_pool_lock
     async with _max_plan_pool_lock:
-        mem_account = next((a for a in _max_plan_pool if a["id"] == account_id), None)
+        mem_account = _account_by_id.get(account_id)
         if mem_account:
             if "enabled" in payload:
                 mem_account["enabled"] = db_account.enabled
@@ -1575,9 +1602,7 @@ async def get_directions(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
     return {"directions": project.directions or [], "autonomous_enabled": project.autonomous_enabled}
 
 
@@ -1589,7 +1614,7 @@ async def add_direction(
     current_user: dict = Depends(get_current_user)
 ):
     project = (await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
+        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
     )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1620,7 +1645,7 @@ async def replace_directions(
 ):
     """Replace the entire directions array for a project."""
     project = (await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
+        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
     )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1657,7 +1682,7 @@ async def remove_direction(
     current_user: dict = Depends(get_current_user)
 ):
     project = (await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
+        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
     )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1703,7 +1728,7 @@ async def reorder_directions(
     current_user: dict = Depends(get_current_user)
 ):
     project = (await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
+        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
     )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1736,7 +1761,7 @@ async def update_direction(
     current_user: dict = Depends(get_current_user)
 ):
     project = (await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
+        select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"]).with_for_update()
     )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1786,9 +1811,7 @@ async def create_direction_research_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
     if not direction:
@@ -1861,9 +1884,7 @@ async def get_direction_task_counts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     result = await session.execute(
         select(Task).where(
@@ -1900,9 +1921,7 @@ async def toggle_autonomous(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     if "enabled" not in payload:
         raise HTTPException(status_code=400, detail="'enabled' field required")
@@ -1925,7 +1944,7 @@ async def get_autonomous_status(
     from app.shared_state import autonomous_failure_counts, runtime_config
 
     projects = (await session.execute(
-        select(Project).order_by(Project.created_at.desc())
+        select(Project).where(Project.user_id == current_user["user_id"]).order_by(Project.created_at.desc())
     )).scalars().all()
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
@@ -1974,7 +1993,7 @@ async def get_autonomous_status(
 
 @router.post("/restart-orchestrator")
 async def restart_orchestrator(
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Restart the orchestrator background task without restarting the entire service."""
     import asyncio
@@ -2068,7 +2087,7 @@ async def get_deploy_state(
 @router.post("/deploy-state/pause")
 async def pause_pipeline(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Manually pause the pipeline (set max_concurrent_vms=0). Used for manual intervention."""
     from app.shared_state import runtime_config
@@ -2094,7 +2113,7 @@ async def pause_pipeline(
 @router.post("/deploy-state/resume")
 async def resume_pipeline(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Resume the pipeline after a pause. Restores max_concurrent_vms to pre-pause value."""
     from app.shared_state import runtime_config
@@ -2130,7 +2149,7 @@ async def resume_pipeline(
 @router.post("/deploy-state/reset-health")
 async def reset_deploy_health(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Force-reset health state and resume the pipeline. Emergency operator escape hatch."""
     from app.shared_state import runtime_config, external_health
@@ -2177,7 +2196,7 @@ async def reset_deploy_health(
 @router.post("/deploy-state/mark-stable")
 async def mark_deploy_stable(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Manually mark the current deploy as stable (skip monitoring window)."""
     from app.shared_state import deploy_monitoring
@@ -2204,7 +2223,7 @@ async def mark_deploy_stable(
 @router.post("/deploy-state/rollback")
 async def trigger_rollback(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """One-click rollback: shift Cloud Run traffic to last_known_good_revision.
     Pauses the pipeline and records the rollback in deployment state."""
@@ -2282,7 +2301,7 @@ async def trigger_rollback(
 @router.post("/repair-state")
 async def repair_state(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Post-rollback state audit and repair. Fixes stuck tasks, orphaned parents, stale evaluating tasks."""
     from app.models import TaskHistory
@@ -2395,9 +2414,11 @@ async def get_activity(
     events: List[Dict[str, Any]] = []
 
     # --- 1 & 2: Completed and Failed tasks in last 7 days (or since cutoff) ---
+    user_project_ids = _user_project_ids(current_user["user_id"])
     task_filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
         Task.created_at >= cutoff,
+        Task.project_id.in_(user_project_ids),
     ]
     if project_id:
         task_filters.append(Task.project_id == project_id)
@@ -2530,6 +2551,7 @@ async def get_activity(
     # --- 3b: In-progress tasks (QUEUED / PROVISIONING / IN_PROGRESS) ---
     inprogress_filters = [
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        Task.project_id.in_(user_project_ids),
     ]
     if project_id:
         inprogress_filters.append(Task.project_id == project_id)
@@ -2636,7 +2658,7 @@ async def get_alerts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    query = select(Alert).order_by(Alert.created_at.desc())
+    query = select(Alert).where(Alert.project_id.in_(_user_project_ids(current_user["user_id"]))).order_by(Alert.created_at.desc())
     if project_id:
         query = query.where(Alert.project_id == uuid.UUID(project_id))
     if not include_dismissed:
@@ -2668,6 +2690,10 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
+    # Verify alert belongs to user's project
+    project = await session.get(Project, alert.project_id)
+    if not project or project.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Alert not found")
     alert.dismissed_at = _utcnow()
     session.add(alert)
     await session.commit()
@@ -2680,7 +2706,7 @@ async def dismiss_all_alerts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    stmt = update(Alert).where(Alert.dismissed_at.is_(None))
+    stmt = update(Alert).where(Alert.dismissed_at.is_(None), Alert.project_id.in_(_user_project_ids(current_user["user_id"])))
     if project_id:
         stmt = stmt.where(Alert.project_id == project_id)
     stmt = stmt.values(dismissed_at=_utcnow())
@@ -2701,9 +2727,7 @@ async def get_autonomy_debug(
     from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
     import app.shared_state as _shared_state_mod
 
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     now = _utcnow()
     blocking_guards = []
@@ -2861,9 +2885,11 @@ async def get_autonomy_debug(
 @router.post("/projects/{project_id}/circuit-breaker/reset")
 async def reset_circuit_breaker(
     project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Manually reset a project's circuit breaker to CLOSED state."""
+    await _get_user_project(project_id, current_user["user_id"], session)
     import app.shared_state as _shared_state
     from app.main import _persist_circuit_breakers, broadcast_to_project
 
@@ -3066,9 +3092,7 @@ async def get_project_diagnostics(
     from app.shared_state import get_circuit_breaker
     from app.compute import get_zone_health_summary
 
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    project = await _get_user_project(project_id, current_user["user_id"], session)
 
     now = _utcnow()
 
@@ -3112,7 +3136,7 @@ async def get_project_diagnostics(
 @router.get("/diagnostics")
 async def get_global_diagnostics(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     """Aggregate pipeline diagnostics across all projects."""
     from app.shared_state import get_circuit_breaker, circuit_breakers
@@ -3184,7 +3208,7 @@ async def get_digest(
     hours: int = Query(24, ge=1, le=168),
     project_id: Optional[uuid.UUID] = Query(None),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """Return a catch-up digest of activity within the requested time window."""
     window_start = _utcnow() - timedelta(hours=hours)
@@ -3405,7 +3429,7 @@ class UserUpdate(BaseModel):
 @router.get("/users")
 async def list_users(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     result = await session.execute(
         select(AllowedUser).order_by(AllowedUser.created_at.desc())
@@ -3428,7 +3452,7 @@ async def list_users(
 async def add_user(
     payload: UserCreate,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     existing = (await session.execute(
         select(AllowedUser).where(AllowedUser.email == payload.email)
@@ -3455,7 +3479,7 @@ async def update_user(
     user_id: uuid.UUID,
     payload: UserUpdate,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     user = await session.get(AllowedUser, user_id)
     if not user:
@@ -3479,7 +3503,7 @@ async def update_user(
 async def remove_user(
     user_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     user = await session.get(AllowedUser, user_id)
     if not user:

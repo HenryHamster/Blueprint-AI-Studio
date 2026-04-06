@@ -14,7 +14,7 @@ def make_project(**kwargs) -> Project:
     """Create a Project instance with test defaults. Pass kwargs to override."""
     defaults = dict(
         name="Test Project",
-        user_id="test-user",
+        user_id="test-user-123",
         autonomous_enabled=False,
         directions=[],
     )

@@ -211,6 +211,7 @@ async def test_cooldown_filter_excludes_recently_researched_direction(db_session
     """A direction researched 1 hour ago (within 4-hour cooldown) should not trigger a task."""
     project = Project(
         name="Cooldown Test — Recent",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[{
             "id": "d-recent01",
@@ -238,6 +239,7 @@ async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
     """A direction researched 5 hours ago (past 4-hour cooldown) should trigger a task."""
     project = Project(
         name="Cooldown Test — Past",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[{
             "id": "d-past0001",
@@ -266,6 +268,7 @@ async def test_cooldown_filter_includes_direction_never_researched(db_session):
     """A direction with no last_researched_at is always eligible for research."""
     project = Project(
         name="Cooldown Test — Never",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[{
             "id": "d-never001",
@@ -294,6 +297,7 @@ async def test_spawn_skipped_when_autonomous_disabled(db_session):
     """_spawn_research_task does nothing when autonomous_enabled is False."""
     project = Project(
         name="Autonomous Disabled",
+        user_id="test-user-123",
         autonomous_enabled=False,
         directions=[{
             "id": "d-dis00001",
@@ -334,6 +338,7 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
 
     project = Project(
         name="Research Completion Test",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
     )
@@ -413,6 +418,7 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
 
     project = Project(
         name="No Findings Test",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
     )
@@ -467,6 +473,7 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
 
     project = Project(
         name="Direction Update Test",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
     )
@@ -548,6 +555,7 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
 
     project = Project(
         name="Direction Note Test",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction],
     )

@@ -78,7 +78,7 @@ class UserIntegration(SQLModel, table=True):
 class Project(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
-    user_id: Optional[str] = Field(default=None, index=True)
+    user_id: str = Field(index=True)
     status: ProjectStatus = Field(default=ProjectStatus.DRAFT, sa_column=Column(String, default=ProjectStatus.DRAFT))
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
@@ -266,6 +266,7 @@ class MaxPlanAccount(SQLModel, table=True):
     Active task counts are tracked in-memory only.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True)
     name: str
     oauth_token: str  # Secret Manager resource name (or raw token for backward compat)
     claude_config_json: Optional[str] = Field(default=None)  # ~/.claude.json content for onboarding bypass

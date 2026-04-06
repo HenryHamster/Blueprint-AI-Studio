@@ -70,6 +70,7 @@ interface SettingsDropdownProps {
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
   // Optional class name for the trigger button (e.g. to hide it on mobile)
   triggerClassName?: string;
+  userRole?: 'admin' | 'user' | null;
 }
 
 function relativeTime(ms: number): string {
@@ -159,6 +160,7 @@ export function SettingsDropdown({
   onRepairState,
   zoneHealth,
   triggerClassName,
+  userRole,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [restarting, setRestarting] = useState(false);
@@ -421,6 +423,7 @@ export function SettingsDropdown({
           <div className="border-t border-neutral-800 pt-3 mb-4">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Settings</h4>
           </div>
+          {userRole === 'admin' && (<>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (1-100)</label>
             <input
@@ -513,6 +516,7 @@ export function SettingsDropdown({
             {restartStatus === 'success' && <p className="text-[11px] text-emerald-400 mt-1">Orchestrator restarted successfully.</p>}
             {restartStatus === 'error' && <p className="text-[11px] text-red-400 mt-1">Restart failed. Check console for details.</p>}
           </div>
+          </>)}
 
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
@@ -795,6 +799,7 @@ export function SettingsDropdown({
             </button>
           </div>
 
+          {userRole === 'admin' && (
           <div className="border-t border-neutral-800 pt-3 mt-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
               <Shield className="w-3 h-3" /> Deploy Health
@@ -1006,6 +1011,7 @@ export function SettingsDropdown({
               <p className="text-[11px] text-neutral-600">No data yet</p>
             )}
           </div>
+          )}
 
           <div className="border-t border-neutral-800 pt-3 mt-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Keyboard Shortcuts</h4>

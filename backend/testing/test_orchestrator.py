@@ -23,9 +23,13 @@ from app.main import (
     _spawn_research_task,
     _handle_research_completion,
     classify_failure,
+    _max_plan_pools,
+    _account_by_id,
 )
 from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
+
+_TEST_USER = "test-user-123"
 
 
 # ── Helper: redirect AsyncSessionLocal to the test database ─────────────────
@@ -51,11 +55,15 @@ class _FakeSessionFactory:
 @pytest.fixture(autouse=False)
 def reset_max_plan_pool():
     """Save and restore the in-memory Max Plan pool around each test."""
-    original = list(_main_module._max_plan_pool)
-    _main_module._max_plan_pool.clear()
+    orig_pools = {k: list(v) for k, v in _main_module._max_plan_pools.items()}
+    orig_by_id = dict(_main_module._account_by_id)
+    _main_module._max_plan_pools.clear()
+    _main_module._account_by_id.clear()
     yield
-    _main_module._max_plan_pool.clear()
-    _main_module._max_plan_pool.extend(original)
+    _main_module._max_plan_pools.clear()
+    _main_module._account_by_id.clear()
+    _main_module._max_plan_pools.update(orig_pools)
+    _main_module._account_by_id.update(orig_by_id)
 
 
 # ── Fixture: reset circuit breaker state for a project ───────────────────────
@@ -370,6 +378,7 @@ class TestMaxPlanPool:
         acct_id = uuid.uuid4()
         account = MaxPlanAccount(
             id=acct_id,
+            user_id=_TEST_USER,
             name="test-account",
             oauth_token="sk-ant-test-token",
             enabled=True,
@@ -404,8 +413,8 @@ class TestMaxPlanPool:
 
         await load_max_plan_pool()
 
-        assert len(_main_module._max_plan_pool) == 1
-        entry = _main_module._max_plan_pool[0]
+        assert len(_main_module._account_by_id) == 1
+        entry = _main_module._account_by_id[str(acct_id)]
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
@@ -416,14 +425,14 @@ class TestMaxPlanPool:
         """load_max_plan_pool() loads all accounts regardless of enabled flag."""
         mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
 
-        db_session.add(MaxPlanAccount(name="enabled-acct", oauth_token="tok-a", enabled=True, total_tasks=0))
-        db_session.add(MaxPlanAccount(name="disabled-acct", oauth_token="tok-b", enabled=False, total_tasks=0))
+        db_session.add(MaxPlanAccount(user_id=_TEST_USER, name="enabled-acct", oauth_token="tok-a", enabled=True, total_tasks=0))
+        db_session.add(MaxPlanAccount(user_id=_TEST_USER, name="disabled-acct", oauth_token="tok-b", enabled=False, total_tasks=0))
         await db_session.commit()
 
         await load_max_plan_pool()
 
-        assert len(_main_module._max_plan_pool) == 2
-        names = {a["name"] for a in _main_module._max_plan_pool}
+        assert len(_main_module._account_by_id) == 2
+        names = {a["name"] for a in _main_module._account_by_id.values()}
         assert names == {"enabled-acct", "disabled-acct"}
 
     # ── Test 3: select_max_plan_account returns lowest active count ──────────
@@ -431,13 +440,15 @@ class TestMaxPlanPool:
     @pytest.mark.asyncio
     async def test_select_max_plan_account_returns_account_with_lowest_active_count(self, reset_max_plan_pool):
         """select_max_plan_account() must pick the enabled account with the fewest active tasks."""
-        _main_module._max_plan_pool.extend([
-            {"id": "aaa", "name": "busy",   "oauth_token": "t1", "enabled": True, "active_tasks": 5},
-            {"id": "bbb", "name": "idle",   "oauth_token": "t2", "enabled": True, "active_tasks": 1},
-            {"id": "ccc", "name": "medium", "oauth_token": "t3", "enabled": True, "active_tasks": 3},
-        ])
+        for entry in [
+            {"id": "aaa", "name": "busy",   "oauth_token": "t1", "enabled": True, "active_tasks": 5, "user_id": _TEST_USER},
+            {"id": "bbb", "name": "idle",   "oauth_token": "t2", "enabled": True, "active_tasks": 1, "user_id": _TEST_USER},
+            {"id": "ccc", "name": "medium", "oauth_token": "t3", "enabled": True, "active_tasks": 3, "user_id": _TEST_USER},
+        ]:
+            _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+            _account_by_id[entry["id"]] = entry
 
-        chosen = await select_max_plan_account()
+        chosen = await select_max_plan_account(_TEST_USER)
         assert chosen is not None
         assert chosen["name"] == "idle"
 
@@ -446,12 +457,14 @@ class TestMaxPlanPool:
     @pytest.mark.asyncio
     async def test_select_max_plan_account_skips_disabled_accounts(self, reset_max_plan_pool):
         """Disabled accounts (enabled=False) must never be selected."""
-        _main_module._max_plan_pool.extend([
-            {"id": "aaa", "name": "disabled-low", "oauth_token": "t1", "enabled": False, "active_tasks": 0},
-            {"id": "bbb", "name": "enabled-high", "oauth_token": "t2", "enabled": True,  "active_tasks": 9},
-        ])
+        for entry in [
+            {"id": "aaa", "name": "disabled-low", "oauth_token": "t1", "enabled": False, "active_tasks": 0, "user_id": _TEST_USER},
+            {"id": "bbb", "name": "enabled-high", "oauth_token": "t2", "enabled": True,  "active_tasks": 9, "user_id": _TEST_USER},
+        ]:
+            _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+            _account_by_id[entry["id"]] = entry
 
-        chosen = await select_max_plan_account()
+        chosen = await select_max_plan_account(_TEST_USER)
         assert chosen is not None
         assert chosen["name"] == "enabled-high", "Must pick enabled account even if it has more tasks"
 
@@ -460,19 +473,21 @@ class TestMaxPlanPool:
     @pytest.mark.asyncio
     async def test_select_max_plan_account_returns_none_when_all_disabled(self, reset_max_plan_pool):
         """When no enabled accounts exist, select_max_plan_account() returns None."""
-        _main_module._max_plan_pool.extend([
-            {"id": "aaa", "name": "acct-a", "oauth_token": "t1", "enabled": False, "active_tasks": 0},
-            {"id": "bbb", "name": "acct-b", "oauth_token": "t2", "enabled": False, "active_tasks": 0},
-        ])
-        assert await select_max_plan_account() is None
+        for entry in [
+            {"id": "aaa", "name": "acct-a", "oauth_token": "t1", "enabled": False, "active_tasks": 0, "user_id": _TEST_USER},
+            {"id": "bbb", "name": "acct-b", "oauth_token": "t2", "enabled": False, "active_tasks": 0, "user_id": _TEST_USER},
+        ]:
+            _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+            _account_by_id[entry["id"]] = entry
+        assert await select_max_plan_account(_TEST_USER) is None
 
     # ── Test 6: empty pool → None ────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_select_max_plan_account_returns_none_for_empty_pool(self, reset_max_plan_pool):
         """Empty pool returns None without raising."""
-        assert len(_main_module._max_plan_pool) == 0
-        assert await select_max_plan_account() is None
+        assert len(_main_module._account_by_id) == 0
+        assert await select_max_plan_account(_TEST_USER) is None
 
     # ── Test 7: release decrements active_tasks ──────────────────────────────
 
@@ -480,14 +495,13 @@ class TestMaxPlanPool:
     async def test_release_max_plan_account_decrements_active_tasks(self, reset_max_plan_pool):
         """release_max_plan_account() must decrement active_tasks for the given account."""
         acct_id = "test-release-id"
-        _main_module._max_plan_pool.append(
-            {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 3}
-        )
+        entry = {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 3, "user_id": _TEST_USER}
+        _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+        _account_by_id[acct_id] = entry
 
         await release_max_plan_account(acct_id)
 
-        entry = _main_module._max_plan_pool[0]
-        assert entry["active_tasks"] == 2
+        assert _account_by_id[acct_id]["active_tasks"] == 2
 
     # ── Test 8: release never goes below zero ────────────────────────────────
 
@@ -495,11 +509,11 @@ class TestMaxPlanPool:
     async def test_release_max_plan_account_floors_at_zero(self, reset_max_plan_pool):
         """active_tasks should not go negative — floor at 0 on release."""
         acct_id = "floor-test-id"
-        _main_module._max_plan_pool.append(
-            {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 0}
-        )
+        entry = {"id": acct_id, "name": "acct", "oauth_token": "tok", "enabled": True, "active_tasks": 0, "user_id": _TEST_USER}
+        _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+        _account_by_id[acct_id] = entry
         await release_max_plan_account(acct_id)
-        assert _main_module._max_plan_pool[0]["active_tasks"] == 0
+        assert _account_by_id[acct_id]["active_tasks"] == 0
 
     # ── Test 9: concurrency limit — select respects in-flight task count ──────
 
@@ -510,12 +524,14 @@ class TestMaxPlanPool:
         least-loaded one (the caller is responsible for enforcing a hard limit).
         Verifies that active_tasks correctly gate account selection ordering.
         """
-        _main_module._max_plan_pool.extend([
-            {"id": "x1", "name": "a1", "oauth_token": "t1", "enabled": True, "active_tasks": 10},
-            {"id": "x2", "name": "a2", "oauth_token": "t2", "enabled": True, "active_tasks": 7},
-            {"id": "x3", "name": "a3", "oauth_token": "t3", "enabled": True, "active_tasks": 10},
-        ])
-        chosen = await select_max_plan_account()
+        for entry in [
+            {"id": "x1", "name": "a1", "oauth_token": "t1", "enabled": True, "active_tasks": 10, "user_id": _TEST_USER},
+            {"id": "x2", "name": "a2", "oauth_token": "t2", "enabled": True, "active_tasks": 7, "user_id": _TEST_USER},
+            {"id": "x3", "name": "a3", "oauth_token": "t3", "enabled": True, "active_tasks": 10, "user_id": _TEST_USER},
+        ]:
+            _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
+            _account_by_id[entry["id"]] = entry
+        chosen = await select_max_plan_account(_TEST_USER)
         assert chosen["id"] == "x2"
 
 

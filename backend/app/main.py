@@ -73,7 +73,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0022"
+EXPECTED_SCHEMA_REVISION = "0023"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -92,12 +92,17 @@ _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
 # --- Max Plan Account Pool ---
 # In-memory cache of DB-persisted accounts. Keeps active_tasks count (runtime only).
-# Each entry: {id, name, oauth_token, claude_config_json, enabled, active_tasks, total_tasks, token_created_at}
-_max_plan_pool: List[Dict[str, Any]] = []
+# Per-user pools keyed by user_id. Flat lookup by account_id for O(1) release.
+_max_plan_pools: Dict[str, List[Dict[str, Any]]] = {}  # user_id → accounts
+_account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
 
+# Backward compat: flat view for code that needs all accounts
+def _all_accounts() -> List[Dict[str, Any]]:
+    return list(_account_by_id.values())
+
 async def load_max_plan_pool():
-    """Load Max plan accounts from database into in-memory pool on startup.
+    """Load Max plan accounts from database into per-user pools on startup.
     Reconciles active_tasks from DB by counting tasks currently PROVISIONING/IN_PROGRESS."""
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(MaxPlanAccount))
@@ -113,7 +118,8 @@ async def load_max_plan_pool():
             if acct_id:
                 active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
 
-        _max_plan_pool.clear()
+        _max_plan_pools.clear()
+        _account_by_id.clear()
         for acct in accounts:
             acct_id = str(acct.id)
             # Resolve Secret Manager resource names to actual tokens
@@ -125,8 +131,9 @@ async def load_max_plan_pool():
                 except Exception as e:
                     logger.error(f"[POOL] Failed to fetch token from Secret Manager for account {acct.name}: {e}")
                     token = None
-            _max_plan_pool.append({
+            entry = {
                 "id": acct_id,
+                "user_id": acct.user_id,
                 "name": acct.name,
                 "oauth_token": token,
                 "claude_config_json": acct.claude_config_json,
@@ -134,17 +141,20 @@ async def load_max_plan_pool():
                 "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
                 "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
-            })
+            }
+            _max_plan_pools.setdefault(acct.user_id, []).append(entry)
+            _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
-        logger.info(f"[STARTUP] Loaded {len(_max_plan_pool)} Max plan accounts ({total_active} active tasks reconciled)")
+        logger.info(f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)")
 
-async def select_max_plan_account(blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-    """Select the Max plan account with the lowest active task count.
+async def select_max_plan_account(user_id: str, blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Select the Max plan account with the lowest active task count for a specific user.
     Pre-increments active_tasks atomically under lock to prevent races.
     Accounts in blacklist are excluded even if not yet disabled in the pool."""
     async with _max_plan_pool_lock:
+        user_pool = _max_plan_pools.get(user_id, [])
         available = [
-            a for a in _max_plan_pool
+            a for a in user_pool
             if a.get("enabled", True) and (not blacklist or a["id"] not in blacklist)
         ]
         if not available:
@@ -156,12 +166,11 @@ async def select_max_plan_account(blacklist: Optional[List[str]] = None) -> Opti
 async def release_max_plan_account(account_id: str):
     """Decrement active tasks for an account when a task finishes."""
     async with _max_plan_pool_lock:
-        for account in _max_plan_pool:
-            if account["id"] == account_id:
-                if account["active_tasks"] <= 0:
-                    logger.warning(f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}")
-                account["active_tasks"] = max(0, account["active_tasks"] - 1)
-                break
+        account = _account_by_id.get(account_id)
+        if account:
+            if account["active_tasks"] <= 0:
+                logger.warning(f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}")
+            account["active_tasks"] = max(0, account["active_tasks"] - 1)
 
 async def recheck_disabled_accounts():
     """Re-enable accounts that were disabled by rate limiting after a cooldown.
@@ -171,7 +180,7 @@ async def recheck_disabled_accounts():
     async with _max_plan_pool_lock:
         now = _utcnow()
 
-        for acct in _max_plan_pool:
+        for acct in _account_by_id.values():
             if acct.get("enabled", True):
                 continue
             disabled_at = acct.get("disabled_at")
@@ -754,21 +763,40 @@ async def _check_external_health():
             ext["errors"]["github_api"] = f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
             failed.append("github_api")
 
-    # Claude API — check credentials + rate limit failures
-    has_credentials = bool(_max_plan_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    # Claude API — check credentials + account availability
+    has_credentials = bool(_account_by_id) or bool(os.getenv("ANTHROPIC_API_KEY"))
     if not has_credentials:
         ext["claude_api"] = False
         failed.append("claude_api")
     else:
-        # Check for rate limit burst — 3+ RATE_LIMIT failures in last 5 results means API is exhausted
-        recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-        rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
-        if rate_limit_count >= 3:
-            ext["claude_api"] = False
-            failed.append("claude_api")
-            logger.warning(f"[HEALTH] Claude API rate limited — {rate_limit_count}/5 recent tasks hit limits")
+        # For Max plan account pools: only mark unhealthy if ALL accounts are disabled.
+        # Individual account rate limits are handled by per-account cooldowns —
+        # the pipeline can continue with remaining enabled accounts.
+        all_accounts = list(_account_by_id.values())
+        if all_accounts:
+            enabled_accounts = [a for a in all_accounts if a.get("enabled", True)]
+            if not enabled_accounts:
+                ext["claude_api"] = False
+                failed.append("claude_api")
+                disabled_names = [a["name"] for a in all_accounts]
+                logger.warning(f"[HEALTH] All Claude API accounts rate-limited: {', '.join(disabled_names)}")
+            else:
+                ext["claude_api"] = True
+                # Log partial degradation for visibility (not a pipeline pause)
+                disabled_accounts = [a for a in all_accounts if not a.get("enabled", True)]
+                if disabled_accounts:
+                    logger.info(f"[HEALTH] Claude API degraded — {len(disabled_accounts)}/{len(all_accounts)} accounts rate-limited, {len(enabled_accounts)} still available")
         else:
-            ext["claude_api"] = True
+            # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
+            # since there's no per-account cooldown mechanism for a single key.
+            recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
+            rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
+            if rate_limit_count >= 3:
+                ext["claude_api"] = False
+                failed.append("claude_api")
+                logger.warning(f"[HEALTH] Claude API rate limited (single key) — {rate_limit_count}/5 recent tasks hit limits")
+            else:
+                ext["claude_api"] = True
 
     # GCP — check is implicit via provisioning success/failure tracking
     # Mark unhealthy only if recent provisions all failed
@@ -1285,14 +1313,14 @@ async def _check_autonomous_research(owner: str, repo: str):
     """Post-merge hook: check if we should spawn a research task."""
     try:
         async with AsyncSessionLocal() as session:
-            project = (await session.execute(
+            projects = (await session.execute(
                 select(Project).where(
                     Project.github_owner == owner,
                     Project.github_repo == repo,
                     Project.autonomous_enabled.is_(True),
                 )
-            )).scalars().first()
-            if not project:
+            )).scalars().all()
+            if not projects:
                 return
 
             # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
@@ -1304,7 +1332,8 @@ async def _check_autonomous_research(owner: str, repo: str):
             )).scalar() or 0
 
             if vm_consuming < _runtime_config["max_concurrent_vms"]:
-                await _spawn_research_task(project, session)
+                for project in projects:
+                    await _spawn_research_task(project, session)
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
 
@@ -2248,7 +2277,7 @@ async def orchestrator_worker():
                     if acct_id:
                         active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 async with _max_plan_pool_lock:
-                    for acct in _max_plan_pool:
+                    for acct in _account_by_id.values():
                         # Reconcile upward only — never clobber in-flight release_max_plan_account() decrements
                         db_count = active_per_account.get(acct["id"], 0)
                         acct["active_tasks"] = max(acct["active_tasks"], db_count)
@@ -2476,7 +2505,7 @@ async def orchestrator_worker():
                     ).with_for_update(skip_locked=True)
                     queued_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
-                logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_max_plan_pool)} accounts")
+                logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts")
                 _shared_state.tasks_queued_gauge = (await session.execute(
                     select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
                 )).scalar() or 0
@@ -2488,9 +2517,11 @@ async def orchestrator_worker():
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
-                    # Select Max plan account (primary) or fall back to API key
+                    # Select Max plan account from task owner's pool
                     _blacklist = (task.context or {}).get("blacklisted_accounts")
-                    account = await select_max_plan_account(blacklist=_blacklist)
+                    task_project = await session.get(Project, task.project_id)
+                    task_owner_id = task_project.user_id if task_project else ""
+                    account = await select_max_plan_account(user_id=task_owner_id, blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None
@@ -3064,11 +3095,12 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         logger.warning(f"[DEBUG] Failed to fetch deployment state for /api/debug/orchestrator: {e}", exc_info=True)
 
     # Snapshot pool under lock for consistent read
+    all_accts = _all_accounts()
     async with _max_plan_pool_lock:
         pool_snapshot = {
-            "size": len(_max_plan_pool),
-            "available": sum(1 for a in _max_plan_pool if a.get("enabled", True)),
-            "disabled": sum(1 for a in _max_plan_pool if not a.get("enabled", True)),
+            "size": len(all_accts),
+            "available": sum(1 for a in all_accts if a.get("enabled", True)),
+            "disabled": sum(1 for a in all_accts if not a.get("enabled", True)),
             "accounts": [
                 {
                     "name": a["name"],
@@ -3077,7 +3109,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
                     "disabled_at": a["disabled_at"].isoformat() if a.get("disabled_at") else None,
                     "reenable_at": (a["disabled_at"] + timedelta(minutes=30)).isoformat() if a.get("disabled_at") else None,
                 }
-                for a in _max_plan_pool
+                for a in all_accts
             ],
         }
 
@@ -3177,8 +3209,8 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     components["zone_health"] = dict(zone_summary, status=zone_status)
 
     # --- Max Plan Pool ---
-    total_accounts = len(_max_plan_pool)
-    available_accounts = len([a for a in _max_plan_pool if a.get("enabled", True)])
+    total_accounts = len(_account_by_id)
+    available_accounts = sum(1 for a in _account_by_id.values() if a.get("enabled", True))
     if total_accounts == 0:
         pool_status = "ok"  # not using Max Plan accounts
     elif available_accounts > 0:
@@ -3289,7 +3321,7 @@ async def prometheus_metrics(request: Request):
     if _orchestrator_last_cycle:
         cycle_age = (_utcnow() - _orchestrator_last_cycle).total_seconds()
 
-    active_vms = sum(a.get("active_tasks", 0) for a in _max_plan_pool)
+    active_vms = sum(a.get("active_tasks", 0) for a in _account_by_id.values())
     consecutive_failures = sum(_shared_state.autonomous_failure_counts.values()) if _shared_state.autonomous_failure_counts else 0
 
     lines: list[str] = []
@@ -3699,12 +3731,7 @@ async def generate_ws_ticket(
     """
     Generates a short-lived ticket for authenticating WebSocket connections.
     """
-    # Admins can access any project's WebSocket
-    stmt = (
-        select(Project).where(Project.id == project_id)
-        if current_user.get("role") == "admin"
-        else select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
-    )
+    stmt = select(Project).where(Project.id == project_id, Project.user_id == current_user["user_id"])
     project = (await session.execute(stmt)).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
@@ -7357,14 +7384,13 @@ async def update_agent_status(
                     if acct_id:
                         await release_max_plan_account(acct_id)
                         async with _max_plan_pool_lock:
-                            for acct in _max_plan_pool:
-                                if acct["id"] == acct_id:
-                                    acct["enabled"] = False
-                                    acct["disabled_at"] = _utcnow()
-                                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
-                                    cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
-                                    logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
-                                    break
+                            acct = _account_by_id.get(acct_id)
+                            if acct:
+                                acct["enabled"] = False
+                                acct["disabled_at"] = _utcnow()
+                                acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+                                cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                                logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
                     old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
                     task.status = TaskStatus.QUEUED
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"

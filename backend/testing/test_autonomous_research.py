@@ -119,6 +119,7 @@ async def test_spawn_blocked_by_open_circuit_breaker(db_session):
     """Circuit breaker in OPEN state (cooldown not elapsed) prevents spawning."""
     project = Project(
         name="CB Open Block",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-cbopen01")],
     )
@@ -150,6 +151,7 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
     """Circuit breaker transitions OPEN → HALF-OPEN when cooldown has elapsed, one task spawned."""
     project = Project(
         name="CB Cooldown Elapsed",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-cbhalf01")],
     )
@@ -192,6 +194,7 @@ async def test_spawn_skipped_when_directions_empty(db_session):
     """_spawn_research_task does nothing when the directions list is empty."""
     project = Project(
         name="Empty Directions",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[],
     )
@@ -210,6 +213,7 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
     """_spawn_research_task does nothing when all directions are paused or completed."""
     project = Project(
         name="All Non-Active Directions",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[
             {**_active_direction("d-paused01", "Paused A"), "status": "paused"},
@@ -235,6 +239,7 @@ async def test_spawn_skipped_when_research_task_already_queued(db_session):
     """_spawn_research_task does not spawn a second task if one is already QUEUED."""
     project = Project(
         name="Already Running Research",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-running1")],
     )
@@ -267,6 +272,7 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
     """_spawn_research_task does not spawn when a research task is IN_PROGRESS."""
     project = Project(
         name="In-Progress Research",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-inprog01")],
     )
@@ -302,6 +308,7 @@ async def test_spawn_skipped_at_per_project_rate_limit(db_session):
     """_spawn_research_task does not spawn when the per-project hourly limit is saturated."""
     project = Project(
         name="Per-Project Rate Limit",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-ratelm01")],
     )
@@ -343,6 +350,7 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
     """_spawn_research_task does not spawn when the global hourly limit is at zero."""
     project = Project(
         name="Global Rate Limit",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-globrl01")],
     )
@@ -370,7 +378,7 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
     """Research at MAX_RESEARCH_DEPTH=3 skips child task creation and sets a status message."""
     direction = _active_direction("d-depth001", "Deep research")
     project = Project(
-        name="Depth Limit", autonomous_enabled=True, directions=[direction]
+        name="Depth Limit", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -404,7 +412,7 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
     """A finding whose hash matches a recent task's finding_hash context key is skipped."""
     direction = _active_direction("d-hashdup1", "Hash dedup direction")
     project = Project(
-        name="Hash Dedup Test", autonomous_enabled=True, directions=[direction]
+        name="Hash Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -459,7 +467,7 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     """A finding with 3+ meaningful words overlapping an active task title is skipped."""
     direction = _active_direction("d-worddup1", "Word overlap direction")
     project = Project(
-        name="Word Overlap Dedup", autonomous_enabled=True, directions=[direction]
+        name="Word Overlap Dedup", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -511,7 +519,7 @@ async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     """Distinct findings that share fewer than 3 meaningful words each get a child task."""
     direction = _active_direction("d-unique01", "Unique findings direction")
     project = Project(
-        name="Unique Findings", autonomous_enabled=True, directions=[direction]
+        name="Unique Findings", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -562,7 +570,7 @@ async def test_child_task_direction_id_set_in_context(db_session, mocker):
     direction_id = "d-dirctx01"
     direction = _active_direction(direction_id, "Direction context test")
     project = Project(
-        name="Child Context Test", autonomous_enabled=True, directions=[direction]
+        name="Child Context Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -593,7 +601,7 @@ async def test_child_task_has_research_task_as_parent(db_session, mocker):
     """Child tasks have parent_task_id pointing to the originating research task."""
     direction = _active_direction("d-parent01", "Parent tracking direction")
     project = Project(
-        name="Parent Task ID Test", autonomous_enabled=True, directions=[direction]
+        name="Parent Task ID Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -624,7 +632,7 @@ async def test_research_task_status_becomes_evaluating(db_session, mocker):
     """After _handle_research_completion, the research task's status is EVALUATING."""
     direction = _active_direction("d-evalsts1", "Evaluating status direction")
     project = Project(
-        name="EVALUATING Status Test", autonomous_enabled=True, directions=[direction]
+        name="EVALUATING Status Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -649,7 +657,7 @@ async def test_multiple_findings_each_create_a_child_task(db_session, mocker):
     """Three distinct findings produce three child tasks."""
     direction = _active_direction("d-multi001", "Multi-finding direction")
     project = Project(
-        name="Multiple Findings", autonomous_enabled=True, directions=[direction]
+        name="Multiple Findings", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -682,7 +690,7 @@ async def test_child_task_carries_research_depth_plus_one(db_session, mocker):
     """Child tasks have research_depth = parent research_depth + 1."""
     direction = _active_direction("d-depth2x1", "Depth tracking direction")
     project = Project(
-        name="Depth Increment Test", autonomous_enabled=True, directions=[direction]
+        name="Depth Increment Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -718,7 +726,7 @@ async def test_finding_type_research_spawns_research_subtask(db_session, mocker)
     """A finding with type='research' spawns a child research task."""
     direction = _active_direction("d-typeres1", "Type research")
     project = Project(
-        name="Sub-Research Test", autonomous_enabled=True, directions=[direction]
+        name="Sub-Research Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -753,7 +761,7 @@ async def test_finding_scope_large_spawns_plan_task(db_session, mocker):
     """A finding with scope='large' spawns a 'plan' task for decomposition."""
     direction = _active_direction("d-planscop1", "Large scope direction")
     project = Project(
-        name="Large Scope Plan Test", autonomous_enabled=True, directions=[direction]
+        name="Large Scope Plan Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -788,7 +796,7 @@ async def test_finding_scope_small_spawns_create_task(db_session, mocker):
     """A finding with scope='small' spawns a 'create' task for single-PR work."""
     direction = _active_direction("d-createsc1", "Small scope direction")
     project = Project(
-        name="Small Scope Create Test", autonomous_enabled=True, directions=[direction]
+        name="Small Scope Create Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -823,7 +831,7 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
     """A finding with type='security_audit' spawns a specialized security_audit task."""
     direction = _active_direction("d-secaud01", "Security audit direction")
     project = Project(
-        name="Security Audit Test", autonomous_enabled=True, directions=[direction]
+        name="Security Audit Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -866,7 +874,7 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
         "research_history": [],
     }
     project = Project(
-        name="History Fields Test", autonomous_enabled=True, directions=[direction]
+        name="History Fields Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -915,7 +923,7 @@ async def test_research_history_capped_at_10_entries(db_session, mocker):
         "research_history": existing_history,
     }
     project = Project(
-        name="History Cap Test", autonomous_enabled=True, directions=[direction]
+        name="History Cap Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -953,7 +961,7 @@ async def test_research_history_only_updated_for_directions_with_findings(db_ses
         {**_active_direction(dir_b_id, "Direction B no findings"), "research_history": []},
     ]
     project = Project(
-        name="Selective History Test", autonomous_enabled=True, directions=directions
+        name="Selective History Test", user_id="test-user-123", autonomous_enabled=True, directions=directions
     )
     db_session.add(project)
     await db_session.commit()
@@ -1005,7 +1013,7 @@ async def test_research_completion_creates_direction_proposals(db_session, mocke
     direction_id = "d-prop0001"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal Happy Path", autonomous_enabled=True, directions=[direction]
+        name="Proposal Happy Path", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -1043,7 +1051,7 @@ async def test_direction_proposals_not_converted_to_tasks(db_session, mocker):
     direction_id = "d-prop0002"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal No Task", autonomous_enabled=True, directions=[direction]
+        name="Proposal No Task", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -1084,7 +1092,7 @@ async def test_direction_proposals_capped_at_5_per_call(db_session, mocker):
     direction_id = "d-prop0003"
     direction = _active_direction(direction_id, "Active direction")
     project = Project(
-        name="Proposal Per-Call Cap", autonomous_enabled=True, directions=[direction]
+        name="Proposal Per-Call Cap", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
     )
     db_session.add(project)
     await db_session.commit()
@@ -1124,6 +1132,7 @@ async def test_direction_proposals_capped_at_10_pending_total(db_session, mocker
     ]
     project = Project(
         name="Proposal Global Cap",
+        user_id="test-user-123",
         autonomous_enabled=True,
         directions=[direction] + existing_proposed,
     )
