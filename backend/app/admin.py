@@ -3046,6 +3046,7 @@ async def _build_stuck_tasks(
     no_heartbeat_secs = 5 * 60
     long_queued_secs = 30 * 60
     stuck_deps_secs = 10 * 60
+    evaluating_timeout_secs = 2 * 3600  # 2 hours
 
     # Pre-fetch all dependency statuses in a single batch query to avoid N+1
     all_dep_uuids: set[uuid.UUID] = set()
@@ -3116,6 +3117,27 @@ async def _build_stuck_tasks(
                 stuck_reason = "long_queued"
                 stuck_for_seconds = int(created_age - long_queued_secs)
 
+        elif task.status == TaskStatus.EVALUATING:
+            # Skip CI-waiting tasks — they have their own timeout
+            ctx = task.context or {}
+            if not ctx.get("ci_waiting") and not ctx.get("review_loop", {}).get("ci_waiting"):
+                # Find when the task entered EVALUATING from status_log
+                evaluating_since = None
+                for entry in reversed(task.status_log or []):
+                    msg = entry.get("msg", "")
+                    if "→ EVALUATING" in msg:
+                        try:
+                            evaluating_since = datetime.fromisoformat(entry["t"])
+                        except (KeyError, ValueError, TypeError):
+                            pass
+                        break
+                if evaluating_since is None:
+                    evaluating_since = task.started_at or task.created_at
+                eval_age = (now - evaluating_since).total_seconds()
+                if eval_age > evaluating_timeout_secs:
+                    stuck_reason = "evaluation_timeout"
+                    stuck_for_seconds = int(eval_age - evaluating_timeout_secs)
+
         if stuck_reason:
             stuck.append({
                 "task_id": str(task.id),
@@ -3164,7 +3186,7 @@ async def get_project_diagnostics(
 
     now = _utcnow()
 
-    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
@@ -3212,7 +3234,7 @@ async def get_global_diagnostics(
 
     now = _utcnow()
 
-    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+    active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_result = await session.execute(
         select(Task).where(
             Task.status.in_(active_statuses),

@@ -512,6 +512,8 @@ async def _init_deployment_state():
                         session.add(state)
                         await session.commit()
                         logger.warning(f"[DEPLOY] Auto-recovery from HALTED after {elapsed:.0f}s cooldown — max_concurrent_vms restored to {restored}")
+                        await _create_halted_recovery_alerts(session)
+                        await session.commit()
                     else:
                         remaining = 3600 - elapsed
                         logger.info(f"[DEPLOY] HALTED — {remaining:.0f}s remaining until auto-recovery")
@@ -547,6 +549,9 @@ async def _init_deployment_state():
             logger.warning(f"[DEPLOY] ROLLBACK DETECTED — reverted from {state.rolled_back_from_sha[:8]} to {_current_sha[:8]} "
                   f"(consecutive rollbacks: {state.rollback_count})")
 
+            await _create_rollback_alerts(session, state.rolled_back_from_sha or "", _current_sha)
+            await session.commit()
+
             if state.rollback_count >= 3:
                 state.status = DeploymentStatus.HALTED
                 state.halted_at = _utcnow()
@@ -554,6 +559,8 @@ async def _init_deployment_state():
                 await session.commit()
                 logger.error(f"[DEPLOY] HALTED — {state.rollback_count} consecutive rollbacks, manual intervention required")
                 _runtime_config["max_concurrent_vms"] = 0
+                await _create_halted_alerts(session, state.rollback_count, state.last_known_good_revision, state.halted_at)
+                await session.commit()
             return
 
         # New deploy detected — update revision tracking
@@ -934,6 +941,98 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
             severity=AlertSeverity.INFO,
             title=resume_title,
             message=resume_title,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+        )
+
+
+async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last_known_good: str, halted_at: "datetime") -> None:
+    """Create ERROR alerts on all projects when deployment enters HALTED state."""
+    title = f"Deployment HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
+    msg = (
+        f"Deployment halted after {rollback_count} consecutive rollbacks. "
+        f"Last known good revision: {last_known_good or 'unknown'}. "
+        f"Halted at: {halted_at.isoformat()}. "
+        "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
+    )
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+        )
+
+
+async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, rolled_back_to: str) -> None:
+    """Create WARNING alerts on all projects when an automatic rollback is detected.
+    Deduplicates: skips if an undismissed rollback alert already exists for a project."""
+    title = "Automatic rollback detected — revision reverted to last known good"
+    msg = (
+        f"Deployment automatically rolled back from {rolled_back_from[:8]} "
+        f"to {rolled_back_to[:8]}."
+    )
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        existing = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.task_id.is_(None),
+                Alert.dismissed_at.is_(None),
+                Alert.title.contains("Automatic rollback"),
+            )
+        )).scalars().first()
+        if existing is not None:
+            continue
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+        )
+
+
+async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
+    """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
+    recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
+    now = _utcnow()
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        # Dismiss existing HALTED ERROR alerts for this project
+        existing_halted = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.severity == AlertSeverity.ERROR,
+                Alert.dismissed_at.is_(None),
+                Alert.title.contains("HALTED"),
+            )
+        )).scalars().all()
+        for h in existing_halted:
+            h.dismissed_at = now
+            session.add(h)
+        # Create INFO recovery alert
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.INFO,
+            title=recovery_title,
+            message=recovery_title,
         )
         session.add(alert)
         await broadcast_to_project(
@@ -2040,6 +2139,7 @@ async def secret_reconciliation_service():
 _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
+_last_evaluating_timeout_check: datetime = _utcnow()
 
 
 async def _persist_circuit_breakers():
@@ -2083,6 +2183,133 @@ async def _persist_zone_health():
                 await session.commit()
     except Exception as e:
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
+
+
+async def _check_evaluating_timeouts():
+    """Detect EVALUATING tasks that are stuck and recover or fail them.
+
+    - If all children are terminal but parent is still EVALUATING → trigger missed rollup.
+    - If evaluating >2h with non-terminal children → WARNING alert.
+    - If evaluating >6h → FAIL with ERROR alert.
+    - Skips CI-waiting tasks (they have their own 30-min timeout).
+    """
+    EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
+    EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
+    TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+    try:
+        async with AsyncSessionLocal() as session:
+            now = _utcnow()
+            evaluating_tasks = (await session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.EVALUATING,
+                    Task.archived.is_(False),
+                )
+            )).scalars().all()
+
+            for task in evaluating_tasks:
+                ctx = task.context or {}
+                # Skip CI-waiting tasks — they have their own timeout
+                if ctx.get("ci_waiting") is True:
+                    continue
+                if ctx.get("review_loop", {}).get("ci_waiting") is True:
+                    continue
+
+                # Determine how long the task has been EVALUATING
+                evaluating_since = None
+                # Walk status_log backwards for the last EVALUATING transition
+                for entry in reversed(task.status_log or []):
+                    msg = entry.get("msg", "")
+                    if "→ EVALUATING" in msg:
+                        try:
+                            evaluating_since = datetime.fromisoformat(entry["t"])
+                        except (KeyError, ValueError, TypeError):
+                            pass
+                        break
+                if evaluating_since is None:
+                    # Fallback to started_at or created_at
+                    evaluating_since = task.started_at or task.created_at
+
+                elapsed = (now - evaluating_since).total_seconds()
+
+                # Fetch children
+                children = (await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )).scalars().all()
+
+                all_children_terminal = bool(children) and all(
+                    c.status in TERMINAL for c in children
+                )
+
+                # Recovery for missed rollup: all children done but parent still EVALUATING
+                if all_children_terminal:
+                    logger.warning(
+                        f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has all children terminal "
+                        f"but is still EVALUATING — triggering missed rollup"
+                    )
+                    # Use any terminal child to trigger rollup
+                    await _check_and_trigger_rollup(children[0], session)
+                    await session.commit()
+                    continue
+
+                # 6-hour hard timeout
+                if elapsed > EVALUATING_FAIL_SECONDS:
+                    hours = round(elapsed / 3600, 1)
+                    logger.error(
+                        f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "
+                        f"for {hours}h — hard timeout, marking FAILED"
+                    )
+                    task.status = TaskStatus.FAILED
+                    task.latest_status_message = (
+                        "Evaluation timeout — children did not complete within 6 hours"
+                    )
+                    session.add(task)
+
+                    # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
+                    await _maybe_create_failure_alert(
+                        task, session,
+                        f"Evaluation timeout after {hours}h — children did not complete",
+                    )
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id), "task_updated",
+                        {"task_id": str(task.id), "status": task.status},
+                    )
+                    continue
+
+                # 2-hour warning
+                if elapsed > EVALUATING_WARN_SECONDS:
+                    hours = round(elapsed / 3600, 1)
+                    # Deduplicate: check for existing undismissed alert on this task
+                    existing = (await session.execute(
+                        select(Alert).where(
+                            Alert.task_id == task.id,
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )).scalars().first()
+                    if existing is None:
+                        logger.warning(
+                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "
+                            f"for {hours}h — children may be stuck"
+                        )
+                        alert = Alert(
+                            project_id=task.project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=f"Task {task.title or str(task.id)[:8]} stuck evaluating",
+                            message=(
+                                f"Task has been evaluating for {hours} hours "
+                                f"— children may be stuck"
+                            ),
+                            task_id=task.id,
+                        )
+                        session.add(alert)
+                        await session.commit()
+                        await broadcast_to_project(
+                            str(task.project_id), "alert_created",
+                            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+                        )
+    except Exception as e:
+        logger.error(f"[EVAL TIMEOUT] Evaluating timeout sweep failed: {e}", exc_info=True)
 
 
 async def _recover_orphaned_tasks():
@@ -2945,6 +3172,11 @@ async def orchestrator_worker():
             if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
                 _last_orphan_check = _utcnow()
                 await _recover_orphaned_tasks()
+            # EVALUATING task timeout — every 300s
+            global _last_evaluating_timeout_check
+            if (_utcnow() - _last_evaluating_timeout_check).total_seconds() >= 300:
+                _last_evaluating_timeout_check = _utcnow()
+                await _check_evaluating_timeouts()
         except Exception as e:
             logger.error(f"[ORCHESTRATOR] Monitoring check error: {e}", exc_info=True)
 
