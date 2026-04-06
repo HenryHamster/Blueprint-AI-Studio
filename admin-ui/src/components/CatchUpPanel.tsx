@@ -47,6 +47,8 @@ interface DigestData {
   research_cycles: number;
   prs_opened: number;
   active_count: number;
+  running_count: number;
+  queued_count: number;
   active_tasks: ActiveTask[];
   needs_attention: NeedsAttentionItem[];
   recent_failures: RecentFailure[];
@@ -59,6 +61,7 @@ export interface CatchUpPanelProps {
   refreshInterval: number;
   onSelectTask: (task: { id: string }) => void;
   onOpenActivityFeed?: () => void;
+  needsAttentionCount?: number;
 }
 
 type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
@@ -139,10 +142,16 @@ function SkeletonRow() {
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed }: CatchUpPanelProps) {
-  const [collapsed, setCollapsed] = useState(() =>
-    localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true'
-  );
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0 }: CatchUpPanelProps) {
+  const [collapsed, setCollapsed] = useState(() => {
+    const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
+    // Auto-expand on first session render if there are items needing attention
+    if (wasCollapsed && needsAttentionCount > 0 && !sessionStorage.getItem('blueprint-admin:catchUpAutoExpanded')) {
+      sessionStorage.setItem('blueprint-admin:catchUpAutoExpanded', 'true');
+      return false;
+    }
+    return wasCollapsed;
+  });
   const [activeWindow, setActiveWindow] = useState<TimeWindow>('last_visit');
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -228,6 +237,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
           <Clock className="w-3 h-3" />
           Catch-up
+          {collapsed && needsAttentionCount > 0 && (
+            <span className="ml-1 bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+              {needsAttentionCount} need attention
+            </span>
+          )}
         </button>
         {!collapsed && (
           <div className="flex items-center gap-1 ml-2">
@@ -265,6 +279,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
             <div className="flex flex-col gap-3">
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
+                {digest!.pending_approval_count > 0 && (
+                  <span className="flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-400" />
+                    {digest!.pending_approval_count} pending approval
+                  </span>
+                )}
                 {digest!.completed_count > 0 && (
                   <span className="flex items-center gap-1">
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
@@ -283,11 +303,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                 {digest!.prs_opened > 0 && (
                   <span>{digest!.prs_opened} PR{digest!.prs_opened !== 1 ? 's' : ''} opened</span>
                 )}
-                {digest!.active_count > 0 && (
+                {digest!.running_count > 0 && (
                   <span className="flex items-center gap-1">
                     <Loader2 className="w-3 h-3 text-neutral-500 animate-spin" />
-                    {digest!.active_count} running
+                    {digest!.running_count} running
                   </span>
+                )}
+                {digest!.queued_count > 0 && (
+                  <span>{digest!.queued_count} queued</span>
                 )}
               </div>
 

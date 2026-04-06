@@ -3269,7 +3269,7 @@ async def get_digest(
             "waiting_since": waiting_since.isoformat() if waiting_since else None,
             "waiting_hours": waiting_hours,
         })
-    needs_attention.sort(key=lambda x: x["waiting_hours"] or 0, reverse=True)
+    needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
 
     # --- recent_failures (up to 10, desc) ---
     sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
@@ -3314,6 +3314,11 @@ async def get_digest(
         for t in active_tasks_all[:5]
     ]
 
+    running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
+    queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}
+    running_count = sum(1 for t in active_tasks_all if t.status in running_statuses)
+    queued_count = sum(1 for t in active_tasks_all if t.status in queued_statuses)
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -3323,6 +3328,8 @@ async def get_digest(
         "research_cycles": research_cycles,
         "prs_opened": pr_count,
         "active_count": len(active_tasks_all),
+        "running_count": running_count,
+        "queued_count": queued_count,
         "active_tasks": active_tasks_list,
         "needs_attention": needs_attention,
         "recent_failures": recent_failures,

@@ -439,6 +439,7 @@ export default function App() {
           selectedProjectId={s.selectedProjectId}
           lastVisitTimestamp={s.lastVisitTimestamp}
           refreshInterval={s.refreshInterval}
+          needsAttentionCount={s.needsAttentionCount}
           onSelectTask={(task) => {
             fetchTask(task.id).then(s.handleViewLogs).catch(() => {
               s.addToast('Could not load task — it may have been deleted', 'error');
