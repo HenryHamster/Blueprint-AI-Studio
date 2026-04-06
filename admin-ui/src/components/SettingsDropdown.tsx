@@ -799,7 +799,7 @@ export function SettingsDropdown({
             </button>
           </div>
 
-          {userRole === 'admin' && (
+          {userRole === 'admin' && (<>
           <div className="border-t border-neutral-800 pt-3 mt-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
               <Shield className="w-3 h-3" /> Deploy Health
@@ -1011,7 +1011,7 @@ export function SettingsDropdown({
               <p className="text-[11px] text-neutral-600">No data yet</p>
             )}
           </div>
-          )}
+          </>)}
 
           <div className="border-t border-neutral-800 pt-3 mt-3">
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Keyboard Shortcuts</h4>
