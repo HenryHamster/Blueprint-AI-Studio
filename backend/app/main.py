@@ -174,6 +174,10 @@ async def select_max_plan_account(user_id: str, model: Optional[str] = None, bla
             if _account_available_for_model(a, model) and (not blacklist or a["id"] not in blacklist)
         ]
         if not available:
+            # Fallback: try blacklisted accounts that are model-enabled
+            # (disabled_models is the real gate with timed cooldown, blacklist is advisory)
+            available = [a for a in user_pool if _account_available_for_model(a, model)]
+        if not available:
             return None
         account = min(available, key=lambda a: a["active_tasks"])
         account["active_tasks"] = account.get("active_tasks", 0) + 1
@@ -7781,6 +7785,13 @@ async def update_agent_status(
 
                     # Track API failure retries to prevent infinite loops
                     ctx = dict(task.context or {})
+                    # Blacklist the account that just hit rate limit so retry picks a different one
+                    acct_id_for_blacklist = (task.context or {}).get("max_plan_account_id")
+                    if acct_id_for_blacklist and failure_class == "RATE_LIMIT":
+                        blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                        if acct_id_for_blacklist not in blacklisted:
+                            blacklisted.append(acct_id_for_blacklist)
+                        ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
                         api_retries = ctx.get("_api_failure_retries", 0) + 1
@@ -7798,7 +7809,6 @@ async def update_agent_status(
                         task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
                         # Clear stale retry_after so dispatcher picks it up immediately
                         ctx.pop("retry_after", None)
-                        ctx.pop("blacklisted_accounts", None)
                         task.context = ctx
                         session.add(task)
                         await session.commit()
