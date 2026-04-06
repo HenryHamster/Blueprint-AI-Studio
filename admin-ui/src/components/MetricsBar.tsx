@@ -15,6 +15,7 @@ export interface MetricsBarProps {
   wsRef: RefObject<WebSocket | null>;
   onRefreshTasks: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
+  pauseReason?: string | null;
 }
 
 function formatDrainTime(minutes: number): string {
@@ -64,6 +65,7 @@ export function MetricsBar({
   wsRef,
   onRefreshTasks,
   metricsHistory,
+  pauseReason,
 }: MetricsBarProps) {
   const drainMinutes = computeDrainMinutes(metricsHistory, queuedTasksLength);
   return (
@@ -116,7 +118,7 @@ export function MetricsBar({
       </button>
       <div className="w-px h-8 bg-neutral-800"></div>
       <span onClick={(e) => e.stopPropagation()}>
-        <AutonomousStatus onRefreshTasks={onRefreshTasks} wsRef={wsRef} />
+        <AutonomousStatus onRefreshTasks={onRefreshTasks} wsRef={wsRef} pauseReason={pauseReason} />
       </span>
       <div className="w-px h-8 bg-neutral-800"></div>
       <span className="text-neutral-500 text-xs transition-transform" style={{ transform: showMetrics ? 'rotate(180deg)' : 'rotate(0deg)' }}>▾</span>

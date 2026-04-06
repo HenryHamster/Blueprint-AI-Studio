@@ -22,6 +22,7 @@ from app.main import (
     release_max_plan_account,
     _spawn_research_task,
     _handle_research_completion,
+    classify_failure,
 )
 from app.models import Project, Task, TaskStatus, MaxPlanAccount
 from testing.factories import make_project, make_task
@@ -914,3 +915,98 @@ class TestResearchCompletion:
         assert task_high.priority > task_low.priority, (
             f"High-priority task ({task_high.priority}) should have higher numeric priority than low ({task_low.priority})"
         )
+
+
+# ── Tests: classify_failure ──────────────────────────────────────────────────
+
+class TestClassifyFailure:
+    """Unit tests for classify_failure() — verifies exit-code and process-killed patterns."""
+
+    def _make_task(self, status_message: str) -> Task:
+        task = Task(
+            id=uuid.uuid4(),
+            title="test task",
+            prompt="test",
+            latest_status_message=status_message,
+            status=TaskStatus.FAILED,
+        )
+        return task
+
+    # ── exit code patterns ───────────────────────────────────────────────────
+
+    def test_exit_code_137_is_agent_timeout(self):
+        task = self._make_task("Agent failed with exit code 137")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_exit_code_143_is_agent_timeout(self):
+        task = self._make_task("Process terminated with exit code 143")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_container_exited_is_agent_timeout(self):
+        task = self._make_task("container exited unexpectedly")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_non_zero_exit_code_is_agent_timeout(self):
+        task = self._make_task("non-zero exit code returned by agent runner")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_process_exited_is_agent_timeout(self):
+        task = self._make_task("process exited with status 1")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_node_process_killed_is_agent_timeout(self):
+        task = self._make_task("node process killed by system")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_oom_killer_is_agent_timeout(self):
+        task = self._make_task("oom killer terminated the agent")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    # ── provision failure patterns ───────────────────────────────────────────
+
+    def test_address_already_in_use_is_provision_failure(self):
+        task = self._make_task("address already in use on port 8080")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_failed_to_connect_is_provision_failure(self):
+        task = self._make_task("failed to connect to agent VM during init")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    # ── existing patterns still pass ─────────────────────────────────────────
+
+    def test_no_heartbeat_is_agent_timeout(self):
+        task = self._make_task("no heartbeat received from agent")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_reaped_is_agent_timeout(self):
+        task = self._make_task("task was reaped by orchestrator")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_sigterm_is_agent_timeout(self):
+        task = self._make_task("process received sigterm")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_out_of_memory_is_agent_timeout(self):
+        task = self._make_task("out of memory error")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_provision_failure(self):
+        task = self._make_task("failed to provision VM")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_rate_limit(self):
+        task = self._make_task("rate limit exceeded")
+        assert classify_failure(task) == "RATE_LIMIT"
+
+    def test_code_error_default(self):
+        task = self._make_task("AttributeError: 'NoneType' object has no attribute 'foo'")
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_logs_also_searched(self):
+        task = self._make_task("")
+        assert classify_failure(task, logs="exit code 137 returned") == "AGENT_TIMEOUT"
+
+    def test_failed_to_connect_does_not_override_db(self):
+        """Database connection errors take priority over 'failed to connect'."""
+        task = self._make_task("could not connect to server: Connection refused (psycopg)")
+        assert classify_failure(task) == "EXTERNAL_API"

@@ -213,7 +213,8 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "connection refused", "connection reset by peer",
                                       "timed out waiting for operation", "sshd", "startup script",
                                       "no space left on device", "disk quota exceeded",
-                                      "filesystem is full"]):
+                                      "filesystem is full",
+                                      "address already in use", "failed to connect"]):
         return "PROVISION_FAILURE"
 
     # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
@@ -235,7 +236,11 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
                                       "execution timed out", "killed", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",
-                                      "cannot allocate memory"]):
+                                      "cannot allocate memory",
+                                      "exit code 137", "exit code 143",
+                                      "non-zero exit code", "process exited",
+                                      "container exited", "node process killed",
+                                      "oom killer"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error
@@ -805,6 +810,75 @@ _pause_failure_streak: int = 0  # consecutive health check cycles with critical 
 _health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
 
+
+async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
+    """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
+    title = "Pipeline auto-paused: external dependencies down"
+    msg = (
+        f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}. "
+        "Will auto-resume when healthy."
+    )
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        existing = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.task_id.is_(None),
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.dismissed_at.is_(None),
+                Alert.title == title,
+            )
+        )).scalars().first()
+        if existing is not None:
+            continue
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+        )
+
+
+async def _create_auto_resume_alerts(session: AsyncSession) -> None:
+    """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes."""
+    pause_title = "Pipeline auto-paused: external dependencies down"
+    resume_title = "Pipeline auto-resumed: all external dependencies healthy."
+    now = _utcnow()
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        # Dismiss existing auto-pause WARNING alerts for this project
+        existing_warnings = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.dismissed_at.is_(None),
+                Alert.title == pause_title,
+            )
+        )).scalars().all()
+        for w in existing_warnings:
+            w.dismissed_at = now
+            session.add(w)
+        # Create INFO resume alert
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.INFO,
+            title=resume_title,
+            message=resume_title,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+        )
+
+
 async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
     global _pause_failure_streak, _health_recovery_streak
@@ -831,6 +905,7 @@ async def _check_pause_mode():
                     state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
                     state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
                     session.add(state)
+                    await _create_auto_pause_alerts(session, critical_failures)
                     await session.commit()
                     # Only set to 0 after saving pre_pause value
                     _runtime_config["max_concurrent_vms"] = 0
@@ -853,6 +928,7 @@ async def _check_pause_mode():
                 state.pre_pause_max_vms = None
                 state.runtime_max_concurrent_vms = restore
                 session.add(state)
+                await _create_auto_resume_alerts(session)
                 await session.commit()
                 initial_vms = min(2, restore)
                 _runtime_config["max_concurrent_vms"] = initial_vms
@@ -889,6 +965,17 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                 await _maybe_create_circuit_breaker_alert(
                     project.id, session,
                     f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
+                return  # Back to cooldown
+            elif not test_task:
+                logger.warning(f"[CIRCUIT BREAKER] HALF_OPEN test task {test_id} no longer exists (deleted/reaped) → OPEN")
+                breaker["state"] = "OPEN"
+                breaker["opened_at"] = _utcnow()
+                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+                breaker["half_open_task_id"] = None
+                await _maybe_create_circuit_breaker_alert(
+                    project.id, session,
+                    f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
                 )
                 return  # Back to cooldown
     # Guard: must have active directions that aren't in cooldown or mid-cycle
@@ -1530,21 +1617,25 @@ async def reaper_service():
                     ).with_for_update(skip_locked=True)
                     orphaned_tasks = list((await session.execute(lock_stmt)).scalars().all())
 
-                    # Track tasks skipped by skip_locked — force-reap after 3 consecutive skips
+                    # Track tasks skipped by skip_locked — attempt force-reap after 5 consecutive skips.
+                    # The threshold is 5 (not 3) to give more time before force-lock attempts, since
+                    # transient lock contention (e.g. a heartbeat write) often resolves within a few cycles.
                     locked_ids = set(orphaned_ids) - {t.id for t in orphaned_tasks}
                     for lid in locked_ids:
                         _reaper_skip_counts[lid] = _reaper_skip_counts.get(lid, 0) + 1
                     for t in orphaned_tasks:
                         _reaper_skip_counts.pop(t.id, None)
 
-                    # Force-lock persistently skipped tasks (blocking, up to lock_timeout)
-                    force_lock_ids = [lid for lid, count in _reaper_skip_counts.items() if count >= 3]
+                    # Force-lock persistently skipped tasks using skip_locked=True (non-blocking).
+                    # A task skipped here stays in _reaper_skip_counts and will be retried next cycle,
+                    # so the reaper never stalls waiting on a contested row.
+                    force_lock_ids = [lid for lid, count in _reaper_skip_counts.items() if count >= 5]
                     if force_lock_ids:
                         try:
                             session.expire_all()
                             force_stmt = select(Task).where(
                                 Task.id.in_(force_lock_ids)
-                            ).with_for_update()
+                            ).with_for_update(skip_locked=True)
                             force_locked = list((await session.execute(force_stmt)).scalars().all())
                             for t in force_locked:
                                 _reaper_skip_counts.pop(t.id, None)
@@ -1555,7 +1646,7 @@ async def reaper_service():
                                 orphaned_tasks.append(t)
                                 logger.warning(f"[REAPER] Force-locked persistently skipped task {t.id}")
                         except Exception as e:
-                            logger.warning(f"[REAPER] Force-lock failed (lock timeout?): {e}")
+                            logger.warning(f"[REAPER] Force-lock failed: {e}")
 
                     # Clean stale entries from skip counts
                     orphaned_id_set = set(orphaned_ids)
@@ -1728,6 +1819,29 @@ async def reaper_service():
                                 await _check_and_trigger_rollup(task, session)
                             except Exception as e:
                                 logger.error(f"[REAPER] Rollup check failed for task {task.id}: {e}", exc_info=True)
+
+                    # Immediately unblock dependents of terminally failed tasks
+                    for task in orphaned_tasks:
+                        if task.status == TaskStatus.FAILED:
+                            try:
+                                async with AsyncSessionLocal() as dep_session:
+                                    dep_stmt = select(Task).where(
+                                        Task.project_id == task.project_id,
+                                        Task.status == TaskStatus.QUEUED,
+                                        Task.depends_on.contains([str(task.id)]),
+                                    )
+                                    dep_result = await dep_session.execute(dep_stmt)
+                                    waiting_tasks = dep_result.scalars().all()
+                                    count = 0
+                                    for wt in waiting_tasks:
+                                        wt.depends_on = [d for d in (wt.depends_on or []) if d != str(task.id)]
+                                        dep_session.add(wt)
+                                        count += 1
+                                    if count:
+                                        await dep_session.commit()
+                                        logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
+                            except Exception as e:
+                                logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
@@ -6585,6 +6699,28 @@ async def update_agent_status(
         # persisted.  expire_on_commit=False keeps the task object usable.
         if session.dirty or session.new:
             await session.commit()
+
+        # Immediately unblock dependents when task terminally fails (retries exhausted)
+        if payload.status == TaskStatus.FAILED:
+            try:
+                async with AsyncSessionLocal() as dep_session:
+                    dep_stmt = select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.status == TaskStatus.QUEUED,
+                        Task.depends_on.contains([str(task.id)]),
+                    )
+                    dep_result = await dep_session.execute(dep_stmt)
+                    waiting_tasks = dep_result.scalars().all()
+                    count = 0
+                    for wt in waiting_tasks:
+                        wt.depends_on = [d for d in (wt.depends_on or []) if d != str(task.id)]
+                        dep_session.add(wt)
+                        count += 1
+                    if count:
+                        await dep_session.commit()
+                        logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
+            except Exception as e:
+                logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:

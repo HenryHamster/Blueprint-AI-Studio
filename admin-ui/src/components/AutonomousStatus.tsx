@@ -63,6 +63,7 @@ interface AutonomyDebug {
 interface AutonomousStatusProps {
   onRefreshTasks?: () => void;
   wsRef?: RefObject<WebSocket | null>;
+  pauseReason?: string | null;
 }
 
 const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Spawning', 'Executing', 'Cooldowns'] as const;
@@ -252,7 +253,7 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
   );
 }
 
-export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProps) {
+export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: AutonomousStatusProps) {
   const [projects, setProjects] = useState<ProjectAutonomousStatus[]>([]);
   const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
   const [expanded, setExpanded] = useState(false);
@@ -430,6 +431,13 @@ export function AutonomousStatus({ onRefreshTasks, wsRef }: AutonomousStatusProp
               </button>
             </span>
           </div>
+
+          {pauseReason && (
+            <div className="mb-3 rounded-md bg-amber-500/10 border border-amber-500/25 px-2.5 py-2 flex items-start gap-1.5">
+              <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />
+              <span className="text-[11px] text-amber-300 leading-tight">{pauseReason}</span>
+            </div>
+          )}
 
           {projects.length === 0 && (
             <p className="text-xs text-neutral-600">No projects found</p>

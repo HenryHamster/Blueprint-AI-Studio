@@ -235,6 +235,7 @@ export function HeaderBar(props: HeaderBarProps) {
           wsRef={wsRef}
           onRefreshTasks={onRefresh}
           metricsHistory={metricsHistory}
+          pauseReason={props.deployState?.reason ?? null}
         />
       </div>
 

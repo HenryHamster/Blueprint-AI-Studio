@@ -9,6 +9,7 @@ export interface DeployState {
   rollback_count: number;
   pause_reason: string | null;
   paused_at: string | null;
+  reason: string | null;
   pre_pause_max_vms: number | null;
   failure_rate: number;
   monitoring_window: { elapsed_seconds: number; total_seconds: number; percent: number } | null;

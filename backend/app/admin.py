@@ -13,7 +13,7 @@ from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
-from app.shared_state import limiter
+from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
 from app.auth import get_current_user, require_admin
 
@@ -2008,6 +2008,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "rollback_count": state.rollback_count,
         "pause_reason": state.pause_reason,
         "paused_at": state.paused_at.isoformat() if state.paused_at else None,
+        "reason": state.pause_reason if state.status == DeploymentStatus.PAUSED else None,
         "pre_pause_max_vms": state.pre_pause_max_vms,
         "monitoring_window": window_progress,
         "failure_rate": round(failure_rate, 3),
@@ -2313,6 +2314,34 @@ async def repair_state(
             session.add(t)
             session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
             repairs.append(f"Cleared orphaned parent ref on {t.id}")
+
+    # 4. Circuit breakers stuck in HALF_OPEN with a deleted/non-existent test task
+    from app.main import _maybe_create_circuit_breaker_alert, _utcnow as _main_utcnow
+    for proj_id, breaker in list(_circuit_breakers.items()):
+        if breaker.get("state") != "HALF_OPEN":
+            continue
+        test_id = breaker.get("half_open_task_id")
+        if not test_id:
+            continue
+        try:
+            test_task = await session.get(Task, uuid.UUID(test_id))
+        except Exception:
+            test_task = None
+        if test_task is None:
+            breaker["state"] = "OPEN"
+            breaker["opened_at"] = _main_utcnow()
+            breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
+            breaker["half_open_task_id"] = None
+            logger.warning(f"[ADMIN REPAIR] Circuit breaker for {proj_id} stuck in HALF_OPEN — test task {test_id} not found, resetting to OPEN")
+            try:
+                project_uuid = uuid.UUID(proj_id)
+                await _maybe_create_circuit_breaker_alert(
+                    project_uuid, session,
+                    f"HALF_OPEN test task deleted/reaped (admin repair) — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
+            except Exception:
+                pass
+            repairs.append(f"Reset HALF_OPEN circuit breaker for project {proj_id} (test task {test_id} not found)")
 
     await session.commit()
     logger.warning(f"[ADMIN] State repair completed: {len(repairs)} repairs")
