@@ -1766,7 +1766,7 @@ export function useAppState() {
   }, [fetchAllowedUsers]);
 
   // ── Project members ─────────────────────────────────────────────────────
-  type ProjectMemberEntry = { id: string; user_id: string; email?: string; role: string; created_at: string | null };
+  type ProjectMemberEntry = { id: string; user_id: string; email?: string; role: 'owner' | 'member' | 'viewer'; created_at: string | null };
   const [projectMembers, setProjectMembers] = useState<ProjectMemberEntry[]>([]);
 
   const fetchProjectMembers = useCallback(async (projectId: string) => {
