@@ -1,7 +1,6 @@
 import copy
 import hashlib
 import hmac
-import httpx
 import ipaddress
 import json
 import logging
@@ -23,8 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -778,6 +776,7 @@ async def _check_external_health():
         # using a separate short-lived client to avoid connection pool contention.
         check_method = "passive" if github_age is not None else "active (cold start)"
         try:
+            import httpx
             from app.github import generate_github_app_jwt
             jwt_token = generate_github_app_jwt()
             async with httpx.AsyncClient(timeout=10.0) as health_client:
@@ -1155,7 +1154,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         )
     )).scalars().all()
     for t in evaluating_research:
-        payload = (t.payloads or [{}])[0]
+        payload = t.first_payload
         if payload.get("type") == "research":
             # New-format tasks include all active directions but only one is targeted
             current_did = payload.get("current_direction_id")
@@ -1226,7 +1225,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         )
     )).scalars().all()
     for t in active_tasks:
-        if ((t.payloads or [{}])[0]).get("type") == "research":
+        if (t.first_payload).get("type") == "research":
             return
     # Guard: global rate limit across ALL projects
     from sqlalchemy import func
@@ -1250,7 +1249,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             Task.created_at >= one_hour_ago,
         )
     )).scalars().all()
-    recent_research_count = sum(1 for t in recent_research if ((t.payloads or [{}])[0]).get("type") == "research")
+    recent_research_count = sum(1 for t in recent_research if (t.first_payload).get("type") == "research")
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
@@ -1346,7 +1345,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         )
     )).scalars().all()
     for t in active_tasks:
-        if ((t.payloads or [{}])[0]).get("type") == task_type:
+        if (t.first_payload).get("type") == task_type:
             return
 
     # Guard: global rate limit across ALL projects
@@ -1382,7 +1381,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     )).scalars().all()
     last_run = None
     for t in completed_tasks:
-        if ((t.payloads or [{}])[0]).get("type") == task_type:
+        if (t.first_payload).get("type") == task_type:
             last_run = t.created_at
             break
 
@@ -1397,7 +1396,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         select(Task).where(Task.project_id == project.id)
         .order_by(Task.created_at.desc()).limit(1)
     )).scalars().first()
-    base_branch = ((recent_task.payloads or [{}])[0]).get("base_branch", "main") if recent_task else "main"
+    base_branch = (recent_task.first_payload).get("base_branch", "main") if recent_task else "main"
 
     task_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     task_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
@@ -1615,7 +1614,7 @@ async def _maybe_create_failure_alert(
 ) -> None:
     """Create an ERROR alert for a task failure unless it's a smoketest or retry task.
     Deduplicates: skips if an undismissed alert already exists for this task."""
-    task_type = ((task.payloads or [{}])[0]).get("type", "")
+    task_type = (task.first_payload).get("type", "")
     if task_type == "smoketest":
         return
     if (task.context or {}).get("is_retry") is True:
@@ -1892,7 +1891,7 @@ async def reaper_service():
                         reap_reason = f"Never started — {age}s since creation, no heartbeat"
                         reap_reason_code = 'never_started'
 
-                    task_type = ((fresh_task.payloads or [{}])[0]).get("type", "unknown")
+                    task_type = (fresh_task.first_payload).get("type", "unknown")
                     logger.info('reaper_task_reaped', extra={
                         'task_id': str(task.id),
                         'task_type': task_type,
@@ -1943,7 +1942,7 @@ async def reaper_service():
                     if can_retry:
                         # Check if this is a research/plan parent with work children —
                         # re-evaluate instead of re-run.
-                        task_type = ((task.payloads or [{}])[0]).get("type", "")
+                        task_type = (task.first_payload).get("type", "")
                         is_parent_type = task_type in ("research", "plan")
                         children = []
                         if is_parent_type:
@@ -2328,7 +2327,7 @@ async def _recover_orphaned_tasks():
             )).scalars().all()
 
             for task in candidates:
-                task_type = (task.payloads or [{}])[0].get("type", "")
+                task_type = task.first_payload.get("type", "")
                 if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
                     continue
 
@@ -2346,7 +2345,7 @@ async def _recover_orphaned_tasks():
                 children = (await session.execute(
                     select(Task).where(Task.parent_task_id == task.id)
                 )).scalars().all()
-                if any((t.payloads or [{}])[0].get("type") == "review" for t in children):
+                if any(t.first_payload.get("type") == "review" for t in children):
                     continue
 
                 # Orphaned — try to find PR on GitHub
@@ -2378,14 +2377,14 @@ async def _recover_orphaned_tasks():
                 pr = prs[0]
                 pr_url = pr["html_url"]
                 pr_number = pr["number"]
-                base_branch = (task.payloads or [{}])[0].get("base_branch", "main")
+                base_branch = task.first_payload.get("base_branch", "main")
 
                 # Create the missing artifact
                 artifact = Artifact(task_id=task.id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url)
                 session.add(artifact)
 
                 # Spawn review
-                original_prompt = (task.payloads or [{}])[0].get("prompt", task.description or "")
+                original_prompt = task.first_payload.get("prompt", task.description or "")
                 review_task = await _spawn_pipeline_task(
                     task, "review", session, pr_number, branch, base_branch,
                     original_prompt=original_prompt, original_task_id=str(task.id)
@@ -2587,7 +2586,7 @@ async def orchestrator_worker():
                             all_met = False
                             continue
                         # For create tasks, also require PR to be merged
-                        dt_type = ((dt.payloads or [{}])[0]).get("type", "create")
+                        dt_type = (dt.first_payload).get("type", "create")
                         if dt_type in ("create", "") and not await _verify_pr_merged(dt, session):
                             all_met = False
 
@@ -2737,7 +2736,7 @@ async def orchestrator_worker():
                             continue
                         # Large scope tasks (refactors, etc.) defer on any overlap
                         scope = (candidate.context or {}).get("scope", "small")
-                        task_type = ((candidate.payloads or [{}])[0]).get("type", "")
+                        task_type = (candidate.first_payload).get("type", "")
                         is_large = scope == "large" or task_type in ("refactor", "plan")
                         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
                         should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
@@ -2978,7 +2977,7 @@ async def orchestrator_worker():
                         if pr_data.get("mergeable") is None:
                             continue
                         if pr_data.get("mergeable") is False:
-                            ci_payload = (ci_task.payloads or [{}])[0]
+                            ci_payload = ci_task.first_payload
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
                             ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
                             ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
@@ -3026,7 +3025,7 @@ async def orchestrator_worker():
                                                        {"task_id": str(ci_task.id), "status": ci_task.status})
                             continue
 
-                        ci_payload = (ci_task.payloads or [{}])[0]
+                        ci_payload = ci_task.first_payload
                         ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
                         ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
                         ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
@@ -3087,8 +3086,8 @@ async def orchestrator_worker():
                             )).scalars().all()
                             existing_fix = next(
                                 (t for t in active_tasks
-                                 if (t.payloads or [{}])[0].get("type") == "fix"
-                                 and (t.payloads or [{}])[0].get("pr_number") == ci_pr_number),
+                                 if t.first_payload.get("type") == "fix"
+                                 and t.first_payload.get("pr_number") == ci_pr_number),
                                 None
                             )
                             if existing_fix:
@@ -3705,7 +3704,7 @@ class AgentStatusPayload(BaseModel):
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
-    filename: str
+    filename: str = Field(..., min_length=1)
 
 class HeartbeatMetrics(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -3726,12 +3725,12 @@ class SpawnTaskRequest(BaseModel):
     payloads: List[Dict[str, Any]] = Field(max_length=20)
     requires_approval: bool = False
     context: Optional[Dict[str, Any]] = None
-    priority: Optional[int] = None
+    priority: Optional[int] = Field(default=None, ge=0, le=100)
 
 class GitHubCommitStatusRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
     sha: str = Field(..., pattern="^[a-fA-F0-9]{40}$")
     state: str = Field(..., pattern="^(error|failure|pending|success)$")
     description: str = ""
@@ -3740,39 +3739,39 @@ class GitHubCommitStatusRequest(BaseModel):
 
 class GitHubPRCommentRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
     pr_number: int
-    body: str
+    body: str = Field(..., min_length=1)
 
 class GitHubPRReviewCommentRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
     pr_number: int
     commit_id: str = Field(..., pattern="^[a-fA-F0-9]{40}$")
-    path: str
+    path: str = Field(..., min_length=1)
     line: int
-    body: str
+    body: str = Field(..., min_length=1)
 
 class GitHubCreateIssueRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
-    title: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
     body: str = ""
     assignees: Optional[List[str]] = None
 
 class GitHubGetIssuesRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
     state: str = Field("open", pattern="^(open|closed|all)$")
 
 class GitHubCreateBranchRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
     branch_name: str = Field(..., pattern="^[a-zA-Z0-9_./-]+$")
     sha: str = Field(..., pattern="^[a-fA-F0-9]{40}$")
 
@@ -3787,9 +3786,9 @@ class GitHubCreateBranchRequest(BaseModel):
 
 class GitHubCreatePRRequest(BaseModel):
     task_id: uuid.UUID
-    owner: str
-    repo: str
-    title: str
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
     head: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
     base: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
     body: str = ""
@@ -3981,7 +3980,7 @@ async def get_project_tasks(
             "id": t.id,
             "title": t.title,
             "status": t.status,
-            "task_type": ((t.payloads or [{}])[0]).get("type", "create"),
+            "task_type": (t.first_payload).get("type", "create"),
             "vm_instance_id": t.vm_instance_id,
             "payloads": t.payloads,
             "created_at": t.created_at,
@@ -4234,7 +4233,7 @@ async def claim_task(
         "context": safe_context
     }
 
-    task_type = (task.payloads or [{}])[0].get("type", "")
+    task_type = task.first_payload.get("type", "")
     if task_type in ("research", "plan", "create", "fix", "refactor"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project
         active_stmt = select(Task).where(
@@ -4245,7 +4244,7 @@ async def claim_task(
         active_tasks_rows = (await session.execute(active_stmt)).scalars().all()
         active_tasks = []
         for t in active_tasks_rows:
-            p = (t.payloads or [{}])[0]
+            p = t.first_payload
             active_tasks.append({
                 "id": str(t.id),
                 "title": t.title,
@@ -4265,7 +4264,7 @@ async def claim_task(
         queued_tasks_rows = (await session.execute(queued_stmt)).scalars().all()
         queued_tasks = []
         for t in queued_tasks_rows:
-            p = (t.payloads or [{}])[0]
+            p = t.first_payload
             queued_tasks.append({
                 "id": str(t.id),
                 "title": t.title,
@@ -4306,7 +4305,7 @@ async def claim_task(
 
         recently_completed_tasks = []
         for t in completed_tasks_rows:
-            p = (t.payloads or [{}])[0]
+            p = t.first_payload
             task_artifacts = artifacts_by_completed_task.get(t.id, [])
             pr_url = t.context.get("rollup_pr_url") if t.context else None
             if not pr_url:
@@ -4358,7 +4357,7 @@ async def claim_task(
                     "title": sib.title,
                     "status": sib.status,
                     "related_files": (sib.context or {}).get("related_files", []),
-                    "task_type": ((sib.payloads or [{}])[0]).get("type", ""),
+                    "task_type": (sib.first_payload).get("type", ""),
                 })
 
         response["project_context"] = {
@@ -4507,7 +4506,7 @@ async def spawn_subtask(
 
     new_tasks = []
     for payload in req.payloads:
-        parent_payload = (parent_task.payloads or [{}])[0]
+        parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),
             "parent_title": parent_task.title,
@@ -4679,7 +4678,7 @@ async def _spawn_pipeline_task(
     Returns None if the review-fix cycle limit has been reached.
     Returns the existing active task if a review/fix is already active for this PR."""
     # Guard: don't spawn if PR is already merged
-    orig_id = original_task_id or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "") or ((source_task.payloads or [{}])[0]).get("original_task_id", "")
+    orig_id = original_task_id or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "") or (source_task.first_payload).get("original_task_id", "")
     if orig_id:
         try:
             orig_task = await session.get(Task, uuid.UUID(orig_id))
@@ -4707,7 +4706,7 @@ async def _spawn_pipeline_task(
     for t in active_pipeline:
         if t.id == source_task.id:
             continue
-        t_payload = (t.payloads or [{}])[0]
+        t_payload = t.first_payload
         if t_payload.get("pr_number") == pr_number and t_payload.get("type") == task_type:
             logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id}")
             source_task.latest_status_message = f"{task_type.title()} already active for PR #{pr_number} → task {str(t.id)[:8]}"
@@ -4724,8 +4723,8 @@ async def _spawn_pipeline_task(
     )).scalars().all()
     pr_iterations = sum(
         1 for t in pr_pipeline_tasks
-        if (t.payloads or [{}])[0].get("pr_number") == pr_number
-        and (t.payloads or [{}])[0].get("type") in ("review", "fix")
+        if t.first_payload.get("pr_number") == pr_number
+        and t.first_payload.get("type") in ("review", "fix")
     )
     if pr_iterations >= MAX_REVIEW_FIX_ITERATIONS:
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
@@ -4735,7 +4734,7 @@ async def _spawn_pipeline_task(
 
     # Track review-fix iteration count to prevent infinite loops (per-chain)
     source_loop = (source_task.context or {}).get("review_loop", {})
-    source_payload = (source_task.payloads or [{}])[0]
+    source_payload = source_task.first_payload
     iteration = source_loop.get("iteration", 0) + 1
 
     if iteration > MAX_REVIEW_FIX_ITERATIONS:
@@ -4794,7 +4793,7 @@ async def _spawn_pipeline_task(
             )).scalars().all()
             prior_feedback_entries = []
             for t in prior_reviews:
-                t_payload = (t.payloads or [{}])[0]
+                t_payload = t.first_payload
                 if t_payload.get("pr_number") == pr_number and t_payload.get("type") == "review":
                     feedback_text = t.latest_status_message or t.description or ""
                     if feedback_text:
@@ -5126,7 +5125,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     task.status = TaskStatus.EVALUATING
     session.add(task)
 
-    parent_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    parent_base = (task.first_payload).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
     plan_branch = f"plan/{short_id}"
 
@@ -5157,7 +5156,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     if existing_children:
         # Agent already spawned subtasks — enrich with branch info, dependencies, and approval
         logger.info(f"[PLAN] Agent already spawned {len(existing_children)} children, enriching...")
-        parent_payload = (task.payloads or [{}])[0]
+        parent_payload = task.first_payload
         model = parent_payload.get('model')
         effort = parent_payload.get('effort')
         create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
@@ -5165,7 +5164,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         parent_research_task_id = (task.context or {}).get('research_task_id')
 
         for i, child in enumerate(existing_children):
-            child_payload = (child.payloads or [{}])[0]
+            child_payload = child.first_payload
             child_risk = child_payload.get('risk', 'low')
             related_files = child_payload.get('related_files', [])
 
@@ -5242,7 +5241,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         return
 
     # First pass: create all child tasks
-    parent_payload = (task.payloads or [{}])[0]
+    parent_payload = task.first_payload
     model = parent_payload.get('model')
     effort = parent_payload.get('effort')
     plan_parent_context = {
@@ -5375,7 +5374,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
     session.add(task)
     await session.commit()
 
-    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    base_branch = (task.first_payload).get("base_branch", "main")
 
     # Spawn create tasks for critical and high severity findings
     actionable = [f for f in findings if f.get("severity") in ("critical", "high")]
@@ -5501,7 +5500,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     task.plan_output = findings
     session.add(task)
 
-    base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    base_branch = (task.first_payload).get("base_branch", "main")
 
     # Spawn create tasks for high-severity findings
     actionable = [f for f in findings if f.get("severity") == "high"]
@@ -5639,7 +5638,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if len(findings) > 15:
         findings = findings[:15]
 
-    original_base = ((task.payloads or [{}])[0]).get("base_branch", "main")
+    original_base = (task.first_payload).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
     research_branch = f"research/{short_id}"
 
@@ -6059,7 +6058,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Store a human-readable research summary artifact
     if child_tasks:
         direction_texts = []
-        payload0 = (task.payloads or [{}])[0]
+        payload0 = task.first_payload
         if payload0.get('directions'):
             direction_texts = [payload0['directions'][0].get('text', 'general improvement')]
         summary_lines = [
@@ -6070,7 +6069,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             f'## Findings:',
         ]
         for ct in child_tasks[:10]:
-            p = (ct.payloads or [{}])[0]
+            p = ct.first_payload
             summary_lines.append(f'- [{p.get("type", "?")}] {ct.title}: {(ct.description or "")[:150]}')
         summary = '\n'.join(summary_lines)
 
@@ -6220,7 +6219,7 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     # Staging branches (research/*, plan/*) are shared by ALL sibling tasks.
     # Only delete when the PARENT task completes (rollup), not on individual child completion.
     # Check if this task IS the parent (has plan_output or is a research task).
-    is_parent = task.plan_output is not None or ((task.payloads or [{}])[0]).get("type") in ("research", "plan")
+    is_parent = task.plan_output is not None or (task.first_payload).get("type") in ("research", "plan")
     if is_parent:
         staging = ctx.get("plan_branch") or ctx.get("research_branch")
         if staging:
@@ -6308,14 +6307,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
     ROLLUP_TYPES = {"create", "refactor", "migrate", "", "plan", "research", "security_audit", "qa", "deps", "docs", "smoketest", "perf"}
     children = [c for c in all_children
-                if ((c.payloads or [{}])[0]).get("type", "create") in ROLLUP_TYPES]
+                if (c.first_payload).get("type", "create") in ROLLUP_TYPES]
 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
     # while a review/fix cycle is in progress
     pipeline_active = any(
         c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
         for c in all_children
-        if ((c.payloads or [{}])[0]).get("type") in ("review", "fix")
+        if (c.first_payload).get("type") in ("review", "fix")
     )
 
     # Check all non-cancelled create children are done with PRs merged
@@ -6688,7 +6687,7 @@ async def _process_post_commit(
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
-            task_payload = (task.payloads or [{}])[0]
+            task_payload = task.first_payload
             task_type = task_payload.get("type", "create")
             review_loop = (task.context or {}).get("review_loop", {})
 
@@ -7077,8 +7076,7 @@ async def _process_post_commit(
                                             try:
                                                 audit_parent = await session.get(Task, orig.parent_task_id)
                                                 if (audit_parent and
-                                                        audit_parent.payloads and
-                                                        audit_parent.payloads[0].get("type") == "security_audit" and
+                                                        audit_parent.first_payload.get("type") == "security_audit" and
                                                         audit_parent.status == TaskStatus.COMPLETED):
                                                     # Only rescan once per original audit
                                                     existing_rescan = (await session.execute(
@@ -7508,7 +7506,7 @@ async def update_agent_status(
                     if existing_fix:
                         logger.info(f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate")
                     else:
-                        base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                        base_branch = (task.first_payload).get("base_branch", "main")
                         failure_summary = "\n".join(
                             f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
                         )
@@ -7612,7 +7610,7 @@ async def update_agent_status(
             # If confidence is high, auto-spawn a create task using the fix_prompt
             if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
                 failed_task_id = (task.context or {}).get("failed_task_id", "")
-                base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                base_branch = (task.first_payload).get("base_branch", "main")
                 debug_title = task.title or ""
                 fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
                 fix_task = Task(
@@ -7787,7 +7785,7 @@ async def update_agent_status(
                     session.add(task)
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
-        failed_task_payload = (task.payloads or [{}])[0]
+        failed_task_payload = task.first_payload
         failed_task_type = failed_task_payload.get("type", "")
         should_auto_debug = (
             payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
@@ -7877,7 +7875,7 @@ async def update_agent_status(
         # skips it (via cancelled-child logic) instead of hanging forever.
         # Other children's work is preserved — only this PR is excluded from the rollup.
         if payload.status == TaskStatus.FAILED:
-            task_payload = (task.payloads or [{}])[0]
+            task_payload = task.first_payload
             task_type = task_payload.get("type", "")
             if task_type in ("review", "fix"):
                 original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
@@ -7931,7 +7929,8 @@ async def update_agent_status(
         # Pass a session factory bound to the SAME engine the request used.
         # In production this is AsyncSessionLocal; in tests it's the test engine.
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
-        _factory = sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+        _bind = session.bind
+        _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
         return await _process_post_commit(task.id, payload, _session_factory=_factory)
 
 

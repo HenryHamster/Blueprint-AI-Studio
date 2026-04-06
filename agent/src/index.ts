@@ -13,12 +13,17 @@ const apiHeaders: Record<string, string> = {
   'X-Agent-Token': AGENT_TOKEN,
 };
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function strVal(v: unknown, fallback = ''): string {
+  return typeof v === 'string' ? v : fallback;
+}
+
 // ── API Helpers ─────────────────────────────────────────────────────────────
 async function tryRefreshToken(): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
       const res = await fetch(`${ORCHESTRATOR_URL}/api/agent/refresh-token`, {
         method: 'POST', headers: { ...apiHeaders }, body: JSON.stringify({}), signal: controller.signal,
       });
@@ -35,7 +40,7 @@ async function tryRefreshToken(): Promise<boolean> {
       // Don't retry client errors (4xx) — only transient/network failures
       if (res.status >= 400 && res.status < 500) return false;
     } catch (e) {
-      log(`Token refresh attempt ${attempt + 1}/3 failed: ${e}`);
+      log(`Token refresh attempt ${attempt + 1}/3 failed: ${String(e)}`);
     }
     if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s backoff
   }
@@ -45,19 +50,19 @@ async function tryRefreshToken(): Promise<boolean> {
 async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 5) {
   // Cap logs field to avoid 422 from backend's max_length=500000 validation.
   // A 422 is a 4xx = no retry = agent dies silently.
-  if (body.logs && typeof body.logs === 'string' && (body.logs as string).length > 450_000) {
-    body = { ...body, logs: (body.logs as string).slice(0, 450_000) + '\n...(truncated)' };
+  if (body.logs && typeof body.logs === 'string' && body.logs.length > 450_000) {
+    body = { ...body, logs: body.logs.slice(0, 450_000) + '\n...(truncated)' };
   }
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
         method: 'POST', headers: apiHeaders, body: JSON.stringify(body), signal: controller.signal,
       });
       clearTimeout(timeout);
-      if (res.ok) return res.json();
+      if (res.ok) return await res.json() as unknown;
       const text = await res.text();
       // 401 with "no longer active": task completed/failed — our previous POST worked.
       // This happens when a status COMPLETED POST succeeded but the response was lost,
@@ -100,10 +105,10 @@ async function apiGet(path: string, retries = 5) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders, signal: controller.signal });
       clearTimeout(timeout);
-      if (res.ok) return res.json();
+      if (res.ok) return await res.json() as unknown;
       const text = await res.text();
       // 401: attempt token refresh at most once, then retry
       if (res.status === 401) {
@@ -166,7 +171,7 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
 function startHeartbeat(taskId: string, getMessage: () => string) {
   // Fire first heartbeat immediately — don't wait 30s.
   // If the agent crashes in the first 30s, at least one heartbeat is recorded.
-  (async () => {
+  void (async () => {
     try {
       const metrics = collectMetrics();
       await apiPost('/api/agent/heartbeat', {
@@ -175,11 +180,11 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
       });
     } catch (e) {
-      log(`Initial heartbeat failed: ${e}`);
+      log(`Initial heartbeat failed: ${String(e)}`);
     }
   })();
 
-  heartbeatTimer = setInterval(async () => {
+  heartbeatTimer = setInterval(() => { void (async () => {
     try {
       const metrics = collectMetrics();
       // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
@@ -195,7 +200,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
       });
     } catch (e: unknown) {
-      log(`Heartbeat failed: ${e}`);
+      log(`Heartbeat failed: ${String(e)}`);
       // 409 = row temporarily locked (skip_locked) — retry once after 5s.
       // Silently dropping heartbeats can let last_heartbeat go stale if the
       // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
@@ -214,8 +219,8 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
             });
             log('Heartbeat retry succeeded');
             return;
-          } catch (retryErr: any) {
-            log(`Heartbeat retry ${retry + 1}/2 failed: ${retryErr}`);
+          } catch (retryErr: unknown) {
+            log(`Heartbeat retry ${retry + 1}/2 failed: ${String(retryErr)}`);
           }
         }
         return;
@@ -230,7 +235,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     }
-  }, 30_000);
+  })(); }, 30_000);
 }
 
 function stopHeartbeat() {
@@ -249,7 +254,8 @@ function appendToLogBuffer(content: string) {
 
 function flushLogBuffer(ws: WebSocket) {
   while (logBuffer.length > 0) {
-    const entry = logBuffer.shift()!;
+    const entry = logBuffer.shift();
+    if (!entry) break;
     try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
   }
 }
@@ -328,7 +334,7 @@ async function cloneWithRetry(args: string[], timeoutMs = 300_000): Promise<void
     } catch (e) {
       if (attempt === 2) throw e;
       const delay = 5000 * Math.pow(2, attempt);
-      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : e}`);
+      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : String(e)}`);
       try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
       await new Promise(r => setTimeout(r, delay));
     }
@@ -361,7 +367,7 @@ async function setupWorkspace(
       git(['push', 'origin', '--delete', workBranch]);
       sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
     } catch (e) {
-      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
+      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : String(e)}\n`);
     }
   }
   git(['checkout', '-b', workBranch]);
@@ -406,7 +412,7 @@ async function pushAndCreatePR(
     } catch { /* no markers found */ }
   }
 
-  const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+  const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
   const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
   git(['push', 'origin', workBranch]);
@@ -418,12 +424,12 @@ async function pushAndCreatePR(
     const prRes = await apiPost('/api/agent/github/pull-requests', {
       task_id: taskId, owner, repo, title,
       head: workBranch, base: baseBranch, body,
-    });
-    prUrl = prRes.data?.html_url || '';
+    }) as { data?: { html_url?: string } };
+    prUrl = prRes.data?.html_url ?? '';
     sendLog(ws, `PR created: ${prUrl}\n`);
   } catch (e) {
-    sendLog(ws, `Failed to create PR: ${e}\n`);
-    throw new Error(`PR creation failed: ${e}`);
+    sendLog(ws, `Failed to create PR: ${String(e)}\n`);
+    throw new Error(`PR creation failed: ${String(e)}`);
   }
 
   return prUrl;
@@ -533,7 +539,7 @@ async function testFixLoop(
 
   if (existsSync(pkgPath)) {
     try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { scripts?: { test?: string } };
       if (pkg.scripts?.test) {
         runners.push({ cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' });
       }
@@ -583,7 +589,7 @@ async function testFixLoop(
 
     if (existsSync(agentPkg)) {
       try {
-        const pkg = JSON.parse(readFileSync(agentPkg, 'utf-8'));
+        const pkg = JSON.parse(readFileSync(agentPkg, 'utf-8')) as { scripts?: { test?: string } };
         if (pkg.scripts?.test) {
           runners.push({ cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)' });
         }
@@ -635,6 +641,13 @@ async function testFixLoop(
 }
 
 // ── Claude Code Runner (shared by all handlers) ─────────────────────────────
+interface ClaudeOutputBlock { type: string; text?: string; name?: string; input?: unknown }
+interface ClaudeOutput {
+  type: string;
+  message?: { content: ClaudeOutputBlock[] };
+  result?: string;
+}
+
 async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
@@ -682,19 +695,19 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
       if (allOutput.length < MAX_OUTPUT) allOutput += text;
       for (const line of text.split('\n').filter(Boolean)) {
         try {
-          const obj = JSON.parse(line);
+          const obj = JSON.parse(line) as ClaudeOutput;
           if (obj.type === 'assistant' && obj.message?.content) {
             for (const block of obj.message.content) {
               if (block.type === 'text') {
-                sendLog(ws, block.text + '\n');
-                statusRef.value = block.text.slice(0, 100);
+                sendLog(ws, (block.text ?? '') + '\n');
+                statusRef.value = (block.text ?? '').slice(0, 100);
               } else if (block.type === 'tool_use') {
-                sendLog(ws, `[tool: ${block.name}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
-                statusRef.value = `Using tool: ${block.name}`;
+                sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
+                statusRef.value = `Using tool: ${strVal(block.name)}`;
               }
             }
           } else if (obj.type === 'result') {
-            lastResultText = obj.result || '';
+            lastResultText = obj.result ?? '';
             sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
           }
         } catch { sendLog(ws, text); }
@@ -709,7 +722,7 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
     });
 
     claude.on('error', (err) => { clearTimeout(killTimer); sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
-    claude.on('close', (code) => { clearTimeout(killTimer); log(`Claude Code exited with code ${code}`); resolve(code ?? 1); });
+    claude.on('close', (code) => { clearTimeout(killTimer); log(`Claude Code exited with code ${code ?? 'null'}`); resolve(code ?? 1); });
   });
 
   sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
@@ -777,9 +790,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     includeTaskTypeHints = false,
   } = opts;
 
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const rawTitle = String(task.title || payload.title || 'automated changes');
+  const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
@@ -789,13 +802,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const parentCtxObj = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   const parentCtx = parentCtxObj?.parent_prompt
-    ? `## Parent Task Context\nThis task is a subtask of: **${parentCtxObj.parent_title}**\nParent goal: ${parentCtxObj.parent_prompt}\n\n`
+    ? `## Parent Task Context\nThis task is a subtask of: **${strVal(parentCtxObj.parent_title)}**\nParent goal: ${strVal(parentCtxObj.parent_prompt)}\n\n`
     : '';
 
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
-  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
-  const taskTypeHint = includeTaskTypeHints && TASK_TYPE_HINTS[String(payload.type || '')]
-    ? `\n\n${TASK_TYPE_HINTS[String(payload.type || '')]}`
+  const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
+  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const taskTypeKey = strVal(payload.type);
+  const taskTypeHint = includeTaskTypeHints && TASK_TYPE_HINTS[taskTypeKey]
+    ? `\n\n${TASK_TYPE_HINTS[taskTypeKey]}`
     : '';
 
   const claudeMd = readClaudeMd();
@@ -831,7 +845,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
     execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
 
-    let prBody = `## Summary\n\n${lastResultText?.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
+    let prBody = `## Summary\n\n${lastResultText.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
     if (runTestFix) {
       const testSummary = testsPassed ? '✅ Tests passed' : testFailuresDetected ? '⚠️ Test failures detected' : '⚠️ Could not run tests';
       prBody += `## Test Results\n\n${testSummary}\n\n`;
@@ -860,17 +874,19 @@ async function handleCreate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
+  const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   // Include title as context so the agent understands intent even if the prompt is terse
-  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
+  const taskTitleStr = strVal(task.title);
+  const prompt = taskTitleStr ? `Task: ${taskTitleStr}\n\n${rawPrompt}` : rawPrompt;
   if (!prompt) throw new Error('No prompt found in task payloads');
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const siblingNote = (projectCtx?.sibling_tasks as unknown[] | undefined)?.length
+  const siblingTasks = projectCtx?.sibling_tasks;
+  const siblingNote = Array.isArray(siblingTasks) && siblingTasks.length > 0
     ? '\n\nNote: Check the Sibling Tasks listed above and avoid making changes that overlap with or duplicate files they are already working on.'
     : '';
 
-  const overlapWarnings = (task.context as Record<string, unknown>)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
+  const overlapWarnings = (task.context as Record<string, unknown> | undefined)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
   const overlapWarningText = overlapWarnings && overlapWarnings.length > 0
     ? overlapWarnings.map(w =>
         `WARNING: This task shares files (${w.shared_files.join(', ')}) with parallel task "${w.with_task}". Coordinate carefully or check if that task already addressed this area.`
@@ -897,10 +913,10 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   model?: string, effort?: string
 ) {
   const prNumber = Number(payload.pr_number);
-  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${payload.pr_number}`);
-  const branch = validateBranchName(String(payload.branch || ''), 'branch');
-  const baseBranch = validateBranchName(String(payload.base_branch || 'main'), 'base_branch');
-  const originalPrompt = String(payload.original_prompt || '');
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
+  const branch = validateBranchName(strVal(payload.branch), 'branch');
+  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const originalPrompt = strVal(payload.original_prompt);
 
   // Read review iteration from task context
   const taskContext = task.context as Record<string, unknown> | undefined;
@@ -993,7 +1009,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
     if (fs.existsSync(`/tmp/review_verdict_${taskId}.json`)) {
       const verdictJson = fs.readFileSync(`/tmp/review_verdict_${taskId}.json`, 'utf-8').trim();
       // Validate it's actual verdict JSON
-      const parsed = JSON.parse(verdictJson);
+      const parsed = JSON.parse(verdictJson) as { verdict?: string };
       if (parsed.verdict) {
         // Send verdict via dedicated field (structured, tamper-resistant vs log parsing)
         verdictJsonField = verdictJson;
@@ -1024,11 +1040,11 @@ async function handleFix(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const branch = validateBranchName(String(payload.branch || ''), 'branch');
-  const baseBranch = validateBranchName(String(payload.base_branch || 'main'), 'base_branch');
-  const prompt = String(payload.prompt || '');
+  const branch = validateBranchName(strVal(payload.branch), 'branch');
+  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const prompt = strVal(payload.prompt);
   const prNumber = Number(payload.pr_number);
-  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${payload.pr_number}`);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -1065,7 +1081,7 @@ async function handleFix(
   }
 
   // Prepend accumulated review history so the agent knows what was previously requested
-  const reviewLoop = (task.context as Record<string, unknown>)?.review_loop as Record<string, unknown> | undefined;
+  const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
   const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string }> | undefined) || [];
   let basePrompt = prompt;
   if (reviewHistory.length > 0) {
@@ -1099,7 +1115,7 @@ async function handleFix(
   // Prepend parent context if this fix agent is part of a larger initiative
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {
-    enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${fixParentCtx.parent_title}**\nParent goal: ${fixParentCtx.parent_prompt}\n\n${enrichedPrompt}`;
+    enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${strVal(fixParentCtx.parent_title)}**\nParent goal: ${strVal(fixParentCtx.parent_prompt)}\n\n${enrichedPrompt}`;
   }
 
   // Prepend CLAUDE.md instructions
@@ -1185,7 +1201,7 @@ async function handleFix(
     try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch { /* ignore */ }
 
     if (localHead !== remoteHead) {
-      const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+      const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
       const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
       execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
       git(['push', '--force-with-lease', 'origin', branch]);
@@ -1207,11 +1223,11 @@ async function handleFix(
 
 function parseResearchSummary(raw: string): string {
   try {
-    const parsed = JSON.parse(raw);
-    const items = Array.isArray(parsed) ? parsed : (parsed?.logs ?? []);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const items = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.logs) ? parsed.logs : []);
     if (Array.isArray(items) && items.length > 0) {
-      return items.slice(0, 3)
-        .map((f: Record<string, unknown>) => `${f.title || '?'}: ${String(f.description || f.prompt || '').slice(0, 120)}`)
+      return (items as Record<string, unknown>[]).slice(0, 3)
+        .map((f) => `${strVal(f.title, '?')}: ${(strVal(f.description) || strVal(f.prompt)).slice(0, 120)}`)
         .join(' | ');
     }
   } catch { /* ignore */ }
@@ -1236,7 +1252,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     for (const t of activeTasks) {
       const files = (t.related_files as string[] | undefined);
       const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
-      activeLines.push(`- [${t.task_type}] **${t.title}** (${t.status}) — ${String(t.prompt || '').slice(0, 400)}${filesSuffix}`);
+      activeLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}** (${strVal(t.status)}) — ${strVal(t.prompt).slice(0, 400)}${filesSuffix}`);
     }
     activeLines.push('');
   }
@@ -1260,7 +1276,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     for (const t of siblingTasks) {
       const files = (t.related_files as string[] | undefined);
       const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
-      siblingLines.push(`- [${t.status}] ${t.title}${filesSuffix}`);
+      siblingLines.push(`- [${strVal(t.status)}] ${strVal(t.title)}${filesSuffix}`);
     }
     siblingLines.push('');
   }
@@ -1274,7 +1290,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
   if (queuedTasks && queuedTasks.length > 0) {
     const fullLines: string[] = ['### Queued Tasks'];
     for (const t of queuedTasks) {
-      fullLines.push(`- [${t.task_type}] **${t.title}** — ${String(t.prompt || '').slice(0, 400)}`);
+      fullLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}** — ${strVal(t.prompt).slice(0, 400)}`);
     }
     fullLines.push('');
     const fullContent = fullLines.join('\n');
@@ -1285,7 +1301,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
       // Reduce to one-liners
       const shortLines: string[] = ['### Queued Tasks'];
       for (const t of queuedTasks) {
-        shortLines.push(`- [${t.task_type}] **${t.title}**`);
+        shortLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**`);
       }
       shortLines.push('');
       queuedLines = shortLines;
@@ -1300,9 +1316,9 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
   if (recentTasks && recentTasks.length > 0) {
     const allEntries: string[] = [];
     for (const t of recentTasks) {
-      const pr = t.pr_url ? ` (${t.pr_url})` : '';
-      const summary = t.research_findings_summary ? ` — ${parseResearchSummary(String(t.research_findings_summary))}` : '';
-      allEntries.push(`- [${t.task_type}] **${t.title}**${pr}${summary}`);
+      const pr = t.pr_url ? ` (${strVal(t.pr_url)})` : '';
+      const summary = t.research_findings_summary ? ` — ${parseResearchSummary(strVal(t.research_findings_summary))}` : '';
+      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}`);
     }
 
     // Keep most recent entries that fit within budget
@@ -1340,9 +1356,9 @@ async function handlePlan(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const prompt = String(payload.prompt || payload.description || task.description || '');
-  const baseBranch = String(payload.base_branch || 'main');
-  const planPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
+  const prompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
+  const baseBranch = strVal(payload.base_branch, 'main');
+  const planPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
 
   if (!prompt) throw new Error('Plan task missing prompt');
 
@@ -1452,29 +1468,29 @@ Rules:
     try {
       let planData: Record<string, unknown> | null = null;
       try {
-        planData = JSON.parse(logs);
+        planData = JSON.parse(logs) as Record<string, unknown>;
       } catch {
         const match = logs.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
-        if (match) planData = JSON.parse(match[0]);
+        if (match) planData = JSON.parse(match[0]) as Record<string, unknown>;
       }
 
       const subtasks = planData?.subtasks;
       if (Array.isArray(subtasks) && subtasks.length > 0 && subtasks.length <= 10) {
         sendLog(ws, `Parsed ${subtasks.length} subtasks from plan output\n`);
 
-        const spawnPayloads = subtasks.map((st: Record<string, unknown>) => ({
-          title: String(st.title || 'Untitled subtask'),
-          description: String(st.prompt || ''),
-          prompt: String(st.prompt || ''),
-          type: String(st.type || 'create'),
-          scope: String(st.scope || 'small'),
-          risk: String(st.risk || 'low'),
+        const spawnPayloads = (subtasks as Record<string, unknown>[]).map((st) => ({
+          title: strVal(st.title, 'Untitled subtask'),
+          description: strVal(st.prompt),
+          prompt: strVal(st.prompt),
+          type: strVal(st.type, 'create'),
+          scope: strVal(st.scope, 'small'),
+          risk: strVal(st.risk, 'low'),
           base_branch: baseBranch,
-          depends_on_indices: st.depends_on_indices || [],
-          related_files: st.related_files || [],
-          ...(st.model ? { model: String(st.model) } : {}),
-          ...(st.effort ? { effort: String(st.effort) } : {}),
-          ...(st.approval_reason ? { approval_reason: String(st.approval_reason) } : {}),
+          depends_on_indices: st.depends_on_indices ?? [],
+          related_files: st.related_files ?? [],
+          ...(st.model ? { model: strVal(st.model) } : {}),
+          ...(st.effort ? { effort: strVal(st.effort) } : {}),
+          ...(st.approval_reason ? { approval_reason: strVal(st.approval_reason) } : {}),
         }));
 
         statusRef.value = 'Spawning subtasks...';
@@ -1485,7 +1501,7 @@ Rules:
           context: { agent_spawned: true },
         }) as Record<string, unknown>;
 
-        const spawnedIds = (spawnResult.task_ids as string[]) || [];
+        const spawnedIds = Array.isArray(spawnResult.task_ids) ? spawnResult.task_ids as string[] : [];
         sendLog(ws, `Spawned ${spawnedIds.length} subtasks: ${spawnedIds.join(', ')}\n`);
 
         // Include full plan data with spawn info for backend enrichment
@@ -1496,7 +1512,7 @@ Rules:
         });
       }
     } catch (err) {
-      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : err}, falling back to backend processing\n`);
+      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : String(err)}, falling back to backend processing\n`);
     }
   }
 
@@ -1514,10 +1530,10 @@ async function handleResearch(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const directions = payload.directions as Array<Record<string, unknown>> || [];
+  const directions = Array.isArray(payload.directions) ? payload.directions as Array<Record<string, unknown>> : [];
   const currentDirectionId = payload.current_direction_id as string | undefined;
-  const baseBranch = String(payload.base_branch || 'main');
-  const userPrompt = String(payload.prompt || payload.description || task.description || '');
+  const baseBranch = strVal(payload.base_branch, 'main');
+  const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
 
   // Full clone — research needs history context
   statusRef.value = `Cloning ${owner}/${repo} for research...`;
@@ -1531,28 +1547,28 @@ async function handleResearch(
   try {
     gitLogOutput = execFileSync('git', ['-C', WORKSPACE, 'log', '--oneline', '-30'], { encoding: 'utf-8' }).trim();
   } catch (e) {
-    sendLog(ws, `Warning: git log failed: ${e}\n`);
+    sendLog(ws, `Warning: git log failed: ${String(e)}\n`);
   }
   let gitShortlogOutput = '';
   try {
     gitShortlogOutput = execFileSync('git', ['-C', WORKSPACE, 'shortlog', '-sn', '--no-merges', '-20'], { encoding: 'utf-8' }).trim();
   } catch (e) {
-    sendLog(ws, `Warning: git shortlog failed: ${e}\n`);
+    sendLog(ws, `Warning: git shortlog failed: ${String(e)}\n`);
   }
   try {
     gitDiffStatOutput = execFileSync('git', ['-C', WORKSPACE, 'diff', '--stat', 'HEAD~5..HEAD'], { encoding: 'utf-8' }).trim();
   } catch (e) {
-    sendLog(ws, `Warning: git diff --stat failed: ${e}\n`);
+    sendLog(ws, `Warning: git diff --stat failed: ${String(e)}\n`);
   }
   let hotspotsSection = '';
   try {
     const hotspots = execFileSync('git', ['log', '--pretty=format:', '--name-only', '-50'], {cwd: WORKSPACE, encoding: 'utf-8'})
       .split('\n').filter(Boolean);
-    const fileCounts = hotspots.reduce((acc, f) => ({...acc, [f]: (acc[f]||0)+1}), {} as Record<string, number>);
+    const fileCounts = hotspots.reduce<Record<string, number>>((acc, f) => ({...acc, [f]: (acc[f] ?? 0)+1}), {});
     const topFiles = Object.entries(fileCounts).sort((a,b) => b[1]-a[1]).slice(0, 10);
     hotspotsSection = `### Most Changed Files (last 50 commits)\n${topFiles.map(([f,c]) => `- ${f} (${c} changes)`).join('\n')}`;
   } catch (e) {
-    sendLog(ws, `Warning: git hotspots failed: ${e}\n`);
+    sendLog(ws, `Warning: git hotspots failed: ${String(e)}\n`);
   }
   const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? `## Recent Git History (last 30 commits)
 ${gitLogOutput || '(unavailable)'}
@@ -1587,19 +1603,17 @@ ${hotspotsSection}
       { cwd: WORKSPACE, encoding: 'utf-8' }
     ).split('\n').slice(0, 150).join('\n');
   } catch (e) {
-    sendLog(ws, `Warning: file tree generation failed: ${e}\n`);
+    sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
   }
   const fileTreeSection = fileTree
     ? `## Repository File Tree (first 150 files)\n\`\`\`\n${fileTree}\n\`\`\`\n\n`
     : '';
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const activeTasks = Array.isArray(projectCtx?.active_tasks)
-    ? (projectCtx!.active_tasks as Array<Record<string, unknown>>)
-    : [];
-  const queuedTasks = Array.isArray(projectCtx?.queued_tasks)
-    ? (projectCtx!.queued_tasks as Array<Record<string, unknown>>)
-    : [];
+  const rawActiveTasks = projectCtx?.active_tasks;
+  const activeTasks: Array<Record<string, unknown>> = Array.isArray(rawActiveTasks) ? rawActiveTasks as Array<Record<string, unknown>> : [];
+  const rawQueuedTasks = projectCtx?.queued_tasks;
+  const queuedTasks: Array<Record<string, unknown>> = Array.isArray(rawQueuedTasks) ? rawQueuedTasks as Array<Record<string, unknown>> : [];
 
   const directionsText = directions.length > 0
     ? directions.map((d, i) => {
@@ -1635,17 +1649,17 @@ ${hotspotsSection}
             const insights = Array.isArray(h.cycle_insights) && (h.cycle_insights as string[]).length > 0
               ? '\n    Insights: ' + (h.cycle_insights as string[]).join(' | ')
               : '';
-            const subNotes = (h.sub_research_notes as Array<Record<string, unknown>> || []);
+            const subNotes = Array.isArray(h.sub_research_notes) ? h.sub_research_notes as Array<Record<string, unknown>> : [];
             const subSummary = subNotes.length > 0
               ? '\n' + subNotes.map((s: Record<string, unknown>) => {
                   const subInsights = Array.isArray(s.insights) && (s.insights as string[]).length > 0
                     ? ' — insights: ' + (s.insights as string[]).join('; ')
                     : '';
-                  const findingTitles = (s.finding_titles as string[] || []);
-                  return `    Sub-research (depth ${s.depth}): ${s.tasks_created} tasks (${findingTitles.join(', ')})${subInsights}`;
+                  const findingTitles = Array.isArray(s.finding_titles) ? s.finding_titles as string[] : [];
+                  return `    Sub-research (depth ${String(s.depth)}): ${String(s.tasks_created)} tasks (${findingTitles.join(', ')})${subInsights}`;
                 }).join('\n')
               : '';
-            return `  - ${h.timestamp}: ${h.tasks_created} tasks created${outcomeStats} — ${titles}${descs}${insights}${subSummary}`;
+            return `  - ${String(h.timestamp)}: ${String(h.tasks_created)} tasks created${outcomeStats} — ${titles}${descs}${insights}${subSummary}`;
           }).join('\n');
           historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):${aggregateSection}\n${entries}`;
         }
@@ -1664,13 +1678,13 @@ ${hotspotsSection}
           const dirQueuedTasks = queuedTasks.filter(t => t['direction_id'] === d.id);
           if (dirActiveTasks.length > 0 || dirQueuedTasks.length > 0) {
             const lines = [
-              ...dirActiveTasks.map(t => `  [${t['task_type']} IN_PROGRESS] ${t['title']}`),
-              ...dirQueuedTasks.map(t => `  [${t['task_type']} QUEUED] ${t['title']}`),
+              ...dirActiveTasks.map(t => `  [${strVal(t['task_type'])} IN_PROGRESS] ${strVal(t['title'])}`),
+              ...dirQueuedTasks.map(t => `  [${strVal(t['task_type'])} QUEUED] ${strVal(t['title'])}`),
             ];
             activeForDirNote = `\n  Active tasks for this direction:\n${lines.join('\n')}`;
           }
         }
-        return `${i + 1}. [${d.priority || 'medium'}] ${d.text}${pathScope} (id: ${d.id})${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
+        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
       }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
@@ -1686,7 +1700,7 @@ ${hotspotsSection}
         const history = d.research_history as Array<Record<string, unknown>>;
         const lastCycle = history[history.length - 1];
         const titles = (Array.isArray(lastCycle.finding_titles) ? lastCycle.finding_titles as string[] : []).slice(0, 3).join(', ');
-        return `- "${String(d.text).slice(0, 80)}": ${lastCycle.tasks_created} tasks (${titles || 'none'})`;
+        return `- "${strVal(d.text).slice(0, 80)}": ${String(lastCycle.tasks_created)} tasks (${titles || 'none'})`;
       })
       .slice(0, 3);  // max 3 other directions
     if (snippets.length > 0) {
@@ -1874,7 +1888,7 @@ Approach:
 - Use TodoWrite to maintain a checklist of areas explored and gaps found. Don't stop exploring when you find the first few easy wins.
 - When a direction has had 3+ prior cycles, STOP looking for surface-level gaps. Instead, think about what NEW CAPABILITY or ARCHITECTURAL CHANGE would make the direction's goal trivially achievable. That's the finding worth proposing.`;
 
-  const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
+  const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort);
 
@@ -1946,7 +1960,7 @@ async function handleSecurityAudit(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for security audit...`;
@@ -1978,13 +1992,13 @@ async function handleSecurityAudit(
       { cwd: WORKSPACE, encoding: 'utf-8' }
     ).split('\n').slice(0, 150).join('\n');
   } catch (e) {
-    sendLog(ws, `Warning: file tree generation failed: ${e}\n`);
+    sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
   }
   const fileTreeSection = fileTree
     ? `## Repository File Tree (first 150 files)\n\`\`\`\n${fileTree}\n\`\`\`\n\n`
     : '';
 
-  const auditScope = String(payload.prompt || payload.description || '');
+  const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
 
   const securityPrompt = `${contextPrefix}${codebaseSummary}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
@@ -2024,7 +2038,7 @@ Rules:
 - IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
-  const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
+  const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running security audit...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + securityPromptSuffix, ws, statusRef, model, effort);
 
@@ -2144,10 +2158,11 @@ async function handleMigrate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
-  const rawBaseBranch = String(payload.base_branch || 'main');
-  const rawTitle = String(task.title || payload.title || 'database migration');
-  const prompt = task.title ? `Task: ${task.title}\n\n${rawPrompt}` : rawPrompt;
+  const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawTitle = strVal(task.title) || strVal(payload.title) || 'database migration';
+  const migrateTaskTitle = strVal(task.title);
+  const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
 
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
@@ -2175,7 +2190,7 @@ async function handleMigrate(
       git(['push', 'origin', '--delete', workBranch]);
       sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
     } catch (e) {
-      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : e}\n`);
+      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : String(e)}\n`);
     }
   }
   git(['checkout', '-b', workBranch]);
@@ -2221,7 +2236,7 @@ CRITICAL RULES:
 
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
-  const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${payload.prompt_suffix}` : '';
+  const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePrompt + migratePromptSuffix, ws, statusRef, model, effort);
 
@@ -2248,7 +2263,7 @@ CRITICAL RULES:
 
     const commitHash = git(['rev-parse', 'HEAD']);
 
-    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
     git(['push', 'origin', workBranch]);
@@ -2263,10 +2278,10 @@ CRITICAL RULES:
       const prRes = await apiPost('/api/agent/github/pull-requests', {
         task_id: taskId, owner, repo, title: `migrate: ${taskTitle}`,
         head: workBranch, base: baseBranch, body: prBody,
-      });
-      prUrl = prRes.data?.html_url || '';
+      }) as { data?: { html_url?: string } };
+      prUrl = prRes.data?.html_url ?? '';
       sendLog(ws, `PR created: ${prUrl}\n`);
-    } catch (e) { sendLog(ws, `Failed to create PR: ${e}\n`); }
+    } catch (e) { sendLog(ws, `Failed to create PR: ${String(e)}\n`); }
 
     await apiPost('/api/agent/status', {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
@@ -2287,7 +2302,7 @@ async function handleSmoketest(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone (read-only — no work branch or push needed)
@@ -2345,7 +2360,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
   let smoketestResult: { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null = null;
   try {
     const resultJson = fs.readFileSync(`/tmp/smoketest_result_${taskId}.json`, 'utf-8');
-    smoketestResult = JSON.parse(resultJson);
+    smoketestResult = JSON.parse(resultJson) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> };
   } catch {
     sendLog(ws, `Warning: /tmp/smoketest_result_${taskId}.json not found or invalid\n`);
   }
@@ -2409,16 +2424,17 @@ async function handleRefactor(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawPrompt = String(payload.prompt || payload.description || task.description || '');
+  const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   if (!rawPrompt) throw new Error('No prompt found in task payloads');
 
-  const refactorOverlapWarnings = (task.context as Record<string, unknown>)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
+  const refactorOverlapWarnings = (task.context as Record<string, unknown> | undefined)?.file_overlap_warnings as Array<{shared_files: string[], with_task: string}> | undefined;
   const refactorOverlapWarningText = refactorOverlapWarnings && refactorOverlapWarnings.length > 0
     ? refactorOverlapWarnings.map(w =>
         `WARNING: This task shares files (${w.shared_files.join(', ')}) with parallel task "${w.with_task}". Coordinate carefully or check if that task already addressed this area.`
       ).join('\n') + '\n\n'
     : '';
 
+  const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
@@ -2432,7 +2448,7 @@ async function handleRefactor(
 - Run the test suite AGAIN after your changes. All tests that passed before must still pass. If any test regresses, revert or fix the regression before committing.
 - Keep the diff minimal — only change what is necessary for the chosen refactor concern.
 
-Task: ${task.title ? task.title : 'Refactor'}
+Task: ${refactorTitle}
 
 ${rp}`,
     commitPrefix: 'refactor',
@@ -2450,10 +2466,10 @@ async function handleDebug(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const errorLogs = String(payload.error_logs || payload.failure_context || '');
-  const failedTaskId = String(payload.failed_task_id || '');
-  const failedTaskTitle = String(payload.failed_task_title || task.title || '');
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const errorLogs = strVal(payload.error_logs) || strVal(payload.failure_context);
+  const failedTaskId = strVal(payload.failed_task_id);
+  const failedTaskTitle = strVal(payload.failed_task_title) || strVal(task.title);
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone for read-only analysis (no work branch or push needed)
@@ -2525,7 +2541,7 @@ IMPORTANT: Always write /tmp/debug_output_${taskId}.json even if you cannot dete
   let debugResult: { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null = null;
   try {
     const resultJson = fs.readFileSync(`/tmp/debug_output_${taskId}.json`, 'utf-8');
-    debugResult = JSON.parse(resultJson);
+    debugResult = JSON.parse(resultJson) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string };
   } catch {
     sendLog(ws, `Warning: /tmp/debug_output_${taskId}.json not found or invalid\n`);
   }
@@ -2554,7 +2570,7 @@ async function handlePerf(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for performance analysis...`;
@@ -2639,9 +2655,9 @@ async function handleInvestigate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = String(payload.base_branch || 'main');
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const userPrompt = String(payload.prompt || payload.description || task.description || '');
+  const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
 
   statusRef.value = `Cloning ${owner}/${repo} for investigation...`;
   sendLog(ws, `Starting investigation...\n`);
@@ -2693,7 +2709,7 @@ IMPORTANT:
     logs = sanitize(raw);
     sendLog(ws, `Read investigation report from ${reportPath}\n`);
   } catch (e) {
-    const errMsg = `Failed to read investigation report: ${e}`;
+    const errMsg = `Failed to read investigation report: ${String(e)}`;
     sendLog(ws, `${errMsg}\n`);
     await apiPost('/api/agent/status', {
       task_id: taskId,
@@ -2744,15 +2760,15 @@ async function main() {
   }
 
   // Claim task
-  const task = await apiPost('/api/agent/claim');
-  const taskId = String(task.task_id);
+  const task = await apiPost('/api/agent/claim') as Record<string, unknown>;
+  const taskId = strVal(task.task_id);
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
-  const payloads = task.payloads || [];
-  const payload = payloads[0] || {};
-  const taskType = String(payload.type || 'create');
-  const model = payload.model ? String(payload.model) : undefined;
-  const effort = payload.effort ? String(payload.effort) : undefined;
-  log(`Claimed task ${taskId} (type: ${taskType}): "${task.title}"`);
+  const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
+  const payload = payloads[0] ?? {} as Record<string, unknown>;
+  const taskType = strVal(payload.type, 'create');
+  const model = payload.model ? strVal(payload.model) : undefined;
+  const effort = payload.effort ? strVal(payload.effort) : undefined;
+  log(`Claimed task ${taskId} (type: ${taskType}): "${strVal(task.title)}"`);
 
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
@@ -2766,13 +2782,15 @@ async function main() {
   try {
     // Get GitHub credentials
     statusRef.value = 'Fetching GitHub credentials...';
-    const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`);
+    const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string; owner: string; repo: string } };
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
     // Dispatch to handler (fall back to create for unknown types)
-    const handler = handlers[taskType] || handlers.create;
-    if (!handlers[taskType]) sendLog(ws, `Warning: unknown task type "${taskType}", using create handler\n`);
+    const handlersMap: Partial<Record<string, Handler>> = handlers;
+    const knownHandler = handlersMap[taskType];
+    if (!knownHandler) sendLog(ws, `Warning: unknown task type "${taskType}", using create handler\n`);
+    const handler = knownHandler ?? handlers.create;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     sendLog(ws, '\nTask completed.\n');
 
@@ -2848,4 +2866,4 @@ process.on('SIGTERM', () => {
   _crashReport('SIGTERM', 'VM shutting down', 143);
 });
 
-main().catch((err) => { console.error('Agent failed to start:', err); process.exit(1); });
+main().catch((err: unknown) => { console.error('Agent failed to start:', err instanceof Error ? err.message : String(err)); process.exit(1); });

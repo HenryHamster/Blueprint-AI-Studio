@@ -1,6 +1,6 @@
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from typing import cast
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -41,8 +41,8 @@ class _LazyEngine:
 engine = _LazyEngine()
 
 # Session factory for background tasks and dependency injection
-AsyncSessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
+AsyncSessionLocal = async_sessionmaker(
+    cast(AsyncEngine, engine), class_=AsyncSession, expire_on_commit=False
 )
 
 async def init_db():

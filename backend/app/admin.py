@@ -358,7 +358,7 @@ async def get_all_tasks(
     # Return tasks with artifact data attached
     result_list = []
     for t in tasks:
-        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        task_type = (t.first_payload).get("type", "create")
         task_dict = {
             "id": str(t.id),
             "project_id": str(t.project_id),
@@ -518,7 +518,7 @@ async def get_task(
     )
     child_task_ids = [str(row) for row in child_ids_result.scalars().all()]
 
-    task_type = ((task.payloads or [{}])[0]).get("type", "create")
+    task_type = (task.first_payload).get("type", "create")
     return {
         "id": str(task.id),
         "project_id": str(task.project_id),
@@ -711,7 +711,7 @@ async def request_changes(
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
-    task_payload = (task.payloads or [{}])[0]
+    task_payload = task.first_payload
     base_branch = task_payload.get("base_branch", "main")
 
     from app.main import _spawn_pipeline_task
@@ -853,7 +853,7 @@ async def modify_task(
                 # Check if this is a research/plan parent with work children — re-evaluate
                 # instead of re-run. Don't treat review/fix/create tasks as parents just
                 # because they have incidental debug children.
-                task_type = ((task.payloads or [{}])[0]).get("type", "")
+                task_type = (task.first_payload).get("type", "")
                 is_parent_type = task_type in ("research", "plan")
                 from app.main import _requeue_parent_task
                 children = []
@@ -893,7 +893,7 @@ async def modify_task(
             if artifact and artifact.pr_url:
                 pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                 branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
-                task_payload = (task.payloads or [{}])[0]
+                task_payload = task.first_payload
                 base_branch = task_payload.get("base_branch", "main")
 
                 ctx = task.context or {}
@@ -1962,7 +1962,7 @@ async def get_direction_task_counts(
 
     counts: Dict[str, int] = {}
     for task in tasks:
-        payload = (task.payloads or [{}])[0]
+        payload = task.first_payload
         if payload.get("type") != "research":
             continue
         # New-format tasks have current_direction_id pointing to the targeted direction
@@ -2024,7 +2024,7 @@ async def get_autonomous_status(
     )).scalars().all()
     tasks_per_project: dict = {}
     for t in auto_tasks:
-        if ((t.payloads or [{}])[0]).get("type") == "research":
+        if (t.first_payload).get("type") == "research":
             tasks_per_project[t.project_id] = tasks_per_project.get(t.project_id, 0) + 1
 
     # Batch query: most recent autonomous task per project
@@ -2536,7 +2536,7 @@ async def get_activity(
 
     for t in recent_tasks:
         tid = str(t.id)
-        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        task_type = (t.first_payload).get("type", "create")
         pr_info = artifact_map.get(tid, {})
 
         # Determine timestamp: last status_log entry or updated_at fallback
@@ -2631,7 +2631,7 @@ async def get_activity(
 
     for t in inprogress_tasks:
         tid = str(t.id)
-        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        task_type = (t.first_payload).get("type", "create")
         events.append({
             "id": f"inprogress-{tid}",
             "type": "TASK_IN_PROGRESS",
@@ -2888,7 +2888,7 @@ async def get_autonomy_debug(
     active_tasks = active_tasks_result.scalars().all()
     blocking_research_task_id = None
     for t in active_tasks:
-        if ((t.payloads or [{}])[0]).get("type") == "research":
+        if (t.first_payload).get("type") == "research":
             blocking_research_task_id = str(t.id)
             break
     if blocking_research_task_id:
@@ -2908,7 +2908,7 @@ async def get_autonomy_debug(
         )
     )
     recent_tasks = recent_tasks_result.scalars().all()
-    tasks_this_hour = sum(1 for t in recent_tasks if ((t.payloads or [{}])[0]).get("type") == "research")
+    tasks_this_hour = sum(1 for t in recent_tasks if (t.first_payload).get("type") == "research")
     max_per_hour = _runtime_config.get("max_autonomous_tasks_per_hour", 5)
     if tasks_this_hour >= max_per_hour:
         blocking_guards.append({
@@ -3356,7 +3356,7 @@ async def get_digest(
     # research_cycles: completed tasks with task_type == 'research'
     research_cycles = sum(
         1 for t in completed_tasks
-        if ((t.payloads or [{}])[0]).get("type", "create") == "research"
+        if (t.first_payload).get("type", "create") == "research"
     )
 
     # --- Batch artifact query ---
@@ -3439,7 +3439,7 @@ async def get_digest(
     for t in sorted_completions[:10]:
         tid = str(t.id)
         ts = _derive_completed_at(t)
-        task_type = ((t.payloads or [{}])[0]).get("type", "create")
+        task_type = (t.first_payload).get("type", "create")
         recent_completions.append({
             "task_id": tid,
             "title": t.title or "Completed task",
@@ -3454,7 +3454,7 @@ async def get_digest(
             "task_id": str(t.id),
             "title": t.title or "Active task",
             "status": t.status.value if hasattr(t.status, "value") else t.status,
-            "task_type": ((t.payloads or [{}])[0]).get("type", "create"),
+            "task_type": (t.first_payload).get("type", "create"),
             "started_at": t.started_at.isoformat() if t.started_at else None,
         }
         for t in active_tasks_all[:5]

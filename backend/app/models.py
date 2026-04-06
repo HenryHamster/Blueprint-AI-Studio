@@ -157,6 +157,11 @@ class Task(SQLModel, table=True):
     started_at: Optional[datetime] = Field(default=None)
     archived: bool = Field(default=False)
 
+    @property
+    def first_payload(self) -> Dict[str, Any]:
+        """First payload dict, defaulting to empty dict if none exist."""
+        return (self.payloads or [{}])[0]
+
     __table_args__ = (
         Index("ix_task_status_priority", "status", "priority"),
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),

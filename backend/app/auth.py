@@ -28,15 +28,17 @@ except (ValueError, Exception) as e:
 security = HTTPBearer()
 
 # Secret key for signing Agent JWTs
-AGENT_JWT_SECRET = os.getenv("AGENT_JWT_SECRET")
-if not AGENT_JWT_SECRET:
+_agent_jwt_secret = os.getenv("AGENT_JWT_SECRET")
+if not _agent_jwt_secret:
     raise ValueError("AGENT_JWT_SECRET environment variable is required")
+AGENT_JWT_SECRET: str = _agent_jwt_secret
 AGENT_JWT_ALGORITHM = "HS256"
 
 # Secret key for signing WebSocket tickets
-WS_TICKET_SECRET = os.getenv("WS_TICKET_SECRET")
-if not WS_TICKET_SECRET:
+_ws_ticket_secret = os.getenv("WS_TICKET_SECRET")
+if not _ws_ticket_secret:
     raise ValueError("WS_TICKET_SECRET environment variable is required")
+WS_TICKET_SECRET: str = _ws_ticket_secret
 
 def create_ws_ticket(user_id: str, project_id: str) -> str:
     """

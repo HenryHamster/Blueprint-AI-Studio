@@ -101,6 +101,7 @@ async def _github_request(
                 f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
             )
             await asyncio.sleep(delay)
+    assert response is not None  # loop always runs at least once (max_retries >= 1)
     return response  # unreachable but satisfies type checker
 
 
@@ -176,7 +177,7 @@ async def get_user_installations(user_token: str) -> list[dict]:
         "Accept": "application/vnd.github.v3+json",
     }
     installations = []
-    url = "https://api.github.com/user/installations?per_page=100"
+    url: str | None = "https://api.github.com/user/installations?per_page=100"
     while url:
         resp = await _github_request("GET", url, headers)
         if resp.status_code != 200:

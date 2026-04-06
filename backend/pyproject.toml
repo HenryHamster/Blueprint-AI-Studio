@@ -38,8 +38,8 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
-no_strict_optional = true
-warn_return_any = false
+no_strict_optional = false
+warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 exclude = [
@@ -51,8 +51,14 @@ exclude = [
 module = ["google.*", "firebase_admin.*", "slowapi.*", "opentelemetry.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# httpx.Response.json() returns Any — suppress no-any-return in the GitHub API wrapper
+# until a future task adds explicit cast() annotations throughout github.py
+module = "app.github"
+warn_return_any = false
 
-# Run type checking: python -m mypy app/models.py app/auth.py app/security.py
+
+# Run type checking: python -m mypy app/models.py app/auth.py app/security.py app/database.py app/shared_state.py
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
