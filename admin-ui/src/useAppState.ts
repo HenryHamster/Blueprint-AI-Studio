@@ -5,7 +5,7 @@ import type { MaxPlanAccount } from './types/settings';
 import type { Alert } from './types/alert';
 import { onAuthChange } from './firebase';
 import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet, COST_PER_VM_HR, fetchTask } from './api';
+import { API_BASE_URL, authHeaders, authGet, apiFetch, COST_PER_VM_HR, fetchTask } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
 
@@ -44,6 +44,8 @@ function playCompletionSound() {
 export function useAppState() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [userRole, setUserRole] = useState<'admin' | 'user' | null>(null);
+  const [accessDenied, setAccessDenied] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
   const [globalActiveCount, setGlobalActiveCount] = useState(0);
@@ -246,6 +248,26 @@ export function useAppState() {
     const unsub = onAuthChange((u) => { setUser(u); setAuthLoading(false); });
     return unsub;
   }, []);
+
+  // Fetch user role from backend after Firebase auth
+  useEffect(() => {
+    if (!user) { setUserRole(null); setAccessDenied(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authGet(`${API_BASE_URL}/api/me`);
+        if (cancelled) return;
+        if (res.status === 403) { setAccessDenied(true); return; }
+        if (!res.ok) { setError(`Failed to verify access: ${res.statusText}`); return; }
+        const data = await res.json();
+        setUserRole(data.role);
+        setAccessDenied(false);
+      } catch {
+        if (!cancelled) setError('Failed to connect to backend server.');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
 
   // Handle OAuth redirect query params
   useEffect(() => {
@@ -1693,9 +1715,55 @@ export function useAppState() {
     ).length;
   }, [tasks]);
 
+  // ── User management ──────────────────────────────────────────────────────
+  type AllowedUserEntry = { id: string; email: string; role: string; display_name: string | null; last_login_at: string | null; created_at: string | null };
+  const [allowedUsers, setAllowedUsers] = useState<AllowedUserEntry[]>([]);
+  const [showUserManagement, setShowUserManagement] = useState(false);
+
+  const fetchAllowedUsers = useCallback(async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/users`);
+      if (res.ok) setAllowedUsers(await res.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  // Load users when panel opens
+  useEffect(() => { if (showUserManagement) fetchAllowedUsers(); }, [showUserManagement, fetchAllowedUsers]);
+
+  const addAllowedUser = useCallback(async (email: string, role: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/users`, {
+      method: 'POST', body: JSON.stringify({ email, role }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(data.detail || 'Failed to add user');
+    }
+    await fetchAllowedUsers();
+  }, [fetchAllowedUsers]);
+
+  const updateAllowedUserRole = useCallback(async (userId: string, role: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/users/${userId}`, {
+      method: 'PATCH', body: JSON.stringify({ role }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(data.detail || 'Failed to update user');
+    }
+    await fetchAllowedUsers();
+  }, [fetchAllowedUsers]);
+
+  const removeAllowedUser = useCallback(async (userId: string) => {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/users/${userId}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(data.detail || 'Failed to remove user');
+    }
+    await fetchAllowedUsers();
+  }, [fetchAllowedUsers]);
+
   return {
     // Auth
-    user, authLoading, error, setError,
+    user, authLoading, userRole, accessDenied, error, setError,
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount, initialLoading, refreshing, page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     needsAttentionCount,
@@ -1780,5 +1848,8 @@ export function useAppState() {
     // Orchestrator health
     orchestratorHealth,
     detailedHealth,
+    // User management
+    allowedUsers, showUserManagement, setShowUserManagement,
+    addAllowedUser, updateAllowedUserRole, removeAllowedUser,
   };
 }

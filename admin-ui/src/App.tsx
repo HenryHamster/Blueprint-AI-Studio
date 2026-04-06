@@ -22,6 +22,7 @@ import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import ActivityFeed from './components/ActivityFeed';
+import { UserManagement } from './components/UserManagement';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { CatchUpPanel } from './components/CatchUpPanel';
 
@@ -280,7 +281,7 @@ export default function App() {
     return (
       <div className="h-screen flex items-center justify-center bg-neutral-950">
         <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
-          <h1 className="text-lg font-semibold text-neutral-100 mb-2">Blueprint Admin</h1>
+          <h1 className="text-lg font-semibold text-neutral-100 mb-2">Blueprint</h1>
           <p className="text-xs text-neutral-500 mb-6">Sign in with your Google account to continue</p>
           <button
             onClick={() => signInWithGoogle().catch(e => s.setError(String(e)))}
@@ -290,6 +291,34 @@ export default function App() {
           </button>
           {s.error && <p className="text-red-400 text-xs mt-4">{s.error}</p>}
         </div>
+      </div>
+    );
+  }
+
+  if (s.accessDenied) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-neutral-950">
+        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-8 text-center max-w-sm">
+          <h1 className="text-lg font-semibold text-neutral-100 mb-2">Access Denied</h1>
+          <p className="text-xs text-neutral-500 mb-4">
+            Your account ({s.user.email}) is not authorized to access Blueprint.
+          </p>
+          <p className="text-xs text-neutral-600 mb-6">Contact an administrator to request access.</p>
+          <button
+            onClick={() => signOut(auth)}
+            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (s.userRole === null) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
+        <Activity className="w-5 h-5 animate-spin" />
       </div>
     );
   }
@@ -388,6 +417,8 @@ export default function App() {
         onMarkStable={s.handleMarkStable}
         onRepairState={s.handleRepairState}
         zoneHealth={s.zoneHealth}
+        showUserManagement={s.showUserManagement}
+        onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
       />
 
       <div
@@ -434,7 +465,7 @@ export default function App() {
         }}
       />
 
-      {!s.showArchive && !s.showActivityFeed && (
+      {!s.showArchive && !s.showActivityFeed && !s.showUserManagement && (
         <CatchUpPanel
           selectedProjectId={s.selectedProjectId}
           lastVisitTimestamp={s.lastVisitTimestamp}
@@ -479,7 +510,16 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
       />
 
-      {s.showActivityFeed ? (
+      {s.showUserManagement ? (
+        <UserManagement
+          users={s.allowedUsers}
+          currentUserEmail={s.user?.email || ''}
+          onAdd={s.addAllowedUser}
+          onUpdateRole={s.updateAllowedUserRole}
+          onRemove={s.removeAllowedUser}
+          onClose={() => s.setShowUserManagement(false)}
+        />
+      ) : s.showActivityFeed ? (
         <ActivityFeed
           selectedProjectId={s.selectedProjectId}
           refreshInterval={s.refreshInterval}

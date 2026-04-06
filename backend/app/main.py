@@ -29,7 +29,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
+from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, reconcile_orphaned_secrets
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -73,7 +73,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0021"
+EXPECTED_SCHEMA_REVISION = "0022"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2897,6 +2897,20 @@ async def orchestrator_worker():
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
 
+async def _seed_initial_admin():
+    """Seed the AllowedUser table with an initial admin if empty."""
+    async with AsyncSessionLocal() as seed_session:
+        count = (await seed_session.execute(select(_func.count()).select_from(AllowedUser))).scalar_one()
+        if count == 0:
+            initial_email = os.getenv("INITIAL_ADMIN_EMAIL")
+            if initial_email:
+                seed_session.add(AllowedUser(email=initial_email, role="admin"))
+                await seed_session.commit()
+                logger.info(f"[STARTUP] Seeded initial admin: {initial_email}")
+            else:
+                logger.warning("[STARTUP] AllowedUser table is empty and INITIAL_ADMIN_EMAIL not set. No users can sign in.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize DB tables
@@ -2904,6 +2918,9 @@ async def lifespan(app: FastAPI):
 
     # Verify schema version matches expected migration
     await _verify_schema_version()
+
+    # Seed initial admin if AllowedUser table is empty
+    await _seed_initial_admin()
 
     # Load persisted Max plan accounts into in-memory pool
     await load_max_plan_pool()
@@ -3201,6 +3218,16 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     return {"status": overall, "components": components}
 
 
+@app.get("/api/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Return the authenticated user's profile and role."""
+    return {
+        "user_id": current_user["user_id"],
+        "email": current_user["email"],
+        "role": current_user["role"],
+    }
+
+
 @app.get("/api/version")
 async def get_version():
     """Public endpoint returning current backend version for frontend compatibility checks."""
@@ -3314,9 +3341,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Pydantic v2 error dicts may contain non-serializable objects in ctx
+    errors = []
+    for e in exc.errors():
+        clean = dict(e)
+        ctx = clean.pop("ctx", None)
+        if ctx:
+            clean["ctx"] = {k: str(v) for k, v in ctx.items()}
+        errors.append(clean)
     return JSONResponse(
         status_code=422,
-        content={"error": {"code": 422, "message": "Validation Error", "details": exc.errors()}},
+        content={"error": {"code": 422, "message": "Validation Error", "details": errors}},
     )
 
 @app.exception_handler(Exception)

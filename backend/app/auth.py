@@ -1,5 +1,7 @@
 from fastapi import Security, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 import os
 import logging
 import jwt
@@ -7,6 +9,9 @@ import secrets
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import auth as firebase_auth
+
+from app.database import get_session
+from app.models import AllowedUser, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +90,14 @@ def verify_agent_jwt(token: str) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid agent token")
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    session: AsyncSession = Depends(get_session),
+):
     """
     FastAPI Dependency to verify the frontend user's JWT using Firebase Auth,
-    or allow programmatic access via ADMIN_API_KEY.
+    then look up the user in the AllowedUser table for role assignment.
+    Also allows programmatic access via ADMIN_API_KEY.
     """
     token = credentials.credentials
 
@@ -97,17 +106,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
         return {"user_id": "admin-api-key", "email": "admin@system.local", "role": "admin"}
 
     try:
-        # Verify the ID token using Firebase Admin SDK
         decoded_token = firebase_auth.verify_id_token(token)
-        # Check for admin custom claim (set via Firebase Admin SDK: auth.set_custom_user_claims)
-        custom_claims = decoded_token.get("custom_claims", {}) or {}
-        role = "admin" if (decoded_token.get("admin") or custom_claims.get("admin")) else "user"
-        return {
-            "user_id": decoded_token.get("uid"),
-            "email": decoded_token.get("email"),
-            "email_verified": decoded_token.get("email_verified", False),
-            "role": role,
-        }
     except (
         firebase_admin.auth.InvalidIdTokenError,
         firebase_admin.auth.ExpiredIdTokenError,
@@ -129,6 +128,40 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication service error",
         )
+
+    uid = decoded_token.get("uid")
+    email = decoded_token.get("email")
+
+    # Look up user in AllowedUser table
+    result = await session.execute(
+        select(AllowedUser).where(AllowedUser.email == email)
+    )
+    allowed_user = result.scalar_one_or_none()
+
+    if not allowed_user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized. Contact an administrator to request access.",
+        )
+
+    # Link Firebase UID on first sign-in
+    if not allowed_user.firebase_uid:
+        allowed_user.firebase_uid = uid
+    # Update display name from Firebase if available
+    display_name = decoded_token.get("name")
+    if display_name and allowed_user.display_name != display_name:
+        allowed_user.display_name = display_name
+    # Track last login
+    allowed_user.last_login_at = _utcnow()
+    session.add(allowed_user)
+    await session.commit()
+
+    return {
+        "user_id": uid,
+        "email": email,
+        "email_verified": decoded_token.get("email_verified", False),
+        "role": allowed_user.role,
+    }
 
 def require_admin(current_user: dict = Depends(get_current_user)):
     """

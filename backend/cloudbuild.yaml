@@ -32,7 +32,7 @@ steps:
       - '--service-account'
       - 'orchestrator-sa@$PROJECT_ID.iam.gserviceaccount.com'
       - '--set-env-vars'
-      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=5'
+      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=5,INITIAL_ADMIN_EMAIL=lihuanshen123@gmail.com'
       - '--set-secrets'
       # ANTHROPIC_API_KEY is optional — only needed as fallback if not using Max plan auth on VM images
       - 'DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest,REDIS_URL=REDIS_URL:latest'

@@ -44,6 +44,20 @@ class ArtifactType(str, Enum):
 
 # --- Models ---
 
+class AllowedUser(SQLModel, table=True):
+    """
+    Allowlist of users permitted to access the Blueprint application.
+    Roles are managed here instead of Firebase custom claims.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    firebase_uid: Optional[str] = Field(default=None, index=True)
+    role: str = Field(default="user")  # "admin" or "user"
+    display_name: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_login_at: Optional[datetime] = None
+
+
 class UserIntegration(SQLModel, table=True):
     """
     Stores third-party integrations for a user, such as GitHub App installations.

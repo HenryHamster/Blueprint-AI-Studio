@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
@@ -94,6 +94,8 @@ export interface HeaderBarProps {
   onMarkStable: () => Promise<void>;
   onRepairState: () => Promise<void>;
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
+  showUserManagement: boolean;
+  onToggleUserManagement: () => void;
 }
 
 
@@ -358,6 +360,17 @@ export function HeaderBar(props: HeaderBarProps) {
 
         {/* More secondary buttons — desktop only */}
         <div className="hidden md:flex items-center gap-2">
+          <button
+            onClick={props.onToggleUserManagement}
+            className={`p-2 rounded text-xs transition-colors border ${
+              props.showUserManagement
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            }`}
+            title="User Management"
+          >
+            <Users className="w-4 h-4" />
+          </button>
           <button
             onClick={onToggleArchive}
             className={`p-2 rounded text-xs transition-colors border ${

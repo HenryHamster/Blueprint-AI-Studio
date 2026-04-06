@@ -14,7 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
-from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, Project, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
 from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
@@ -3367,3 +3367,128 @@ async def get_digest(
         "recent_failures": recent_failures,
         "recent_completions": recent_completions,
     }
+
+
+# ── User Management ──────────────────────────────────────────────────────────
+
+class UserCreate(BaseModel):
+    email: str
+    role: str = "user"
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if "@" not in v:
+            raise ValueError("Invalid email address")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in ("admin", "user"):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
+
+
+class UserUpdate(BaseModel):
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in ("admin", "user"):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
+
+
+@router.get("/users")
+async def list_users(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await session.execute(
+        select(AllowedUser).order_by(AllowedUser.created_at.desc())
+    )
+    users = result.scalars().all()
+    return [
+        {
+            "id": str(u.id),
+            "email": u.email,
+            "role": u.role,
+            "display_name": u.display_name,
+            "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users
+    ]
+
+
+@router.post("/users", status_code=201)
+async def add_user(
+    payload: UserCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    existing = (await session.execute(
+        select(AllowedUser).where(AllowedUser.email == payload.email)
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="User with this email already exists")
+
+    user = AllowedUser(email=payload.email, role=payload.role)
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "role": user.role,
+        "display_name": user.display_name,
+        "last_login_at": None,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+@router.patch("/users/{user_id}")
+async def update_user(
+    user_id: uuid.UUID,
+    payload: UserUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    user = await session.get(AllowedUser, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.role = payload.role
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "role": user.role,
+        "display_name": user.display_name,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+@router.delete("/users/{user_id}")
+async def remove_user(
+    user_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    user = await session.get(AllowedUser, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Prevent self-deletion
+    if user.firebase_uid == current_user.get("user_id") or user.email == current_user.get("email"):
+        raise HTTPException(status_code=400, detail="Cannot remove your own access")
+
+    await session.delete(user)
+    await session.commit()
+    return {"message": f"User {user.email} removed"}
