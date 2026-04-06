@@ -542,6 +542,20 @@ class TestMaxPlanPool:
 class TestResearchSpawning:
     """Tests for _spawn_research_task() guard conditions."""
 
+    @pytest.fixture(autouse=True)
+    def _ensure_test_accounts(self):
+        """Ensure _spawn_research_task finds available accounts for test users."""
+        for uid in ("user1", _TEST_USER):
+            entry = {"id": f"acct-{uid}", "user_id": uid, "name": "test", "enabled": True,
+                     "active_tasks": 0, "oauth_token": "sk-ant-test", "total_tasks": 0,
+                     "token_created_at": None, "claude_config_json": None}
+            _max_plan_pools.setdefault(uid, []).append(entry)
+            _account_by_id[f"acct-{uid}"] = entry
+        yield
+        for uid in ("user1", _TEST_USER):
+            _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != f"acct-{uid}"]
+            _account_by_id.pop(f"acct-{uid}", None)
+
     # ── Test 1: autonomous disabled → no task spawned ───────────────────────
 
     @pytest.mark.asyncio

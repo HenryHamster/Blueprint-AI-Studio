@@ -679,7 +679,7 @@ async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { 
 
     // Kill Claude if it exceeds 30 minutes — kill entire process group (negative PID)
     // so child processes (npm, pytest, etc.) are also terminated
-    const CLAUDE_TIMEOUT_MS = 30 * 60 * 1000;
+    const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
     const killTimer = setTimeout(() => {
       log('Claude Code process timed out after 30 minutes — killing process group');
       sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
@@ -1636,7 +1636,7 @@ ${hotspotsSection}
         }
         let historySection = '';
         if (history.length > 0) {
-          const entries = history.slice(-3).map((h) => {
+          const entries = history.slice(-5).map((h) => {
             const titles = Array.isArray(h.finding_titles) ? (h.finding_titles as string[]).join(', ') : 'none';
             const descs = Array.isArray(h.key_finding_descriptions)
               ? '\n    Key findings: ' + (h.key_finding_descriptions as string[]).map(d => d.slice(0, 150)).join(' | ')
@@ -1646,6 +1646,12 @@ ${hotspotsSection}
             if (typeof h.tasks_failed === 'number' && h.tasks_failed > 0) outcomeParts.push(`${h.tasks_failed} failed`);
             if (typeof h.tasks_cancelled === 'number' && h.tasks_cancelled > 0) outcomeParts.push(`${h.tasks_cancelled} cancelled`);
             const outcomeStats = outcomeParts.length > 0 ? ` (${outcomeParts.join(', ')})` : '';
+            const failedDetails = Array.isArray(h.failed_task_details)
+              ? (h.failed_task_details as Array<{title: string; reason: string}>)
+                  .map(f => `    FAILED: ${f.title}${f.reason ? ` — ${f.reason.slice(0, 100)}` : ''}`)
+                  .join('\n')
+              : '';
+            const failedSection = failedDetails ? '\n' + failedDetails : '';
             const insights = Array.isArray(h.cycle_insights) && (h.cycle_insights as string[]).length > 0
               ? '\n    Insights: ' + (h.cycle_insights as string[]).join(' | ')
               : '';
@@ -1659,9 +1665,9 @@ ${hotspotsSection}
                   return `    Sub-research (depth ${String(s.depth)}): ${String(s.tasks_created)} tasks (${findingTitles.join(', ')})${subInsights}`;
                 }).join('\n')
               : '';
-            return `  - ${String(h.timestamp)}: ${String(h.tasks_created)} tasks created${outcomeStats} — ${titles}${descs}${insights}${subSummary}`;
+            return `  - ${String(h.timestamp)}: ${String(h.tasks_created)} tasks created${outcomeStats} — ${titles}${descs}${failedSection}${insights}${subSummary}`;
           }).join('\n');
-          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 3)}):${aggregateSection}\n${entries}`;
+          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 5)}):${aggregateSection}\n${entries}`;
         }
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
@@ -1767,12 +1773,19 @@ Instructions:
    - Use TodoWrite to track what you've explored and what gaps remain — don't stop at the first few easy finds
    - For each active direction, ask yourself: "what would it take for this direction to be DONE?" Then work backward from that goal to find the gaps that matter most.
    - Think about what the system CAN'T do today, not what it does slightly wrong. Missing capabilities > polish.
+   - Before writing findings, verify you have explored at MINIMUM:
+     a) All directories mentioned in the direction's scope (or top-level dirs if no scope)
+     b) At least 3 subagents for parallel exploration of different areas
+     c) At least 1 WebSearch for best practices related to the direction's goal
+     d) A TodoWrite checklist of areas explored and gaps remaining
+   - If your TodoWrite checklist shows unexplored areas, keep exploring before writing findings.
 2. Based on your exploration and external research, identify specific, actionable improvements. Findings must be medium or large scope — small-scope findings are only acceptable when bundled together. For each finding, assess scope and risk.
-3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. The reviewer must reject any finding that is:
-   - Cosmetic or polish (badges, indicators, UI tweaks that don't unlock capability)
-   - Trivially small (<50 lines, single file, could be done in 5 minutes)
-   - "Add X to Y" without architectural significance
-   Have the reviewer rewrite the findings file, CUTTING weak findings ruthlessly. 3 strong findings > 8 mediocre ones.
+3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. The reviewer should:
+   - REJECT findings that are cosmetic, trivially small (<50 lines), or "add X to Y" without architectural significance
+   - RANK remaining findings by impact (high/medium/low)
+   - KEEP at least 5 findings after filtering — if fewer survive, the reviewer should explain what areas need deeper exploration rather than just cutting
+   - Improve prompt quality on surviving findings (make them more specific and self-contained)
+   Do NOT instruct the reviewer to minimize count. Volume of strong findings is good — the pipeline handles it.
 4. Output your final findings as a JSON array as the VERY LAST thing in your response:
 
 [
@@ -1810,7 +1823,7 @@ Valid values:
 
 Rules:
 - ALL findings must be scope=medium or scope=large. The ONLY exception: you may have ONE scope=small finding that bundles multiple trivial fixes together. If you can only find small fixes, you haven't explored deeply enough.
-- Limit to 15 findings maximum. Aim for 5-10 high-impact findings.
+- Target 8-12 findings. Minimum 5 — if you have fewer than 5, you stopped exploring too early. Maximum 15.
 - When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
 - Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
 - A finding should be ONE PR-sized unit of work (scope=medium for multi-file work, scope=large for architectural changes)
@@ -1873,7 +1886,7 @@ Rules for direction proposals:
 
 Context — you are part of an autonomous pipeline:
 - You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
-- Think BIG. Each finding spawns a full VM, an implementing agent, a review cycle, and a PR merge. That pipeline exists to handle complexity — use it. A cycle that produces 2-3 substantial findings (new subsystems, architectural refactors, cross-cutting capabilities) is worth 10x more than one with 8 small UI tweaks.
+- Think BIG. Each finding spawns a full VM, an implementing agent, a review cycle, and a PR merge. That pipeline exists to handle complexity — use it. A cycle that produces 5-8 substantial findings (new subsystems, architectural refactors, cross-cutting capabilities) is the target. Don't stop at 3 — keep exploring until you have 8+.
 - Keep the codebase clean. Other agents will read and modify the same code after you. Messy patterns multiply — extensible patterns compound.
 - Use type=research findings for areas that need deeper investigation before implementation. This spawns a sub-research agent to dig in further. Don't rush to implement something you're uncertain about.
 - PREFER scope=large findings. The pipeline has a planning agent that decomposes large work into safe subtasks. Don't shy away from proposing ambitious work — propose the thing that actually matters, not a watered-down version of it.

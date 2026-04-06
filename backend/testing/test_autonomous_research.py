@@ -20,7 +20,20 @@ from sqlalchemy import select
 
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion
+from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id
+
+
+@pytest.fixture(autouse=True)
+def _ensure_test_account_pool():
+    """Ensure _spawn_research_task finds an available account for the test user."""
+    uid = "test-user-123"
+    entry = {"id": "test-acct", "user_id": uid, "name": "test", "enabled": True, "active_tasks": 0,
+             "oauth_token": "sk-ant-test", "total_tasks": 0, "token_created_at": None, "claude_config_json": None}
+    _max_plan_pools.setdefault(uid, []).append(entry)
+    _account_by_id["test-acct"] = entry
+    yield
+    _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"]
+    _account_by_id.pop("test-acct", None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

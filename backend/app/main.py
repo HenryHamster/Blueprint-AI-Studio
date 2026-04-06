@@ -1104,6 +1104,12 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
+    # Guard: don't spawn if user has no available accounts (avoids immediate failure)
+    user_pool = _max_plan_pools.get(project.user_id, [])
+    has_available = any(_account_available_for_model(a, None) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    if not has_available:
+        logger.info(f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts")
+        return
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
@@ -1912,7 +1918,7 @@ async def reaper_service():
                     # Separate provision failures from agent failures for retry budgeting
                     is_provision_failure = fresh_task.status == TaskStatus.PROVISIONING
                     provision_failures = (task.context or {}).get("provision_failures", 0)
-                    max_provision_retries = 2
+                    max_provision_retries = 3
                     can_retry = False
 
                     # Rate-limited tasks: requeue without burning retry budget
@@ -2456,7 +2462,7 @@ async def orchestrator_worker():
                         and t.started_at and t.started_at < ten_min_ago):
                         # Check provision failure limit before requeueing
                         provision_failures = (t.context or {}).get("provision_failures", 0) + 1
-                        if provision_failures >= 5:
+                        if provision_failures >= 3:
                             t.status = TaskStatus.FAILED
                             t.latest_status_message = f"Failed after {provision_failures} provision attempts"
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
@@ -2880,29 +2886,47 @@ async def orchestrator_worker():
                             if not success and acct_id_for_release:
                                 await release_max_plan_account(acct_id_for_release)
                         if not success:
-                            logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}")
+                            provision_err = get_provision_error(vm_id)
+                            logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}")
                             record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
-                            # Mark as failed immediately to avoid 10 min wait
+                            # Requeue with retry tracking — zone exhaustion is transient
                             try:
                                 async with AsyncSessionLocal() as inner_session:
                                     failed_task = await inner_session.get(Task, t_id)
                                     if failed_task:
-                                        failed_task.status = TaskStatus.FAILED
-                                        provision_err = get_provision_error(vm_id)
-                                        failed_task.latest_status_message = f"VM provisioning failed ({vm_id}): {provision_err or 'unknown error'}"
+                                        ctx = dict(failed_task.context or {})
+                                        prov_failures = ctx.get("provision_failures", 0) + 1
+                                        ctx["provision_failures"] = prov_failures
+                                        max_prov_retries = 3
+                                        if prov_failures >= max_prov_retries:
+                                            # Exhausted retries — permanent failure
+                                            failed_task.status = TaskStatus.FAILED
+                                            failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
+                                            await _maybe_create_failure_alert(
+                                                failed_task, inner_session,
+                                                (provision_err or "unknown error")[:200]
+                                            )
+                                            logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
+                                        else:
+                                            # Requeue for retry — zone exhaustion is transient
+                                            failed_task.status = TaskStatus.QUEUED
+                                            failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                                            failed_task.last_heartbeat = None
+                                            failed_task.started_at = None
+                                            # Back off 2 min per failure to let zones recover
+                                            ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
+                                            failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
+                                            logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
+                                        failed_task.context = ctx
                                         inner_session.add(failed_task)
-                                        await _maybe_create_failure_alert(
-                                            failed_task, inner_session,
-                                            (provision_err or "unknown error")[:200]
-                                        )
                                         await inner_session.commit()
                                         await broadcast_to_project(
                                             str(p_id),
                                             "task_updated",
-                                            {"task_id": str(t_id), "status": TaskStatus.FAILED}
+                                            {"task_id": str(t_id), "status": failed_task.status}
                                         )
                             except Exception as e:
-                                logger.error(f"[ORCHESTRATOR] Error marking task {t_id} as failed: {e}", exc_info=True)
+                                logger.error(f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}", exc_info=True)
                             # Delete partially-created VM (may exist if insert succeeded but wait failed)
                             await _ensure_vm_deleted(vm_id, reason="provision_failure")
 
@@ -5070,28 +5094,38 @@ async def _ensure_branch(
     Returns True on success, False on failure (task set to FAILED).
     """
     gh_token = owner = repo = None
-    try:
-        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-        sha = await get_branch_sha(gh_token, owner, repo, source_branch)
-        await create_branch(gh_token, owner, repo, branch_name, sha)
-        logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
-        return True
-    except Exception as e:
-        if gh_token:
-            try:
-                await get_branch_sha(gh_token, owner, repo, branch_name)
-                logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
-                return True
-            except Exception:
-                logger.error(f"[{label}] Branch {branch_name} does not exist and creation failed: {e!r}")
-        else:
-            logger.error(f"[{label}] Cannot create branch — GitHub token unavailable: {e!r}")
-        task.status = TaskStatus.FAILED
-        task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
-        session.add(task)
-        await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
-        await session.commit()
-        return False
+    last_err = None
+    for _attempt in range(3):
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+            sha = await get_branch_sha(gh_token, owner, repo, source_branch)
+            await create_branch(gh_token, owner, repo, branch_name, sha)
+            logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
+            return True
+        except Exception as e:
+            last_err = e
+            if gh_token:
+                try:
+                    await get_branch_sha(gh_token, owner, repo, branch_name)
+                    logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
+                    return True
+                except Exception:
+                    pass
+            if _attempt < 2:
+                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {5 * (2 ** _attempt)}s: {e!r}")
+                await asyncio.sleep(5 * (2 ** _attempt))
+            else:
+                if gh_token:
+                    logger.error(f"[{label}] Branch {branch_name} creation failed after 3 attempts: {last_err!r}")
+                else:
+                    logger.error(f"[{label}] Cannot create branch — GitHub token unavailable: {last_err!r}")
+    e = last_err
+    task.status = TaskStatus.FAILED
+    task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
+    session.add(task)
+    await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
+    await session.commit()
+    return False
 
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
@@ -5915,14 +5949,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     await session.commit()
 
-    # Update last_researched_at only for directions that actually produced findings,
-    # not all directions in the payload. This allows directions with no findings to
-    # be re-researched sooner instead of all going on cooldown simultaneously.
+    # Update last_researched_at for directions that produced findings.
+    # Also update the current direction if all findings were deduped — prevents
+    # the system from immediately re-researching and hitting the same duplicates.
     direction_ids_with_findings = set()
     for ct in child_tasks:
         did = (ct.context or {}).get("direction_id")
         if did:
             direction_ids_with_findings.add(did)
+    # If all findings were deduped, still put the current direction on cooldown
+    current_direction_id = (task.context or {}).get("direction_id")
+    all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
+    if all_deduped and current_direction_id:
+        direction_ids_with_findings.add(current_direction_id)
     if direction_ids_with_findings:
         project = await session.get(Project, task.project_id)
         if project:
@@ -6081,6 +6120,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session.add(summary_artifact)
 
     task.status = TaskStatus.EVALUATING
+    direction_id = (task.context or {}).get("direction_id", "?")
+    logger.info(
+        f"[RESEARCH] Task {task.id}: {len(findings)} raw findings, "
+        f"{skipped_duplicates} deduped, {len(child_tasks)} tasks created "
+        f"(direction: {str(direction_id)[:8]})"
+    )
     task.latest_status_message = (
         f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
         + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
@@ -6344,21 +6389,40 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             await session.commit()
         return
 
-    # Surface what's blocking if children are done but not all merged
+    # All children terminal but not all succeeded — finalize immediately instead of waiting 6 hours
     if not all_done and active_count == 0 and not pipeline_active:
         unmerged = [c for c in children
                     if c.status == TaskStatus.COMPLETED and not (c.context or {}).get("pr_merged")]
         failed = [c for c in children if c.status == TaskStatus.FAILED]
+        completed_merged = [c for c in children
+                           if c.status == TaskStatus.COMPLETED and (c.context or {}).get("pr_merged")]
+
         if unmerged:
+            # Some completed but PRs not yet merged — wait for merge verification
             titles = [c.title[:40] for c in unmerged]
             parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
             logger.error(f"[ROLLUP] Parent {parent.id} blocked — {len(unmerged)} children completed but unmerged")
-        elif failed:
-            parent.latest_status_message = f"{len(failed)} subtask(s) failed — requeue parent to retry"
-            logger.error(f"[ROLLUP] Parent {parent.id} blocked — {len(failed)} children failed")
-        session.add(parent)
-        await session.commit()
-        return
+            session.add(parent)
+            await session.commit()
+            return
+
+        # No unmerged PRs — only failed/cancelled/merged children remain
+        if completed_merged:
+            # Some succeeded — proceed with partial rollup of what worked
+            logger.warning(f"[ROLLUP] Parent {parent.id} — {len(failed)} failed, {len(completed_merged)} succeeded. Rolling up successes.")
+            all_done = True  # Let rollup proceed with merged children
+            # Fall through to rollup logic below
+        else:
+            # Nothing succeeded — fail the parent immediately
+            parent.status = TaskStatus.FAILED
+            parent.latest_status_message = f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
+            session.add(parent)
+            await _maybe_create_failure_alert(parent, session, f"{len(failed)} subtasks failed, none succeeded")
+            await session.commit()
+            await broadcast_to_project(str(parent.project_id), "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+            logger.error(f"[ROLLUP] Parent {parent.id} — all {len(failed)} children failed, marking parent FAILED")
+            return
 
     child_statuses = [c.status for c in children]
 
@@ -6381,9 +6445,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
 
         completed_count = len(children) - cancelled_count
+        failed_children = [c for c in children if c.status == TaskStatus.FAILED]
         rollup_note = ""
         if cancelled_count > 0:
-            rollup_note = f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
+            rollup_note += f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
+        if failed_children:
+            rollup_note += f"\n\n*{len(failed_children)} subtask(s) failed and were excluded from this rollup.*"
 
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
@@ -6612,15 +6679,27 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         except Exception as cleanup_err:
                             logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
             except Exception as e:
-                logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
-                parent.status = TaskStatus.FAILED
-                parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
-                if gh_token:
-                    try:
-                        await delete_branch(gh_token, owner, repo, staging_branch)
-                        logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (rollup exception)")
-                    except Exception as cleanup_err:
-                        logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
+                err_str = str(e).lower()
+                is_transient = any(kw in err_str for kw in [
+                    "api.github.com", "502", "503", "connection", "timeout",
+                    "rate limit", "ssl", "name resolution",
+                ])
+                rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
+                if is_transient and rollup_retries <= 3:
+                    # Transient GitHub error — leave parent EVALUATING, retry next cycle
+                    parent.context = {**(parent.context or {}), "_rollup_retries": rollup_retries}
+                    parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/3), will retry: {type(e).__name__}"
+                    logger.warning(f"[ROLLUP] Transient error creating rollup PR (attempt {rollup_retries}): {e}")
+                else:
+                    logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
+                    parent.status = TaskStatus.FAILED
+                    parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
+                    if gh_token:
+                        try:
+                            await delete_branch(gh_token, owner, repo, staging_branch)
+                            logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (rollup exception)")
+                        except Exception as cleanup_err:
+                            logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
@@ -7301,10 +7380,25 @@ async def _process_post_commit(
                     f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",
                     exc_info=True,
                 )
-                task.latest_status_message = (
-                    f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
-                )
-                task.status = TaskStatus.FAILED
+                # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
+                err_str = str(handler_exc).lower()
+                is_transient = any(kw in err_str for kw in [
+                    "api.github.com", "502", "503", "connection", "timeout",
+                    "rate limit", "ssl", "name resolution", "connection refused",
+                ])
+                if is_transient and task.attempt_count < _runtime_config["max_retries"]:
+                    task.status = TaskStatus.QUEUED
+                    task.attempt_count += 1
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    task.last_heartbeat = None
+                    task.started_at = None
+                    task.latest_status_message = f"Handler hit transient error, requeuing (attempt {task.attempt_count}): {type(handler_exc).__name__}"
+                    logger.warning(f"[HANDLER] Transient error for {task.id}, requeuing: {handler_exc}")
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.latest_status_message = (
+                        f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
+                    )
                 session.add(task)
 
         # 6. Parent task rollup — delegated to shared function
@@ -7687,30 +7781,32 @@ async def update_agent_status(
 
                     # Track API failure retries to prevent infinite loops
                     ctx = dict(task.context or {})
+                    should_requeue = True
                     if failure_class == "EXTERNAL_API":
                         api_retries = ctx.get("_api_failure_retries", 0) + 1
+                        ctx["_api_failure_retries"] = api_retries
                         if api_retries > 3:
-                            logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — giving up")
-                        else:
-                            ctx["_api_failure_retries"] = api_retries
+                            logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                            should_requeue = False
 
-                    old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
-                    task.status = TaskStatus.QUEUED
-                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    task.last_heartbeat = None
-                    task.started_at = None
-                    task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
-                    # Clear stale retry_after so dispatcher picks it up immediately
-                    ctx.pop("retry_after", None)
-                    ctx.pop("blacklisted_accounts", None)
-                    task.context = ctx
-                    session.add(task)
-                    await session.commit()
-                    await broadcast_to_project(str(task.project_id), "task_updated",
-                        {"task_id": str(task.id), "status": TaskStatus.QUEUED})
-                    logger.info(f"[AGENT STATUS] Task {task.id} rate-limited — requeued without burning retry")
-                    await _ensure_vm_deleted(old_vm_id_rl, reason="rate_limit_requeue")
-                    return {"status": "accepted"}
+                    if should_requeue:
+                        old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
+                        task.status = TaskStatus.QUEUED
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        task.last_heartbeat = None
+                        task.started_at = None
+                        task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
+                        # Clear stale retry_after so dispatcher picks it up immediately
+                        ctx.pop("retry_after", None)
+                        ctx.pop("blacklisted_accounts", None)
+                        task.context = ctx
+                        session.add(task)
+                        await session.commit()
+                        await broadcast_to_project(str(task.project_id), "task_updated",
+                            {"task_id": str(task.id), "status": TaskStatus.QUEUED})
+                        logger.info(f"[AGENT STATUS] Task {task.id} {failure_class} — requeued without burning retry")
+                        await _ensure_vm_deleted(old_vm_id_rl, reason="rate_limit_requeue")
+                        return {"status": "accepted"}
         except Exception as e:
             logger.error(f"[STATUS] Exception during result recording for task {task.id}: {e!r}", exc_info=True)
 

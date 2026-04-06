@@ -3,19 +3,22 @@
 Usage:
     python scripts/tasks.py list [--status STATUS] [--limit N] [-v]
     python scripts/tasks.py show <id_or_title>
+    python scripts/tasks.py scope <id_or_title> [-v]       — show prompt, research question, payload
     python scripts/tasks.py tree <parent_id>
-    python scripts/tasks.py diagnose                       — health check all active tasks (attempts, errors, memory)
+    python scripts/tasks.py children <parent_id> [--all]   — list children with merge status
+    python scripts/tasks.py diagnose                       — health check all active tasks
     python scripts/tasks.py failures                       — analyze failed tasks, group by root cause
     python scripts/tasks.py health                         — system health: autonomy, deploy, settings
-    python scripts/tasks.py complete <task_id> [--message MSG]  — mark task as COMPLETED
-    python scripts/tasks.py set-status <task_id> <status> [--message MSG]  — set arbitrary status
-    python scripts/tasks.py requeue <task_id> [<task_id> ...]
-    python scripts/tasks.py cancel <task_id> [<task_id> ...]
+    python scripts/tasks.py evaluating [-v]                — EVALUATING tasks (verbose: research Q + children)
+    python scripts/tasks.py autonomy-debug [project_id]    — why autonomy isn't spawning
+    python scripts/tasks.py complete <task_id> [--message]
+    python scripts/tasks.py set-status <task_id> <status> [--message]
+    python scripts/tasks.py requeue <task_id> [...]
+    python scripts/tasks.py cancel <task_id> [...]
     python scripts/tasks.py cancel-all [--status STATUS]
-    python scripts/tasks.py evaluating
     python scripts/tasks.py requeue-ci
-    python scripts/tasks.py trigger-rollup [<parent_id>]    — mark unmerged children as merged, trigger rollup
-    python scripts/tasks.py children <parent_id> [--all]   — list children with merge status
+    python scripts/tasks.py trigger-rollup [<parent_id>]
+    python scripts/tasks.py archive [--completed]          — archive old terminal tasks
 """
 import json
 import sys
@@ -259,20 +262,50 @@ def cmd_cancel_all(args):
 
 
 def cmd_evaluating(args):
-    """Show all EVALUATING tasks with blocking info."""
+    """Show all EVALUATING tasks with scope, research question, and blocking info."""
+    from blueprint_api import api
     tasks = list_tasks(status="EVALUATING")
     if not tasks:
         print("No EVALUATING tasks.")
         return
+    verbose = "-v" in args or "--verbose" in args
     for t in tasks:
         ctx = t.get("context") or {}
         loop = ctx.get("review_loop", {})
         ci = loop.get("ci_waiting", False)
         pr = loop.get("pr_number", "-")
+        ptype = (t.get("payloads") or [{}])[0].get("type", t.get("task_type", "?"))
         msg = _safe(t.get("latest_status_message") or "", 80)
-        print(f"  {t['id'][:8]}  {_safe(t['title'], 55):<55}  ci={ci}  pr={pr}")
+        print(f"  {t['id'][:8]}  [{ptype:8}]  {_safe(t['title'], 50):<50}  ci={ci}  pr={pr}")
         if msg:
             print(f"           {msg}")
+        # Show scope for research/plan parents
+        if verbose and ptype in ("research", "plan"):
+            try:
+                full = api("GET", f"/api/admin/tasks/{t['id']}")
+                ft = full.get("task", full)
+                payloads = ft.get("payloads") or []
+                if payloads:
+                    prompt = payloads[0].get("prompt", "")
+                    scope = (ft.get("context") or {}).get("scope", "")
+                    rq = (ft.get("context") or {}).get("research_question", "")
+                    if rq:
+                        print(f"           Q: {_safe(rq, 120)}")
+                    if scope:
+                        print(f"           Scope: {_safe(scope, 100)}")
+                    if prompt and not rq:
+                        print(f"           Prompt: {_safe(prompt, 120)}")
+                # Show child summary
+                children = _get_children(t['id'][:8])
+                if children:
+                    by_status = {}
+                    for c in children:
+                        by_status.setdefault(c["status"], []).append(c)
+                    parts = [f"{s}={len(v)}" for s, v in sorted(by_status.items())]
+                    merged = sum(1 for c in children if (c.get("context") or {}).get("pr_merged"))
+                    print(f"           Children: {len(children)} ({', '.join(parts)}, merged={merged})")
+            except Exception:
+                pass
 
 
 def cmd_requeue_ci(args):
@@ -498,6 +531,106 @@ def cmd_set_status(args):
         print(f"  {t['id'][:8]}: FAILED -- {e}")
 
 
+def cmd_scope(args):
+    """Show the prompt, research question, and payload for a task — what it's actually doing."""
+    from blueprint_api import api
+    if not args:
+        print("Usage: tasks.py scope <id_or_title>")
+        return
+    query = args[0]
+    t = _resolve_task(query)
+    if not t:
+        print(f"Task '{query}' not found.")
+        return
+    # Fetch full task
+    try:
+        full = api("GET", f"/api/admin/tasks/{t['id']}")
+        t = full.get("task", full)
+    except Exception:
+        pass
+
+    tid = t["id"][:8]
+    title = t.get("title", "?")
+    status = t.get("status", "?")
+    ptype = (t.get("payloads") or [{}])[0].get("type", t.get("task_type", "?"))
+    ctx = t.get("context") or {}
+    payloads = t.get("payloads") or []
+
+    print(f"=== {tid} [{ptype}] {status} ===")
+    print(f"Title: {title}")
+    print()
+
+    # Research question
+    rq = ctx.get("research_question", "")
+    if rq:
+        print(f"Research Question:")
+        print(f"  {rq}")
+        print()
+
+    # Scope
+    scope = ctx.get("scope", "")
+    if scope:
+        print(f"Scope: {scope}")
+        print()
+
+    # Prompt from payload
+    if payloads:
+        prompt = payloads[0].get("prompt", "")
+        if prompt:
+            print(f"Prompt ({len(prompt)} chars):")
+            # Show first 500 chars, full if -v
+            lim = len(prompt) if ("-v" in args or "--verbose" in args) else 500
+            print(f"  {_safe(prompt[:lim], lim)}")
+            if len(prompt) > lim:
+                print(f"  ... ({len(prompt) - lim} more chars, use -v for full)")
+            print()
+
+    # PR info
+    pr_num = (payloads[0] if payloads else {}).get("pr_number")
+    branch = (payloads[0] if payloads else {}).get("branch", "")
+    base = (payloads[0] if payloads else {}).get("base_branch", "")
+    if pr_num:
+        print(f"PR: #{pr_num}  branch={branch}  base={base}")
+
+    # Artifacts
+    artifacts = t.get("artifacts") or {}
+    if isinstance(artifacts, list):
+        for art in artifacts:
+            pr_url = art.get("pr_url", "")
+            if pr_url:
+                print(f"PR URL: {pr_url}")
+    elif isinstance(artifacts, dict):
+        pr_url = artifacts.get("pr_url", "")
+        art_branch = artifacts.get("branch_name", "")
+        if pr_url:
+            print(f"PR URL: {pr_url}")
+        if art_branch:
+            print(f"Branch: {art_branch}")
+
+    # Children summary
+    children = _get_children(t["id"][:8])
+    if children:
+        print()
+        by_status = {}
+        for c in children:
+            by_status.setdefault(c["status"], []).append(c)
+        merged = sum(1 for c in children if (c.get("context") or {}).get("pr_merged"))
+        print(f"Children: {len(children)} (merged={merged})")
+        icons = {"QUEUED": "Q", "PROVISIONING": "P", "IN_PROGRESS": "R", "COMPLETED": "D",
+                 "FAILED": "F", "CANCELLED": "X", "EVALUATING": "E"}
+        for c in children:
+            cptype = (c.get("payloads") or [{}])[0].get("type", "?")
+            if cptype in ("review", "fix", "debug"):
+                continue
+            s = icons.get(c["status"], "?")
+            cm = (c.get("context") or {}).get("pr_merged", False)
+            c_arts = c.get("artifacts") or {}
+            cpr = c_arts[0].get("pr_url", "") if isinstance(c_arts, list) and c_arts else c_arts.get("pr_url", "") if isinstance(c_arts, dict) else ""
+            print(f"  [{s}] {c['id'][:8]}  {_safe(c.get('title',''), 55)}  merged={cm}")
+            if cpr:
+                print(f"       {cpr}")
+
+
 def cmd_failures(args):
     """Analyze failed tasks — group by root cause, show actionable details."""
     from blueprint_api import api
@@ -704,9 +837,86 @@ def cmd_health(args):
         print(f"  {st}: {len(all_t)}")
 
 
+def cmd_directions(args):
+    """Show research directions for a project."""
+    from blueprint_api import api, get_project_id
+    pid = args[0] if args and not args[0].startswith("-") else get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+    dirs = data.get("directions", data) if isinstance(data, dict) else data
+    if not dirs:
+        print("No research directions configured.")
+        return
+    print(f"=== RESEARCH DIRECTIONS ({len(dirs)}) ===")
+    for d in dirs:
+        prio = d.get("priority", "?")
+        text = _safe(d.get("text") or d.get("summary") or "?", 120)
+        did = (d.get("id") or "?")[:8]
+        saturated = d.get("saturated", False)
+        sat_str = " [SATURATED]" if saturated else ""
+        history = d.get("research_history") or []
+        hist_str = f"  ({len(history)} cycles)" if history else ""
+        print(f"  [{prio:6}] {did}  {text}{sat_str}{hist_str}")
+
+
+def cmd_autonomy_debug(args):
+    """Show why autonomy is or isn't spawning — blocking guards, eligible directions."""
+    from blueprint_api import api, get_project_id
+    pid = args[0] if args and not args[0].startswith("-") else get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/autonomy-debug")
+
+    print("=== AUTONOMY DEBUG ===")
+    print(f"  can_spawn: {data.get('can_spawn', '?')}")
+
+    guards = data.get('blocking_guards', [])
+    if guards:
+        print(f"\n--- Blocking Guards ({len(guards)}) ---")
+        for g in guards:
+            print(f"  {g.get('guard', '?')}: {g.get('reason', '?')}")
+            for k, v in g.items():
+                if k not in ('guard', 'reason'):
+                    print(f"    {k}: {v}")
+    else:
+        print("  No blocking guards.")
+
+    cb = data.get('circuit_breaker', {})
+    if cb:
+        print(f"\n--- Circuit Breaker ---")
+        print(f"  state={cb.get('state')}  failures={cb.get('failure_count')}  successes={cb.get('success_count')}")
+        if cb.get('cooldown_ends_at'):
+            print(f"  cooldown_until={cb['cooldown_ends_at']}")
+
+    dirs = data.get('eligible_directions', [])
+    if dirs:
+        print(f"\n--- Eligible Directions ({len(dirs)}) ---")
+        for d in dirs:
+            did = (d.get('id') or '?')[:8]
+            summary = (d.get('summary') or d.get('title') or '?')[:80]
+            cooldown = d.get('on_cooldown', False)
+            status = " (on cooldown)" if cooldown else ""
+            print(f"  {did}  {summary}{status}")
+
+    spawn = data.get('spawn_readiness', {})
+    if spawn:
+        print(f"\n--- Spawn Readiness ---")
+        for k, v in spawn.items():
+            print(f"  {k}: {v}")
+
+
+def cmd_archive(args):
+    """Archive old completed/failed tasks."""
+    from blueprint_api import api
+    filter_type = 'terminal'  # default: archive all terminal tasks
+    for i, a in enumerate(args):
+        if a == '--completed':
+            filter_type = 'completed'
+    result = api("POST", "/api/admin/tasks/bulk-archive", {"filter": filter_type})
+    print(f"Archived {result.get('archived_count', '?')} tasks (filter={filter_type}).")
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
+    "scope": cmd_scope,
     "tree": cmd_tree,
     "children": cmd_children,
     "diagnose": cmd_diagnose,
@@ -720,6 +930,9 @@ COMMANDS = {
     "evaluating": cmd_evaluating,
     "requeue-ci": cmd_requeue_ci,
     "trigger-rollup": cmd_trigger_rollup,
+    "directions": cmd_directions,
+    "autonomy-debug": cmd_autonomy_debug,
+    "archive": cmd_archive,
 }
 
 if __name__ == "__main__":

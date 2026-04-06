@@ -637,6 +637,8 @@ STATICENV
                 instance_config.machine_type = f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
+                # Re-assign to ensure protobuf picks up the change
+                instance_config.network_interfaces = [network_interface]
 
                 # Delete any existing VM with this name first (stale from retries)
                 try:

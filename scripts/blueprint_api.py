@@ -108,6 +108,27 @@ def create_task(
     return api("POST", "/api/admin/tasks", payload)
 
 
+_project_id_cache: str | None = None
+
+
+def get_project_id(project_id: str | None = None) -> str:
+    """Return a project ID. Uses explicit arg, config, or fetches the first project."""
+    global _project_id_cache
+    if project_id:
+        return project_id
+    cfg = load_config()
+    if cfg.get("project_id"):
+        return cfg["project_id"]
+    if _project_id_cache:
+        return _project_id_cache
+    projects = api("GET", "/api/admin/projects")
+    if not projects:
+        print("ERROR: No projects found.")
+        sys.exit(1)
+    _project_id_cache = projects[0]["id"]
+    return _project_id_cache
+
+
 def fmt_task(t: dict, verbose: bool = False) -> str:
     """Format a task as a one-line summary."""
     tid = t["id"][:8]
