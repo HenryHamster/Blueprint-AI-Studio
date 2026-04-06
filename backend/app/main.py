@@ -1965,17 +1965,21 @@ async def orchestrator_worker():
                 )).scalars().all()
 
                 # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
-                five_min_ago = _utcnow() - timedelta(minutes=5)
+                ten_min_ago = _utcnow() - timedelta(minutes=10)
                 stale_vm_ids = []
                 cancelled_provision_ids = []
                 for t in active_tasks_result:
-                    if (t.status == TaskStatus.PROVISIONING
-                        and (t.last_heartbeat is None or t.last_heartbeat < five_min_ago)
-                        and t.started_at and t.started_at < five_min_ago):
+                    if t.status != TaskStatus.PROVISIONING:
+                        continue
+                    # Skip if provision coroutine is still running — it hasn't
+                    # failed yet, just let it finish. Only requeue truly abandoned tasks.
+                    active_coro = _provision_coroutines.get(str(t.id))
+                    if active_coro and not active_coro.done():
+                        continue
+                    if ((t.last_heartbeat is None or t.last_heartbeat < ten_min_ago)
+                        and t.started_at and t.started_at < ten_min_ago):
                         stale_vm_ids.append(t.vm_instance_id)
-                        # Cancel the zombie provision coroutine to free the semaphore slot.
-                        # Without this, the coroutine holds a slot for up to 360s, starving
-                        # new provisions and creating a cascading vm_id mismatch failure.
+                        # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
                         if zombie and not zombie.done():
                             zombie.cancel()
@@ -2339,17 +2343,33 @@ async def orchestrator_worker():
                             success = await provision_agent_vm(vm_id, t_id, payload_uri,
                                                                oauth_token=token, claude_config_json=config_json)
                             if success:
-                                # Touch last_heartbeat so stale recovery (5-min threshold)
-                                # doesn't requeue while the VM is still booting.
+                                # Verify the task still wants this VM — stale recovery may have
+                                # requeued the task with a new vm_id while we were provisioning.
+                                # If so, this VM is an orphan: delete it immediately.
                                 try:
                                     async with AsyncSessionLocal() as hb_session:
                                         hb_task = await hb_session.get(Task, t_id)
-                                        if hb_task and hb_task.status == TaskStatus.PROVISIONING:
+                                        if not hb_task or hb_task.vm_instance_id != vm_id:
+                                            current_vm = hb_task.vm_instance_id if hb_task else "gone"
+                                            logger.warning(f"[ORCHESTRATOR] VM {vm_id} created but task {t_id} now has vm_id={current_vm} — deleting orphan")
+                                            await _ensure_vm_deleted(vm_id, reason="vm_id_mismatch")
+                                            success = False
+                                            return
+                                        if hb_task.status == TaskStatus.PROVISIONING:
                                             hb_task.last_heartbeat = _utcnow()
                                             hb_session.add(hb_task)
                                             await hb_session.commit()
                                 except Exception as e:
-                                    logger.warning(f"[ORCHESTRATOR] Failed to touch heartbeat after provision for {t_id}: {e}")
+                                    logger.warning(f"[ORCHESTRATOR] Failed to verify/touch heartbeat after provision for {t_id}: {e}")
+                        except asyncio.CancelledError:
+                            # Stale recovery cancelled us, but the underlying GCP thread may
+                            # still create the VM. Schedule a delayed cleanup to catch it.
+                            logger.warning(f"[ORCHESTRATOR] Provision for {vm_id} cancelled — scheduling orphan cleanup")
+                            async def _delayed_orphan_cleanup(orphan_vm_id: str):
+                                await asyncio.sleep(120)  # Wait for GCP thread to finish
+                                await _ensure_vm_deleted(orphan_vm_id, reason="cancelled_provision_orphan")
+                            asyncio.create_task(_delayed_orphan_cleanup(vm_id))
+                            raise
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
                             success = False
