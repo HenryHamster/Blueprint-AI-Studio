@@ -530,6 +530,16 @@ async def create_task_manually(
         active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
         task_payload["directions"] = active_directions
 
+    # Guard: cap active tasks per project to prevent queue explosion
+    active_count = (await session.execute(
+        select(func.count(Task.id)).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+        )
+    )).scalar() or 0
+    if active_count >= 200:
+        raise HTTPException(status_code=429, detail=f"Project has {active_count} active tasks (limit: 200)")
+
     new_task = Task(
         project_id=project.id,
         title=payload.title,
@@ -669,10 +679,19 @@ async def modify_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
     changes = {}
     if "status" in payload:
         try:
             new_status = TaskStatus(payload["status"])
+
+            # State machine validation: restrict invalid transitions
+            if new_status == TaskStatus.QUEUED and task.status not in _TERMINAL_STATUSES:
+                raise HTTPException(status_code=400, detail=f"Cannot requeue task in {task.status.value} state (must be completed/failed/cancelled)")
+            if task.status in _TERMINAL_STATUSES and new_status not in (TaskStatus.QUEUED,):
+                raise HTTPException(status_code=400, detail=f"Cannot transition from terminal state {task.status.value} to {new_status.value} (only requeue is allowed)")
+
             task.status = new_status
             changes["status"] = new_status.value
 
@@ -759,6 +778,9 @@ async def modify_task(
         was_blocked = task.requires_approval
         task.requires_approval = bool(payload["requires_approval"])
         changes["requires_approval"] = task.requires_approval
+
+        if was_blocked and not task.requires_approval:
+            logger.info(f"[ADMIN] Task {task.id} manually approved (was blocked: {task.latest_status_message or 'unknown reason'})")
 
         # Approval flow: if unblocking a completed task with a PR, continue pipeline
         if was_blocked and not task.requires_approval and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING):
@@ -1566,7 +1588,9 @@ async def add_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1595,7 +1619,9 @@ async def replace_directions(
     current_user: dict = Depends(get_current_user)
 ):
     """Replace the entire directions array for a project."""
-    project = await session.get(Project, project_id)
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1630,7 +1656,9 @@ async def remove_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1674,7 +1702,9 @@ async def reorder_directions(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1705,7 +1735,9 @@ async def update_direction(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await session.get(Project, project_id)
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )).scalars().first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 

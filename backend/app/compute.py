@@ -42,8 +42,47 @@ _vm_zones: dict[str, str] = {}
 # and stays well under GCP's 20 QPS rate limit.
 # Separate limits for slow insert (up to 300s) vs fast ops (list/delete/get, ~10s)
 # so long-running provisions don't starve orphan cleanup.
+# Local semaphore still used as secondary guard even with Redis (prevents thread starvation).
 _gcp_provision_semaphore = asyncio.Semaphore(6)  # insert/create — long-running (up to 300s)
 _gcp_ops_semaphore = asyncio.Semaphore(8)         # list/delete/get — fast ops (~10s)
+
+# Distributed provision semaphore via Redis sorted set (falls back to local-only)
+_PROVISION_REDIS_KEY = "blueprint:active-provisions"
+_MAX_GLOBAL_PROVISIONS = 6
+_PROVISION_SLOT_TTL = 600  # 10 min — auto-reclaim if process crashes
+
+
+async def _acquire_provision_slot(vm_id: str) -> bool:
+    """Acquire a global provision slot via Redis. Falls back to local semaphore check."""
+    from app.redis_client import get_redis
+    r = await get_redis()
+    if not r:
+        return True  # No Redis — rely on local semaphore only
+    try:
+        now = time.time()
+        pipe = r.pipeline()
+        pipe.zremrangebyscore(_PROVISION_REDIS_KEY, 0, now)  # Clean expired
+        pipe.zcard(_PROVISION_REDIS_KEY)
+        results = await pipe.execute()
+        count = results[1]
+        if count >= _MAX_GLOBAL_PROVISIONS:
+            return False
+        await r.zadd(_PROVISION_REDIS_KEY, {vm_id: now + _PROVISION_SLOT_TTL})
+        return True
+    except Exception as e:
+        logger.warning(f"[REDIS] Provision slot acquire failed, using local semaphore: {e}")
+        return True  # Degrade gracefully
+
+
+async def _release_provision_slot(vm_id: str):
+    """Release a global provision slot."""
+    from app.redis_client import get_redis
+    r = await get_redis()
+    if r:
+        try:
+            await r.zrem(_PROVISION_REDIS_KEY, vm_id)
+        except Exception:
+            pass  # Best-effort — TTL will reclaim
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
@@ -358,6 +397,49 @@ def _delete_agent_secret(vm_instance_id: str) -> None:
         logger.warning(f"Failed to delete agent secret {secret_name}: {e}")
 
 
+def _list_managed_secrets() -> list[tuple[str, str, datetime]]:
+    """List all blueprint-managed secrets with their vm_instance_id and create_time."""
+    from google.cloud import secretmanager
+
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{GCP_PROJECT_ID}"
+    results: list[tuple[str, str, datetime]] = []
+    for secret in client.list_secrets(request={"parent": parent, "filter": "labels.managed-by=blueprint"}):
+        vm_id = secret.labels.get("vm-instance", "")
+        if vm_id:
+            results.append((secret.name, vm_id, secret.create_time))
+    return results
+
+
+async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
+    """Delete secrets whose VM is no longer active. Skips secrets < 30 min old."""
+    if LOCAL_MODE:
+        return {"listed": 0, "deleted": 0, "skipped_young": 0, "failed": 0}
+
+    async with _gcp_ops_semaphore:
+        secrets = await asyncio.to_thread(_list_managed_secrets)
+
+    now = datetime.now(timezone.utc)
+    stats: dict[str, int] = {"listed": len(secrets), "deleted": 0, "skipped_young": 0, "skipped_active": 0, "failed": 0}
+    for _secret_name, vm_id, create_time in secrets:
+        if vm_id in active_vm_ids:
+            stats["skipped_active"] += 1
+            continue
+        # Ensure create_time is timezone-aware for comparison
+        ct = create_time if create_time.tzinfo else create_time.replace(tzinfo=timezone.utc)
+        age_seconds = (now - ct).total_seconds()
+        if age_seconds < 1800:  # < 30 min — could be mid-provision
+            stats["skipped_young"] += 1
+            continue
+        try:
+            async with _gcp_ops_semaphore:
+                await asyncio.to_thread(_delete_agent_secret, vm_id)
+            stats["deleted"] += 1
+        except Exception:
+            stats["failed"] += 1
+    return stats
+
+
 async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
                          oauth_token: str | None = None, claude_config_json: str | None = None):
     from google.cloud import compute_v1
@@ -458,6 +540,16 @@ STATICENV
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{ echo "Service start failed, powering off"; poweroff; }}
 
+    # 7b. Notify orchestrator that startup completed — early health signal
+    # Reads AGENT_SECRET_TOKEN from env file (written from Secret Manager above)
+    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
+    ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+    curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
+      -H "Content-Type: application/json" \
+      -H "X-Agent-Token: $AGENT_TOKEN" \
+      -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
+      --connect-timeout 10 --max-time 15 && echo "PROVISION_HEALTH_OK" || echo "PROVISION_HEALTH_FAILED (agent will self-report via heartbeat)"
+
     # Wait for the service to finish (with TTL guard)
     POLL_START=$(date +%s)
     while systemctl is-active --quiet blueprint-agent; do
@@ -522,6 +614,8 @@ STATICENV
     ]
     instance_config.service_accounts = [service_account]
 
+    _cancel_event = threading.Event()
+
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
         last_error = None
@@ -529,6 +623,9 @@ STATICENV
         skipped_cooldown = []
 
         for zone, subnet_name in FALLBACK_ZONES:
+            if _cancel_event.is_set():
+                logger.info(f"[PROVISION] {vm_instance_id} cancelled — skipping remaining zones")
+                return None
             # Skip zones in cooldown (recently failed) — use per-zone exponential backoff expiry
             zone_cooldown_expires = _zone_health.get(zone, {}).get("cooldown_expires_at")
             if zone_cooldown_expires and now < zone_cooldown_expires:
@@ -670,20 +767,37 @@ STATICENV
                 raise Exception(f"All zones in cooldown — soonest: {soonest_wait:.0f}s")
         raise last_error or Exception("All zones exhausted")
 
+    # Distributed provision slot (Redis sorted set with TTL fallback)
+    if not await _acquire_provision_slot(vm_instance_id):
+        _last_provision_error[vm_instance_id] = "Global provision capacity reached"
+        if len(_last_provision_error) > _PROVISION_ERROR_MAX:
+            _last_provision_error.popitem(last=False)
+        await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
+        return False
+
     try:
-        async with _gcp_provision_semaphore:
+        async with _gcp_provision_semaphore:  # Local guard still useful for thread pool
             operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=360)
         logger.info(f"GCP Operation completed: {operation_name}")
         return True
-    except Exception as e:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+        _cancel_event.set()  # Signal thread to stop trying more zones
         logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
         _last_provision_error[vm_instance_id] = str(e)[:300]
         if len(_last_provision_error) > _PROVISION_ERROR_MAX:
             _last_provision_error.popitem(last=False)
-        # Clean up the credential secret that was stored before provisioning began.
-        # Without this, the secret would be orphaned if all zones are exhausted.
         await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return False
+    except Exception as e:
+        _cancel_event.set()
+        logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
+        _last_provision_error[vm_instance_id] = str(e)[:300]
+        if len(_last_provision_error) > _PROVISION_ERROR_MAX:
+            _last_provision_error.popitem(last=False)
+        await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
+        return False
+    finally:
+        await _release_provision_slot(vm_instance_id)
 
 
 # ─── Shared VM Helpers (used by both delete and cleanup paths) ────────────
@@ -734,10 +848,10 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
 # ─── Individual VM Deletion ───────────────────────────────────────────────
 
 async def _delete_gcp(vm_instance_id: str):
-    """Delete a single VM. Deletes first, captures serial after (non-blocking forensics)."""
+    """Delete a single VM. Captures serial BEFORE deletion for reliable forensics."""
     logger.info(f"Issuing external kill command for VM: {vm_instance_id}")
 
-    def _find_and_delete():
+    def _find_capture_and_delete():
         from google.cloud import compute_v1
         instance_client = compute_v1.InstancesClient()
         zones_to_try = []
@@ -750,40 +864,29 @@ async def _delete_gcp(vm_instance_id: str):
         for zone in zones_to_try:
             try:
                 instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                # Found it — delete immediately (don't block on serial first)
+                # Capture serial BEFORE deletion (VM still exists)
+                serial_tail = _capture_serial_for_vm(vm_instance_id, zone)
+                # Now delete
                 operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
                 operation.result(timeout=300)
                 logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
-                return zone  # Return zone for post-delete serial capture
+                return zone, serial_tail
             except Exception as e:
                 if "was not found" in str(e) or "404" in str(e):
                     continue
                 raise
         logger.warning(f"VM {vm_instance_id} not found in any zone")
-        return None
+        return None, None
 
     try:
-        # Note: asyncio.wait_for cancels the awaitable on timeout but cannot kill
-        # the underlying OS thread. The thread will continue until the GCP API call
-        # returns or times out on its own. This is a Python limitation; the 60s cap
-        # here prevents the caller from blocking, not the thread from running.
         async with _gcp_ops_semaphore:
-            deleted_zone = await asyncio.wait_for(
-                asyncio.to_thread(_find_and_delete),
+            deleted_zone, serial_tail = await asyncio.wait_for(
+                asyncio.to_thread(_find_capture_and_delete),
                 timeout=60
             )
 
-        # Fire-and-forget serial capture (non-blocking forensics)
-        if deleted_zone:
-            async def _bg_serial():
-                try:
-                    async with _gcp_ops_semaphore:
-                        tail = await asyncio.to_thread(_capture_serial_for_vm, vm_instance_id, deleted_zone)
-                    if tail:
-                        logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{tail}")
-                except Exception as e:
-                    logger.warning(f"[VM-SERIAL] Could not fetch serial for {vm_instance_id}: {e}")
-            asyncio.create_task(_bg_serial())  # noqa: RUF006 — fire-and-forget background serial fetch
+        if serial_tail:
+            logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{serial_tail}")
 
         # Best-effort: clean up any leftover credentials secret
         async with _gcp_ops_semaphore:

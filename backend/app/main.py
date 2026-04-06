@@ -24,12 +24,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
-from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error
+from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, reconcile_orphaned_secrets
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
@@ -323,7 +324,7 @@ async def _get_actual_gcp_vm_count() -> int:
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 # Webhook dedup: track recent GitHub delivery IDs to prevent duplicate processing
-_webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp
+_webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp (in-memory fallback)
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
@@ -379,19 +380,27 @@ async def _init_deployment_state():
 
         if not state:
             # First boot — create the singleton row
-            state = DeploymentState(
-                id=1,
-                current_revision=_current_revision,
-                current_sha=_current_sha,
-                deployed_at=_utcnow(),
-                status=DeploymentStatus.STABLE,
-                last_known_good_revision=_current_revision,
-                last_known_good_sha=_current_sha,
-            )
-            session.add(state)
-            await session.commit()
-            logger.info(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
-            return
+            # Wrapped in try/except to handle race between multiple Cloud Run instances
+            try:
+                state = DeploymentState(
+                    id=1,
+                    current_revision=_current_revision,
+                    current_sha=_current_sha,
+                    deployed_at=_utcnow(),
+                    status=DeploymentStatus.STABLE,
+                    last_known_good_revision=_current_revision,
+                    last_known_good_sha=_current_sha,
+                )
+                session.add(state)
+                await session.commit()
+                logger.info(f"[DEPLOY] First boot — initialized deployment state (revision={_current_revision})")
+                return
+            except Exception:
+                await session.rollback()
+                # Another instance likely inserted first — fetch the row they created
+                state = await session.get(DeploymentState, 1)
+                if not state:
+                    raise  # Genuine error, not a race
 
         # Restore persisted runtime config values so settings survive restarts
         # Wrapped in try/except: if migration hasn't added these columns yet, skip gracefully
@@ -1368,6 +1377,7 @@ class ConnectionManager:
         self.active_connections: Dict[str, List[WebSocket]] = {}
         self.ip_connections: Dict[str, int] = {}
         self.MAX_CONNECTIONS_PER_IP = 20
+        self._lock = asyncio.Lock()
 
     async def check_and_add_ip(self, websocket: WebSocket) -> bool:
         client_ip = _get_websocket_client_ip(websocket)
@@ -1378,44 +1388,52 @@ class ConnectionManager:
             self.ip_connections[client_ip] = self.ip_connections.get(client_ip, 0) + 1
         return True
 
-    def remove_ip(self, websocket: WebSocket):
+    def _remove_ip(self, websocket: WebSocket):
         client_ip = _get_websocket_client_ip(websocket)
         if client_ip != "unknown" and client_ip in self.ip_connections:
             self.ip_connections[client_ip] -= 1
             if self.ip_connections[client_ip] <= 0:
                 del self.ip_connections[client_ip]
 
+    # Keep old name for any external callers
+    def remove_ip(self, websocket: WebSocket):
+        self._remove_ip(websocket)
+
     async def connect(self, websocket: WebSocket, project_id: str) -> bool:
-        if not await self.check_and_add_ip(websocket):
-            return False
+        async with self._lock:
+            if not await self.check_and_add_ip(websocket):
+                return False
 
-        if project_id not in self.active_connections:
-            self.active_connections[project_id] = []
-        self.active_connections[project_id].append(websocket)
-        return True
+            if project_id not in self.active_connections:
+                self.active_connections[project_id] = []
+            self.active_connections[project_id].append(websocket)
+            return True
 
-    def disconnect(self, websocket: WebSocket, project_id: str):
-        if project_id in self.active_connections:
-            if websocket in self.active_connections[project_id]:
-                self.active_connections[project_id].remove(websocket)
-            if not self.active_connections[project_id]:
-                del self.active_connections[project_id]
+    async def disconnect(self, websocket: WebSocket, project_id: str):
+        async with self._lock:
+            if project_id in self.active_connections:
+                if websocket in self.active_connections[project_id]:
+                    self.active_connections[project_id].remove(websocket)
+                if not self.active_connections[project_id]:
+                    del self.active_connections[project_id]
 
-        self.remove_ip(websocket)
+            self._remove_ip(websocket)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):
-        if project_id in self.active_connections:
-            message = {"event": event_type, "data": data}
-            # Create a copy of the list to avoid RuntimeError if modified during iteration
-            for connection in list(self.active_connections[project_id]):  # noqa: PERF101 — disconnect() mutates the list mid-iteration
-                try:
-                    await asyncio.wait_for(connection.send_json(message), timeout=5.0)
-                except asyncio.TimeoutError:
-                    logger.warning(f"[WS] Send timeout for client (project={project_id}, event={event_type})")
-                    self.disconnect(connection, project_id)
-                except Exception as e:
-                    logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
-                    self.disconnect(connection, project_id)
+        async with self._lock:
+            if project_id not in self.active_connections:
+                return
+            connections = list(self.active_connections[project_id])  # noqa: PERF101 — snapshot under lock
+        message = {"event": event_type, "data": data}
+        for connection in connections:
+            try:
+                await asyncio.wait_for(connection.send_json(message), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[WS] Send timeout for client (project={project_id}, event={event_type})")
+                await self.disconnect(connection, project_id)
+            except Exception as e:
+                logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
+                await self.disconnect(connection, project_id)
 
     async def broadcast_to_all(self, event_type: str, data: dict):
         """Broadcasts a message to all connected WebSocket clients across all projects."""
@@ -1425,8 +1443,14 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def broadcast_to_project(project_id: str, event_type: str, data: dict):
-    """Broadcasts a message to all WebSocket clients listening to a specific project."""
-    await manager.broadcast(project_id, event_type, data)
+    """Broadcasts a message to all WebSocket clients listening to a specific project.
+
+    Swallows exceptions to prevent crashing HTTP handlers after DB commits.
+    """
+    try:
+        await manager.broadcast(project_id, event_type, data)
+    except Exception as e:
+        logger.warning(f"[WS] Broadcast failed (project={project_id}, event={event_type}): {e}")
 
 
 async def _maybe_create_failure_alert(
@@ -1588,6 +1612,7 @@ async def reaper_service():
 
                 now = _utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
+                four_minutes_ago = now - timedelta(minutes=4)
                 ten_minutes_ago = now - timedelta(minutes=10)
 
                 fifteen_minutes_ago = now - timedelta(minutes=15)
@@ -1598,11 +1623,17 @@ async def reaper_service():
                     if task.status == TaskStatus.PROVISIONING and task.started_at and task.started_at < fifteen_minutes_ago:
                         orphaned_ids.append(task.id)  # PROVISIONING timeout regardless of heartbeat
                         logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
-                    elif task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
-                        orphaned_ids.append(task.id)
-                    elif task.started_at and task.started_at < ten_minutes_ago:
-                        orphaned_ids.append(task.id)
-                    elif not task.started_at and task.created_at < ten_minutes_ago:
+                    elif task.last_heartbeat:
+                        # Has heartbeat — ONLY check heartbeat freshness.
+                        # Do NOT fall through to started_at — that's for tasks with no heartbeat.
+                        if task.last_heartbeat < five_minutes_ago:
+                            orphaned_ids.append(task.id)
+                    elif task.started_at:
+                        # No heartbeat ever received — startup callback should arrive within ~2 min.
+                        # 4-minute threshold gives 2.5x margin for slow boots.
+                        if task.started_at < four_minutes_ago:
+                            orphaned_ids.append(task.id)
+                    elif task.created_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
 
                 # Step 2: Lock ONLY orphaned rows (heartbeats on healthy tasks are never blocked)
@@ -1633,6 +1664,10 @@ async def reaper_service():
                     if force_lock_ids:
                         try:
                             session.expire_all()
+                            # Extend lock_timeout for force-lock — 30s default is too short
+                            # when competing with long-running operations. Reverts on commit/rollback.
+                            from sqlalchemy import text as _text
+                            await session.execute(_text("SET LOCAL lock_timeout = '60000'"))
                             force_stmt = select(Task).where(
                                 Task.id.in_(force_lock_ids)
                             ).with_for_update(skip_locked=True)
@@ -1646,7 +1681,10 @@ async def reaper_service():
                                 orphaned_tasks.append(t)
                                 logger.warning(f"[REAPER] Force-locked persistently skipped task {t.id}")
                         except Exception as e:
-                            logger.warning(f"[REAPER] Force-lock failed: {e}")
+                            logger.warning(f"[REAPER] Force-lock failed (lock timeout?): {e}")
+                            # Reset skip counts so force-lock is retried next cycle
+                            for lid in force_lock_ids:
+                                _reaper_skip_counts.pop(lid, None)
 
                     # Clean stale entries from skip counts
                     orphaned_id_set = set(orphaned_ids)
@@ -1658,13 +1696,18 @@ async def reaper_service():
                     # expire_all() above ensures these objects have fresh DB values
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
                     five_minutes_ago = now - timedelta(minutes=5)
+                    four_minutes_ago = now - timedelta(minutes=4)
                     ten_minutes_ago = now - timedelta(minutes=10)
                     verified = []
                     for t in orphaned_tasks:
-                        if t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
-                            verified.append(t)
-                        elif t.started_at and t.started_at < ten_minutes_ago:
-                            verified.append(t)
+                        if t.last_heartbeat:
+                            # Has heartbeat — ONLY reap if stale. Fresh heartbeat = healthy.
+                            if t.last_heartbeat < five_minutes_ago:
+                                verified.append(t)
+                        elif t.started_at:
+                            # No heartbeat — startup callback should arrive within ~2 min
+                            if t.started_at < four_minutes_ago:
+                                verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)
                     orphaned_tasks = verified
@@ -1680,39 +1723,40 @@ async def reaper_service():
                         logger.info(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
                         continue
 
-                    # Determine why the reaper flagged this task
-                    if task.last_heartbeat:
-                        age = int((now - task.last_heartbeat).total_seconds())
-                        reap_reason = f"No heartbeat for {age}s (last: {task.last_heartbeat.isoformat()})"
+                    # Determine why the reaper flagged this task (use fresh_task for accurate data)
+                    if fresh_task.last_heartbeat:
+                        age = int((now - fresh_task.last_heartbeat).total_seconds())
+                        reap_reason = f"No heartbeat for {age}s (last: {fresh_task.last_heartbeat.isoformat()})"
                         reap_reason_code = 'heartbeat_timeout'
-                    elif task.started_at:
-                        age = int((now - task.started_at).total_seconds())
+                    elif fresh_task.started_at:
+                        age = int((now - fresh_task.started_at).total_seconds())
                         reap_reason = f"No heartbeat received after {age}s since provisioning"
                         reap_reason_code = 'provision_timeout'
                     else:
-                        age = int((now - task.created_at).total_seconds())
+                        age = int((now - fresh_task.created_at).total_seconds())
                         reap_reason = f"Never started — {age}s since creation, no heartbeat"
                         reap_reason_code = 'never_started'
 
-                    task_type = ((task.payloads or [{}])[0]).get("type", "unknown")
+                    task_type = ((fresh_task.payloads or [{}])[0]).get("type", "unknown")
                     logger.info('reaper_task_reaped', extra={
                         'task_id': str(task.id),
                         'task_type': task_type,
                         'reap_reason': reap_reason_code,
-                        'vm_instance_id': task.vm_instance_id,
+                        'vm_instance_id': fresh_task.vm_instance_id,
                     })
 
                     # Capture old VM ID before any overwrite — deletion happens after commit
-                    if task.vm_instance_id:
-                        _reaper_old_vms[str(task.id)] = task.vm_instance_id
+                    if fresh_task.vm_instance_id:
+                        _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
 
-                    # Release Max Plan account slot
-                    acct_id = (task.context or {}).get("max_plan_account_id")
-                    if acct_id:
+                    # Release Max Plan account slot (idempotent — skip if already released)
+                    acct_id = (fresh_task.context or {}).get("max_plan_account_id")
+                    if acct_id and not (fresh_task.context or {}).get("_slot_released"):
                         await release_max_plan_account(acct_id)
+                        task.context = {**(task.context or {}), "_slot_released": True}
 
                     # Separate provision failures from agent failures for retry budgeting
-                    is_provision_failure = task.status == TaskStatus.PROVISIONING
+                    is_provision_failure = fresh_task.status == TaskStatus.PROVISIONING
                     provision_failures = (task.context or {}).get("provision_failures", 0)
                     max_provision_retries = 2
                     can_retry = False
@@ -1908,6 +1952,35 @@ async def gcp_cleanup_service():
             logger.info("[GCP CLEANUP] Service shutting down.")
             break
 
+async def secret_reconciliation_service():
+    """Periodic cleanup of orphaned agent credential secrets (every 30 min)."""
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = select(Task.vm_instance_id).where(
+                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                )
+                active_vm_ids = (await session.execute(stmt)).scalars().all()
+                active_vm_ids = {vid for vid in active_vm_ids if vid}
+
+            recon_result = await asyncio.wait_for(
+                reconcile_orphaned_secrets(active_vm_ids),
+                timeout=120
+            )
+            if recon_result and recon_result.get("deleted"):
+                logger.info(f"[SECRET RECONCILIATION] {recon_result}")
+        except asyncio.CancelledError:
+            logger.info("[SECRET RECONCILIATION] Service shutting down.")
+            break
+        except Exception as e:
+            logger.error(f"[SECRET RECONCILIATION] Error: {e}", exc_info=True)
+
+        try:
+            await asyncio.sleep(1800)  # Run every 30 minutes
+        except asyncio.CancelledError:
+            logger.info("[SECRET RECONCILIATION] Service shutting down.")
+            break
+
 _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
@@ -1918,6 +1991,9 @@ async def _persist_circuit_breakers():
     try:
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
+            # Prune: don't persist CLOSED breakers with no failures (default state)
+            if v.get("state") == "CLOSED" and v.get("failure_count", 0) == 0:
+                continue
             serializable[k] = {
                 **v,
                 "opened_at": v["opened_at"].isoformat() if v.get("opened_at") else None,
@@ -1994,6 +2070,7 @@ async def _recover_orphaned_tasks():
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                 except Exception:
+                    logger.warning(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub token fetch failed", exc_info=True)
                     continue
 
                 short_id = str(task.id).replace('-', '')[:8]
@@ -2008,9 +2085,11 @@ async def _recover_orphaned_tasks():
                         headers)
                     prs = resp.json() if resp.status_code == 200 else []
                 except Exception:
+                    logger.warning(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — GitHub PR lookup failed", exc_info=True)
                     continue
 
                 if not prs:
+                    logger.info(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — no open PR found for branch {branch}")
                     continue
 
                 pr = prs[0]
@@ -2055,6 +2134,7 @@ async def orchestrator_worker():
     global _last_pool_refresh
     while True:
         queued_tasks = []
+        session = None  # defined before try so except handler can reference it
         try:
             global _orchestrator_last_cycle
             _orchestrator_last_cycle = _utcnow()
@@ -2092,7 +2172,22 @@ async def orchestrator_worker():
                         continue
                     if ((t.last_heartbeat is None or t.last_heartbeat < ten_min_ago)
                         and t.started_at and t.started_at < ten_min_ago):
+                        # Check provision failure limit before requeueing
+                        provision_failures = (t.context or {}).get("provision_failures", 0) + 1
+                        if provision_failures >= 5:
+                            t.status = TaskStatus.FAILED
+                            t.latest_status_message = f"Failed after {provision_failures} provision attempts"
+                            logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
+                            acct_id = (t.context or {}).get("max_plan_account_id")
+                            if acct_id:
+                                await release_max_plan_account(acct_id)
+                            session.add(t)
+                            continue
                         stale_vm_ids.append(t.vm_instance_id)
+                        # Release Max Plan account slot before requeueing
+                        acct_id = (t.context or {}).get("max_plan_account_id")
+                        if acct_id:
+                            await release_max_plan_account(acct_id)
                         # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
                         if zombie and not zombie.done():
@@ -2101,6 +2196,7 @@ async def orchestrator_worker():
                         t.status = TaskStatus.QUEUED
                         t.started_at = None
                         t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        t.context = {**(t.context or {}), "provision_failures": provision_failures}
                         session.add(t)
                         tasks_recovered += 1
                         if t.last_heartbeat is None:
@@ -2153,7 +2249,9 @@ async def orchestrator_worker():
                         active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 async with _max_plan_pool_lock:
                     for acct in _max_plan_pool:
-                        acct["active_tasks"] = active_per_account.get(acct["id"], 0)
+                        # Reconcile upward only — never clobber in-flight release_max_plan_account() decrements
+                        db_count = active_per_account.get(acct["id"], 0)
+                        acct["active_tasks"] = max(acct["active_tasks"], db_count)
 
                 # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
                 candidate_stmt = select(Task).where(
@@ -2186,8 +2284,7 @@ async def orchestrator_worker():
                         dep_uuids = [uuid.UUID(d) for d in deps]
                     except (ValueError, AttributeError) as e:
                         logger.error(f"[ORCHESTRATOR] Task {task.id} has invalid dependency UUID: {e}", exc_info=True)
-                        eligible_ids.append(task.id)
-                        continue
+                        continue  # Don't dispatch — deps can't be validated
                     dep_result = await session.execute(select(Task).where(Task.id.in_(dep_uuids)))
                     dep_tasks = dep_result.scalars().all()
 
@@ -2608,8 +2705,10 @@ async def orchestrator_worker():
                                 logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
                             else:
                                 # Fix not spawned — likely duplicate guard (fix already running) or iteration cap
-                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix already in progress or iteration limit reached"
-                                logger.info(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — leaving in EVALUATING")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.requires_approval = True
+                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
+                                logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -2767,7 +2866,8 @@ async def orchestrator_worker():
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
             }, exc_info=True)
             try:
-                await session.rollback()
+                if session:
+                    await session.rollback()
             except Exception:
                 pass
 
@@ -2817,6 +2917,9 @@ async def lifespan(app: FastAPI):
     # Start the GCP Cleanup Service background task
     gcp_cleanup_task = asyncio.create_task(gcp_cleanup_service())
 
+    # Start Secret Reconciliation Service (orphaned agent-creds-* cleanup)
+    secret_recon_task = asyncio.create_task(secret_reconciliation_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -2825,6 +2928,7 @@ async def lifespan(app: FastAPI):
     _bg_tasks["orchestrator"] = orchestrator_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
+    _bg_tasks["secret_reconciliation"] = secret_recon_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
@@ -2834,6 +2938,7 @@ async def lifespan(app: FastAPI):
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
             "gcp_cleanup": gcp_cleanup_service,
+            "secret_reconciliation": secret_reconciliation_service,
         }
         while True:
             await asyncio.sleep(30)
@@ -2860,7 +2965,7 @@ async def lifespan(app: FastAPI):
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, orchestrator_task, monitor_task]
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, orchestrator_task, monitor_task]
     for t in tasks_to_cancel:
         t.cancel()
     try:
@@ -2871,6 +2976,8 @@ async def lifespan(app: FastAPI):
     except asyncio.TimeoutError:
         logger.warning("[SHUTDOWN] Background tasks didn't finish within 10s grace period")
     await close_github_client()
+    from app.redis_client import close_redis
+    await close_redis()
 
 app = FastAPI(
     title="Blueprint Orchestrator",
@@ -3377,8 +3484,7 @@ async def deploy_blueprint(
         github_repo=payload.github_repo
     )
     session.add(project)
-    await session.commit()
-    await session.refresh(project)
+    await session.flush()  # Assign project.id without committing
 
     # 2. Create Tasks based on the flexible payloads
     created_tasks = []
@@ -3392,8 +3498,7 @@ async def deploy_blueprint(
         created_by="USER"
     )
     session.add(parent_task)
-    await session.commit()
-    await session.refresh(parent_task)
+    await session.flush()  # Assign parent_task.id without committing
 
     for p in payload.payloads:
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
@@ -3632,7 +3737,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
                 message_count = 1
             # We can handle client-to-server messages here if needed
     except WebSocketDisconnect:
-        manager.disconnect(websocket, project_id)
+        await manager.disconnect(websocket, project_id)
 
 # --- Agent APIs ---
 
@@ -3755,7 +3860,7 @@ async def claim_task(
     stmt = select(Task).where(
         Task.vm_instance_id == token.get("vm_instance_id"),
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
-    )
+    ).with_for_update()
     result = await session.execute(stmt)
     task = result.scalars().first()
 
@@ -4858,14 +4963,19 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         await session.refresh(ct)
 
     # Inject serial dependencies for subtasks that share files (additive only)
+    # Save original (explicit) deps so we can restore them if injection creates a cycle
+    original_deps = {i: list(st.get("depends_on_indices", [])) for i, st in enumerate(subtasks)}
     _inject_file_overlap_deps(subtasks, "PLAN")
 
     # Re-validate after file overlap injection — injection can create cycles
     # (e.g., A explicitly depends on B, but file overlap adds B → A)
     if not _validate_plan_dependencies(subtasks):
-        logger.error("[PLAN] Circular dependency after file overlap injection — stripping all depends_on_indices")
-        for st in subtasks:
-            st.pop("depends_on_indices", None)
+        logger.error("[PLAN] Circular dependency after file overlap injection — reverting to explicit deps only")
+        for i, st in enumerate(subtasks):
+            if original_deps.get(i):
+                st["depends_on_indices"] = original_deps[i]
+            else:
+                st.pop("depends_on_indices", None)
 
     # Second pass: resolve depends_on_indices to actual UUIDs
     for i, subtask_def in enumerate(subtasks):
@@ -6191,517 +6301,24 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         logger.error(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
 
 
-@app.post("/api/agent/status")
-@limiter.limit("120/minute")
-async def update_agent_status(
-    request: Request,
+async def _process_post_commit(
+    task_id: uuid.UUID,
     payload: AgentStatusPayload,
-    background_tasks: BackgroundTasks,
-    session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
-):
+    _session_factory=None,
+) -> dict:
+    """Post-commit processing: review pipeline, completion handlers, rollup, aggregation.
+
+    Uses its own session to avoid holding the FOR UPDATE lock from the
+    status endpoint while making GitHub API calls (which can hang 15-120s).
+    _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
-    Endpoint for agents to report progress, save git artifacts, and update task status.
-    """
-    if str(payload.task_id) != token.get("sub"):
-        raise HTTPException(status_code=403, detail="Task ID mismatch")
-
-    # 1. Fetch task — validate vm_instance_id to prevent stale agents from
-    # overwriting status after a task was requeued with a new VM.
-    # FOR UPDATE prevents race with reaper: without it, a stale agent's
-    # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
-    stmt = select(Task).where(
-        Task.id == payload.task_id,
-        Task.vm_instance_id == token.get("vm_instance_id")
-    ).with_for_update()
-    result = await session.execute(stmt)
-    task = result.scalars().first()
-
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found for this VM")
-
-    # Idempotency guard: if the task is already in a terminal state, ignore duplicate
-    # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-        return {"status": "already_terminal", "task_id": str(task.id)}
-
-    # 2. Update task status
-    task.status = payload.status
-    # Preserve logs on the task when no artifact is created (e.g., "no changes" completion)
-    if payload.logs and not payload.artifact_type:
-        task.latest_status_message = payload.logs[:2000]
-    session.add(task)
-
-    # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
-    if payload.artifact_type:
-        if payload.artifact_type == ArtifactType.PULL_REQUEST:
-            existing = (await session.execute(
-                select(Artifact).where(
-                    Artifact.task_id == task.id,
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST
-                )
-            )).scalars().first()
-            if existing:
-                logger.info(f"[STATUS] Task {task.id} already has PR artifact, skipping duplicate")
-            else:
-                artifact = Artifact(
-                    task_id=task.id,
-                    artifact_type=payload.artifact_type,
-                    commit_hash=payload.commit_hash,
-                    repo_url=payload.repo_url,
-                    pr_url=payload.pr_url,
-                    storage_uri=payload.storage_uri,
-                    logs=payload.logs
-                )
-                session.add(artifact)
-        else:
-            artifact = Artifact(
-                task_id=task.id,
-                artifact_type=payload.artifact_type,
-                commit_hash=payload.commit_hash,
-                repo_url=payload.repo_url,
-                pr_url=payload.pr_url,
-                storage_uri=payload.storage_uri,
-                logs=payload.logs
-            )
-            session.add(artifact)
-
-        # Broadcast artifact creation (e.g., new logs or screenshot available)
-        await broadcast_to_project(
-            str(task.project_id),
-            "artifact_created",
-            {
-                "task_id": str(task.id),
-                "artifact_type": payload.artifact_type,
-                "logs": payload.logs,
-                "storage_uri": payload.storage_uri
-            }
-        )
-
-    # 3b. Parse and store smoketest result in task.plan_output + document in history
-    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
-        try:
-            smoketest_data = json.loads(payload.logs)
-            task.plan_output = smoketest_data
-            session.add(task)
-            # Document every smoketest result (pass or fail) in task history
-            all_tests = smoketest_data.get("tests", [])
-            pass_count = len([t for t in all_tests if t.get("status") == "pass"])
-            fail_count = len([t for t in all_tests if t.get("status") == "fail"])
-            session.add(TaskHistory(
-                task_id=task.id, action="SMOKETEST_RESULT",
-                details={
-                    "passed": smoketest_data.get("passed", False),
-                    "total_tests": len(all_tests),
-                    "passed_count": pass_count,
-                    "failed_count": fail_count,
-                    "suite_results": smoketest_data.get("suites", {}),
-                    "guardrail_violations": smoketest_data.get("guardrail_violations", []),
-                }
-            ))
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}", exc_info=True)
-
-    # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
-    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
-        try:
-            smoketest_data = json.loads(payload.logs)
-            if not smoketest_data.get("passed"):
-                failed_tests = [t for t in smoketest_data.get("tests", []) if t.get("status") == "fail"]
-                if failed_tests:
-                    # Duplicate prevention: skip if a fix task already exists for this smoketest
-                    existing_fix = (await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id).limit(1)
-                    )).scalars().first()
-                    if existing_fix:
-                        logger.info(f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate")
-                    else:
-                        base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
-                        failure_summary = "\n".join(
-                            f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
-                        )
-
-                        # Determine priority based on which suite failed (higher = dispatched first)
-                        suite_results = smoketest_data.get("suites", {})
-                        if suite_results.get("startup", {}).get("passed") is False:
-                            fix_priority = 90  # Startup failure — critical
-                        elif suite_results.get("curated", {}).get("passed") is False:
-                            fix_priority = 70  # Curated test failure — high
-                        else:
-                            fix_priority = 50  # Regression-only failure — normal
-
-                        type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
-                        type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
-                        plan_task = Task(
-                            project_id=task.project_id,
-                            title=f"Fix smoketest failures on {base_branch}",
-                            description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
-                            parent_task_id=task.id,
-                            priority=fix_priority,
-                            payloads=[{
-                                "type": "plan",
-                                "prompt": (
-                                    f"Smoke tests failed after a merge to {base_branch}. "
-                                    f"Investigate and plan fixes for these failures:\n\n"
-                                    f"{failure_summary}\n\n"
-                                    f"IMPORTANT GUARDRAILS:\n"
-                                    f"- Do NOT delete or skip tests just to make them pass\n"
-                                    f"- First diagnose: is the failure in the CODE or the TEST?\n"
-                                    f"- If the test is wrong, fix it to correctly test the intended behavior\n"
-                                    f"- If the code is wrong, fix the code\n"
-                                    f"- Tests may only be removed if the tested functionality was removed — explain why\n"
-                                    f"- Do NOT weaken assertions without justification\n"
-                                    f"Diagnose root causes, identify which recent changes caused each failure, "
-                                    f"and produce subtasks to fix them."
-                                ),
-                                "base_branch": base_branch,
-                                **({"model": type_model} if type_model else {}),
-                                **({"effort": type_effort} if type_effort else {}),
-                            }],
-                            context={
-                                "smoketest_task_id": str(task.id),
-                                "failed_tests": [t["name"] for t in failed_tests],
-                                "suite_results": suite_results,
-                                "guardrail_violations": smoketest_data.get("guardrail_violations", []),
-                                "total_tests": len(smoketest_data.get("tests", [])),
-                                "passed_count": len([t for t in smoketest_data.get("tests", []) if t.get("status") == "pass"]),
-                                "failed_count": len(failed_tests),
-                            },
-                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                            status=TaskStatus.QUEUED,
-                            created_by="ORCHESTRATOR",
-                        )
-                        session.add(plan_task)
-                        await session.flush()
-                        history = TaskHistory(
-                            task_id=plan_task.id, action="SPAWNED",
-                            details={"spawned_by": "SMOKETEST_FAILURE", "priority": fix_priority, "failed_tests": [t["name"] for t in failed_tests]}
-                        )
-                        session.add(history)
-
-                        # Build suite breakdown for alert message
-                        suite_detail = ""
-                        for suite_name, suite_data in suite_results.items():
-                            if isinstance(suite_data, dict) and suite_data.get("passed") is False:
-                                suite_fails = [t for t in suite_data.get("tests", []) if t.get("status") == "fail"]
-                                if suite_fails:
-                                    suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
-
-                        alert = Alert(
-                            project_id=task.project_id,
-                            severity=AlertSeverity.ERROR,
-                            title=f"Smoke tests failed on {base_branch}",
-                            message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
-                                    + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else "")
-                                    + (suite_detail if suite_detail else ""),
-                            task_id=task.id,
-                        )
-                        session.add(alert)
-
-                        await broadcast_to_project(
-                            str(task.project_id), "task_updated",
-                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
-                        )
-                        await broadcast_to_project(
-                            str(task.project_id), "alert_created",
-                            {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
-                        )
-                        logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests")
-        except Exception as e:
-            logger.warning(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}", exc_info=True)
-
-    # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
-    if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
-        try:
-            debug_data = json.loads(payload.logs)
-            task.plan_output = debug_data
-            session.add(task)
-
-            # If confidence is high, auto-spawn a create task using the fix_prompt
-            if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
-                failed_task_id = (task.context or {}).get("failed_task_id", "")
-                base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
-                debug_title = task.title or ""
-                fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
-                fix_task = Task(
-                    project_id=task.project_id,
-                    title=f"Fix: {fix_title}",
-                    description=debug_data["fix_prompt"],
-                    parent_task_id=task.parent_task_id or task.id,
-                    payloads=[{
-                        "type": "create",
-                        "prompt": debug_data["fix_prompt"],
-                        "base_branch": base_branch,
-                    }],
-                    context={
-                        "debug_task_id": str(task.id),
-                        "failed_task_id": failed_task_id,
-                        "root_cause": debug_data.get("root_cause", ""),
-                    },
-                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                    status=TaskStatus.QUEUED,
-                    created_by="ORCHESTRATOR",
-                )
-                session.add(fix_task)
-                await session.flush()
-                await broadcast_to_project(
-                    str(task.project_id),
-                    "task_updated",
-                    {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
-                )
-                logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}", exc_info=True)
-
-    # 4. External VM Termination
-    # If the task is finished or failed, immediately kill the VM to save costs
-    if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-        # Record result for deployment monitoring and update Prometheus counters
-        if payload.status == TaskStatus.COMPLETED:
-            record_task_result(success=True, task_id=str(task.id))
-            _shared_state.tasks_completed_total += 1
-        else:
-            failure_class = classify_failure(task, payload.logs)
-            record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
-            _shared_state.tasks_failed_total += 1
-
-            # Rate-limited tasks: requeue instead of permanently failing
-            if failure_class == "RATE_LIMIT":
-                acct_id = (task.context or {}).get("max_plan_account_id")
-                if acct_id:
-                    await release_max_plan_account(acct_id)
-                    async with _max_plan_pool_lock:
-                        for acct in _max_plan_pool:
-                            if acct["id"] == acct_id:
-                                acct["enabled"] = False
-                                acct["disabled_at"] = _utcnow()
-                                acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
-                                cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
-                                logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
-                                break
-                task.status = TaskStatus.QUEUED
-                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                task.last_heartbeat = None
-                task.started_at = None
-                task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
-                session.add(task)
-                await session.commit()
-                old_vm_id_rl = (task.context or {}).get("_prev_vm_id") or payload.logs[:50] if payload.logs else ""
-                await broadcast_to_project(str(task.project_id), "task_updated",
-                    {"task_id": str(task.id), "status": TaskStatus.QUEUED})
-                logger.info(f"[AGENT STATUS] Task {task.id} rate-limited — requeued without burning retry")
-                await _ensure_vm_deleted(task.vm_instance_id, reason="rate_limit_requeue")
-                return {"status": "accepted"}
-
-        # Release Max plan account slot
-        acct_id = (task.context or {}).get("max_plan_account_id")
-        if acct_id:
-            await release_max_plan_account(acct_id)
-
-        old_vm_id = task.vm_instance_id
-        await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
-
-        # Retry logic for failed tasks
-        if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
-            task.attempt_count += 1
-            task.status = TaskStatus.QUEUED
-            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-            task.last_heartbeat = None
-            task.started_at = None  # Fresh timeout window for the new VM
-            # Add retry delay for transient failures to avoid hammering exhausted resources
-            ctx = dict(task.context or {})
-            if failure_class == "RATE_LIMIT":
-                # Track per-account rate-limit hit count for exponential backoff
-                rl_counts = dict(ctx.get("rate_limit_counts") or {})
-                if acct_id:
-                    rl_counts[str(acct_id)] = rl_counts.get(str(acct_id), 0) + 1
-                ctx["rate_limit_counts"] = rl_counts
-
-                rl_hit_count = rl_counts.get(str(acct_id), 1) if acct_id else 1
-                # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
-                base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
-                delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
-                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
-                ctx["retry_after"] = retry_after
-                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
-                # Blacklist rate-limited account so the retry picks a different one
-                if acct_id:
-                    blacklisted = list(ctx.get("blacklisted_accounts") or [])
-                    if acct_id not in blacklisted:
-                        blacklisted.append(acct_id)
-                    ctx["blacklisted_accounts"] = blacklisted
-            elif failure_class == "PROVISION_FAILURE":
-                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
-                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
-                ctx["retry_after"] = retry_after
-                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
-            else:
-                ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
-            task.context = ctx
-            session.add(task)
-
-            await session.commit()
-
-            await broadcast_to_project(
-                str(task.project_id),
-                "task_updated",
-                {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
-            )
-            return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
-
-        else:
-            # Retries exhausted — annotate the final status message with context
-            if payload.status == TaskStatus.FAILED:
-                max_r = _runtime_config["max_retries"]
-                existing_msg = task.latest_status_message or ""
-                if "retries exhausted" not in existing_msg:
-                    task.latest_status_message = (
-                        f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r}). "
-                        + existing_msg[:300]
-                    ).strip()
-                    session.add(task)
-
-        # Spawn a debug task for permanently failed tasks (retries exhausted)
-        failed_task_payload = (task.payloads or [{}])[0]
-        failed_task_type = failed_task_payload.get("type", "")
-        should_auto_debug = (
-            payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
-            failed_task_type != "debug" and  # Don't recursively debug debug tasks
-            (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
-            payload.logs and
-            failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
-            (
-                (task.context or {}).get("auto_debug") is True or
-                task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
-                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
-            )
-        )
-        if should_auto_debug:
-            base_branch = failed_task_payload.get("base_branch", "main")
-            debug_task = Task(
-                project_id=task.project_id,
-                title=f"Debug: {task.title}",
-                description=f"Automated root cause analysis for failed task: {task.title}",
-                parent_task_id=task.id,
-                payloads=[{
-                    "type": "debug",
-                    "failed_task_id": str(task.id),
-                    "failed_task_title": task.title,
-                    "error_logs": (payload.logs or "")[:20000],
-                    "base_branch": base_branch,
-                }],
-                context={
-                    "failed_task_id": str(task.id),
-                    "parent_base": base_branch,
-                },
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                status=TaskStatus.QUEUED,
-                created_by="ORCHESTRATOR",
-            )
-            session.add(debug_task)
-            await session.flush()
-            await broadcast_to_project(
-                str(task.project_id),
-                "task_updated",
-                {"task_id": str(debug_task.id), "status": TaskStatus.QUEUED, "title": debug_task.title}
-            )
-            logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
-
-        # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
-        # Only count code errors toward the breaker — rate limits and provision failures aren't code quality issues
-        _cb_failure_class = classify_failure(task, payload.logs)
-        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR" and _cb_failure_class not in ("RATE_LIMIT", "PROVISION_FAILURE"):
-            project_key = str(task.project_id)
-            breaker = _shared_state.get_circuit_breaker(project_key)
-            # Only CODE_ERROR and AGENT_TIMEOUT indicate code regressions; infra/rate-limit
-            # failures are transient and should not trip the breaker.
-            is_code_failure = failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
-            if is_code_failure:
-                breaker["failure_count"] += 1
-                breaker["success_count"] = 0
-
-            # HALF-OPEN test task failed → back to OPEN with doubled cooldown
-            # (any failure on the test task re-opens, including infra failures)
-            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
-                breaker["state"] = "OPEN"
-                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
-                breaker["opened_at"] = _utcnow()
-                breaker["half_open_task_id"] = None
-                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
-                await _maybe_create_circuit_breaker_alert(
-                    task.project_id, session,
-                    f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
-                )
-
-            # CLOSED → OPEN after 3 consecutive failures
-            elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
-                breaker["state"] = "OPEN"
-                breaker["opened_at"] = _utcnow()
-                breaker["cooldown_seconds"] = breaker["base_cooldown"]
-                await broadcast_to_project(project_key, "autonomous_paused",
-                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
-                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
-                await _maybe_create_circuit_breaker_alert(
-                    task.project_id, session,
-                    f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
-                )
-            # Persist breaker state on any transition
-            if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
-                await _persist_circuit_breakers()
-        # When review/fix fails permanently, cancel the original create task so rollup
-        # skips it (via cancelled-child logic) instead of hanging forever.
-        # Other children's work is preserved — only this PR is excluded from the rollup.
-        if payload.status == TaskStatus.FAILED:
-            task_payload = (task.payloads or [{}])[0]
-            task_type = task_payload.get("type", "")
-            if task_type in ("review", "fix"):
-                original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
-                                    or task_payload.get("original_task_id", ""))
-                if original_task_id:
-                    try:
-                        orig = await session.get(Task, uuid.UUID(original_task_id))
-                        if orig and orig.status == TaskStatus.COMPLETED:
-                            orig.status = TaskStatus.CANCELLED
-                            orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
-                            session.add(orig)
-                            await session.commit()
-                            # Trigger rollup check so parent can proceed with remaining children
-                            if orig.parent_task_id:
-                                await _check_and_trigger_rollup(orig, session)
-                            logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
-                    except Exception as e:
-                        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
-
-        if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
-            project_key = str(task.project_id)
-            breaker = _shared_state.get_circuit_breaker(project_key)
-            breaker["failure_count"] = 0
-            breaker["success_count"] += 1
-
-            # HALF-OPEN test task succeeded → back to CLOSED
-            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
-                breaker["state"] = "CLOSED"
-                breaker["cooldown_seconds"] = breaker["base_cooldown"]
-                breaker["half_open_task_id"] = None
-                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
-            elif breaker["state"] == "OPEN":
-                # Shouldn't happen (OPEN blocks spawning), but reset if it does
-                breaker["state"] = "CLOSED"
-            # Persist on state transition back to CLOSED
-            if breaker["state"] == "CLOSED" and breaker["failure_count"] == 0:
-                await _persist_circuit_breakers()
-
-        # ── EARLY COMMIT ──
-        # Release the FOR UPDATE lock NOW, before downstream processing.
-        # Everything below (review pipeline, completion handlers, rollup) makes
-        # GitHub API calls that can hang 15-120+ seconds during connectivity issues.
-        # Holding the lock during those calls starves the heartbeat endpoint
-        # (which also needs FOR UPDATE on this row), causing last_heartbeat to go
-        # stale and the reaper to kill the task.
-        # At this point the status change, artifact, and retry logic are all
-        # persisted.  expire_on_commit=False keeps the task object usable.
-        if session.dirty or session.new:
-            await session.commit()
+    factory = _session_factory or AsyncSessionLocal
+    async with factory() as session:
+        task = (await session.execute(
+            select(Task).where(Task.id == task_id)
+        )).scalars().first()
+        if not task:
+            return {"status": "accepted"}
 
         # Immediately unblock dependents when task terminally fails (retries exhausted)
         if payload.status == TaskStatus.FAILED:
@@ -6951,11 +6568,15 @@ async def update_agent_status(
                         upper_text.rfind("REQUEST_CHANGES"),
                         upper_text.rfind("REQUEST CHANGES"),
                     )
-                    if approve_idx > rc_idx:
+                    if approve_idx == -1 and rc_idx == -1:
+                        verdict = "APPROVE"
+                        logger.warning(f"[REVIEW PIPELINE] No verdict keywords found for task {task.id} (len={len(verdict_text)}) — defaulting to APPROVE")
+                    elif approve_idx > rc_idx:
                         verdict = "APPROVE"
                     elif rc_idx > approve_idx:
                         verdict = "REQUEST_CHANGES"
-                    logger.warning(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
+                    else:
+                        logger.warning(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
 
                 # Post the review to the PR as a comment
                 try:
@@ -7346,7 +6967,10 @@ async def update_agent_status(
 
         # 6. Parent task rollup — delegated to shared function
         if task.parent_task_id and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
-            await _check_and_trigger_rollup(task, session)
+            try:
+                await _check_and_trigger_rollup(task, session)
+            except Exception as e:
+                logger.error(f"[ROLLUP] Rollup check failed for task {task.id}: {e!r}", exc_info=True)
 
         # 6b. Update direction research history outcomes for child tasks of a research cycle
         _task_ctx = task.context or {}
@@ -7398,23 +7022,551 @@ async def update_agent_status(
                 await session.commit()
                 await broadcast_to_project(str(project.id), "project_updated", {"status": new_project_status})
 
-    # Final commit for any deferred changes (status, artifacts, spawned tasks)
-    if session.dirty or session.new:
-        await session.commit()
+        # Final commit for any deferred changes (status, artifacts, spawned tasks)
+        if session.dirty or session.new:
+            await session.commit()
 
-    # Broadcast AFTER all processing is complete (artifacts saved, pipeline spawned)
-    await broadcast_to_project(
-        str(task.project_id),
-        "task_updated",
-        {"task_id": str(task.id), "status": payload.status}
-    )
+        # Broadcast AFTER all processing is complete (artifacts saved, pipeline spawned)
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": payload.status}
+        )
 
-    return {
-        "status": "received",
-        "message": f"Status update for task {payload.task_id} recorded."
-    }
+        return {
+            "status": "received",
+            "message": f"Status update for task {payload.task_id} recorded."
+        }
+
+
+@app.post("/api/agent/status")
+@limiter.limit("120/minute")
+async def update_agent_status(
+    request: Request,
+    payload: AgentStatusPayload,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token)
+):
+    """
+    Endpoint for agents to report progress, save git artifacts, and update task status.
+    """
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    # 1. Fetch task — validate vm_instance_id to prevent stale agents from
+    # overwriting status after a task was requeued with a new VM.
+    # FOR UPDATE prevents race with reaper: without it, a stale agent's
+    # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
+    stmt = select(Task).where(
+        Task.id == payload.task_id,
+        Task.vm_instance_id == token.get("vm_instance_id")
+    ).with_for_update()
+    result = await session.execute(stmt)
+    task = result.scalars().first()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found for this VM")
+
+    # Idempotency guard: if the task is already in a terminal state, ignore duplicate
+    # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return {"status": "already_terminal", "task_id": str(task.id)}
+
+    # 2. Update task status
+    task.status = payload.status
+    # Preserve logs on the task when no artifact is created (e.g., "no changes" completion)
+    if payload.logs and not payload.artifact_type:
+        task.latest_status_message = payload.logs[:2000]
+    session.add(task)
+
+    # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
+    if payload.artifact_type:
+        if payload.artifact_type == ArtifactType.PULL_REQUEST:
+            existing = (await session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST
+                )
+            )).scalars().first()
+            if existing:
+                logger.info(f"[STATUS] Task {task.id} already has PR artifact, skipping duplicate")
+            else:
+                artifact = Artifact(
+                    task_id=task.id,
+                    artifact_type=payload.artifact_type,
+                    commit_hash=payload.commit_hash,
+                    repo_url=payload.repo_url,
+                    pr_url=payload.pr_url,
+                    storage_uri=payload.storage_uri,
+                    logs=payload.logs
+                )
+                session.add(artifact)
+        else:
+            artifact = Artifact(
+                task_id=task.id,
+                artifact_type=payload.artifact_type,
+                commit_hash=payload.commit_hash,
+                repo_url=payload.repo_url,
+                pr_url=payload.pr_url,
+                storage_uri=payload.storage_uri,
+                logs=payload.logs
+            )
+            session.add(artifact)
+
+        # Broadcast artifact creation (e.g., new logs or screenshot available)
+        await broadcast_to_project(
+            str(task.project_id),
+            "artifact_created",
+            {
+                "task_id": str(task.id),
+                "artifact_type": payload.artifact_type,
+                "logs": payload.logs,
+                "storage_uri": payload.storage_uri
+            }
+        )
+
+    # 3b. Parse and store smoketest result in task.plan_output + document in history
+    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
+        try:
+            smoketest_data = json.loads(payload.logs)
+            task.plan_output = smoketest_data
+            session.add(task)
+            # Document every smoketest result (pass or fail) in task history
+            all_tests = smoketest_data.get("tests", [])
+            pass_count = len([t for t in all_tests if t.get("status") == "pass"])
+            fail_count = len([t for t in all_tests if t.get("status") == "fail"])
+            session.add(TaskHistory(
+                task_id=task.id, action="SMOKETEST_RESULT",
+                details={
+                    "passed": smoketest_data.get("passed", False),
+                    "total_tests": len(all_tests),
+                    "passed_count": pass_count,
+                    "failed_count": fail_count,
+                    "suite_results": smoketest_data.get("suites", {}),
+                    "guardrail_violations": smoketest_data.get("guardrail_violations", []),
+                }
+            ))
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}", exc_info=True)
+
+    # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
+    if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
+        try:
+            smoketest_data = json.loads(payload.logs)
+            if not smoketest_data.get("passed"):
+                failed_tests = [t for t in smoketest_data.get("tests", []) if t.get("status") == "fail"]
+                if failed_tests:
+                    # Duplicate prevention: skip if a fix task already exists for this smoketest
+                    existing_fix = (await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id).limit(1)
+                    )).scalars().first()
+                    if existing_fix:
+                        logger.info(f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate")
+                    else:
+                        base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                        failure_summary = "\n".join(
+                            f"- {t['name']}: {t.get('message', 'no details')}" for t in failed_tests
+                        )
+
+                        # Determine priority based on which suite failed (higher = dispatched first)
+                        suite_results = smoketest_data.get("suites", {})
+                        if suite_results.get("startup", {}).get("passed") is False:
+                            fix_priority = 90  # Startup failure — critical
+                        elif suite_results.get("curated", {}).get("passed") is False:
+                            fix_priority = 70  # Curated test failure — high
+                        else:
+                            fix_priority = 50  # Regression-only failure — normal
+
+                        type_model = _runtime_config.get("task_type_models", {}).get("plan") or None
+                        type_effort = _runtime_config.get("task_type_efforts", {}).get("plan") or None
+                        plan_task = Task(
+                            project_id=task.project_id,
+                            title=f"Fix smoketest failures on {base_branch}",
+                            description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
+                            parent_task_id=task.id,
+                            priority=fix_priority,
+                            payloads=[{
+                                "type": "plan",
+                                "prompt": (
+                                    f"Smoke tests failed after a merge to {base_branch}. "
+                                    f"Investigate and plan fixes for these failures:\n\n"
+                                    f"{failure_summary}\n\n"
+                                    f"IMPORTANT GUARDRAILS:\n"
+                                    f"- Do NOT delete or skip tests just to make them pass\n"
+                                    f"- First diagnose: is the failure in the CODE or the TEST?\n"
+                                    f"- If the test is wrong, fix it to correctly test the intended behavior\n"
+                                    f"- If the code is wrong, fix the code\n"
+                                    f"- Tests may only be removed if the tested functionality was removed — explain why\n"
+                                    f"- Do NOT weaken assertions without justification\n"
+                                    f"Diagnose root causes, identify which recent changes caused each failure, "
+                                    f"and produce subtasks to fix them."
+                                ),
+                                "base_branch": base_branch,
+                                **({"model": type_model} if type_model else {}),
+                                **({"effort": type_effort} if type_effort else {}),
+                            }],
+                            context={
+                                "smoketest_task_id": str(task.id),
+                                "failed_tests": [t["name"] for t in failed_tests],
+                                "suite_results": suite_results,
+                                "guardrail_violations": smoketest_data.get("guardrail_violations", []),
+                                "total_tests": len(smoketest_data.get("tests", [])),
+                                "passed_count": len([t for t in smoketest_data.get("tests", []) if t.get("status") == "pass"]),
+                                "failed_count": len(failed_tests),
+                            },
+                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                            status=TaskStatus.QUEUED,
+                            created_by="ORCHESTRATOR",
+                        )
+                        session.add(plan_task)
+                        await session.flush()
+                        history = TaskHistory(
+                            task_id=plan_task.id, action="SPAWNED",
+                            details={"spawned_by": "SMOKETEST_FAILURE", "priority": fix_priority, "failed_tests": [t["name"] for t in failed_tests]}
+                        )
+                        session.add(history)
+
+                        # Build suite breakdown for alert message
+                        suite_detail = ""
+                        for suite_name, suite_data in suite_results.items():
+                            if isinstance(suite_data, dict) and suite_data.get("passed") is False:
+                                suite_fails = [t for t in suite_data.get("tests", []) if t.get("status") == "fail"]
+                                if suite_fails:
+                                    suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
+
+                        alert = Alert(
+                            project_id=task.project_id,
+                            severity=AlertSeverity.ERROR,
+                            title=f"Smoke tests failed on {base_branch}",
+                            message=f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                                    + (f" (+{len(failed_tests) - 5} more)" if len(failed_tests) > 5 else "")
+                                    + (suite_detail if suite_detail else ""),
+                            task_id=task.id,
+                        )
+                        session.add(alert)
+
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED}
+                        )
+                        await broadcast_to_project(
+                            str(task.project_id), "alert_created",
+                            {"alert_id": str(alert.id), "severity": alert.severity, "title": alert.title}
+                        )
+                        logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests")
+        except Exception as e:
+            logger.warning(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}", exc_info=True)
+
+    # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
+    if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
+        try:
+            debug_data = json.loads(payload.logs)
+            task.plan_output = debug_data
+            session.add(task)
+
+            # If confidence is high, auto-spawn a create task using the fix_prompt
+            if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
+                failed_task_id = (task.context or {}).get("failed_task_id", "")
+                base_branch = ((task.payloads or [{}])[0]).get("base_branch", "main")
+                debug_title = task.title or ""
+                fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
+                fix_task = Task(
+                    project_id=task.project_id,
+                    title=f"Fix: {fix_title}",
+                    description=debug_data["fix_prompt"],
+                    parent_task_id=task.parent_task_id or task.id,
+                    payloads=[{
+                        "type": "create",
+                        "prompt": debug_data["fix_prompt"],
+                        "base_branch": base_branch,
+                    }],
+                    context={
+                        "debug_task_id": str(task.id),
+                        "failed_task_id": failed_task_id,
+                        "root_cause": debug_data.get("root_cause", ""),
+                    },
+                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                    status=TaskStatus.QUEUED,
+                    created_by="ORCHESTRATOR",
+                )
+                session.add(fix_task)
+                await session.flush()
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "task_updated",
+                    {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
+                )
+                logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}", exc_info=True)
+
+    # 4. External VM Termination
+    # If the task is finished or failed, immediately kill the VM to save costs
+    if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+        # Record result for deployment monitoring and update Prometheus counters
+        # Wrapped in try-except so slot release (below) always runs even if
+        # classify_failure() or record_task_result() throw.
+        try:
+            if payload.status == TaskStatus.COMPLETED:
+                record_task_result(success=True, task_id=str(task.id))
+                _shared_state.tasks_completed_total += 1
+            else:
+                failure_class = classify_failure(task, payload.logs)
+                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
+                _shared_state.tasks_failed_total += 1
+
+                # Rate-limited tasks: requeue instead of permanently failing
+                if failure_class == "RATE_LIMIT":
+                    acct_id = (task.context or {}).get("max_plan_account_id")
+                    if acct_id:
+                        await release_max_plan_account(acct_id)
+                        async with _max_plan_pool_lock:
+                            for acct in _max_plan_pool:
+                                if acct["id"] == acct_id:
+                                    acct["enabled"] = False
+                                    acct["disabled_at"] = _utcnow()
+                                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
+                                    cooldown_minutes = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                                    logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown_minutes:.0f}min)")
+                                    break
+                    old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
+                    task.status = TaskStatus.QUEUED
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    task.last_heartbeat = None
+                    task.started_at = None
+                    task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
+                    session.add(task)
+                    await session.commit()
+                    await broadcast_to_project(str(task.project_id), "task_updated",
+                        {"task_id": str(task.id), "status": TaskStatus.QUEUED})
+                    logger.info(f"[AGENT STATUS] Task {task.id} rate-limited — requeued without burning retry")
+                    await _ensure_vm_deleted(old_vm_id_rl, reason="rate_limit_requeue")
+                    return {"status": "accepted"}
+        except Exception as e:
+            logger.error(f"[STATUS] Exception during result recording for task {task.id}: {e!r}", exc_info=True)
+
+        # Release Max plan account slot (idempotent — skip if already released by reaper)
+        # Runs regardless of whether result recording above succeeded or threw.
+        acct_id = (task.context or {}).get("max_plan_account_id")
+        if acct_id and not (task.context or {}).get("_slot_released"):
+            await release_max_plan_account(acct_id)
+            task.context = {**(task.context or {}), "_slot_released": True}
+
+        old_vm_id = task.vm_instance_id
+        await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
+
+        # Retry logic for failed tasks
+        if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
+            task.attempt_count += 1
+            task.status = TaskStatus.QUEUED
+            task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+            task.last_heartbeat = None
+            task.started_at = None  # Fresh timeout window for the new VM
+            # Add retry delay for transient failures to avoid hammering exhausted resources
+            ctx = dict(task.context or {})
+            if failure_class == "RATE_LIMIT":
+                # Track per-account rate-limit hit count for exponential backoff
+                rl_counts = dict(ctx.get("rate_limit_counts") or {})
+                if acct_id:
+                    rl_counts[str(acct_id)] = rl_counts.get(str(acct_id), 0) + 1
+                ctx["rate_limit_counts"] = rl_counts
+
+                rl_hit_count = rl_counts.get(str(acct_id), 1) if acct_id else 1
+                # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
+                base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
+                delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
+                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
+                # Blacklist rate-limited account so the retry picks a different one
+                if acct_id:
+                    blacklisted = list(ctx.get("blacklisted_accounts") or [])
+                    if acct_id not in blacklisted:
+                        blacklisted.append(acct_id)
+                    ctx["blacklisted_accounts"] = blacklisted
+            elif failure_class == "PROVISION_FAILURE":
+                delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
+                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
+                ctx["retry_after"] = retry_after
+                logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
+            else:
+                ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
+            task.context = ctx
+            session.add(task)
+
+            await session.commit()
+
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(task.id), "status": TaskStatus.QUEUED, "attempt_count": task.attempt_count}
+            )
+            return {"status": "retrying", "message": f"Task {task.id} failed, retrying (Attempt {task.attempt_count}/3)"}
+
+        else:
+            # Retries exhausted — annotate the final status message with context
+            if payload.status == TaskStatus.FAILED:
+                max_r = _runtime_config["max_retries"]
+                existing_msg = task.latest_status_message or ""
+                if "retries exhausted" not in existing_msg:
+                    task.latest_status_message = (
+                        f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r}). "
+                        + existing_msg[:300]
+                    ).strip()
+                    session.add(task)
+
+        # Spawn a debug task for permanently failed tasks (retries exhausted)
+        failed_task_payload = (task.payloads or [{}])[0]
+        failed_task_type = failed_task_payload.get("type", "")
+        should_auto_debug = (
+            payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
+            failed_task_type != "debug" and  # Don't recursively debug debug tasks
+            (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
+            payload.logs and
+            failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
+            (
+                (task.context or {}).get("auto_debug") is True or
+                task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
+                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
+            )
+        )
+        if should_auto_debug:
+            base_branch = failed_task_payload.get("base_branch", "main")
+            debug_task = Task(
+                project_id=task.project_id,
+                title=f"Debug: {task.title}",
+                description=f"Automated root cause analysis for failed task: {task.title}",
+                parent_task_id=task.id,
+                payloads=[{
+                    "type": "debug",
+                    "failed_task_id": str(task.id),
+                    "failed_task_title": task.title,
+                    "error_logs": (payload.logs or "")[:20000],
+                    "base_branch": base_branch,
+                }],
+                context={
+                    "failed_task_id": str(task.id),
+                    "parent_base": base_branch,
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+            session.add(debug_task)
+            await session.flush()
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(debug_task.id), "status": TaskStatus.QUEUED, "title": debug_task.title}
+            )
+            logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
+
+        # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
+        # Only count code errors toward the breaker — rate limits and provision failures aren't code quality issues
+        _cb_failure_class = classify_failure(task, payload.logs)
+        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR" and _cb_failure_class not in ("RATE_LIMIT", "PROVISION_FAILURE"):
+            project_key = str(task.project_id)
+            breaker = _shared_state.get_circuit_breaker(project_key)
+            # Only CODE_ERROR and AGENT_TIMEOUT indicate code regressions; infra/rate-limit
+            # failures are transient and should not trip the breaker.
+            is_code_failure = failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
+            if is_code_failure:
+                breaker["failure_count"] += 1
+                breaker["success_count"] = 0
+
+            # HALF-OPEN test task failed → back to OPEN with doubled cooldown
+            # (any failure on the test task re-opens, including infra failures)
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+                breaker["state"] = "OPEN"
+                breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)  # cap at 2 hours
+                breaker["opened_at"] = _utcnow()
+                breaker["half_open_task_id"] = None
+                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → OPEN for {project_key} (cooldown doubled to {breaker['cooldown_seconds']}s)")
+                await _maybe_create_circuit_breaker_alert(
+                    task.project_id, session,
+                    f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
+                )
+
+            # CLOSED → OPEN after 3 consecutive failures
+            elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
+                breaker["state"] = "OPEN"
+                breaker["opened_at"] = _utcnow()
+                breaker["cooldown_seconds"] = breaker["base_cooldown"]
+                await broadcast_to_project(project_key, "autonomous_paused",
+                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
+                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
+                await _maybe_create_circuit_breaker_alert(
+                    task.project_id, session,
+                    f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
+                )
+            # Persist breaker state on any transition
+            if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
+                await _persist_circuit_breakers()
+        # When review/fix fails permanently, cancel the original create task so rollup
+        # skips it (via cancelled-child logic) instead of hanging forever.
+        # Other children's work is preserved — only this PR is excluded from the rollup.
+        if payload.status == TaskStatus.FAILED:
+            task_payload = (task.payloads or [{}])[0]
+            task_type = task_payload.get("type", "")
+            if task_type in ("review", "fix"):
+                original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
+                                    or task_payload.get("original_task_id", ""))
+                if original_task_id:
+                    try:
+                        orig = await session.get(Task, uuid.UUID(original_task_id))
+                        if orig and orig.status == TaskStatus.COMPLETED:
+                            orig.status = TaskStatus.CANCELLED
+                            orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
+                            session.add(orig)
+                            await session.commit()
+                            # Trigger rollup check so parent can proceed with remaining children
+                            if orig.parent_task_id:
+                                await _check_and_trigger_rollup(orig, session)
+                            logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
+                    except Exception as e:
+                        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+
+        if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
+            project_key = str(task.project_id)
+            breaker = _shared_state.get_circuit_breaker(project_key)
+            breaker["failure_count"] = 0
+            breaker["success_count"] += 1
+
+            # HALF-OPEN test task succeeded → back to CLOSED
+            if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
+                breaker["state"] = "CLOSED"
+                breaker["cooldown_seconds"] = breaker["base_cooldown"]
+                breaker["half_open_task_id"] = None
+                logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
+            elif breaker["state"] == "OPEN":
+                # Shouldn't happen (OPEN blocks spawning), but reset if it does
+                breaker["state"] = "CLOSED"
+            # Persist on state transition back to CLOSED
+            if breaker["state"] == "CLOSED" and breaker["failure_count"] == 0:
+                await _persist_circuit_breakers()
+
+        # ── EARLY COMMIT ──
+        # Release the FOR UPDATE lock NOW, before downstream processing.
+        # Everything below (review pipeline, completion handlers, rollup) makes
+        # GitHub API calls that can hang 15-120+ seconds during connectivity issues.
+        # Holding the lock during those calls starves the heartbeat endpoint
+        # (which also needs FOR UPDATE on this row), causing last_heartbeat to go
+        # stale and the reaper to kill the task.
+        # At this point the status change, artifact, and retry logic are all
+        # persisted.  expire_on_commit=False keeps the task object usable.
+        if session.dirty or session.new:
+            await session.commit()
+
+        # Pass a session factory bound to the SAME engine the request used.
+        # In production this is AsyncSessionLocal; in tests it's the test engine.
+        # This ensures the helper's fresh session doesn't bypass test DB overrides.
+        _factory = sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+        return await _process_post_commit(task.id, payload, _session_factory=_factory)
+
 
 _github_token_cache: Dict[str, Dict] = {}  # project_id -> {"token", "owner", "repo", "fetched_at"}
+_github_token_cache_lock = asyncio.Lock()  # Prevent concurrent cache miss → duplicate token generation
 _GITHUB_TOKEN_TTL = 3000  # 50 minutes (installation tokens expire after 60min)
 
 
@@ -7435,9 +7587,10 @@ async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession, f
 
     # Return cached token if still fresh (installation tokens expire after 60min)
     if not force_refresh:
-        cached = _github_token_cache.get(project_id_str)
-        if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
-            return cached["token"], cached["owner"], cached["repo"]
+        async with _github_token_cache_lock:
+            cached = _github_token_cache.get(project_id_str)
+            if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
+                return cached["token"], cached["owner"], cached["repo"]
 
     project_stmt = select(Project).where(Project.id == task.project_id)
     project = (await session.execute(project_stmt)).scalars().first()
@@ -7472,14 +7625,15 @@ async def get_github_token_for_task(task_id: uuid.UUID, session: AsyncSession, f
     _shared_state.last_github_success = _utcnow()
 
     # Cache token to avoid re-generating for every API call within the same project
-    _github_token_cache[project_id_str] = {
-        "token": token, "owner": project.github_owner, "repo": project.github_repo,
-        "fetched_at": _utcnow()
-    }
-    # Evict stale entries
-    stale_cutoff = _utcnow() - timedelta(seconds=_GITHUB_TOKEN_TTL + 600)
-    for k in [k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff]:
-        _github_token_cache.pop(k, None)
+    async with _github_token_cache_lock:
+        _github_token_cache[project_id_str] = {
+            "token": token, "owner": project.github_owner, "repo": project.github_repo,
+            "fetched_at": _utcnow()
+        }
+        # Evict stale entries
+        stale_cutoff = _utcnow() - timedelta(seconds=_GITHUB_TOKEN_TTL + 600)
+        for k in [k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff]:
+            _github_token_cache.pop(k, None)
 
     return token, project.github_owner, project.github_repo
 
@@ -7946,23 +8100,34 @@ async def github_webhook(
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     # Dedup by GitHub delivery ID — prevents duplicate processing on webhook retries
+    # Uses Redis for cross-instance dedup when available, else per-instance in-memory
     delivery_id = request.headers.get("x-github-delivery")
     if delivery_id:
-        async with _webhook_dedup_lock:
-            # Evict stale entries (older than TTL)
-            now = time.time()
-            while _webhook_delivery_ids:
-                oldest_id, oldest_time = next(iter(_webhook_delivery_ids.items()))
-                if now - oldest_time > _WEBHOOK_DEDUP_TTL:
-                    _webhook_delivery_ids.pop(oldest_id)
-                else:
-                    break
-            if delivery_id in _webhook_delivery_ids:
-                logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping")
-                return {"status": "duplicate", "delivery_id": delivery_id}
-            _webhook_delivery_ids[delivery_id] = now
-            if len(_webhook_delivery_ids) > _WEBHOOK_DEDUP_MAX:
-                _webhook_delivery_ids.popitem(last=False)
+        from app.redis_client import get_redis as _get_redis
+        _r = await _get_redis()
+        if _r:
+            try:
+                was_new = await _r.set(f"webhook:{delivery_id}", "1", nx=True, ex=_WEBHOOK_DEDUP_TTL)
+                if not was_new:
+                    logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping (Redis)")
+                    return {"status": "duplicate", "delivery_id": delivery_id}
+            except Exception:
+                pass  # Fall through to in-memory check
+        else:
+            async with _webhook_dedup_lock:
+                now = time.time()
+                while _webhook_delivery_ids:
+                    oldest_id, oldest_time = next(iter(_webhook_delivery_ids.items()))
+                    if now - oldest_time > _WEBHOOK_DEDUP_TTL:
+                        _webhook_delivery_ids.pop(oldest_id)
+                    else:
+                        break
+                if delivery_id in _webhook_delivery_ids:
+                    logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping")
+                    return {"status": "duplicate", "delivery_id": delivery_id}
+                _webhook_delivery_ids[delivery_id] = now
+                if len(_webhook_delivery_ids) > _WEBHOOK_DEDUP_MAX:
+                    _webhook_delivery_ids.popitem(last=False)
 
     event_type = request.headers.get("x-github-event")
     data = json.loads(payload)
@@ -8001,6 +8166,8 @@ async def github_webhook(
                         )
                     )
                     pr_artifacts = art_result.scalars().all()
+                    if not pr_artifacts:
+                        logger.info(f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet")
                     affected_tasks = []
                     for art in pr_artifacts:
                         pr_task = await session.get(Task, art.task_id)

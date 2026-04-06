@@ -164,9 +164,31 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
 }
 
 function startHeartbeat(taskId: string, getMessage: () => string) {
+  // Fire first heartbeat immediately — don't wait 30s.
+  // If the agent crashes in the first 30s, at least one heartbeat is recorded.
+  (async () => {
+    try {
+      const metrics = collectMetrics();
+      await apiPost('/api/agent/heartbeat', {
+        task_id: taskId,
+        status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
+        metrics,
+      });
+    } catch (e) {
+      log(`Initial heartbeat failed: ${e}`);
+    }
+  })();
+
   heartbeatTimer = setInterval(async () => {
     try {
       const metrics = collectMetrics();
+      // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
+      if (metrics.cgroup_mb && metrics.cgroup_limit_mb) {
+        const memPct = metrics.cgroup_mb / metrics.cgroup_limit_mb;
+        if (memPct > 0.85) {
+          log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
+        }
+      }
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
@@ -178,18 +200,23 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       // Silently dropping heartbeats can let last_heartbeat go stale if the
       // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
       if (e instanceof Error && /failed \(409\)/.test(e.message)) {
-        log('Heartbeat skipped (row locked), retrying in 5s');
-        await new Promise(r => setTimeout(r, 5000));
-        try {
-          const retryMetrics = collectMetrics();
-          await apiPost('/api/agent/heartbeat', {
-            task_id: taskId,
-            status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
-            metrics: retryMetrics,
-          });
-          log('Heartbeat retry succeeded');
-        } catch (retryErr: any) {
-          log(`Heartbeat retry also failed: ${retryErr}`);
+        // Exponential backoff: 5s, then 10s. Total window 15s, within 30s interval.
+        for (let retry = 0; retry < 2; retry++) {
+          const delay = 5000 * (retry + 1);
+          log(`Heartbeat skipped (row locked), retrying in ${delay / 1000}s (attempt ${retry + 1}/2)`);
+          await new Promise(r => setTimeout(r, delay));
+          try {
+            const retryMetrics = collectMetrics();
+            await apiPost('/api/agent/heartbeat', {
+              task_id: taskId,
+              status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
+              metrics: retryMetrics,
+            });
+            log('Heartbeat retry succeeded');
+            return;
+          } catch (retryErr: any) {
+            log(`Heartbeat retry ${retry + 1}/2 failed: ${retryErr}`);
+          }
         }
         return;
       }
@@ -292,6 +319,22 @@ function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+/** Clone with retry — transient network failures get 3 attempts with exponential backoff. */
+async function cloneWithRetry(args: string[], timeoutMs = 300_000): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      execFileSync('git', args, { encoding: 'utf-8', timeout: timeoutMs });
+      return;
+    } catch (e) {
+      if (attempt === 2) throw e;
+      const delay = 5000 * Math.pow(2, attempt);
+      log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : e}`);
+      try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
 // ── Workspace + PR Helpers ───────────────────────────────────────────────────
 async function setupWorkspace(
   owner: string, repo: string, ghToken: string, baseBranch: string,
@@ -302,7 +345,7 @@ async function setupWorkspace(
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -870,7 +913,7 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  execFileSync('git', ['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE]);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -995,7 +1038,7 @@ async function handleFix(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  execFileSync('git', ['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE]);
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
@@ -1308,7 +1351,7 @@ async function handlePlan(
   sendLog(ws, `Planning task decomposition for: ${prompt.slice(0, 200)}\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
@@ -1481,7 +1524,7 @@ async function handleResearch(
   sendLog(ws, `Starting codebase research...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
@@ -1884,7 +1927,7 @@ async function handleSecurityAudit(
   sendLog(ws, `Starting security audit...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
@@ -2089,7 +2132,7 @@ async function handleMigrate(
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
@@ -2226,7 +2269,7 @@ async function handleSmoketest(
   sendLog(ws, `Cloning ${owner}/${repo} @ ${baseBranch}...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
@@ -2392,7 +2435,7 @@ async function handleDebug(
   sendLog(ws, `Cloning ${owner}/${repo} @ ${rawBaseBranch} for debug analysis...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '100', '--branch', rawBaseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '100', '--branch', rawBaseBranch, cloneUrl, WORKSPACE]);
 
   // Gather git context upfront to include in the prompt
   const gitLog = git(['log', '--oneline', '-20']);
@@ -2492,7 +2535,7 @@ async function handlePerf(
   sendLog(ws, `Starting performance analysis...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
@@ -2578,7 +2621,7 @@ async function handleInvestigate(
   sendLog(ws, `Starting investigation...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE], { encoding: 'utf-8', timeout: 300_000 });
+  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 
@@ -2689,6 +2732,9 @@ async function main() {
   const statusRef = { value: 'Initializing...' };
   startHeartbeat(taskId, () => statusRef.value);
   const ws = await connectLogStream(taskId);
+  if (!ws) {
+    log('WARNING: WebSocket log stream unavailable — logs will be sent via status updates only');
+  }
   sendLog(ws, `Agent started (VM: ${VM_INSTANCE_ID}, type: ${taskType})\n`);
 
   try {
