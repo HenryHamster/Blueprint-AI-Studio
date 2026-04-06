@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, ExternalLink, Inbox, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 
@@ -521,7 +521,7 @@ function RootGroup({
   );
 }
 
-export function PipelineView({ tasks, loading = false, hasActiveFilters = false, onViewLogs, onNavigateToParent, onClearWaveDeps }: PipelineViewProps) {
+export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -568,28 +568,6 @@ export function PipelineView({ tasks, loading = false, hasActiveFilters = false,
       el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 0);
   };
-
-  if (tasks.length === 0 && !loading) {
-    return (
-      <div className="flex-1 flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3 text-center">
-          {hasActiveFilters ? (
-            <>
-              <Search className="w-10 h-10 text-neutral-700" />
-              <p className="text-neutral-400 text-sm font-medium">No tasks match your filters</p>
-              <p className="text-neutral-600 text-xs">Try adjusting your search or filter settings</p>
-            </>
-          ) : (
-            <>
-              <Inbox className="w-10 h-10 text-neutral-700" />
-              <p className="text-neutral-400 text-sm font-medium">No tasks yet</p>
-              <p className="text-neutral-600 text-xs">Tasks will appear here once they are created</p>
-            </>
-          )}
-        </div>
-      </div>
-    );
-  }
 
   const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
   const chipBase = 'px-2.5 py-1 text-xs rounded-full border transition-colors font-medium';

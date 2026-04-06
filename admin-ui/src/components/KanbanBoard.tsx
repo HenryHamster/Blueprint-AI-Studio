@@ -1,5 +1,5 @@
 import { useMemo, useState, useRef, useCallback, useEffect } from 'react';
-import { Archive, ArrowDownUp, GripVertical, ChevronLeft, ChevronRight, Inbox, Search } from 'lucide-react';
+import { Archive, ArrowDownUp, GripVertical, ChevronLeft, ChevronRight } from 'lucide-react';
 import {
   DndContext,
   closestCenter,
@@ -327,7 +327,6 @@ export function KanbanBoard({
   onViewLogs,
   groupBy = 'status',
   projects = [],
-  hasActiveFilters = false,
 }: KanbanBoardProps) {
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
@@ -492,28 +491,6 @@ export function KanbanBoard({
   }, [projects]);
 
   const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs };
-
-  if (tasks.length === 0 && !loading) {
-    return (
-      <main className="flex-1 flex items-center justify-center">
-        <div className="flex flex-col items-center gap-3 text-center">
-          {hasActiveFilters ? (
-            <>
-              <Search className="w-10 h-10 text-neutral-700" />
-              <p className="text-neutral-400 text-sm font-medium">No tasks match your filters</p>
-              <p className="text-neutral-600 text-xs">Try adjusting your search or filter settings</p>
-            </>
-          ) : (
-            <>
-              <Inbox className="w-10 h-10 text-neutral-700" />
-              <p className="text-neutral-400 text-sm font-medium">No tasks yet</p>
-              <p className="text-neutral-600 text-xs">Tasks will appear here once they are created</p>
-            </>
-          )}
-        </div>
-      </main>
-    );
-  }
 
   return (
     <DndContext
