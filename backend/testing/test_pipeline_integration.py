@@ -757,3 +757,500 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
         f"Duplicate guard should have blocked the review spawn, "
         f"but found extra review tasks: {[t.id for t in extra_review_tasks]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Iteration cap enforcement tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a review task reaches the per-chain iteration cap, _spawn_pipeline_task
+    must return None (no fix task spawned) and set requires_approval=True on the
+    original task.
+
+    Setup: scope='small' → cap=3.  Place the review task at iteration=3 so the
+    next spawned task would be iteration=4 (> cap), triggering the per-chain cap.
+    Keep completed pipeline tasks at 1 (just this review itself after it finishes)
+    so the global cap (pr_iterations >= cap) does not fire first.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Cap Enforcement Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The "original" create task that started the pipeline
+    original_task = Task(
+        project_id=project.id,
+        title="Implement cap-tested feature",
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        vm_instance_id="agent-vm-cap-orig-001",
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Review task at iteration=3 (the 3rd review in the chain).
+    # scope='small' → _max_review_iterations returns 3.
+    # Attempting to spawn next task → iteration=4 > 3 → per-chain cap fires.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #88",
+        payloads=[{
+            "type": "review",
+            "pr_number": 88,
+            "branch": "blueprint/task-cap0001",
+            "base_branch": "main",
+        }],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "pr_number": 88,
+                "branch": "blueprint/task-cap0001",
+                "base_branch": "main",
+                "iteration": 3,
+                "original_task_id": str(original_task.id),
+            },
+        },
+        vm_instance_id="agent-vm-cap-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    feedback = "Still missing null checks"
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: null checks still missing",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # No fix task should have been spawned — cap was hit
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([original_task.id, review_task.id]),
+        )
+    )
+    new_tasks = result.scalars().all()
+    fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 0, (
+        f"Iteration cap should have blocked fix spawn, but found: {[t.id for t in fix_tasks]}"
+    )
+
+    # Original task must be flagged for manual intervention
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Per-chain iteration cap must set requires_approval=True on the original task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_fix_cap_ci_failure_lower_limit(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When fix_reason='ci_failure' is stored in the review_loop context,
+    _max_review_iterations returns 2 (lower than the default 4-5).
+
+    A review task at iteration=2 with fix_reason='ci_failure' should trigger
+    the per-chain cap when attempting to spawn iteration=3, because 3 > 2.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="CI Failure Cap Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = Task(
+        project_id=project.id,
+        title="Create CI-tested feature",
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        vm_instance_id="agent-vm-ci-orig-001",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Review task at iteration=2 with fix_reason='ci_failure'.
+    # _max_review_iterations returns 2 for ci_failure.
+    # Attempting to spawn next task → iteration=3 > 2 → per-chain cap fires.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #55 (ci failure context)",
+        payloads=[{
+            "type": "review",
+            "pr_number": 55,
+            "branch": "blueprint/task-ci0001",
+            "base_branch": "main",
+        }],
+        context={
+            "review_loop": {
+                "pr_number": 55,
+                "branch": "blueprint/task-ci0001",
+                "base_branch": "main",
+                "iteration": 2,
+                "fix_reason": "ci_failure",
+                "original_task_id": str(original_task.id),
+            },
+        },
+        vm_instance_id="agent-vm-ci-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "CI errors remain"})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="CI still failing",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # No fix task should be spawned — ci_failure cap (2) was hit at iteration 3
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([original_task.id, review_task.id]),
+        )
+    )
+    new_tasks = result.scalars().all()
+    fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 0, (
+        f"ci_failure cap (limit=2) should have blocked fix spawn at iteration 3, "
+        f"but found: {[t.id for t in fix_tasks]}"
+    )
+
+    # Original task must be flagged
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "ci_failure iteration cap must set requires_approval=True on the original task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_fix_cap_sets_status_message(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When the per-chain iteration cap is hit, the original task's
+    latest_status_message must describe the cap event — specifically, it must
+    mention 'iteration' and 'manual review' so operators know why the pipeline
+    stalled.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Cap Status Message Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = Task(
+        project_id=project.id,
+        title="Feature with status message check",
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        vm_instance_id="agent-vm-msg-orig-001",
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # scope='small' → cap=3; iteration=3 → next would be 4 > 3 → per-chain cap fires
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #73",
+        payloads=[{
+            "type": "review",
+            "pr_number": 73,
+            "branch": "blueprint/task-msg0001",
+            "base_branch": "main",
+        }],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "pr_number": 73,
+                "branch": "blueprint/task-msg0001",
+                "base_branch": "main",
+                "iteration": 3,
+                "original_task_id": str(original_task.id),
+            },
+        },
+        vm_instance_id="agent-vm-msg-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": "More changes needed"})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: more changes needed",
+    )
+
+    # The original task's status message must contain the expected keywords
+    await db_session.refresh(original_task)
+    msg = original_task.latest_status_message or ""
+    assert "iteration" in msg.lower(), (
+        f"Status message should mention 'iteration', got: {msg!r}"
+    )
+    assert "manual review" in msg.lower(), (
+        f"Status message should mention 'manual review', got: {msg!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stuck-cycle detection tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When >=50% of CRITICAL/MAJOR issues repeat across two consecutive review
+    iterations, the fix spawn must be suppressed (return None) and the original
+    task must be marked requires_approval=True.
+
+    Setup: a review task at iteration=1 whose review_loop already carries a
+    prior review_history entry with the same CRITICAL issue. When the review
+    completes with REQUEST_CHANGES (same issue), _spawn_pipeline_task is called
+    with task_type="fix" at iteration=2. new_review_history will have 2 entries
+    with matching CRITICAL issues → stuck-cycle detection fires.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Stuck Cycle Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = Task(
+        project_id=project.id,
+        title="Create stuck-cycle feature",
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        vm_instance_id="agent-vm-stuck-orig-001",
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Repeated CRITICAL issue: same description in prior history and current verdict
+    repeated_issue = {
+        "severity": "CRITICAL",
+        "description": "Missing input validation on user-facing endpoints",
+    }
+    # This entry is already in the review_loop context from the previous iteration
+    prior_history_entry = {
+        "iteration": 0,
+        "feedback": "Still missing validation",
+        "issues": [repeated_issue],
+    }
+
+    # Review task at iteration=1. Its review_loop carries one prior history entry.
+    # When it completes with the same CRITICAL issue, iteration for the spawned fix
+    # will be 2, and new_review_history will have 2 matching entries → stuck detected.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #99",
+        payloads=[{
+            "type": "review",
+            "pr_number": 99,
+            "branch": "blueprint/task-stuck0001",
+            "base_branch": "main",
+            "original_task_id": str(original_task.id),
+        }],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "pr_number": 99,
+                "branch": "blueprint/task-stuck0001",
+                "base_branch": "main",
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "review_history": [prior_history_entry],
+            },
+        },
+        vm_instance_id="agent-vm-stuck-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Still missing validation",
+        "issues": [repeated_issue],
+    })
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: still missing validation",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # No fix task should be spawned — stuck cycle was detected
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.notin_([original_task.id, review_task.id]),
+        )
+    )
+    new_tasks = result.scalars().all()
+    fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 0, (
+        f"Stuck-cycle detection should have suppressed fix spawn, "
+        f"but found: {[t.id for t in fix_tasks]}"
+    )
+
+    # Original task must be flagged for manual intervention
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Stuck-cycle detection must set requires_approval=True on the original task"
+    )
+    msg = original_task.latest_status_message or ""
+    assert "stuck" in msg.lower() or "manual review" in msg.lower(), (
+        f"Status message should indicate a stuck cycle, got: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_detected_without_explicit_original_task_id(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    Regression test: stuck-cycle detection must still mark a task as
+    requires_approval even when original_task_id is absent from source_loop
+    and source_payload.
+
+    In this case resolved_original_id falls back to str(source_task.id) (the
+    review task itself), so the review task gets flagged — the key assertion is
+    that the function does NOT silently drop the cycle (return None without
+    setting requires_approval anywhere), which was the bug introduced by
+    recomputing stuck_orig_id with an incomplete fallback chain.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.main.broadcast_to_project")
+
+    project = Project(name="Stuck Cycle No-OrigID Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    repeated_issue = {
+        "severity": "MAJOR",
+        "description": "SQL injection risk in search query construction",
+    }
+    prior_history_entry = {
+        "iteration": 0,
+        "feedback": "SQL injection still present",
+        "issues": [repeated_issue],
+    }
+
+    # Review task at iteration=1 with NO original_task_id anywhere.
+    # resolved_original_id will fall back to str(source_task.id) = review_task.id.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #101",
+        payloads=[{
+            "type": "review",
+            "pr_number": 101,
+            "branch": "blueprint/task-stuck0002",
+            "base_branch": "main",
+            # deliberately omit original_task_id
+        }],
+        context={
+            "review_loop": {
+                "pr_number": 101,
+                "branch": "blueprint/task-stuck0002",
+                "base_branch": "main",
+                "iteration": 1,
+                # deliberately omit original_task_id
+                "review_history": [prior_history_entry],
+            },
+        },
+        vm_instance_id="agent-vm-stuck-noid-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "SQL injection still present",
+        "issues": [repeated_issue],
+    })
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: SQL injection still present",
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+    # No fix task — stuck cycle suppresses spawn
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    new_tasks = result.scalars().all()
+    fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
+
+    assert len(fix_tasks) == 0, (
+        f"Stuck-cycle must suppress spawn even without explicit original_task_id, "
+        f"but found fix tasks: {[t.id for t in fix_tasks]}"
+    )
+
+    # The review task itself (acting as resolved_original_id fallback) must be flagged
+    await db_session.refresh(review_task)
+    assert review_task.requires_approval is True, (
+        "Without explicit original_task_id, resolved_original_id falls back to "
+        "source_task.id — that task must still be flagged requires_approval=True"
+    )

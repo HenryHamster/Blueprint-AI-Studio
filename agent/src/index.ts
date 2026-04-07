@@ -804,6 +804,80 @@ function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
+function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[]): string {
+  if (!relatedFiles || relatedFiles.length === 0) return '';
+
+  try {
+    const testEntries: string[] = [];
+    const seen = new Set<string>();
+
+    const extractTestNames = (content: string): string[] => {
+      const names: string[] = [];
+      for (const line of content.split('\n')) {
+        const m = line.match(/^\s*(?:def (test_\w+)|it\(['"`]([^'"`]+)['"`]|test\(['"`]([^'"`]+)['"`]|describe\(['"`]([^'"`]+)['"`])/);
+        if (m) names.push(m[1] || m[2] || m[3] || m[4]);
+      }
+      return names;
+    };
+
+    const processTestFile = (testPath: string) => {
+      const full = `${WORKSPACE}/${testPath}`;
+      if (seen.has(testPath) || !fs.existsSync(full)) return;
+      seen.add(testPath);
+      try {
+        const content = fs.readFileSync(full, 'utf-8').split('\n').slice(0, 80).join('\n');
+        const names = extractTestNames(content);
+        if (names.length > 0) {
+          testEntries.push(`- ${testPath}: ${names.slice(0, 10).join(', ')}`);
+        } else {
+          testEntries.push(`- ${testPath}`);
+        }
+      } catch { /* skip unreadable */ }
+    };
+
+    for (const relFile of relatedFiles) {
+      // Convention-based discovery
+      if (relFile.startsWith('backend/') && relFile.endsWith('.py')) {
+        const base = relFile.replace(/^backend\/app\//, '').replace(/\.py$/, '');
+        const candidate = `backend/testing/test_${base.split('/').pop()}.py`;
+        processTestFile(candidate);
+      } else if (relFile.match(/^admin-ui\/.*\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+        const testPath = relFile.replace(/\.(tsx?|jsx?)$/, '.test.$1');
+        processTestFile(testPath);
+      } else if (relFile.startsWith('agent/')) {
+        // Search for any test files in agent/
+        try {
+          const agentTestFiles = execFileSync('git', ['ls-files', 'agent/'],
+            { cwd: WORKSPACE, encoding: 'utf-8' })
+            .split('\n')
+            .filter(f => f.includes('.test.') || f.includes('test_') || f.includes('/tests/'));
+          for (const tf of agentTestFiles) processTestFile(tf);
+        } catch { /* skip */ }
+      }
+
+      // Grep-based discovery: find test files importing from this module
+      try {
+        const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+        if (moduleName) {
+          const grepResult = execFileSync('git', ['grep', '-l', moduleName, '--', '*test*'],
+            { cwd: WORKSPACE, encoding: 'utf-8' });
+          for (const tf of grepResult.split('\n').filter(Boolean)) {
+            processTestFile(tf);
+          }
+        }
+      } catch { /* no matches */ }
+    }
+
+    if (testEntries.length === 0) return '';
+
+    const output = `## Related Tests\nThese tests cover files you'll be modifying:\n${testEntries.join('\n')}\n\n`;
+    return output.slice(0, 2000);
+  } catch (e) {
+    sendLog(ws, `Warning: related test discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
 // ── Standard Handler Helper ───────────────────────────────────────────────
 interface StandardHandlerOpts {
   taskId: string;
@@ -823,6 +897,7 @@ interface StandardHandlerOpts {
   noChangesMessage?: string;
   runLintFix?: boolean;
   runTestFix?: boolean;
+  failOnTestFailure?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
 }
@@ -834,6 +909,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     noChangesMessage = 'No file changes.',
     runLintFix = true,
     runTestFix = false,
+    failOnTestFailure = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = false,
   } = opts;
@@ -863,8 +939,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
 
+  const fileTree = buildFileTree(ws);
+  const finalPromptWithTree = fileTree + finalPrompt;
+
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPromptWithTree, ws, statusRef, model, effort);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -884,6 +963,15 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const result = await testFixLoop(ws, statusRef, model, effort);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
+    }
+
+    if (failOnTestFailure && testFailuresDetected && !testsPassed) {
+      sendLog(ws, 'Tests failed after max fix attempts — marking task as FAILED.\n');
+      await apiPost('/api/agent/status', {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`,
+      });
+      return;
     }
 
     git(['add', '-A']);
@@ -938,15 +1026,23 @@ async function handleCreate(
       ).join('\n') + '\n\n'
     : '';
 
+  const relatedFiles = (
+    (payload.related_files as string[] | undefined) ||
+    ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+    []
+  );
+  const relatedTestContext = discoverRelatedTests(ws, relatedFiles);
+
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${overlapWarningText}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
+    failOnTestFailure: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
   });
@@ -1111,6 +1207,7 @@ async function handleFix(
   const prompt = strVal(payload.prompt);
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
+  const originalPrompt = strVal(payload.original_prompt);
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -1155,7 +1252,8 @@ async function handleFix(
   if (iteration >= maxIterations) {
     iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';
   }
-  let basePrompt = iterationHeader + prompt;
+  const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
+  let basePrompt = originalPromptSection + iterationHeader + prompt;
   if (reviewHistory.length > 0) {
     const historyLines = reviewHistory
       .map(e => {
@@ -1170,7 +1268,7 @@ async function handleFix(
         }
       })
       .join('\n');
-    basePrompt = `Previous review iterations:\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
+    basePrompt = `${originalPromptSection}Previous review iterations:\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed
@@ -2520,8 +2618,13 @@ async function handleDebug(
   const gitLog = git(['log', '--oneline', '-20']);
   const gitDiffStat = (() => { try { return git(['diff', 'HEAD~5...HEAD', '--stat']); } catch { return '(not enough history)'; } })();
 
-  const debugPrompt = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
+  // Load codebase instructions and project context (like other handlers)
+  const claudeMd = readClaudeMd();
+  const contextPrefix = buildContextPrefix(task);
+  const fileTree = buildFileTree(ws);
 
+  const debugPrompt = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
+${claudeMd ? `\n## Codebase Instructions\n${claudeMd}\n` : ''}${contextPrefix ? `\n${contextPrefix}` : ''}${fileTree ? `\n## Repository File Tree\n${fileTree}\n` : ''}
 ## Failed Task
 Title: ${failedTaskTitle}
 ${failedTaskId ? `Task ID: ${failedTaskId}` : ''}

@@ -5191,6 +5191,7 @@ async def _spawn_pipeline_task(
 
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
                         "base_branch": base_branch, "prompt": enriched_fix_prompt,
+                        "original_prompt": original_prompt,
                         "original_task_id": resolved_original_id,
                         **({"model": type_model} if type_model else {}),
                         **({"effort": type_effort} if type_effort else {})}
@@ -5205,6 +5206,54 @@ async def _spawn_pipeline_task(
         if task_type == "fix" and current_feedback
         else prev_review_history
     )
+
+    # Stuck-cycle detection: if the same CRITICAL/MAJOR issues repeat across consecutive
+    # iterations, escalate for manual review instead of consuming the full iteration budget.
+    if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
+        prev_entry = new_review_history[-2]
+        curr_entry = new_review_history[-1]
+        prev_issues_list = prev_entry.get("issues") or []
+        curr_issues_list = curr_entry.get("issues") or []
+        prev_critical_major = {
+            i.get("description", "").lower().strip()
+            for i in prev_issues_list
+            if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
+            and i.get("description", "").strip()
+        }
+        curr_critical_major = [
+            i.get("description", "").lower().strip()
+            for i in curr_issues_list
+            if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
+            and i.get("description", "").strip()
+        ]
+        if curr_critical_major and prev_critical_major:
+            matched_count = sum(
+                1 for desc in curr_critical_major
+                if any(desc in prev_desc or prev_desc in desc for prev_desc in prev_critical_major)
+            )
+            total_count = len(curr_critical_major)
+            if matched_count / total_count >= 0.5:
+                logger.warning(
+                    f"[PIPELINE] Stuck cycle detected for PR #{pr_number}: "
+                    f"{matched_count}/{total_count} issues repeated"
+                )
+                # resolved_original_id is always non-empty (falls back to str(source_task.id))
+                try:
+                    stuck_orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                    if stuck_orig:
+                        stuck_orig.requires_approval = True
+                        stuck_orig.latest_status_message = (
+                            f"Review-fix cycle appears stuck — same issues repeated across "
+                            f"{iteration} iterations. Manual review required."
+                        )
+                        session.add(stuck_orig)
+                        await session.commit()
+                except Exception as e:
+                    logger.warning(
+                        f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
+                        exc_info=True,
+                    )
+                return None
 
     source_ctx = source_task.context or {}
     propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
@@ -7906,6 +7955,7 @@ async def _process_post_commit(
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=fix_prompt_text,
+                        original_prompt=original_prompt,
                         original_task_id=original_task_id,
                         current_feedback=feedback,
                         current_issues=issues
