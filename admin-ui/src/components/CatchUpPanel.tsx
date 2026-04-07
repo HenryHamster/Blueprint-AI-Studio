@@ -20,6 +20,22 @@ interface RecentFailure {
   failed_at: string | null;
   error_snippet: string | null;
   waiting_hours?: number;
+  attempt_count?: number;
+}
+
+interface FailureGroupTask {
+  task_id: string;
+  title: string;
+  error_snippet: string | null;
+  attempt_count: number;
+  waiting_hours?: number;
+}
+
+interface FailureGroup {
+  failure_class: string;
+  label: string;
+  count: number;
+  tasks: FailureGroupTask[];
 }
 
 interface RecentCompletion {
@@ -40,6 +56,9 @@ interface DirectionProgress {
   tasks_created: number;
   prs_merged: number;
   possibly_saturated: boolean;
+  latest_insights?: string[];
+  recent_finding_titles?: string[];
+  latest_research_at?: string | null;
 }
 
 interface ActiveTask {
@@ -64,10 +83,18 @@ interface DigestData {
   active_tasks: ActiveTask[];
   needs_attention: NeedsAttentionItem[];
   recent_failures: RecentFailure[];
+  failure_groups?: FailureGroup[];
   recent_completions: RecentCompletion[];
   success_rate?: number | null;
   narrative_summary?: string;
   direction_progress?: DirectionProgress[];
+  prev_completed_count?: number;
+  prev_failed_count?: number;
+  prev_success_rate?: number | null;
+  completed_delta?: number;
+  failed_delta?: number;
+  success_rate_delta?: number | null;
+  trend?: 'improving' | 'declining' | 'stable';
 }
 
 export interface CatchUpPanelProps {
@@ -79,9 +106,36 @@ export interface CatchUpPanelProps {
   needsAttentionCount?: number;
   onApprove?: (taskId: string) => void;
   onRetry?: (taskId: string) => void;
+  onBulkApprove?: (taskIds: string[]) => void;
+  onBulkRetry?: (taskIds: string[]) => void;
 }
 
 type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
+
+type DismissEntry = { type: 'dismiss' } | { type: 'snooze'; until: number };
+type DismissedState = Record<string, DismissEntry>;
+
+function loadDismissed(): DismissedState {
+  try {
+    const raw = localStorage.getItem('blueprint-admin:dismissedAttention');
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDismissed(state: DismissedState): void {
+  localStorage.setItem('blueprint-admin:dismissedAttention', JSON.stringify(state));
+}
+
+function formatSnoozeRemaining(until: number): string {
+  const remaining = until - Date.now();
+  if (remaining <= 0) return 'expired';
+  const hours = Math.floor(remaining / (3600 * 1000));
+  const mins = Math.floor((remaining % (3600 * 1000)) / 60000);
+  if (hours > 0) return `snoozed for ${hours}h more`;
+  return `snoozed for ${mins}m more`;
+}
 
 function windowToHours(window: TimeWindow, lastVisitTimestamp: number | null): number {
   switch (window) {
@@ -159,7 +213,75 @@ function SkeletonRow() {
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry }: CatchUpPanelProps) {
+function DirectionProgressSection({ directions }: { directions: DirectionProgress[] }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const toggle = (id: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
+      {directions.map(dp => {
+        const hasInsights = (dp.latest_insights?.length ?? 0) > 0;
+        const isExpanded = expanded.has(dp.direction_id);
+        return (
+          <div key={dp.direction_id} className="flex flex-col bg-neutral-950 border border-neutral-800/80 rounded">
+            <div className="flex items-center gap-2 text-xs px-2 py-1.5">
+              <span className="flex-1 truncate text-neutral-400">{dp.direction_text || dp.direction_id}</span>
+              {dp.latest_research_at && (
+                <span className="shrink-0 text-[10px] font-mono text-neutral-600">{formatRelativeTime(dp.latest_research_at)}</span>
+              )}
+              <div className="shrink-0 flex items-center gap-1.5 text-[10px] font-mono text-neutral-600">
+                {dp.cycles_in_window > 0 && (
+                  <span>{dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}</span>
+                )}
+                {dp.tasks_created > 0 && (
+                  <span>{dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}</span>
+                )}
+                {dp.prs_merged > 0 && (
+                  <span className="text-emerald-600">{dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}</span>
+                )}
+              </div>
+              {dp.possibly_saturated && (
+                <span className="shrink-0 text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">saturated</span>
+              )}
+              {hasInsights && (
+                <button
+                  onClick={() => toggle(dp.direction_id)}
+                  className="shrink-0 text-neutral-600 hover:text-neutral-400"
+                >
+                  {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                </button>
+              )}
+            </div>
+            {hasInsights && isExpanded && (
+              <div className="border-t border-neutral-800/60 px-2 py-1.5 flex flex-col gap-1">
+                <ul className="flex flex-col gap-0.5">
+                  {dp.latest_insights!.map((insight, i) => (
+                    <li key={i} className="text-[11px] italic text-neutral-500 leading-relaxed">• {insight}</li>
+                  ))}
+                </ul>
+                {(dp.recent_finding_titles?.length ?? 0) > 0 && (
+                  <div className="text-[10px] text-neutral-600 mt-0.5">
+                    <span className="font-semibold text-neutral-500">Findings:</span> {dp.recent_finding_titles!.join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry }: CatchUpPanelProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -176,8 +298,21 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [dismissed, setDismissed] = useState<DismissedState>(() => {
+    const raw = loadDismissed();
+    const now = Date.now();
+    const state = Object.fromEntries(
+      Object.entries(raw).filter(([, entry]) => !(entry.type === 'snooze' && entry.until <= now))
+    ) as DismissedState;
+    if (Object.keys(state).length < Object.keys(raw).length) saveDismissed(state);
+    return state;
+  });
+  const [openDropdown, setOpenDropdown] = useState<string | null>(null);
+  const [showDismissed, setShowDismissed] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoSectionExpandedRef = useRef(false);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
 
   const fetchDigest = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -227,6 +362,49 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     }
   }, [digest]);
 
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!openDropdown) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOpenDropdown(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [openDropdown]);
+
+  const dismissItem = (taskId: string) => {
+    const next = { ...dismissed, [taskId]: { type: 'dismiss' as const } };
+    setDismissed(next);
+    saveDismissed(next);
+    setOpenDropdown(null);
+  };
+
+  const snoozeItem = (taskId: string, hours: number) => {
+    const until = Date.now() + hours * 3600 * 1000;
+    const next = { ...dismissed, [taskId]: { type: 'snooze' as const, until } };
+    setDismissed(next);
+    saveDismissed(next);
+    setOpenDropdown(null);
+  };
+
+  const restoreItem = (taskId: string) => {
+    const next = Object.fromEntries(
+      Object.entries(dismissed).filter(([k]) => k !== taskId)
+    ) as DismissedState;
+    setDismissed(next);
+    saveDismissed(next);
+  };
+
+  const isHidden = (taskId: string): boolean => {
+    const entry = dismissed[taskId];
+    if (!entry) return false;
+    if (entry.type === 'dismiss') return true;
+    if (entry.type === 'snooze') return Date.now() < entry.until;
+    return false;
+  };
+
   const toggle = () => {
     const next = !collapsed;
     setCollapsed(next);
@@ -253,7 +431,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
 
   // Failures not already in needs_attention
   const attentionIds = new Set(digest?.needs_attention.map(i => i.task_id) ?? []);
-  const extraFailures = digest?.recent_failures.filter(f => !attentionIds.has(f.task_id)) ?? [];
+  const extraFailureGroups = (digest?.failure_groups ?? [])
+    .map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) }))
+    .filter(g => g.tasks.length > 0);
 
   const windowLabels: { key: TimeWindow; label: string }[] = [
     { key: 'last_visit', label: lastVisitTimestamp ? 'Since last visit' : 'Since last visit (24h)' },
@@ -312,14 +492,34 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
             </div>
           ) : (
             <div className="flex flex-col gap-3">
-              {digest!.narrative_summary && (
-                <p className="text-sm text-neutral-300 mb-3 leading-relaxed">{digest!.narrative_summary}</p>
+              {(digest!.narrative_summary || digest!.trend) && (
+                <div className="flex items-start gap-2 mb-3">
+                  {digest!.narrative_summary && (
+                    <p className="text-sm text-neutral-300 leading-relaxed flex-1">{digest!.narrative_summary}</p>
+                  )}
+                  {digest!.trend && (
+                    <span className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                      digest!.trend === 'improving'
+                        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
+                        : digest!.trend === 'declining'
+                          ? 'bg-red-500/15 text-red-400 border-red-500/20'
+                          : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30'
+                    }`}>
+                      {digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}
+                    </span>
+                  )}
+                </div>
               )}
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
                 {digest!.success_rate != null && (
                   <span className={`flex items-center gap-1 ${digest!.success_rate >= 0.8 ? 'text-emerald-400' : digest!.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
                     {Math.round(digest!.success_rate * 100)}% success
+                    {digest!.success_rate_delta != null && (
+                      <span className={digest!.success_rate_delta > 0 ? 'text-emerald-400' : digest!.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
+                        {digest!.success_rate_delta > 0 ? '+' : ''}{Math.round(digest!.success_rate_delta * 100)}%
+                      </span>
+                    )}
                   </span>
                 )}
                 {digest!.pending_approval_count > 0 && (
@@ -332,12 +532,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   <span className="flex items-center gap-1">
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
                     {digest!.completed_count} completed
+                    {digest!.completed_delta != null && digest!.completed_delta !== 0 && (
+                      <span className={digest!.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}>
+                        {digest!.completed_delta > 0 ? '↑' : '↓'}
+                      </span>
+                    )}
                   </span>
                 )}
                 {digest!.failed_count > 0 && (
                   <span className="flex items-center gap-1">
                     <XCircle className="w-3 h-3 text-red-500" />
                     {digest!.failed_count} failed
+                    {digest!.failed_delta != null && digest!.failed_delta !== 0 && (
+                      <span className={digest!.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}>
+                        {digest!.failed_delta > 0 ? '↑' : '↓'}
+                      </span>
+                    )}
                   </span>
                 )}
                 {digest!.research_cycles > 0 && (
@@ -359,92 +569,160 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
 
               {/* Direction progress */}
               {digest!.direction_progress && digest!.direction_progress.length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
-                  {digest!.direction_progress.map(dp => (
-                    <div key={dp.direction_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded">
-                      <span className="flex-1 truncate text-neutral-400">{dp.direction_text || dp.direction_id}</span>
-                      <div className="shrink-0 flex items-center gap-1.5 text-[10px] font-mono text-neutral-600">
-                        {dp.cycles_in_window > 0 && (
-                          <span>{dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}</span>
-                        )}
-                        {dp.tasks_created > 0 && (
-                          <span>{dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}</span>
-                        )}
-                        {dp.prs_merged > 0 && (
-                          <span className="text-emerald-600">{dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}</span>
-                        )}
-                      </div>
-                      {dp.possibly_saturated && (
-                        <span className="shrink-0 text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">saturated</span>
-                      )}
-                    </div>
-                  ))}
-                </div>
+                <DirectionProgressSection directions={digest!.direction_progress} />
               )}
 
               {/* Needs attention */}
-              {digest!.needs_attention.length > 0 && (
-                <div className="border border-amber-500/30 rounded-lg p-3 flex flex-col gap-2">
-                  <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-400 uppercase tracking-widest">
-                    <AlertTriangle className="w-3 h-3" />
-                    Needs attention ({digest!.needs_attention.length})
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    {digest!.needs_attention.map(item => (
-                      <div key={item.task_id} className="flex flex-col gap-1">
-                        <div
-                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
-                          onClick={() => onSelectTask({ id: item.task_id })}
+              {digest!.needs_attention.length > 0 && (() => {
+                const visibleItems = digest!.needs_attention.filter(item => !isHidden(item.task_id));
+                const hiddenItems = digest!.needs_attention.filter(item => isHidden(item.task_id));
+                const countLabel = hiddenItems.length > 0
+                  ? `${visibleItems.length} visible / ${digest!.needs_attention.length} total`
+                  : String(digest!.needs_attention.length);
+                return (
+                  <div className="border border-amber-500/30 rounded-lg p-3 flex flex-col gap-2">
+                    <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-400 uppercase tracking-widest">
+                      <AlertTriangle className="w-3 h-3" />
+                      <span className="flex-1">Needs attention ({countLabel})</span>
+                      {onBulkApprove && visibleItems.filter(i => i.reason === 'approval_required').length >= 2 && (
+                        <button
+                          className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
+                          onClick={() => onBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
                         >
-                          <span className="flex-1 truncate text-neutral-300">{item.title}</span>
-                          <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
-                            item.reason === 'failed'
-                              ? 'bg-red-500/10 text-red-400'
-                              : 'bg-amber-500/10 text-amber-400'
-                          }`}>
-                            {item.reason === 'failed' ? 'Failed' : 'Approval required'}
-                          </span>
-                          <WaitingBadge hours={item.waiting_hours} />
-                          {item.reason === 'approval_required' && onApprove && (
-                            <button
-                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
-                              onClick={e => { e.stopPropagation(); onApprove(item.task_id); }}
-                            >
-                              <Check className="w-2.5 h-2.5" />
-                              Approve
-                            </button>
-                          )}
-                          {item.reason === 'failed' && onRetry && (
-                            <button
-                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
-                              onClick={e => { e.stopPropagation(); onRetry(item.task_id); }}
-                            >
-                              <RotateCcw className="w-2.5 h-2.5" />
-                              Retry
-                            </button>
+                          <Check className="w-3 h-3" />
+                          Approve all ({visibleItems.filter(i => i.reason === 'approval_required').length})
+                        </button>
+                      )}
+                      {onBulkRetry && visibleItems.filter(i => i.reason === 'failed').length >= 2 && (
+                        <button
+                          className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
+                          onClick={() => onBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Retry all ({visibleItems.filter(i => i.reason === 'failed').length})
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      {visibleItems.map(item => (
+                        <div key={item.task_id} className="flex flex-col gap-1">
+                          <div
+                            className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            onClick={() => onSelectTask({ id: item.task_id })}
+                          >
+                            <span className="flex-1 truncate text-neutral-300">{item.title}</span>
+                            <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
+                              item.reason === 'failed'
+                                ? 'bg-red-500/10 text-red-400'
+                                : 'bg-amber-500/10 text-amber-400'
+                            }`}>
+                              {item.reason === 'failed' ? 'Failed' : 'Approval required'}
+                            </span>
+                            <WaitingBadge hours={item.waiting_hours} />
+                            {item.reason === 'approval_required' && onApprove && (
+                              <button
+                                className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
+                                onClick={e => { e.stopPropagation(); onApprove(item.task_id); }}
+                              >
+                                <Check className="w-2.5 h-2.5" />
+                                Approve
+                              </button>
+                            )}
+                            {item.reason === 'failed' && onRetry && (
+                              <button
+                                className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
+                                onClick={e => { e.stopPropagation(); onRetry(item.task_id); }}
+                              >
+                                <RotateCcw className="w-2.5 h-2.5" />
+                                Retry
+                              </button>
+                            )}
+                            {/* Dismiss/snooze button */}
+                            <div className="relative shrink-0" onClick={e => e.stopPropagation()}>
+                              <button
+                                className="text-neutral-600 hover:text-neutral-400 transition-colors px-1 leading-none text-sm"
+                                title="Dismiss or snooze"
+                                onClick={() => setOpenDropdown(openDropdown === item.task_id ? null : item.task_id)}
+                              >
+                                ×
+                              </button>
+                              {openDropdown === item.task_id && (
+                                <div
+                                  ref={dropdownRef}
+                                  className="absolute right-0 top-full mt-0.5 z-10 bg-neutral-900 border border-neutral-700 rounded shadow-lg py-0.5 min-w-[110px]"
+                                >
+                                  {(['Dismiss', 'Snooze 4h', 'Snooze 12h', 'Snooze 24h'] as const).map(opt => (
+                                    <button
+                                      key={opt}
+                                      className="block w-full text-left text-[11px] px-3 py-1 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition-colors"
+                                      onClick={() => {
+                                        if (opt === 'Dismiss') dismissItem(item.task_id);
+                                        else if (opt === 'Snooze 4h') snoozeItem(item.task_id, 4);
+                                        else if (opt === 'Snooze 12h') snoozeItem(item.task_id, 12);
+                                        else snoozeItem(item.task_id, 24);
+                                      }}
+                                    >
+                                      {opt}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          {item.error_snippet && (
+                            <div className="px-2">
+                              <button
+                                onClick={() => toggleSnippet(item.task_id)}
+                                className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+                              >
+                                {expandedSnippets.has(item.task_id) ? 'hide error ▲' : 'show error ▼'}
+                              </button>
+                              {expandedSnippets.has(item.task_id) && (
+                                <pre className="mt-1 text-[10px] text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                                  {item.error_snippet}
+                                </pre>
+                              )}
+                            </div>
                           )}
                         </div>
-                        {item.error_snippet && (
-                          <div className="px-2">
-                            <button
-                              onClick={() => toggleSnippet(item.task_id)}
-                              className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
-                            >
-                              {expandedSnippets.has(item.task_id) ? 'hide error ▲' : 'show error ▼'}
-                            </button>
-                            {expandedSnippets.has(item.task_id) && (
-                              <pre className="mt-1 text-[10px] text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
-                                {item.error_snippet}
-                              </pre>
-                            )}
+                      ))}
+                    </div>
+                    {hiddenItems.length > 0 && (
+                      <div className="mt-1">
+                        <button
+                          className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+                          onClick={() => setShowDismissed(v => !v)}
+                        >
+                          {showDismissed ? 'Hide dismissed' : `Show ${hiddenItems.length} dismissed`}
+                        </button>
+                        {showDismissed && (
+                          <div className="flex flex-col gap-1.5 mt-1.5">
+                            {hiddenItems.map(item => {
+                              const entry = dismissed[item.task_id];
+                              return (
+                                <div key={item.task_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/50 px-2 py-1.5 rounded opacity-50">
+                                  <span className="flex-1 truncate text-neutral-400">{item.title}</span>
+                                  {entry?.type === 'snooze' && (
+                                    <span className="shrink-0 text-[9px] font-mono text-neutral-500">
+                                      {formatSnoozeRemaining((entry as { type: 'snooze'; until: number }).until)}
+                                    </span>
+                                  )}
+                                  <button
+                                    className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
+                                    onClick={() => restoreItem(item.task_id)}
+                                  >
+                                    Restore
+                                  </button>
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
                       </div>
-                    ))}
+                    )}
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* In progress */}
               {digest!.active_count > 0 && (
@@ -484,8 +762,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                 </div>
               )}
 
-              {/* Recent failures (not in needs_attention) */}
-              {extraFailures.length > 0 && (
+              {/* Recent failures grouped by classification (not in needs_attention) */}
+              {extraFailureGroups.length > 0 && (
                 <div>
                   <button
                     onClick={() => setFailuresExpanded(v => !v)}
@@ -493,22 +771,74 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   >
                     {failuresExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                     <XCircle className="w-3 h-3 text-red-500" />
-                    Recent failures ({extraFailures.length})
+                    Recent failures ({extraFailureGroups.reduce((s, g) => s + g.tasks.length, 0)})
                   </button>
                   {failuresExpanded && (
-                    <div className="flex flex-col gap-1.5">
-                      {extraFailures.map(f => (
-                        <div
-                          key={f.task_id}
-                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
-                          onClick={() => onSelectTask({ id: f.task_id })}
-                        >
-                          <span className="flex-1 truncate text-neutral-400">{f.title}</span>
-                          {f.failed_at && (
-                            <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{formatRelativeTime(f.failed_at)}</span>
-                          )}
-                        </div>
-                      ))}
+                    <div className="flex flex-col gap-2">
+                      {extraFailureGroups.map(group => {
+                        const isGroupExpanded = expandedGroups.has(group.failure_class);
+                        const badgeClass = group.failure_class === 'CODE_ERROR'
+                          ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                          : group.failure_class === 'RATE_LIMIT' || group.failure_class === 'EXTERNAL_API'
+                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          : 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30';
+                        return (
+                          <div key={group.failure_class}>
+                            <button
+                              onClick={() => setExpandedGroups(prev => {
+                                const next = new Set(prev);
+                                if (next.has(group.failure_class)) next.delete(group.failure_class);
+                                else next.add(group.failure_class);
+                                return next;
+                              })}
+                              className="flex items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
+                            >
+                              {isGroupExpanded ? <ChevronUp className="w-3 h-3 text-neutral-500 shrink-0" /> : <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />}
+                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${badgeClass}`}>
+                                {group.label}
+                              </span>
+                              <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
+                            </button>
+                            {isGroupExpanded && (
+                              <div className="flex flex-col gap-1 ml-5">
+                                {group.tasks.map(t => (
+                                  <div key={t.task_id} className="flex flex-col gap-0.5">
+                                    <div
+                                      className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                                      onClick={() => onSelectTask({ id: t.task_id })}
+                                    >
+                                      <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                                      {t.attempt_count > 1 && (
+                                        <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40">
+                                          attempt {t.attempt_count}
+                                        </span>
+                                      )}
+                                      {t.waiting_hours != null && t.waiting_hours > 0 && (
+                                        <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{t.waiting_hours}h ago</span>
+                                      )}
+                                    </div>
+                                    {t.error_snippet && (
+                                      <div className="px-2">
+                                        <button
+                                          onClick={() => toggleSnippet(t.task_id)}
+                                          className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
+                                        >
+                                          {expandedSnippets.has(t.task_id) ? 'hide error ▲' : 'show error ▼'}
+                                        </button>
+                                        {expandedSnippets.has(t.task_id) && (
+                                          <pre className="mt-1 text-[10px] text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                                            {t.error_snippet}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>

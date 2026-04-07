@@ -482,6 +482,8 @@ export default function App() {
           onOpenActivityFeed={() => s.setShowActivityFeed(true)}
           onApprove={(taskId) => s.handleApprove(taskId)}
           onRetry={(taskId) => s.handleRetry(taskId)}
+          onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
+          onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
         />
       )}
 

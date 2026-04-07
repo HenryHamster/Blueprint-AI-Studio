@@ -455,6 +455,151 @@ async def bulk_archive_tasks(
     return {"archived_count": len(archived)}
 
 
+class BulkActionRequest(BaseModel):
+    action: str  # 'approve' or 'retry'
+    task_ids: List[str]
+
+
+@router.post("/tasks/bulk-action")
+@limiter.limit("60/minute")
+async def bulk_action_tasks(
+    request: Request,
+    body: BulkActionRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    if body.action not in ('approve', 'retry'):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'retry'")
+
+    results = []
+
+    for raw_id in body.task_ids:
+        try:
+            task_uuid = uuid.UUID(raw_id)
+        except (ValueError, AttributeError):
+            results.append({"task_id": raw_id, "status": "error", "error": "Invalid task ID"})
+            continue
+
+        try:
+            task = await _get_user_task_with_role(task_uuid, current_user["user_id"], session, "member")
+        except HTTPException as e:
+            results.append({"task_id": raw_id, "status": "error", "error": e.detail})
+            continue
+
+        try:
+            if body.action == 'retry':
+                task.status = TaskStatus.QUEUED
+                task_type = (task.first_payload).get("type", "")
+                is_parent_type = task_type in ("research", "plan")
+                from app.main import _requeue_parent_task
+                children = []
+                if is_parent_type:
+                    children = (await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id)
+                    )).scalars().all()
+                old_vm = None
+                if children:
+                    await _requeue_parent_task(task, session)
+                else:
+                    old_vm = task.vm_instance_id
+                    task.attempt_count = 0
+                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    task.last_heartbeat = None
+                history = TaskHistory(
+                    task_id=task.id,
+                    action="MODIFIED",
+                    details={"changes": {"status": "QUEUED"}, "modified_by": "BULK_ACTION"}
+                )
+                session.add(task)
+                session.add(history)
+                await session.commit()
+
+                # Delete old VM after commit, same as modify_task
+                if old_vm:
+                    from app.main import _ensure_vm_deleted
+                    await _ensure_vm_deleted(old_vm, reason="admin_requeue")
+
+            elif body.action == 'approve':
+                was_blocked = task.requires_approval
+                task.requires_approval = False
+
+                if was_blocked:
+                    logger.info(f"[ADMIN] Task {task.id} bulk-approved (was blocked: {task.latest_status_message or 'unknown reason'})")
+
+                if was_blocked and task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING):
+                    artifact = (await session.execute(
+                        select(Artifact).where(Artifact.task_id == task.id,
+                                               Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+                    )).scalars().first()
+                    if artifact and artifact.pr_url:
+                        pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+                        branch = f"blueprint/task-{str(task.id).replace('-','')[:8]}"
+                        task_payload = task.first_payload
+                        base_branch = task_payload.get("base_branch", "main")
+
+                        ctx = task.context or {}
+                        if ctx.get("touched_critical"):
+                            try:
+                                from app.main import get_github_token_for_task
+                                from app.github import merge_pull_request, create_pr_comment, delete_branch
+                                gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                                merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+                                if merge_result.get("merged"):
+                                    task.status = TaskStatus.COMPLETED
+                                    task.context = {**ctx, "pr_merged": True}
+                                    task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
+                                    await create_pr_comment(gh_token, owner, repo, pr_number,
+                                        "**Blueprint Review Pipeline**: Human-approved merge (security-critical files).")
+                                    try:
+                                        await delete_branch(gh_token, owner, repo, branch)
+                                    except Exception:
+                                        pass
+                                    logger.info(f"[ADMIN] Bulk-approved merge of PR #{pr_number} (critical files)")
+                                else:
+                                    task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
+                                    logger.error(f"[ADMIN] Bulk-approved merge of PR #{pr_number} failed: {merge_result.get('message')}")
+                            except Exception as e:
+                                task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
+                                logger.error(f"[ADMIN] Bulk-approved merge failed: {e}", exc_info=True)
+                        else:
+                            from app.main import _spawn_pipeline_task
+                            original_prompt = task_payload.get("prompt", task.description or "")
+                            review_task = await _spawn_pipeline_task(
+                                task, "review", session, pr_number, branch, base_branch,
+                                original_prompt=original_prompt, original_task_id=str(task.id)
+                            )
+                            if not review_task:
+                                task.requires_approval = True
+                                task.status = TaskStatus.FAILED
+                                task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
+                                session.add(task)
+                                await session.commit()
+                                results.append({"task_id": raw_id, "status": "error", "error": "Iteration cap reached"})
+                                continue
+
+                history = TaskHistory(
+                    task_id=task.id,
+                    action="MODIFIED",
+                    details={"changes": {"requires_approval": False}, "modified_by": "BULK_ACTION"}
+                )
+                session.add(task)
+                session.add(history)
+                await session.commit()
+
+            results.append({"task_id": raw_id, "status": "ok"})
+        except HTTPException as e:
+            await session.rollback()
+            results.append({"task_id": raw_id, "status": "error", "error": e.detail})
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"[ADMIN] Bulk action {body.action} failed for task {raw_id}: {e}", exc_info=True)
+            results.append({"task_id": raw_id, "status": "error", "error": str(e)[:200]})
+
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    error_count = len(results) - success_count
+    return {"results": results, "success_count": success_count, "error_count": error_count}
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,
@@ -3348,8 +3493,10 @@ async def get_digest(
 ):
     """Return a catch-up digest of activity within the requested time window."""
     window_start = _utcnow() - timedelta(hours=hours)
-    # Extend lookback to capture long-running tasks that completed within the window
-    lookback_start = _utcnow() - timedelta(hours=min(hours * 2, 24 * 7))
+    prev_window_start = window_start - timedelta(hours=hours)
+    # Extend lookback to capture long-running tasks and the previous window for trend comparison
+    raw_lookback = _utcnow() - timedelta(hours=min(hours * 2, 24 * 7))
+    lookback_start = min(raw_lookback, prev_window_start)
 
     def _derive_completed_at(t: Task):
         if t.status_log:
@@ -3458,6 +3605,11 @@ async def get_digest(
                 if cycles_in_window == 0 and tasks_created_in_window == 0:
                     continue
 
+                last_entry = (d.get("research_history") or [])[-1] if d.get("research_history") else None
+                latest_insights = last_entry.get("cycle_insights", []) if last_entry else []
+                recent_finding_titles = last_entry.get("finding_titles", []) if last_entry else []
+                latest_research_at = last_entry.get("timestamp") if last_entry else None
+
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 direction_progress_list.append({
                     "direction_id": did,
@@ -3467,6 +3619,9 @@ async def get_digest(
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
                     "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                    "latest_insights": latest_insights,
+                    "recent_finding_titles": recent_finding_titles,
+                    "latest_research_at": latest_research_at,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -3496,7 +3651,7 @@ async def get_digest(
                     pr_count += 1
                 pr_artifact_map[tid] = a.pr_url or ""
             elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in error_log_map:
-                error_log_map[tid] = a.logs[:200]
+                error_log_map[tid] = a.logs[:500]
 
     # --- needs_attention: failed + pending approval ---
     _now = _utcnow()
@@ -3543,7 +3698,44 @@ async def get_digest(
             "failed_at": ts.isoformat() if ts else None,
             "error_snippet": error_log_map.get(tid),
             "waiting_hours": waiting_hours,
+            "attempt_count": t.attempt_count,
         })
+
+    # --- failure_groups (classify failures by type) ---
+    from app.main import classify_failure as _classify_failure
+    _failure_class_labels = {
+        "CODE_ERROR": "Code Error",
+        "PROVISION_FAILURE": "Provision Failure",
+        "AGENT_TIMEOUT": "Agent Timeout",
+        "EXTERNAL_API": "External API",
+        "RATE_LIMIT": "Rate Limit",
+    }
+    _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for t in failed_tasks:
+        tid = str(t.id)
+        cls = _classify_failure(t, error_log_map.get(tid))
+        waiting_since = _derive_completed_at(t)
+        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        _failure_class_groups.setdefault(cls, []).append({
+            "task_id": tid,
+            "title": t.title or "Failed task",
+            "error_snippet": error_log_map.get(tid),
+            "attempt_count": t.attempt_count,
+            "waiting_hours": waiting_hours,
+        })
+    failure_groups = sorted(
+        [
+            {
+                "failure_class": cls,
+                "label": _failure_class_labels.get(cls, cls),
+                "count": len(tasks),
+                "tasks": tasks,
+            }
+            for cls, tasks in _failure_class_groups.items()
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
 
     # --- recent_completions (up to 10, desc) ---
     sorted_completions = sorted(completed_tasks, key=_derive_completed_at, reverse=True)
@@ -3589,12 +3781,54 @@ async def get_digest(
     failed_count = len(failed_tasks)
     pending_approval_count = len(approval_tasks)
 
+    # --- Previous window metrics for trend comparison ---
+    prev_completed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.COMPLETED
+        and prev_window_start <= _derive_completed_at(t) < window_start
+    ]
+    prev_failed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.FAILED
+        and prev_window_start <= _derive_completed_at(t) < window_start
+    ]
+    prev_total_terminal = len(prev_completed_tasks) + len(prev_failed_tasks)
+    prev_success_rate = round(len(prev_completed_tasks) / prev_total_terminal, 2) if prev_total_terminal > 0 else None
+    prev_completed_count = len(prev_completed_tasks)
+    prev_failed_count = len(prev_failed_tasks)
+
+    completed_delta = completed_count - prev_completed_count
+    failed_delta = failed_count - prev_failed_count
+    success_rate_delta: Optional[float] = (
+        round(success_rate - prev_success_rate, 2)
+        if success_rate is not None and prev_success_rate is not None
+        else None
+    )
+    if success_rate_delta is not None:
+        if success_rate_delta > 0.05:
+            trend: Optional[str] = "improving"
+        elif success_rate_delta < -0.05:
+            trend = "declining"
+        else:
+            trend = "stable"
+    else:
+        trend = None
+
     narrative_parts = []
+
+    if trend == "declining":
+        narrative_parts.append("Pipeline health declining —")
+    elif trend == "improving":
+        narrative_parts.append("Good progress —")
 
     if completed_count > 0:
         shipped = f"{completed_count} task{'s' if completed_count != 1 else ''} completed"
         if pr_count > 0:
             shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
+        if completed_delta > 0:
+            shipped += f" (up from {prev_completed_count} last period)"
+        elif completed_delta < 0:
+            shipped += f" (down from {prev_completed_count} last period)"
         narrative_parts.append(shipped + ".")
 
     if failed_count > 0:
@@ -3642,9 +3876,17 @@ async def get_digest(
         "success_rate": success_rate,
         "needs_attention": needs_attention,
         "recent_failures": recent_failures,
+        "failure_groups": failure_groups,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
         "narrative_summary": narrative_summary,
+        "prev_completed_count": prev_completed_count,
+        "prev_failed_count": prev_failed_count,
+        "prev_success_rate": prev_success_rate,
+        "completed_delta": completed_delta,
+        "failed_delta": failed_delta,
+        "success_rate_delta": success_rate_delta,
+        "trend": trend,
     }
 
 

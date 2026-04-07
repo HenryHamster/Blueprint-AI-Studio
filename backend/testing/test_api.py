@@ -287,3 +287,118 @@ async def test_fix_task_receives_project_context(client: AsyncClient, db_session
     assert "active_tasks" in data["project_context"]
     assert "sibling_tasks" in data["project_context"]
     assert "open_prs" in data["project_context"]
+
+
+# --- Bulk Action Tests ---
+
+async def _make_task(db_session, project, status, requires_approval=False):
+    """Helper: create a task belonging to a project with test user as member."""
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        status=status,
+        payloads=[{"type": "fix", "prompt": "do something"}],
+        requires_approval=requires_approval,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _make_project_with_member(db_session):
+    """Helper: create a project with test-user-123 as member."""
+    project = Project(
+        name="Bulk Test Project",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_invalid_action(client: AsyncClient):
+    """POST /api/admin/tasks/bulk-action with unknown action returns 400."""
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "delete", "task_ids": []},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_retry_requeues_tasks(client: AsyncClient, db_session, mocker):
+    """Bulk retry sets status=QUEUED, assigns new vm_instance_id, and creates TaskHistory."""
+    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_task(db_session, project, TaskStatus.FAILED)
+    task2 = await _make_task(db_session, project, TaskStatus.FAILED)
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "retry", "task_ids": [str(task1.id), str(task2.id)]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success_count"] == 2
+    assert data["error_count"] == 0
+    assert all(r["status"] == "ok" for r in data["results"])
+
+    # Verify task state via the admin GET endpoint (avoids SQLite session isolation)
+    get_resp = await client.get(f"/api/admin/tasks/{task1.id}")
+    assert get_resp.status_code == 200
+    t1_data = get_resp.json()
+    assert t1_data["status"] == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_approve_clears_approval_flag(client: AsyncClient, db_session):
+    """Bulk approve clears requires_approval and creates TaskHistory."""
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_task(db_session, project, TaskStatus.QUEUED, requires_approval=True)
+    task2 = await _make_task(db_session, project, TaskStatus.QUEUED, requires_approval=True)
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "approve", "task_ids": [str(task1.id), str(task2.id)]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success_count"] == 2
+    assert data["error_count"] == 0
+
+    # Verify via GET endpoint
+    get_resp = await client.get(f"/api/admin/tasks/{task1.id}")
+    assert get_resp.status_code == 200
+    t1_data = get_resp.json()
+    assert t1_data["requires_approval"] is False
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_partial_errors(client: AsyncClient, db_session, mocker):
+    """Invalid task IDs in the batch produce per-task errors without failing the whole request."""
+    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+
+    project = await _make_project_with_member(db_session)
+    valid_task = await _make_task(db_session, project, TaskStatus.FAILED)
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={
+            "action": "retry",
+            "task_ids": [str(valid_task.id), "not-a-uuid", str(uuid.uuid4())],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success_count"] == 1
+    assert data["error_count"] == 2
+    statuses = {r["task_id"]: r["status"] for r in data["results"]}
+    assert statuses[str(valid_task.id)] == "ok"
+    assert statuses["not-a-uuid"] == "error"

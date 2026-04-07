@@ -1041,6 +1041,28 @@ export function useAppState() {
     setConfirmDialog(null);
   };
 
+  const handleBulkAction = async (action: 'approve' | 'retry', taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, task_ids: taskIds }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      fetchTasks();
+      if (data.error_count === 0) {
+        addToast(`${action === 'approve' ? 'Approved' : 'Retried'} ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
+      } else {
+        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
+      }
+    } catch (error) {
+      console.error(`Failed to bulk ${action} tasks:`, error);
+      addToast(`Failed to ${action} tasks`, 'error');
+    }
+  };
+
   const handleBulkArchiveSelected = async () => {
     const ids = Array.from(selectedTaskIds);
     if (ids.length === 0) return;
@@ -1817,7 +1839,7 @@ export function useAppState() {
     needsAttentionCount,
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
-    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
+    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn, handleBulkAction,
     selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
     confirmDialog, setConfirmDialog,
     // Toasts
