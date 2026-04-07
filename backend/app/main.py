@@ -1377,17 +1377,29 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     # Include all active directions so the agent can see cross-direction context,
     # but mark which one is the current research target.
+    # Every Nth cycle is "undirected" — the agent explores the whole codebase
+    # without a specific direction lens, finding cross-cutting improvements.
     all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    undirected_frequency = _runtime_config.get("undirected_research_frequency", 4)
+    total_research_count = sum(
+        len(d.get("research_history", [])) for d in all_active_directions
+    )
+    is_undirected = undirected_frequency > 0 and total_research_count > 0 and total_research_count % undirected_frequency == 0
+
     research_payload: dict = {
         "type": "research",
         "directions": all_active_directions,
-        "current_direction_id": chosen_direction.get("id"),
+        "current_direction_id": None if is_undirected else chosen_direction.get("id"),
         "base_branch": base_branch,
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
     }
-    direction_text = (chosen_direction.get("text") or "general improvement")[:80]
+    if is_undirected:
+        direction_text = "Cross-cutting codebase analysis"
+        logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{total_research_count})")
+    else:
+        direction_text = (chosen_direction.get("text") or "general improvement")[:80]
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text}",

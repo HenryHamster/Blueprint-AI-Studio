@@ -4,6 +4,7 @@ Usage:
     python scripts/tasks.py list [--status STATUS] [--limit N] [-v]
     python scripts/tasks.py show <id_or_title>
     python scripts/tasks.py scope <id_or_title> [-v]       — show prompt, research question, payload
+    python scripts/tasks.py payload <id_or_title>          — dump full raw payload + context JSON
     python scripts/tasks.py tree <parent_id>
     python scripts/tasks.py children <parent_id> [--all]   — list children with merge status
     python scripts/tasks.py diagnose                       — health check all active tasks
@@ -838,9 +839,11 @@ def cmd_health(args):
 
 
 def cmd_directions(args):
-    """Show research directions for a project."""
+    """Show research directions for a project. Use -v for full text."""
     from blueprint_api import api, get_project_id
-    pid = args[0] if args and not args[0].startswith("-") else get_project_id()
+    verbose = "-v" in args or "--verbose" in args
+    clean_args = [a for a in args if not a.startswith("-")]
+    pid = clean_args[0] if clean_args else get_project_id()
     data = api("GET", f"/api/admin/projects/{pid}/directions")
     dirs = data.get("directions", data) if isinstance(data, dict) else data
     if not dirs:
@@ -849,13 +852,54 @@ def cmd_directions(args):
     print(f"=== RESEARCH DIRECTIONS ({len(dirs)}) ===")
     for d in dirs:
         prio = d.get("priority", "?")
-        text = _safe(d.get("text") or d.get("summary") or "?", 120)
-        did = (d.get("id") or "?")[:8]
+        full_text = d.get("text") or d.get("summary") or "?"
+        did = d.get("id") or "?"
+        status = d.get("status", "active")
         saturated = d.get("saturated", False)
         sat_str = " [SATURATED]" if saturated else ""
+        status_str = f" [{status}]" if status != "active" else ""
         history = d.get("research_history") or []
         hist_str = f"  ({len(history)} cycles)" if history else ""
-        print(f"  [{prio:6}] {did}  {text}{sat_str}{hist_str}")
+        if verbose:
+            print(f"\n  [{prio:6}] {did}{sat_str}{status_str}{hist_str}")
+            print(f"  {full_text}")
+            notes = d.get("notes") or []
+            if notes:
+                print(f"  Notes ({len(notes)}):")
+                for n in notes[-3:]:
+                    print(f"    • {_safe(n.get('text', ''), 200)}")
+        else:
+            print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
+
+
+def cmd_update_direction(args):
+    """Update a direction's text, priority, or status.
+
+    Usage: tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
+    """
+    from blueprint_api import api, get_project_id
+    if not args:
+        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...]")
+        return
+    did = args[0]
+    patch = {}
+    for i, a in enumerate(args):
+        if a == "--text" and i + 1 < len(args):
+            patch["text"] = args[i + 1]
+        if a == "--priority" and i + 1 < len(args):
+            patch["priority"] = args[i + 1]
+        if a == "--status" and i + 1 < len(args):
+            patch["status"] = args[i + 1]
+    if not patch:
+        print("Nothing to update. Use --text, --priority, or --status.")
+        return
+    pid = get_project_id()
+    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
+    print(f"Updated {did}: {json.dumps(patch)}")
+    # Show the updated direction
+    updated = result.get("direction", {})
+    if updated:
+        print(f"  New text: {updated.get('text', '?')}")
 
 
 def cmd_autonomy_debug(args):
@@ -913,10 +957,48 @@ def cmd_archive(args):
     print(f"Archived {result.get('archived_count', '?')} tasks (filter={filter_type}).")
 
 
+def cmd_payload(args):
+    """Dump the full raw payload and context JSON for a task — everything the agent receives."""
+    from blueprint_api import api
+    if not args:
+        print("Usage: tasks.py payload <id_or_title>")
+        return
+    query = args[0]
+    t = _resolve_task(query)
+    if not t:
+        print(f"Task '{query}' not found.")
+        return
+    try:
+        full = api("GET", f"/api/admin/tasks/{t['id']}")
+        t = full.get("task", full)
+    except Exception:
+        pass
+
+    tid = t["id"][:8]
+    ptype = (t.get("payloads") or [{}])[0].get("type", "?")
+    print(f"=== {tid} [{ptype}] {t.get('status','?')} ===")
+    print(f"Title: {t.get('title','?')}")
+    print()
+
+    # Full payloads
+    payloads = t.get("payloads") or []
+    if payloads:
+        print("=== PAYLOADS ===")
+        print(json.dumps(payloads, indent=2, default=str))
+        print()
+
+    # Full context
+    ctx = t.get("context") or {}
+    if ctx:
+        print("=== CONTEXT ===")
+        print(json.dumps(ctx, indent=2, default=str))
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
     "scope": cmd_scope,
+    "payload": cmd_payload,
     "tree": cmd_tree,
     "children": cmd_children,
     "diagnose": cmd_diagnose,
@@ -931,6 +1013,7 @@ COMMANDS = {
     "requeue-ci": cmd_requeue_ci,
     "trigger-rollup": cmd_trigger_rollup,
     "directions": cmd_directions,
+    "update-direction": cmd_update_direction,
     "autonomy-debug": cmd_autonomy_debug,
     "archive": cmd_archive,
 }

@@ -1631,9 +1631,9 @@ ${prompt}
 
 Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.
-2. Break the task into the smallest meaningful units of work. Each subtask should be one PR-sized change.
+2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
 3. Identify dependencies between subtasks — which must complete before others can start.
-4. Write clear, self-contained prompts for each subtask. The implementing agent knows nothing about this planning session.
+4. Write clear, self-contained prompts for each subtask. Describe the PROBLEM and desired outcome — do not prescribe exact line numbers. The implementing agent has full repo access and will figure out the details.
 
 Output EXACTLY one JSON block as the VERY LAST thing in your response:
 
@@ -1646,7 +1646,7 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "related_files": ["src/main.py", "src/utils.py"],
       "model": "claude-sonnet-4-6 | claude-opus-4-6 | null (inherit from parent)",
       "effort": "low | medium | high | null (inherit from parent)",
-      "scope": "small",
+      "scope": "medium",
       "risk": "low",
       "type": "create",
       "approval_reason": "Only set when risk=high — brief reason why human approval is needed (omit otherwise)"
@@ -1658,7 +1658,7 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "related_files": ["src/main.py"],
       "model": null,
       "effort": null,
-      "scope": "medium",
+      "scope": "large",
       "risk": "medium",
       "type": "create"
     }
@@ -1678,7 +1678,7 @@ Rules:
 - Keep prompts concise — describe what to achieve, not step-by-step how
 - Order subtasks so that dependencies flow forward (a subtask can only depend on earlier subtasks)
 - If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
-- Aim for 2-6 subtasks. If the task is simple enough for 1 PR, output a single subtask with no dependencies
+- Aim for 1-4 subtasks. Prefer 1-2 large subtasks over 4-6 small ones. If the task can be one PR, output a single subtask.
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
 - Use model=claude-opus-4-6 and effort=high only for complex architectural subtasks. Leave null for simple additive changes.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
@@ -1686,7 +1686,7 @@ Rules:
 - If any subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds new database tables/columns, include a separate subtask with set type="migrate" (e.g., title "feat: add index for user lookup", type "migrate"). This subtask should depend on the model change subtask. The migration agent will handle Alembic generation.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
-- For subtasks that involve the agent system (agent/src/index.ts), note that the agent is a monolithic file — changes must be minimal and focused to avoid conflicts with parallel subtasks.
+- For subtasks that involve the agent system (agent/src/index.ts), note that the agent is a monolithic file — be aware of potential conflicts with parallel subtasks touching the same file.
 - IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
 
   statusRef.value = 'Running Claude Code for planning...';
@@ -1854,85 +1854,61 @@ ${hotspotsSection}
           ? ` [scope: ${(d.paths as string[]).join(', ')}]`
           : '';
         const history = Array.isArray(d.research_history) ? d.research_history as Array<Record<string, unknown>> : [];
-        let aggregateSection = '';
         const agg = (d.history_aggregate || {}) as Record<string, number | string | null>;
         const totalCycles = history.length + ((agg.total_cycles as number) || 0);
-        if (totalCycles >= 3) {
-          const totalTasksCreated = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0) + ((agg.total_tasks_created as number) || 0);
-          const totalPrsMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0) + ((agg.total_prs_merged as number) || 0);
+
+        // One-line stats summary
+        let statsLine = '';
+        if (totalCycles > 0) {
+          const totalTasks = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0) + ((agg.total_tasks_created as number) || 0);
+          const totalMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0) + ((agg.total_prs_merged as number) || 0);
           const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0) + ((agg.total_tasks_failed as number) || 0);
-          const zeroCycles = history.filter(h => ((h.tasks_created as number) || 0) === 0).length;
-          const parts = [`${totalCycles} cycles`, `${totalTasksCreated} tasks created`];
-          if (totalPrsMerged > 0) parts.push(`${totalPrsMerged} merged`);
+          const parts = [`${totalCycles} cycles`, `${totalTasks} tasks`];
+          if (totalMerged > 0) parts.push(`${totalMerged} merged`);
           if (totalFailed > 0) parts.push(`${totalFailed} failed`);
-          if (zeroCycles > 0) parts.push(`${zeroCycles} empty cycles`);
-          aggregateSection = `\n  Lifetime: ${parts.join(', ')}.`;
+          statsLine = `\n  Stats: ${parts.join(', ')}`;
         }
+
+        // Research context (synthesized knowledge) — show in full, this is the good stuff
         const researchCtx = typeof d.research_context === 'string' && (d.research_context as string).length > 0
-          ? `\n  Research Context (accumulated knowledge — use as starting point):\n${d.research_context as string}`
+          ? `\n  Accumulated knowledge:\n${d.research_context as string}`
           : '';
+
+        // Condensed history: titles only from last 3 cycles
         let historySection = '';
         if (history.length > 0) {
-          const historySlice = researchCtx ? history.slice(-3) : history.slice(-5);
-          const historyHeader = researchCtx
-            ? `\n  Recent cycle details (supplementary — research context above has the synthesis):`
-            : `\n  Prior research cycles (last ${Math.min(history.length, 5)}):${aggregateSection}`;
-          const entries = historySlice.map((h) => {
-            const titles = Array.isArray(h.finding_titles) ? (h.finding_titles as string[]).join(', ') : 'none';
-            const descs = Array.isArray(h.key_finding_descriptions)
-              ? '\n    Key findings: ' + (h.key_finding_descriptions as string[]).map(d => d.slice(0, 150)).join(' | ')
-              : '';
-            const outcomeParts: string[] = [];
-            if (typeof h.prs_merged === 'number' && h.prs_merged > 0) outcomeParts.push(`${h.prs_merged} merged`);
-            if (typeof h.tasks_failed === 'number' && h.tasks_failed > 0) outcomeParts.push(`${h.tasks_failed} failed`);
-            if (typeof h.tasks_cancelled === 'number' && h.tasks_cancelled > 0) outcomeParts.push(`${h.tasks_cancelled} cancelled`);
-            const outcomeStats = outcomeParts.length > 0 ? ` (${outcomeParts.join(', ')})` : '';
-            const failedDetails = Array.isArray(h.failed_task_details)
-              ? (h.failed_task_details as Array<{title: string; reason: string}>)
-                  .map(f => `    FAILED: ${f.title}${f.reason ? ` — ${f.reason.slice(0, 100)}` : ''}`)
-                  .join('\n')
-              : '';
-            const failedSection = failedDetails ? '\n' + failedDetails : '';
-            const insights = Array.isArray(h.cycle_insights) && (h.cycle_insights as string[]).length > 0
-              ? '\n    Insights: ' + (h.cycle_insights as string[]).join(' | ')
-              : '';
-            const subNotes = Array.isArray(h.sub_research_notes) ? h.sub_research_notes as Array<Record<string, unknown>> : [];
-            const subSummary = subNotes.length > 0
-              ? '\n' + subNotes.map((s: Record<string, unknown>) => {
-                  const subInsights = Array.isArray(s.insights) && (s.insights as string[]).length > 0
-                    ? ' — insights: ' + (s.insights as string[]).join('; ')
-                    : '';
-                  const findingTitles = Array.isArray(s.finding_titles) ? s.finding_titles as string[] : [];
-                  return `    Sub-research (depth ${String(s.depth)}): ${String(s.tasks_created)} tasks (${findingTitles.join(', ')})${subInsights}`;
-                }).join('\n')
-              : '';
-            return `  - ${String(h.timestamp)}: ${String(h.tasks_created)} tasks created${outcomeStats} — ${titles}${descs}${failedSection}${insights}${subSummary}`;
-          }).join('\n');
-          historySection = `${historyHeader}\n${entries}`;
+          const historySlice = history.slice(-3);
+          const allTitles = historySlice.flatMap(h =>
+            Array.isArray(h.finding_titles) ? h.finding_titles as string[] : []
+          );
+          if (allTitles.length > 0) {
+            historySection = `\n  Previous findings (titles — do NOT re-propose): ${allTitles.join(', ')}`;
+          }
         }
+
+        // Notes: last 2, truncated to 80 chars
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
         if (notes.length > 0) {
-          const recent = notes.slice(-3).map(n => `  • ${n.text.slice(0, 120)}`).join('\n');
-          notesSection = `\n  Agent notes (last ${Math.min(notes.length, 3)}):\n${recent}`;
+          const recent = notes.slice(-2).map(n => `  • ${n.text.slice(0, 80)}`).join('\n');
+          notesSection = `\n  Notes:\n${recent}`;
         }
+
         const saturationNote = d.possibly_saturated
-          ? '\n  ⚠ SATURATION SIGNAL: Last 3 cycles produced ≤1 finding each. Consider proposing a direction_update to narrow the scope, or a direction_proposal for a related but more specific area. Avoid reproposing previously attempted work.'
+          ? '\n  ⚠ SATURATED: Consider a direction_update or direction_note instead of more findings.'
           : '';
+
+        // Active tasks for this direction (avoid duplicating)
         let activeForDirNote = '';
         if (d.id === currentDirectionId) {
-          const dirActiveTasks = activeTasks.filter(t => t['direction_id'] === d.id);
-          const dirQueuedTasks = queuedTasks.filter(t => t['direction_id'] === d.id);
-          if (dirActiveTasks.length > 0 || dirQueuedTasks.length > 0) {
-            const lines = [
-              ...dirActiveTasks.map(t => `  [${strVal(t['task_type'])} IN_PROGRESS] ${strVal(t['title'])}`),
-              ...dirQueuedTasks.map(t => `  [${strVal(t['task_type'])} QUEUED] ${strVal(t['title'])}`),
-            ];
-            activeForDirNote = `\n  Active tasks for this direction:\n${lines.join('\n')}`;
+          const dirTasks = [...activeTasks, ...queuedTasks].filter(t => t['direction_id'] === d.id);
+          if (dirTasks.length > 0) {
+            activeForDirNote = `\n  In-flight: ${dirTasks.map(t => strVal(t['title'])).join(', ')}`;
           }
         }
-        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
-      }).join('\n')
+
+        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${statsLine}${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
+      }).join('\n\n')
     : 'No specific directions provided. Identify general improvements.';
 
   // Build cross-direction context from OTHER active directions
@@ -1961,132 +1937,88 @@ ${hotspotsSection}
     ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string, status?: string}>)
     : [];
 
-  const researchPrompt = `${codebaseSummary}${contextPrefix}${fileTreeSection}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
+  const researchPrompt = `${contextPrefix}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
-${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
-${directionsText}${crossDirSection}
+# SECTION 1: MISSION
 
-Recently completed tasks (DO NOT re-propose these — they were already implemented):
+Your job: find what this codebase is MISSING. Not what's slightly wrong — what doesn't exist yet. Each finding you produce should require 100+ lines of real implementation across multiple files.
+
+Before writing any finding, ask: "Would a senior engineer make this a standalone PR, or roll their eyes?" If the latter, it's not a finding.
+
+BAD findings (will be rejected by the pipeline):
+- "add X to Y" where the change is <50 lines — wiring, not engineering
+- Cosmetic polish, trivial data plumbing, config tweaks, lint rules
+- Standalone test additions — bundle into the feature that needs them
+- Anything direction notes say is "in place" or "established"
+
+GOOD findings:
+- New subsystems or capabilities (cost tracking, knowledge persistence, live WebSocket view)
+- Architectural decomposition (splitting monolithic files into modules)
+- Cross-cutting changes affecting 3+ components
+- Performance fixes for real bottlenecks (N+1 queries, blocking I/O)
+- Missing user-facing capabilities that change how someone uses the product
+
+Direction maturity — the MORE cycles, the BIGGER the findings:
+- Cycles 1-2: Medium scope minimum. Surface-level gaps OK.
+- Cycles 3-4: Large scope only. What's MISSING as a system?
+- Cycles 5+: ONLY architectural or new-capability findings. If only small things remain, propose a direction_update or direction_note.
+
+# SECTION 2: CODEBASE CONTEXT
+
+${codebaseSummary}${fileTreeSection}${gitHistorySection}
+# SECTION 3: DIRECTIONS
+${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
+
+# SECTION 4: DEDUP — do not re-propose these
 ${recentlyCompleted.length > 0
   ? recentlyCompleted.map(t => {
       const status = t.status ?? 'completed';
-      let label: string;
-      if (status === 'failed') label = '(FAILED — avoid reproposing)';
-      else if (status === 'cancelled') label = '(cancelled)';
-      else label = '(merged)';
+      const label = status === 'failed' ? '(FAILED)' : status === 'cancelled' ? '(cancelled)' : '(merged)';
       return `- [${t.task_type}] ${t.title} ${label}`;
     }).join('\n')
   : '(none yet)'}
 
-## Quality bar and rules — READ THIS FIRST
-Each finding spawns a cloud VM, an implementing agent, a review cycle, and a PR — real money and time. Ask: "Would a senior engineer make this a standalone PR, or would they roll their eyes?" If the latter, cut or bundle it. Do not re-propose recently completed tasks; if prior work was partial, you may propose a follow-up that references it.
+# SECTION 5: HOW TO RESEARCH
 
-BAD findings (do NOT produce these):
-- "add a badge/indicator/icon to the UI" — cosmetic polish that doesn't unlock new capability
-- "add field X to endpoint Y" — trivial data plumbing with no architectural significance
-- "add tests for X" as a standalone finding — bundle test gaps into the feature that needs them
-- "config tweak", "lint rule", "rename for clarity" — bundle ALL of these into one finding or skip them
-- ANY finding where the description is "add X to Y" and the whole change is <50 lines
+1. Explore aggressively — spawn subagents for parallel exploration, use WebSearch for best practices, use TodoWrite to track coverage. For each direction, ask: "what would it take for this to be DONE?" Work backward.
+2. Think about what the system CAN'T do, not what it does slightly wrong. Missing capabilities > polish.
+3. Before writing findings, verify you explored all major directories and have a TodoWrite checklist showing coverage.
+4. Self-review: spawn a review subagent that REJECTs any finding <100 lines or touching only 1 file. If <3 survive, explore deeper.
+5. Finding prompts should describe the PROBLEM and desired outcome — not exact line numbers. Let implementing agents make design decisions.
 
-GOOD findings look like:
-- New subsystems or capabilities (e.g., a knowledge persistence layer, a new agent type, a retry strategy overhaul)
-- Architectural improvements that make the system more extensible or reliable
-- Cross-cutting changes that affect multiple components and unlock future work
-- Performance or reliability fixes for real bottlenecks that affect production behavior
+# SECTION 6: OUTPUT FORMAT
 
-## Maturity escalation
-Look at the prior research cycles below for each direction. The MORE cycles a direction has had, the BIGGER your findings should be:
-- Cycles 1-2: Finding surface-level gaps is fine. Small/medium scope OK.
-- Cycles 3-4: You should be past surface issues. Findings must be medium or large scope. Think about what's MISSING as a system, not what's slightly wrong.
-- Cycles 5+: Only large-scope, architectural, or new-capability findings are acceptable. If you can only find small things, the direction is either done or you're not looking deep enough. Propose a direction_update to evolve the goal, or a direction_note marking it near-complete.
-- If a direction has a 'Research Context' section, use it as your foundation. Do NOT re-investigate findings marked as 'Established'. Focus your effort on 'Open Questions' and finding new approaches for items listed under 'Failed Approaches'.
-- When writing your findings, be explicit about how they build on or diverge from the established context.
+Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array as the last thing in your response.
 
-Instructions:
-1. Use ALL of your tools aggressively to explore the codebase and research solutions:
-   - Spawn subagents (Agent tool) to explore different parts of the codebase in parallel
-   - Use WebSearch to research best practices, patterns, and how other projects solve similar problems
-   - Use WebFetch to read relevant documentation, GitHub issues, or API references
-   - Use TodoWrite to track what you've explored and what gaps remain — don't stop at the first few easy finds
-   - For each active direction, ask yourself: "what would it take for this direction to be DONE?" Then work backward from that goal to find the gaps that matter most.
-   - Think about what the system CAN'T do today, not what it does slightly wrong. Missing capabilities > polish.
-   - Before writing findings, verify you have explored at MINIMUM:
-     a) All directories mentioned in the direction's scope (or top-level dirs if no scope)
-     b) At least 3 subagents for parallel exploration of different areas
-     c) At least 1 WebSearch for best practices related to the direction's goal
-     d) A TodoWrite checklist of areas explored and gaps remaining
-   - If your TodoWrite checklist shows unexplored areas, keep exploring before writing findings.
-2. Based on your exploration and external research, identify specific, actionable improvements. Findings must be medium or large scope — small-scope findings are only acceptable when bundled together. For each finding, assess scope and risk.
-3. Spawn a review subagent (Agent tool) with your draft findings and the direction goals. The reviewer should:
-   - REJECT findings that are cosmetic, trivially small (<50 lines), or "add X to Y" without architectural significance
-   - RANK remaining findings by impact (high/medium/low)
-   - KEEP at least 5 findings after filtering — if fewer survive, the reviewer should explain what areas need deeper exploration rather than just cutting
-   - Improve prompt quality on surviving findings (make them more specific and self-contained)
-   Do NOT instruct the reviewer to minimize count. Volume of strong findings is good — the pipeline handles it.
-4. Output your final findings as a JSON array as the VERY LAST thing in your response:
+\`\`\`json
+[{
+  "type": "feature|improvement|bug|refactor|perf|research|security_audit|qa|deps|docs|migrate|test|direction_proposal|direction_update|direction_note",
+  "title": "feat: short title (under 60 chars, conventional commit style)",
+  "description": "1-3 sentences: what and why",
+  "prompt": "Self-contained prompt for the implementing agent. Describe the problem and desired outcome.",
+  "scope": "medium|large",
+  "risk": "low|medium|high",
+  "priority": "high|medium|low",
+  "related_files": ["path/to/file.py"],
+  "depends_on_indices": [],
+  "direction_id": "d-xxx or null",
+  "model": "claude-opus-4-6|claude-sonnet-4-6|null",
+  "effort": "high|medium|low|null"
+}]
+\`\`\`
 
-[
-  {
-    "type": "feature",
-    "title": "feat: short title (under 60 chars, conventional commit style)",
-    "description": "1-3 sentence description of the change and why it matters",
-    "prompt": "The exact prompt to give to an implementing agent. Must be self-contained.",
-    "scope": "medium",
-    "risk": "medium",
-    "priority": "high",
-    "related_files": ["path/to/file1.py", "path/to/file2.tsx"],
-    "depends_on_indices": [],
-    "direction_id": "d-1 or null if self-discovered",
-    "model": "claude-opus-4-6 | claude-sonnet-4-6 | null (use project default)",
-    "effort": "high | medium | low | null (use project default)"
-  }
-]
-
-Valid values:
-- type: improvement, bug, refactor, feature, test, perf, migrate, research (deeper investigation needed), security_audit, qa, deps, docs, direction_proposal, direction_update, direction_note
-- scope: small (single file, <50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural — anything that could break the system if done wrong)
-- risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
-- priority: high, medium, low
+Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
+Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
 
 Rules:
-- Target 8-12 findings. Minimum 5 (fewer means you stopped early). Maximum 15.
-- All findings must be scope=medium or scope=large. Exception: one scope=small finding that bundles multiple trivial fixes.
-- Each finding is ONE PR-sized unit of work. The prompt must be self-contained — the implementing agent knows nothing about this research.
-- Use depends_on_indices (0-based) when findings involve structural refactors of the same files (renames, interface changes). Additive changes to shared files can stay parallel.
-- When a direction has [scope: path/prefix], limit findings to files under those prefixes (blockers excepted).
-- Do not propose tasks already in Recent Git History. Check Sibling Tasks — skip areas they cover or ensure your findings are clearly additive.
-- Use model=claude-opus-4-6 and effort=high for scope=large findings. Leave null for medium scope.
-
-Routing (type controls which agent runs):
-- security_audit/qa/deps/docs/migrate/perf → specialist agent that opens a PR (or auto-spawns fix tasks)
-- research → sub-research agent for deeper investigation before implementation
-- improvement/bug/refactor/feature/test + scope=large → plan agent (decomposes into subtasks); + scope=small/medium → create agent (single PR)
-- direction_proposal → pending direction held for user approval (no task spawned)
-- direction_update fields: direction_id, suggested_text, suggested_priority, suggested_paths, description. Use when a direction is too vague, mis-scoped, or mis-prioritized. Propose at most 1 per cycle.
-- direction_note fields: direction_id, description (max 500 chars). Must be balanced and self-critical — include what's still broken, what prior cycles failed, and honest progress assessment. The user decides when a direction is done.
-- Write findings to /tmp/research_findings_${taskId}.json (JSON array only, no markdown). Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for architectural observations not worth implementing.
-
-## Direction Proposals
-If you discover a strategic area that clearly warrants ongoing research over multiple cycles — not just a one-time fix — you may propose it as a new standing direction. Use type=direction_proposal with this structure:
-{
-  "type": "direction_proposal",
-  "title": "direction: <short name>",
-  "description": "<rationale for why this should be a permanent direction, not a one-time task>",
-  "prompt": "<the direction text as it should appear to future research agents — be specific and actionable>",
-  "priority": "high|medium|low",
-  "scope": "small",
-  "risk": "low",
-  "related_files": [],
-  "depends_on_indices": []
-}
-Rules for direction proposals:
-- Propose at most 2 per research cycle
-- Only propose when the area clearly needs multiple research cycles to address fully
-- Do NOT propose if a similar active direction already exists
-- The "prompt" field becomes the direction text shown to users — write it as a concise goal statement
-- Direction proposals are held for user review and never auto-approved
-
-Context: You are a research agent inside Blueprint, an autonomous AI coding system. Your findings are implemented by other agents, reviewed, and merged — another research cycle will build on your work. Think BIG and use scope=large freely (the pipeline has a planning agent for safe decomposition). Target 8-12 substantial findings across all system layers (backend, frontend, agent, infra); fewer than 5 means you stopped exploring too early.`;
+- Target 8-12 findings, all scope=medium or large. One scope=small "chore: housekeeping" bundling minor fixes is OK.
+- Use scope=large freely — the pipeline has a plan agent for safe decomposition.
+- Use model=claude-opus-4-6 and effort=high for large findings.
+- Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research, direction_proposal → user review.
+- direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
+- direction_note: add context to a direction (fields: direction_id, description max 500 chars). Be honest about progress.
+- direction_proposal: propose a new standing direction (max 2 per cycle, held for user approval).
+- Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
