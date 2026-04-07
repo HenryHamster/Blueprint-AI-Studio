@@ -95,6 +95,7 @@ interface DigestData {
   failed_delta?: number;
   success_rate_delta?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
+  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number}[];
 }
 
 export interface CatchUpPanelProps {
@@ -178,6 +179,7 @@ function WaitingBadge({ hours }: { hours: number | undefined }) {
 }
 
 function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask: (task: { id: string }) => void }) {
+  const prNum = c.pr_url?.match(/\/(\d+)\/?$/)?.[1];
   return (
     <div
       className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
@@ -193,7 +195,7 @@ function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask:
             onClick={e => e.stopPropagation()}
             className="text-[9px] text-emerald-400 hover:text-emerald-300 font-medium"
           >
-            PR
+            {prNum ? `PR #${prNum}` : 'PR'}
           </a>
         )}
         {c.completed_at && (
@@ -214,69 +216,28 @@ function SkeletonRow() {
 }
 
 function DirectionProgressSection({ directions }: { directions: DirectionProgress[] }) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-
-  const toggle = (id: string) => {
-    setExpanded(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  };
-
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
-      {directions.map(dp => {
-        const hasInsights = (dp.latest_insights?.length ?? 0) > 0;
-        const isExpanded = expanded.has(dp.direction_id);
-        return (
-          <div key={dp.direction_id} className="flex flex-col bg-neutral-950 border border-neutral-800/80 rounded">
-            <div className="flex items-center gap-2 text-xs px-2 py-1.5">
-              <span className="flex-1 truncate text-neutral-400">{dp.direction_text || dp.direction_id}</span>
-              {dp.latest_research_at && (
-                <span className="shrink-0 text-[10px] font-mono text-neutral-600">{formatRelativeTime(dp.latest_research_at)}</span>
-              )}
-              <div className="shrink-0 flex items-center gap-1.5 text-[10px] font-mono text-neutral-600">
-                {dp.cycles_in_window > 0 && (
-                  <span>{dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}</span>
-                )}
-                {dp.tasks_created > 0 && (
-                  <span>{dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}</span>
-                )}
-                {dp.prs_merged > 0 && (
-                  <span className="text-emerald-600">{dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}</span>
-                )}
-              </div>
-              {dp.possibly_saturated && (
-                <span className="shrink-0 text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">saturated</span>
-              )}
-              {hasInsights && (
-                <button
-                  onClick={() => toggle(dp.direction_id)}
-                  className="shrink-0 text-neutral-600 hover:text-neutral-400"
-                >
-                  {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                </button>
-              )}
-            </div>
-            {hasInsights && isExpanded && (
-              <div className="border-t border-neutral-800/60 px-2 py-1.5 flex flex-col gap-1">
-                <ul className="flex flex-col gap-0.5">
-                  {dp.latest_insights!.map((insight, i) => (
-                    <li key={i} className="text-[11px] italic text-neutral-500 leading-relaxed">• {insight}</li>
-                  ))}
-                </ul>
-                {(dp.recent_finding_titles?.length ?? 0) > 0 && (
-                  <div className="text-[10px] text-neutral-600 mt-0.5">
-                    <span className="font-semibold text-neutral-500">Findings:</span> {dp.recent_finding_titles!.join(', ')}
-                  </div>
-                )}
-              </div>
+      {directions.map(dp => (
+        <div key={dp.direction_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded">
+          <span className="flex-1 truncate text-neutral-400">
+            {(dp.direction_text || dp.direction_id).slice(0, 50)}
+          </span>
+          <div className="shrink-0 flex items-center gap-1">
+            {dp.prs_merged > 0 && (
+              <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
+              </span>
+            )}
+            {dp.possibly_saturated && (
+              <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                saturated
+              </span>
             )}
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -292,8 +253,17 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     return wasCollapsed;
   });
   const [activeWindow, setActiveWindow] = useState<TimeWindow>('last_visit');
-  const [digest, setDigest] = useState<DigestData | null>(null);
+  const [digest, setDigest] = useState<DigestData | null>(() => {
+    if (!selectedProjectId) return null;
+    try {
+      const cached = localStorage.getItem(`blueprint-admin:lastDigest:${selectedProjectId}`);
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
   const [loading, setLoading] = useState(false);
+  const [updatingDigest, setUpdatingDigest] = useState(false);
   const [activeExpanded, setActiveExpanded] = useState(false);
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
@@ -316,6 +286,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
 
   const fetchDigest = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
+    else setUpdatingDigest(true);
     try {
       const hours = windowToHours(activeWindow, lastVisitTimestamp);
       const params = new URLSearchParams({ hours: String(hours) });
@@ -324,18 +295,38 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
       if (res.ok) {
         const data: DigestData = await res.json();
         setDigest(data);
+        if (selectedProjectId) {
+          try {
+            localStorage.setItem(`blueprint-admin:lastDigest:${selectedProjectId}`, JSON.stringify(data));
+          } catch { /* storage full */ }
+        }
       }
     } catch {
       // silently fail — digest is non-critical
     } finally {
       if (!silent) setLoading(false);
+      else setUpdatingDigest(false);
     }
   }, [activeWindow, lastVisitTimestamp, selectedProjectId]);
 
-  // Fetch on mount and when window/project changes
+  // Load cached digest when project changes
   useEffect(() => {
-    if (collapsed) return;
-    fetchDigest();
+    if (!selectedProjectId) { setDigest(null); return; }
+    try {
+      const cached = localStorage.getItem(`blueprint-admin:lastDigest:${selectedProjectId}`);
+      setDigest(cached ? JSON.parse(cached) : null);
+    } catch {
+      setDigest(null);
+    }
+  }, [selectedProjectId]);
+
+  // Fetch on mount and when window/project changes; silent when collapsed
+  useEffect(() => {
+    if (collapsed) {
+      fetchDigest(true);
+    } else {
+      fetchDigest();
+    }
   }, [fetchDigest, collapsed]);
 
   // Auto-refresh
@@ -457,6 +448,24 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               {needsAttentionCount} need attention
             </span>
           )}
+          {collapsed && digest && (
+            <span className="text-[10px] text-neutral-500 font-mono ml-1 normal-case tracking-normal font-normal">
+              {digest.completed_count} shipped · {digest.success_rate != null ? `${Math.round(digest.success_rate * 100)}%` : '—'}
+              {digest.trend && (
+                <>
+                  {' · '}
+                  <span className={
+                    digest.trend === 'improving' ? 'text-emerald-400' :
+                    digest.trend === 'declining' ? 'text-red-400' :
+                    'text-neutral-500'
+                  }>{digest.trend}</span>
+                </>
+              )}
+            </span>
+          )}
+          {updatingDigest && (
+            <span className="text-[9px] text-neutral-600 font-normal normal-case tracking-normal ml-1">Updating...</span>
+          )}
         </button>
         {!collapsed && (
           <div className="flex items-center gap-1 ml-2">
@@ -495,7 +504,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               {(digest!.narrative_summary || digest!.trend) && (
                 <div className="flex items-start gap-2 mb-3">
                   {digest!.narrative_summary && (
-                    <p className="text-sm text-neutral-300 leading-relaxed flex-1">{digest!.narrative_summary}</p>
+                    <p className="text-sm text-neutral-300 leading-relaxed flex-1">
+                      {activeWindow === 'last_visit' && digest!.window_hours && (
+                        <span className="text-neutral-400">Since you last checked ({digest!.window_hours}h ago): </span>
+                      )}
+                      {digest!.narrative_summary}
+                    </p>
                   )}
                   {digest!.trend && (
                     <span className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
@@ -519,6 +533,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       <span className={digest!.success_rate_delta > 0 ? 'text-emerald-400' : digest!.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
                         {digest!.success_rate_delta > 0 ? '+' : ''}{Math.round(digest!.success_rate_delta * 100)}%
                       </span>
+                    )}
+                    {digest!.trend_history && digest!.trend_history.length >= 3 && (
+                      <div className="flex items-end gap-px h-3 ml-1">
+                        {digest!.trend_history.map((p, i) => {
+                          const rate = p.success_rate ?? 0;
+                          const color = rate >= 0.8 ? 'bg-emerald-400' : rate >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
+                          return <div key={i} className={`w-1 rounded-sm ${p.success_rate == null ? 'bg-neutral-700' : color}`} style={{height: `${Math.max(rate * 100, 8)}%`}} />;
+                        })}
+                      </div>
                     )}
                   </span>
                 )}

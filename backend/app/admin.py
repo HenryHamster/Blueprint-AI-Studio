@@ -3504,8 +3504,8 @@ async def get_digest(
     """Return a catch-up digest of activity within the requested time window."""
     window_start = _utcnow() - timedelta(hours=hours)
     prev_window_start = window_start - timedelta(hours=hours)
-    # Extend lookback to capture long-running tasks and the previous window for trend comparison
-    raw_lookback = _utcnow() - timedelta(hours=min(hours * 2, 24 * 7))
+    # Extend lookback to capture long-running tasks and 7 periods for trend history
+    raw_lookback = _utcnow() - timedelta(hours=min(hours * 7, 24 * 14))
     lookback_start = min(raw_lookback, prev_window_start)
 
     def _derive_completed_at(t: Task):
@@ -3824,6 +3824,30 @@ async def get_digest(
     else:
         trend = None
 
+    # Compute trend history: 7 periods (6 previous + current), oldest first
+    _now = _utcnow()
+    trend_history = []
+    for _i in range(7):
+        _p_start = _now - timedelta(hours=hours * (7 - _i))
+        _p_end = _now - timedelta(hours=hours * (6 - _i))
+        _p_completed = sum(
+            1 for t in all_tasks
+            if t.status == TaskStatus.COMPLETED
+            and _p_start <= _derive_completed_at(t) < _p_end
+        )
+        _p_failed = sum(
+            1 for t in all_tasks
+            if t.status == TaskStatus.FAILED
+            and _p_start <= _derive_completed_at(t) < _p_end
+        )
+        _p_total = _p_completed + _p_failed
+        trend_history.append({
+            "period_end": _p_end.isoformat(),
+            "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
+            "completed": _p_completed,
+            "failed": _p_failed,
+        })
+
     narrative_parts = []
 
     if trend == "declining":
@@ -3842,11 +3866,27 @@ async def get_digest(
         narrative_parts.append(shipped + ".")
 
     if failed_count > 0:
-        failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
-        failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
-        if failure_titles:
-            failed_str += f" ({', '.join(failure_titles)})"
-        narrative_parts.append(failed_str + ".")
+        dominant_group = failure_groups[0] if failure_groups else None
+        dominant_msg = None
+        if dominant_group and dominant_group["count"] >= 2 and dominant_group["count"] / failed_count >= 0.6:
+            cls = dominant_group["failure_class"]
+            cnt = dominant_group["count"]
+            _root_cause_msgs = {
+                "RATE_LIMIT": f"Most failures ({cnt}/{failed_count}) are rate-limit errors — consider pausing until account recovery.",
+                "PROVISION_FAILURE": f"Most failures ({cnt}/{failed_count}) are provisioning issues — check GCP quota and zone health.",
+                "EXTERNAL_API": f"Most failures ({cnt}/{failed_count}) are external API errors — GitHub/Claude API may be experiencing issues.",
+                "AGENT_TIMEOUT": f"Most failures ({cnt}/{failed_count}) are agent timeouts — tasks may need complexity reduction.",
+                "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
+            }
+            dominant_msg = _root_cause_msgs.get(cls)
+        if dominant_msg:
+            narrative_parts.append(dominant_msg)
+        else:
+            failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
+            failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+            if failure_titles:
+                failed_str += f" ({', '.join(failure_titles)})"
+            narrative_parts.append(failed_str + ".")
 
     if pending_approval_count > 0:
         approval_items = [
@@ -3857,6 +3897,19 @@ async def get_digest(
         if max_wait > 0:
             approval_str += f" ({max_wait}h)"
         narrative_parts.append(approval_str + ".")
+
+    if project_id and direction_progress_list:
+        dir_summaries = []
+        for dp in direction_progress_list:
+            dt = (dp["direction_text"] or "")[:40]
+            if dp["prs_merged"] > 0:
+                dir_summaries.append(f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged")
+            elif dp.get("possibly_saturated"):
+                dir_summaries.append(f"{dt}: may be saturated")
+            elif dp["tasks_created"] > 0:
+                dir_summaries.append(f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress")
+        if dir_summaries:
+            narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
 
     if running_count > 0 or queued_count > 0:
         pipeline_parts = []
@@ -3897,6 +3950,7 @@ async def get_digest(
         "failed_delta": failed_delta,
         "success_rate_delta": success_rate_delta,
         "trend": trend,
+        "trend_history": trend_history,
     }
 
 

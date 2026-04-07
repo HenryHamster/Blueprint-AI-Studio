@@ -622,3 +622,495 @@ async def test_digest_direction_progress_absent_without_project_id(client: Async
     assert response.status_code == 200
     data = response.json()
     assert data["direction_progress"] == []
+
+
+# ---------------------------------------------------------------------------
+# Narrative content assertion tests
+# ---------------------------------------------------------------------------
+
+
+def _curr_ts():
+    """Timestamp ~1 hour ago — within the default 24h window."""
+    return _utcnow() - timedelta(hours=1)
+
+
+def _prev_ts():
+    """Timestamp ~36 hours ago — in the previous 24h window (24–48h ago)."""
+    return _utcnow() - timedelta(hours=36)
+
+
+@pytest.mark.asyncio
+async def test_narrative_good_progress_prefix(client: AsyncClient, db_session):
+    """Narrative starts with 'Good progress' when success rate improves by > 0.05 vs previous window."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Previous window: 1 completed + 3 failed = 0.25 success rate
+    prev = _prev_ts()
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+    ))
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        ))
+
+    # Current window: 3 completed + 1 failed = 0.75 success rate
+    # delta = 0.75 - 0.25 = 0.50 > 0.05 → trend="improving" → "Good progress —"
+    curr = _curr_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["narrative_summary"], str)
+    assert len(data["narrative_summary"]) > 0
+    assert "Good progress" in data["narrative_summary"]
+    assert data["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_narrative_declining_prefix(client: AsyncClient, db_session):
+    """Narrative starts with 'Pipeline health declining' when success rate drops by > 0.05 vs previous."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Previous window: 3 completed + 1 failed = 0.75 success rate
+    prev = _prev_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+    ))
+
+    # Current window: 1 completed + 3 failed = 0.25 success rate
+    # delta = 0.25 - 0.75 = -0.50 < -0.05 → trend="declining" → "Pipeline health declining —"
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+    ))
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["narrative_summary"], str)
+    assert len(data["narrative_summary"]) > 0
+    assert "Pipeline health declining" in data["narrative_summary"]
+    assert data["trend"] == "declining"
+
+
+@pytest.mark.asyncio
+async def test_narrative_no_trend_prefix_when_stable(client: AsyncClient, db_session):
+    """Narrative has no trend prefix when success rate delta is within ±0.05 (stable)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Both windows: 3 completed + 1 failed = 0.75 success rate → delta = 0.0 → stable
+    prev = _prev_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+    ))
+
+    curr = _curr_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["narrative_summary"], str)
+    assert len(data["narrative_summary"]) > 0
+    assert "Good progress" not in data["narrative_summary"]
+    assert "Pipeline health declining" not in data["narrative_summary"]
+    assert data["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_narrative_up_from_x(client: AsyncClient, db_session):
+    """Narrative includes 'up from X' when current window has more completions than previous."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Previous window: 1 completed
+    prev = _prev_ts()
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+    ))
+
+    # Current window: 2 completed → completed_delta = 2 - 1 = 1 > 0 → "(up from 1 last period)"
+    curr = _curr_ts()
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["narrative_summary"], str)
+    assert len(data["narrative_summary"]) > 0
+    assert "up from 1" in data["narrative_summary"]
+    assert data["completed_delta"] == 1
+
+
+@pytest.mark.asyncio
+async def test_narrative_all_quiet_fallback(client: AsyncClient, db_session):
+    """Narrative is 'All quiet' when no tasks exist in the window."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["narrative_summary"], str)
+    assert len(data["narrative_summary"]) > 0
+    assert "All quiet" in data["narrative_summary"]
+
+
+# ---------------------------------------------------------------------------
+# Trend boundary tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trend_improving(client: AsyncClient, db_session):
+    """trend='improving' when success_rate_delta > 0.05 (prev=0.5, current=0.6, delta=0.1)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Previous window: 5 completed + 5 failed = 0.50 success rate
+    prev = _prev_ts()
+    for _ in range(5):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        ))
+    for _ in range(5):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        ))
+
+    # Current window: 6 completed + 4 failed = 0.60 success rate → delta = 0.10 > 0.05
+    curr = _curr_ts()
+    for _ in range(6):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["trend"] == "improving"
+    assert data["prev_success_rate"] == 0.5
+    assert data["success_rate"] == 0.6
+    assert data["success_rate_delta"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_trend_declining(client: AsyncClient, db_session):
+    """trend='declining' when success_rate_delta < -0.05 (prev=0.8, current=0.7, delta=-0.1)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Previous window: 8 completed + 2 failed = 0.80 success rate
+    prev = _prev_ts()
+    for _ in range(8):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        ))
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        ))
+
+    # Current window: 7 completed + 3 failed = 0.70 success rate → delta = -0.10 < -0.05
+    curr = _curr_ts()
+    for _ in range(7):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["trend"] == "declining"
+    assert data["prev_success_rate"] == 0.8
+    assert data["success_rate"] == 0.7
+    assert data["success_rate_delta"] == -0.1
+
+
+@pytest.mark.asyncio
+async def test_trend_stable(client: AsyncClient, db_session):
+    """trend='stable' when |success_rate_delta| <= 0.05 (identical rates, delta=0.0)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Both windows: 3 completed + 1 failed = 0.75 success rate → delta = 0.0
+    prev = _prev_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+    ))
+
+    curr = _curr_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["trend"] == "stable"
+    assert data["success_rate_delta"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_trend_none_when_no_previous_terminal_tasks(client: AsyncClient, db_session):
+    """trend=None when the previous window has zero terminal tasks (can't compute prev_success_rate)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Current window only: 2 completed — no tasks in previous window
+    curr = _curr_ts()
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["prev_success_rate"] is None
+    assert data["success_rate_delta"] is None
+    assert data["trend"] is None
+
+
+# ---------------------------------------------------------------------------
+# Failure classification in digest tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failure_group_rate_limit(client: AsyncClient, db_session):
+    """Task with 'rate limit exceeded' in status message is classified into RATE_LIMIT failure group."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Rate Limited Task",
+        status=TaskStatus.FAILED,
+        latest_status_message="rate limit exceeded",
+        created_at=curr,
+        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    failure_classes = {g["failure_class"] for g in data["failure_groups"]}
+    assert "RATE_LIMIT" in failure_classes
+
+    rate_limit_group = next(g for g in data["failure_groups"] if g["failure_class"] == "RATE_LIMIT")
+    assert rate_limit_group["count"] == 1
+    task_ids = [t["task_id"] for t in rate_limit_group["tasks"]]
+    assert any("Rate Limited Task" in t.get("title", "") for t in rate_limit_group["tasks"])
+
+
+@pytest.mark.asyncio
+async def test_failure_group_provision_failure(client: AsyncClient, db_session):
+    """Task with 'quota' in status message is classified into PROVISION_FAILURE failure group."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Quota Exceeded Task",
+        status=TaskStatus.FAILED,
+        latest_status_message="quota exceeded for region us-central1",
+        created_at=curr,
+        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    failure_classes = {g["failure_class"] for g in data["failure_groups"]}
+    assert "PROVISION_FAILURE" in failure_classes
+
+    provision_group = next(g for g in data["failure_groups"] if g["failure_class"] == "PROVISION_FAILURE")
+    assert provision_group["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_group_code_error_default(client: AsyncClient, db_session):
+    """Task with a generic error message is classified into CODE_ERROR failure group (default)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Generic Error Task",
+        status=TaskStatus.FAILED,
+        latest_status_message="TypeError: cannot read property 'foo' of undefined",
+        created_at=curr,
+        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    failure_classes = {g["failure_class"] for g in data["failure_groups"]}
+    assert "CODE_ERROR" in failure_classes
+
+    code_error_group = next(g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR")
+    assert code_error_group["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db_session):
+    """failure_groups are sorted by count descending (most frequent failure class first)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # 2 CODE_ERROR tasks (generic messages)
+    for i in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Code Error Task {i}",
+            status=TaskStatus.FAILED,
+            latest_status_message="SyntaxError: unexpected token",
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        ))
+    # 1 RATE_LIMIT task
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Rate Limit Task",
+        status=TaskStatus.FAILED,
+        latest_status_message="rate limit exceeded",
+        created_at=curr,
+        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["failure_groups"]) >= 2
+    # First group should have the highest count
+    counts = [g["count"] for g in data["failure_groups"]]
+    assert counts == sorted(counts, reverse=True)
+    assert data["failure_groups"][0]["failure_class"] == "CODE_ERROR"
+    assert data["failure_groups"][0]["count"] == 2
