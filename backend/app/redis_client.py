@@ -6,24 +6,34 @@ fall back to per-instance in-memory state when REDIS_URL is not configured.
 
 import os
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 _redis = None
-_init_attempted = False
+_last_attempt: float = 0.0
+_RETRY_INTERVAL: float = 300.0  # Retry every 5 minutes
 
 
 async def get_redis():
     """Get shared Redis connection. Returns None if unavailable."""
-    global _redis, _init_attempted
+    global _redis, _last_attempt
     if _redis is not None:
-        return _redis
-    if _init_attempted:
-        return None  # Already tried and failed — don't retry every call
+        try:
+            await _redis.ping()
+            return _redis
+        except Exception:
+            logger.warning("[REDIS] Connection lost, will retry")
+            _redis = None
+
+    # Rate-limit reconnection attempts
+    now = time.monotonic()
+    if now - _last_attempt < _RETRY_INTERVAL:
+        return None
+    _last_attempt = now
 
     url = os.getenv("REDIS_URL")
     if not url:
-        _init_attempted = True
         return None
 
     try:
@@ -34,14 +44,13 @@ async def get_redis():
     except Exception as e:
         logger.warning(f"[REDIS] Connection failed, falling back to in-memory: {e}")
         _redis = None
-        _init_attempted = True
     return _redis
 
 
 async def close_redis():
     """Close Redis connection on shutdown."""
-    global _redis, _init_attempted
+    global _redis, _last_attempt
     if _redis:
         await _redis.close()
         _redis = None
-    _init_attempted = False
+    _last_attempt = 0.0

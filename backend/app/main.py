@@ -515,6 +515,8 @@ async def _init_deployment_state():
                 from datetime import timezone as tz
                 with _zone_lock:
                     for zone, data in state.zone_health_state.items():
+                        if not isinstance(data, dict):
+                            continue
                         restored = {}
                         for k, v in data.items():
                             if isinstance(v, str) and k in ("last_success", "last_failure", "cooldown_expires_at"):
@@ -532,6 +534,17 @@ async def _init_deployment_state():
                 logger.info(f"[DEPLOY] Restored zone health state for {len(state.zone_health_state)} zones")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore zone health state: {e}", exc_info=True)
+
+        # Restore pause/health streaks
+        try:
+            if state.zone_health_state:
+                global _pause_failure_streak, _health_recovery_streak
+                _pause_failure_streak = state.zone_health_state.get("_pause_failure_streak", 0)
+                _health_recovery_streak = state.zone_health_state.get("_health_recovery_streak", 0)
+                if _pause_failure_streak or _health_recovery_streak:
+                    logger.info(f"[DEPLOY] Restored health streaks: pause_failures={_pause_failure_streak}, recovery={_health_recovery_streak}")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore health streaks: {e}", exc_info=True)
 
         # Auto-recovery from HALTED after 1 hour cooldown
         if state.status == DeploymentStatus.HALTED:
@@ -921,6 +934,27 @@ _health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gat
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
 
 
+async def _send_webhook_notification(event_type: str, title: str, details: str) -> None:
+    """Fire-and-forget webhook notification for critical pipeline events."""
+    url = os.getenv("PIPELINE_WEBHOOK_URL")
+    if not url:
+        return
+    import httpx
+    payload = {
+        "event_type": event_type,
+        "title": title,
+        "details": details,
+        "timestamp": _utcnow().isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning(f"[WEBHOOK] POST returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[WEBHOOK] Failed to send notification: {e}")
+
+
 async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
     title = "Pipeline auto-paused: external dependencies down"
@@ -953,6 +987,7 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
             "alert_created",
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
+    await _send_webhook_notification("AUTO_PAUSED", title, msg)
 
 
 async def _create_auto_resume_alerts(session: AsyncSession) -> None:
@@ -1012,6 +1047,7 @@ async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
+    await _send_webhook_notification("PIPELINE_HALTED", title, msg)
 
 
 async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, rolled_back_to: str) -> None:
@@ -1730,6 +1766,7 @@ async def _maybe_create_circuit_breaker_alert(
         "alert_created",
         {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
     )
+    await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
 
 async def broadcast_deploy_state():
@@ -2249,6 +2286,8 @@ async def _persist_zone_health():
                     k: v.isoformat() if isinstance(v, datetime) else v
                     for k, v in data.items()
                 }
+        snapshot["_pause_failure_streak"] = _pause_failure_streak
+        snapshot["_health_recovery_streak"] = _health_recovery_streak
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:
@@ -2493,8 +2532,8 @@ async def orchestrator_worker():
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
         try:
-            global _orchestrator_last_cycle
-            _orchestrator_last_cycle = _utcnow()
+            global _orchestrator_last_cycle, _orchestrator_cycle_started
+            _orchestrator_cycle_started = _utcnow()
             cycle_start = time.monotonic()
             tasks_recovered = 0
 
@@ -3249,6 +3288,7 @@ async def orchestrator_worker():
                 'tasks_dispatched': len(queued_tasks),
                 'tasks_recovered': tasks_recovered,
             })
+            _orchestrator_last_cycle = _utcnow()
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
@@ -3256,6 +3296,7 @@ async def orchestrator_worker():
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
             }, exc_info=True)
+            _orchestrator_last_cycle = _utcnow()
             try:
                 if session:
                     await session.rollback()
@@ -3354,26 +3395,69 @@ async def lifespan(app: FastAPI):
             "secret_reconciliation": secret_reconciliation_service,
         }
         while True:
-            await asyncio.sleep(30)
-            for name, t in list(tasks.items()):
-                if t.done():
-                    exc = t.exception() if not t.cancelled() else None
-                    logger.error(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
-                    factory = task_factories.get(name)
-                    if factory and not t.cancelled():
-                        state = restart_state.setdefault(name, {"attempts": 0, "last_restart": None})
-                        now = _utcnow()
-                        # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
-                        if state["last_restart"] and (now - state["last_restart"]).total_seconds() > 300:
-                            state["attempts"] = 0
-                        backoff = min(2 ** state["attempts"], 300)  # 1s, 2s, 4s, ... cap 5min
-                        if backoff > 1:
-                            logger.warning(f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})")
-                            await asyncio.sleep(backoff)
-                        state["attempts"] += 1
-                        state["last_restart"] = _utcnow()
-                        logger.info(f"[MONITOR] Restarting {name}...")
-                        tasks[name] = asyncio.create_task(factory())
+            try:
+                await asyncio.sleep(30)
+                for name, t in list(tasks.items()):
+                    if t.done():
+                        exc = t.exception() if not t.cancelled() else None
+                        logger.error(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
+                        asyncio.create_task(_send_webhook_notification("SERVICE_CRASHED", f"Background service crashed: {name}", str(exc)[:500]))
+                        try:
+                            async with AsyncSessionLocal() as alert_session:
+                                projects = (await alert_session.execute(select(Project))).scalars().all()
+                                alert_title = f"Background service crashed: {name}"
+                                for project in projects:
+                                    existing = (await alert_session.execute(
+                                        select(Alert).where(
+                                            Alert.project_id == project.id,
+                                            Alert.title == alert_title,
+                                            Alert.dismissed_at.is_(None),
+                                        )
+                                    )).scalars().first()
+                                    if existing:
+                                        continue
+                                    alert = Alert(
+                                        project_id=project.id,
+                                        severity=AlertSeverity.ERROR,
+                                        title=alert_title,
+                                        message=f"Background service '{name}' crashed with: {str(exc)[:300]}. Auto-restarting with backoff.",
+                                    )
+                                    alert_session.add(alert)
+                                await alert_session.commit()
+                        except Exception as alert_exc:
+                            logger.warning(f"[MONITOR] Failed to create crash alert: {alert_exc}")
+                        factory = task_factories.get(name)
+                        if factory and not t.cancelled():
+                            state = restart_state.setdefault(name, {"attempts": 0, "last_restart": None})
+                            now = _utcnow()
+                            # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
+                            if state["last_restart"] and (now - state["last_restart"]).total_seconds() > 300:
+                                state["attempts"] = 0
+                            backoff = min(2 ** state["attempts"], 300)  # 1s, 2s, 4s, ... cap 5min
+                            if backoff > 1:
+                                logger.warning(f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})")
+                                await asyncio.sleep(backoff)
+                            state["attempts"] += 1
+                            state["last_restart"] = _utcnow()
+                            logger.info(f"[MONITOR] Restarting {name}...")
+                            tasks[name] = asyncio.create_task(factory())
+                            try:
+                                async with AsyncSessionLocal() as alert_session:
+                                    projects = (await alert_session.execute(select(Project))).scalars().all()
+                                    for project in projects:
+                                        alert = Alert(
+                                            project_id=project.id,
+                                            severity=AlertSeverity.INFO,
+                                            title=f"Background service restarted: {name}",
+                                            message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",
+                                        )
+                                        alert_session.add(alert)
+                                    await alert_session.commit()
+                            except Exception as alert_exc:
+                                logger.warning(f"[MONITOR] Failed to create restart alert: {alert_exc}")
+            except Exception as mon_exc:
+                logger.error(f"[MONITOR] Monitor itself hit exception: {mon_exc}", exc_info=True)
+                await asyncio.sleep(10)  # Brief pause before retrying
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
@@ -3405,6 +3489,7 @@ app.include_router(admin_router)
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: Optional[datetime] = None
+_orchestrator_cycle_started: Optional[datetime] = None
 
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
@@ -3478,8 +3563,15 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
             ],
         }
 
+    hung = False
+    if _orchestrator_cycle_started and _orchestrator_last_cycle:
+        if _orchestrator_cycle_started > _orchestrator_last_cycle:
+            hung_seconds = (_utcnow() - _orchestrator_cycle_started).total_seconds()
+            hung = hung_seconds > 300  # 5 minutes without completing a cycle
+
     return {
         "orchestrator_alive": _orchestrator_last_cycle is not None,
+        "orchestrator_hung": hung,
         "last_cycle_seconds_ago": ago,
         "queued_tasks": queued,
         "active_tasks": active,
@@ -3644,12 +3736,21 @@ async def health_check():
     # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
     orchestrator_healthy = orchestrator_alive and (cycle_age is not None and cycle_age < 60)
 
+    # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
+    orchestrator_hung = False
+    if _orchestrator_cycle_started and _orchestrator_last_cycle:
+        if _orchestrator_cycle_started > _orchestrator_last_cycle:
+            hung_seconds = (_utcnow() - _orchestrator_cycle_started).total_seconds()
+            orchestrator_hung = hung_seconds > 300
+
     # Only DB is critical for 503 — GitHub/Claude/GCP outages shouldn't remove us from LB
     critical_healthy = external_health.get("db", True)
     degraded_deps = [
         k for k in ("github_api", "claude_api", "gcp")
         if not external_health.get(k, True)
     ]
+    if orchestrator_hung:
+        degraded_deps.append("orchestrator_hung")
 
     healthy = orchestrator_healthy and critical_healthy
     status = "healthy" if healthy and not degraded_deps else "degraded" if healthy else "unhealthy"
@@ -4735,13 +4836,26 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         logger.info(f"[REQUEUE] Skipping requeue — parent {parent.id} is CANCELLED")
         return 0
 
+    # Cap re-evaluations to prevent infinite loops when children consistently fail
+    MAX_PARENT_REQUEUES = 3
+    parent_ctx = parent.context or {}
+    requeue_count = parent_ctx.get("_requeue_count", 0)
+    if requeue_count >= MAX_PARENT_REQUEUES:
+        logger.warning(f"[REQUEUE] Parent {parent.id} hit re-evaluation limit ({requeue_count} attempts) — failing permanently")
+        parent.status = TaskStatus.FAILED
+        parent.latest_status_message = f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
+        session.add(parent)
+        await session.commit()
+        # Create failure alert
+        await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
+        return 0
+
     children = (await session.execute(
         select(Task).where(Task.parent_task_id == parent.id)
     )).scalars().all()
 
     # Refresh base_branch from parent's staging branch — the original child's
     # base_branch may reference a deleted branch (e.g., plan/* after rollup merge)
-    parent_ctx = parent.context or {}
     parent_staging = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
 
     # Pass 1: Clone failed children, build old→new ID mapping
@@ -4804,9 +4918,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             for _, clone in cloned_pairs:
                 clone.depends_on = []
 
+    parent.context = {**(parent.context or {}), "_requeue_count": requeue_count + 1}
     parent.status = TaskStatus.EVALUATING
     parent.latest_status_message = f"Requeued — retrying {retried_count} failed subtask(s)"
-    parent.attempt_count = 0
+    parent.attempt_count += 1
     session.add(parent)
     await session.commit()
 

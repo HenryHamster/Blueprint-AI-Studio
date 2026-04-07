@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any, List, TypedDict
+import os
 import uuid
 import json
 import httpx
@@ -1175,6 +1176,7 @@ async def get_settings(
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
         "github_account": github_account,
+        "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
