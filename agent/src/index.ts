@@ -1222,9 +1222,12 @@ async function handleFix(
     const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
     await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort);
 
+    const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort);
+
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const testNote = fixTestFailures ? '\n\nNote: test failures detected, manual review recommended' : '';
+    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`], { encoding: 'utf-8' });
   }
 
   // Final rebase onto base branch to ensure no conflicts remain before push.
@@ -1405,7 +1408,8 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     for (const t of recentTasks) {
       const pr = t.pr_url ? ` (${strVal(t.pr_url)})` : '';
       const summary = t.research_findings_summary ? ` — ${parseResearchSummary(strVal(t.research_findings_summary))}` : '';
-      const failureSuffix = t.failure_reason ? ` (FAILED: ${strVal(t.failure_reason)})` : '';
+      const failureClass = t.failure_class ? ` [${strVal(t.failure_class)}]` : '';
+      const failureSuffix = t.failure_reason ? ` (FAILED${failureClass}: ${strVal(t.failure_reason)})` : '';
       const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
       allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}`);
     }
@@ -1433,7 +1437,8 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
   if (lessonsData && lessonsData.length > 0) {
     const candidateLines: string[] = ['### Lessons from Past Reviews'];
     for (const l of lessonsData) {
-      candidateLines.push(`- **${strVal(l.task_title)}** (${l.iterations} cycles): ${strVal(l.last_feedback)}`);
+      const fcSuffix = l.failure_class ? ` [${strVal(l.failure_class)}]` : '';
+      candidateLines.push(`- **${strVal(l.task_title)}** (${l.iterations} cycles)${fcSuffix}: ${strVal(l.last_feedback)}`);
     }
     candidateLines.push('');
     const candidateContent = candidateLines.join('\n');

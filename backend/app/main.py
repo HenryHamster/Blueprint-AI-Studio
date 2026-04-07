@@ -4426,7 +4426,8 @@ async def claim_task(
                 "status": t.status.value if hasattr(t.status, "value") else str(t.status),
                 "pr_url": pr_url,
                 "research_findings_summary": research_findings_summary,
-                "failure_reason": (t.latest_status_message or "")[:200] if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
+                "failure_reason": (t.latest_status_message or "")[:500] if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
+                "failure_class": classify_failure(t) if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
                 "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0) if (t.context or {}).get("review_loop") else None,
             })
 
@@ -4447,18 +4448,35 @@ async def claim_task(
             if not review_loop:
                 continue
             iteration = review_loop.get("iteration", 0)
-            if iteration < 3:
+            if iteration < 2:
                 continue
             review_hist = review_loop.get("review_history", [])
             if review_hist:
-                last_feedback = review_hist[-1].get("feedback", "")[:300]
+                last_feedback = review_hist[-1].get("feedback", "")[:500]
                 lessons.append({
                     "task_title": ht.title,
                     "iterations": len(review_hist) + 1,
                     "last_feedback": last_feedback,
                 })
-            if len(lessons) >= 5:
+            if len(lessons) >= 8:
                 break
+
+        # Second pass: collect CODE_ERROR failures with no review loop
+        if len(lessons) < 8:
+            for ht in high_iter_rows:
+                if (ht.context or {}).get("review_loop"):
+                    continue  # already handled above
+                if ht.status == TaskStatus.FAILED and ht.latest_status_message:
+                    fc = classify_failure(ht)
+                    if fc == "CODE_ERROR":
+                        lessons.append({
+                            "task_title": ht.title,
+                            "iterations": 0,
+                            "last_feedback": (ht.latest_status_message or "")[:500],
+                            "failure_class": "CODE_ERROR",
+                        })
+                if len(lessons) >= 8:
+                    break
 
         # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
         open_prs_stmt = (
@@ -8144,10 +8162,15 @@ async def update_agent_status(
                     "failed_task_title": task.title,
                     "error_logs": (payload.logs or "")[:20000],
                     "base_branch": base_branch,
+                    "failed_task_prompt": (failed_task_payload.get("prompt") or task.description or "")[:2000],
+                    "failed_task_type": failed_task_type,
                 }],
                 context={
                     "failed_task_id": str(task.id),
                     "parent_base": base_branch,
+                    "related_files": (task.context or {}).get("related_files", []),
+                    "scope": (task.context or {}).get("scope"),
+                    "failure_class": failure_class,
                 },
                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                 status=TaskStatus.QUEUED,
