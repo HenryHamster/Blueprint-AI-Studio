@@ -60,7 +60,7 @@ async def eval_db(mocker):
         bind=_engine, class_=AsyncSession,
         autocommit=False, autoflush=False, expire_on_commit=False,
     )
-    mocker.patch("app.main.AsyncSessionLocal", _Session)
+    mocker.patch("app.services.AsyncSessionLocal", _Session)
 
     async with _Session() as session:
         yield session

@@ -101,7 +101,7 @@ class TestReaperService:
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="Reaper FAILED test", user_id="user1")
@@ -141,7 +141,7 @@ class TestReaperService:
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="Heartbeat alive", user_id="user1")
@@ -180,7 +180,7 @@ class TestReaperService:
         """
         mocker.patch("app.main.delete_agent_vm", return_value=None)
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="Retry test", user_id="user1")
@@ -218,7 +218,7 @@ class TestReaperService:
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="No-VM test", user_id="user1")
@@ -300,7 +300,7 @@ class TestReaperService:
             return await original_get(model, pk, **kwargs)
 
         db_session.get = _intercepted_get
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
 
         try:
             await reaper_service()
@@ -328,7 +328,7 @@ class TestReaperService:
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="Already-failed test", user_id="user1")

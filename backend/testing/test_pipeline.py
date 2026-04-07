@@ -502,14 +502,14 @@ class TestSpawnLimits:
     """Fix 2.5: SpawnTaskRequest payloads limited to 20."""
 
     def test_spawn_payload_max_length(self):
-        from app.main import SpawnTaskRequest
+        from app.schemas import SpawnTaskRequest
         import uuid
         # 20 payloads should work
         req = SpawnTaskRequest(task_id=uuid.uuid4(), payloads=[{"type": "create"}] * 20)
         assert len(req.payloads) == 20
 
     def test_spawn_payload_over_limit(self):
-        from app.main import SpawnTaskRequest
+        from app.schemas import SpawnTaskRequest
         from pydantic import ValidationError
         import uuid
         with pytest.raises(ValidationError):
@@ -554,7 +554,7 @@ class TestVerdictJsonField:
     """Fix 2.8: AgentStatusPayload has verdict_json field."""
 
     def test_verdict_json_field_accepted(self):
-        from app.main import AgentStatusPayload
+        from app.schemas import AgentStatusPayload
         import uuid
         payload = AgentStatusPayload(
             task_id=uuid.uuid4(),
@@ -566,7 +566,7 @@ class TestVerdictJsonField:
         assert parsed["verdict"] == "APPROVE"
 
     def test_verdict_json_field_optional(self):
-        from app.main import AgentStatusPayload
+        from app.schemas import AgentStatusPayload
         import uuid
         payload = AgentStatusPayload(
             task_id=uuid.uuid4(),

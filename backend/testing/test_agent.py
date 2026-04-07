@@ -273,7 +273,7 @@ async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_
     The _terminated_task_ids set (populated by SQLAlchemy event on status transition)
     causes verify_agent_token to reject the request with 401.
     """
-    from app.main import _terminated_task_ids
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="Token Revocation Test", user_id="test-user-123")
     db_session.add(project)

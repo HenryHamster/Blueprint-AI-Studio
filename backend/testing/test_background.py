@@ -30,7 +30,7 @@ async def reaper_db(mocker):
         bind=reaper_engine, class_=AsyncSession,
         autocommit=False, autoflush=False, expire_on_commit=False,
     )
-    mocker.patch("app.main.AsyncSessionLocal", ReaperSession)
+    mocker.patch("app.reaper.AsyncSessionLocal", ReaperSession)
 
     async with ReaperSession() as session:
         yield session

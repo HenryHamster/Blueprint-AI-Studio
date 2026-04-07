@@ -76,7 +76,7 @@ async def test_post_github_pat_invalid_format(client, mocker):
     A classic token (ghp_) is rejected with HTTP 400 by the endpoint.
     """
     mocker.patch(
-        "app.main.validate_fine_grained_pat",
+        "app.routers.github.validate_fine_grained_pat",
         side_effect=HTTPException(status_code=400, detail="Invalid token format"),
     )
 
@@ -92,11 +92,11 @@ async def test_post_github_pat_valid(client, mocker):
     A valid fine-grained PAT returns HTTP 200 with status=success.
     """
     mocker.patch(
-        "app.main.validate_fine_grained_pat",
+        "app.routers.github.validate_fine_grained_pat",
         return_value={"user": "testuser", "status": "valid"},
     )
     mocker.patch(
-        "app.main.store_user_secret",
+        "app.routers.github.store_user_secret",
         return_value="projects/test/secrets/github-pat-test-user-123",
     )
 
@@ -112,7 +112,7 @@ async def test_post_github_pat_unauthorized(client, mocker):
     An expired or revoked PAT returns HTTP 401 from the endpoint.
     """
     mocker.patch(
-        "app.main.validate_fine_grained_pat",
+        "app.routers.github.validate_fine_grained_pat",
         side_effect=HTTPException(status_code=401, detail="Token invalid or expired"),
     )
 

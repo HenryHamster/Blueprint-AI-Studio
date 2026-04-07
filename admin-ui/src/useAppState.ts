@@ -3,27 +3,18 @@ import type { Task } from './types/task';
 import type { Project } from './types/project';
 import type { MaxPlanAccount } from './types/settings';
 import type { Alert } from './types/alert';
-import { onAuthChange } from './firebase';
-import type { User } from 'firebase/auth';
-import { API_BASE_URL, authHeaders, authGet, apiFetch, COST_PER_VM_HR, fetchTask } from './api';
+import { API_BASE_URL, authHeaders, authGet, apiFetch } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
+import { usePersistedState } from './hooks/usePersistedState';
+import { useAuth } from './hooks/useAuth';
+import { useViewPreferences } from './hooks/useViewPreferences';
+import { useMetrics } from './hooks/useMetrics';
+import { useArchive } from './hooks/useArchive';
+import { useDeploymentState } from './hooks/useDeploymentState';
+import { useLogViewer } from './hooks/useLogViewer';
 
 export type { DeployState } from './types/settings';
-import type { DeployState } from './types/settings';
-
-function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
-  const [state, setState] = useState<T>(() => {
-    try {
-      const stored = localStorage.getItem(`blueprint-admin:${key}`);
-      return stored ? JSON.parse(stored) : defaultValue;
-    } catch { return defaultValue; }
-  });
-  useEffect(() => {
-    localStorage.setItem(`blueprint-admin:${key}`, JSON.stringify(state));
-  }, [key, state]);
-  return [state, setState];
-}
 
 function playCompletionSound() {
   try {
@@ -42,10 +33,37 @@ function playCompletionSound() {
 }
 
 export function useAppState() {
-  const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [userRole, setUserRole] = useState<'admin' | 'user' | null>(null);
-  const [accessDenied, setAccessDenied] = useState(false);
+  // ── Composed hooks ──────────────────────────────────────────────────────
+  const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
+  const { toasts, addToast, dismissToast } = useToasts();
+  const { viewMode, setViewMode, compactMode, setCompactMode, groupBy, setGroupBy, columnPrefs, setColumnPrefs, defaultTaskType, setDefaultTaskType } = useViewPreferences();
+  const { metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow, addMetricsPoint } = useMetrics();
+  const {
+    showArchive, setShowArchive, archiveTasks, archiveLoading,
+    archivePage, setArchivePage, archivePageSize, setArchivePageSize,
+    archiveStatusFilter, setArchiveStatusFilter,
+    archiveSearchQuery, setArchiveSearchQuery,
+    archiveDateRange, setArchiveDateRange,
+    archiveTotalTasks, fetchArchiveTasks,
+    archiveSortOrder, setArchiveSortOrder,
+  } = useArchive(addToast);
+
+  const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
+
+  const {
+    deployState, setDeployState,
+    handlePausePipeline, handleResumePipeline, handleResetHealth,
+    handleRollback, handleMarkStable, handleRepairState,
+    zoneHealth, orchestratorHealth, detailedHealth,
+  } = useDeploymentState(addToast, user, fetchTasksRef);
+
+  const {
+    logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
+    handleViewLogs, closeLogViewer,
+    wsRef, wsConnected,
+  } = useLogViewer({ fetchTasksRef, setDeployState });
+
+  // ── Remaining state ─────────────────────────────────────────────────────
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
   const [globalActiveCount, setGlobalActiveCount] = useState(0);
@@ -53,7 +71,6 @@ export function useAppState() {
   const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = usePersistedState<number>('pageSize', 50);
   const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
@@ -81,18 +98,7 @@ export function useAppState() {
   const [branchError, setBranchError] = useState<string | null>(null);
   const [useManualBranch, setUseManualBranch] = useState(false);
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
-  const { toasts, addToast, dismissToast } = useToasts();
   const [alerts, setAlerts] = useState<Alert[]>([]);
-
-  // Log viewer state
-  const [logTask, setLogTask] = useState<Task | null>(null);
-  const [logLines, setLogLines] = useState<string[]>([]);
-  const [logsConnecting, setLogsConnecting] = useState(false);
-  const [wsDisconnected, setWsDisconnected] = useState(false);
-  const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const wsReconnectAttemptRef = useRef<number>(0);
-  const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Research browser state
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
@@ -124,8 +130,6 @@ export function useAppState() {
   const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
-  const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
   // Max plan pool state
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
   const [newAccountName, setNewAccountName] = useState('');
@@ -134,8 +138,7 @@ export function useAppState() {
   // GitHub connection state
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
 
-  // Defaults
-  const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('defaultTaskType', 'create');
+  // Notification defaults
   const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
   const [notifyOnFail, setNotifyOnFail] = usePersistedState<boolean>('notifyOnFail', false);
   const [notifyOnApprovalNeeded, setNotifyOnApprovalNeeded] = usePersistedState<boolean>('notifyOnApprovalNeeded', false);
@@ -150,14 +153,6 @@ export function useAppState() {
   const soundOnCompleteRef = useRef(soundOnComplete);
   useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
 
-  // View toggle state
-  const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline'>('viewMode', 'kanban');
-  const [compactMode, setCompactMode] = usePersistedState<boolean>('compactMode', false);
-  const [groupBy, setGroupBy] = usePersistedState<'status' | 'type' | 'project'>('groupBy', 'status');
-
-  // Kanban column preferences (order + visibility)
-  const [columnPrefs, setColumnPrefs] = usePersistedState<{ id: string; visible: boolean }[]>('kanban_column_prefs', []);
-
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
@@ -166,32 +161,8 @@ export function useAppState() {
   // Directions panel state
   const [showDirections, setShowDirections] = useState(false);
 
-  // Metrics dashboard state
+  // Metrics toggle
   const [showMetrics, setShowMetrics] = useState(false);
-  const [metricsHistory, setMetricsHistory] = useState<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>(() => {
-    try {
-      const stored = localStorage.getItem('blueprint-admin:metricsHistory');
-      const parsed: { timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[] = stored ? JSON.parse(stored) : [];
-      return parsed.filter(p => Date.now() - p.timestamp <= 21600000);
-    } catch { return []; }
-  });
-  useEffect(() => {
-    const toStore = metricsHistory.filter(p => Date.now() - p.timestamp <= 21600000);
-    try {
-      localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore));
-    } catch (e) {
-      if (e instanceof DOMException && e.name === 'QuotaExceededError') {
-        try {
-          localStorage.setItem('blueprint-admin:metricsHistory', JSON.stringify(toStore.slice(-50)));
-        } catch { /* storage unavailable, skip persistence */ }
-      }
-    }
-  }, [metricsHistory]);
-  const [cumulativeCost, setCumulativeCost] = usePersistedState<number>('cumulativeCost', 0);
-  const [cumulativeVmHours, setCumulativeVmHours] = usePersistedState<number>('cumulativeVmHours', 0);
-  const [metricsWindow, setMetricsWindow] = usePersistedState<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'>('metricsWindow', '1h');
-  const metricsHistoryRef = useRef<{ timestamp: number; activeVMs: number; costPerHr: number; completedCount: number; failedCount: number }[]>([]);
-  useEffect(() => { metricsHistoryRef.current = metricsHistory.filter(p => Date.now() - p.timestamp <= 86400000); }, [metricsHistory]);
 
   // Last visit timestamp — captures when the user previously loaded the app
   const [lastVisitTimestamp] = useState<number | null>(() => {
@@ -209,7 +180,6 @@ export function useAppState() {
 
   // Status bar state
   const [apiHealthy, setApiHealthy] = useState(true);
-  const [wsConnected, setWsConnected] = useState(false);
   const [lastFetchTime, setLastFetchTime] = useState<number>(0);
 
   // Search and filter state
@@ -231,43 +201,7 @@ export function useAppState() {
   // Confirm dialog state
   const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; confirmLabel: string; onConfirm: () => void } | null>(null);
 
-  // Archive view state
-  const [showArchive, setShowArchiveState] = useState(false);
-  const [archiveTasks, setArchiveTasks] = useState<Task[]>([]);
-  const [archiveLoading, setArchiveLoading] = useState(false);
-  const [archivePage, setArchivePageState] = useState(1);
-  const [archivePageSize, setArchivePageSizeState] = usePersistedState<number>('archivePageSize', 50);
-  const [archiveStatusFilter, setArchiveStatusFilterState] = useState<string>('all');
-  const [archiveSearchQuery, setArchiveSearchQueryState] = useState('');
-  const [archiveDateRange, setArchiveDateRangeState] = useState<string>('all');
-  const [archiveTotalTasks, setArchiveTotalTasks] = useState(0);
-  const [archiveSortOrder, setArchiveSortOrderState] = useState<'desc' | 'asc'>('desc');
-
-  // Firebase auth state
-  useEffect(() => {
-    const unsub = onAuthChange((u) => { setUser(u); setAuthLoading(false); });
-    return unsub;
-  }, []);
-
-  // Fetch user role from backend after Firebase auth
-  useEffect(() => {
-    if (!user) { setUserRole(null); setAccessDenied(false); return; }
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await authGet(`${API_BASE_URL}/api/me`);
-        if (cancelled) return;
-        if (res.status === 403) { setAccessDenied(true); return; }
-        if (!res.ok) { setError(`Failed to verify access: ${res.statusText}`); return; }
-        const data = await res.json();
-        setUserRole(data.role);
-        setAccessDenied(false);
-      } catch {
-        if (!cancelled) setError('Failed to connect to backend server.');
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [user]);
+  // ── Effects ─────────────────────────────────────────────────────────────
 
   // Handle OAuth redirect query params
   useEffect(() => {
@@ -288,7 +222,7 @@ export function useAppState() {
       setError(messages[ghError] || `GitHub error: ${ghError}`);
       window.history.replaceState({}, '', window.location.pathname);
     }
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Immediate fetch when filters, page, or project selection change
   useEffect(() => {
@@ -312,24 +246,6 @@ export function useAppState() {
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshInterval, user]);
-
-  // Clear wsDisconnected banner when task reaches a terminal state
-  useEffect(() => {
-    if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
-      setWsDisconnected(false);
-      setWsDisconnectReason(null);
-    }
-  }, [logTask, logTask?.status]);
-
-  // Clean up WebSocket on close
-  useEffect(() => {
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-    };
-  }, []);
 
   // Close settings dropdown on outside click
   useEffect(() => {
@@ -368,7 +284,7 @@ export function useAppState() {
         if (logTask) { closeLogViewer(); return; }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
-        if (showArchive) { setShowArchiveState(false); return; }
+        if (showArchive) { setShowArchive(false); return; }
         if (showDirections) { setShowDirections(false); return; }
         if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
@@ -419,6 +335,8 @@ export function useAppState() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
+
+  // ── Functions ───────────────────────────────────────────────────────────
 
   const fetchTasks = async () => {
     if (tasks.length === 0) {
@@ -504,25 +422,8 @@ export function useAppState() {
         setApiHealthy(true);
         setLastFetchTime(Date.now());
 
-        // Always record metrics data points (rendering depends on showMetrics, not collection)
-        const now = Date.now();
-        const activeVMs = data.active_count ?? newTasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-        const costPerHr = activeVMs * COST_PER_VM_HR;
-
-        // Compute cumulative cost and VM-hours using the rate from the *previous* interval
-        const prevHistory = metricsHistoryRef.current;
-        const lastPoint = prevHistory[prevHistory.length - 1];
-        if (lastPoint) {
-          const intervalMs = now - lastPoint.timestamp;
-          const intervalHrs = intervalMs / 3600000;
-          setCumulativeCost(c => c + lastPoint.costPerHr * intervalHrs);
-          setCumulativeVmHours(h => h + lastPoint.activeVMs * intervalHrs);
-        }
-
-        const filtered = prevHistory.filter((p: { timestamp: number }) => now - p.timestamp <= 21600000);
-        const newHistory = [...filtered, { timestamp: now, activeVMs, costPerHr, completedCount, failedCount }];
-        metricsHistoryRef.current = newHistory;
-        setMetricsHistory(newHistory);
+        // Record metrics data point
+        addMetricsPoint(data.active_count, newTasks, completedCount, failedCount);
       } else {
         setError(`Failed to fetch tasks: ${res.statusText}`);
         setApiHealthy(false);
@@ -817,211 +718,6 @@ export function useAppState() {
       throw error;
     }
   };
-
-  // --- Deploy State ---
-  const [deployState, setDeployState] = useState<DeployState | null>(null);
-
-  const fetchDeployState = useCallback(async (silent = false) => {
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/deploy-state`);
-      if (res.ok) setDeployState(await res.json());
-    } catch (err) {
-      console.error('Failed to fetch deploy state:', err);
-      if (!silent) addToast('Failed to load deploy state', 'error');
-    }
-  }, [addToast]);
-
-  const handlePausePipeline = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/pause`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) throw new Error(res.statusText);
-      addToast('Pipeline paused', 'success');
-      fetchDeployState();
-    } catch {
-      addToast('Failed to pause pipeline', 'error');
-    }
-  };
-
-  const handleResumePipeline = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/resume`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        addToast(data.detail || 'Failed to resume pipeline', 'error');
-        return;
-      }
-      addToast('Pipeline resumed', 'success');
-      fetchDeployState();
-      fetchTasks();
-    } catch {
-      addToast('Failed to resume pipeline', 'error');
-    }
-  };
-
-  const handleResetHealth = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/reset-health`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        addToast(data.detail || 'Failed to reset health', 'error');
-        return;
-      }
-      addToast('Health reset — pipeline resumed', 'success');
-      const data = await res.json().catch(() => null);
-      if (data) setDeployState(data);
-      fetchTasks();
-    } catch {
-      addToast('Failed to reset health', 'error');
-    }
-  };
-
-  const handleRollback = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/rollback`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        addToast(`Rollback failed: ${data.detail || res.statusText}`, 'error');
-        return;
-      }
-      const data = await res.json();
-      addToast(`Rolled back: ${data.from_sha?.slice(0, 8)} → ${data.to_sha?.slice(0, 8)}`, 'success');
-      fetchDeployState();
-    } catch {
-      addToast('Rollback failed', 'error');
-    }
-  };
-
-  const handleMarkStable = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/deploy-state/mark-stable`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) throw new Error(res.statusText);
-      addToast('Deploy marked stable', 'success');
-      fetchDeployState();
-    } catch {
-      addToast('Failed to mark stable', 'error');
-    }
-  };
-
-  const handleRepairState = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/repair-state`, {
-        method: 'POST', headers: await authHeaders(),
-      });
-      if (!res.ok) throw new Error(res.statusText);
-      const data = await res.json();
-      addToast(`Repaired ${data.count} issue${data.count !== 1 ? 's' : ''}`, 'success');
-      fetchTasks();
-    } catch {
-      addToast('State repair failed', 'error');
-    }
-  };
-
-  // Fetch deploy state on mount and periodically (WS push is the primary path; this is a fallback)
-  useEffect(() => {
-    if (!user) return;
-    fetchDeployState();
-    const id = setInterval(() => fetchDeployState(true), 60000);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
-
-  // --- Zone Health ---
-  const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);
-
-  const fetchZoneHealth = async () => {
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/zone-health`);
-      if (res.ok) setZoneHealth(await res.json());
-    } catch { /* ignore */ }
-  };
-
-  useEffect(() => {
-    if (!user) return;
-    fetchZoneHealth();
-    const id = setInterval(fetchZoneHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
-
-  // --- Orchestrator Health ---
-  interface OrchestratorHealth {
-    last_cycle_seconds_ago: number | null;
-    queued_tasks: number;
-    active_tasks: number;
-    pool_info: Record<string, unknown>;
-    deploy_state?: {
-      status: string;
-      rollback_count: number;
-      rollback_reason: string | null;
-      pause_reason: string | null;
-      monitoring_since: string | null;
-      recent_outcomes: { created_at: string; status: string; failure_class: string | null }[];
-    } | null;
-    deploy_monitoring?: {
-      external_health?: Record<string, boolean | string | string[]>;
-    };
-  }
-  const [orchestratorHealth, setOrchestratorHealth] = useState<OrchestratorHealth | null>(null);
-
-  const fetchOrchestratorHealth = async () => {
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/debug/orchestrator`);
-      if (res.ok) setOrchestratorHealth(await res.json());
-      else setOrchestratorHealth(null);
-    } catch { setOrchestratorHealth(null); }
-  };
-
-  useEffect(() => {
-    if (!user) return;
-    fetchOrchestratorHealth();
-    const id = setInterval(fetchOrchestratorHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
-
-  // --- Detailed Health ---
-  interface CircuitBreakerState {
-    state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
-    failure_count: number;
-    opened_at: string | null;
-  }
-  interface DetailedHealth {
-    circuit_breaker: { projects: Record<string, CircuitBreakerState> };
-    max_plan_pool: { total: number; available: number };
-    autonomous: { enabled: boolean; consecutive_failures: number };
-  }
-  const [detailedHealth, setDetailedHealth] = useState<DetailedHealth | null>(null);
-
-  const fetchDetailedHealth = async () => {
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/health/detailed`);
-      if (res.ok) {
-        const data = await res.json();
-        setDetailedHealth({
-          circuit_breaker: data.components?.circuit_breaker ?? { projects: {} },
-          max_plan_pool: data.components?.max_plan_pool ?? { total: 0, available: 0 },
-          autonomous: data.components?.autonomous ?? { enabled: false, consecutive_failures: 0 },
-        });
-      } else {
-        setDetailedHealth(null);
-      }
-    } catch { setDetailedHealth(null); }
-  };
-
-  useEffect(() => {
-    if (!user) return;
-    fetchDetailedHealth();
-    const id = setInterval(fetchDetailedHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
 
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
     try {
@@ -1492,246 +1188,6 @@ export function useAppState() {
       console.error('Failed to create task:', error);
       addToast('Failed to create task', 'error');
     }
-  };
-
-  const handleViewLogs = useCallback((task: Task) => {
-    if (wsReconnectTimerRef.current) {
-      clearTimeout(wsReconnectTimerRef.current);
-      wsReconnectTimerRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    wsReconnectAttemptRef.current = 0;
-    setLogTask(task);
-    setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
-    // Fetch fresh task data in the background; show stale list data immediately
-    fetchTask(task.id).then(fresh => setLogTask(fresh)).catch(() => {/* keep stale data */});
-    setWsDisconnected(false);
-
-    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;
-    if (!task.project_id) return;
-
-    setLogsConnecting(true);
-
-    const connectWs = async () => {
-      try {
-        const ticketRes = await fetch(`${API_BASE_URL}/api/projects/${task.project_id}/ws-ticket`, {
-          method: 'POST',
-          headers: await authHeaders(),
-        });
-        if (!ticketRes.ok) {
-          setLogsConnecting(false);
-          setLogLines(prev => [...prev, '[Failed to get WebSocket ticket]']);
-          return;
-        }
-        const { ticket } = await ticketRes.json();
-
-        const wsUrl = (API_BASE_URL || window.location.origin).replace(/^http/, 'ws');
-        const ws = new WebSocket(`${wsUrl}/api/projects/${task.project_id}/ws`);
-        wsRef.current = ws;
-        let wasConnected = false;
-
-        ws.onopen = () => {
-          ws.send(JSON.stringify({ ticket }));
-          wsReconnectAttemptRef.current = 0;
-          setLogLines(prev => [...prev, '[Connected to live log stream]']);
-          setWsConnected(true);
-          setLogsConnecting(false);
-          setWsDisconnected(false);
-          wasConnected = true;
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.event === 'agent_log' && msg.data?.task_id === task.id) {
-              setLogLines(prev => [...prev, msg.data.log]);
-            } else if (msg.event === 'task_updated' && msg.data?.task_id === task.id) {
-              setLogLines(prev => [...prev, `[Status: ${msg.data.status}]`]);
-            }
-            if (msg.event === 'deploy_state') {
-              setDeployState(msg.data);
-            }
-            if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
-              if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
-              fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
-            }
-          } catch {
-            // ignore parse errors
-          }
-        };
-
-        ws.onerror = (e) => {
-          console.error('[WS] error:', e);
-          setLogLines(prev => [...prev, `[WebSocket error — check browser console (F12)]`]);
-          setLogsConnecting(false);
-          if (wasConnected) setWsDisconnected(true);
-        };
-
-        ws.onclose = (e) => {
-          setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
-          setWsConnected(false);
-          setLogsConnecting(false);
-
-          if (!wasConnected) return;
-
-          const isIntentional = e.code === 1000 || e.code === 1008;
-          const attemptsExhausted = wsReconnectAttemptRef.current >= 5;
-
-          if (!isIntentional && !attemptsExhausted) {
-            const attempt = wsReconnectAttemptRef.current;
-            wsReconnectAttemptRef.current = attempt + 1;
-            const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
-            const delaySec = Math.round(delay / 1000);
-            setWsDisconnected(true);
-            setWsDisconnectReason(`Connection lost — reconnecting in ${delaySec}s (attempt ${attempt + 1}/5)...`);
-            wsReconnectTimerRef.current = setTimeout(() => {
-              wsReconnectTimerRef.current = null;
-              setLogsConnecting(true);
-              connectWs();
-            }, delay);
-          } else {
-            setWsDisconnected(true);
-            let reason: string;
-            if (e.code === 1008) {
-              reason = 'Authentication failed — please refresh the page';
-            } else if (attemptsExhausted) {
-              reason = 'Connection failed after 5 attempts — please refresh the page';
-            } else {
-              reason = `Disconnected (code ${e.code})`;
-            }
-            setWsDisconnectReason(reason);
-          }
-        };
-      } catch (err) {
-        setLogsConnecting(false);
-        setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
-      }
-    };
-
-    connectWs();
-  }, []);
-
-  const closeLogViewer = () => {
-    if (wsReconnectTimerRef.current) {
-      clearTimeout(wsReconnectTimerRef.current);
-      wsReconnectTimerRef.current = null;
-    }
-    wsReconnectAttemptRef.current = 0;
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setWsConnected(false);
-    setLogsConnecting(false);
-    setWsDisconnected(false);
-    setWsDisconnectReason(null);
-    setLogTask(null);
-    setLogLines([]);
-  };
-
-  const fetchArchiveTasks = async (
-    pageOverride?: number,
-    pageSizeOverride?: number,
-    statusOverride?: string,
-    searchOverride?: string,
-    dateRangeOverride?: string,
-    sortOrderOverride?: 'desc' | 'asc',
-  ) => {
-    setArchiveLoading(true);
-    try {
-      const p = pageOverride ?? archivePage;
-      const ps = pageSizeOverride ?? archivePageSize;
-      const status = statusOverride ?? archiveStatusFilter;
-      const search = searchOverride ?? archiveSearchQuery;
-      const dateRange = dateRangeOverride ?? archiveDateRange;
-      const sortOrder = sortOrderOverride ?? archiveSortOrder;
-      const offset = (p - 1) * ps;
-      let url = `${API_BASE_URL}/api/admin/tasks?limit=${ps}&offset=${offset}&archived=true`;
-      if (status !== 'all') {
-        url += `&status=${status}`;
-      }
-      if (search.trim()) {
-        url += `&search=${encodeURIComponent(search.trim())}`;
-      }
-      if (dateRange !== 'all') {
-        const now = new Date();
-        const hours = dateRange === '24h' ? 24 : dateRange === '7d' ? 24 * 7 : dateRange === '30d' ? 24 * 30 : 0;
-        if (hours > 0) {
-          const after = new Date(now.getTime() - hours * 60 * 60 * 1000);
-          url += `&created_after=${encodeURIComponent(after.toISOString())}`;
-        }
-      }
-      url += `&sort_order=${sortOrder}`;
-      const res = await authGet(url);
-      if (res.ok) {
-        const data = await res.json();
-        let tasks: Task[] = data.tasks || [];
-        // Frontend fallback sort in case the backend ignores the sort_order param
-        tasks = [...tasks].sort((a, b) => {
-          const diff = new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-          return sortOrder === 'asc' ? -diff : diff;
-        });
-        setArchiveTasks(tasks);
-        setArchiveTotalTasks(data.total || 0);
-      }
-    } catch (err) {
-      console.error('Failed to fetch archive tasks:', err);
-      addToast('Failed to load archive', 'error');
-    } finally {
-      setArchiveLoading(false);
-    }
-  };
-
-  const setShowArchive = (show: boolean) => {
-    setShowArchiveState(show);
-    if (show) {
-      fetchArchiveTasks();
-    }
-  };
-
-  const setArchivePage = (page: number) => {
-    setArchivePageState(page);
-    fetchArchiveTasks(page);
-  };
-
-  const setArchivePageSize = (size: number) => {
-    setArchivePageSizeState(size);
-    setArchivePageState(1);
-    fetchArchiveTasks(1, size);
-  };
-
-  const setArchiveStatusFilter = (status: string) => {
-    setArchiveStatusFilterState(status);
-    setArchivePageState(1);
-    fetchArchiveTasks(1, undefined, status);
-  };
-
-  const archiveSearchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const setArchiveSearchQuery = (query: string) => {
-    setArchiveSearchQueryState(query);
-    if (archiveSearchDebounceRef.current) {
-      clearTimeout(archiveSearchDebounceRef.current);
-    }
-    archiveSearchDebounceRef.current = setTimeout(() => {
-      setArchivePageState(1);
-      fetchArchiveTasks(1, undefined, undefined, query);
-    }, 300);
-  };
-
-  const setArchiveDateRange = (range: string) => {
-    setArchiveDateRangeState(range);
-    setArchivePageState(1);
-    fetchArchiveTasks(1, undefined, undefined, undefined, range);
-  };
-
-  const setArchiveSortOrder = (order: 'desc' | 'asc') => {
-    setArchiveSortOrderState(order);
-    setArchivePageState(1);
-    fetchArchiveTasks(1, undefined, undefined, undefined, undefined, order);
   };
 
   const needsAttentionCount = useMemo(() => {

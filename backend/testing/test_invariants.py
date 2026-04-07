@@ -98,7 +98,7 @@ class TestDeploymentStateModel:
 class TestAgentModels:
     def test_agent_models_ignore_extra(self):
         """Agent-facing Pydantic models must accept unknown fields (forward compat)."""
-        from app.main import AgentStatusPayload, HeartbeatRequest, SpawnTaskRequest
+        from app.schemas import AgentStatusPayload, HeartbeatRequest, SpawnTaskRequest
         for model_cls in [AgentStatusPayload, HeartbeatRequest, SpawnTaskRequest]:
             config = model_cls.model_config
             assert config.get("extra") == "ignore", (
