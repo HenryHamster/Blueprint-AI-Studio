@@ -420,3 +420,205 @@ async def test_activity_requires_auth(unauthenticated_client: AsyncClient):
         headers={"Authorization": "Bearer bogus-token"},
     )
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# direction_progress tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_basic(client: AsyncClient, db_session):
+    """Active direction with completed research tasks appears in direction_progress."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Improve test coverage",
+                "status": "active",
+                "priority": "high",
+                "possibly_saturated": False,
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Research task for that direction, completed within the window
+    task = make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "direction_progress" in data
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    assert dp["direction_id"] == "dir-1"
+    assert dp["direction_text"] == "Improve test coverage"
+    assert dp["priority"] == "high"
+    assert dp["cycles_in_window"] == 1
+    assert dp["tasks_created"] >= 1
+    assert dp["possibly_saturated"] is False
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_excludes_inactive(client: AsyncClient, db_session):
+    """Inactive directions are not included in direction_progress even if tasks exist."""
+    project = make_project(
+        directions=[
+            {"id": "dir-active", "text": "Active direction", "status": "active"},
+            {"id": "dir-inactive", "text": "Inactive direction", "status": "inactive"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ("dir-active", "dir-inactive"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Task for {did}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": did},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    ids = [dp["direction_id"] for dp in data["direction_progress"]]
+    assert "dir-active" in ids
+    assert "dir-inactive" not in ids
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_excludes_no_activity(client: AsyncClient, db_session):
+    """Active directions with no tasks in the window are omitted from direction_progress."""
+    project = make_project(
+        directions=[
+            {"id": "dir-busy", "text": "Busy direction", "status": "active"},
+            {"id": "dir-idle", "text": "Idle direction", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Only create a task for dir-busy
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Task for busy",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-busy"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    ids = [dp["direction_id"] for dp in data["direction_progress"]]
+    assert "dir-busy" in ids
+    assert "dir-idle" not in ids
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_session):
+    """prs_merged is summed from research_history entries within the time window."""
+    window_start = _utcnow() - timedelta(hours=24)
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction with PRs",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 3},   # inside window
+                    {"timestamp": old_ts, "prs_merged": 10},      # outside window
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    assert data["direction_progress"][0]["prs_merged"] == 3  # only the recent entry
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_sorted_by_cycles(client: AsyncClient, db_session):
+    """direction_progress list is sorted by cycles_in_window descending."""
+    project = make_project(
+        directions=[
+            {"id": "dir-few", "text": "Few cycles", "status": "active"},
+            {"id": "dir-many", "text": "Many cycles", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 1 research task for dir-few, 3 for dir-many
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Few task 1",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-few"},
+    ))
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Many task {i}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-many"},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    ids = [dp["direction_id"] for dp in data["direction_progress"]]
+    assert ids.index("dir-many") < ids.index("dir-few")
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_absent_without_project_id(client: AsyncClient, db_session):
+    """direction_progress is empty when no project_id is supplied."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["direction_progress"] == []

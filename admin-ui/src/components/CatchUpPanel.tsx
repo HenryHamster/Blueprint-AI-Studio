@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2 } from 'lucide-react';
+import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw } from 'lucide-react';
 import { apiFetch } from '../api';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
 import type { TaskType } from './TaskCard';
@@ -28,6 +28,18 @@ interface RecentCompletion {
   completed_at: string | null;
   pr_url: string | null;
   task_type: string;
+  direction_id?: string | null;
+  direction_text?: string | null;
+}
+
+interface DirectionProgress {
+  direction_id: string;
+  direction_text: string;
+  priority: string;
+  cycles_in_window: number;
+  tasks_created: number;
+  prs_merged: number;
+  possibly_saturated: boolean;
 }
 
 interface ActiveTask {
@@ -53,6 +65,9 @@ interface DigestData {
   needs_attention: NeedsAttentionItem[];
   recent_failures: RecentFailure[];
   recent_completions: RecentCompletion[];
+  success_rate?: number | null;
+  narrative_summary?: string;
+  direction_progress?: DirectionProgress[];
 }
 
 export interface CatchUpPanelProps {
@@ -62,6 +77,8 @@ export interface CatchUpPanelProps {
   onSelectTask: (task: { id: string }) => void;
   onOpenActivityFeed?: () => void;
   needsAttentionCount?: number;
+  onApprove?: (taskId: string) => void;
+  onRetry?: (taskId: string) => void;
 }
 
 type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
@@ -142,7 +159,7 @@ function SkeletonRow() {
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0 }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry }: CatchUpPanelProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -160,6 +177,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoSectionExpandedRef = useRef(false);
 
   const fetchDigest = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -191,6 +209,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     intervalRef.current = setInterval(() => fetchDigest(true), refreshInterval);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [fetchDigest, collapsed, refreshInterval]);
+
+  // Auto-expand most relevant section on initial digest load
+  useEffect(() => {
+    if (!digest || autoSectionExpandedRef.current) return;
+    autoSectionExpandedRef.current = true;
+    const attentionIdSet = new Set(digest.needs_attention.map(i => i.task_id));
+    const extra = digest.recent_failures.filter(f => !attentionIdSet.has(f.task_id));
+    if (digest.needs_attention.length > 0) {
+      // needs_attention is always visible — nothing to expand
+    } else if (digest.recent_completions.length > 0) {
+      setCompletionsExpanded(true);
+    } else if (extra.length > 0) {
+      setFailuresExpanded(true);
+    } else if (digest.active_count > 0) {
+      setActiveExpanded(true);
+    }
+  }, [digest]);
 
   const toggle = () => {
     const next = !collapsed;
@@ -277,8 +312,16 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
             </div>
           ) : (
             <div className="flex flex-col gap-3">
+              {digest!.narrative_summary && (
+                <p className="text-sm text-neutral-300 mb-3 leading-relaxed">{digest!.narrative_summary}</p>
+              )}
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
+                {digest!.success_rate != null && (
+                  <span className={`flex items-center gap-1 ${digest!.success_rate >= 0.8 ? 'text-emerald-400' : digest!.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
+                    {Math.round(digest!.success_rate * 100)}% success
+                  </span>
+                )}
                 {digest!.pending_approval_count > 0 && (
                   <span className="flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3 text-amber-400" />
@@ -314,6 +357,32 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                 )}
               </div>
 
+              {/* Direction progress */}
+              {digest!.direction_progress && digest!.direction_progress.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
+                  {digest!.direction_progress.map(dp => (
+                    <div key={dp.direction_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded">
+                      <span className="flex-1 truncate text-neutral-400">{dp.direction_text || dp.direction_id}</span>
+                      <div className="shrink-0 flex items-center gap-1.5 text-[10px] font-mono text-neutral-600">
+                        {dp.cycles_in_window > 0 && (
+                          <span>{dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}</span>
+                        )}
+                        {dp.tasks_created > 0 && (
+                          <span>{dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}</span>
+                        )}
+                        {dp.prs_merged > 0 && (
+                          <span className="text-emerald-600">{dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}</span>
+                        )}
+                      </div>
+                      {dp.possibly_saturated && (
+                        <span className="shrink-0 text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">saturated</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* Needs attention */}
               {digest!.needs_attention.length > 0 && (
                 <div className="border border-amber-500/30 rounded-lg p-3 flex flex-col gap-2">
@@ -337,6 +406,24 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                             {item.reason === 'failed' ? 'Failed' : 'Approval required'}
                           </span>
                           <WaitingBadge hours={item.waiting_hours} />
+                          {item.reason === 'approval_required' && onApprove && (
+                            <button
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
+                              onClick={e => { e.stopPropagation(); onApprove(item.task_id); }}
+                            >
+                              <Check className="w-2.5 h-2.5" />
+                              Approve
+                            </button>
+                          )}
+                          {item.reason === 'failed' && onRetry && (
+                            <button
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
+                              onClick={e => { e.stopPropagation(); onRetry(item.task_id); }}
+                            >
+                              <RotateCcw className="w-2.5 h-2.5" />
+                              Retry
+                            </button>
+                          )}
                         </div>
                         {item.error_snippet && (
                           <div className="px-2">

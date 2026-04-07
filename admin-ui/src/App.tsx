@@ -3,7 +3,6 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown, UserPlus } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
-import { SummaryPanels } from './components/SummaryPanels';
 import { DirectionsPanel } from './components/DirectionsPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { PipelineView } from './components/PipelineView';
@@ -241,19 +240,8 @@ export default function App() {
     return alerts.filter(a => !dismissedZoneAlertIds.has(a.id));
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
-  const actionRequiredTasks = useMemo(() => s.tasks.filter(t => t.requires_approval || t.status === 'FAILED'), [s.tasks]);
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
-  const completedRecently = useMemo(() => {
-    const oneDayAgo = new Date(new Date().getTime() - 24 * 60 * 60 * 1000);
-    return s.tasks.filter(t => {
-      if (t.status !== 'COMPLETED' && t.status !== 'CANCELLED') return false;
-      const completedAt = t.history && t.history.length > 0
-        ? t.history[t.history.length - 1].timestamp
-        : t.created_at;
-      return new Date(completedAt) > oneDayAgo;
-    });
-  }, [s.tasks]);
 
   const effectiveColumnPrefs = useMemo<ColumnPref[]>(() => {
     const base = s.columnPrefs.length > 0 ? s.columnPrefs : COLUMNS.map(c => ({ id: c.id, visible: true }));
@@ -454,7 +442,6 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
-      <SummaryPanels actionRequiredTasks={actionRequiredTasks} runningTasks={runningTasks} completedRecently={completedRecently} queuedTasks={queuedTasks} onSelectTask={s.handleViewLogs} onApproveTask={s.handleApprove} />
 
       {versionMismatch && (
         <div className="mx-4 mb-2 p-3 bg-yellow-900/50 border border-yellow-700 rounded-lg text-yellow-200 text-sm flex items-center gap-2">
@@ -493,6 +480,8 @@ export default function App() {
             });
           }}
           onOpenActivityFeed={() => s.setShowActivityFeed(true)}
+          onApprove={(taskId) => s.handleApprove(taskId)}
+          onRetry={(taskId) => s.handleRetry(taskId)}
         />
       )}
 

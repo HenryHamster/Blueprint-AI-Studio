@@ -3403,6 +3403,72 @@ async def get_digest(
         if (t.first_payload).get("type", "create") == "research"
     )
 
+    # --- Direction progress (only when project_id provided) ---
+    direction_progress_list: List[Dict[str, Any]] = []
+    dir_id_to_text: Dict[str, str] = {}
+
+    if project_id:
+        project = await session.get(Project, project_id)
+        if project:
+            active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+
+            # Build direction_id -> text lookup
+            for d in active_directions:
+                did = d.get("id") or d.get("direction_id")
+                if did:
+                    dir_id_to_text[str(did)] = d.get("text") or d.get("description") or ""
+
+            # Build direction_id -> tasks mapping
+            dir_tasks: Dict[str, List] = {}
+            for t in all_tasks:
+                did = (t.context or {}).get("direction_id")
+                if did:
+                    dir_tasks.setdefault(str(did), []).append(t)
+
+            for d in active_directions:
+                did = str(d.get("id") or d.get("direction_id") or "")
+                if not did:
+                    continue
+
+                tasks_for_dir = dir_tasks.get(did, [])
+
+                cycles_in_window = sum(
+                    1 for t in tasks_for_dir
+                    if t.status == TaskStatus.COMPLETED
+                    and (t.first_payload).get("type", "create") == "research"
+                    and _derive_completed_at(t) >= window_start
+                )
+                tasks_created_in_window = sum(
+                    1 for t in tasks_for_dir
+                    if t.created_at >= window_start
+                )
+
+                # prs_merged: sum from research_history entries within window
+                prs_merged = 0
+                for entry in d.get("research_history") or []:
+                    try:
+                        entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                        if entry_ts >= window_start:
+                            prs_merged += entry.get("prs_merged") or 0
+                    except (ValueError, TypeError):
+                        pass
+
+                if cycles_in_window == 0 and tasks_created_in_window == 0:
+                    continue
+
+                direction_text = (d.get("text") or d.get("description") or "")[:80]
+                direction_progress_list.append({
+                    "direction_id": did,
+                    "direction_text": direction_text,
+                    "priority": d.get("priority") or "medium",
+                    "cycles_in_window": cycles_in_window,
+                    "tasks_created": tasks_created_in_window,
+                    "prs_merged": prs_merged,
+                    "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                })
+
+            direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
+
     # --- Batch artifact query ---
     all_task_ids = [t.id for t in all_tasks]
     pr_count = 0
@@ -3484,12 +3550,16 @@ async def get_digest(
         tid = str(t.id)
         ts = _derive_completed_at(t)
         task_type = (t.first_payload).get("type", "create")
+        t_dir_id = (t.context or {}).get("direction_id")
+        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         recent_completions.append({
             "task_id": tid,
             "title": t.title or "Completed task",
             "completed_at": ts.isoformat() if ts else None,
             "pr_url": pr_artifact_map.get(tid),
             "task_type": task_type,
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
         })
 
     # --- active_tasks list (up to 5, oldest started first) ---
@@ -3509,6 +3579,52 @@ async def get_digest(
     running_count = sum(1 for t in active_tasks_all if t.status in running_statuses)
     queued_count = sum(1 for t in active_tasks_all if t.status in queued_statuses)
 
+    total_terminal = len(completed_tasks) + len(failed_tasks)
+    success_rate = round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+
+    # --- narrative_summary ---
+    completed_count = len(completed_tasks)
+    failed_count = len(failed_tasks)
+    pending_approval_count = len(approval_tasks)
+
+    narrative_parts = []
+
+    if completed_count > 0:
+        shipped = f"{completed_count} task{'s' if completed_count != 1 else ''} completed"
+        if pr_count > 0:
+            shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
+        narrative_parts.append(shipped + ".")
+
+    if failed_count > 0:
+        failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
+        failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+        if failure_titles:
+            failed_str += f" ({', '.join(failure_titles)})"
+        narrative_parts.append(failed_str + ".")
+
+    if pending_approval_count > 0:
+        approval_items = [
+            x for x in needs_attention if x["reason"] == "approval_required"
+        ]
+        max_wait = max((x.get("waiting_hours") or 0 for x in approval_items), default=0)
+        approval_str = f"{pending_approval_count} task{'s' if pending_approval_count != 1 else ''} awaiting approval"
+        if max_wait > 0:
+            approval_str += f" ({max_wait}h)"
+        narrative_parts.append(approval_str + ".")
+
+    if running_count > 0 or queued_count > 0:
+        pipeline_parts = []
+        if running_count > 0:
+            pipeline_parts.append(f"{running_count} running")
+        if queued_count > 0:
+            pipeline_parts.append(f"{queued_count} queued")
+        narrative_parts.append(", ".join(pipeline_parts) + ".")
+
+    if narrative_parts:
+        narrative_summary = " ".join(narrative_parts)
+    else:
+        narrative_summary = f"All quiet — no activity in the last {hours}h."
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -3521,9 +3637,12 @@ async def get_digest(
         "running_count": running_count,
         "queued_count": queued_count,
         "active_tasks": active_tasks_list,
+        "success_rate": success_rate,
         "needs_attention": needs_attention,
         "recent_failures": recent_failures,
         "recent_completions": recent_completions,
+        "direction_progress": direction_progress_list,
+        "narrative_summary": narrative_summary,
     }
 
 
