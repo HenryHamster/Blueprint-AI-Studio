@@ -174,10 +174,6 @@ async def select_max_plan_account(user_id: str, model: Optional[str] = None, bla
             if _account_available_for_model(a, model) and (not blacklist or a["id"] not in blacklist)
         ]
         if not available:
-            # Fallback: try blacklisted accounts that are model-enabled
-            # (disabled_models is the real gate with timed cooldown, blacklist is advisory)
-            available = [a for a in user_pool if _account_available_for_model(a, model)]
-        if not available:
             return None
         account = min(available, key=lambda a: a["active_tasks"])
         account["active_tasks"] = account.get("active_tasks", 0) + 1
@@ -1926,15 +1922,23 @@ async def reaper_service():
                     can_retry = False
 
                     # Rate-limited tasks: requeue without burning retry budget
+                    # Check both status message and error_logs for rate-limit indicators
                     msg_lower = (task.latest_status_message or "").lower()
-                    is_rate_limited = any(kw in msg_lower for kw in ["rate limit", "usage exhausted", "rate_limit"])
-                    if is_rate_limited and not is_provision_failure:
+                    error_lower = ((task.context or {}).get("last_error") or "").lower()
+                    is_rate_limited = any(kw in msg_lower + " " + error_lower
+                                         for kw in ["rate limit", "usage exhausted", "rate_limit"])
+                    if is_rate_limited:
                         logger.info(f"[REAPER] Task {task.id} rate-limited — requeuing without burning retry")
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
                         task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
+                        # Clear account so dispatcher picks a different one
+                        rl_ctx = dict(task.context or {})
+                        rl_ctx.pop("max_plan_account_id", None)
+                        rl_ctx.pop("_slot_released", None)
+                        task.context = rl_ctx
                         session.add(task)
                         await broadcast_to_project(str(task.project_id), "task_updated",
                             {"task_id": str(task.id), "status": TaskStatus.QUEUED})
@@ -1975,11 +1979,14 @@ async def reaper_service():
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
                             task.started_at = None
+                            reaper_ctx = dict(task.context or {})
+                            # Clear account so dispatcher does fresh selection (respects blacklist)
+                            reaper_ctx.pop("max_plan_account_id", None)
+                            reaper_ctx.pop("_slot_released", None)
                             if is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
-                                reaper_ctx = dict(task.context or {})
                                 reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
-                                task.context = reaper_ctx
+                            task.context = reaper_ctx
                             session.add(task)
 
                         await broadcast_to_project(
