@@ -1059,3 +1059,34 @@ def get_zone_health_summary() -> dict:
         "available": len(FALLBACK_ZONES) - len(exhausted),
         "exhausted": exhausted,
     }
+
+
+def any_zone_available() -> bool:
+    """Return True if at least one zone is not in cooldown."""
+    now = datetime.now(timezone.utc)
+    with _zone_lock:
+        for zone, _ in FALLBACK_ZONES:
+            health = _zone_health.get(zone)
+            if health is None:
+                return True  # Unknown = available
+            cooldown = health.get('cooldown_expires_at')
+            if cooldown is None or now >= cooldown:
+                return True
+    return False
+
+
+def soonest_zone_recovery() -> Optional[datetime]:
+    """Return the earliest zone cooldown expiry, or None if a zone is available."""
+    now = datetime.now(timezone.utc)
+    soonest = None
+    with _zone_lock:
+        for zone, _ in FALLBACK_ZONES:
+            health = _zone_health.get(zone)
+            if health is None:
+                return None  # Unknown = available now
+            cooldown = health.get('cooldown_expires_at')
+            if cooldown is None or now >= cooldown:
+                return None  # Available now
+            if soonest is None or cooldown < soonest:
+                soonest = cooldown
+    return soonest

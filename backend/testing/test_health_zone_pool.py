@@ -23,6 +23,8 @@ from app.main import (
 from app.compute import (
     get_zone_health,
     get_zone_health_summary,
+    any_zone_available,
+    soonest_zone_recovery,
     FALLBACK_ZONES,
     ZONE_COOLDOWN_SECONDS,
     _zone_failures,
@@ -423,6 +425,83 @@ class TestZoneHealth:
         assert result[zone_exhausted]["status"] == "exhausted"
         assert result[zone_recovering]["status"] == "recovering"
         assert result[zone_healthy]["status"] == "healthy"
+
+    # ── any_zone_available() ──────────────────────────────────────────────────
+
+    @pytest.mark.smoketest
+    def test_any_zone_available_true_when_no_cooldowns(self, clean_zone_state):
+        """Returns True when no zone has cooldown state (all zones unknown = available)."""
+        assert any_zone_available() is True
+
+    def test_any_zone_available_true_when_one_zone_healthy(self, clean_zone_state):
+        """Returns True when at least one zone is not in cooldown."""
+        # Put all zones except the last into cooldown
+        for zone, _ in FALLBACK_ZONES[:-1]:
+            _zone_health[zone] = {
+                "consecutive_failures": 1,
+                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
+            }
+        assert any_zone_available() is True
+
+    def test_any_zone_available_false_when_all_in_cooldown(self, clean_zone_state):
+        """Returns False when every zone has an active (future) cooldown_expires_at."""
+        for zone, _ in FALLBACK_ZONES:
+            _zone_health[zone] = {
+                "consecutive_failures": 1,
+                "cooldown_expires_at": datetime.now(timezone.utc) + timedelta(seconds=300),
+            }
+        assert any_zone_available() is False
+
+    def test_any_zone_available_true_when_cooldown_expired(self, clean_zone_state):
+        """Returns True when a zone's cooldown_expires_at is in the past."""
+        for zone, _ in FALLBACK_ZONES:
+            _zone_health[zone] = {
+                "consecutive_failures": 1,
+                "cooldown_expires_at": datetime.now(timezone.utc) - timedelta(seconds=10),
+            }
+        assert any_zone_available() is True
+
+    # ── soonest_zone_recovery() ───────────────────────────────────────────────
+
+    @pytest.mark.smoketest
+    def test_soonest_zone_recovery_none_when_no_cooldowns(self, clean_zone_state):
+        """Returns None when no zone has cooldown state (all available)."""
+        assert soonest_zone_recovery() is None
+
+    def test_soonest_zone_recovery_none_when_zone_available(self, clean_zone_state):
+        """Returns None immediately if any zone is available (not all in cooldown)."""
+        # At least one zone has no health entry → available
+        assert soonest_zone_recovery() is None
+
+    def test_soonest_zone_recovery_returns_earliest_expiry(self, clean_zone_state):
+        """Returns the earliest cooldown_expires_at across all zones when all are in cooldown."""
+        now = datetime.now(timezone.utc)
+        expiries = []
+        for i, (zone, _) in enumerate(FALLBACK_ZONES):
+            expires = now + timedelta(seconds=300 + i * 60)
+            expiries.append(expires)
+            _zone_health[zone] = {
+                "consecutive_failures": 1,
+                "cooldown_expires_at": expires,
+            }
+        result = soonest_zone_recovery()
+        assert result is not None
+        assert result == expiries[0]  # smallest expiry is first zone
+
+    def test_soonest_zone_recovery_result_is_timezone_aware(self, clean_zone_state):
+        """The returned datetime is timezone-aware (UTC), so subtraction with now(UTC) works."""
+        now = datetime.now(timezone.utc)
+        for zone, _ in FALLBACK_ZONES:
+            _zone_health[zone] = {
+                "consecutive_failures": 1,
+                "cooldown_expires_at": now + timedelta(seconds=300),
+            }
+        result = soonest_zone_recovery()
+        assert result is not None
+        assert result.tzinfo is not None
+        # Must not raise TypeError — this is the critical timezone-aware subtraction
+        wait_sec = (result - datetime.now(timezone.utc)).total_seconds()
+        assert wait_sec > 0
 
 
 # ─── Max Plan Account Pool ───────────────────────────────────────────────────

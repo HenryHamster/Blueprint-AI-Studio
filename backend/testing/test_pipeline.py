@@ -7,8 +7,13 @@ that don't require a database.
 """
 import json
 import pytest
+import pytest_asyncio
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel
 
 from app.main import (
     _parse_research_findings,
@@ -17,8 +22,9 @@ from app.main import (
     record_task_result,
     should_rollback,
     MAX_REVIEW_FIX_ITERATIONS,
+    _check_and_trigger_rollup,
 )
-from app.models import Task, TaskStatus, DeploymentStatus
+from app.models import Project, Task, TaskStatus, DeploymentStatus
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
@@ -613,3 +619,87 @@ class TestGCPHealthCheck:
                              if r[2] == "PROVISION_FAILURE"]
         # With 0 provision failures, GCP should stay healthy
         assert len(recent_provisions) < 3
+
+
+# ── Rollup Empty Children Guard ──────────────────────────────────────────────
+
+@pytest_asyncio.fixture()
+async def rollup_db(mocker):
+    """Isolated in-memory DB for rollup tests."""
+    # Ensure SQLite can handle PostgreSQL JSONB columns
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+    mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker):
+    """When all children are review/fix types (excluded from ROLLUP_TYPES),
+    the parent should be marked COMPLETED rather than incorrectly CANCELLED."""
+    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(name="Rollup Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    # Create only review and fix children — none are in ROLLUP_TYPES
+    review_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "review", "prompt": "review the PR"}],
+        status=TaskStatus.COMPLETED,
+    )
+    fix_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "fix", "prompt": "fix the issue"}],
+        status=TaskStatus.COMPLETED,
+    )
+    rollup_db.add(review_child)
+    rollup_db.add(fix_child)
+    await rollup_db.commit()
+    await rollup_db.refresh(review_child)
+    await rollup_db.refresh(fix_child)
+
+    # Call rollup check using one of the children as trigger
+    await _check_and_trigger_rollup(review_child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Expected COMPLETED but got {parent.status}: {parent.latest_status_message}"
+    )
+    assert "pipeline tasks" in (parent.latest_status_message or "").lower() or \
+           "review/fix" in (parent.latest_status_message or "").lower(), \
+        f"Unexpected status message: {parent.latest_status_message}"

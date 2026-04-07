@@ -28,7 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
-from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, get_vm_zone, reconcile_orphaned_secrets
+from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, get_vm_zone, reconcile_orphaned_secrets, any_zone_available, soonest_zone_recovery
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
@@ -945,6 +945,7 @@ async def _check_external_health():
 _pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
 _health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
+_last_zone_exhaustion_log: Optional[datetime] = None  # throttle: log all-zones-cooldown at most once/min
 
 
 async def _send_webhook_notification(event_type: str, title: str, details: str) -> None:
@@ -1034,6 +1035,40 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
             str(project.id),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+        )
+
+
+async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_errors: int) -> None:
+    """Create ERROR alerts on all projects when the orchestrator hits repeated errors (deduplicated)."""
+    title = "Orchestrator error loop"
+    msg = (
+        f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
+        "The pipeline may be stalled. Check logs for details."
+    )
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        existing = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.task_id.is_(None),
+                Alert.severity == AlertSeverity.ERROR,
+                Alert.dismissed_at.is_(None),
+                Alert.title == title,
+            )
+        )).scalars().first()
+        if existing is not None:
+            continue
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
 
 
@@ -2628,12 +2663,14 @@ async def orchestrator_worker():
     Background worker that polls for QUEUED tasks and provisions VMs.
     This ensures tasks are not lost if the server restarts before provisioning.
     """
-    global _last_pool_refresh
+    global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
+    global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
+    global _last_orphan_check, _last_evaluating_timeout_check
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
         try:
-            global _orchestrator_last_cycle, _orchestrator_cycle_started
+            _orchestrator_consecutive_errors = 0
             _orchestrator_cycle_started = _utcnow()
             cycle_start = time.monotonic()
             tasks_recovered = 0
@@ -3002,6 +3039,20 @@ async def orchestrator_worker():
                 )).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
+                # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
+                if queued_tasks and not any_zone_available():
+                    global _last_zone_exhaustion_log
+                    now_check = datetime.now(timezone.utc)
+                    if _last_zone_exhaustion_log is None or (now_check - _last_zone_exhaustion_log).total_seconds() >= 60:
+                        _last_zone_exhaustion_log = now_check
+                        recovery = soonest_zone_recovery()
+                        if recovery:
+                            wait_sec = max(0, (recovery - now_check).total_seconds())
+                            logger.info(f'[ORCHESTRATOR] All zones in cooldown — skipping dispatch (recovery in {int(wait_sec)}s)')
+                        else:
+                            logger.info('[ORCHESTRATOR] All zones in cooldown — skipping dispatch')
+                    queued_tasks = []  # Clear so the loop below is skipped
+
                 for task in queued_tasks:
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
                     if not task.vm_instance_id:
@@ -3033,7 +3084,30 @@ async def orchestrator_worker():
                         if user_pool:
                             # Accounts exist but all blocked — notify user and skip
                             logger.info(f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)")
-                            stall_msg = "All accounts rate-limited — waiting for cooldown"
+                            # Calculate earliest recovery time from account cooldowns
+                            earliest_recovery = None
+                            for acct in user_pool:
+                                dm = acct.get('disabled_models', {})
+                                for model_name, info in dm.items():
+                                    disabled_at = info.get('at')
+                                    hits = info.get('hits', 1)
+                                    cooldown_min = min(30 * (2 ** (hits - 1)), 240)
+                                    if disabled_at:
+                                        recovery = disabled_at + timedelta(minutes=cooldown_min)
+                                        if earliest_recovery is None or recovery < earliest_recovery:
+                                            earliest_recovery = recovery
+                                # Also check legacy account-level disable
+                                if not acct.get('enabled', True) and acct.get('disabled_at'):
+                                    rl_hits = acct.get('rl_hit_count', 1)
+                                    cooldown_min = min(30 * (2 ** (rl_hits - 1)), 240)
+                                    recovery = acct['disabled_at'] + timedelta(minutes=cooldown_min)
+                                    if earliest_recovery is None or recovery < earliest_recovery:
+                                        earliest_recovery = recovery
+                            if earliest_recovery:
+                                wait_min = max(0, (earliest_recovery - _utcnow()).total_seconds() / 60)
+                                stall_msg = f'All accounts rate-limited — earliest recovery in {int(wait_min)}min'
+                            else:
+                                stall_msg = 'All accounts rate-limited — waiting for cooldown'
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg
@@ -3457,8 +3531,12 @@ async def orchestrator_worker():
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
         except Exception:
+            _orchestrator_consecutive_errors += 1
+            backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
+                'consecutive_errors': _orchestrator_consecutive_errors,
+                'backoff_seconds': backoff,
             }, exc_info=True)
             _orchestrator_last_cycle = _utcnow()
             try:
@@ -3466,6 +3544,14 @@ async def orchestrator_worker():
                     await session.rollback()
             except Exception:
                 pass
+            # After 3 consecutive errors, alert all projects (deduplicated)
+            if _orchestrator_consecutive_errors >= 3:
+                try:
+                    async with AsyncSessionLocal() as alert_session:
+                        await _create_orchestrator_error_alerts(alert_session, _orchestrator_consecutive_errors)
+                        await alert_session.commit()
+                except Exception as alert_err:
+                    logger.error(f"[ORCHESTRATOR] Failed to create error alerts: {alert_err}")
 
         # Monitoring checks run every cycle (not just when idle)
         try:
@@ -3473,21 +3559,28 @@ async def orchestrator_worker():
             await _check_external_health()
             await _check_pause_mode()
             # Orphaned task recovery — every 120s
-            global _last_orphan_check
             if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
                 _last_orphan_check = _utcnow()
                 await _recover_orphaned_tasks()
             # EVALUATING task timeout — every 300s
-            global _last_evaluating_timeout_check
             if (_utcnow() - _last_evaluating_timeout_check).total_seconds() >= 300:
                 _last_evaluating_timeout_check = _utcnow()
                 await _check_evaluating_timeouts()
+            _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
-            logger.error(f"[ORCHESTRATOR] Monitoring check error: {e}", exc_info=True)
+            _orchestrator_consecutive_monitoring_errors += 1
+            monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+            logger.error(f"[ORCHESTRATOR] Monitoring check error (consecutive={_orchestrator_consecutive_monitoring_errors}, backoff={monitoring_backoff:.1f}s): {e}", exc_info=True)
 
         # Sleep based on whether we found tasks
         try:
-            if queued_tasks:
+            if _orchestrator_consecutive_errors > 0:
+                backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
+                await asyncio.sleep(backoff)
+            elif _orchestrator_consecutive_monitoring_errors > 0:
+                monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+                await asyncio.sleep(monitoring_backoff)
+            elif queued_tasks:
                 await asyncio.sleep(0.5)
             else:
                 await asyncio.sleep(5)
@@ -3654,6 +3747,10 @@ app.include_router(admin_router)
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: Optional[datetime] = None
 _orchestrator_cycle_started: Optional[datetime] = None
+
+# Consecutive error counters for exponential backoff
+_orchestrator_consecutive_errors: int = 0
+_orchestrator_consecutive_monitoring_errors: int = 0
 
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
@@ -7086,6 +7183,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     children = [c for c in all_children
                 if (c.first_payload).get("type", "create") in ROLLUP_TYPES]
 
+    # Guard: if all children are review/fix types (none in ROLLUP_TYPES), mark parent COMPLETED
+    if not children and all_children:
+        parent.status = TaskStatus.COMPLETED
+        parent.latest_status_message = "All subtasks were pipeline tasks (review/fix) — no rollup needed"
+        session.add(parent)
+        await session.commit()
+        await _cleanup_branches(parent, session)
+        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                   {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+        logger.info(f"[ROLLUP] Parent {parent.id} completed — all children were review/fix pipeline tasks")
+        return
+
     # Also check if any review/fix pipeline tasks are still active — don't rollup
     # while a review/fix cycle is in progress
     pipeline_active = any(
@@ -7159,7 +7268,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     child_statuses = [c.status for c in children]
 
     # Edge case: all children cancelled — nothing to rollup, mark parent cancelled
-    if cancelled_count == len(children):
+    if children and cancelled_count == len(children):
         parent.status = TaskStatus.CANCELLED
         parent.latest_status_message = f"All {len(children)} subtasks were cancelled"
         session.add(parent)
@@ -8555,6 +8664,7 @@ async def update_agent_status(
                                     info["hits"] += 1
                                     info["at"] = _utcnow()
                                     cooldown = min(30 * (2 ** (info["hits"] - 1)), 240)
+                                    cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
                                     # Disable top-level only if ALL known models are disabled
                                     logger.warning(f"[POOL] Account {acct['name']} model {model} disabled (hit #{info['hits']}, cooldown {cooldown:.0f}min)")
                                 elif acct:
@@ -8563,6 +8673,7 @@ async def update_agent_status(
                                     acct["disabled_at"] = _utcnow()
                                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
                                     cooldown = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
+                                    cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
                                     logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown:.0f}min)")
                                 # Persist rate-limit state to DB so it survives deploys
                                 if acct:
