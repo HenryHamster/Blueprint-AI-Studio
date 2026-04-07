@@ -1017,6 +1017,16 @@ async def modify_task(
                     task.attempt_count = 0
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
+                    task.started_at = None
+                    # Reset all retry counters for a clean slate
+                    requeue_ctx = dict(task.context or {})
+                    requeue_ctx.pop("provision_failures", None)
+                    requeue_ctx.pop("retry_after", None)
+                    requeue_ctx.pop("max_plan_account_id", None)
+                    requeue_ctx.pop("blacklisted_accounts", None)
+                    requeue_ctx.pop("_slot_released", None)
+                    requeue_ctx.pop("_api_failure_retries", None)
+                    task.context = requeue_ctx
                     changes["attempt_count"] = 0
                     changes["vm_instance_id"] = task.vm_instance_id
                     changes["_old_vm_to_delete"] = old_vm_id

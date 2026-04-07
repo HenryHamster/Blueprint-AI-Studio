@@ -2534,6 +2534,79 @@ async def _recover_orphaned_tasks():
                 await broadcast_to_project(str(task.project_id), "alert_created",
                     {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
                 logger.warning(f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
+
+            # Phase 2: Reaped-with-artifact recovery.
+            # Tasks that were reaped (set back to QUEUED/PROVISIONING) after the PR was already
+            # created.  The PR endpoint saves the artifact, so these tasks have an artifact but
+            # never reached COMPLETED and thus never triggered pipeline routing.
+            reaped_candidates = (await session.execute(
+                select(Task).where(
+                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.attempt_count > 0,
+                    Task.created_at >= one_hour_ago,
+                )
+            )).scalars().all()
+
+            for task in reaped_candidates:
+                task_type = task.first_payload.get("type", "")
+                if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
+                    continue
+
+                # Only recover tasks that already have a PR artifact
+                pr_artifact = (await session.execute(
+                    select(Artifact).where(
+                        Artifact.task_id == task.id,
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    ).limit(1)
+                )).scalars().first()
+                if not pr_artifact or not pr_artifact.pr_url:
+                    continue
+
+                # Skip if review child already exists
+                children = (await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )).scalars().all()
+                if any(t.first_payload.get("type") == "review" for t in children):
+                    continue
+
+                # Lock row to prevent race with reaper/dispatcher
+                locked = (await session.execute(
+                    select(Task).where(Task.id == task.id).with_for_update(skip_locked=True)
+                )).scalars().first()
+                if not locked or locked.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
+                    continue
+
+                pr_url = pr_artifact.pr_url
+                pr_number = int(pr_url.rstrip("/").split("/")[-1])
+                base_branch = locked.first_payload.get("base_branch", "main")
+                short_id = str(locked.id).replace('-', '')[:8]
+                type_prefix = {"docs": "docs", "deps": "deps", "migrate": "migrate", "refactor": "refactor"}.get(task_type, "task")
+                branch = f"blueprint/{type_prefix}-{short_id}"
+
+                locked.status = TaskStatus.COMPLETED
+                locked.latest_status_message = f"Auto-completed: PR #{pr_number} found after reap recovery"
+                session.add(locked)
+
+                original_prompt = locked.first_payload.get("prompt", locked.description or "")
+                review_task = await _spawn_pipeline_task(
+                    locked, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(locked.id)
+                )
+
+                alert = Alert(
+                    project_id=locked.project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Auto-recovered reaped task with PR #{pr_number}",
+                    message=f"Task {short_id} was reaped after creating PR #{pr_number}. Auto-completed and review spawned.",
+                    task_id=locked.id,
+                )
+                session.add(alert)
+                await session.commit()
+
+                await broadcast_to_project(str(locked.project_id), "alert_created",
+                    {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                logger.warning(f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
     except Exception as e:
         logger.error(f"[RECOVERY] Orphaned task sweep failed: {e}", exc_info=True)
 
@@ -9044,6 +9117,17 @@ async def agent_github_create_pr(
         base=req.base,
         body=req.body
     )
+
+    # Save artifact immediately so the PR is linked even if the agent is reaped
+    # before it can report COMPLETED status.  Without this, orphan recovery can't
+    # find the PR and the pipeline stalls.
+    pr_url = result.get("html_url", "")
+    if pr_url:
+        artifact = Artifact(task_id=req.task_id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url)
+        session.add(artifact)
+        await session.commit()
+        logger.info(f"[PR] Saved PR artifact for task {req.task_id}: {pr_url}")
+
     return {"status": "success", "data": result}
 
 @app.post("/api/projects/{project_id}/cancel")

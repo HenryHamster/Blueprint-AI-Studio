@@ -242,6 +242,28 @@ function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
 }
 
+/** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
+ *  Fires curl in a child process (sync) so the event loop doesn't need to be free. */
+function sendHeartbeatSync(taskId: string, statusMessage: string) {
+  try {
+    const metrics = collectMetrics();
+    const payload = JSON.stringify({
+      task_id: taskId,
+      status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
+      metrics,
+    });
+    execFileSync('curl', [
+      '-sf', '-X', 'POST',
+      `${ORCHESTRATOR_URL}/api/agent/heartbeat`,
+      '-H', 'Content-Type: application/json',
+      '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
+      '-d', payload,
+    ], { timeout: 10_000, stdio: 'ignore' });
+  } catch {
+    log('Sync heartbeat failed (non-fatal)');
+  }
+}
+
 // ── WebSocket Log Stream ────────────────────────────────────────────────────
 const MAX_LOG_BUFFER = 1000;
 interface LogEntry { timestamp: number; content: string; }
@@ -388,6 +410,7 @@ async function pushAndCreatePR(
     statusRef.value = `Rebasing onto ${baseBranch}...`;
     try {
       git(['fetch', 'origin', baseBranch]);
+      sendHeartbeatSync(taskId, `Fetched ${baseBranch}, rebasing...`);
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
@@ -412,6 +435,9 @@ async function pushAndCreatePR(
     } catch { /* no markers found */ }
   }
 
+  // Heartbeat before push — sync git operations block the event loop and starve
+  // the setInterval heartbeat, which can cause the reaper to kill us mid-push.
+  sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
   const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
   const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
@@ -2389,6 +2415,7 @@ CRITICAL RULES:
     statusRef.value = `Rebasing onto ${baseBranch}...`;
     try {
       git(['fetch', 'origin', baseBranch]);
+      sendHeartbeatSync(taskId, `Fetched ${baseBranch}, rebasing...`);
       git(['rebase', `origin/${baseBranch}`]);
       sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
     } catch {
@@ -2398,6 +2425,7 @@ CRITICAL RULES:
 
     const commitHash = git(['rev-parse', 'HEAD']);
 
+    sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
@@ -2897,6 +2925,37 @@ async function main() {
     log('Using OAuth token for Claude Code auth');
   } else if (process.env.ANTHROPIC_API_KEY) {
     log('Using ANTHROPIC_API_KEY as fallback auth');
+  }
+
+  // Pre-validate token before claiming task — catch dead tokens in ~5s instead of 2+ min
+  try {
+    const valEnv: Record<string, string> = {
+      HOME: process.env.HOME || '/home/agent',
+      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      TERM: process.env.TERM || 'xterm-256color',
+    };
+    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) valEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (process.env.ANTHROPIC_API_KEY) valEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+    log('Validating Claude auth token...');
+    const valResult = await new Promise<{exitCode: number; stderr: string}>((resolve) => {
+      let stderr = '';
+      const check = spawn('claude', ['-p', 'respond with OK', '--max-turns', '1', '--output-format', 'stream-json', '--dangerously-skip-permissions'],
+        { cwd: '/tmp', env: valEnv });
+      const valTimeout = setTimeout(() => { try { check.kill(); } catch {} }, 30000);
+      check.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+      check.on('close', (code) => { clearTimeout(valTimeout); resolve({ exitCode: code ?? 1, stderr }); });
+    });
+    if (valResult.exitCode !== 0 && /usage.*exhausted|rate.*limit|credit|billing/i.test(valResult.stderr)) {
+      log(`Token validation FAILED — account rate-limited: ${valResult.stderr.slice(0, 200)}`);
+      // Exit immediately — reaper will catch the task in PROVISIONING and requeue.
+      // Don't waste 2+ minutes of setup only to discover the same thing.
+      process.exit(1);
+    }
+    log('Token validation OK');
+  } catch (e) {
+    log(`Token validation error (continuing): ${e instanceof Error ? e.message : String(e)}`);
   }
 
   // Claim task
