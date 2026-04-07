@@ -789,10 +789,10 @@ async def modify_task(
         try:
             new_status = TaskStatus(payload["status"])
 
-            # State machine validation: restrict invalid transitions
-            if new_status == TaskStatus.QUEUED and task.status not in _TERMINAL_STATUSES:
-                raise HTTPException(status_code=400, detail=f"Cannot requeue task in {task.status.value} state (must be completed/failed/cancelled)")
-            if task.status in _TERMINAL_STATUSES and new_status not in (TaskStatus.QUEUED, TaskStatus.CANCELLED):
+            # State machine validation: admins can always requeue or cancel.
+            # Only block nonsensical transitions like FAILED → IN_PROGRESS.
+            admin_allowed = {TaskStatus.QUEUED, TaskStatus.CANCELLED}
+            if new_status not in admin_allowed and task.status in _TERMINAL_STATUSES:
                 raise HTTPException(status_code=400, detail=f"Cannot transition from terminal state {task.status.value} to {new_status.value} (only requeue or cancel is allowed)")
 
             task.status = new_status
