@@ -745,6 +745,7 @@ const TASK_TYPE_HINTS: Record<string, string> = {
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
+  'fix': 'You are fixing issues from a code review. Read ALL review feedback carefully and address every point. Run the relevant test suite to confirm your fix does not introduce regressions. Verify each feedback item is resolved before committing.',
 };
 
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
@@ -922,6 +923,7 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   const taskContext = task.context as Record<string, unknown> | undefined;
   const reviewLoop = taskContext?.review_loop as Record<string, unknown> | undefined;
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
+  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
 
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
@@ -951,11 +953,26 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
     changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
   } catch { changedFiles = '(could not generate file list)'; }
 
+  // Read CLAUDE.md for codebase instructions
+  const reviewClaudeMd = readClaudeMd();
+  const reviewClaudeMdPrefix = reviewClaudeMd
+    ? `## Codebase Instructions\n${reviewClaudeMd}\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n`
+    : '';
+
+  // Read project_context for active/sibling task awareness
+  const reviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
+  const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx) + '\n\n' : '';
+
+  // Build prior review history section (for iterations > 1)
+  const reviewHistorySection = reviewHistory.length > 0 && iteration > 1
+    ? `Previous review feedback (for reference — focus on verifying these were addressed):\n${reviewHistory.map(e => `- Iteration ${e.iteration}: ${e.feedback.slice(0, 800)}`).join('\n')}\n\n`
+    : '';
+
   // Build iteration preamble
   const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
 
   // Build review prompt — Claude has full repo access, not just a diff blob
-  const reviewPrompt = `You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
+  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
 ${iterationPreamble}
 
@@ -987,6 +1004,11 @@ Review the changes thoroughly using this checklist:
 **Test Coverage:**
 - Are there tests for the new/changed behavior?
 - Do existing tests still pass given these changes?
+
+**Build & Type Safety:**
+- For TypeScript changes (admin-ui/ or agent/): run \`cd admin-ui && npx tsc --noEmit\` and/or \`cd agent && npx tsc --noEmit\` and report any type errors
+- For Python changes: verify imports are correct and consistent with existing patterns
+- Include build/type check results in your verdict feedback
 
 After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
 
@@ -1082,11 +1104,27 @@ async function handleFix(
 
   // Prepend accumulated review history so the agent knows what was previously requested
   const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
-  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string }> | undefined) || [];
-  let basePrompt = prompt;
+  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
+  const iteration = (reviewLoop?.iteration as number | undefined) || 1;
+  const maxIterations = 5;
+  let iterationHeader = `You are on fix iteration ${iteration} of ${maxIterations}.\n`;
+  if (iteration >= maxIterations) {
+    iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';
+  }
+  let basePrompt = iterationHeader + prompt;
   if (reviewHistory.length > 0) {
     const historyLines = reviewHistory
-      .map(e => `- Iteration ${e.iteration}: ${e.feedback.slice(0, 300)}`)
+      .map(e => {
+        const issues = e.issues;
+        if (issues && issues.length > 0) {
+          const critical = issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL] ${i.description}`);
+          const major = issues.filter(i => i.severity === 'major').map(i => `  [MAJOR] ${i.description}`);
+          const minor = issues.filter(i => i.severity === 'minor').map(i => `  [MINOR] ${i.description}`);
+          return `- Iteration ${e.iteration}:\n${[...critical, ...major, ...minor].join('\n')}`;
+        } else {
+          return `- Iteration ${e.iteration}: ${e.feedback.slice(0, 1500)}`;
+        }
+      })
       .join('\n');
     basePrompt = `Previous review iterations:\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
@@ -1122,6 +1160,11 @@ async function handleFix(
   const fixClaudeMd = readClaudeMd();
   if (fixClaudeMd) {
     enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${enrichedPrompt}`;
+  }
+
+  // Append fix-specific task type hint
+  if (TASK_TYPE_HINTS['fix']) {
+    enrichedPrompt = `${enrichedPrompt}\n\n${TASK_TYPE_HINTS['fix']}`;
   }
 
   // Run Claude with the review feedback as the prompt
@@ -1318,7 +1361,9 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     for (const t of recentTasks) {
       const pr = t.pr_url ? ` (${strVal(t.pr_url)})` : '';
       const summary = t.research_findings_summary ? ` — ${parseResearchSummary(strVal(t.research_findings_summary))}` : '';
-      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}`);
+      const failureSuffix = t.failure_reason ? ` (FAILED: ${strVal(t.failure_reason)})` : '';
+      const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
+      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}`);
     }
 
     // Keep most recent entries that fit within budget
@@ -1338,6 +1383,22 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     }
   }
 
+  // Build lessons section — only if budget allows
+  const lessonsData = ctx.lessons as Array<Record<string, unknown>> | undefined;
+  let lessonsLines: string[] = [];
+  if (lessonsData && lessonsData.length > 0) {
+    const candidateLines: string[] = ['### Lessons from Past Reviews'];
+    for (const l of lessonsData) {
+      candidateLines.push(`- **${strVal(l.task_title)}** (${l.iterations} cycles): ${strVal(l.last_feedback)}`);
+    }
+    candidateLines.push('');
+    const candidateContent = candidateLines.join('\n');
+    if (candidateContent.length <= budget) {
+      lessonsLines = candidateLines;
+      budget -= candidateContent.length;
+    }
+  }
+
   // Append footer if anything was omitted
   const footerLines: string[] = [];
   const omittedCount = recentDropped;
@@ -1346,7 +1407,7 @@ function formatProjectContext(ctx: Record<string, unknown>): string {
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }
 

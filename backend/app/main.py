@@ -4335,7 +4335,7 @@ async def claim_task(
     }
 
     task_type = task.first_payload.get("type", "")
-    if task_type in ("research", "plan", "create", "fix", "refactor"):
+    if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project
         active_stmt = select(Task).where(
             Task.project_id == task.project_id,
@@ -4426,7 +4426,39 @@ async def claim_task(
                 "status": t.status.value if hasattr(t.status, "value") else str(t.status),
                 "pr_url": pr_url,
                 "research_findings_summary": research_findings_summary,
+                "failure_reason": (t.latest_status_message or "")[:200] if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
+                "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0) if (t.context or {}).get("review_loop") else None,
             })
+
+        # Build lessons from high-iteration tasks (3+ review cycles)
+        lessons = []
+        high_iter_stmt = (
+            select(Task)
+            .where(
+                Task.project_id == task.project_id,
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+            )
+            .order_by(Task.created_at.desc())
+            .limit(50)
+        )
+        high_iter_rows = (await session.execute(high_iter_stmt)).scalars().all()
+        for ht in high_iter_rows:
+            review_loop = (ht.context or {}).get("review_loop", {})
+            if not review_loop:
+                continue
+            iteration = review_loop.get("iteration", 0)
+            if iteration < 3:
+                continue
+            review_hist = review_loop.get("review_history", [])
+            if review_hist:
+                last_feedback = review_hist[-1].get("feedback", "")[:300]
+                lessons.append({
+                    "task_title": ht.title,
+                    "iterations": len(review_hist) + 1,
+                    "last_feedback": last_feedback,
+                })
+            if len(lessons) >= 5:
+                break
 
         # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
         open_prs_stmt = (
@@ -4467,6 +4499,7 @@ async def claim_task(
             "recently_completed_tasks": recently_completed_tasks,
             "open_prs": list(open_prs_rows),
             "sibling_tasks": sibling_tasks,
+            "lessons": lessons,
         }
 
     return response
@@ -4773,7 +4806,7 @@ async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
-    current_feedback: str = ""
+    current_feedback: str = "", current_issues: list = None
 ) -> Optional[Task]:
     """Spawn a review or fix task as part of the automated review pipeline.
     Returns None if the review-fix cycle limit has been reached.
@@ -4917,8 +4950,11 @@ async def _spawn_pipeline_task(
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix
     prev_review_history = source_loop.get("review_history", [])
+    new_review_entry = {"iteration": iteration - 1, "feedback": current_feedback}
+    if current_issues:
+        new_review_entry["issues"] = current_issues
     new_review_history = (
-        [*prev_review_history, {"iteration": iteration - 1, "feedback": current_feedback}]
+        [*prev_review_history, new_review_entry]
         if task_type == "fix" and current_feedback
         else prev_review_history
     )
@@ -7072,10 +7108,12 @@ async def _process_post_commit(
                 verdict_text = payload.logs or task.latest_status_message or ""
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
+                issues = []
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
                 import re
                 verdict_parsed = False
+                verdict_unparseable = False
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -7084,6 +7122,7 @@ async def _process_post_commit(
                         if vj.get("verdict"):
                             verdict = vj["verdict"]
                             feedback = vj.get("feedback", verdict_text)
+                            issues = vj.get("issues", []) if isinstance(vj.get("issues"), list) else []
                             verdict_parsed = True
                             logger.info(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
                     except (json.JSONDecodeError, TypeError):
@@ -7107,6 +7146,7 @@ async def _process_post_commit(
                                             if "verdict" in candidate:
                                                 verdict = candidate["verdict"]
                                                 feedback = candidate.get("feedback", verdict_text)
+                                                issues = candidate.get("issues", []) if isinstance(candidate.get("issues"), list) else []
                                                 verdict_parsed = True
                                         except json.JSONDecodeError:
                                             pass
@@ -7128,14 +7168,34 @@ async def _process_post_commit(
                         upper_text.rfind("REQUEST CHANGES"),
                     )
                     if approve_idx == -1 and rc_idx == -1:
-                        verdict = "APPROVE"
-                        logger.warning(f"[REVIEW PIPELINE] No verdict keywords found for task {task.id} (len={len(verdict_text)}) — defaulting to APPROVE")
+                        verdict = "REQUEST_CHANGES"
+                        feedback = "Review agent did not produce a verdict — manual review required"
+                        logger.warning(f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
+                        verdict_unparseable = True
                     elif approve_idx > rc_idx:
                         verdict = "APPROVE"
                     elif rc_idx > approve_idx:
                         verdict = "REQUEST_CHANGES"
                     else:
-                        logger.warning(f"[REVIEW PIPELINE] WARNING: No verdict JSON found for task {task.id} (len={len(verdict_text)}), fallback verdict={verdict}")
+                        verdict = "REQUEST_CHANGES"
+                        feedback = "Review agent did not produce a verdict — manual review required"
+                        logger.warning(f"[REVIEW PIPELINE] Ambiguous verdict for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
+                        verdict_unparseable = True
+
+                # If verdict was unparseable, flag the original task for manual review
+                if verdict_unparseable:
+                    source_loop = (task.context or {}).get("review_loop", {})
+                    original_task_id = source_loop.get("original_task_id")
+                    if original_task_id:
+                        try:
+                            orig = await session.get(Task, uuid.UUID(original_task_id))
+                            if orig:
+                                orig.requires_approval = True
+                                orig.latest_status_message = "Review agent did not produce a verdict — manual review required"
+                                session.add(orig)
+                                await session.commit()
+                        except Exception as e:
+                            logger.warning(f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}", exc_info=True)
 
                 # Post the review to the PR as a comment
                 try:
@@ -7404,11 +7464,26 @@ async def _process_post_commit(
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
                     except Exception as e:
                         logger.error(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}", exc_info=True)
+                    if issues:
+                        critical = [i for i in issues if i.get('severity') == 'critical']
+                        major = [i for i in issues if i.get('severity') == 'major']
+                        minor = [i for i in issues if i.get('severity') == 'minor']
+                        structured = ""
+                        if critical:
+                            structured += "\n\nCRITICAL issues (must fix):\n" + "\n".join(f"- {i['description']}" for i in critical)
+                        if major:
+                            structured += "\n\nMajor issues:\n" + "\n".join(f"- {i['description']}" for i in major)
+                        if minor:
+                            structured += "\n\nMinor issues:\n" + "\n".join(f"- {i['description']}" for i in minor)
+                        fix_prompt_text = f"A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
+                    else:
+                        fix_prompt_text = f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
                     fix_task = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
-                        fix_prompt=f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}",
+                        fix_prompt=fix_prompt_text,
                         original_task_id=original_task_id,
-                        current_feedback=feedback
+                        current_feedback=feedback,
+                        current_issues=issues
                     )
                     if fix_task:
                         logger.info(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
