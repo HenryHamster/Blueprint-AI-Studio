@@ -71,7 +71,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0026"
+EXPECTED_SCHEMA_REVISION = "0027"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2929,6 +2929,7 @@ async def orchestrator_worker():
                     # Mark as PROVISIONING to prevent other workers from picking it up
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
+                    task.vm_provisioned_at = _utcnow()
                     task.last_heartbeat = _utcnow()  # Reset stale-recovery clock from dispatch
                     _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
@@ -3072,6 +3073,17 @@ async def orchestrator_worker():
                     if not ci_pr_number:
                         continue
 
+                    # Exponential backoff: skip if not enough time has elapsed since last poll
+                    ci_poll_interval = ci_loop.get("ci_poll_interval", 10)
+                    ci_last_polled = ci_loop.get("ci_last_polled")
+                    if ci_last_polled:
+                        try:
+                            _last_polled_dt = datetime.fromisoformat(ci_last_polled)
+                            if (_utcnow() - _last_polled_dt).total_seconds() < ci_poll_interval:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+
                     try:
                         # Timeout: if CI has been pending too long, proceed to merge anyway
                         ci_wait_started = ci_loop.get("ci_wait_started")
@@ -3159,6 +3171,10 @@ async def orchestrator_worker():
                         if ci_result["status"] != "completed":
                             details = [d["name"] for d in ci_result.get("details", []) if d.get("status") in ("queued", "in_progress")]
                             ci_task.latest_status_message = f"CI in progress on PR #{ci_pr_number}: {', '.join(details) or 'waiting for checks'}..."
+                            ci_loop["ci_poll_interval"] = min(ci_poll_interval * 2, 60)
+                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                            ci_loop["head_sha"] = ci_head_sha
+                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -3250,7 +3266,8 @@ async def orchestrator_worker():
                             fix_task = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
                                 fix_prompt=ci_fix_prompt,
-                                original_task_id=ci_orig_id
+                                original_task_id=ci_orig_id,
+                                fix_reason="ci_failure"
                             )
                             if fix_task:
                                 ci_task.status = TaskStatus.COMPLETED
@@ -4702,6 +4719,8 @@ async def agent_heartbeat(
         raise HTTPException(status_code=409, detail="Task already terminal")
 
     task.last_heartbeat = _utcnow()
+    if task.vm_started_at is None:
+        task.vm_started_at = _utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
     if req.metrics:
@@ -4935,11 +4954,33 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
 MAX_REVIEW_FIX_ITERATIONS = 5
 
+
+def _max_review_iterations(task: Task) -> int:
+    """Scope-aware review-fix iteration limit."""
+    ctx = task.context or {}
+    scope = ctx.get('scope', 'medium')
+    fix_reason = ctx.get('review_loop', {}).get('fix_reason', 'code_review')
+
+    # CI-only fixes should converge fast (lint/type/test errors)
+    if fix_reason == 'ci_failure':
+        limit = 2
+    # Small scope tasks: less code, fewer things to fix
+    elif scope == 'small':
+        limit = 3
+    # Medium scope: moderate iteration budget
+    elif scope == 'medium':
+        limit = 4
+    # Large scope or unknown: full budget
+    else:
+        limit = 5
+    return min(limit, MAX_REVIEW_FIX_ITERATIONS)
+
+
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
-    current_feedback: str = "", current_issues: list = None
+    current_feedback: str = "", fix_reason: str = "", current_issues: list = None
 ) -> Optional[Task]:
     """Spawn a review or fix task as part of the automated review pipeline.
     Returns None if the review-fix cycle limit has been reached.
@@ -4993,7 +5034,8 @@ async def _spawn_pipeline_task(
         if t.first_payload.get("pr_number") == pr_number
         and t.first_payload.get("type") in ("review", "fix")
     )
-    if pr_iterations >= MAX_REVIEW_FIX_ITERATIONS:
+    global_cap = _max_review_iterations(source_task)
+    if pr_iterations >= global_cap:
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
         source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
         session.add(source_task)
@@ -5003,8 +5045,9 @@ async def _spawn_pipeline_task(
     source_loop = (source_task.context or {}).get("review_loop", {})
     source_payload = source_task.first_payload
     iteration = source_loop.get("iteration", 0) + 1
+    per_chain_cap = _max_review_iterations(source_task)
 
-    if iteration > MAX_REVIEW_FIX_ITERATIONS:
+    if iteration > per_chain_cap:
         # Cap reached — require manual intervention
         orig_id = original_task_id or source_loop.get("original_task_id", "") or source_payload.get("original_task_id", "")
         if orig_id:
@@ -5012,7 +5055,7 @@ async def _spawn_pipeline_task(
                 orig = await session.get(Task, uuid.UUID(orig_id))
                 if orig:
                     orig.requires_approval = True
-                    orig.latest_status_message = f"Review-fix cycle reached limit ({MAX_REVIEW_FIX_ITERATIONS} iterations) — manual review required"
+                    orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
                     session.add(orig)
                     await session.commit()
             except Exception as e:
@@ -5092,17 +5135,21 @@ async def _spawn_pipeline_task(
         else prev_review_history
     )
 
+    source_ctx = source_task.context or {}
+    propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
     new_task = Task(
         project_id=source_task.project_id,
         title=title,
         description=fix_prompt or f"Automated {task_type} for PR #{pr_number}",
         parent_task_id=parent_id,
         payloads=[payload_data],
-        context={"review_loop": {"pr_number": pr_number, "branch": branch,
+        context={"scope": propagated_scope,
+                 "review_loop": {"pr_number": pr_number, "branch": branch,
                                   "base_branch": base_branch,
                                   "original_task_id": resolved_original_id,
                                   "iteration": iteration,
-                                  **({"review_history": new_review_history} if new_review_history else {})}},
+                                  **({"review_history": new_review_history} if new_review_history else {}),
+                                  **({"fix_reason": fix_reason} if fix_reason else {})}},
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
@@ -7550,7 +7597,8 @@ async def _process_post_commit(
                             fix_task = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
                                 fix_prompt=ci_fix_prompt,
-                                original_task_id=original_task_id
+                                original_task_id=original_task_id,
+                                fix_reason="ci_failure"
                             )
                             if fix_task:
                                 logger.error(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
@@ -7844,7 +7892,21 @@ async def _process_post_commit(
                     session.add(task)
                     await session.commit()
 
-                if not scan_blocked:
+                fix_reason = review_loop.get("fix_reason", "code_review")
+                if not scan_blocked and fix_reason == "ci_failure":
+                    # CI-only fix: skip re-review, go straight to CI check + merge.
+                    # The original review already approved the code logic.
+                    ci_loop = review_loop.copy()
+                    ci_loop["ci_waiting"] = True
+                    ci_loop["ci_wait_started"] = _utcnow().isoformat()
+                    ci_loop["ci_poll_interval"] = 10
+                    task.status = TaskStatus.EVALUATING
+                    task.context = {**(task.context or {}), "review_loop": ci_loop}
+                    task.latest_status_message = f"CI-only fix applied for PR #{pr_number} — waiting for CI (review already approved)"
+                    session.add(task)
+                    await session.commit()
+                    logger.info(f"[REVIEW PIPELINE] CI-only fix for PR #{pr_number} — skipping re-review, waiting for CI")
+                elif not scan_blocked:
                     review_task = await _spawn_pipeline_task(
                         task, "review", session, pr_number, branch, base_branch,
                         original_task_id=original_task_id
@@ -8347,6 +8409,7 @@ async def update_agent_status(
             await release_max_plan_account(acct_id)
             task.context = {**(task.context or {}), "_slot_released": True}
 
+        task.vm_stopped_at = _utcnow()
         old_vm_id = task.vm_instance_id
         await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
 
@@ -9187,6 +9250,39 @@ async def github_webhook(
                         await session.commit()
                         for at in affected_tasks:
                             await _check_and_trigger_rollup(at, session)
+
+    elif event_type == 'check_run':
+        action = data.get('action')
+        if action != 'completed':
+            return {'status': 'ignored'}
+
+        check_run = data.get('check_run', {})
+        head_sha = check_run.get('head_sha')
+        repo_full = data.get('repository', {}).get('full_name', '')
+        if '/' not in repo_full or not head_sha:
+            return {'status': 'ignored'}
+
+        owner, repo = repo_full.split('/', 1)
+
+        # Find ci_waiting tasks matching this commit SHA
+        ci_tasks = (await session.execute(
+            select(Task).where(Task.status == TaskStatus.EVALUATING)
+        )).scalars().all()
+
+        for task in ci_tasks:
+            loop = (task.context or {}).get('review_loop', {})
+            if not loop.get('ci_waiting'):
+                continue
+            task_sha = loop.get('head_sha')
+            if task_sha == head_sha:
+                # Reset the polling interval to trigger immediate check on next cycle
+                loop['ci_poll_interval'] = 0
+                loop['ci_last_polled'] = None
+                task.context = {**(task.context or {}), 'review_loop': loop}
+                session.add(task)
+
+        await session.commit()
+        logger.info(f'[WEBHOOK] check_run completed for {head_sha[:8]} — reset polling for matching tasks')
 
     return {"status": "received"}
 

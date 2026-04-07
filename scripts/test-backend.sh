@@ -28,11 +28,21 @@ else
   echo "=== Docker not found — running pytest directly ==="
   # Ensure pip-installed binaries are on PATH
   export PATH="$HOME/.local/bin:$PATH"
-  # Install dependencies if needed
-  if ! python3 -c "import fastapi" &>/dev/null; then
+  # Install dependencies if needed (use uv if pip is unavailable)
+  VENV=/tmp/blueprint-backend-venv
+  [ -d "$VENV" ] && export PYTHON="$VENV/bin/python"
+  if ! "${PYTHON:-python3}" -c "import fastapi" &>/dev/null; then
     echo "=== Installing dependencies ==="
-    python3 -m pip install -q -r requirements.txt 2>&1 | tail -5 || true
+    if python3 -m pip install -q -r requirements.txt 2>&1 | tail -5; then
+      true
+    elif command -v uv &>/dev/null || (curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"); then
+      [ -d "$VENV" ] || uv venv "$VENV" -q
+      uv pip install --python "$VENV/bin/python" -q -r requirements.txt
+      uv pip install --python "$VENV/bin/python" -q "setuptools<81"
+      export PYTHON="$VENV/bin/python"
+    fi
   fi
+  PYTHON="${PYTHON:-python3}"
 fi
 
 _run() {
@@ -40,7 +50,12 @@ _run() {
   if [ "$USE_DOCKER" = "1" ]; then
     docker run --rm $ENV_ARGS blueprint-backend-test "$@"
   else
-    env $ENV_VARS PYTHONPATH="$(pwd)" "$@"
+    # Replace leading "python3" with $PYTHON if set (venv interpreter)
+    if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then
+      shift; env $ENV_VARS PYTHONPATH="$(pwd)" "$PYTHON" "$@"
+    else
+      env $ENV_VARS PYTHONPATH="$(pwd)" "$@"
+    fi
   fi
 }
 

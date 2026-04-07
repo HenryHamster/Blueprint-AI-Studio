@@ -9,7 +9,7 @@ import json
 import httpx
 import logging
 import asyncio
-from collections import deque
+from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
@@ -3911,3 +3911,35 @@ async def remove_user(
     await session.delete(user)
     await session.commit()
     return {"message": f"User {user.email} removed"}
+
+
+@router.get('/cost-summary')
+async def cost_summary(
+    session: AsyncSession = Depends(get_session),
+    days: int = 7,
+    current_user: dict = Depends(require_admin),
+):
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    tasks = (await session.execute(
+        select(Task).where(Task.created_at >= cutoff)
+    )).scalars().all()
+
+    # e2-standard-2 pricing: ~$0.067/hr on-demand, ~$0.020/hr spot
+    ON_DEMAND_RATE = 0.067 / 3600  # per second
+    SPOT_RATE = 0.020 / 3600
+
+    by_type = defaultdict(lambda: {'count': 0, 'total_seconds': 0, 'estimated_cost': 0.0})
+    for t in tasks:
+        if t.vm_provisioned_at and t.vm_stopped_at:
+            seconds = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            task_type = (t.payloads or [{}])[0].get('type', 'unknown')
+            by_type[task_type]['count'] += 1
+            by_type[task_type]['total_seconds'] += seconds
+            by_type[task_type]['estimated_cost'] += seconds * rate
+
+    return {
+        'period_days': days,
+        'by_task_type': dict(by_type),
+        'total_estimated_cost': sum(v['estimated_cost'] for v in by_type.values()),
+    }

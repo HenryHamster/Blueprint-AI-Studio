@@ -158,6 +158,12 @@ class Task(SQLModel, table=True):
     started_at: Optional[datetime] = Field(default=None)
     archived: bool = Field(default=False)
 
+    # VM lifecycle timing for cost tracking
+    vm_provisioned_at: Optional[datetime] = Field(default=None)
+    vm_started_at: Optional[datetime] = Field(default=None)
+    vm_stopped_at: Optional[datetime] = Field(default=None)
+    vm_spot: bool = Field(default=False)
+
     @property
     def first_payload(self) -> Dict[str, Any]:
         """First payload dict, defaulting to empty dict if none exist."""
