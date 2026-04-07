@@ -772,7 +772,13 @@ const TASK_TYPE_HINTS: Record<string, string> = {
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
   'fix': 'You are fixing issues from a code review. Read ALL review feedback carefully and address every point. Run the relevant test suite to confirm your fix does not introduce regressions. Verify each feedback item is resolved before committing.',
+  'docs': 'Read the existing README and documentation files first. Understand the current documentation structure before making changes.',
+  'deps': 'Check for breaking changes in major version bumps. Run the full test suite after updating to verify compatibility.',
+  'refactor': 'Run the full test suite BEFORE and AFTER changes. Zero test regressions allowed. Do not change external behavior.',
+  'investigate': 'This is a read-only investigation. Do NOT modify any files. Write your findings to the output JSON only.',
 };
+
+const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work.';
 
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
 function readClaudeMd(): string {
@@ -937,7 +943,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     runTestFix = false,
     failOnTestFailure = false,
     lintContext = 'the code you just wrote',
-    includeTaskTypeHints = false,
+    includeTaskTypeHints = true,
   } = opts;
 
   const rawBaseBranch = strVal(payload.base_branch, 'main');
@@ -961,7 +967,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
-  const finalPrompt = claudeMdPrefix + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + promptSuffix;
+  const finalPrompt = claudeMdPrefix + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
 
@@ -1090,6 +1096,8 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
   const reviewLoop = taskContext?.review_loop as Record<string, unknown> | undefined;
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
   const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
+  const taskScope = (taskContext?.scope as string | undefined) || 'medium';
+  const origTaskType = strVal(payload.original_task_type || '');
 
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
@@ -1131,7 +1139,15 @@ async function handleReview(  taskId: string, payload: Record<string, unknown>, 
 
   // Build prior review history section (for iterations > 1)
   const reviewHistorySection = reviewHistory.length > 0 && iteration > 1
-    ? `Previous review feedback (for reference — focus on verifying these were addressed):\n${reviewHistory.map(e => `- Iteration ${e.iteration}: ${e.feedback.slice(0, 800)}`).join('\n')}\n\n`
+    ? `Issues from previous iterations (verify each was addressed):\n${reviewHistory.map(e => {
+        if (e.issues && e.issues.length > 0) {
+          const critical = e.issues.filter(i => i.severity === 'critical').map(i => '  [CRITICAL] ' + i.description);
+          const major = e.issues.filter(i => i.severity === 'major').map(i => '  [MAJOR] ' + i.description);
+          const minor = e.issues.filter(i => i.severity === 'minor').map(i => '  [MINOR] ' + i.description);
+          return '- Iteration ' + e.iteration + ':\n' + [...critical, ...major, ...minor].join('\n');
+        }
+        return '- Iteration ' + e.iteration + ': ' + e.feedback.slice(0, 800);
+      }).join('\n')}\n\n`
     : '';
 
   // Build iteration preamble
@@ -1149,7 +1165,7 @@ You have full access to the codebase. Read any files you need to understand the 
 
 Review the changes thoroughly using this checklist:
 
-**Correctness & Logic:**
+${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
@@ -1605,7 +1621,10 @@ async function handlePlan(
 
   const contextPrefix = buildContextPrefix(task);
 
-  const planPrompt = `${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+  const claudeMd = readClaudeMd();
+  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+
+  const planPrompt = `${claudeMdPrefix}${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}
@@ -1942,7 +1961,7 @@ ${hotspotsSection}
     ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string, status?: string}>)
     : [];
 
-  const researchPrompt = `${contextPrefix}${codebaseSummary}${fileTreeSection}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
+  const researchPrompt = `${codebaseSummary}${contextPrefix}${fileTreeSection}${gitHistorySection}You are a codebase research agent. You have full access to this repository. Your job is to analyze the codebase and produce structured findings that will be used to create concrete implementation tasks.
 
 ${userPrompt ? `Research focus:\n${userPrompt}\n` : ''}Current project directions from the user:
 ${directionsText}${crossDirSection}
@@ -2162,7 +2181,7 @@ async function handleSecurityAudit(
   const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
 
-  const securityPrompt = `${contextPrefix}${codebaseSummary}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
+  const securityPrompt = `${codebaseSummary}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
 
 Analyze the codebase for the following vulnerability categories:
 1. OWASP Top 10 vulnerabilities
@@ -2200,8 +2219,9 @@ Rules:
 - Also output the same JSON array as the final output in your logs.`;
 
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const secTypeHint = TASK_TYPE_HINTS['security_audit'] ? '\n\n' + TASK_TYPE_HINTS['security_audit'] : '';
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + securityPromptSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort);
 
   let logs = '';
   const findingsPath = `/tmp/security_findings_${taskId}.json`;
@@ -2787,8 +2807,10 @@ Rules:
 - IMPORTANT: Write your findings JSON array to /tmp/perf_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
+  const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const perfTypeHint = TASK_TYPE_HINTS['perf'] ? '\n\n' + TASK_TYPE_HINTS['perf'] : '';
   statusRef.value = 'Running performance analysis...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort);
 
   let logs = '';
   const findingsPath = `/tmp/perf_output_${taskId}.json`;

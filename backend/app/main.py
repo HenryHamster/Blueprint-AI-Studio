@@ -5231,6 +5231,7 @@ async def _spawn_pipeline_task(
         payload_data = {"type": "review", "pr_number": pr_number, "branch": branch,
                         "base_branch": base_branch, "original_prompt": original_prompt,
                         "original_task_id": resolved_original_id,
+                        "original_task_type": source_task.first_payload.get("type", ""),
                         **({"model": type_model} if type_model else {}),
                         **({"effort": type_effort} if type_effort else {})}
     else:
