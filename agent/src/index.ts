@@ -757,6 +757,53 @@ function readClaudeMd(): string {
   return '';
 }
 
+// ── Shared prompt assembly helpers ──────────────────────────────────────────
+function buildContextPrefix(task: Record<string, unknown>): string {
+  const projectCtx = task.project_context as Record<string, unknown> | undefined;
+  if (!projectCtx) return '';
+  const hasData = Object.keys(projectCtx).some(k => {
+    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+  });
+  return hasData ? formatProjectContext(projectCtx) + '\n\n' : '';
+}
+
+function buildFileTree(ws: WebSocket | null): string {
+  try {
+    // Get files ranked by recent git activity
+    let recentFiles: string[] = [];
+    try {
+      const gitLog = execFileSync('git', ['log', '--pretty=format:', '--name-only', '-100'],
+        { cwd: WORKSPACE, encoding: 'utf-8' });
+      const counts: Record<string, number> = {};
+      for (const f of gitLog.split('\n').filter(Boolean)) {
+        counts[f] = (counts[f] ?? 0) + 1;
+      }
+      recentFiles = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([f]) => f);
+    } catch { /* fallback to unsorted */ }
+
+    // Get all tracked files
+    const allFiles = execFileSync('git', ['ls-files'],
+      { cwd: WORKSPACE, encoding: 'utf-8' })
+      .split('\n')
+      .filter(f => f && !f.includes('node_modules/') && !f.includes('dist/'));
+
+    // Merge: recent files first, then remaining alphabetically
+    const recentSet = new Set(recentFiles);
+    const remaining = allFiles.filter(f => !recentSet.has(f)).sort();
+    const sorted = [...recentFiles.filter(f => allFiles.includes(f)), ...remaining];
+    const tree = sorted.slice(0, 150).map(f => './' + f).join('\n');
+
+    return tree
+      ? `## Repository File Tree (first 150 files, sorted by recent activity)\n\`\`\`\n${tree}\n\`\`\`\n\n`
+      : '';
+  } catch (e) {
+    sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
 // ── Standard Handler Helper ───────────────────────────────────────────────
 interface StandardHandlerOpts {
   taskId: string;
@@ -796,10 +843,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const contextPrefix = buildContextPrefix(task);
 
   const parentCtxObj = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   const parentCtx = parentCtxObj?.parent_prompt
@@ -1430,10 +1474,7 @@ async function handlePlan(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const contextPrefix = buildContextPrefix(task);
 
   const planPrompt = `${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
@@ -1646,29 +1687,12 @@ ${hotspotsSection}
 
   // Build codebase summary to reduce exploration overhead
 
-  const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;
-  const claudeMd = fs.existsSync(claudeMdPath)
-    ? fs.readFileSync(claudeMdPath, 'utf-8').slice(0, 2000)
-    : '';
+  const claudeMd = readClaudeMd();
   const codebaseSummary = claudeMd
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
 
-  let fileTree = '';
-  try {
-    fileTree = execFileSync(
-      'find', ['.', '-type', 'f',
-        '-not', '-path', '*/node_modules/*',
-        '-not', '-path', '*/.git/*',
-        '-not', '-path', '*/dist/*'],
-      { cwd: WORKSPACE, encoding: 'utf-8' }
-    ).split('\n').slice(0, 150).join('\n');
-  } catch (e) {
-    sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
-  }
-  const fileTreeSection = fileTree
-    ? `## Repository File Tree (first 150 files)\n\`\`\`\n${fileTree}\n\`\`\`\n\n`
-    : '';
+  const fileTreeSection = buildFileTree(ws);
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const rawActiveTasks = projectCtx?.active_tasks;
@@ -1775,9 +1799,7 @@ ${hotspotsSection}
     }
   }
 
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const contextPrefix = buildContextPrefix(task);
 
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
     ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string, status?: string}>)
@@ -1800,12 +1822,8 @@ ${recentlyCompleted.length > 0
     }).join('\n')
   : '(none yet)'}
 
-Rules for avoiding duplication:
-- Do not propose findings that are substantially the same as any recently completed task above.
-- If a recently completed task partially addressed an issue and more work remains, you MAY propose a follow-up but must reference the prior work in your description.
-
-## Quality bar — READ THIS FIRST
-Each finding you produce spawns a cloud VM, an implementing agent, a review cycle, and a PR. That costs real money and time. Ask yourself for EVERY finding: "Would a senior engineer mass-produce this as a standalone PR, or would they roll their eyes?" If the latter, cut it or bundle it.
+## Quality bar and rules — READ THIS FIRST
+Each finding spawns a cloud VM, an implementing agent, a review cycle, and a PR — real money and time. Ask: "Would a senior engineer make this a standalone PR, or would they roll their eyes?" If the latter, cut or bundle it. Do not re-propose recently completed tasks; if prior work was partial, you may propose a follow-up that references it.
 
 BAD findings (do NOT produce these):
 - "add a badge/indicator/icon to the UI" — cosmetic polish that doesn't unlock new capability
@@ -1867,64 +1885,28 @@ Instructions:
 ]
 
 Valid values:
-- type: improvement, bug, refactor, feature, test, research, security_audit, qa, deps, docs, migrate, perf, direction_proposal, direction_update, direction_note
-  (use "research" when an area needs deeper investigation before implementation)
-  (use "security_audit" when the finding involves security vulnerabilities that need a dedicated audit)
-  (use "qa" when the finding is about missing test coverage)
-  (use "deps" when the finding is about outdated or insecure dependencies)
-  (use "docs" when the finding is about missing or outdated documentation)
-  (use "migrate" when the finding requires a database schema migration via Alembic)
-  (use "perf" when the finding involves performance bottlenecks — database queries, API latency, frontend bundle size)
-  (use "direction_proposal" when you discover a strategic area warranting a permanent standing research direction — see Direction Proposals section below)
-  (use "direction_update" when an existing direction is too vague, mis-prioritized, or could benefit from a path scope — see below)
-  (use "direction_note" when you observe something important about a direction's scope, constraints, or promising areas that doesn't warrant a full direction_update — see below)
-- scope: small (single file, under 50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural, orchestrator/model/agent/security changes — anything that could break the system if done wrong)
+- type: improvement, bug, refactor, feature, test, perf, migrate, research (deeper investigation needed), security_audit, qa, deps, docs, direction_proposal, direction_update, direction_note
+- scope: small (single file, <50 lines), medium (2-5 files, 50-200 lines), large (cross-component, architectural — anything that could break the system if done wrong)
 - risk: low (tests, docs, cosmetic), medium (logic changes, new endpoints), high (core logic, auth, data models)
 - priority: high, medium, low
 
 Rules:
-- ALL findings must be scope=medium or scope=large. The ONLY exception: you may have ONE scope=small finding that bundles multiple trivial fixes together. If you can only find small fixes, you haven't explored deeply enough.
-- Target 8-12 findings. Minimum 5 — if you have fewer than 5, you stopped exploring too early. Maximum 15.
-- When a direction includes a [scope: path/prefix] annotation, limit your file exploration and findings to files under those path prefixes. Findings outside the scoped paths should only be included if they are blockers.
-- Do NOT propose tasks for changes that appear in the Recent Git History above — those are already done or in progress.
-- A finding should be ONE PR-sized unit of work (scope=medium for multi-file work, scope=large for architectural changes)
-- The prompt field must be self-contained — the implementing agent knows nothing about this research
-- depends_on_indices uses 0-based array positions. If findings involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices so they run sequentially. Small additive changes to shared files can stay parallel.
-- Check the Sibling Tasks listed above (if any). Do not propose findings that duplicate or conflict with work those sibling tasks are already covering. If a sibling task is working on the same files, either skip that area or ensure your findings are clearly additive and non-overlapping.
-- For medium/large scope findings, the prompt should describe the full scope — it will be sent to a planning agent for decomposition
-- For type=research findings, the prompt should describe what needs deeper investigation — it will spawn a sub-research task
-- For type=security_audit findings, the prompt should describe the audit scope/focus — it will spawn a dedicated security audit agent
-- For type=qa findings, the prompt should describe what to test — it will spawn a dedicated QA agent
-- For type=deps findings, the prompt can be minimal (e.g. 'Update dependencies') — it will spawn a dedicated dependency update agent
-- For type=docs findings, the prompt can be minimal (e.g. 'Update documentation') — it will spawn a dedicated documentation agent
-- Use model=claude-opus-4-6 and effort=high for complex architectural changes. Use it for scope=large findings. Leave null for medium scope.
-- Do NOT propose findings that duplicate recently completed tasks listed above.
+- Target 8-12 findings. Minimum 5 (fewer means you stopped early). Maximum 15.
+- All findings must be scope=medium or scope=large. Exception: one scope=small finding that bundles multiple trivial fixes.
+- Each finding is ONE PR-sized unit of work. The prompt must be self-contained — the implementing agent knows nothing about this research.
+- Use depends_on_indices (0-based) when findings involve structural refactors of the same files (renames, interface changes). Additive changes to shared files can stay parallel.
+- When a direction has [scope: path/prefix], limit findings to files under those prefixes (blockers excepted).
+- Do not propose tasks already in Recent Git History. Check Sibling Tasks — skip areas they cover or ensure your findings are clearly additive.
+- Use model=claude-opus-4-6 and effort=high for scope=large findings. Leave null for medium scope.
 
-How your findings get routed (you control this via type and scope):
-- type=security_audit → spawns a **security audit** agent that scans for vulnerabilities and auto-spawns fix tasks for critical/high findings
-- type=qa → spawns a **QA** agent that generates missing tests and opens a PR
-- type=deps → spawns a **dependency updater** agent that checks for outdated/insecure deps and opens a PR
-- type=docs → spawns a **docs** agent that generates/updates documentation and opens a PR
-- type=migrate → spawns a **migration** agent that generates Alembic migrations and opens a PR
-- type=perf → spawns a **performance** agent that scans for bottlenecks and auto-spawns fix tasks for high-severity findings
-- type=research → spawns another **research** agent for deeper investigation before any implementation
-- type=improvement/bug/refactor/feature/test with scope=large → spawns a **plan** agent that decomposes into subtasks
-- type=improvement/bug/refactor/feature/test with scope=small or medium → spawns a **create** agent (single PR)
-- type=direction_proposal → does NOT spawn a task; instead creates a **pending direction** awaiting user approval in the Directions panel
-- type=direction_update → proposes a refinement to an existing direction (no task spawned, requires user review)
-  - direction_id: the id of the direction to update (from the directions list above)
-  - suggested_text: improved direction text (or omit to keep current)
-  - suggested_priority: "high"|"medium"|"low" (or omit to keep current)
-  - suggested_paths: array of path prefixes to scope the direction (or omit)
-  - description: rationale for why this update improves the direction
-  - Use this when a direction is too vague, incorrectly scoped, or mis-prioritized. Propose at most 1 direction_update per research cycle.
-- type=direction_note → appends a persistent note to a direction (no task created, no user review needed)
-  - direction_id: the id of the direction to annotate (from the directions list above)
-  - description: the note text (max 500 chars) — observations about scope, constraints, dead ends, or promising areas for future research
-  - Notes must be balanced and self-critical. Don't write "direction is close to its goal" unless you can explain what SPECIFIC user-visible outcome has improved. Always include: (1) what's still broken or missing, (2) what prior cycles failed to deliver, (3) honest assessment of whether the direction's core goal is actually closer. The user decides when a direction is done, not you.
-  - Use this when you observe something worth preserving for future research cycles that doesn't warrant a full direction_update. Notes are shown to future research agents in the directions list.
-- IMPORTANT: Write your findings JSON array to /tmp/research_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
-- OPTIONAL: You may also write a research insights file to /tmp/research_insights_${taskId}.json containing architectural observations, blockers, or recommendations for future research cycles. These are NOT tasks to implement — they are notes about the codebase state that will appear in the history context for future agents. Format: [{"summary": "concise observation under 200 chars", "area": "path/to/relevant/file"}]. Omit this file if you have no significant observations beyond your findings.
+Routing (type controls which agent runs):
+- security_audit/qa/deps/docs/migrate/perf → specialist agent that opens a PR (or auto-spawns fix tasks)
+- research → sub-research agent for deeper investigation before implementation
+- improvement/bug/refactor/feature/test + scope=large → plan agent (decomposes into subtasks); + scope=small/medium → create agent (single PR)
+- direction_proposal → pending direction held for user approval (no task spawned)
+- direction_update fields: direction_id, suggested_text, suggested_priority, suggested_paths, description. Use when a direction is too vague, mis-scoped, or mis-prioritized. Propose at most 1 per cycle.
+- direction_note fields: direction_id, description (max 500 chars). Must be balanced and self-critical — include what's still broken, what prior cycles failed, and honest progress assessment. The user decides when a direction is done.
+- Write findings to /tmp/research_findings_${taskId}.json (JSON array only, no markdown). Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for architectural observations not worth implementing.
 
 ## Direction Proposals
 If you discover a strategic area that clearly warrants ongoing research over multiple cycles — not just a one-time fix — you may propose it as a new standing direction. Use type=direction_proposal with this structure:
@@ -1946,22 +1928,7 @@ Rules for direction proposals:
 - The "prompt" field becomes the direction text shown to users — write it as a concise goal statement
 - Direction proposals are held for user review and never auto-approved
 
-Context — you are part of an autonomous pipeline:
-- You are a research agent inside Blueprint, an autonomous AI coding system. Your findings will be automatically implemented by other agents, reviewed by review agents, and merged. After merging, another research cycle may run and build on your work.
-- Think BIG. Each finding spawns a full VM, an implementing agent, a review cycle, and a PR merge. That pipeline exists to handle complexity — use it. A cycle that produces 5-8 substantial findings (new subsystems, architectural refactors, cross-cutting capabilities) is the target. Don't stop at 3 — keep exploring until you have 8+.
-- Keep the codebase clean. Other agents will read and modify the same code after you. Messy patterns multiply — extensible patterns compound.
-- Use type=research findings for areas that need deeper investigation before implementation. This spawns a sub-research agent to dig in further. Don't rush to implement something you're uncertain about.
-- PREFER scope=large findings. The pipeline has a planning agent that decomposes large work into safe subtasks. Don't shy away from proposing ambitious work — propose the thing that actually matters, not a watered-down version of it.
-
-Approach:
-- This is a full-stack system. Consider ALL layers: backend (Python/FastAPI), frontend (React/TypeScript), agent (Node.js/TypeScript), and infrastructure. The best findings often span multiple layers.
-- Think about what the system CANNOT do today. Missing capabilities are more valuable than improvements to existing ones. Ask: what would make this system fundamentally more powerful?
-- Prefer extensible, data-driven designs over copy-paste. If adding a new instance of something (a new type, a new endpoint, a new UI panel), first check if the pattern should be generalized.
-- Architectural refactors (making something extensible, adding a registry, restructuring) are valuable findings. Include them when the current pattern won't scale.
-- Use WebSearch to find prior art and best practices before proposing solutions. A finding backed by "here's how other projects solve this" is far more valuable than guessing at an implementation.
-- Spawn subagents liberally — for exploring code, for web research, for reviewing your own work. You have Opus-level capability; use it to its full potential.
-- Use TodoWrite to maintain a checklist of areas explored and gaps found. Don't stop exploring when you find the first few easy wins.
-- When a direction has had 3+ prior cycles, STOP looking for surface-level gaps. Instead, think about what NEW CAPABILITY or ARCHITECTURAL CHANGE would make the direction's goal trivially achievable. That's the finding worth proposing.`;
+Context: You are a research agent inside Blueprint, an autonomous AI coding system. Your findings are implemented by other agents, reviewed, and merged — another research cycle will build on your work. Think BIG and use scope=large freely (the pipeline has a planning agent for safe decomposition). Target 8-12 substantial findings across all system layers (backend, frontend, agent, infra); fewer than 5 means you stopped exploring too early.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
@@ -2044,34 +2011,14 @@ async function handleSecurityAudit(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
-  const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  const contextPrefix = projectCtx && Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  }) ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const contextPrefix = buildContextPrefix(task);
 
-  const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;
-  const claudeMd = fs.existsSync(claudeMdPath)
-    ? fs.readFileSync(claudeMdPath, 'utf-8').slice(0, 2000)
-    : '';
+  const claudeMd = readClaudeMd();
   const codebaseSummary = claudeMd
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
 
-  let fileTree = '';
-  try {
-    fileTree = execFileSync(
-      'find', ['.', '-type', 'f',
-        '-not', '-path', '*/node_modules/*',
-        '-not', '-path', '*/.git/*',
-        '-not', '-path', '*/dist/*'],
-      { cwd: WORKSPACE, encoding: 'utf-8' }
-    ).split('\n').slice(0, 150).join('\n');
-  } catch (e) {
-    sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
-  }
-  const fileTreeSection = fileTree
-    ? `## Repository File Tree (first 150 files)\n\`\`\`\n${fileTree}\n\`\`\`\n\n`
-    : '';
+  const fileTreeSection = buildFileTree(ws);
 
   const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
