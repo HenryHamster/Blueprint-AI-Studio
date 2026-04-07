@@ -2810,11 +2810,16 @@ async def orchestrator_worker():
                         claude_config_json = account.get("claude_config_json")
                         logger.info(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
                     else:
-                        # No Max plan account — check for API key fallback
+                        # No available account — either all disabled/blacklisted or none configured
+                        user_pool = _max_plan_pools.get(dispatch_user_id, [])
+                        if user_pool:
+                            # Accounts exist but all blocked — skip task, don't waste a VM
+                            logger.info(f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)")
+                            continue
+                        # No accounts at all — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
                             logger.info("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
                         else:
-                            # No credentials at all — skip this task, don't waste a VM
                             logger.warning(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
                             async with AsyncSessionLocal() as msg_session:
                                 msg_task = await msg_session.get(Task, task.id)
