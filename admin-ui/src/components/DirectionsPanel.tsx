@@ -45,6 +45,9 @@ interface Direction {
     added_at: string;
     added_by_task: string;
   }>;
+  paused_reason?: string;
+  paused_at?: string;
+  auto_paused?: boolean;
 }
 
 function formatRelativeTime(isoString: string): string {
@@ -305,6 +308,21 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       fetchDirections();
     } catch {
       setError('Failed to update status. Please try again.');
+    }
+  }
+
+  async function reactivateDirection(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'active' }),
+      });
+      if (!res.ok) throw new Error('Failed to reactivate direction');
+      fetchDirections();
+    } catch {
+      setError('Failed to reactivate direction. Please try again.');
     }
   }
 
@@ -951,6 +969,13 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                   }
                                   return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at!)}</p>;
                                 })()}
+                                {/* Auto-pause reason subtitle */}
+                                {key === 'paused' && d.paused_reason && (
+                                  <p className="text-[10px] text-amber-500/80 mt-0.5 leading-relaxed">
+                                    {d.paused_reason}
+                                    {d.paused_at && <span className="text-neutral-600"> · paused {formatRelativeTime(d.paused_at)}</span>}
+                                  </p>
+                                )}
                                 <div className="flex items-center gap-2 mt-2">
                                   <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
                                     {d.priority}
@@ -967,6 +992,15 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors[d.status]}`}>
                                       {d.status}
                                     </span>
+                                  )}
+                                  {/* Reactivate button for auto-paused directions */}
+                                  {d.auto_paused && key === 'paused' && (
+                                    <button
+                                      onClick={() => reactivateDirection(d.id)}
+                                      className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
+                                    >
+                                      Reactivate
+                                    </button>
                                   )}
                                   {/* Cooldown badge */}
                                   {key === 'active' && (() => {

@@ -1767,9 +1767,29 @@ async def remove_direction(
 ):
     project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
-    directions = [d for d in (project.directions or []) if d.get("id") != direction_id]
-    if len(directions) == len(project.directions or []):
+    original_directions = list(project.directions or [])
+    removed = [d for d in original_directions if d.get("id") == direction_id]
+    directions = [d for d in original_directions if d.get("id") != direction_id]
+    if len(directions) == len(original_directions):
         raise HTTPException(status_code=404, detail="Direction not found")
+
+    # If this was a proposed direction, keep a tombstone (status='rejected') to prevent re-proposal
+    if removed and removed[0].get("status") == "proposed":
+        from datetime import datetime, timezone
+        rejected_text = (removed[0].get("text") or "")[:200]
+        if rejected_text.strip():
+            tombstone = {
+                "id": removed[0]["id"],
+                "text": rejected_text,
+                "status": "rejected",
+                "rejected_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            }
+            # Append tombstone and cap to 20 most-recent rejected entries
+            rejected = [d for d in directions if d.get("status") == "rejected"]
+            non_rejected = [d for d in directions if d.get("status") != "rejected"]
+            rejected.append(tombstone)
+            rejected = rejected[-20:]
+            directions = non_rejected + rejected
 
     # Cancel QUEUED tasks spawned for this direction
     cancelled_result = await session.execute(
@@ -1856,6 +1876,11 @@ async def update_direction(
                 d["priority"] = payload["priority"]
             if "status" in payload:
                 d["status"] = payload["status"]
+                # When reactivating from paused, clear auto-pause fields
+                if payload["status"] == "active":
+                    d.pop("paused_reason", None)
+                    d.pop("paused_at", None)
+                    d.pop("auto_paused", None)
             if "text" in payload:
                 d["text"] = payload["text"]
             if "paths" in payload:

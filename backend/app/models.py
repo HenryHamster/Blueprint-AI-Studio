@@ -85,6 +85,7 @@ class Project(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
     # Autonomous improvement: user-defined high-level directions for research agents
+    # Includes directions with status: 'active', 'paused', 'proposed', 'rejected'
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)

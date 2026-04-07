@@ -1214,6 +1214,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                         busy_direction_ids.add(did)
 
     active_directions = []
+    auto_paused_any = False
     for d in (project.directions or []):
         if d.get("status") != "active":
             continue
@@ -1239,7 +1240,21 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                     f"{minutes_ago:.1f}m ago (cooldown: {effective_cooldown}m)"
                 )
                 continue
+        # Auto-pause check — must come after cooldown to only evaluate directions eligible for research
+        pause_reason = _check_direction_health(d)
+        if pause_reason:
+            d["status"] = "paused"
+            d["paused_reason"] = pause_reason
+            d["paused_at"] = _utcnow().isoformat()
+            d["auto_paused"] = True
+            logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
+            auto_paused_any = True
+            continue
         active_directions.append(d)
+    if auto_paused_any:
+        flag_modified(project, "directions")
+        session.add(project)
+        await session.commit()
     if not active_directions:
         return
     # Pick ONE direction per research task to avoid putting all on cooldown at once.
@@ -5012,6 +5027,62 @@ def _compute_saturation(history: list) -> bool:
     return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
 
 
+def _check_direction_health(direction: dict) -> Optional[str]:
+    """Return a pause reason if this direction should be auto-paused, else None."""
+    history = direction.get("research_history") or []
+
+    # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
+    if direction.get("possibly_saturated") and len(history) >= 5:
+        recent5 = history[-5:]
+        if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
+            return "Saturated: last 5 research cycles produced no actionable findings"
+
+    # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
+    # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
+    if len(history) >= 5:
+        total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+        if total_merged == 0:
+            last = history[-1]
+            created = last.get("tasks_created", 0)
+            finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
+            if created == 0 or finished >= created:
+                total_created = sum(entry.get("tasks_created", 0) for entry in history)
+                return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
+
+    # Rule 3: High failure rate — last 3 cycles have >70% tasks failed
+    if len(history) >= 3:
+        recent3 = history[-3:]
+        total_created_3 = sum(entry.get("tasks_created", 0) for entry in recent3)
+        total_failed_3 = sum(entry.get("tasks_failed", 0) for entry in recent3)
+        if total_created_3 > 0 and total_failed_3 / total_created_3 > 0.7:
+            return "High failure rate: >70% of spawned tasks failed in last 3 cycles"
+
+    return None
+
+
+def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejected_proposals: list) -> bool:
+    """Return True if proposal_text overlaps with an existing or recently rejected direction."""
+    STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
+                 'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
+                 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
+    words = set(proposal_text.lower().split()) - STOPWORDS
+    if len(words) < 2:
+        return False
+    for d in existing_directions:
+        existing_text = (d.get("text") or "").lower()
+        existing_words = set(existing_text.split()) - STOPWORDS
+        if len(words & existing_words) >= 4:
+            return True
+    cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    for entry in rejected_proposals:
+        if entry.get("rejected_at", "") < cutoff:
+            continue
+        rejected_words = set((entry.get("text") or "").lower().split()) - STOPWORDS
+        if len(words & rejected_words) >= 4:
+            return True
+    return False
+
+
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
     """Extract structured research findings JSON array from agent output text."""
     json_str = _extract_json_array(text, "title", "prompt")
@@ -6126,6 +6197,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         proposal_project = await session.get(Project, task.project_id)
         if proposal_project:
             proj_directions = list(proposal_project.directions or [])
+            rejected_proposals = [d for d in proj_directions if d.get("status") == "rejected"]
             pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
             max_proposals = 10
             now_iso = _utcnow().isoformat()
@@ -6135,6 +6207,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     break
                 proposal_text = (proposal.get("prompt") or proposal.get("description") or "")[:500]
                 if not proposal_text.strip():
+                    continue
+                if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
+                    logger.info(f"[RESEARCH] Skipping direction proposal — overlaps with existing direction")
                     continue
                 new_direction = {
                     "id": f"d-{uuid.uuid4().hex[:8]}",
