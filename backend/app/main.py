@@ -71,7 +71,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0025"
+EXPECTED_SCHEMA_REVISION = "0026"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -140,6 +140,23 @@ async def load_max_plan_pool():
                 "total_tasks": acct.total_tasks,
                 "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
             }
+            # Restore rate-limit state from DB (skip expired cooldowns)
+            rl_state = acct.rate_limit_state or {}
+            db_disabled_models = rl_state.get("disabled_models", {})
+            if db_disabled_models:
+                now = _utcnow()
+                restored_dm = {}
+                for model_name, info in db_disabled_models.items():
+                    at_str = info.get("at")
+                    if at_str:
+                        at_dt = datetime.fromisoformat(at_str)
+                        hits = info.get("hits", 1)
+                        cooldown_minutes = min(30 * (2 ** (hits - 1)), 240)
+                        if (now - at_dt).total_seconds() < cooldown_minutes * 60:
+                            restored_dm[model_name] = {"hits": hits, "at": at_dt}
+                if restored_dm:
+                    entry["disabled_models"] = restored_dm
+                    logger.info(f"[STARTUP] Restored rate-limit state for {acct.name}: {list(restored_dm.keys())}")
             _max_plan_pools.setdefault(acct.user_id, []).append(entry)
             _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
@@ -191,6 +208,7 @@ async def release_max_plan_account(account_id: str):
 async def recheck_disabled_accounts():
     """Re-enable accounts/models that were disabled by rate limiting after cooldown.
     Checks both per-model disables and legacy full-account disables."""
+    changed_accounts = []
     async with _max_plan_pool_lock:
         now = _utcnow()
 
@@ -205,6 +223,7 @@ async def recheck_disabled_accounts():
                 cooldown_minutes = min(30 * (2 ** (hits - 1)), 240)
                 if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
                     del dm[model_name]
+                    changed_accounts.append(acct)
                     logger.warning(f"[POOL] Re-enabled account {acct['name']} model {model_name} after {cooldown_minutes:.0f}min cooldown (hit #{hits})")
 
             # Legacy full-account disable (backward compat)
@@ -217,7 +236,28 @@ async def recheck_disabled_accounts():
                 if (now - disabled_at).total_seconds() >= cooldown_minutes * 60:
                     acct["enabled"] = True
                     acct["disabled_at"] = None
+                    changed_accounts.append(acct)
                     logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
+
+    # Persist changes to DB (outside lock to avoid holding it during IO)
+    if changed_accounts:
+        try:
+            async with AsyncSessionLocal() as rl_session:
+                for acct in changed_accounts:
+                    db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct["id"]))
+                    if db_acct:
+                        dm = acct.get("disabled_models", {})
+                        db_acct.rate_limit_state = {
+                            "disabled_models": {
+                                m: {"hits": i["hits"], "at": i["at"].isoformat()}
+                                for m, i in dm.items()
+                            }
+                        } if dm else None
+                        db_acct.enabled = acct.get("enabled", True)
+                        rl_session.add(db_acct)
+                await rl_session.commit()
+        except Exception as e:
+            logger.warning(f"[POOL] Failed to persist rate-limit state changes: {e}")
 
 
 # --- Deployment State Management ---
@@ -7799,6 +7839,24 @@ async def update_agent_status(
                                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
                                     cooldown = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
                                     logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown:.0f}min)")
+                                # Persist rate-limit state to DB so it survives deploys
+                                if acct:
+                                    try:
+                                        async with AsyncSessionLocal() as rl_session:
+                                            db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct_id))
+                                            if db_acct:
+                                                dm = acct.get("disabled_models", {})
+                                                db_acct.rate_limit_state = {
+                                                    "disabled_models": {
+                                                        m: {"hits": i["hits"], "at": i["at"].isoformat()}
+                                                        for m, i in dm.items()
+                                                    }
+                                                } if dm else None
+                                                db_acct.enabled = acct.get("enabled", True)
+                                                rl_session.add(db_acct)
+                                                await rl_session.commit()
+                                    except Exception as e:
+                                        logger.warning(f"[POOL] Failed to persist rate-limit state: {e}")
                         # EXTERNAL_API: don't disable account (transient outage)
 
                     # Track API failure retries to prevent infinite loops

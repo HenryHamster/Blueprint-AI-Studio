@@ -292,6 +292,7 @@ class MaxPlanAccount(SQLModel, table=True):
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
     token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)
+    rate_limit_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
