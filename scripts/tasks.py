@@ -872,6 +872,26 @@ def cmd_directions(args):
             print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
 
 
+def cmd_add_direction(args):
+    """Add a new research direction.
+
+    Usage: tasks.py add-direction "direction text" [--priority high|medium|low]
+    """
+    from blueprint_api import api, get_project_id
+    if not args:
+        print("Usage: tasks.py add-direction 'direction text' [--priority high|medium|low]")
+        return
+    text = args[0]
+    priority = "medium"
+    for i, a in enumerate(args):
+        if a == "--priority" and i + 1 < len(args):
+            priority = args[i + 1]
+    pid = get_project_id()
+    result = api("POST", f"/api/admin/projects/{pid}/directions", {"text": text, "priority": priority})
+    d = result.get("direction", {})
+    print(f"Added direction {d.get('id', '?')} [{priority}]: {text[:80]}")
+
+
 def cmd_update_direction(args):
     """Update a direction's text, priority, or status.
 
@@ -1013,6 +1033,7 @@ COMMANDS = {
     "requeue-ci": cmd_requeue_ci,
     "trigger-rollup": cmd_trigger_rollup,
     "directions": cmd_directions,
+    "add-direction": cmd_add_direction,
     "update-direction": cmd_update_direction,
     "autonomy-debug": cmd_autonomy_debug,
     "archive": cmd_archive,
