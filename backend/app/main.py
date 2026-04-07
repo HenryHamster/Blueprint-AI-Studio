@@ -94,6 +94,7 @@ _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 _max_plan_pools: Dict[str, List[Dict[str, Any]]] = {}  # user_id → accounts
 _account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
+_pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
 
 # Backward compat: flat view for code that needs all accounts
 def _all_accounts() -> List[Dict[str, Any]]:
@@ -239,6 +240,14 @@ async def recheck_disabled_accounts():
                     changed_accounts.append(acct)
                     logger.warning(f"[POOL] Re-enabled account {acct['name']} after {cooldown_minutes:.0f}min cooldown (rl_hit #{rl_hit_count})")
 
+    # Retry any previously failed rate-limit persists
+    if _pending_rl_persists:
+        retry_ids = list(_pending_rl_persists)
+        for acct_id in retry_ids:
+            acct = _account_by_id.get(acct_id)
+            if acct and acct not in changed_accounts:
+                changed_accounts.append(acct)
+
     # Persist changes to DB (outside lock to avoid holding it during IO)
     if changed_accounts:
         try:
@@ -256,6 +265,10 @@ async def recheck_disabled_accounts():
                         db_acct.enabled = acct.get("enabled", True)
                         rl_session.add(db_acct)
                 await rl_session.commit()
+            # Clear any retried accounts on success
+            for acct in changed_accounts:
+                if acct["id"] in _pending_rl_persists:
+                    _pending_rl_persists.remove(acct["id"])
         except Exception as e:
             logger.warning(f"[POOL] Failed to persist rate-limit state changes: {e}")
 
@@ -2010,7 +2023,7 @@ async def reaper_service():
                     # Separate provision failures from agent failures for retry budgeting
                     is_provision_failure = fresh_task.status == TaskStatus.PROVISIONING
                     provision_failures = (task.context or {}).get("provision_failures", 0)
-                    max_provision_retries = 3
+                    max_provision_retries = _runtime_config["max_provision_retries"]
                     can_retry = False
 
                     # Rate-limited tasks: requeue without burning retry budget
@@ -2077,7 +2090,10 @@ async def reaper_service():
                             reaper_ctx.pop("_slot_released", None)
                             if is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
-                                reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
+                            else:
+                                # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
+                                delay_minutes = min(2 ** (task.attempt_count - 1), 15) * random.uniform(0.75, 1.25)
+                            reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
                             task.context = reaper_ctx
                             session.add(task)
 
@@ -2568,20 +2584,26 @@ async def orchestrator_worker():
                         continue
                     if ((t.last_heartbeat is None or t.last_heartbeat < ten_min_ago)
                         and t.started_at and t.started_at < ten_min_ago):
+                        # Re-read with lock to prevent race with reaper on provision_failures
+                        fresh_t = (await session.execute(
+                            select(Task).where(Task.id == t.id).with_for_update(skip_locked=True)
+                        )).scalars().first()
+                        if not fresh_t or fresh_t.status != TaskStatus.PROVISIONING:
+                            continue  # Reaper already handled it
                         # Check provision failure limit before requeueing
-                        provision_failures = (t.context or {}).get("provision_failures", 0) + 1
-                        if provision_failures >= 3:
-                            t.status = TaskStatus.FAILED
-                            t.latest_status_message = f"Failed after {provision_failures} provision attempts"
+                        provision_failures = (fresh_t.context or {}).get("provision_failures", 0) + 1
+                        if provision_failures >= _runtime_config["max_provision_retries"]:
+                            fresh_t.status = TaskStatus.FAILED
+                            fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
-                            acct_id = (t.context or {}).get("max_plan_account_id")
+                            acct_id = (fresh_t.context or {}).get("max_plan_account_id")
                             if acct_id:
                                 await release_max_plan_account(acct_id)
-                            session.add(t)
+                            session.add(fresh_t)
                             continue
-                        stale_vm_ids.append(t.vm_instance_id)
+                        stale_vm_ids.append(fresh_t.vm_instance_id)
                         # Release Max Plan account slot before requeueing
-                        acct_id = (t.context or {}).get("max_plan_account_id")
+                        acct_id = (fresh_t.context or {}).get("max_plan_account_id")
                         if acct_id:
                             await release_max_plan_account(acct_id)
                         # Cancel any lingering coroutine reference
@@ -2589,16 +2611,16 @@ async def orchestrator_worker():
                         if zombie and not zombie.done():
                             zombie.cancel()
                             cancelled_provision_ids.append(str(t.id))
-                        t.status = TaskStatus.QUEUED
-                        t.started_at = None
-                        t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                        t.context = {**(t.context or {}), "provision_failures": provision_failures}
-                        session.add(t)
+                        fresh_t.status = TaskStatus.QUEUED
+                        fresh_t.started_at = None
+                        fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        fresh_t.context = {**(fresh_t.context or {}), "provision_failures": provision_failures}
+                        session.add(fresh_t)
                         tasks_recovered += 1
-                        if t.last_heartbeat is None:
-                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (no heartbeat, started_at={t.started_at})")
+                        if fresh_t.last_heartbeat is None:
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (no heartbeat, started_at={fresh_t.started_at})")
                         else:
-                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (stale heartbeat={t.last_heartbeat}, started_at={t.started_at})")
+                            logger.warning(f"[ORCHESTRATOR] Recovered stale PROVISIONING task {t.id} → QUEUED (stale heartbeat={fresh_t.last_heartbeat}, started_at={fresh_t.started_at})")
                 if cancelled_provision_ids:
                     logger.warning(f"[ORCHESTRATOR] Cancelled {len(cancelled_provision_ids)} zombie provision coroutine(s): {cancelled_provision_ids}")
                 if session.dirty:
@@ -2637,6 +2659,22 @@ async def orchestrator_worker():
                     await asyncio.sleep(5)
                     continue
 
+                # Failure-rate dispatch gate — throttle when recent tasks are mostly failing
+                # Filter to last 15 min so the gate auto-clears when failures age out
+                _fr_cutoff = (_utcnow() - timedelta(minutes=15)).isoformat()
+                recent_results = [r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= _fr_cutoff]
+                if len(recent_results) >= 5:
+                    recent_window = recent_results[-10:]
+                    recent_failures = sum(1 for r in recent_window if r[1] == "failure")
+                    recent_rate = recent_failures / len(recent_window)
+                    if recent_rate >= 0.8:
+                        logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for 30s")
+                        # Run account re-enablement before sleeping so rate-limited accounts
+                        # can recover even while dispatch is throttled
+                        await recheck_disabled_accounts()
+                        await asyncio.sleep(30)
+                        continue
+
                 # Reconcile Max Plan active_tasks counters from DB each cycle
                 active_per_account: Dict[str, int] = {}
                 for t in active_tasks_result:
@@ -2645,9 +2683,10 @@ async def orchestrator_worker():
                         active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 async with _max_plan_pool_lock:
                     for acct in _account_by_id.values():
-                        # Reconcile upward only — never clobber in-flight release_max_plan_account() decrements
+                        # Reconcile from DB — the pre-increment in select_max_plan_account() is always
+                        # committed as PROVISIONING before the next cycle's reconciliation runs.
                         db_count = active_per_account.get(acct["id"], 0)
-                        acct["active_tasks"] = max(acct["active_tasks"], db_count)
+                        acct["active_tasks"] = db_count
 
                 # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
                 candidate_stmt = select(Task).where(
@@ -2907,20 +2946,24 @@ async def orchestrator_worker():
                         # No available account — either all disabled/blacklisted or none configured
                         user_pool = _max_plan_pools.get(dispatch_user_id, [])
                         if user_pool:
-                            # Accounts exist but all blocked — skip task, don't waste a VM
+                            # Accounts exist but all blocked — notify user and skip
                             logger.info(f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)")
+                            stall_msg = "All accounts rate-limited — waiting for cooldown"
+                            if not (task.latest_status_message or "").startswith("All accounts"):
+                                # Update directly on the locked task object (separate session would deadlock)
+                                task.latest_status_message = stall_msg
+                                session.add(task)
+                                await broadcast_to_project(str(task.project_id), "task_updated",
+                                    {"task_id": str(task.id), "status": task.status, "message": stall_msg})
                             continue
                         # No accounts at all — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
                             logger.info("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
                         else:
                             logger.warning(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
-                            async with AsyncSessionLocal() as msg_session:
-                                msg_task = await msg_session.get(Task, task.id)
-                                if msg_task:
-                                    msg_task.latest_status_message = "Waiting for credentials — add a Max plan account or set ANTHROPIC_API_KEY"
-                                    msg_session.add(msg_task)
-                                    await msg_session.commit()
+                            # Update directly on the locked task object (separate session would deadlock)
+                            task.latest_status_message = "Waiting for credentials — add a Max plan account or set ANTHROPIC_API_KEY"
+                            session.add(task)
                             continue
 
                     # Store which account this task uses for cleanup on completion
@@ -3005,47 +3048,62 @@ async def orchestrator_worker():
                         if not success:
                             provision_err = get_provision_error(vm_id)
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}")
-                            record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
-                            # Requeue with retry tracking — zone exhaustion is transient
                             try:
-                                async with AsyncSessionLocal() as inner_session:
-                                    failed_task = await inner_session.get(Task, t_id)
-                                    if failed_task:
-                                        ctx = dict(failed_task.context or {})
-                                        prov_failures = ctx.get("provision_failures", 0) + 1
-                                        ctx["provision_failures"] = prov_failures
-                                        max_prov_retries = 3
-                                        if prov_failures >= max_prov_retries:
-                                            # Exhausted retries — permanent failure
-                                            failed_task.status = TaskStatus.FAILED
-                                            failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
-                                            await _maybe_create_failure_alert(
-                                                failed_task, inner_session,
-                                                (provision_err or "unknown error")[:200]
+                                record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
+                                # Capture serial port logs before VM deletion (best-effort)
+                                serial_log = None
+                                try:
+                                    prov_zone = get_vm_zone(vm_id)
+                                    if prov_zone and prov_zone != "unknown":
+                                        from app.compute import _capture_serial_for_vm
+                                        serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
+                                        if serial_log:
+                                            logger.error(f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log[-500:]}")
+                                except Exception:
+                                    pass
+                                # Requeue with retry tracking — zone exhaustion is transient
+                                try:
+                                    async with AsyncSessionLocal() as inner_session:
+                                        failed_task = await inner_session.get(Task, t_id)
+                                        if failed_task:
+                                            ctx = dict(failed_task.context or {})
+                                            prov_failures = ctx.get("provision_failures", 0) + 1
+                                            ctx["provision_failures"] = prov_failures
+                                            if serial_log:
+                                                ctx["last_serial_log"] = serial_log[-500:]
+                                            max_prov_retries = _runtime_config["max_provision_retries"]
+                                            if prov_failures >= max_prov_retries:
+                                                # Exhausted retries — permanent failure
+                                                failed_task.status = TaskStatus.FAILED
+                                                failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
+                                                await _maybe_create_failure_alert(
+                                                    failed_task, inner_session,
+                                                    (provision_err or "unknown error")[:200]
+                                                )
+                                                logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
+                                            else:
+                                                # Requeue for retry — zone exhaustion is transient
+                                                failed_task.status = TaskStatus.QUEUED
+                                                failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                                                failed_task.last_heartbeat = None
+                                                failed_task.started_at = None
+                                                # Back off 2 min per failure to let zones recover
+                                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
+                                                failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
+                                                logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
+                                            failed_task.context = ctx
+                                            inner_session.add(failed_task)
+                                            await inner_session.commit()
+                                            await broadcast_to_project(
+                                                str(p_id),
+                                                "task_updated",
+                                                {"task_id": str(t_id), "status": failed_task.status}
                                             )
-                                            logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
-                                        else:
-                                            # Requeue for retry — zone exhaustion is transient
-                                            failed_task.status = TaskStatus.QUEUED
-                                            failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                                            failed_task.last_heartbeat = None
-                                            failed_task.started_at = None
-                                            # Back off 2 min per failure to let zones recover
-                                            ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
-                                            failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
-                                            logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
-                                        failed_task.context = ctx
-                                        inner_session.add(failed_task)
-                                        await inner_session.commit()
-                                        await broadcast_to_project(
-                                            str(p_id),
-                                            "task_updated",
-                                            {"task_id": str(t_id), "status": failed_task.status}
-                                        )
-                            except Exception as e:
-                                logger.error(f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}", exc_info=True)
-                            # Delete partially-created VM (may exist if insert succeeded but wait failed)
-                            await _ensure_vm_deleted(vm_id, reason="provision_failure")
+                                except Exception as e:
+                                    logger.error(f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}", exc_info=True)
+                            finally:
+                                # ALWAYS delete partially-created VM, even if requeue logic crashes
+                                await _ensure_vm_deleted(vm_id, reason="provision_failure")
 
                     provision_coro = asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
@@ -3059,6 +3117,10 @@ async def orchestrator_worker():
                         "task_updated",
                         {"task_id": str(task.id), "status": TaskStatus.PROVISIONING}
                     )
+
+                # Flush any status message updates from skipped tasks (e.g., "All accounts rate-limited")
+                if session.dirty:
+                    await session.commit()
 
                 # Check tasks waiting on CI (review approved, CI pending)
                 CI_WAIT_TIMEOUT_MINUTES = 30
@@ -4422,11 +4484,20 @@ async def claim_task(
     stmt = select(Task).where(
         Task.vm_instance_id == token.get("vm_instance_id"),
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
-    ).with_for_update()
+    ).with_for_update(skip_locked=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
 
     if not task:
+        # Distinguish "no task" from "task locked by another process"
+        check = await session.execute(
+            select(Task.id).where(
+                Task.vm_instance_id == token.get("vm_instance_id"),
+                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
+            )
+        )
+        if check.scalars().first():
+            raise HTTPException(status_code=503, detail="Task is temporarily locked, retry shortly")
         raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
 
     task.status = TaskStatus.IN_PROGRESS
@@ -6723,6 +6794,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     if not artifact or not artifact.pr_url:
         # No PR artifact — task completed without creating a PR (e.g., no changes needed).
         # Treat as "done" so it doesn't block rollup.
+        # Cache in context so partial-rollup path (which checks context.pr_merged directly)
+        # doesn't see this task as "unmerged".
+        task.context = {**(task.context or {}), "pr_merged": True}
         return True
     if artifact and artifact.pr_url:
         try:
@@ -6730,33 +6804,42 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
             pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
-                # Use separate session to persist — don't pollute caller's session
-                async with AsyncSessionLocal() as write_session:
-                    db_task = await write_session.get(Task, task.id)
-                    if db_task:
-                        db_task.context = {**(db_task.context or {}), "pr_merged": True}
-                        write_session.add(db_task)
-                        await write_session.commit()
-                # Also update the in-memory object so caller sees the change
+                # Update in-memory first so caller sees the change even if DB write fails
                 task.context = {**(task.context or {}), "pr_merged": True}
+                # Persist to DB in separate session (best-effort — may fail if caller
+                # holds FOR UPDATE lock on this row, but in-memory update is sufficient
+                # for the current rollup cycle)
+                try:
+                    async with AsyncSessionLocal() as write_session:
+                        db_task = await write_session.get(Task, task.id)
+                        if db_task:
+                            db_task.context = {**(db_task.context or {}), "pr_merged": True}
+                            write_session.add(db_task)
+                            await write_session.commit()
+                except Exception as write_err:
+                    logger.warning(f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}")
                 return True
             # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
                 logger.warning(f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected")
-                async with AsyncSessionLocal() as write_session:
-                    db_task = await write_session.get(Task, task.id)
-                    if db_task:
-                        db_task.context = {**(db_task.context or {}), "pr_closed_unmerged": True}
-                        db_task.status = TaskStatus.FAILED
-                        db_task.latest_status_message = f"PR #{pr_number} closed without merging"
-                        write_session.add(db_task)
-                        await _maybe_create_failure_alert(
-                            db_task, write_session,
-                            f"PR #{pr_number} was closed without merging"
-                        )
-                        await write_session.commit()
+                # Update in-memory first
                 task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                 task.status = TaskStatus.FAILED
+                try:
+                    async with AsyncSessionLocal() as write_session:
+                        db_task = await write_session.get(Task, task.id)
+                        if db_task:
+                            db_task.context = {**(db_task.context or {}), "pr_closed_unmerged": True}
+                            db_task.status = TaskStatus.FAILED
+                            db_task.latest_status_message = f"PR #{pr_number} closed without merging"
+                            write_session.add(db_task)
+                            await _maybe_create_failure_alert(
+                                db_task, write_session,
+                                f"PR #{pr_number} was closed without merging"
+                            )
+                            await write_session.commit()
+                except Exception as write_err:
+                    logger.warning(f"[PR_VERIFY] Failed to persist pr_closed_unmerged for task {task.id}: {write_err}")
                 return True  # Return True so callers don't block — task is now FAILED which they handle
         except Exception as e:
             logger.warning(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}", exc_info=True)
@@ -8362,7 +8445,9 @@ async def update_agent_status(
                                                 rl_session.add(db_acct)
                                                 await rl_session.commit()
                                     except Exception as e:
-                                        logger.warning(f"[POOL] Failed to persist rate-limit state: {e}")
+                                        logger.warning(f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry")
+                                        if acct_id not in _pending_rl_persists:
+                                            _pending_rl_persists.append(acct_id)
                         # EXTERNAL_API: don't disable account (transient outage)
 
                     # Track API failure retries to prevent infinite loops

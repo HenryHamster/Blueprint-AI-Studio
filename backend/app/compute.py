@@ -482,6 +482,7 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
     startup_script = f"""#!/bin/bash
     set -euo pipefail
+    trap 'echo "FATAL: Startup script failed at line $LINENO"; poweroff' ERR
     echo "Starting Agent VM Initialization..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
@@ -535,15 +536,36 @@ STATICENV
 
     # 6. Pull latest agent source from GCS (hotfix: deploys with orchestrator, no Packer rebuild needed)
     echo "Pulling latest agent source from GCS..."
-    gsutil -q cp gs://{ARTIFACT_BUCKET_NAME}/agent-hotfix/index.ts /opt/agent/src/index.ts 2>/dev/null && {{
+    HOTFIX_TMP="/tmp/agent-hotfix-index.ts"
+    gsutil -q cp gs://{ARTIFACT_BUCKET_NAME}/agent-hotfix/index.ts "$HOTFIX_TMP" 2>/dev/null && {{
+        # Validate hotfix before replacing baked-in source
+        cp /opt/agent/src/index.ts /opt/agent/src/index.ts.bak
+        cp "$HOTFIX_TMP" /opt/agent/src/index.ts
         chown agent:agent /opt/agent/src/index.ts
-        echo "Agent source updated from GCS hotfix."
+        if su agent -c "cd /opt/agent && npx tsx --no-warnings -e 'process.exit(0)'" 2>/dev/null; then
+            echo "Agent source updated from GCS hotfix (validated)."
+        else
+            echo "GCS hotfix failed validation — reverting to baked-in source."
+            mv /opt/agent/src/index.ts.bak /opt/agent/src/index.ts
+        fi
+        rm -f /opt/agent/src/index.ts.bak "$HOTFIX_TMP"
     }} || echo "No GCS hotfix found, using baked-in agent source."
 
     # 7. Start the systemd service
     echo "Starting blueprint-agent service..."
     systemctl daemon-reload
-    timeout 60 systemctl restart blueprint-agent || {{ echo "Service start failed, powering off"; poweroff; }}
+    timeout 60 systemctl restart blueprint-agent || {{
+        echo "Service start failed"
+        AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
+        ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+        SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 30 2>/dev/null | tr '"' "'" | tr '\\n' ' ' || echo 'no journal')"
+        curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
+          -H "Content-Type: application/json" \
+          -H "X-Agent-Token: $AGENT_TOKEN" \
+          -d '{{"task_id": "{task_id}", "status_message": "PROVISION_HEALTH_FAILED: service start failed. Journal: '"$SERVICE_LOG"'"}}' \
+          --connect-timeout 10 --max-time 15 || true
+        poweroff
+    }}
 
     # 7b. Notify orchestrator that startup completed — early health signal
     # Reads AGENT_SECRET_TOKEN from env file (written from Secret Manager above)

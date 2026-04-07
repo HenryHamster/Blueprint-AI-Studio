@@ -31,6 +31,7 @@ runtime_config_lock = asyncio.Lock()
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
+    "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_autonomous_tasks_per_hour": 5,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
