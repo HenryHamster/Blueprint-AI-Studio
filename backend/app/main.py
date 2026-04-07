@@ -28,7 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
 from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, _on_task_terminal_callbacks
-from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, reconcile_orphaned_secrets
+from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, get_vm_zone, reconcile_orphaned_secrets
 from app.storage import generate_upload_signed_url, upload_json_payload, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
@@ -1967,7 +1967,10 @@ async def reaper_service():
                                 task.attempt_count += 1
                             retry_label = f"provision {provision_failures}/{max_provision_retries}" if is_provision_failure else f"attempt {task.attempt_count}/{_runtime_config['max_retries']}"
                             logger.info(f"[REAPER] Retrying task {task.id} ({retry_label})")
-                            task.latest_status_message = f"Reaped ({retry_label}): {reap_reason}"
+                            reap_ctx = task.context or {}
+                            reap_zone = reap_ctx.get("provision_zone", "?")
+                            reap_acct = (reap_ctx.get("max_plan_account_id") or "?")[:8]
+                            task.latest_status_message = f"Reaped ({retry_label}): {reap_reason} [zone={reap_zone}, acct={reap_acct}]"
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
@@ -2868,6 +2871,9 @@ async def orchestrator_worker():
                                             return
                                         if hb_task.status == TaskStatus.PROVISIONING:
                                             hb_task.last_heartbeat = _utcnow()
+                                            # Save provision zone for diagnostics
+                                            prov_zone = get_vm_zone(vm_id)
+                                            hb_task.context = {**(hb_task.context or {}), "provision_zone": prov_zone}
                                             hb_session.add(hb_task)
                                             await hb_session.commit()
                                 except Exception as e:

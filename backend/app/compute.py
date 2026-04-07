@@ -233,6 +233,11 @@ def get_provision_error(vm_instance_id: str) -> str:
     return _last_provision_error.pop(vm_instance_id, "")
 
 
+def get_vm_zone(vm_instance_id: str) -> str:
+    """Get the zone a VM was provisioned in."""
+    return _vm_zones.get(vm_instance_id, "unknown")
+
+
 async def delete_agent_vm(vm_instance_id: str):
     """
     Terminates an agent. In LOCAL_MODE, kills the subprocess.
