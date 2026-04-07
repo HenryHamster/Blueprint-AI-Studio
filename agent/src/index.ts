@@ -1712,11 +1712,12 @@ ${hotspotsSection}
           : '';
         const history = Array.isArray(d.research_history) ? d.research_history as Array<Record<string, unknown>> : [];
         let aggregateSection = '';
-        if (history.length >= 3) {
-          const totalTasksCreated = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0);
-          const totalPrsMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0);
-          const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0);
-          const totalCycles = history.length;
+        const agg = (d.history_aggregate || {}) as Record<string, number | string | null>;
+        const totalCycles = history.length + ((agg.total_cycles as number) || 0);
+        if (totalCycles >= 3) {
+          const totalTasksCreated = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0) + ((agg.total_tasks_created as number) || 0);
+          const totalPrsMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0) + ((agg.total_prs_merged as number) || 0);
+          const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0) + ((agg.total_tasks_failed as number) || 0);
           const zeroCycles = history.filter(h => ((h.tasks_created as number) || 0) === 0).length;
           const parts = [`${totalCycles} cycles`, `${totalTasksCreated} tasks created`];
           if (totalPrsMerged > 0) parts.push(`${totalPrsMerged} merged`);
@@ -1724,9 +1725,16 @@ ${hotspotsSection}
           if (zeroCycles > 0) parts.push(`${zeroCycles} empty cycles`);
           aggregateSection = `\n  Lifetime: ${parts.join(', ')}.`;
         }
+        const researchCtx = typeof d.research_context === 'string' && (d.research_context as string).length > 0
+          ? `\n  Research Context (accumulated knowledge — use as starting point):\n${d.research_context as string}`
+          : '';
         let historySection = '';
         if (history.length > 0) {
-          const entries = history.slice(-5).map((h) => {
+          const historySlice = researchCtx ? history.slice(-3) : history.slice(-5);
+          const historyHeader = researchCtx
+            ? `\n  Recent cycle details (supplementary — research context above has the synthesis):`
+            : `\n  Prior research cycles (last ${Math.min(history.length, 5)}):${aggregateSection}`;
+          const entries = historySlice.map((h) => {
             const titles = Array.isArray(h.finding_titles) ? (h.finding_titles as string[]).join(', ') : 'none';
             const descs = Array.isArray(h.key_finding_descriptions)
               ? '\n    Key findings: ' + (h.key_finding_descriptions as string[]).map(d => d.slice(0, 150)).join(' | ')
@@ -1757,7 +1765,7 @@ ${hotspotsSection}
               : '';
             return `  - ${String(h.timestamp)}: ${String(h.tasks_created)} tasks created${outcomeStats} — ${titles}${descs}${failedSection}${insights}${subSummary}`;
           }).join('\n');
-          historySection = `\n  Prior research cycles (last ${Math.min(history.length, 5)}):${aggregateSection}\n${entries}`;
+          historySection = `${historyHeader}\n${entries}`;
         }
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
@@ -1780,7 +1788,7 @@ ${hotspotsSection}
             activeForDirNote = `\n  Active tasks for this direction:\n${lines.join('\n')}`;
           }
         }
-        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
+        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
       }).join('\n')
     : 'No specific directions provided. Identify general improvements.';
 
@@ -1848,6 +1856,8 @@ Look at the prior research cycles below for each direction. The MORE cycles a di
 - Cycles 1-2: Finding surface-level gaps is fine. Small/medium scope OK.
 - Cycles 3-4: You should be past surface issues. Findings must be medium or large scope. Think about what's MISSING as a system, not what's slightly wrong.
 - Cycles 5+: Only large-scope, architectural, or new-capability findings are acceptable. If you can only find small things, the direction is either done or you're not looking deep enough. Propose a direction_update to evolve the goal, or a direction_note marking it near-complete.
+- If a direction has a 'Research Context' section, use it as your foundation. Do NOT re-investigate findings marked as 'Established'. Focus your effort on 'Open Questions' and finding new approaches for items listed under 'Failed Approaches'.
+- When writing your findings, be explicit about how they build on or diverge from the established context.
 
 Instructions:
 1. Use ALL of your tools aggressively to explore the codebase and research solutions:

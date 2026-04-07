@@ -5196,6 +5196,89 @@ def _compute_saturation(history: list) -> bool:
     return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
 
 
+def _parse_research_context(text: str) -> dict:
+    """Parse a research_context string into its 3 sections."""
+    result: dict = {"established": [], "failed": [], "open_questions": []}
+    if not text:
+        return result
+    section_map = {
+        "## Established Findings": "established",
+        "## Failed Approaches": "failed",
+        "## Open Questions": "open_questions",
+    }
+    current_key: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in section_map:
+            current_key = section_map[stripped]
+        elif current_key and stripped.startswith("- "):
+            result[current_key].append(stripped[2:])
+    return result
+
+
+def _build_research_context(
+    prior_context: Optional[str],
+    finding_titles: list,
+    key_finding_descriptions: list,
+    cycle_insights: list,
+    history_entry: dict,
+) -> str:
+    """Build a compounding research_context document deterministically (no LLM)."""
+    parsed = _parse_research_context(prior_context or "")
+
+    # Append new findings to Established Findings as (proposed)
+    for i, title in enumerate(finding_titles):
+        desc = key_finding_descriptions[i] if i < len(key_finding_descriptions) else ""
+        if desc:
+            first_sentence = desc.split(".")[0].strip()
+            entry_text = f"{title} (proposed). {first_sentence}" if first_sentence else f"{title} (proposed)"
+        else:
+            entry_text = f"{title} (proposed)"
+        parsed["established"].append(entry_text)
+
+    # Add cycle_insights to Open Questions (deduplicate)
+    existing_oq = set(parsed["open_questions"])
+    for insight in cycle_insights:
+        if insight and insight not in existing_oq:
+            parsed["open_questions"].append(insight)
+            existing_oq.add(insight)
+
+    def _format_doc(sections: dict) -> str:
+        parts: list = []
+        for header, key in [
+            ("## Established Findings", "established"),
+            ("## Failed Approaches", "failed"),
+            ("## Open Questions", "open_questions"),
+        ]:
+            parts.append(header)
+            for item in sections[key]:
+                parts.append(f"- {item}")
+            parts.append("")
+        return "\n".join(parts).strip() + "\n"
+
+    doc = _format_doc(parsed)
+    MAX_CHARS = 4000
+    if len(doc) <= MAX_CHARS:
+        return doc
+
+    # Trim oldest entries (from top of each section) to stay under limit
+    while len(doc) > MAX_CHARS:
+        trimmed = False
+        for key in sorted(
+            ["established", "failed", "open_questions"],
+            key=lambda k: -len(parsed[k]),
+        ):
+            if len(parsed[key]) > 1:
+                parsed[key] = parsed[key][1:]
+                trimmed = True
+                break
+        if not trimmed:
+            break
+        doc = _format_doc(parsed)
+
+    return doc[:MAX_CHARS]
+
+
 def _check_direction_health(direction: dict) -> Optional[str]:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -6298,9 +6381,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "key_finding_descriptions": finding_descriptions_by_dir.get(did, [])[:5],
                         "cycle_insights": [i["summary"][:200] for i in insights[:3]],
                     }
-                    # Keep last 10 history entries to avoid unbounded growth
-                    d["research_history"] = (history + [entry])[-10:]
+                    # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
+                    new_history = history + [entry]
+                    if len(new_history) > 10:
+                        evicted = new_history[:-10]
+                        prev_agg = d.get("history_aggregate", {
+                            "total_cycles": 0, "total_tasks_created": 0,
+                            "total_prs_merged": 0, "total_tasks_failed": 0,
+                            "total_tasks_cancelled": 0, "first_cycle_at": None,
+                        })
+                        for ev in evicted:
+                            prev_agg["total_cycles"] += 1
+                            prev_agg["total_tasks_created"] += ev.get("tasks_created", 0)
+                            prev_agg["total_prs_merged"] += ev.get("prs_merged", 0)
+                            prev_agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
+                            prev_agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
+                            if not prev_agg["first_cycle_at"] and ev.get("timestamp"):
+                                prev_agg["first_cycle_at"] = ev["timestamp"]
+                        d["history_aggregate"] = prev_agg
+                    d["research_history"] = new_history[-10:]
                     d["possibly_saturated"] = _compute_saturation(d["research_history"])
+                    d["research_context"] = _build_research_context(
+                        prior_context=d.get("research_context"),
+                        finding_titles=finding_titles_by_dir.get(did, [])[:5],
+                        key_finding_descriptions=finding_descriptions_by_dir.get(did, [])[:5],
+                        cycle_insights=[i["summary"][:200] for i in insights[:3]],
+                        history_entry=entry,
+                    )
             project.directions = directions
             flag_modified(project, "directions")
             session.add(project)
@@ -6486,6 +6593,59 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
             )
+            # Capture failed task details so research agents can see WHY tasks failed
+            failed_details = []
+            for ct in child_tasks_rows:
+                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    reason = (ct.latest_status_message or "")[:120]
+                    failed_details.append({"title": ct.title or "", "reason": reason})
+            entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
+
+            # Maintain research_context: promote proposed findings based on outcomes
+            ctx = d.get("research_context", "")
+            if ctx:
+                parsed = _parse_research_context(ctx)
+                for ct in child_tasks_rows:
+                    title = ct.title or ""
+                    if not title:
+                        continue
+                    if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                        # Move matching proposed finding to Failed Approaches
+                        reason = (ct.latest_status_message or "")[:120]
+                        new_established = []
+                        moved = False
+                        for item in parsed["established"]:
+                            if title.lower() in item.lower():
+                                parsed["failed"].append(f"{title} — {reason}" if reason else title)
+                                moved = True
+                            else:
+                                new_established.append(item)
+                        if moved:
+                            parsed["established"] = new_established
+                    elif ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+                        # Promote (proposed) finding to (confirmed)
+                        new_established = []
+                        for item in parsed["established"]:
+                            if title.lower() in item.lower() and "(proposed)" in item:
+                                new_established.append(item.replace("(proposed)", "(confirmed)"))
+                            else:
+                                new_established.append(item)
+                        parsed["established"] = new_established
+
+                # Reassemble the document
+                parts: list = []
+                for header, key in [
+                    ("## Established Findings", "established"),
+                    ("## Failed Approaches", "failed"),
+                    ("## Open Questions", "open_questions"),
+                ]:
+                    parts.append(header)
+                    for item in parsed[key]:
+                        parts.append(f"- {item}")
+                    parts.append("")
+                updated_ctx = "\n".join(parts).strip() + "\n"
+                d["research_context"] = updated_ctx[:4000]
+
             updated = True
             break
         if updated:
@@ -6494,6 +6654,7 @@ async def _update_direction_research_outcomes(
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
+        await session.commit()
 
 
 # --- Rollup & Branch Cleanup Helpers ---

@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id
+from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id, _update_direction_research_outcomes
 
 
 @pytest.fixture(autouse=True)
@@ -1438,3 +1438,227 @@ async def test_research_endpoint_project_not_found_returns_404(client: AsyncClie
         f"/api/admin/projects/{uuid.uuid4()}/directions/d-any/research"
     )
     assert resp.status_code == 404
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# research_context accumulation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_research_context_accumulates_across_cycles(db_session, mocker):
+    """research_context compounds across cycles, accumulating finding titles."""
+    direction_id = "d-ctx0001"
+    direction = _active_direction(direction_id, "Accumulation test")
+    project = Project(
+        name="Context Accumulate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.main._parse_research_insights", return_value=[])
+    mocker.patch(
+        "app.main._parse_research_findings",
+        side_effect=[
+            [_make_finding(title="Finding Alpha", direction_id=direction_id)],
+            [_make_finding(title="Finding Beta", direction_id=direction_id)],
+            [_make_finding(title="Finding Gamma", direction_id=direction_id)],
+        ],
+    )
+
+    expected_titles = ["Finding Alpha", "Finding Beta", "Finding Gamma"]
+    for i in range(3):
+        await db_session.refresh(project)
+        dirs = project.directions or []
+        current_dir = next((x for x in dirs if x.get("id") == direction_id), direction)
+        task = await _make_research_task(project, current_dir, db_session)
+        await _handle_research_completion(task, "", db_session)
+
+        await db_session.refresh(project)
+        dirs = project.directions or []
+        d = next((x for x in dirs if x.get("id") == direction_id), None)
+        assert d is not None, f"Direction not found after cycle {i + 1}"
+        ctx = d.get("research_context", "")
+        assert ctx, f"research_context should exist after cycle {i + 1}"
+
+        # All findings up to this cycle should be present
+        for title in expected_titles[: i + 1]:
+            assert f"{title} (proposed)" in ctx, (
+                f"'{title} (proposed)' should be in research_context after cycle {i + 1}"
+            )
+
+    # Final assertions after all 3 cycles
+    assert "## Established Findings" in ctx
+    assert "Finding Alpha (proposed)" in ctx
+    assert "Finding Beta (proposed)" in ctx
+    assert "Finding Gamma (proposed)" in ctx
+
+
+@pytest.mark.asyncio
+async def test_research_context_truncated_under_4000_chars(db_session, mocker):
+    """research_context stays under 4000 chars even with many findings."""
+    direction_id = "d-ctx0002"
+    direction = _active_direction(direction_id, "Truncation test")
+    project = Project(
+        name="Context Truncation",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.main._parse_research_insights", return_value=[])
+
+    # Build findings with long descriptions to generate large research_context entries
+    findings_per_cycle = []
+    for cycle in range(6):
+        cycle_findings = []
+        for i in range(5):
+            title = f"unique-{cycle}-{i}"
+            cycle_findings.append({
+                "title": title,
+                "description": f"Long description for {title}: " + "x" * 150,
+                "prompt": f"Implement: {title}",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            })
+        findings_per_cycle.append(cycle_findings)
+
+    mocker.patch("app.main._parse_research_findings", side_effect=findings_per_cycle)
+
+    for i in range(6):
+        await db_session.refresh(project)
+        dirs = project.directions or []
+        current_dir = next((x for x in dirs if x.get("id") == direction_id), direction)
+        task = await _make_research_task(project, current_dir, db_session)
+        await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next((x for x in dirs if x.get("id") == direction_id), None)
+    assert d is not None
+    ctx = d.get("research_context", "")
+    assert ctx, "research_context should exist after 6 cycles"
+    assert len(ctx) <= 4000, f"research_context should be ≤4000 chars, got {len(ctx)}"
+
+
+@pytest.mark.asyncio
+async def test_research_context_updates_on_task_failure(db_session, mocker):
+    """Failed tasks move their proposed finding to Failed Approaches; merged PRs get confirmed."""
+    direction_id = "d-ctx0003"
+    initial_ctx = (
+        "## Established Findings\n"
+        "- Add retry logic to API client (proposed)\n"
+        "- Improve caching layer (proposed)\n"
+        "\n"
+        "## Failed Approaches\n"
+        "\n"
+        "## Open Questions\n"
+        "- How many retries are optimal?\n"
+    )
+
+    # Create child tasks directly so we control their titles and statuses
+    fail_task = Task(
+        project_id=uuid.uuid4(),  # placeholder, overridden after project creation
+        title="Add retry logic to API client",
+        payloads=[{"type": "create", "prompt": "add retry logic"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Timed out after 30 minutes",
+        created_by="ORCHESTRATOR",
+    )
+    merge_task = Task(
+        project_id=uuid.uuid4(),  # placeholder
+        title="Improve caching layer",
+        payloads=[{"type": "create", "prompt": "improve caching"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+
+    direction = _active_direction(direction_id, "Outcome update test")
+    direction["research_context"] = initial_ctx
+
+    project = Project(
+        name="Context Outcome Update",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fix the project_id on child tasks now that we have it
+    fail_task.project_id = project.id
+    merge_task.project_id = project.id
+    db_session.add(fail_task)
+    db_session.add(merge_task)
+    await db_session.commit()
+    await db_session.refresh(fail_task)
+    await db_session.refresh(merge_task)
+
+    # Create a research task and manually add a history entry with child_task_ids
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Outcome update test",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    # Inject research_history entry with child_task_ids
+    dirs = list(project.directions or [])
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [{
+                "timestamp": "2026-04-07T00:00:00",
+                "task_id": str(research_task.id),
+                "tasks_created": 2,
+                "child_task_ids": [str(fail_task.id), str(merge_task.id)],
+                "finding_titles": ["Add retry logic to API client", "Improve caching layer"],
+            }]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Trigger outcome update
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    ctx = d.get("research_context", "")
+
+    # Failed task's finding should be moved to Failed Approaches
+    assert "## Failed Approaches" in ctx
+    assert "Add retry logic to API client" in ctx
+    assert "Timed out after 30 minutes" in ctx, "Failure reason should appear in Failed Approaches"
+    # Should no longer be in Established as (proposed)
+    assert "Add retry logic to API client (proposed)" not in ctx
+
+    # Merged task's finding should be promoted from (proposed) to (confirmed)
+    assert "Improve caching layer (confirmed)" in ctx
+    assert "Improve caching layer (proposed)" not in ctx
