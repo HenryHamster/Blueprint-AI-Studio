@@ -1,7 +1,7 @@
 import { usePersistedState } from './usePersistedState';
 
 export function useViewPreferences() {
-  const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline'>('viewMode', 'kanban');
+  const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline' | 'timeline'>('viewMode', 'kanban');
   const [compactMode, setCompactMode] = usePersistedState<boolean>('compactMode', false);
   const [groupBy, setGroupBy] = usePersistedState<'status' | 'type' | 'project'>('groupBy', 'status');
   const [columnPrefs, setColumnPrefs] = usePersistedState<{ id: string; visible: boolean }[]>('kanban_column_prefs', []);

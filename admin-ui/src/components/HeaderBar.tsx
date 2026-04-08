@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users, Stethoscope, LayoutGrid } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
@@ -16,8 +16,8 @@ export interface HeaderBarProps {
   maxConcurrentVMs: number;
   lastRefresh: Date | null;
   onRefresh: () => void;
-  viewMode: 'kanban' | 'pipeline';
-  onToggleViewMode: () => void;
+  viewMode: 'kanban' | 'pipeline' | 'timeline';
+  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'timeline') => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
   showArchive: boolean;
@@ -97,6 +97,9 @@ export interface HeaderBarProps {
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
   userRole: 'admin' | 'user' | null;
+  showDiagnostics: boolean;
+  onToggleDiagnostics: () => void;
+  stuckTaskCount: number;
 }
 
 
@@ -110,7 +113,7 @@ export function HeaderBar(props: HeaderBarProps) {
     lastRefresh,
     onRefresh,
     viewMode,
-    onToggleViewMode,
+    onSetViewMode,
     showResearchBrowser,
     onToggleResearchBrowser,
     showArchive,
@@ -278,13 +281,29 @@ export function HeaderBar(props: HeaderBarProps) {
               </div>
             )}
           </div>
-          <button
-            onClick={onToggleViewMode}
-            className={`p-2 rounded text-xs transition-colors border ${viewMode === 'pipeline' ? 'bg-neutral-700 text-neutral-100 border-neutral-600' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'}`}
-            title={viewMode === 'kanban' ? 'Switch to Pipeline view' : 'Switch to Kanban view'}
-          >
-            <Network className="w-4 h-4" />
-          </button>
+          <div className="flex items-center rounded border border-neutral-700 overflow-hidden">
+            <button
+              onClick={() => onSetViewMode('kanban')}
+              className={`p-2 text-xs transition-colors border-r border-neutral-700 ${viewMode === 'kanban' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
+              title="Kanban view"
+            >
+              <LayoutGrid className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => onSetViewMode('pipeline')}
+              className={`p-2 text-xs transition-colors border-r border-neutral-700 ${viewMode === 'pipeline' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
+              title="Pipeline view"
+            >
+              <Network className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => onSetViewMode('timeline')}
+              className={`p-2 text-xs transition-colors ${viewMode === 'timeline' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
+              title="Timeline view"
+            >
+              <Clock className="w-4 h-4" />
+            </button>
+          </div>
           <button
             onClick={onShowDirections}
             className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700"
@@ -305,7 +324,7 @@ export function HeaderBar(props: HeaderBarProps) {
           defaultTaskType={defaultTaskType}
           onUpdateDefaultTaskType={onUpdateDefaultTaskType}
           viewMode={viewMode}
-          onToggleViewMode={onToggleViewMode}
+          onSetViewMode={onSetViewMode}
           notifyOnComplete={notifyOnComplete}
           onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
           notifyOnFail={notifyOnFail}
@@ -416,6 +435,22 @@ export function HeaderBar(props: HeaderBarProps) {
               </span>
             )}
           </button>
+          <button
+            onClick={props.onToggleDiagnostics}
+            className={`p-2 rounded text-xs transition-colors border relative flex items-center ${
+              props.showDiagnostics
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            }`}
+            title="Pipeline Diagnostics"
+          >
+            <Stethoscope className="w-4 h-4" />
+            {props.stuckTaskCount > 0 && (
+              <span className="ml-1 bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                {props.stuckTaskCount}
+              </span>
+            )}
+          </button>
         </div>
 
         {/* Mobile overflow menu — hidden on desktop */}
@@ -430,11 +465,25 @@ export function HeaderBar(props: HeaderBarProps) {
           {showMobileMenu && (
             <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
               <button
-                onClick={() => { onToggleViewMode(); setShowMobileMenu(false); }}
+                onClick={() => { onSetViewMode('kanban'); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <LayoutGrid className="w-4 h-4 shrink-0" />
+                <span>Kanban view</span>
+              </button>
+              <button
+                onClick={() => { onSetViewMode('pipeline'); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'pipeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
                 <Network className="w-4 h-4 shrink-0" />
-                <span>{viewMode === 'kanban' ? 'Switch to Pipeline' : 'Switch to Kanban'}</span>
+                <span>Pipeline view</span>
+              </button>
+              <button
+                onClick={() => { onSetViewMode('timeline'); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'timeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <Clock className="w-4 h-4 shrink-0" />
+                <span>Timeline view</span>
               </button>
               <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
@@ -464,6 +513,18 @@ export function HeaderBar(props: HeaderBarProps) {
                 {newActivityCount > 0 && !showActivityFeed && (
                   <span className="ml-auto bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {newActivityCount}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => { props.onToggleDiagnostics(); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${props.showDiagnostics ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <Stethoscope className="w-4 h-4 shrink-0" />
+                <span>Diagnostics</span>
+                {props.stuckTaskCount > 0 && (
+                  <span className="ml-auto bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                    {props.stuckTaskCount}
                   </span>
                 )}
               </button>

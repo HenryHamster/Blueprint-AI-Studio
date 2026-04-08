@@ -202,7 +202,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter
         <span className="text-xs text-neutral-200 truncate group-hover:text-neutral-100">
           {task.title}
         </span>
-        {task.latest_status_message && task.status !== 'QUEUED' && task.status !== 'COMPLETED' && task.status !== 'CANCELLED' && (
+        {task.latest_status_message && task.status !== 'COMPLETED' && task.status !== 'CANCELLED' && (
           <span className="text-[10px] text-neutral-500 truncate">
             {task.latest_status_message}
           </span>

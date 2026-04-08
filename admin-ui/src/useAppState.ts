@@ -50,17 +50,21 @@ export function useAppState() {
 
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
 
+  // Moved before useDeploymentState so it can be passed as a parameter
+  const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
+
   const {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,
-    zoneHealth, orchestratorHealth, detailedHealth,
-  } = useDeploymentState(addToast, user, fetchTasksRef);
+    zoneHealth, orchestratorHealth, detailedHealth, diagnostics,
+  } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId);
 
   const {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
+    pipelineThrottle,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
   // ── Remaining state ─────────────────────────────────────────────────────
@@ -156,13 +160,15 @@ export function useAppState() {
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
-  const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
 
   // Directions panel state
   const [showDirections, setShowDirections] = useState(false);
 
   // Metrics toggle
   const [showMetrics, setShowMetrics] = useState(false);
+
+  // Diagnostics panel toggle
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
 
   // Last visit timestamp — captures when the user previously loaded the app
   const [lastVisitTimestamp] = useState<number | null>(() => {
@@ -1383,6 +1389,9 @@ export function useAppState() {
     // Orchestrator health
     orchestratorHealth,
     detailedHealth,
+    // Diagnostics
+    diagnostics, showDiagnostics, setShowDiagnostics,
+    pipelineThrottle,
     // User management
     allowedUsers, showUserManagement, setShowUserManagement,
     addAllowedUser, updateAllowedUserRole, removeAllowedUser,

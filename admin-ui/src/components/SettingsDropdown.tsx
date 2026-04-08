@@ -11,8 +11,8 @@ interface SettingsDropdownProps {
   // Defaults
   defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
   onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
-  viewMode: 'kanban' | 'pipeline';
-  onToggleViewMode: () => void;
+  viewMode: 'kanban' | 'pipeline' | 'timeline';
+  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'timeline') => void;
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
@@ -107,7 +107,7 @@ export function SettingsDropdown({
   defaultTaskType,
   onUpdateDefaultTaskType,
   viewMode,
-  onToggleViewMode,
+  onSetViewMode,
   notifyOnComplete,
   onUpdateNotifyOnComplete,
   notifyOnFail,
@@ -250,13 +250,15 @@ export function SettingsDropdown({
           </div>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Default View Mode</label>
-            <button
-              onClick={onToggleViewMode}
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 flex items-center justify-between"
+            <select
+              value={viewMode}
+              onChange={e => onSetViewMode(e.target.value as 'kanban' | 'pipeline' | 'timeline')}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
             >
-              <span>{viewMode === 'kanban' ? 'Kanban' : 'Pipeline'}</span>
-              <span className="text-neutral-500 text-xs">Click to toggle</span>
-            </button>
+              <option value="kanban">Kanban</option>
+              <option value="pipeline">Pipeline</option>
+              <option value="timeline">Timeline</option>
+            </select>
           </div>
 
           <div className="mb-4">

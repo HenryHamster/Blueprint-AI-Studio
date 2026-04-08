@@ -15,6 +15,8 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
   const [wsDisconnected, setWsDisconnected] = useState(false);
   const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
+  const [pipelineThrottle, setPipelineThrottle] = useState<{ reason: string; detail: string; recovery_seconds: number | null } | null>(null);
+  const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsReconnectAttemptRef = useRef<number>(0);
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -28,12 +30,15 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
     }
   }, [logTask, logTask?.status]);
 
-  // Clean up WebSocket on unmount
+  // Clean up WebSocket and timers on unmount
   useEffect(() => {
     return () => {
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
+      }
+      if (pipelineThrottleTimerRef.current) {
+        clearTimeout(pipelineThrottleTimerRef.current);
       }
     };
   }, []);
@@ -97,6 +102,12 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
             }
             if (msg.event === 'deploy_state') {
               setDeployState(msg.data);
+            }
+            if (msg.event === 'pipeline_throttle') {
+              setPipelineThrottle(msg.data);
+              if (pipelineThrottleTimerRef.current) clearTimeout(pipelineThrottleTimerRef.current);
+              const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
+              pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
             }
             if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
               if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
@@ -180,5 +191,6 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
+    pipelineThrottle,
   };
 }

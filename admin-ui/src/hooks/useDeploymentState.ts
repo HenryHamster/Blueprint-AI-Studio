@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { User } from 'firebase/auth';
 import type { DeployState } from '../types/settings';
+import type { ProjectDiagnostics } from '../types/diagnostics';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 
 interface OrchestratorHealth {
@@ -37,6 +38,7 @@ export function useDeploymentState(
   addToast: (msg: string, type: 'success' | 'error') => void,
   user: User | null,
   fetchTasksRef: React.MutableRefObject<() => void>,
+  selectedProjectId: string | null = null,
 ) {
   // --- Deploy State ---
   const [deployState, setDeployState] = useState<DeployState | null>(null);
@@ -216,6 +218,25 @@ export function useDeploymentState(
     return () => clearInterval(id);
   }, [user]);
 
+  // --- Diagnostics ---
+  const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
+
+  const fetchDiagnostics = useCallback(async () => {
+    if (!selectedProjectId) { setDiagnostics(null); return; }
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
+      if (res.ok) setDiagnostics(await res.json());
+      else setDiagnostics(null);
+    } catch { setDiagnostics(null); }
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!user || !selectedProjectId) { setDiagnostics(null); return; }
+    fetchDiagnostics();
+    const id = setInterval(fetchDiagnostics, 30000);
+    return () => clearInterval(id);
+  }, [user, selectedProjectId, fetchDiagnostics]);
+
   return {
     deployState, setDeployState,
     handlePausePipeline, handleResumePipeline, handleResetHealth,
@@ -223,5 +244,6 @@ export function useDeploymentState(
     zoneHealth,
     orchestratorHealth,
     detailedHealth,
+    diagnostics,
   };
 }

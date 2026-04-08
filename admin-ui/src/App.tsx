@@ -25,6 +25,8 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { CatchUpPanel } from './components/CatchUpPanel';
+import { DiagnosticsPanel } from './components/DiagnosticsPanel';
+import { TimelineView } from './components/TimelineView';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -356,7 +358,7 @@ export default function App() {
         onUpdateNotifyOnApprovalNeeded={s.setNotifyOnApprovalNeeded}
         soundOnComplete={s.soundOnComplete}
         onUpdateSoundOnComplete={s.setSoundOnComplete}
-        onToggleViewMode={() => s.setViewMode(v => v === 'kanban' ? 'pipeline' : 'kanban')}
+        onSetViewMode={s.setViewMode}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showArchive={s.showArchive}
@@ -424,6 +426,9 @@ export default function App() {
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
         userRole={s.userRole}
+        showDiagnostics={s.showDiagnostics}
+        onToggleDiagnostics={() => s.setShowDiagnostics(prev => !prev)}
+        stuckTaskCount={s.diagnostics?.stuck_tasks.length ?? 0}
       />
 
       <div
@@ -496,7 +501,22 @@ export default function App() {
         wsConnected={s.wsConnected}
         lastFetchTime={s.lastFetchTime}
         tasks={s.tasks}
+        pipelineThrottle={s.pipelineThrottle}
       />
+
+      <div
+        className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
+        style={{ maxHeight: s.showDiagnostics ? '500px' : '0px', opacity: s.showDiagnostics ? 1 : 0 }}
+      >
+        <DiagnosticsPanel
+          diagnostics={s.diagnostics}
+          onViewTask={(taskId) => {
+            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+              s.addToast('Could not load task — it may have been deleted', 'error');
+            });
+          }}
+        />
+      </div>
 
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
@@ -753,6 +773,16 @@ export default function App() {
               onArchive={s.handleArchiveTask}
               onViewLogs={s.handleViewLogs}
             />
+            </ErrorBoundary>
+          ) : s.viewMode === 'timeline' ? (
+            <ErrorBoundary level="panel">
+            <main className="flex-1 overflow-hidden flex flex-col">
+              <TimelineView
+                tasks={filteredTasks}
+                hasActiveFilters={hasActiveFilters}
+                onViewLogs={s.handleViewLogs}
+              />
+            </main>
             </ErrorBoundary>
           ) : (
             <ErrorBoundary level="panel">

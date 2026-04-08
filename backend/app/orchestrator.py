@@ -50,6 +50,7 @@ _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: Optional[datetime] = None
+_last_concurrency_broadcast: float = 0.0
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: Optional[datetime] = None
@@ -143,6 +144,7 @@ async def orchestrator_worker():
         _max_plan_pools,
         _max_plan_pool_lock,
         get_github_token_for_task,
+        manager as ws_manager,
     )
     from app.github import (
         create_pr_comment,
@@ -259,6 +261,17 @@ async def orchestrator_worker():
                     _shared_state.tasks_queued_gauge = (await session.execute(
                         select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
                     )).scalar() or 0
+                    global _last_concurrency_broadcast
+                    if (time.monotonic() - _last_concurrency_broadcast) > 60:
+                        _last_concurrency_broadcast = time.monotonic()
+                        try:
+                            await ws_manager.broadcast_to_all("pipeline_throttle", {
+                                "reason": "concurrency_limit",
+                                "detail": f"All {_runtime_config['max_concurrent_vms']} VM slots in use",
+                                "recovery_seconds": None,
+                            })
+                        except Exception:
+                            pass
                     logger.info('orchestrator_cycle_complete', extra={
                         'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                         'tasks_dispatched': 0,
@@ -277,6 +290,14 @@ async def orchestrator_worker():
                     recent_rate = recent_failures / len(recent_window)
                     if recent_rate >= 0.8:
                         logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for 30s")
+                        try:
+                            await ws_manager.broadcast_to_all("pipeline_throttle", {
+                                "reason": "high_failure_rate",
+                                "detail": f"{recent_failures}/{len(recent_window)} recent tasks failed",
+                                "recovery_seconds": 30,
+                            })
+                        except Exception:
+                            pass
                         # Run account re-enablement before sleeping so rate-limited accounts
                         # can recover even while dispatch is throttled
                         await recheck_disabled_accounts()
@@ -366,6 +387,20 @@ async def orchestrator_worker():
                         logger.error(f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed")
                     elif all_met:
                         eligible_ids.append(task.id)
+                    else:
+                        # Surface dependency-wait reason to UI
+                        pending = [str(dt.id)[:8] for dt in dep_tasks if dt.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)]
+                        dep_msg = f"Waiting on {len(pending)} dep{'s' if len(pending) != 1 else ''}: {', '.join(pending[:3])}"
+                        if pending and task.latest_status_message != dep_msg:
+                            try:
+                                async with AsyncSessionLocal() as _dep_session:
+                                    _dep_task = await _dep_session.get(Task, task.id)
+                                    if _dep_task and _dep_task.latest_status_message != dep_msg:
+                                        _dep_task.latest_status_message = dep_msg
+                                        _dep_session.add(_dep_task)
+                                        await _dep_session.commit()
+                            except Exception:
+                                pass
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
                 global _last_deadlock_check
@@ -559,6 +594,11 @@ async def orchestrator_worker():
                             if candidate.latest_status_message != defer_msg:
                                 candidate.latest_status_message = defer_msg
                                 session.add(candidate)
+                                try:
+                                    await broadcast_to_project(str(candidate.project_id), "task_updated",
+                                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
+                                except Exception:
+                                    logger.debug(f"Failed to broadcast deferral for {eid}", exc_info=True)
                             logger.info(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}")
                         else:
                             non_conflicting.append(eid)
@@ -593,7 +633,16 @@ async def orchestrator_worker():
                             wait_sec = max(0, (recovery - now_check).total_seconds())
                             logger.info(f'[ORCHESTRATOR] All zones in cooldown — skipping dispatch (recovery in {int(wait_sec)}s)')
                         else:
+                            wait_sec = None
                             logger.info('[ORCHESTRATOR] All zones in cooldown — skipping dispatch')
+                        try:
+                            await ws_manager.broadcast_to_all("pipeline_throttle", {
+                                "reason": "zone_exhaustion",
+                                "detail": "All GCP zones in cooldown",
+                                "recovery_seconds": int(wait_sec) if wait_sec is not None else None,
+                            })
+                        except Exception:
+                            pass
                     queued_tasks = []  # Clear so the loop below is skipped
 
                 for task in queued_tasks:

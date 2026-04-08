@@ -31,6 +31,12 @@ interface DetailedHealth {
   autonomous: { enabled: boolean; consecutive_failures: number };
 }
 
+interface PipelineThrottle {
+  reason: string;
+  detail: string;
+  recovery_seconds: number | null;
+}
+
 interface OrchestratorHealthBarProps {
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
@@ -38,6 +44,7 @@ interface OrchestratorHealthBarProps {
   wsConnected: boolean;
   lastFetchTime: number;
   tasks: Task[];
+  pipelineThrottle?: PipelineThrottle | null;
 }
 
 const DEP_LABELS: Record<string, string> = {
@@ -75,7 +82,7 @@ function monitoringDuration(since: string, now: number): string {
   return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
 }
 
-export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks }: OrchestratorHealthBarProps) {
+export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
 
@@ -284,6 +291,17 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">{autonomousFailures} auto-fail</span>
             </div>
+          </>
+        )}
+
+        {pipelineThrottle && (
+          <>
+            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-900/40 text-amber-400 text-xs rounded">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              Throttled: {pipelineThrottle.detail}
+              {pipelineThrottle.recovery_seconds != null && ` (~${pipelineThrottle.recovery_seconds}s)`}
+            </span>
           </>
         )}
       </div>
