@@ -210,14 +210,15 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
     assert len(sleep_calls) == 3, (
         f"Expected 3 sleep calls (one per error cycle), got {len(sleep_calls)}: {sleep_calls}"
     )
-    assert sleep_calls[0] == 0.5, f"Error 1: expected 0.5s, got {sleep_calls[0]}s"
-    assert sleep_calls[1] == 1.0, (
-        f"Error 2: expected 1.0s, got {sleep_calls[1]}s. "
-        f"If 0.5, the counter is being reset at the start of each cycle (the bug)."
+    # Backoffs include ±20% jitter, so check ranges instead of exact values
+    assert 0.4 <= sleep_calls[0] <= 0.6, f"Error 1: expected ~0.5s, got {sleep_calls[0]}s"
+    assert 0.8 <= sleep_calls[1] <= 1.2, (
+        f"Error 2: expected ~1.0s, got {sleep_calls[1]}s. "
+        f"If ~0.5, the counter is being reset at the start of each cycle (the bug)."
     )
-    assert sleep_calls[2] == 2.0, (
-        f"Error 3: expected 2.0s, got {sleep_calls[2]}s. "
-        f"If 0.5, the counter is being reset at the start of each cycle (the bug)."
+    assert 1.6 <= sleep_calls[2] <= 2.4, (
+        f"Error 3: expected ~2.0s, got {sleep_calls[2]}s. "
+        f"If ~0.5, the counter is being reset at the start of each cycle (the bug)."
     )
 
 

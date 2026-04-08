@@ -511,7 +511,7 @@ async def orchestrator_worker():
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
                                         fix_session.add(fix_task)
-                                    broad_broken += 1
+                                        broad_broken += 1
                                 await fix_session.commit()
 
                     total_broken = narrow_broken + broad_broken
@@ -1105,7 +1105,6 @@ async def orchestrator_worker():
                 'tasks_recovered': tasks_recovered,
             })
             _orchestrator_last_cycle = _utcnow()
-            _orchestrator_consecutive_errors = 0
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
