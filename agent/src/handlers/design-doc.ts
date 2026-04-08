@@ -78,8 +78,10 @@ export async function handleDesignDocUpdate(
 # Project
 ${projectName}
 
-You are an architecture analyst. Your job is to maintain a living design document
-that accurately describes what this system IS — not what it should be.
+You are an architecture analyst. Your job is to analyze the codebase and output a
+structured JSON document describing the architecture. Do NOT create files in the
+repository, do NOT open pull requests, do NOT make any code changes. Your ONLY
+output is a JSON file written to /tmp/. This is a read-only analysis task.
 
 # Current design document
 ${existingDocJson || 'No document exists yet. Build one from scratch by analyzing the codebase.'}
@@ -137,6 +139,9 @@ ${proposalsText}
 8. If you're genuinely uncertain about an architectural decision or need user input, create a message. Max 3 per cycle. Don't block on answers — note assumptions and move on.
 ${openMessagesText ? `\n# Open Messages\nMessages from users or previous cycles. Address corrections and feedback.\n${openMessagesText}\n` : ''}
 # Output
+
+IMPORTANT: Do NOT create any files in the repository. Do NOT commit, push, or open PRs.
+Your only output is this JSON file:
 
 Write to /tmp/design_doc_output_${taskId}.json:
 
