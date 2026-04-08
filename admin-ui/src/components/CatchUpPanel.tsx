@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw } from 'lucide-react';
 import { apiFetch } from '../api';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
@@ -111,6 +112,7 @@ export interface CatchUpPanelProps {
   onRetry?: (taskId: string) => void;
   onBulkApprove?: (taskIds: string[]) => void;
   onBulkRetry?: (taskIds: string[]) => void;
+  wsRef?: RefObject<WebSocket | null>;
 }
 
 type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
@@ -184,8 +186,11 @@ function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask:
   const prNum = c.pr_url?.match(/\/(\d+)\/?$/)?.[1];
   return (
     <div
+      role="button"
+      tabIndex={0}
       className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
       onClick={() => onSelectTask({ id: c.task_id })}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: c.task_id }); } }}
     >
       <span className="flex-1 truncate text-neutral-400">{c.title}</span>
       <div className="shrink-0 flex items-center gap-2">
@@ -236,9 +241,10 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
         const isExpanded = expandedDirections.has(dp.direction_id);
         return (
           <div key={dp.direction_id}>
-            <div
-              className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30"
+            <button
+              className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30 w-full text-left"
               onClick={() => toggleDirection(dp.direction_id)}
+              aria-expanded={isExpanded}
             >
               {isExpanded ? <ChevronUp className="w-3 h-3 shrink-0 text-neutral-600" /> : <ChevronDown className="w-3 h-3 shrink-0 text-neutral-600" />}
               <span className="flex-1 truncate text-neutral-400">
@@ -266,7 +272,7 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                   </span>
                 )}
               </div>
-            </div>
+            </button>
             {isExpanded && (
               <div className="mt-1 ml-5 flex flex-col gap-1">
                 {dp.recent_finding_titles && dp.recent_finding_titles.length > 0 && (
@@ -295,7 +301,7 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -388,6 +394,59 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     intervalRef.current = setInterval(() => fetchDigest(true), refreshInterval);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [fetchDigest, collapsed, refreshInterval]);
+
+  // WebSocket-driven digest invalidation
+  useEffect(() => {
+    if (!wsRef) return;
+    let attachedWs: WebSocket | null = null;
+
+    const handleMessage = (event: MessageEvent) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.event === 'task_updated') {
+          fetchDigest(true);
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    const attach = () => {
+      const currentWs = wsRef.current;
+      if (currentWs === attachedWs) return;
+      if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
+      attachedWs = currentWs;
+      if (currentWs) currentWs.addEventListener('message', handleMessage);
+    };
+
+    attach();
+    const interval = setInterval(attach, 5000);
+    return () => {
+      clearInterval(interval);
+      if (attachedWs) attachedWs.removeEventListener('message', handleMessage);
+    };
+  }, [wsRef, fetchDigest]);
+
+  // Action wrappers: call prop then silently refresh digest after backend processes
+  const handleApprove = useCallback((taskId: string) => {
+    onApprove?.(taskId);
+    setTimeout(() => fetchDigest(true), 1500);
+  }, [onApprove, fetchDigest]);
+
+  const handleRetry = useCallback((taskId: string) => {
+    onRetry?.(taskId);
+    setTimeout(() => fetchDigest(true), 1500);
+  }, [onRetry, fetchDigest]);
+
+  const handleBulkApprove = useCallback((taskIds: string[]) => {
+    onBulkApprove?.(taskIds);
+    setTimeout(() => fetchDigest(true), 1500);
+  }, [onBulkApprove, fetchDigest]);
+
+  const handleBulkRetry = useCallback((taskIds: string[]) => {
+    onBulkRetry?.(taskIds);
+    setTimeout(() => fetchDigest(true), 1500);
+  }, [onBulkRetry, fetchDigest]);
 
   // Auto-expand most relevant section on initial digest load
   useEffect(() => {
@@ -491,6 +550,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
       <div className="flex items-center gap-2">
         <button
           onClick={toggle}
+          aria-expanded={!collapsed}
           className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
         >
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
@@ -533,6 +593,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               <button
                 key={key}
                 onClick={() => setActiveWindow(key)}
+                aria-pressed={activeWindow === key}
                 className={`px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors ${
                   activeWindow === key
                     ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
@@ -578,13 +639,16 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                     </p>
                   )}
                   {digest!.trend && (
-                    <span className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                      digest!.trend === 'improving'
-                        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
-                        : digest!.trend === 'declining'
-                          ? 'bg-red-500/15 text-red-400 border-red-500/20'
-                          : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30'
-                    }`}>
+                    <span
+                      className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                        digest!.trend === 'improving'
+                          ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
+                          : digest!.trend === 'declining'
+                            ? 'bg-red-500/15 text-red-400 border-red-500/20'
+                            : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30'
+                      }`}
+                      aria-label={`Trend: ${digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}`}
+                    >
                       {digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}
                     </span>
                   )}
@@ -593,7 +657,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
                 {digest!.success_rate != null && (
-                  <span className={`flex items-center gap-1 ${digest!.success_rate >= 0.8 ? 'text-emerald-400' : digest!.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
+                  <span
+                    className={`flex items-center gap-1 ${digest!.success_rate >= 0.8 ? 'text-emerald-400' : digest!.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}
+                    aria-label={`Success rate: ${Math.round(digest!.success_rate * 100)}% (${digest!.success_rate >= 0.8 ? 'healthy' : digest!.success_rate >= 0.5 ? 'warning' : 'critical'})`}
+                  >
                     {Math.round(digest!.success_rate * 100)}% success
                     {digest!.success_rate_delta != null && (
                       <span className={digest!.success_rate_delta > 0 ? 'text-emerald-400' : digest!.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
@@ -682,7 +749,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       {onBulkApprove && visibleItems.filter(i => i.reason === 'approval_required').length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
-                          onClick={() => onBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
+                          onClick={() => handleBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
                         >
                           <Check className="w-3 h-3" />
                           Approve all ({visibleItems.filter(i => i.reason === 'approval_required').length})
@@ -691,7 +758,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       {onBulkRetry && visibleItems.filter(i => i.reason === 'failed').length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
-                          onClick={() => onBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
+                          onClick={() => handleBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
                         >
                           <RotateCcw className="w-3 h-3" />
                           Retry all ({visibleItems.filter(i => i.reason === 'failed').length})
@@ -702,8 +769,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       {visibleItems.map(item => (
                         <div key={item.task_id} className="flex flex-col gap-1">
                           <div
+                            role="button"
+                            tabIndex={0}
                             className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                             onClick={() => onSelectTask({ id: item.task_id })}
+                            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >
                             <span className="flex-1 truncate text-neutral-300">{item.title}</span>
                             <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
@@ -717,7 +787,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                             {item.reason === 'approval_required' && onApprove && (
                               <button
                                 className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
-                                onClick={e => { e.stopPropagation(); onApprove(item.task_id); }}
+                                onClick={e => { e.stopPropagation(); handleApprove(item.task_id); }}
                               >
                                 <Check className="w-2.5 h-2.5" />
                                 Approve
@@ -726,7 +796,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                             {item.reason === 'failed' && onRetry && (
                               <button
                                 className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
-                                onClick={e => { e.stopPropagation(); onRetry(item.task_id); }}
+                                onClick={e => { e.stopPropagation(); handleRetry(item.task_id); }}
                               >
                                 <RotateCcw className="w-2.5 h-2.5" />
                                 Retry
@@ -737,18 +807,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                               <button
                                 className="text-neutral-600 hover:text-neutral-400 transition-colors px-1 leading-none text-sm"
                                 title="Dismiss or snooze"
+                                aria-label="Dismiss or snooze this item"
                                 onClick={() => setOpenDropdown(openDropdown === item.task_id ? null : item.task_id)}
+                                onKeyDown={e => { if (e.key === 'Escape') setOpenDropdown(null); }}
                               >
                                 ×
                               </button>
                               {openDropdown === item.task_id && (
                                 <div
                                   ref={dropdownRef}
+                                  role="menu"
                                   className="absolute right-0 top-full mt-0.5 z-10 bg-neutral-900 border border-neutral-700 rounded shadow-lg py-0.5 min-w-[110px]"
+                                  onKeyDown={e => { if (e.key === 'Escape') setOpenDropdown(null); }}
                                 >
                                   {(['Dismiss', 'Snooze 4h', 'Snooze 12h', 'Snooze 24h'] as const).map(opt => (
                                     <button
                                       key={opt}
+                                      role="menuitem"
                                       className="block w-full text-left text-[11px] px-3 py-1 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition-colors"
                                       onClick={() => {
                                         if (opt === 'Dismiss') dismissItem(item.task_id);
@@ -780,6 +855,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                             <div className="px-2">
                               <button
                                 onClick={() => toggleSnippet(item.task_id)}
+                                aria-expanded={expandedSnippets.has(item.task_id)}
+                                aria-label={expandedSnippets.has(item.task_id) ? 'Hide error details' : 'Show error details'}
                                 className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
                               >
                                 {expandedSnippets.has(item.task_id) ? 'hide error ▲' : 'show error ▼'}
@@ -816,6 +893,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                                   )}
                                   <button
                                     className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
+                                    aria-label="Restore this item"
                                     onClick={() => restoreItem(item.task_id)}
                                   >
                                     Restore
@@ -836,6 +914,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                 <div>
                   <button
                     onClick={() => setActiveExpanded(v => !v)}
+                    aria-expanded={activeExpanded}
                     className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
                   >
                     {activeExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -847,8 +926,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                       {digest!.active_tasks.map(t => (
                         <div
                           key={t.task_id}
+                          role="button"
+                          tabIndex={0}
                           className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                           onClick={() => onSelectTask({ id: t.task_id })}
+                          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
                           <span className="flex-1 truncate text-neutral-400">{t.title}</span>
                           <span className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500">
@@ -874,6 +956,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                 <div>
                   <button
                     onClick={() => setFailuresExpanded(v => !v)}
+                    aria-expanded={failuresExpanded}
                     className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
                   >
                     {failuresExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
@@ -898,6 +981,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                                 else next.add(group.failure_class);
                                 return next;
                               })}
+                              aria-expanded={isGroupExpanded}
                               className="flex items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
                             >
                               {isGroupExpanded ? <ChevronUp className="w-3 h-3 text-neutral-500 shrink-0" /> : <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />}
@@ -911,8 +995,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                                 {group.tasks.map(t => (
                                   <div key={t.task_id} className="flex flex-col gap-0.5">
                                     <div
+                                      role="button"
+                                      tabIndex={0}
                                       className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                                       onClick={() => onSelectTask({ id: t.task_id })}
+                                      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                                     >
                                       <span className="flex-1 truncate text-neutral-400">{t.title}</span>
                                       {t.attempt_count > 1 && (
@@ -928,6 +1015,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                                       <div className="px-2">
                                         <button
                                           onClick={() => toggleSnippet(t.task_id)}
+                                          aria-expanded={expandedSnippets.has(t.task_id)}
+                                          aria-label={expandedSnippets.has(t.task_id) ? 'Hide error details' : 'Show error details'}
                                           className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
                                         >
                                           {expandedSnippets.has(t.task_id) ? 'hide error ▲' : 'show error ▼'}
@@ -968,6 +1057,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   <div>
                     <button
                       onClick={() => setCompletionsExpanded(v => !v)}
+                      aria-expanded={completionsExpanded}
                       className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
                     >
                       {completionsExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}

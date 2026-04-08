@@ -485,6 +485,7 @@ export default function App() {
           onRetry={(taskId) => s.handleRetry(taskId)}
           onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
           onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
+          wsRef={s.wsRef}
         />
       )}
 

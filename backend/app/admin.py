@@ -3653,6 +3653,10 @@ async def get_digest(
             shipped = f"{trend_prefix}{completed_count} task{'s' if completed_count != 1 else ''} completed"
             if pr_count > 0:
                 shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
+            completion_titles = [t.title or "Completed task" for t in sorted_completions[:2]]
+            completion_titles = [t[:50] + "..." if len(t) > 50 else t for t in completion_titles]
+            if completion_titles:
+                shipped += f" including {', '.join(completion_titles)}"
             if completed_delta > 0:
                 shipped += f" (up from {prev_completed_count} last period)"
             elif completed_delta < 0:
