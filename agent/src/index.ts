@@ -2,6 +2,18 @@ import { spawn, execFileSync } from 'child_process';
 import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
+import {
+  API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH,
+  HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
+  GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
+  CONFLICT_CHECK_TIMEOUT,
+  MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS,
+  FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT,
+  AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
+  RUFF_TIMEOUT,
+  TEST_RUNNER_TIMEOUT,
+  CLAUDE_TIMEOUT_MS, MAX_OUTPUT_BYTES,
+} from './constants.js';
 
 // ── Environment ─────────────────────────────────────────────────────────────
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
@@ -24,7 +36,7 @@ async function tryRefreshToken(): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
       const res = await fetch(`${ORCHESTRATOR_URL}/api/agent/refresh-token`, {
         method: 'POST', headers: { ...apiHeaders }, body: JSON.stringify({}), signal: controller.signal,
       });
@@ -48,17 +60,17 @@ async function tryRefreshToken(): Promise<boolean> {
   return false;
 }
 
-export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = 5) {
+export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = API_MAX_RETRIES) {
   // Cap logs field to avoid 422 from backend's max_length=500000 validation.
   // A 422 is a 4xx = no retry = agent dies silently.
-  if (body.logs && typeof body.logs === 'string' && body.logs.length > 450_000) {
-    body = { ...body, logs: body.logs.slice(0, 450_000) + '\n...(truncated)' };
+  if (body.logs && typeof body.logs === 'string' && body.logs.length > LOGS_MAX_LENGTH) {
+    body = { ...body, logs: body.logs.slice(0, LOGS_MAX_LENGTH) + '\n...(truncated)' };
   }
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
         method: 'POST', headers: apiHeaders, body: JSON.stringify(body), signal: controller.signal,
       });
@@ -101,12 +113,12 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
   throw new Error(`POST ${path} failed after ${retries} retries`);
 }
 
-export async function apiGet(path: string, retries = 5) {
+export async function apiGet(path: string, retries = API_MAX_RETRIES) {
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, 30_000);
+      const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders, signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) return await res.json() as unknown;
@@ -236,7 +248,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     }
-  })(); }, 30_000);
+  })(); }, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -266,7 +278,6 @@ export function sendHeartbeatSync(taskId: string, statusMessage: string) {
 }
 
 // ── WebSocket Log Stream ────────────────────────────────────────────────────
-const MAX_LOG_BUFFER = 1000;
 interface LogEntry { timestamp: number; content: string; }
 const logBuffer: LogEntry[] = [];
 
@@ -325,6 +336,33 @@ export function sanitize(text: string): string {
     .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
 }
 
+export function readHandlerOutput<T = unknown>(
+  taskId: string,
+  outputType: string,
+  ws: WebSocket | null,
+): T | null {
+  const filePath = `/tmp/${outputType}_${taskId}.json`;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch (err: unknown) {
+    sendLog(ws, `[WARNING] Failed to read ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
+    return null;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err: unknown) {
+    sendLog(ws, `[WARNING] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
+    const match = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]) as T;
+      } catch { /* no fallback available */ }
+    }
+    return null;
+  }
+}
+
 export function validateBranchName(branch: string, label: string): string {
   if (!branch) throw new Error(`${label} is required`);
   if (!/^[a-zA-Z0-9_./-]+$/.test(branch)) throw new Error(`Invalid ${label}: ${branch}`);
@@ -349,14 +387,14 @@ export function git(args: string[], cwd = WORKSPACE): string {
 }
 
 /** Clone with retry — transient network failures get 3 attempts with exponential backoff. */
-export async function cloneWithRetry(args: string[], timeoutMs = 300_000): Promise<void> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
+  for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
     try {
       execFileSync('git', args, { encoding: 'utf-8', timeout: timeoutMs });
       return;
     } catch (e) {
-      if (attempt === 2) throw e;
-      const delay = 5000 * Math.pow(2, attempt);
+      if (attempt === CLONE_MAX_RETRIES - 1) throw e;
+      const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
       log(`Git clone failed (attempt ${attempt + 1}/3), retrying in ${delay / 1000}s: ${e instanceof Error ? e.message : String(e)}`);
       try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' }); } catch { /* ignore */ }
       await new Promise(r => setTimeout(r, delay));
@@ -428,7 +466,7 @@ export async function pushAndCreatePR(
 
     // Verify no conflict markers before pushing
     try {
-      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      const markers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: CONFLICT_CHECK_TIMEOUT }).trim();
       if (markers) {
         sendLog(ws, `WARNING: Conflict markers found in:\n${markers}\nAborting rebase and pushing original commit.\n`);
         try { git(['rebase', '--abort']); } catch { /* ignore */ }
@@ -463,8 +501,6 @@ export async function pushAndCreatePR(
 }
 
 // ── Lint / Build Checks ─────────────────────────────────────────────────────
-const MAX_LINT_FIX_ATTEMPTS = 3;
-
 /** Run lint/build checks on changed files. Throws with error details on failure. */
 export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
   const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
@@ -472,21 +508,21 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
   const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
   if (touchesFrontend) {
     sendLog(ws, 'Running frontend lint + build...\n');
-    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000 });
-    execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 60_000 });
-    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: 120_000, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
+    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
+    execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
+    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
     sendLog(ws, 'Frontend checks passed.\n');
   }
   if (touchesAgent) {
     sendLog(ws, 'Running agent type check...\n');
-    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 120_000 });
-    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: 60_000 });
+    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_NPM_TIMEOUT });
+    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_TSC_TIMEOUT });
     sendLog(ws, 'Agent type check passed.\n');
   }
   if (touchesBackend) {
     sendLog(ws, 'Running backend ruff lint...\n');
     try {
-      const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
+      const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
       sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
     } catch (err: unknown) {
       const errCode = (err as NodeJS.ErrnoException).code;
@@ -499,7 +535,7 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     }
     sendLog(ws, 'Running backend ruff format check...\n');
     try {
-      const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: 60_000 });
+      const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
       sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
     } catch (err: unknown) {
       const errCode = (err as NodeJS.ErrnoException).code;
@@ -536,8 +572,6 @@ export async function lintFixLoop(
   sendLog(ws, `WARNING: Lint checks still failing after ${MAX_LINT_FIX_ATTEMPTS} attempts.\n`);
   return false;
 }
-
-const MAX_TEST_FIX_ATTEMPTS = 2;
 
 /**
  * Detect the project's test runner, run tests, and retry via Claude on failure.
@@ -638,7 +672,7 @@ export async function testFixLoop(
     const failures: string[] = [];
     for (const runner of runners) {
       try {
-        execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: 180_000 });
+        execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
@@ -704,9 +738,8 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     if (effort) args.push('--effort', effort);
     const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true });
 
-    // Kill Claude if it exceeds 30 minutes — kill entire process group (negative PID)
+    // Kill Claude if it exceeds 45 minutes — kill entire process group (negative PID)
     // so child processes (npm, pytest, etc.) are also terminated
-    const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
     const killTimer = setTimeout(() => {
       log('Claude Code process timed out after 30 minutes — killing process group');
       sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
@@ -715,11 +748,9 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
       setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
     }, CLAUDE_TIMEOUT_MS);
 
-    const MAX_OUTPUT = 10_000_000; // 10MB cap — prevents unbounded memory growth
-
     claude.stdout.on('data', (data: Buffer) => {
       const text = data.toString();
-      if (allOutput.length < MAX_OUTPUT) allOutput += text;
+      if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       for (const line of text.split('\n').filter(Boolean)) {
         try {
           const obj = JSON.parse(line) as ClaudeOutput;
@@ -743,7 +774,7 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
 
     claude.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
-      if (allOutput.length < MAX_OUTPUT) allOutput += text;
+      if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (stderrBuffer.length < 50_000) stderrBuffer += text;
       sendLog(ws, `[stderr] ${text}`);
     });

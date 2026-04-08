@@ -37,6 +37,8 @@ from app.routers.agent import router as agent_router
 from app.routers.agent import verify_agent_token, get_github_token_for_task, invalidate_github_token_cache, _github_token_cache, _has_local_cycle
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
+from app.routers.directions import router as directions_router
+from app.routers.deploy import router as deploy_router
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -1875,6 +1877,8 @@ app.include_router(admin_router)
 app.include_router(agent_router)
 app.include_router(github_router)
 app.include_router(projects_router)
+app.include_router(directions_router)
+app.include_router(deploy_router)
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""

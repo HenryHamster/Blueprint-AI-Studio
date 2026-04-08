@@ -2,9 +2,10 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
-  WORKSPACE, strVal, sanitize, sendLog,
+  WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   apiPost, cloneWithRetry, runClaudeCode,
 } from '../index.js';
+import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree,
 } from '../prompt.js';
@@ -26,7 +27,7 @@ export async function handlePlan(
   sendLog(ws, `Planning task decomposition for: ${prompt.slice(0, 200)}\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -446,16 +447,8 @@ Rules:
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
-  let logs = '';
-  const findingsPath = `/tmp/research_findings_${taskId}.json`;
-  try {
-    if (fs.existsSync(findingsPath)) {
-      logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, `Read research findings from ${findingsPath}\n`);
-    }
-  } catch {
-    sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
-  }
+  const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);
+  let logs = researchFindings !== null ? sanitize(JSON.stringify(researchFindings)) : '';
   if (!logs) {
     if (lastResultText && lastResultText.includes('"prompt"')) {
       logs = sanitize(lastResultText);

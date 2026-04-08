@@ -6,6 +6,7 @@ import {
   apiPost, apiGet, git, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
 } from '../index.js';
+import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, readClaudeMd, formatProjectContext,
 } from '../prompt.js';
@@ -36,7 +37,7 @@ export async function handleReview(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -190,7 +191,7 @@ export async function handleFix(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', branch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);

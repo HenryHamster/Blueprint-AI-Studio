@@ -1,10 +1,10 @@
-import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
-  WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
+  WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   apiPost, apiGet, git, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
 } from '../index.js';
+import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, readClaudeMd, buildContextPrefix, buildFileTree,
 } from '../prompt.js';
@@ -22,7 +22,7 @@ export async function handleSecurityAudit(
   sendLog(ws, `Starting security audit...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -78,16 +78,8 @@ Rules:
   statusRef.value = 'Running security audit...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort);
 
-  let logs = '';
-  const findingsPath = `/tmp/security_findings_${taskId}.json`;
-  try {
-    if (fs.existsSync(findingsPath)) {
-      logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, `Read security findings from ${findingsPath}\n`);
-    }
-  } catch {
-    sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
-  }
+  const findings = readHandlerOutput(taskId, 'security_findings', ws);
+  let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
   if (!logs) {
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
@@ -312,13 +304,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
   const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort);
 
   // Read result file written by Claude
-  let smoketestResult: { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null = null;
-  try {
-    const resultJson = fs.readFileSync(`/tmp/smoketest_result_${taskId}.json`, 'utf-8');
-    smoketestResult = JSON.parse(resultJson) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> };
-  } catch {
-    sendLog(ws, `Warning: /tmp/smoketest_result_${taskId}.json not found or invalid\n`);
-  }
+  const smoketestResult = readHandlerOutput<{ passed: boolean; tests: Array<{ name: string; status: string; message: string }> }>(taskId, 'smoketest_result', ws);
 
   if (exitCode === 0 && smoketestResult) {
     // Live endpoint checks
@@ -431,7 +417,7 @@ ${gitDiffStat}
 
 4. Identify the specific root cause — name the file, function, and line where the problem originates.
 
-5. Write your analysis to /tmp/debug_output_${taskId}.json with EXACTLY this structure:
+5. Write your analysis to /tmp/debug_report_${taskId}.json with EXACTLY this structure:
 {
   "root_cause": "One clear paragraph explaining what caused the failure, which file/function is responsible, and how it broke",
   "affected_files": ["path/to/file1.ts", "path/to/file2.py"],
@@ -444,18 +430,12 @@ Set confidence to:
 - "medium" if you have a strong hypothesis but some uncertainty
 - "low" if the root cause is unclear or spans many systems
 
-IMPORTANT: Always write /tmp/debug_output_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
+IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
   const { allOutput } = await runClaudeCode(debugPrompt, ws, statusRef, model, effort);
 
-  let debugResult: { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null = null;
-  try {
-    const resultJson = fs.readFileSync(`/tmp/debug_output_${taskId}.json`, 'utf-8');
-    debugResult = JSON.parse(resultJson) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string };
-  } catch {
-    sendLog(ws, `Warning: /tmp/debug_output_${taskId}.json not found or invalid\n`);
-  }
+  const debugResult = readHandlerOutput<{ root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string }>(taskId, 'debug_report', ws);
 
   if (debugResult) {
     sendLog(ws, `\nDebug analysis complete (confidence: ${debugResult.confidence})\n`);
@@ -488,7 +468,7 @@ export async function handlePerf(
   sendLog(ws, `Starting performance analysis...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
@@ -505,7 +485,7 @@ Instructions:
 1. Read key files: backend/app/models.py (table/index definitions), backend/app/main.py (query patterns, endpoint handlers), and admin-ui/src (React components, imports).
 2. For each finding, identify the specific file, function, and line range where the problem is observable.
 3. Only report findings that are demonstrably present — cite the exact code pattern that shows the problem.
-4. Produce your findings as a JSON array written to /tmp/perf_output_${taskId}.json:
+4. Produce your findings as a JSON array written to /tmp/perf_report_${taskId}.json:
 
 [
   {
@@ -527,7 +507,7 @@ Rules:
 - Do NOT flag theoretical issues (e.g. "this could be slow if data grows") — only flag patterns that are demonstrably inefficient now
 - fix_prompt must be fully self-contained — the fixing agent has no context beyond that string
 - Limit to 15 findings maximum, prioritized by severity
-- IMPORTANT: Write your findings JSON array to /tmp/perf_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
+- IMPORTANT: Write your findings JSON array to /tmp/perf_report_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
   const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -535,16 +515,8 @@ Rules:
   statusRef.value = 'Running performance analysis...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort);
 
-  let logs = '';
-  const findingsPath = `/tmp/perf_output_${taskId}.json`;
-  try {
-    if (fs.existsSync(findingsPath)) {
-      logs = sanitize(fs.readFileSync(findingsPath, 'utf-8'));
-      sendLog(ws, `Read perf findings from ${findingsPath}\n`);
-    }
-  } catch {
-    sendLog(ws, `Failed to read ${findingsPath}, falling back to output parsing\n`);
-  }
+  const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
+  let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
   if (!logs) {
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
@@ -576,7 +548,7 @@ export async function handleInvestigate(
   sendLog(ws, `Starting investigation...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', '50', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 
@@ -608,31 +580,18 @@ IMPORTANT:
   statusRef.value = 'Running investigation...';
   const { exitCode } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
 
-
-  const reportPath = `/tmp/investigation_report_${taskId}.json`;
-
-  let logs = '';
-  try {
-    if (!fs.existsSync(reportPath)) {
-      throw new Error(`Investigation report not found at ${reportPath}`);
-    }
-    const raw = fs.readFileSync(reportPath, 'utf-8');
-    // Validate it parses as JSON
-    JSON.parse(raw);
-    logs = sanitize(raw);
-    sendLog(ws, `Read investigation report from ${reportPath}\n`);
-  } catch (e) {
-    const errMsg = `Failed to read investigation report: ${String(e)}`;
-    sendLog(ws, `${errMsg}\n`);
+  const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
+  if (investigationResult === null) {
     await apiPost('/api/agent/status', {
       task_id: taskId,
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
-      logs: errMsg,
+      logs: `Failed to read investigation report from /tmp/investigation_report_${taskId}.json`,
     });
     return;
   }
 
+  const logs = sanitize(JSON.stringify(investigationResult));
   await apiPost('/api/agent/status', {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
