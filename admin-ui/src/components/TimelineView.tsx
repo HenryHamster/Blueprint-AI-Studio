@@ -39,6 +39,14 @@ function formatDuration(ms: number): string {
 
 function getTaskEnd(task: Task, now: number): number {
   if (TERMINAL_STATUSES.includes(task.status)) {
+    // Use last status_log entry as completion time, then last_heartbeat, then created_at
+    if (task.status_log?.length) {
+      try {
+        const lastEntry = task.status_log[task.status_log.length - 1];
+        const ts = new Date(lastEntry.t).getTime();
+        if (!isNaN(ts)) return ts;
+      } catch { /* fall through */ }
+    }
     return task.last_heartbeat ? new Date(task.last_heartbeat).getTime() : new Date(task.created_at).getTime();
   }
   if (task.last_heartbeat) return Math.max(new Date(task.last_heartbeat).getTime(), now);

@@ -16,7 +16,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
-from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
@@ -135,6 +135,8 @@ async def get_all_projects(
             "github_repo": project.github_repo,
             "created_at": project.created_at.isoformat() if project.created_at else None,
             "directions": project.directions,
+            "vision": project.vision or {},
+            "design_doc": project.design_doc or {},
             "autonomous_enabled": project.autonomous_enabled,
             "is_self_repo": project.is_self_repo,
             "my_role": role,
@@ -145,6 +147,8 @@ async def get_all_projects(
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     directions: Optional[List[Dict[str, Any]]] = None
+    vision: Optional[Dict[str, Any]] = None
+    design_doc: Optional[Dict[str, Any]] = None
     autonomous_enabled: Optional[bool] = None
 
 
@@ -177,6 +181,21 @@ async def update_project(
             normalized.append(entry)
         project.directions = normalized
         flag_modified(project, "directions")
+    if payload.vision is not None:
+        vision = dict(payload.vision)
+        current_rev = (project.vision or {}).get("revision", 0)
+        vision["revision"] = (current_rev or 0) + 1
+        vision["last_updated"] = _utcnow().isoformat()
+        project.vision = vision
+        flag_modified(project, "vision")
+    if payload.design_doc is not None:
+        doc = dict(payload.design_doc)
+        current_rev = (project.design_doc or {}).get("revision", 0)
+        doc["revision"] = (current_rev or 0) + 1
+        doc["last_updated"] = _utcnow().isoformat()
+        doc["updated_by"] = "user"
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
 
     session.add(project)
     await session.commit()
@@ -1462,6 +1481,7 @@ async def get_settings(
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
+        "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
         "github_account": github_account,
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
@@ -1617,6 +1637,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 50):
             raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 50")
         _runtime_config["autonomous_research_wave_size"] = val
+    if "strategic_research_frequency" in payload:
+        try:
+            val = int(payload["strategic_research_frequency"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="strategic_research_frequency must be a number")
+        if not (0 <= val <= 100):
+            raise HTTPException(status_code=400, detail="strategic_research_frequency must be between 0 and 100 (0 = disabled)")
+        _runtime_config["strategic_research_frequency"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -1650,6 +1678,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
                     "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
+                    "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
@@ -2596,6 +2625,146 @@ async def dismiss_all_alerts(
     result = await session.execute(stmt)
     await session.commit()
     return {"dismissed_count": result.rowcount}
+
+
+# ── Project Messages ─────────────────────────────────────────────────────────
+
+class MessageCreate(BaseModel):
+    project_id: str
+    message_type: str = "NOTE"
+    content: str
+    context: Optional[Dict[str, Any]] = None
+
+class MessageResolve(BaseModel):
+    resolution: Optional[str] = None
+
+@router.get("/messages")
+async def list_messages(
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query("open"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List project messages, optionally filtered by project and status."""
+    user_pids = _user_project_ids(current_user["user_id"])
+    filters = [ProjectMessage.project_id.in_(user_pids)]
+    if project_id:
+        try:
+            filters.append(ProjectMessage.project_id == uuid.UUID(project_id))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid project_id format")
+    if status and status != "all":
+        if status not in ("open", "resolved"):
+            raise HTTPException(status_code=400, detail="Invalid status filter. Must be 'open', 'resolved', or 'all'")
+        filters.append(ProjectMessage.status == status)
+
+    total = (await session.execute(
+        select(func.count()).select_from(ProjectMessage).where(*filters)
+    )).scalar() or 0
+
+    result = await session.execute(
+        select(ProjectMessage).where(*filters)
+        .order_by(ProjectMessage.created_at.desc())
+        .offset(offset).limit(limit)
+    )
+    messages = result.scalars().all()
+
+    return {
+        "messages": [
+            {
+                "id": str(m.id),
+                "project_id": str(m.project_id),
+                "message_type": m.message_type,
+                "from_type": m.from_type,
+                "from_task_id": str(m.from_task_id) if m.from_task_id else None,
+                "content": m.content,
+                "context": m.context or {},
+                "status": m.status,
+                "resolution": m.resolution,
+                "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in messages
+        ],
+        "total": total,
+    }
+
+@router.post("/messages")
+async def create_message(
+    payload: MessageCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """User creates a message (feedback, bug report, note)."""
+    try:
+        project_id = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    # Verify user has access
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    valid_types = {t.value for t in MessageType}
+    msg_type = payload.message_type.upper()
+    if msg_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    # Cap context size to prevent storage abuse
+    ctx = payload.context or {}
+    if len(json.dumps(ctx)) > 50_000:
+        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
+
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType(msg_type),
+        from_type="user",
+        content=payload.content.strip()[:5000],
+        context=ctx,
+    )
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+    return {"id": str(msg.id), "status": "created"}
+
+@router.patch("/messages/{message_id}")
+async def resolve_message(
+    message_id: uuid.UUID,
+    payload: MessageResolve,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resolve a message with an optional response."""
+    msg = await session.get(ProjectMessage, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    # Verify user has access to the project
+    await _get_user_project(msg.project_id, current_user["user_id"], session)
+
+    if msg.status == "resolved":
+        return {"id": str(msg.id), "status": "already_resolved"}
+    msg.status = "resolved"
+    msg.resolution = (payload.resolution or "").strip()[:5000] or None
+    msg.resolved_at = _utcnow()
+    session.add(msg)
+    await session.commit()
+    return {"id": str(msg.id), "status": "resolved"}
+
+@router.delete("/messages/{message_id}")
+async def delete_message(
+    message_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a message."""
+    msg = await session.get(ProjectMessage, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    await _get_user_project(msg.project_id, current_user["user_id"], session)
+    await session.delete(msg)
+    await session.commit()
+    return {"deleted": True}
 
 
 # ── Autonomy Debug ────────────────────────────────────────────────────────────

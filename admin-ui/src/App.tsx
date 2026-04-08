@@ -27,6 +27,7 @@ import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { CatchUpPanel } from './components/CatchUpPanel';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { TimelineView } from './components/TimelineView';
+import { MessagesPanel } from './components/MessagesPanel';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -365,6 +366,8 @@ export default function App() {
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showActivityFeed={s.showActivityFeed}
         onToggleActivityFeed={() => s.setShowActivityFeed(prev => !prev)}
+        showMessages={s.showMessages}
+        onToggleMessages={() => s.setShowMessages(prev => !prev)}
         newActivityCount={newActivityCount}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
@@ -387,6 +390,8 @@ export default function App() {
         onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
         directionCooldownMinutes={s.directionCooldownMinutes}
         onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
+        strategicResearchFrequency={s.strategicResearchFrequency}
+        onUpdateStrategicResearchFrequency={s.handleUpdateStrategicResearchFrequency}
         onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}
         healthCheckUrls={s.healthCheckUrls}
         onUpdateHealthCheckUrls={s.updateHealthCheckUrls}
@@ -590,6 +595,12 @@ export default function App() {
           lastVisitTimestamp={s.prevLastActivityFeedOpen}
           onEventsChange={setActivityEvents}
           initialFilter={activityFeedFilter}
+        />
+      ) : s.showMessages ? (
+        <MessagesPanel
+          selectedProjectId={s.selectedProjectId}
+          onClose={() => s.setShowMessages(false)}
+          addToast={s.addToast}
         />
       ) : s.showArchive ? (
         <ArchiveView

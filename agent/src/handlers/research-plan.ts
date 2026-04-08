@@ -176,12 +176,16 @@ Rules:
     }
   }
 
-  await apiPost('/api/agent/status', {
-    task_id: taskId,
-    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
-    logs,
-  });
+  try {
+    await apiPost('/api/agent/status', {
+      task_id: taskId,
+      status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+      ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
+      logs,
+    });
+  } catch (e) {
+    sendLog(ws, `[ERROR] Failed to post plan completion status: ${e}\n`);
+  }
 }
 
 // ── Handler: Research (analyze codebase, output improvement findings) ──────
@@ -383,43 +387,359 @@ ${hotspotsSection}
 
   const contextPrefix = buildContextPrefix(task);
 
+  // ── Strategic mode: product-level vision review ────────────────────────
+  if (payload.research_mode === 'strategic') {
+    const vision = payload.vision as Record<string, unknown> | undefined;
+    const directionsSummary = Array.isArray(payload.directions_summary)
+      ? payload.directions_summary as Array<Record<string, unknown>>
+      : [];
+    const projectName = strVal(payload.project_name, 'Unknown Project');
+
+    const openMessages = Array.isArray(payload.open_messages)
+      ? payload.open_messages as Array<Record<string, unknown>>
+      : [];
+
+    const visionJson = vision && Object.keys(vision).length > 0
+      ? JSON.stringify(vision, null, 2)
+      : '';
+
+    // Build outcome evaluation section
+    const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
+    let outcomeSection = '';
+    if (outcomeEval && typeof outcomeEval === 'object') {
+      const window = outcomeEval.window as Record<string, unknown> | undefined;
+      const overall = outcomeEval.overall as Record<string, unknown> | undefined;
+      const systems = Array.isArray(outcomeEval.systems) ? outcomeEval.systems as Array<Record<string, unknown>> : [];
+      const dirOutcomes = Array.isArray(outcomeEval.directions) ? outcomeEval.directions as Array<Record<string, unknown>> : [];
+
+      const lines: string[] = [];
+      if (window) {
+        lines.push(`# Outcome evaluation (since vision rev ${window.vision_revision || 0})`);
+        lines.push(`Window: ${strVal(window.from as string, '?')} to ${strVal(window.to as string, '?')}`);
+      }
+      if (overall) {
+        const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
+        lines.push(`Overall: ${overall.cycles || 0} cycles, ${overall.merged || 0} merged, ${overall.failed || 0} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')})`);
+      }
+
+      if (systems.length > 0) {
+        lines.push('');
+        lines.push('## System progress');
+        lines.push('Each vision system compared against actual direction outcomes:');
+        for (const sys of systems) {
+          const gap = (sys.directions_count as number) === 0 ? ' [NO DIRECTIONS MAPPED]' : '';
+          lines.push(`- ${strVal(sys.name as string)} (${strVal(sys.id as string)}): planned=${strVal(sys.planned_status as string)}, ${sys.directions_count || 0} directions, ${sys.merged || 0} merged, ${sys.failed || 0} failed${gap}`);
+        }
+      }
+
+      if (dirOutcomes.length > 0) {
+        lines.push('');
+        lines.push('## Direction outcomes');
+        lines.push('What each direction actually produced. Use confirmed findings to judge real impact:');
+        for (const d of dirOutcomes) {
+          const sysTag = d.system_id ? ` (system: ${strVal(d.system_id as string)})` : '';
+          lines.push(`\n### ${strVal(d.text as string)} (${strVal(d.id as string)})${sysTag} [${strVal(d.status as string)}]`);
+          lines.push(`Stats: ${d.cycles || 0} cycles, ${d.merged || 0} merged, ${d.failed || 0} failed`);
+
+          const lifetime = d.lifetime as Record<string, number> | undefined;
+          if (lifetime) {
+            lines.push(`Lifetime: ${lifetime.cycles || 0} total cycles, ${lifetime.merged || 0} total merged`);
+          }
+
+          const confirmed = Array.isArray(d.confirmed) ? d.confirmed as string[] : [];
+          if (confirmed.length > 0) {
+            lines.push(`Confirmed (shipped): ${confirmed.join('; ')}`);
+          }
+          const proposed = Array.isArray(d.proposed) ? d.proposed as string[] : [];
+          if (proposed.length > 0) {
+            lines.push(`Proposed (in-flight): ${proposed.join('; ')}`);
+          }
+          const failedApproaches = Array.isArray(d.failed_approaches) ? d.failed_approaches as string[] : [];
+          if (failedApproaches.length > 0) {
+            lines.push(`Failed approaches: ${failedApproaches.slice(0, 5).join('; ')}`);
+          }
+        }
+      }
+
+      if (lines.length > 0) {
+        outcomeSection = '\n' + lines.join('\n') + '\n';
+      }
+    }
+
+    const openMessagesText = openMessages.length > 0
+      ? openMessages.map(m => {
+          const age = m.created_at ? (() => {
+            const ms = Date.now() - new Date(String(m.created_at)).getTime();
+            const h = Math.floor(ms / 3600000);
+            return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+          })() : '?';
+          return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 200)}`;
+        }).join('\n')
+      : '';
+
+    const dirSummaryText = directionsSummary.length > 0
+      ? directionsSummary.map((d, i) => {
+          const parts = [`${d.total_cycles || 0} cycles`];
+          if (d.prs_merged) parts.push(`${d.prs_merged} merged`);
+          if (d.tasks_failed) parts.push(`${d.tasks_failed} failed`);
+          const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
+          const sysNote = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
+
+          // Research context: show established findings count, failed approaches, open questions
+          let ctxSection = '';
+          if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
+            const rawCtx = d.research_context as string;
+            const sections: Record<string, string[]> = { established: [], failed: [], open: [] };
+            let currentSection = '';
+            for (const line of rawCtx.split('\n')) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
+              if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
+              if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
+              if (trimmed.startsWith('- ') && currentSection) {
+                sections[currentSection].push(trimmed);
+              }
+            }
+            const ctxParts: string[] = [];
+            if (sections.established.length > 0) {
+              const confirmed = sections.established.filter(s => s.includes('(confirmed)'));
+              const proposed = sections.established.filter(s => s.includes('(proposed)'));
+              ctxParts.push(`   ${confirmed.length} confirmed findings, ${proposed.length} proposed`);
+            }
+            if (sections.failed.length > 0) {
+              ctxParts.push(`   Failed approaches: ${sections.failed.slice(0, 3).join('; ')}`);
+            }
+            if (sections.open.length > 0) {
+              ctxParts.push(`   Open questions: ${sections.open.slice(0, 3).join('; ')}`);
+            }
+            if (ctxParts.length > 0) ctxSection = '\n' + ctxParts.join('\n');
+          }
+
+          // Recent findings: what was actually discovered/built
+          let findingsSection = '';
+          const findings = Array.isArray(d.recent_findings) ? d.recent_findings as string[] : [];
+          if (findings.length > 0) {
+            findingsSection = `\n   Recent work: ${findings.slice(0, 5).join('; ')}`;
+          }
+
+          // Recent failures: why things failed
+          let failuresSection = '';
+          const failures = Array.isArray(d.recent_failures) ? d.recent_failures as Array<Record<string, string>> : [];
+          if (failures.length > 0) {
+            const failLines = failures.slice(0, 3).map(f => `${f.title || '?'}: ${f.reason || 'unknown'}`);
+            failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
+          }
+
+          return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)} (id: ${strVal(d.id)})${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
+        }).join('\n\n')
+      : 'No directions exist yet.';
+
+    // Build design doc section — this is the primary input for Phase 2
+    const designDoc = payload.design_doc as Record<string, unknown> | undefined;
+    const designDocJson = designDoc && Object.keys(designDoc).length > 0
+      ? JSON.stringify(designDoc, null, 2)
+      : '';
+
+    const strategicPrompt = `${contextPrefix}You are a strategic product architect. You decide WHERE this project goes.
+
+The design document tells you what IS. The vision tells you what SHOULD BE.
+The outcome evaluation tells you what CHANGED. Your job is to close the gap.
+
+# Current architecture (design document)
+${designDocJson || 'No design document exists yet. The architecture agent will build one. For now, use the file tree below.'}
+
+# Current vision
+${visionJson || 'No vision exists yet. Build one from the design document and project context.'}
+${outcomeSection}
+# Current research directions
+${dirSummaryText}
+
+# Project
+${projectName}
+
+# Reference
+${codebaseSummary}${fileTreeSection}
+${openMessagesText ? `# Open Messages\nMessages from users or previous cycles. Address them through direction changes where appropriate.\n${openMessagesText}\n` : ''}
+# Instructions
+
+1. **Study the design document.** This is ground truth about what exists. The architecture
+   agent just analyzed the codebase — trust its assessment over your own guesses about code.
+
+2. **Review the outcome evaluation.** What actually shipped since the last vision update?
+   For each direction, judge: is the confirmed work meaningful toward its vision system,
+   or is it low-impact churn? A direction that merges 5 trivial PRs is less valuable than
+   one that merges 1 architectural foundation.
+
+3. **Compare architecture against vision.** Where are the gaps?
+   - Systems in the vision that the design doc shows as "missing" or "stub" → need directions
+   - Capabilities the design doc shows as "missing" → may need new vision systems + directions
+   - Systems the design doc shows as "mature" → may not need active directions
+   - If the design doc doesn't exist yet, use the file tree and project context to form an initial vision
+
+4. **Update the vision based on reality:**
+   - Update system statuses to match what the design doc shows
+   - Adjust priorities based on confirmed outcomes, not hoped-for outcomes
+   - Don't plan systems the project clearly doesn't need
+   - Add systems for gaps the design doc identified
+
+5. **Manage directions:**
+   - Create directions for the most impactful gaps between doc and vision
+   - Retire directions for work the design doc shows is already complete
+   - Reprioritize based on what's actually working vs stuck
+   - Tag each direction with system_id — this drives research priority
+   - Think about sequencing — what depends on what
+
+6. Address open messages. Create messages only for genuine design questions. Max 3 per cycle.
+
+Messages are async — never wait for answers. Make your best judgment and note assumptions.
+Judge by impact, not activity. Think big — what fundamental changes would move this project forward?
+
+# Output
+
+Write to /tmp/strategic_output_${taskId}.json:
+
+\`\`\`json
+{
+  "vision": {
+    "purpose": "What this product is and who it's for",
+    "success_criteria": ["Outcome-level goals"],
+    "systems": [
+      {
+        "id": "sys-short-id",
+        "name": "System Name",
+        "description": "What and why",
+        "status": "planned | in_progress | functional | mature",
+        "depends_on": ["sys-other-id"]
+      }
+    ],
+    "priorities": ["sys-id-1", "sys-id-2"],
+    "context": "Free-form notes — confidence gaps, strategic reasoning, open questions"
+  },
+  "direction_operations": [
+    { "op": "create", "text": "Direction description", "priority": "high|medium|low", "system_id": "sys-id from vision", "rationale": "Why" },
+    { "op": "update", "direction_id": "d-xxx", "changes": { "text": "...", "priority": "...", "system_id": "sys-id" }, "rationale": "Why" },
+    { "op": "retire", "direction_id": "d-xxx", "rationale": "Why" }
+  ],
+  "messages": [
+    { "type": "question|blocker|note", "content": "Your question or note", "context": {} }
+  ],
+  "resolved_messages": [{"id": "uuid-of-message", "resolution": "How you addressed it"}]
+}
+\`\`\`
+
+The vision schema is flexible — add fields if they help capture your understanding.
+Direction operations only — no implementation findings. If something is urgent, create or reprioritize a direction for it.
+Max 10 direction operations per cycle (max 5 creates). Focus on the most impactful changes.`;
+
+    statusRef.value = 'Running strategic vision review...';
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort);
+
+    const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
+    let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
+    if (!logs) {
+      // Fall back to parsing output for JSON
+      const jsonMatch = allOutput.match(/\{[\s\S]*?"vision"[\s\S]*?"direction_operations"[\s\S]*?\}\s*$/);
+      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+    }
+
+    try {
+      await apiPost('/api/agent/status', {
+        task_id: taskId,
+        status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+        ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
+        logs,
+      });
+    } catch (e) {
+      sendLog(ws, `[ERROR] Failed to post strategic completion status: ${e}\n`);
+    }
+    return;
+  }
+
+  // ── Tactical research mode (default) ──────────────────────────────────
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
     ? (projectCtx.recently_completed_tasks as Array<{title: string, task_type: string, status?: string}>)
     : [];
 
+  // Build design doc section for tactical research
+  const tacticalDesignDoc = payload.design_doc as Record<string, unknown> | undefined;
+  const dirDesignCtx = payload.direction_design_context as Record<string, unknown> | undefined;
+
+  // Direction-specific design doc highlight — surfaces relevant system + spec upfront
+  let designDocHighlight = '';
+  if (dirDesignCtx) {
+    const lines: string[] = ['# YOUR DIRECTION\'S ARCHITECTURE CONTEXT'];
+    const sys = dirDesignCtx.system as Record<string, unknown> | undefined;
+    if (sys) {
+      lines.push(`System: ${strVal(sys.name as string)} (${strVal(sys.id as string)}) — status: **${strVal(sys.status as string)}**`);
+      if (sys.description) lines.push(`Description: ${strVal(sys.description as string)}`);
+      if (sys.spec) {
+        const spec = sys.spec as Record<string, unknown>;
+        lines.push('Architectural spec (use this as your blueprint):');
+        if (spec.approach) lines.push(`  Approach: ${strVal(spec.approach as string)}`);
+        if (Array.isArray(spec.technology)) lines.push(`  Technology: ${(spec.technology as string[]).join(', ')}`);
+        if (Array.isArray(spec.interfaces)) lines.push(`  Interfaces: ${(spec.interfaces as string[]).join('; ')}`);
+        if (Array.isArray(spec.integration_points)) lines.push(`  Integration: ${(spec.integration_points as string[]).join('; ')}`);
+        if (spec.notes) lines.push(`  Notes: ${strVal(spec.notes as string)}`);
+      }
+    } else {
+      lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
+    }
+    const missingCaps = dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined;
+    if (missingCaps && Object.keys(missingCaps).length > 0) {
+      lines.push('Missing/partial capabilities relevant to your direction:');
+      for (const [name, cap] of Object.entries(missingCaps)) {
+        lines.push(`  - ${name}: ${cap.status}${cap.notes ? ` (${cap.notes})` : ''}`);
+      }
+    }
+    lines.push('');
+    designDocHighlight = lines.join('\n') + '\n';
+  }
+
+  const designDocSection = tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0
+    ? `# ARCHITECTURE (Design Document)\nFull architectural context. Your direction's specific context is highlighted above.\n${JSON.stringify(tacticalDesignDoc, null, 2)}\n\n`
+    : '';
+
   const researchPrompt = `${contextPrefix}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
-# SECTION 1: MISSION
+# MISSION
 
-Your job: find what this codebase is MISSING. Not what's slightly wrong — what doesn't exist yet. Each finding you produce should require 100+ lines of real implementation across multiple files.
+Your job is to advance the system toward its directions. HOW you do that depends on what exists:
 
-Before writing any finding, ask: "Would a senior engineer make this a standalone PR, or roll their eyes?" If the latter, it's not a finding.
+**If a direction targets something MISSING** (the design document shows it as missing, stub, or
+nonexistent): your job is to DESIGN it. Output a single large-scope finding that builds the
+foundation. The plan agent will decompose it into ordered implementation steps. Don't output
+5 small findings when the system needs 1 foundational one.
 
-BAD findings (will be rejected by the pipeline):
-- "add X to Y" where the change is <50 lines — wiring, not engineering
-- Cosmetic polish, trivial data plumbing, config tweaks, lint rules
-- Standalone test additions — bundle into the feature that needs them
-- Anything direction notes say is "in place" or "established"
+**If the design document has a spec for the target system** (look for a "spec" field on the
+system entry): use it as your architectural blueprint. The architecture agent analyzed the
+full codebase and wrote that spec to fit the existing stack. Follow its approach, technology
+choices, and integration points. You should still explore the codebase to verify the spec
+makes sense, but don't redesign from scratch when a spec exists.
 
-GOOD findings:
-- New subsystems or capabilities (cost tracking, knowledge persistence, live WebSocket view)
-- Architectural decomposition (splitting monolithic files into modules)
-- Cross-cutting changes affecting 3+ components
-- Performance fixes for real bottlenecks (N+1 queries, blocking I/O)
-- Missing user-facing capabilities that change how someone uses the product
+**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
+normal for new projects. Use the design doc specs and the project's config files to create
+foundational structure. Output a large-scope finding that bootstraps the target system.
 
-Direction maturity — the MORE cycles, the BIGGER the findings:
-- Cycles 1-2: Medium scope minimum. Surface-level gaps OK.
-- Cycles 3-4: Large scope only. What's MISSING as a system?
-- Cycles 5+: ONLY architectural or new-capability findings. If only small things remain, propose a direction_update or direction_note.
+**If a direction targets something EXISTING** (the design document shows it as partial, functional,
+or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
+broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.
+Quality over quantity — 2 real findings beats 10 incremental ones.
 
-# SECTION 2: CODEBASE CONTEXT
+**Sequencing matters.** If your findings have dependencies (e.g., "build cache infrastructure"
+must come before "add caching to user API"), use depends_on_indices to order them. The pipeline
+respects these — dependent tasks won't start until prerequisites complete.
+
+**Think in layers:** Foundation first, then features. If the last cycle confirmed a foundation
+was built (check research context for "(confirmed)" entries), build features on top of it.
+Don't re-propose the foundation.
+
+# CODEBASE CONTEXT
 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
-# SECTION 3: DIRECTIONS
+${designDocHighlight}${designDocSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${anomalySection}
-# SECTION 4: DEDUP — do not re-propose these
+# DEDUP — do not re-propose these
 ${recentlyCompleted.length > 0
   ? recentlyCompleted.map(t => {
       const status = t.status ?? 'completed';
@@ -428,25 +748,40 @@ ${recentlyCompleted.length > 0
     }).join('\n')
   : '(none yet)'}
 
-# SECTION 5: HOW TO RESEARCH
+# HOW TO RESEARCH
 
-1. Explore aggressively — spawn subagents for parallel exploration, use WebSearch for best practices, use TodoWrite to track coverage. For each direction, ask: "what would it take for this to be DONE?" Work backward.
-2. Think about what the system CAN'T do, not what it does slightly wrong. Missing capabilities > polish.
-3. Before writing findings, verify you explored all major directories and have a TodoWrite checklist showing coverage.
-4. Self-review: spawn a review subagent that REJECTs any finding <100 lines or touching only 1 file. If <3 survive, explore deeper.
-5. Finding prompts should describe the PROBLEM and desired outcome — not exact line numbers. Let implementing agents make design decisions.
+1. Explore aggressively — spawn subagents for parallel exploration, use WebSearch for best practices, use TodoWrite to track coverage.
+2. For each direction, ask: "what would it take for this to be DONE?" Work backward from the goal.
+3. Check the design document — if the direction targets something missing, look for a spec on that system entry first. If a spec exists, use it as your design foundation. If no spec, design from scratch. If the direction targets something existing, improve it.
+4. Before writing findings, verify you explored all major directories.
+5. Finding prompts should describe the PROBLEM and desired outcome — not exact line numbers.
+   For foundational findings (scope=large), include: what the system needs and why, recommended
+   approach and technology choices, key architectural decisions, and how it fits with existing systems.
+   Let implementing agents handle the code, but give them the design.
 
-# SECTION 6: OUTPUT FORMAT
+# SCOPE GUIDANCE
+
+- **Building something new?** Use scope=large. Write the finding prompt as a design brief.
+  The plan agent will decompose this into ordered implementation steps.
+- **Improving something existing?** Use scope=small or medium as appropriate.
+- **Building features on a foundation?** If research context shows a foundation was confirmed
+  (e.g., "(confirmed)" entries), output findings that USE it. These are typically scope=medium.
+
+Don't output 10 incremental findings when the direction needs 1 foundational change.
+1 well-designed large finding that builds the right architecture is worth more than
+10 small fixes that don't add up to a system.
+
+# OUTPUT FORMAT
 
 Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array as the last thing in your response.
 
 \`\`\`json
 [{
-  "type": "feature|improvement|bug|refactor|perf|research|security_audit|qa|deps|docs|migrate|test|direction_proposal|direction_update|direction_note",
+  "type": "feature|improvement|bug|refactor|perf|research|security_audit|qa|deps|docs|migrate|test|direction_proposal|direction_update|direction_note|design_doc_observation",
   "title": "feat: short title (under 60 chars, conventional commit style)",
   "description": "1-3 sentences: what and why",
   "prompt": "Self-contained prompt for the implementing agent. Describe the problem and desired outcome.",
-  "scope": "medium|large",
+  "scope": "small|medium|large",
   "risk": "low|medium|high",
   "priority": "high|medium|low",
   "related_files": ["path/to/file.py"],
@@ -459,15 +794,13 @@ Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array a
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
+Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research.
 
-Rules:
-- Target 8-12 findings, all scope=medium or large. One scope=small "chore: housekeeping" bundling minor fixes is OK.
 - Use scope=large freely — the pipeline has a plan agent for safe decomposition.
-- Use model=claude-opus-4-6 and effort=high for large findings.
-- Routing: large scope \u2192 plan agent (decomposition), medium \u2192 create agent (single PR), research \u2192 sub-research, direction_proposal \u2192 user review.
 - direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
 - direction_note: add context to a direction (fields: direction_id, description max 500 chars). Be honest about progress.
 - direction_proposal: propose a new standing direction (max 2 per cycle, held for user approval).
+- design_doc_observation: flag an architectural observation for the design document (fields: description, section). Use when you discover something about the system's architecture — module patterns, missing capabilities, structural risks. These are reviewed by the architecture agent, not acted on directly. Max 3 per cycle.
 - Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
@@ -486,10 +819,14 @@ Rules:
     }
   }
 
-  await apiPost('/api/agent/status', {
-    task_id: taskId,
-    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
-    logs,
-  });
+  try {
+    await apiPost('/api/agent/status', {
+      task_id: taskId,
+      status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+      ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
+      logs,
+    });
+  } catch (e) {
+    sendLog(ws, `[ERROR] Failed to post research completion status: ${e}\n`);
+  }
 }

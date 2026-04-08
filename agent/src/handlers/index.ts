@@ -3,6 +3,7 @@ import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA } from '
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleSecurityAudit, handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
+import { handleDesignDocUpdate } from './design-doc.js';
 
 export type Handler = (
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -26,4 +27,6 @@ export const handlers: Record<string, Handler> = {
   debug: handleDebug,
   perf: handlePerf,
   investigate: handleInvestigate,
+  design_doc_update: handleDesignDocUpdate,
+  strategic_review: handleResearch,  // Reuses research handler; branches on research_mode
 };

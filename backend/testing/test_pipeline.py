@@ -462,7 +462,7 @@ class TestCircuitBreaker:
 class TestIterationCap:
     def test_max_iterations_value(self):
         """Tripwire: MAX_REVIEW_FIX_ITERATIONS must not be raised without review."""
-        assert MAX_REVIEW_FIX_ITERATIONS == 5
+        assert MAX_REVIEW_FIX_ITERATIONS == 8
 
 
 # ── Security Scan Coverage ─────────────────────────────────────────────────

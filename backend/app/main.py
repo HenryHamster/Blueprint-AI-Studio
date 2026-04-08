@@ -26,7 +26,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity
+from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, ProjectMessage, MessageType
 from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, get_vm_zone, reconcile_orphaned_secrets, any_zone_available, soonest_zone_recovery
 from app.storage import upload_json_payload
 from app.secrets_manager import store_user_secret, get_user_secret
@@ -83,7 +83,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0028"
+EXPECTED_SCHEMA_REVISION = "0030"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -312,11 +312,16 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "address already in use", "failed to connect"]):
         return "PROVISION_FAILURE"
 
-    # Rate limit — Claude API usage exhausted, token/context limits, resource quotas
-    if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "billing",
-                                      "usage limit", "usage exhausted", "token limit exceeded",
+    # Transient API overload — server-side, not account-specific (must be checked before RATE_LIMIT
+    # because "overloaded" would otherwise trigger the rate limit classifier and disable accounts)
+    if "overloaded" in combined and "usage" not in combined:
+        return "EXTERNAL_API"
+
+    # Rate limit — Claude API usage exhausted, account-level billing/quota issues
+    if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "credit", "billing",
+                                      "usage limit", "usage exhausted",
                                       "too many requests", "resource_exhausted", "daily limit",
-                                      "context_length_exceeded", "tokens per minute"]):
+                                      "tokens per minute"]):
         return "RATE_LIMIT"
 
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
@@ -324,7 +329,8 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "502 bad gateway", "503 service unavailable",
                                       "github api error", "claude api",
                                       "connection timed out", "name resolution failed",
-                                      "ssl", "certificate"]):
+                                      "ssl", "certificate",
+                                      "context_length_exceeded", "token limit exceeded"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM
@@ -522,6 +528,8 @@ async def _init_deployment_state():
                         _runtime_config[key] = config_json[key]
                 if "autonomous_research_wave_size" in config_json:
                     _runtime_config["autonomous_research_wave_size"] = int(config_json["autonomous_research_wave_size"])
+                if "strategic_research_frequency" in config_json:
+                    _runtime_config["strategic_research_frequency"] = int(config_json["strategic_research_frequency"])
                 logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)
@@ -1249,6 +1257,304 @@ def _compute_merge_rate(d: dict) -> float:
     return total_merged / total_cycles
 
 
+def _build_outcome_evaluation(project) -> dict:
+    """Build a planned-vs-actual assessment for the strategic agent.
+
+    Compares what the vision predicted against what directions actually produced.
+    All data lives on project.directions and project.vision — no DB queries needed.
+    """
+    vision = project.vision or {}
+    directions = project.directions or []
+    now_iso = _utcnow().isoformat()
+
+    # Determine evaluation window: since last vision update, or all time
+    window_from = vision.get("last_updated")
+    vision_rev = vision.get("revision", 0)
+
+    # Per-direction outcomes
+    direction_outcomes = []
+    for d in directions:
+        status = d.get("status", "active")
+        if status not in ("active", "expired", "paused"):
+            continue
+        history = d.get("research_history", [])
+        agg = d.get("history_aggregate", {})
+
+        # Filter history to evaluation window
+        if window_from:
+            window_history = [h for h in history if (h.get("timestamp") or "") >= window_from]
+        else:
+            window_history = list(history)
+
+        cycles = len(window_history)
+        merged = sum(h.get("prs_merged", 0) for h in window_history)
+        failed = sum(h.get("tasks_failed", 0) for h in window_history)
+
+        # Extract confirmed vs proposed findings from research_context
+        confirmed = []
+        proposed = []
+        failed_approaches = []
+        ctx = d.get("research_context", "")
+        if ctx:
+            parsed = _parse_research_context(ctx)
+            for item in parsed.get("established", []):
+                if "(confirmed)" in item:
+                    confirmed.append(item.replace("(confirmed)", "").strip())
+                elif "(proposed)" in item:
+                    proposed.append(item.replace("(proposed)", "").strip())
+                else:
+                    confirmed.append(item)  # Unmarked items are treated as confirmed
+            failed_approaches = parsed.get("failed", [])
+
+        outcome: dict = {
+            "id": d.get("id"),
+            "text": (d.get("text") or "")[:200],
+            "system_id": d.get("system_id"),
+            "status": status,
+            "cycles": cycles,
+            "merged": merged,
+            "failed": failed,
+        }
+        if confirmed:
+            outcome["confirmed"] = confirmed[:15]
+        if proposed:
+            outcome["proposed"] = proposed[:10]
+        if failed_approaches:
+            outcome["failed_approaches"] = failed_approaches[:10]
+        # Include lifetime totals for context
+        lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
+        lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        if lifetime_cycles > cycles:
+            outcome["lifetime"] = {"cycles": lifetime_cycles, "merged": lifetime_merged}
+
+        direction_outcomes.append(outcome)
+
+    # Overall health
+    total_cycles = sum(d["cycles"] for d in direction_outcomes)
+    total_merged = sum(d["merged"] for d in direction_outcomes)
+    total_failed = sum(d["failed"] for d in direction_outcomes)
+    success_rate = round(total_merged / max(total_merged + total_failed, 1), 2)
+
+    # Trend: compare first half vs second half of all window history entries
+    all_window_entries = []
+    for d in directions:
+        history = d.get("research_history", [])
+        if window_from:
+            entries = [h for h in history if (h.get("timestamp") or "") >= window_from]
+        else:
+            entries = list(history)
+        all_window_entries.extend(entries)
+    all_window_entries.sort(key=lambda h: h.get("timestamp") or "")
+    trend = "stable"
+    if len(all_window_entries) >= 4:
+        mid = len(all_window_entries) // 2
+        first_half = all_window_entries[:mid]
+        second_half = all_window_entries[mid:]
+        first_rate = sum(h.get("prs_merged", 0) for h in first_half) / max(len(first_half), 1)
+        second_rate = sum(h.get("prs_merged", 0) for h in second_half) / max(len(second_half), 1)
+        if second_rate > first_rate * 1.3:
+            trend = "improving"
+        elif second_rate < first_rate * 0.7:
+            trend = "declining"
+
+    # System-level status — cross-reference vision systems with direction outcomes
+    systems = []
+    vision_systems = vision.get("systems", [])
+    if isinstance(vision_systems, list):
+        for sys in vision_systems:
+            if not isinstance(sys, dict):
+                continue
+            sys_id = sys.get("id")
+            if not sys_id:
+                continue
+            # Find directions mapped to this system
+            mapped = [d for d in direction_outcomes if d.get("system_id") == sys_id]
+            sys_merged = sum(d["merged"] for d in mapped)
+            sys_failed = sum(d["failed"] for d in mapped)
+            systems.append({
+                "id": sys_id,
+                "name": sys.get("name", ""),
+                "planned_status": sys.get("status", "unknown"),
+                "directions_count": len(mapped),
+                "merged": sys_merged,
+                "failed": sys_failed,
+            })
+
+    result: dict = {
+        "window": {"from": window_from or "all_time", "to": now_iso, "vision_revision": vision_rev},
+        "overall": {
+            "cycles": total_cycles, "merged": total_merged, "failed": total_failed,
+            "success_rate": success_rate, "trend": trend,
+        },
+    }
+    if systems:
+        result["systems"] = systems
+    if direction_outcomes:
+        result["directions"] = direction_outcomes
+    return result
+
+
+async def _spawn_design_doc_update(project: Project, session: AsyncSession):
+    """Spawn a design doc update task (Phase 1 of strategic cycle).
+
+    This runs as a separate task type so it doesn't block tactical research.
+    On completion, it chains to _spawn_strategic_review (Phase 2).
+    """
+    # Guard: no design_doc_update or strategic_review already running
+    active = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active:
+        t_type = (t.first_payload).get("type")
+        if t_type in ("design_doc_update", "strategic_review"):
+            logger.debug(f"[STRATEGIC] Skipping design doc update — {t_type} task {t.id} already active")
+            return
+
+    doc_model = _runtime_config.get("task_type_models", {}).get("design_doc_update") or \
+                _runtime_config.get("task_type_models", {}).get("research") or None
+    doc_effort = _runtime_config.get("task_type_efforts", {}).get("design_doc_update") or \
+                 _runtime_config.get("task_type_efforts", {}).get("research") or None
+
+    # Fetch open messages for the design doc agent
+    open_msgs_result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+        ).order_by(ProjectMessage.created_at.asc()).limit(20)
+    )
+    open_msgs = [
+        {"id": str(m.id), "type": m.message_type, "content": m.content,
+         "context": m.context, "from": m.from_type,
+         "created_at": m.created_at.isoformat() if m.created_at else None}
+        for m in open_msgs_result.scalars().all()
+    ]
+
+    payload: dict = {
+        "type": "design_doc_update",
+        "design_doc": project.design_doc or {},
+        "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
+        "project_name": project.name,
+        "vision": project.vision or {},
+        "open_messages": open_msgs,
+        "base_branch": "main",
+        **({"model": doc_model} if doc_model else {}),
+        **({"effort": doc_effort} if doc_effort else {}),
+    }
+    new_task = Task(
+        project_id=project.id,
+        title=f"Architecture review: {project.name}",
+        description="Update project design document",
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={"spawned_by": "STRATEGIC_CYCLE", "phase": "design_doc_update"},
+    )
+    session.add(history)
+    await session.commit()
+    logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id}")
+
+
+async def _spawn_strategic_review(project: Project, session: AsyncSession):
+    """Spawn Phase 2 of the strategic cycle: vision + direction review.
+
+    Called by _handle_design_doc_completion after the design doc is updated.
+    Uses type 'strategic_review' so it doesn't block tactical research.
+    """
+    # Build direction stats with rich data (same as previous strategic payload)
+    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    direction_stats = []
+    for d in all_active_directions:
+        history = d.get("research_history", [])
+        agg = d.get("history_aggregate", {})
+        total_cycles = len(history) + (agg.get("total_cycles") or 0)
+        total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
+        recent_history = history[-5:]
+        recent_findings = []
+        recent_failures = []
+        for h in recent_history:
+            for desc in (h.get("key_finding_descriptions") or []):
+                if desc and desc not in recent_findings:
+                    recent_findings.append(desc)
+            for fd in (h.get("failed_task_details") or []):
+                if fd:
+                    recent_failures.append(fd)
+        stat_entry: dict = {
+            "id": d.get("id"), "text": d.get("text"), "priority": d.get("priority"),
+            "status": d.get("status"), "total_cycles": total_cycles,
+            "prs_merged": total_merged, "tasks_failed": total_failed,
+            "possibly_saturated": d.get("possibly_saturated", False),
+        }
+        ctx = d.get("research_context")
+        if ctx:
+            stat_entry["research_context"] = ctx[:3000]
+        if recent_findings:
+            stat_entry["recent_findings"] = recent_findings[:10]
+        if recent_failures:
+            stat_entry["recent_failures"] = recent_failures[:5]
+        if d.get("system_id"):
+            stat_entry["system_id"] = d["system_id"]
+        direction_stats.append(stat_entry)
+
+    # Fetch open messages
+    open_msgs_result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+        ).order_by(ProjectMessage.created_at.asc()).limit(20)
+    )
+    open_msgs = [
+        {"id": str(m.id), "type": m.message_type, "content": m.content,
+         "context": m.context, "from": m.from_type,
+         "created_at": m.created_at.isoformat() if m.created_at else None}
+        for m in open_msgs_result.scalars().all()
+    ]
+
+    review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
+                   _runtime_config.get("task_type_models", {}).get("research") or None
+    review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
+                    _runtime_config.get("task_type_efforts", {}).get("research") or None
+
+    payload: dict = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "design_doc": project.design_doc or {},
+        "vision": project.vision or {},
+        "directions_summary": direction_stats,
+        "outcome_evaluation": _build_outcome_evaluation(project),
+        "project_name": project.name,
+        "open_messages": open_msgs,
+        "base_branch": "main",
+        **({"model": review_model} if review_model else {}),
+        **({"effort": review_effort} if review_effort else {}),
+    }
+    new_task = Task(
+        project_id=project.id,
+        title=f"Strategic review: {project.name}",
+        description="Vision and direction review",
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
+    )
+    session.add(history)
+    await session.commit()
+    logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
+
+
 async def _spawn_research_task(project: Project, session: AsyncSession):
     """Spawn a research task for a project if conditions are met."""
     # Guard: autonomous must be enabled
@@ -1380,33 +1686,65 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         flag_modified(project, "directions")
         session.add(project)
         await session.commit()
-    if not active_directions:
+    # Allow strategic cycles to proceed even without active directions (they create directions).
+    # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
+    vision_data = project.vision or {}
+    strategic_failures = vision_data.get("_strategic_failures", 0)
+    force_strategic = not vision_data.get("purpose") and strategic_failures < 3
+    if not active_directions and not force_strategic:
         return
     # Pick ONE direction per research task to avoid putting all on cooldown at once.
     # active_directions preserves UI drag-order (index 0 = highest priority).
     # Among eligible directions, prefer those never researched or oldest researched.
-    import random
-    priority_rank = {"high": 0, "medium": 1, "low": 2}
-    never_researched = [d for d in active_directions if not d.get("last_researched_at")]
-    if never_researched:
-        # Pick from the highest priority tier among never-researched
-        best_pri = min(priority_rank.get(d.get("priority", "medium"), 1) for d in never_researched)
-        top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
-        chosen_direction = random.choice(top_tier)
-    else:
-        # All have been researched — pick highest priority first, then non-saturated,
-        # then higher merge rate, then oldest researched
-        for d in active_directions:
-            did = d.get("id", "?")
-            merge_rate = _compute_merge_rate(d)
-            logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f}")
-        active_directions.sort(key=lambda d: (
-            priority_rank.get(d.get("priority", "medium"), 1),
-            1 if d.get("possibly_saturated") else 0,
-            -_compute_merge_rate(d),  # higher merge rate preferred
-            d.get("last_researched_at") or ""
-        ))
-        chosen_direction = active_directions[0]
+    chosen_direction: Optional[dict] = None
+    # Build vision priority lookup: directions tagged with a system_id that appears
+    # earlier in vision.priorities get a lower (better) rank.  This makes vision
+    # operational — the strategic agent's priority ordering actually influences which
+    # direction gets researched next.
+    vision_priorities = (vision_data.get("priorities") or []) if vision_data else []
+    vision_priority_index: dict = {}
+    for idx, sys_id in enumerate(vision_priorities):
+        if isinstance(sys_id, str):
+            vision_priority_index[sys_id] = idx
+
+    def _vision_rank(d: dict) -> int:
+        """0 = top vision priority, len = unlisted. Directions without system_id get neutral rank."""
+        sid = d.get("system_id")
+        if not sid:
+            return len(vision_priorities)  # neutral — don't penalize untagged
+        return vision_priority_index.get(sid, len(vision_priorities) + 1)  # unlisted slightly below neutral
+
+    if active_directions:
+        import random
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        never_researched = [d for d in active_directions if not d.get("last_researched_at")]
+        if never_researched:
+            # Pick from the highest priority tier among never-researched,
+            # breaking ties by vision alignment
+            best_pri = min(priority_rank.get(d.get("priority", "medium"), 1) for d in never_researched)
+            top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
+            if vision_priorities and len(top_tier) > 1:
+                top_tier.sort(key=_vision_rank)
+                best_vr = _vision_rank(top_tier[0])
+                top_tier = [d for d in top_tier if _vision_rank(d) == best_vr]
+            chosen_direction = random.choice(top_tier)
+        else:
+            # All have been researched — sort by priority, vision alignment,
+            # saturation, merge rate, then oldest researched
+            for d in active_directions:
+                did = d.get("id", "?")
+                merge_rate = _compute_merge_rate(d)
+                logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f} vision_rank={_vision_rank(d)}")
+            active_directions.sort(key=lambda d: (
+                priority_rank.get(d.get("priority", "medium"), 1),
+                _vision_rank(d),  # vision-aligned directions get researched sooner
+                1 if d.get("possibly_saturated") else 0,
+                -_compute_merge_rate(d),  # higher merge rate preferred
+                d.get("last_researched_at") or ""
+            ))
+            chosen_direction = active_directions[0]
+    elif not force_strategic:
+        return  # No directions and not a strategic cycle — nothing to do
 
     # Guard: no research task actively running (queued/provisioning/in_progress).
     # EVALUATING parents are just waiting on children — they don't block new research.
@@ -1468,31 +1806,74 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )
     is_undirected = undirected_frequency > 0 and total_research_count > 0 and total_research_count % undirected_frequency == 0
 
-    research_payload: dict = {
-        "type": "research",
-        "directions": all_active_directions,
-        "current_direction_id": None if is_undirected else chosen_direction.get("id"),
-        "base_branch": base_branch,
-        **({"model": research_model} if research_model else {}),
-        **({"effort": research_effort} if research_effort else {}),
-        **({"prompt_suffix": research_suffix} if research_suffix else {}),
-    }
-    if not is_undirected and chosen_direction.get("possibly_complete"):
-        research_payload["direction_possibly_complete"] = True
-        research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
-    if is_undirected:
-        anomalies = await _compute_research_anomalies(project.id, session)
-        if anomalies:
-            research_payload["anomaly_signals"] = anomalies
-    if is_undirected:
-        direction_text = "Cross-cutting codebase analysis"
-        logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{total_research_count})")
-    else:
-        direction_text = (chosen_direction.get("text") or "general improvement")[:80]
+    # Strategic vision cycle: runs every Nth research cycle, or forced when vision is empty
+    strategic_frequency = _runtime_config.get("strategic_research_frequency", 6)
+    is_strategic = (
+        (strategic_frequency > 0 and total_research_count > 0 and total_research_count % strategic_frequency == 0)
+        or force_strategic  # Includes empty vision, missing purpose, etc.
+    )
+    # Strategic cycle: spawn design doc update (Phase 1) as a side-channel.
+    # This does NOT block tactical research — it uses a separate task type.
+    # Phase 1 chains to Phase 2 (strategic_review) on completion.
+    if is_strategic:
+        is_undirected = False
+        await _spawn_design_doc_update(project, session)
+        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{total_research_count}, vision rev {(project.vision or {}).get('revision', 0)})")
+        # Fall through to spawn tactical research normally
+        is_strategic = False
+
+    # Build tactical research payload (always, even on strategic cycles)
+    if True:
+        research_payload: dict = {
+            "type": "research",
+            "directions": all_active_directions,
+            "current_direction_id": None if is_undirected else chosen_direction.get("id"),
+            "design_doc": project.design_doc or {},
+            "base_branch": base_branch,
+            **({"model": research_model} if research_model else {}),
+            **({"effort": research_effort} if research_effort else {}),
+            **({"prompt_suffix": research_suffix} if research_suffix else {}),
+        }
+        # Pre-extract design doc context for the current direction's system_id
+        # so the research agent sees relevant architectural context upfront
+        if not is_undirected and chosen_direction:
+            dir_system_id = chosen_direction.get("system_id")
+            if dir_system_id and project.design_doc:
+                doc = project.design_doc
+                doc_systems = doc.get("systems", [])
+                doc_capabilities = doc.get("capabilities", {})
+                relevant: dict = {"system_id": dir_system_id}
+                # Find matching system entry
+                for sys in (doc_systems if isinstance(doc_systems, list) else []):
+                    if isinstance(sys, dict) and sys.get("id") == dir_system_id:
+                        relevant["system"] = sys
+                        break
+                # Find capabilities that might relate (by keyword match on system name/id)
+                if isinstance(doc_capabilities, dict):
+                    sys_name = (relevant.get("system", {}).get("name") or dir_system_id).lower()
+                    related_caps = {}
+                    for cap_name, cap_val in doc_capabilities.items():
+                        if isinstance(cap_val, dict) and cap_val.get("status") in ("missing", "partial"):
+                            related_caps[cap_name] = cap_val
+                    if related_caps:
+                        relevant["missing_capabilities"] = related_caps
+                research_payload["direction_design_context"] = relevant
+        if not is_undirected and chosen_direction.get("possibly_complete"):
+            research_payload["direction_possibly_complete"] = True
+            research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
+        if is_undirected:
+            anomalies = await _compute_research_anomalies(project.id, session)
+            if anomalies:
+                research_payload["anomaly_signals"] = anomalies
+        if is_undirected:
+            direction_text = "Cross-cutting codebase analysis"
+            logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{total_research_count})")
+        else:
+            direction_text = (chosen_direction.get("text") or "general improvement")[:80]
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text}",
-        description=f"Autonomous research for direction: {direction_text}",
+        description=f"Autonomous research for: {direction_text}",
         payloads=[research_payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1700,7 +2081,9 @@ async def _check_idle_research():
                     logger.info(f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review")
 
                 active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
-                if not active_directions:
+                # Allow projects with no directions through if vision needs bootstrapping
+                vision_needs_bootstrap = not (project.vision or {}).get("purpose")
+                if not active_directions and not vision_needs_bootstrap:
                     continue
 
                 # Spawn if VM slots are available — count only tasks consuming VMs,
@@ -2530,7 +2913,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     return retried_count
 
 
-MAX_REVIEW_FIX_ITERATIONS = 5
+MAX_REVIEW_FIX_ITERATIONS = 8
 
 
 def _max_review_iterations(task: Task) -> int:
@@ -2541,16 +2924,16 @@ def _max_review_iterations(task: Task) -> int:
 
     # CI-only fixes should converge fast (lint/type/test errors)
     if fix_reason == 'ci_failure':
-        limit = 2
+        limit = 3
     # Small scope tasks: less code, fewer things to fix
     elif scope == 'small':
-        limit = 3
+        limit = 5
     # Medium scope: moderate iteration budget
     elif scope == 'medium':
-        limit = 4
+        limit = 6
     # Large scope or unknown: full budget
     else:
-        limit = 5
+        limit = 8
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
 
@@ -4048,6 +4431,356 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     session.add(task)
 
 
+async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSession):
+    """Handle Phase 1 completion: update project.design_doc, then chain to Phase 2."""
+    import json as _json
+
+    # Parse design doc output from logs
+    new_doc = None
+    proposal_resolutions = []
+    try:
+        parsed = _json.loads(logs)
+        if isinstance(parsed, dict):
+            new_doc = parsed.get("design_doc")
+            proposal_resolutions = parsed.get("proposal_resolutions", [])
+    except (ValueError, TypeError):
+        # Try extracting JSON from mixed output
+        match = re.search(r'\{[\s\S]*"design_doc"[\s\S]*\}', logs)
+        if match:
+            try:
+                parsed = _json.loads(match.group(0))
+                new_doc = parsed.get("design_doc")
+                proposal_resolutions = parsed.get("proposal_resolutions", [])
+            except (ValueError, TypeError):
+                pass
+
+    # Lock project for update
+    result = await session.execute(
+        select(Project).where(Project.id == task.project_id).with_for_update()
+    )
+    project = result.scalars().first()
+    if not project:
+        logger.error(f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found")
+        return
+
+    if new_doc and isinstance(new_doc, dict):
+        old_revision = (project.design_doc or {}).get("revision", 0)
+        new_doc["revision"] = (old_revision or 0) + 1
+        new_doc["last_updated"] = _utcnow().isoformat()
+        new_doc["updated_by_task"] = str(task.id)
+
+        # Process proposal resolutions: remove accepted/rejected, keep still-pending
+        resolved_ids = set()
+        for res in proposal_resolutions:
+            if isinstance(res, dict) and res.get("id"):
+                resolved_ids.add(res["id"])
+        existing_proposals = (project.design_doc or {}).get("proposed_changes", [])
+        still_pending = [p for p in existing_proposals if p.get("id") not in resolved_ids and p.get("status") == "pending"]
+        new_doc["proposed_changes"] = still_pending
+
+        project.design_doc = new_doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[DESIGN DOC] Updated design doc for project {project.id} (rev {new_doc['revision']}, {len(resolved_ids)} proposals resolved)")
+
+        # Store raw output for debugging
+        task.plan_output = logs[:50000]
+        task.latest_status_message = f"Design doc updated to rev {new_doc['revision']}"
+        session.add(task)
+        await session.commit()
+    else:
+        task.latest_status_message = "Design doc review: no updates produced"
+        session.add(task)
+        await session.commit()
+        logger.warning(f"[DESIGN DOC] Task {task.id}: no design_doc in output")
+
+    # Process messages from design doc agent (architecture questions)
+    if parsed and isinstance(parsed, dict):
+        msgs_created = 0
+        for msg_entry in (parsed.get("messages") or [])[:3]:
+            if not isinstance(msg_entry, dict):
+                continue
+            content = (msg_entry.get("content") or "").strip()
+            if not content:
+                continue
+            try:
+                msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
+            except ValueError:
+                msg_type = MessageType.NOTE
+            new_msg = ProjectMessage(
+                project_id=project.id,
+                message_type=msg_type,
+                from_type="design_doc",
+                from_task_id=task.id,
+                content=content[:5000],
+                context=msg_entry.get("context") or {},
+            )
+            session.add(new_msg)
+            msgs_created += 1
+
+        # Resolve messages the agent addressed
+        msgs_resolved = 0
+        resolved_entries = parsed.get("resolved_messages") or []
+        if not resolved_entries:
+            resolved_entries = [{"id": mid} for mid in (parsed.get("resolved_message_ids") or [])]
+        for entry in resolved_entries[:10]:
+            try:
+                msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
+                resolution_text = entry.get("resolution", "Addressed by architecture review") if isinstance(entry, dict) else "Addressed by architecture review"
+                msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
+                if msg and msg.project_id == project.id and msg.status == "open":
+                    msg.status = "resolved"
+                    msg.resolution = str(resolution_text)[:5000] if resolution_text else "Addressed by architecture review"
+                    msg.resolved_at = _utcnow()
+                    session.add(msg)
+                    msgs_resolved += 1
+            except (ValueError, TypeError):
+                pass
+        if msgs_created or msgs_resolved:
+            await session.commit()
+            logger.info(f"[DESIGN DOC] Messages: {msgs_created} created, {msgs_resolved} resolved")
+
+    # Chain: spawn Phase 2 (strategic review)
+    # Refresh project to get the just-committed design_doc
+    await session.refresh(project)
+    await _spawn_strategic_review(project, session)
+
+
+async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSession):
+    """Parse strategic vision output and update project vision + directions."""
+    try:
+        parsed = json.loads(logs[:500_000]) if logs else None
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+
+    if not parsed or not isinstance(parsed, dict):
+        # Increment failure counter so force_strategic doesn't loop indefinitely
+        project = await session.get(Project, task.project_id)
+        if project:
+            current_vision = project.vision or {}
+            failures = current_vision.get("_strategic_failures", 0) + 1
+            current_vision["_strategic_failures"] = failures
+            project.vision = current_vision
+            flag_modified(project, "vision")
+            session.add(project)
+        task.latest_status_message = "Strategic output could not be parsed"
+        session.add(task)
+        await session.commit()
+        failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
+        logger.warning(f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})")
+        return
+
+    new_vision = parsed.get("vision")
+    direction_ops = parsed.get("direction_operations", [])
+
+    # Lock project row to prevent concurrent direction/vision mutations
+    result = await session.execute(
+        select(Project).where(Project.id == task.project_id).with_for_update()
+    )
+    project = result.scalars().first()
+    if not project:
+        logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
+        return
+
+    # Store raw output for admin visibility
+    task.plan_output = parsed
+    session.add(task)
+
+    # Update vision — merge with current DB state to avoid overwriting concurrent user edits
+    if new_vision and isinstance(new_vision, dict):
+        current_vision = dict(project.vision or {})
+        # Check if user edited vision while the strategic cycle was running
+        payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
+        db_vision_rev = current_vision.get("revision", 0)
+        if db_vision_rev > payload_vision_rev:
+            # User edited vision since this cycle started — merge carefully
+            # Keep user's purpose/criteria if they changed them, take agent's systems/priorities/context
+            logger.info(f"[STRATEGIC] Vision was edited during cycle (payload rev {payload_vision_rev}, DB rev {db_vision_rev}) — merging")
+            merged = dict(current_vision)  # Start from user's current state
+            # Agent's structural analysis takes precedence for these fields
+            for key in ("systems", "priorities", "context"):
+                if key in new_vision:
+                    merged[key] = new_vision[key]
+            # Only update purpose/criteria if the user didn't change them
+            if current_vision.get("purpose") == (task.first_payload.get("vision") or {}).get("purpose"):
+                if "purpose" in new_vision:
+                    merged["purpose"] = new_vision["purpose"]
+            if current_vision.get("success_criteria") == (task.first_payload.get("vision") or {}).get("success_criteria"):
+                if "success_criteria" in new_vision:
+                    merged["success_criteria"] = new_vision["success_criteria"]
+            # Preserve any extra fields the agent added
+            for key in new_vision:
+                if key not in merged:
+                    merged[key] = new_vision[key]
+            new_vision = merged
+        new_vision["revision"] = (db_vision_rev or 0) + 1
+        new_vision["last_updated"] = _utcnow().isoformat()
+        new_vision.pop("_strategic_failures", None)  # Reset failure counter on success
+        project.vision = new_vision
+        flag_modified(project, "vision")
+        logger.info(f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}")
+    else:
+        # No vision produced — increment failure counter to prevent infinite strategic loops
+        current_vision = dict(project.vision or {})
+        failures = current_vision.get("_strategic_failures", 0) + 1
+        current_vision["_strategic_failures"] = failures
+        project.vision = current_vision
+        flag_modified(project, "vision")
+        logger.warning(f"[STRATEGIC] Task {task.id}: no vision produced (failure #{failures})")
+
+    # Process direction operations (capped to prevent flooding)
+    MAX_DIRECTION_OPS = 10
+    MAX_DIRECTION_CREATES = 5
+    ops_applied = 0
+    if direction_ops and isinstance(direction_ops, list):
+        if len(direction_ops) > MAX_DIRECTION_OPS:
+            logger.warning(f"[STRATEGIC] Task {task.id}: truncating {len(direction_ops)} direction ops to {MAX_DIRECTION_OPS}")
+            direction_ops = direction_ops[:MAX_DIRECTION_OPS]
+        directions = list(project.directions or [])
+        creates_count = 0
+
+        for op_entry in direction_ops:
+            if not isinstance(op_entry, dict):
+                continue
+            op = op_entry.get("op")
+            rationale = op_entry.get("rationale", "")
+
+            if op == "create":
+                if creates_count >= MAX_DIRECTION_CREATES:
+                    continue
+                text = op_entry.get("text", "").strip()
+                if not text:
+                    continue
+                text = text[:500]  # Match user API text length limit
+                # Dedup: skip if an active/proposed direction has very similar text
+                text_lower = text.lower()
+                if any(d.get("status") in ("active", "proposed") and
+                       d.get("text", "").lower().strip() == text_lower
+                       for d in directions):
+                    logger.info(f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}")
+                    continue
+                raw_priority = op_entry.get("priority", "medium")
+                priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
+                new_dir = {
+                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "text": text,
+                    "status": "active",
+                    "priority": priority,
+                    "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
+                    "research_history": [],
+                }
+                if op_entry.get("paths"):
+                    new_dir["paths"] = op_entry["paths"]
+                if op_entry.get("system_id"):
+                    new_dir["system_id"] = str(op_entry["system_id"])[:40]
+                directions.append(new_dir)
+                ops_applied += 1
+                creates_count += 1
+                logger.info(f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}")
+
+            elif op == "update":
+                dir_id = op_entry.get("direction_id")
+                changes = op_entry.get("changes", {})
+                if not dir_id or not changes:
+                    continue
+                for d in directions:
+                    if d.get("id") == dir_id:
+                        if "text" in changes:
+                            d["text"] = str(changes["text"])[:500]
+                        if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
+                            d["priority"] = changes["priority"]
+                        if "paths" in changes:
+                            d["paths"] = changes["paths"]
+                        if "system_id" in changes:
+                            d["system_id"] = str(changes["system_id"])[:40] if changes["system_id"] else None
+                        if "status" in changes and changes["status"] in ("active", "paused", "expired"):
+                            # Block reactivating a direction the user manually paused
+                            if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
+                                logger.warning(f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}")
+                            else:
+                                d["status"] = changes["status"]
+                        # Record rationale as a note
+                        if rationale:
+                            notes = d.get("notes", [])
+                            notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
+                            d["notes"] = notes[-20:]  # Keep last 20
+                        ops_applied += 1
+                        logger.info(f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}")
+                        break
+
+            elif op == "retire":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                for d in directions:
+                    if d.get("id") == dir_id:
+                        d["status"] = "expired"
+                        if rationale:
+                            notes = d.get("notes", [])
+                            notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
+                            d["notes"] = notes[-20:]
+                        ops_applied += 1
+                        logger.info(f"[STRATEGIC] Retired direction {dir_id} for project {project.id}")
+                        break
+
+        if ops_applied > 0:
+            project.directions = directions
+            flag_modified(project, "directions")
+
+    session.add(project)
+
+    # Process messages from agent (questions, blockers, notes)
+    msgs_created = 0
+    for msg_entry in (parsed.get("messages") or [])[:5]:
+        if not isinstance(msg_entry, dict):
+            continue
+        content = (msg_entry.get("content") or "").strip()
+        if not content:
+            continue
+        try:
+            msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
+        except ValueError:
+            msg_type = MessageType.NOTE
+        new_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=msg_type,
+            from_type="strategic",
+            from_task_id=task.id,
+            content=content[:5000],
+            context=msg_entry.get("context") or {},
+        )
+        session.add(new_msg)
+        msgs_created += 1
+
+    # Resolve messages the agent addressed
+    msgs_resolved = 0
+    # Support both formats: resolved_messages (with resolution text) and resolved_message_ids (legacy)
+    resolved_entries = parsed.get("resolved_messages") or []
+    if not resolved_entries:
+        # Fall back to legacy format (plain ID list)
+        resolved_entries = [{"id": mid} for mid in (parsed.get("resolved_message_ids") or [])]
+    for entry in resolved_entries[:10]:
+        try:
+            msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
+            resolution_text = entry.get("resolution", "Addressed by strategic review") if isinstance(entry, dict) else "Addressed by strategic review"
+            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
+            if msg and msg.project_id == project.id and msg.status == "open":
+                msg.status = "resolved"
+                msg.resolution = str(resolution_text)[:5000] if resolution_text else "Addressed by strategic review"
+                msg.resolved_at = _utcnow()
+                session.add(msg)
+                msgs_resolved += 1
+        except (ValueError, TypeError):
+            pass
+
+    vision_rev = (project.vision or {}).get("revision", "?")
+    task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
+    session.add(task)
+    await session.commit()  # Single commit: vision + directions + messages + task status
+    logger.info(f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved")
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Depth guard: prevent infinite research recursion
@@ -4207,8 +4940,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         title = finding.get("title", f"Research finding #{orig_i+1}")
         prompt = finding.get("prompt", finding.get("description", ""))
 
-        # Determine task type early — direction_update findings don't require a prompt
+        # Determine task type early — some findings don't spawn tasks
         finding_type = finding.get("type", "improvement")
+
+        if finding_type == "design_doc_observation":
+            # Append to design doc proposals for Phase 1 to review
+            obs_project = await session.get(Project, task.project_id)
+            if obs_project:
+                doc = dict(obs_project.design_doc or {})
+                proposals = doc.get("proposed_changes", [])
+                proposals.append({
+                    "id": f"pc-{uuid.uuid4().hex[:8]}",
+                    "observation": finding.get("description", "")[:500],
+                    "section": finding.get("section", "general"),
+                    "proposed_by_task": str(task.id),
+                    "proposed_at": _utcnow().isoformat(),
+                    "status": "pending",
+                })
+                doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
+                obs_project.design_doc = doc
+                flag_modified(obs_project, "design_doc")
+                session.add(obs_project)
+            continue  # Don't create a task
+
         if finding_type == "direction_update":
             # Process as a direction modification proposal, not a task
             target_id = finding.get("direction_id")
@@ -5844,7 +6598,29 @@ async def _process_post_commit(
                         task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
-                        await session.commit()
+                        cap_alert_title = f"PR #{pr_number} stalled — iteration cap reached"
+                        existing_cap_alert = (await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == task.project_id,
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title == cap_alert_title,
+                            )
+                        )).scalars().first()
+                        if not existing_cap_alert:
+                            alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title=cap_alert_title,
+                                message=f"Review requested changes on PR #{pr_number} but the fix iteration cap was reached. Manual intervention required.",
+                                task_id=task.id,
+                            )
+                            session.add(alert)
+                            await session.commit()
+                            await broadcast_to_project(str(task.project_id), "alert_created",
+                                {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                        else:
+                            await session.commit()
                         logger.warning(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
                     action_taken = True
 
@@ -5928,7 +6704,29 @@ async def _process_post_commit(
                         task.latest_status_message = f"Fix applied but review not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
                         session.add(task)
-                        await session.commit()
+                        cap_alert_title = f"PR #{pr_number} stalled — iteration cap reached"
+                        existing_cap_alert = (await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == task.project_id,
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title == cap_alert_title,
+                            )
+                        )).scalars().first()
+                        if not existing_cap_alert:
+                            alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title=cap_alert_title,
+                                message=f"Fix was applied to PR #{pr_number} but the review iteration cap was reached. Manual intervention required.",
+                                task_id=task.id,
+                            )
+                            session.add(alert)
+                            await session.commit()
+                            await broadcast_to_project(str(task.project_id), "alert_created",
+                                {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
+                        else:
+                            await session.commit()
                         logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn after fix returned None for PR #{pr_number}")
 
             # Completion handlers — wrapped in try/except to prevent VM leak.
@@ -5939,6 +6737,14 @@ async def _process_post_commit(
                 if task_type == "plan":
                     plan_logs = payload.logs or task.latest_status_message or ""
                     await _handle_plan_completion(task, plan_logs, session)
+
+                elif task_type == "design_doc_update":
+                    doc_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_design_doc_completion(task, doc_logs, session)
+
+                elif task_type == "strategic_review":
+                    review_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_strategic_completion(task, review_logs, session)
 
                 elif task_type == "research":
                     research_logs = payload.logs or task.latest_status_message or ""

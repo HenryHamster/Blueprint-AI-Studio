@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Settings, Zap } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
+import { VisionEditorModal } from './VisionEditorModal';
 
 interface Project {
   id: string;
@@ -112,6 +113,16 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
+  const [vision, setVision] = useState<Record<string, unknown>>({});
+  const [visionExpanded, setVisionExpanded] = useState(false);
+  const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
+  const [designDocExpanded, setDesignDocExpanded] = useState(false);
+  const [showVisionEditor, setShowVisionEditor] = useState(false);
+  const [showStrategicOutput, setShowStrategicOutput] = useState(false);
+  const [strategicOutput, setStrategicOutput] = useState<Record<string, unknown> | null>(null);
+  const [strategicTaskId, setStrategicTaskId] = useState<string | null>(null);
+  const [loadingStrategic, setLoadingStrategic] = useState(false);
+  const [contextExpanded, setContextExpanded] = useState(false);
 
   // Add form
   const [newText, setNewText] = useState('');
@@ -180,6 +191,29 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!showStrategicOutput || !selectedProjectId) return;
+    (async () => {
+      setLoadingStrategic(true);
+      try {
+        const h = await authHeaders();
+        const res = await fetch(
+          `${API_BASE_URL}/api/admin/tasks?search=${encodeURIComponent('Strategic:')}&limit=1&status=COMPLETED`,
+          { headers: h }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const tasks = data.tasks ?? [];
+          if (tasks.length > 0) {
+            setStrategicTaskId(tasks[0].id);
+            setStrategicOutput(tasks[0].plan_output ?? null);
+          }
+        }
+      } catch { /* silent */ }
+      setLoadingStrategic(false);
+    })();
+  }, [showStrategicOutput, selectedProjectId]);
 
   async function fetchCooldownSetting() {
     try {
@@ -252,6 +286,9 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       const data = await res.json();
       setDirections(data.directions ?? []);
       setAutonomousEnabled(data.autonomous_enabled ?? false);
+      setVision(data.vision ?? {});
+      setDesignDoc(data.design_doc ?? {});
+      if ((data.vision ?? {}).purpose) setVisionExpanded(true);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
@@ -760,6 +797,430 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
         {/* Directions list */}
         <div className="flex-1 overflow-y-auto custom-scrollbar px-5 py-3">
+          {/* Vision — strategic layer */}
+          {selectedProjectId && !loading && (() => {
+            const hasPurpose = typeof vision.purpose === 'string' && vision.purpose;
+            const visionSystems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
+            const statusCounts = visionSystems.reduce<Record<string, number>>((acc, s) => {
+              const st = String(s.status || 'planned');
+              acc[st] = (acc[st] || 0) + 1;
+              return acc;
+            }, {});
+            const barColors: Record<string, string> = {
+              mature: 'bg-cyan-500', functional: 'bg-emerald-500', in_progress: 'bg-amber-500', planned: 'bg-neutral-600',
+            };
+            const visionStatusColors: Record<string, string> = {
+              planned: 'bg-neutral-700 text-neutral-400',
+              in_progress: 'bg-amber-500/20 text-amber-400',
+              functional: 'bg-emerald-500/20 text-emerald-400',
+              mature: 'bg-cyan-500/20 text-cyan-400',
+            };
+            return (
+            <div className="mb-5">
+              {/* Header */}
+              <div className="flex items-center gap-2 mb-1.5">
+                <button
+                  onClick={() => setVisionExpanded(prev => !prev)}
+                  className="flex items-center gap-2 flex-1 text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1 transition-colors"
+                >
+                  {visionExpanded
+                    ? <ChevronDown className="w-3.5 h-3.5 text-cyan-500/60 group-hover:text-cyan-400 transition-colors" />
+                    : <ChevronRight className="w-3.5 h-3.5 text-cyan-500/60 group-hover:text-cyan-400 transition-colors" />
+                  }
+                  <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+                    Product Vision
+                  </span>
+                  {typeof vision.last_updated === 'string' && (
+                    <span className="text-[9px] text-neutral-600 font-mono ml-1">
+                      {formatRelativeTime(vision.last_updated as string)}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setShowVisionEditor(true)}
+                  className="text-neutral-600 hover:text-neutral-400 transition-colors p-1 rounded hover:bg-neutral-800/50"
+                  title="Edit vision"
+                >
+                  <Pencil className="w-3 h-3" />
+                </button>
+              </div>
+
+              {/* Collapsed: systems health bar */}
+              {!visionExpanded && visionSystems.length > 0 && (
+                <div className="px-1.5">
+                  <div className="flex h-1.5 rounded-full overflow-hidden bg-neutral-800 mb-1">
+                    {['mature', 'functional', 'in_progress', 'planned'].map(status => {
+                      const count = statusCounts[status] || 0;
+                      if (count === 0) return null;
+                      const pct = (count / visionSystems.length) * 100;
+                      return <div key={status} className={`${barColors[status]} transition-all`} style={{ width: `${pct}%` }} />;
+                    })}
+                  </div>
+                  <div className="flex items-center gap-2 text-[9px] text-neutral-600">
+                    <span>{visionSystems.length} systems</span>
+                    {statusCounts.mature ? <span className="text-cyan-500/70">{statusCounts.mature} mature</span> : null}
+                    {statusCounts.functional ? <span className="text-emerald-500/70">{statusCounts.functional} functional</span> : null}
+                    {statusCounts.in_progress ? <span className="text-amber-500/70">{statusCounts.in_progress} in progress</span> : null}
+                    {statusCounts.planned ? <span className="text-neutral-500">{statusCounts.planned} planned</span> : null}
+                  </div>
+                </div>
+              )}
+
+              {/* Empty state */}
+              {visionExpanded && !hasPurpose && Object.keys(vision).length === 0 && (
+                <div className="bg-neutral-900/60 border border-neutral-800 border-dashed rounded-lg p-4 text-center">
+                  <p className="text-xs text-neutral-500 mb-2">No vision set yet. Describe what this project should build.</p>
+                  <button
+                    onClick={() => setShowVisionEditor(true)}
+                    className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors font-medium"
+                  >
+                    Set initial vision
+                  </button>
+                </div>
+              )}
+
+              {/* Expanded: full vision */}
+              {visionExpanded && (hasPurpose || Object.keys(vision).length > 0) && (() => {
+                const purpose = typeof vision.purpose === 'string' ? vision.purpose : '';
+                const criteria = Array.isArray(vision.success_criteria) ? vision.success_criteria as string[] : [];
+                const context = typeof vision.context === 'string' ? vision.context : '';
+                return (
+                <div className="border-l-2 border-cyan-500/20 pl-3 ml-1 space-y-2.5 mt-1">
+                  {purpose && (
+                    <p className="text-xs text-neutral-300 leading-relaxed">{purpose}</p>
+                  )}
+                  {criteria.length > 0 && (
+                    <div>
+                      <span className="text-[10px] font-semibold text-neutral-500 uppercase">Success Criteria</span>
+                      <ul className="mt-0.5 space-y-0.5">
+                        {criteria.map((c, i) => (
+                          <li key={i} className="text-xs text-neutral-400">- {String(c)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {visionSystems.length > 0 && (
+                    <div>
+                      <span className="text-[10px] font-semibold text-neutral-500 uppercase cursor-help" title="planned = not started, in progress = being built, functional = working, mature = stable">Systems</span>
+                      {/* Progress bar */}
+                      <div className="flex h-1.5 rounded-full overflow-hidden bg-neutral-800 mt-1.5 mb-2">
+                        {['mature', 'functional', 'in_progress', 'planned'].map(status => {
+                          const count = statusCounts[status] || 0;
+                          if (count === 0) return null;
+                          const pct = (count / visionSystems.length) * 100;
+                          return <div key={status} className={`${barColors[status]} transition-all`} style={{ width: `${pct}%` }} />;
+                        })}
+                      </div>
+                      <div className="space-y-1">
+                        {visionSystems.map((sys, sysIdx) => {
+                          const sysStatus = String(sys.status || 'planned');
+                          const color = visionStatusColors[sysStatus] || visionStatusColors.planned;
+                          const desc = typeof sys.description === 'string' ? sys.description : '';
+                          return (
+                            <div key={String(sys.id || `sys-${sysIdx}`)} className="flex items-center gap-2 text-xs">
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium border border-transparent ${color}`}>
+                                {sysStatus.replace('_', ' ')}
+                              </span>
+                              <span className="text-neutral-300 font-medium">{String(sys.name)}</span>
+                              {desc && <span className="text-neutral-600 truncate">— {desc}</span>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {context && (
+                    <div>
+                      <span className="text-[10px] font-semibold text-neutral-500 uppercase">Context</span>
+                      <p className="text-xs text-neutral-500 mt-0.5 whitespace-pre-wrap">
+                        {contextExpanded ? context : context.slice(0, 500)}{!contextExpanded && context.length > 500 && '...'}
+                      </p>
+                      {context.length > 500 && (
+                        <button
+                          onClick={() => setContextExpanded(prev => !prev)}
+                          className="text-[10px] text-cyan-500 hover:text-cyan-400 transition-colors mt-0.5"
+                        >
+                          {contextExpanded ? 'Show less' : 'Show more'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-[10px] pt-1.5 border-t border-neutral-800/50">
+                    <span className="text-neutral-600">
+                      Guiding {directions.filter(d => d.status === 'active').length} active direction{directions.filter(d => d.status === 'active').length !== 1 ? 's' : ''}
+                    </span>
+                    <button
+                      onClick={() => setShowStrategicOutput(true)}
+                      className="text-cyan-500 hover:text-cyan-400 transition-colors underline underline-offset-2"
+                    >
+                      View last strategic review
+                    </button>
+                  </div>
+                </div>
+                );
+              })()}
+              {showStrategicOutput && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowStrategicOutput(false)}>
+                  <div className="bg-neutral-900 border border-neutral-700 rounded-xl p-5 max-w-2xl w-full mx-4 shadow-2xl max-h-[80vh] overflow-y-auto custom-scrollbar" onClick={e => e.stopPropagation()}>
+                    <div className="flex justify-between items-center mb-4">
+                      <h3 className="text-sm font-semibold text-neutral-100">Last Strategic Review</h3>
+                      <button onClick={() => setShowStrategicOutput(false)} className="text-neutral-500 hover:text-neutral-300 transition-colors"><X className="w-4 h-4" /></button>
+                    </div>
+                    {loadingStrategic ? (
+                      <p className="text-xs text-neutral-500">Loading...</p>
+                    ) : strategicOutput ? (() => {
+                      const sVision = strategicOutput.vision as Record<string, unknown> | undefined;
+                      const sDirOps = Array.isArray(strategicOutput.direction_operations) ? strategicOutput.direction_operations as Array<Record<string, string>> : [];
+                      return (
+                        <div className="space-y-4">
+                          {/* Vision summary */}
+                          {sVision && (
+                            <div>
+                              <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Vision Update</h4>
+                              {typeof sVision.purpose === 'string' && (
+                                <p className="text-xs text-neutral-300 mb-1.5">{sVision.purpose}</p>
+                              )}
+                              {Array.isArray(sVision.systems) && (
+                                <div className="space-y-1 mt-2">
+                                  {(sVision.systems as Array<Record<string, string>>).map((sys) => {
+                                    const sColors: Record<string, string> = {
+                                      planned: 'text-neutral-400', in_progress: 'text-amber-400',
+                                      functional: 'text-emerald-400', mature: 'text-cyan-400',
+                                    };
+                                    return (
+                                      <div key={sys.id} className="flex items-center gap-2 text-xs">
+                                        <span className={sColors[sys.status] || 'text-neutral-400'}>{(sys.status || 'planned').replace('_', ' ')}</span>
+                                        <span className="text-neutral-300">{sys.name}</span>
+                                        {sys.description && <span className="text-neutral-600">— {sys.description}</span>}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {typeof sVision.context === 'string' && (
+                                <p className="text-[11px] text-neutral-500 mt-2 whitespace-pre-wrap">{(sVision.context as string).slice(0, 800)}</p>
+                              )}
+                            </div>
+                          )}
+                          {/* Direction operations */}
+                          {sDirOps.length > 0 && (
+                            <div>
+                              <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Direction Changes ({sDirOps.length})</h4>
+                              <div className="space-y-2">
+                                {sDirOps.map((op, i) => {
+                                  const opColors: Record<string, string> = {
+                                    create: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20',
+                                    update: 'text-amber-400 bg-amber-500/10 border-amber-500/20',
+                                    retire: 'text-red-400 bg-red-500/10 border-red-500/20',
+                                  };
+                                  const color = opColors[op.op] || 'text-neutral-400 bg-neutral-700 border-neutral-600';
+                                  return (
+                                    <div key={i} className="bg-neutral-950 border border-neutral-800 rounded-lg p-2.5">
+                                      <div className="flex items-center gap-2 mb-1">
+                                        <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded border ${color}`}>{op.op}</span>
+                                        {op.text && <span className="text-xs text-neutral-200 flex-1">{op.text}</span>}
+                                        {op.op === 'update' && op.changes && (() => {
+                                          const c = op.changes as unknown as Record<string, string>;
+                                          const parts = [
+                                            c.text && `text \u2192 "${c.text}"`,
+                                            c.priority && `priority \u2192 ${c.priority}`,
+                                            c.status && `status \u2192 ${c.status}`,
+                                          ].filter(Boolean);
+                                          return parts.length > 0 ? (
+                                            <span className="text-xs text-neutral-300 flex-1">{parts.join(', ')}</span>
+                                          ) : null;
+                                        })()}
+                                        {op.direction_id && <span className="text-[9px] text-neutral-600 font-mono">{op.direction_id}</span>}
+                                      </div>
+                                      {op.rationale && <p className="text-[11px] text-neutral-500">{op.rationale}</p>}
+                                      {op.priority && <span className="text-[9px] text-neutral-600">Priority: {op.priority}</span>}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                          {!sVision && sDirOps.length === 0 && (
+                            <p className="text-xs text-neutral-500">No structured output — the review may have failed or produced an unexpected format.</p>
+                          )}
+                        </div>
+                      );
+                    })() : (
+                      <p className="text-xs text-neutral-500">No completed strategic reviews found yet. Strategic reviews run every Nth research cycle (configurable in Settings).</p>
+                    )}
+                    {strategicTaskId && (
+                      <p className="text-[10px] text-neutral-600 mt-3 pt-2 border-t border-neutral-800">Task: {strategicTaskId}</p>
+                    )}
+                  </div>
+                </div>
+              )}
+              {showVisionEditor && selectedProjectId && (
+                <VisionEditorModal
+                  projectId={selectedProjectId}
+                  initialVision={vision}
+                  onSave={(updatedVision) => {
+                    setVision(updatedVision);
+                    setShowVisionEditor(false);
+                    addToast('Vision updated', 'success');
+                  }}
+                  onClose={() => setShowVisionEditor(false)}
+                />
+              )}
+            </div>
+            );
+          })()}
+
+          {/* ── Design Document (Architecture) ───────────────────── */}
+          {(() => {
+            const docSummary = typeof designDoc.summary === 'string' ? designDoc.summary : '';
+            const docSystems = Array.isArray(designDoc.systems) ? designDoc.systems as Array<Record<string, unknown>> : [];
+            const docCapabilities = (typeof designDoc.capabilities === 'object' && designDoc.capabilities && !Array.isArray(designDoc.capabilities))
+              ? designDoc.capabilities as Record<string, Record<string, string>>
+              : {};
+            const docRisks = Array.isArray(designDoc.risks) ? designDoc.risks as string[] : [];
+            const docArch = (typeof designDoc.architecture === 'object' && designDoc.architecture && !Array.isArray(designDoc.architecture))
+              ? designDoc.architecture as Record<string, unknown>
+              : {};
+            const hasContent = docSummary || docSystems.length > 0 || Object.keys(docCapabilities).length > 0;
+
+            const capStatusColors: Record<string, string> = {
+              mature: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+              functional: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+              partial: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+              missing: 'bg-red-500/20 text-red-400 border-red-500/30',
+            };
+            const sysStatusColors: Record<string, string> = {
+              mature: 'text-cyan-400',
+              functional: 'text-emerald-400',
+              partial: 'text-amber-400',
+              stub: 'text-orange-400',
+              missing: 'text-red-400',
+            };
+
+            if (!hasContent && !designDocExpanded) return null;
+
+            return (
+            <div className="mb-5">
+              <div className="flex items-center gap-2 mb-1.5">
+                <button
+                  onClick={() => setDesignDocExpanded(prev => !prev)}
+                  className="flex items-center gap-2 flex-1 text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1 transition-colors"
+                >
+                  {designDocExpanded
+                    ? <ChevronDown className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
+                    : <ChevronRight className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
+                  }
+                  <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+                    Architecture
+                  </span>
+                  {typeof designDoc.last_updated === 'string' && (
+                    <span className="text-[9px] text-neutral-600 font-mono ml-1">
+                      {formatRelativeTime(designDoc.last_updated as string)}
+                    </span>
+                  )}
+                  {docSystems.length > 0 && !designDocExpanded && (
+                    <span className="text-[9px] text-neutral-600 ml-1">{docSystems.length} systems</span>
+                  )}
+                </button>
+              </div>
+
+              {/* Collapsed: capability status bar */}
+              {!designDocExpanded && Object.keys(docCapabilities).length > 0 && (
+                <div className="px-1.5">
+                  <div className="flex flex-wrap gap-1">
+                    {Object.entries(docCapabilities).slice(0, 8).map(([name, cap]) => {
+                      const status = typeof cap === 'object' ? (cap.status || 'missing') : 'missing';
+                      return (
+                        <span key={name} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`}>
+                          {name}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Expanded */}
+              {designDocExpanded && hasContent && (
+                <div className="bg-neutral-900/60 border border-neutral-800 rounded-lg p-3 space-y-3 text-xs">
+                  {docSummary && (
+                    <p className="text-neutral-300">{docSummary}</p>
+                  )}
+
+                  {typeof docArch.type === 'string' && (
+                    <div>
+                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Architecture</span>
+                      <p className="text-neutral-400 mt-0.5">{String(docArch.type)}{docArch.description ? ` — ${String(docArch.description).slice(0, 200)}` : ''}</p>
+                    </div>
+                  )}
+
+                  {docSystems.length > 0 && (
+                    <div>
+                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Systems</span>
+                      <div className="mt-1 space-y-1">
+                        {docSystems.map((sys, i) => (
+                          <div key={i} className="flex items-start gap-2">
+                            <span className={`text-[9px] font-mono ${sysStatusColors[String(sys.status || 'missing')] || 'text-neutral-500'}`}>
+                              {String(sys.status || '?').toUpperCase()}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <span className="text-neutral-200 font-medium">{String(sys.name || sys.id || '?')}</span>
+                              {typeof sys.description === 'string' && <span className="text-neutral-500 ml-1.5">{sys.description.slice(0, 120)}</span>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {Object.keys(docCapabilities).length > 0 && (
+                    <div>
+                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Capabilities</span>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {Object.entries(docCapabilities).map(([name, cap]) => {
+                          const status = typeof cap === 'object' ? (cap.status || 'missing') : 'missing';
+                          const notes = typeof cap === 'object' ? (cap.notes || '') : '';
+                          return (
+                            <span key={name} className={`text-[9px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`} title={notes}>
+                              {name}: {status}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {docRisks.length > 0 && (
+                    <div>
+                      <span className="text-[9px] font-semibold text-red-500/70 uppercase tracking-wider">Risks</span>
+                      <ul className="mt-1 space-y-0.5">
+                        {docRisks.map((risk, i) => (
+                          <li key={i} className="text-neutral-400 flex items-start gap-1.5">
+                            <span className="text-red-500/50 mt-0.5">-</span>
+                            <span>{String(risk).slice(0, 200)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  <div className="text-[9px] text-neutral-600 pt-1 border-t border-neutral-800/50">
+                    rev {String(designDoc.revision || 0)}
+                    {typeof designDoc.updated_by_task === 'string' && ' (agent)'}
+                    {designDoc.updated_by === 'user' && ' (user)'}
+                  </div>
+                </div>
+              )}
+
+              {designDocExpanded && !hasContent && (
+                <div className="bg-neutral-900/60 border border-neutral-800 border-dashed rounded-lg p-4 text-center">
+                  <p className="text-xs text-neutral-500">No design document yet. The architecture agent will build one on the next strategic cycle.</p>
+                </div>
+              )}
+            </div>
+            );
+          })()}
+
           {loading ? (
             <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
           ) : !selectedProjectId ? (
@@ -944,7 +1405,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                   <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
                                   <div className="flex items-center gap-1 shrink-0">
                                     {key === 'active' && (() => {
-                                      const activeItems = grouped.find(g => g.key === 'active')!.items;
+                                      const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
                                       const idx = activeItems.findIndex(x => x.id === d.id);
                                       return (<>
                                         {idx > 0 && (
@@ -1041,9 +1502,9 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     return <p className="text-[10px] text-neutral-600 mt-0.5">Never researched</p>;
                                   }
                                   if (cooldownStatus === 'cooling') {
-                                    return <p className="text-[10px] text-amber-500/80 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at!)}</p>;
+                                    return <p className="text-[10px] text-amber-500/80 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
                                   }
-                                  return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at!)}</p>;
+                                  return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
                                 })()}
                                 {/* Auto-pause reason subtitle */}
                                 {key === 'paused' && d.paused_reason && (
@@ -1099,7 +1560,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     if (cooldownStatus === 'cooling') {
                                       return (
                                         <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
-                                          Cooling down · {formatTimeRemaining(d.last_researched_at!, cooldownMinutes)}
+                                          Cooling down · {formatTimeRemaining(d.last_researched_at ?? '', cooldownMinutes)}
                                         </span>
                                       );
                                     }

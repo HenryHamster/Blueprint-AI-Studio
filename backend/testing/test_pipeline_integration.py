@@ -772,8 +772,8 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     must return None (no fix task spawned) and set requires_approval=True on the
     original task.
 
-    Setup: scope='small' → cap=3.  Place the review task at iteration=3 so the
-    next spawned task would be iteration=4 (> cap), triggering the per-chain cap.
+    Setup: scope='small' → cap=5.  Place the review task at iteration=5 so the
+    next spawned task would be iteration=6 (> cap), triggering the per-chain cap.
     Keep completed pipeline tasks at 1 (just this review itself after it finishes)
     so the global cap (pr_iterations >= cap) does not fire first.
     """
@@ -799,9 +799,9 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Review task at iteration=3 (the 3rd review in the chain).
-    # scope='small' → _max_review_iterations returns 3.
-    # Attempting to spawn next task → iteration=4 > 3 → per-chain cap fires.
+    # Review task at iteration=5 (the 5th review in the chain).
+    # scope='small' → _max_review_iterations returns 5.
+    # Attempting to spawn next task → iteration=6 > 5 → per-chain cap fires.
     review_task = Task(
         project_id=project.id,
         title="Review PR #88",
@@ -817,7 +817,7 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
                 "pr_number": 88,
                 "branch": "blueprint/task-cap0001",
                 "base_branch": "main",
-                "iteration": 3,
+                "iteration": 5,
                 "original_task_id": str(original_task.id),
             },
         },
@@ -867,10 +867,10 @@ async def test_review_fix_cap_ci_failure_lower_limit(
 ):
     """
     When fix_reason='ci_failure' is stored in the review_loop context,
-    _max_review_iterations returns 2 (lower than the default 4-5).
+    _max_review_iterations returns 3 (lower than the default 6-8).
 
-    A review task at iteration=2 with fix_reason='ci_failure' should trigger
-    the per-chain cap when attempting to spawn iteration=3, because 3 > 2.
+    A review task at iteration=3 with fix_reason='ci_failure' should trigger
+    the per-chain cap when attempting to spawn iteration=4, because 4 > 3.
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
@@ -892,9 +892,9 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Review task at iteration=2 with fix_reason='ci_failure'.
-    # _max_review_iterations returns 2 for ci_failure.
-    # Attempting to spawn next task → iteration=3 > 2 → per-chain cap fires.
+    # Review task at iteration=3 with fix_reason='ci_failure'.
+    # _max_review_iterations returns 3 for ci_failure.
+    # Attempting to spawn next task → iteration=4 > 3 → per-chain cap fires.
     review_task = Task(
         project_id=project.id,
         title="Review PR #55 (ci failure context)",
@@ -909,7 +909,7 @@ async def test_review_fix_cap_ci_failure_lower_limit(
                 "pr_number": 55,
                 "branch": "blueprint/task-ci0001",
                 "base_branch": "main",
-                "iteration": 2,
+                "iteration": 3,
                 "fix_reason": "ci_failure",
                 "original_task_id": str(original_task.id),
             },
@@ -932,7 +932,7 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     await db_session.refresh(review_task)
     assert review_task.status == TaskStatus.COMPLETED
 
-    # No fix task should be spawned — ci_failure cap (2) was hit at iteration 3
+    # No fix task should be spawned — ci_failure cap (3) was hit at iteration 3
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -943,7 +943,7 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     fix_tasks = [t for t in new_tasks if _task_type(t) == "fix"]
 
     assert len(fix_tasks) == 0, (
-        f"ci_failure cap (limit=2) should have blocked fix spawn at iteration 3, "
+        f"ci_failure cap (limit=3) should have blocked fix spawn at iteration 4, "
         f"but found: {[t.id for t in fix_tasks]}"
     )
 
@@ -985,7 +985,7 @@ async def test_review_fix_cap_sets_status_message(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # scope='small' → cap=3; iteration=3 → next would be 4 > 3 → per-chain cap fires
+    # scope='small' → cap=5; iteration=5 → next would be 6 > 5 → per-chain cap fires
     review_task = Task(
         project_id=project.id,
         title="Review PR #73",
@@ -1001,7 +1001,7 @@ async def test_review_fix_cap_sets_status_message(
                 "pr_number": 73,
                 "branch": "blueprint/task-msg0001",
                 "base_branch": "main",
-                "iteration": 3,
+                "iteration": 5,
                 "original_task_id": str(original_task.id),
             },
         },

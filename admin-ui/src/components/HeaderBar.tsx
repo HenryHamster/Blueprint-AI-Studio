@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users, Stethoscope, LayoutGrid } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users, Stethoscope, LayoutGrid, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
@@ -24,6 +24,8 @@ export interface HeaderBarProps {
   onToggleArchive: () => void;
   showActivityFeed: boolean;
   onToggleActivityFeed: () => void;
+  showMessages: boolean;
+  onToggleMessages: () => void;
   newActivityCount: number;
   needsAttentionCount: number;
   onOpenNewTaskModal: () => void;
@@ -57,6 +59,8 @@ export interface HeaderBarProps {
   onUpdateAutonomousResearchInterval: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
+  strategicResearchFrequency: number;
+  onUpdateStrategicResearchFrequency: (value: number) => void;
   onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
@@ -120,6 +124,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleArchive,
     showActivityFeed,
     onToggleActivityFeed,
+    showMessages,
+    onToggleMessages,
     newActivityCount,
     needsAttentionCount,
     onOpenNewTaskModal,
@@ -152,6 +158,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateAutonomousResearchInterval,
     directionCooldownMinutes,
     onUpdateDirectionCooldownMinutes,
+    strategicResearchFrequency,
+    onUpdateStrategicResearchFrequency,
     onSyncTaskTypeDefaults,
     agentPromptSuffixes,
     onUpdateAgentPromptSuffixes,
@@ -343,6 +351,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
           directionCooldownMinutes={directionCooldownMinutes}
           onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
+          strategicResearchFrequency={strategicResearchFrequency}
+          onUpdateStrategicResearchFrequency={onUpdateStrategicResearchFrequency}
           onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}
           healthCheckUrls={props.healthCheckUrls}
           onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
@@ -418,6 +428,17 @@ export function HeaderBar(props: HeaderBarProps) {
             {newActivityCount > 0 && !showActivityFeed && (
               <span className="absolute top-0.5 right-0.5 w-2 h-2 bg-red-500 rounded-full" />
             )}
+          </button>
+          <button
+            onClick={onToggleMessages}
+            className={`p-2 rounded text-xs transition-colors border ${
+              showMessages
+                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            }`}
+            title="Messages"
+          >
+            <MessageSquare className="w-4 h-4" />
           </button>
           <button
             onClick={onToggleResearchBrowser}
@@ -527,6 +548,13 @@ export function HeaderBar(props: HeaderBarProps) {
                     {props.stuckTaskCount}
                   </span>
                 )}
+              </button>
+              <button
+                onClick={() => { onToggleMessages(); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <MessageSquare className="w-4 h-4 shrink-0" />
+                <span>Messages</span>
               </button>
               <button
                 onClick={() => { onShowDirections(); setShowMobileMenu(false); }}

@@ -353,10 +353,18 @@ export function readHandlerOutput<T = unknown>(
     return JSON.parse(raw) as T;
   } catch (err: unknown) {
     sendLog(ws, `[WARNING] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
-    const match = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-    if (match) {
+    // Try extracting a JSON array (research findings, plans)
+    const arrayMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    if (arrayMatch) {
       try {
-        return JSON.parse(match[0]) as T;
+        return JSON.parse(arrayMatch[0]) as T;
+      } catch { /* no fallback available */ }
+    }
+    // Try extracting a JSON object (strategic output)
+    const objMatch = raw.match(/\{[\s\S]*?"vision"[\s\S]*?"direction_operations"[\s\S]*?\}\s*$/);
+    if (objMatch) {
+      try {
+        return JSON.parse(objMatch[0]) as T;
       } catch { /* no fallback available */ }
     }
     return null;
@@ -907,7 +915,7 @@ async function main() {
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     // Clean up /tmp files written by Claude Code handlers (task-specific paths)
-    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report']) {
+    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
     log('Agent shutdown complete.');

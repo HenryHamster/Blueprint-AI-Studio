@@ -123,6 +123,9 @@ export function useAppState() {
     }
   }, [showActivityFeed]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Messages panel state
+  const [showMessages, setShowMessages] = useState(false);
+
   // Settings state
   const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
@@ -130,6 +133,7 @@ export function useAppState() {
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
   const [autonomousResearchIntervalMinutes, setAutonomousResearchIntervalMinutes] = useState(30);
   const [directionCooldownMinutes, setDirectionCooldownMinutes] = useState(240);
+  const [strategicResearchFrequency, setStrategicResearchFrequency] = useState(6);
   const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
   const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
@@ -290,6 +294,7 @@ export function useAppState() {
         if (logTask) { closeLogViewer(); return; }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
+        if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
         if (showDirections) { setShowDirections(false); return; }
         if (showMetrics) { setShowMetrics(false); return; }
@@ -340,7 +345,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
 
   // ── Functions ───────────────────────────────────────────────────────────
 
@@ -847,6 +852,7 @@ export function useAppState() {
         setMaxAutonomousTasksPerHour(data.max_autonomous_tasks_per_hour ?? 10);
         setAutonomousResearchIntervalMinutes(data.autonomous_research_interval_minutes ?? 30);
         setDirectionCooldownMinutes(data.autonomous_direction_cooldown_minutes ?? 240);
+        setStrategicResearchFrequency(data.strategic_research_frequency ?? 6);
         setHealthCheckUrls(data.health_check_urls ?? []);
         setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
         setUsingMaxPlan(data.using_max_plan ?? false);
@@ -1040,6 +1046,22 @@ export function useAppState() {
     } catch {
       setDirectionCooldownMinutes(prev);
       addToast('Failed to update direction cooldown', 'error');
+    }
+  };
+
+  const handleUpdateStrategicResearchFrequency = async (value: number) => {
+    const v = Math.max(0, Math.min(100, value));
+    const prev = strategicResearchFrequency;
+    setStrategicResearchFrequency(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ strategic_research_frequency: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setStrategicResearchFrequency(prev);
+      addToast('Failed to update strategic research frequency', 'error');
     }
   };
 
@@ -1333,6 +1355,8 @@ export function useAppState() {
     showResearchBrowser, setShowResearchBrowser,
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
+    // Messages
+    showMessages, setShowMessages,
     // New task modal
     showNewTaskModal, setShowNewTaskModal,
     newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
@@ -1351,10 +1375,10 @@ export function useAppState() {
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
-    autonomousResearchIntervalMinutes, directionCooldownMinutes,
+    autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
     updateMaxVMs, updateMaxRetries, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     agentPromptSuffixes, updateAgentPromptSuffixes,
-    handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes,
+    handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

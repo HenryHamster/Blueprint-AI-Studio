@@ -235,6 +235,7 @@ async def test_cooldown_filter_excludes_recently_researched_direction(db_session
             "added_at": "2026-01-01T00:00:00",
             "last_researched_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
         }],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -263,6 +264,7 @@ async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
             "added_at": "2026-01-01T00:00:00",
             "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
         }],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -292,6 +294,7 @@ async def test_cooldown_filter_includes_direction_never_researched(db_session):
             "added_at": "2026-01-01T00:00:00",
             # no last_researched_at key
         }],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()

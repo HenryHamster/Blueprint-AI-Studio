@@ -33,6 +33,8 @@ interface SettingsDropdownProps {
   onUpdateAutonomousResearchInterval: (value: number) => void;
   directionCooldownMinutes: number;
   onUpdateDirectionCooldownMinutes: (value: number) => void;
+  strategicResearchFrequency: number;
+  onUpdateStrategicResearchFrequency: (value: number) => void;
   onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
@@ -126,6 +128,8 @@ export function SettingsDropdown({
   onUpdateAutonomousResearchInterval,
   directionCooldownMinutes,
   onUpdateDirectionCooldownMinutes,
+  strategicResearchFrequency,
+  onUpdateStrategicResearchFrequency,
   onSyncTaskTypeDefaults,
   healthCheckUrls,
   onUpdateHealthCheckUrls,
@@ -491,6 +495,18 @@ export function SettingsDropdown({
                 onChange={e => onUpdateDirectionCooldownMinutes(parseInt(e.target.value) || 240)}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
+            </div>
+            <div>
+              <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Strategic Freq (0=off)</label>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={strategicResearchFrequency}
+                onChange={e => onUpdateStrategicResearchFrequency(parseInt(e.target.value) || 0)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+              <p className="text-[9px] text-neutral-600 mt-0.5">Every Nth cycle reviews vision</p>
             </div>
           </div>
           <div className="mb-4">

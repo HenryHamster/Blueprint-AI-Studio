@@ -37,7 +37,7 @@ async def get_directions(
     current_user: dict = Depends(get_current_user)
 ):
     project = await _get_user_project(project_id, current_user["user_id"], session)
-    return {"directions": project.directions or [], "autonomous_enabled": project.autonomous_enabled}
+    return {"directions": project.directions or [], "autonomous_enabled": project.autonomous_enabled, "vision": project.vision or {}, "design_doc": project.design_doc or {}}
 
 
 @router.post("/projects/{project_id}/directions")

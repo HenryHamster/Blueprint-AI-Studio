@@ -167,6 +167,7 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-cbhalf01")],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't override
     )
     db_session.add(project)
     await db_session.commit()
@@ -210,6 +211,7 @@ async def test_spawn_skipped_when_directions_empty(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()
@@ -232,6 +234,7 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
             {**_active_direction("d-paused01", "Paused A"), "status": "paused"},
             {**_active_direction("d-done0001", "Completed B"), "status": "completed"},
         ],
+        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
     )
     db_session.add(project)
     await db_session.commit()

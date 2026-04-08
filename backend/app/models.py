@@ -87,6 +87,10 @@ class Project(SQLModel, table=True):
     # Autonomous improvement: user-defined high-level directions for research agents
     # Includes directions with status: 'active', 'paused', 'proposed', 'rejected', 'expired'
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
+    # Strategic product vision maintained by the strategic research agent
+    vision: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
+    # Living architectural description maintained by design doc update agent
+    design_doc: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
@@ -240,6 +244,32 @@ class Alert(SQLModel, table=True):
     task_id: Optional[uuid.UUID] = None
     created_at: datetime = Field(default_factory=_utcnow)
     dismissed_at: Optional[datetime] = None
+
+
+class MessageType(str, Enum):
+    QUESTION = "QUESTION"
+    FEEDBACK = "FEEDBACK"
+    BUG_REPORT = "BUG_REPORT"
+    BLOCKER = "BLOCKER"
+    NOTE = "NOTE"
+
+class ProjectMessage(SQLModel, table=True):
+    """Async message board between users and the strategic agent."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    message_type: MessageType = Field(default=MessageType.NOTE, sa_column=Column(String, default=MessageType.NOTE))
+    from_type: str = Field(default="user")  # "user" | "agent" | "strategic"
+    from_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
+    content: str = Field(default="")
+    context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
+    status: str = Field(default="open")  # "open" | "resolved"
+    resolution: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        Index("ix_projectmessage_project_status", "project_id", "status"),
+    )
 
 
 class DeploymentStatus(str, Enum):
