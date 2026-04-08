@@ -664,6 +664,8 @@ async def get_pull_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
         headers
     )
+    if response.status_code in (404, 410):
+        raise HTTPException(status_code=response.status_code, detail=f"PR #{pr_number} not found or repo gone")
     if response.status_code != 200:
         logger.error(f"Failed to get PR #{pr_number}: {response.text}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get PR #{pr_number}")

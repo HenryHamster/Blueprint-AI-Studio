@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
+from fastapi import HTTPException
 from sqlalchemy import func as _func
 from sqlmodel import select
 
@@ -816,7 +817,43 @@ async def orchestrator_worker():
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
 
                         # Re-fetch current PR head to handle force-pushes
-                        pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                        try:
+                            pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                        except HTTPException as exc:
+                            if exc.status_code in (404, 410):
+                                _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
+                                logger.error(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = _pr_gone_msg
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                                continue
+                            raise
+
+                        if not pr_data:
+                            _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
+                            ci_loop["pr_fetch_failures"] = _fetch_failures
+                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                            session.add(ci_task)
+                            await session.commit()
+                            if _fetch_failures >= 5:
+                                _empty_msg = f"PR #{ci_pr_number} returned empty response {_fetch_failures} times consecutively"
+                                logger.error(f"[CI] {_empty_msg} for task {ci_task.id}")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = _empty_msg
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(ci_task, session, _empty_msg)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                            continue
+
+                        if ci_loop.get("pr_fetch_failures"):
+                            ci_loop["pr_fetch_failures"] = 0
+
                         pr_state = pr_data.get("state", "open")
 
                         # Check if PR was already merged (prevents double merge)
