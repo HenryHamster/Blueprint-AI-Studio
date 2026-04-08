@@ -8,6 +8,7 @@ EVALUATING tasks.
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 import uuid
@@ -155,7 +156,6 @@ async def orchestrator_worker():
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
         try:
-            _orchestrator_consecutive_errors = 0
             _orchestrator_cycle_started = _utcnow()
             cycle_start = time.monotonic()
             tasks_recovered = 0
@@ -1012,12 +1012,13 @@ async def orchestrator_worker():
                 'tasks_recovered': tasks_recovered,
             })
             _orchestrator_last_cycle = _utcnow()
+            _orchestrator_consecutive_errors = 0
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
         except Exception:
             _orchestrator_consecutive_errors += 1
-            backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
+            backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60) * random.uniform(0.8, 1.2)
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                 'consecutive_errors': _orchestrator_consecutive_errors,
@@ -1054,16 +1055,16 @@ async def orchestrator_worker():
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1
-            monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+            monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60) * random.uniform(0.8, 1.2)
             logger.error(f"[ORCHESTRATOR] Monitoring check error (consecutive={_orchestrator_consecutive_monitoring_errors}, backoff={monitoring_backoff:.1f}s): {e}", exc_info=True)
 
         # Sleep based on whether we found tasks
         try:
             if _orchestrator_consecutive_errors > 0:
-                backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
+                backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(backoff)
             elif _orchestrator_consecutive_monitoring_errors > 0:
-                monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+                monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(monitoring_backoff)
             elif queued_tasks:
                 await asyncio.sleep(0.5)
