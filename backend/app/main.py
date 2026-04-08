@@ -1223,6 +1223,17 @@ async def _check_pause_mode():
                 await broadcast_deploy_state()
 
 
+def _compute_merge_rate(d: dict) -> float:
+    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    if total_cycles == 0:
+        return 0.5  # unknown, neutral
+    return total_merged / total_cycles
+
+
 async def _spawn_research_task(project: Project, session: AsyncSession):
     """Spawn a research task for a project if conditions are met."""
     # Guard: autonomous must be enabled
@@ -1353,10 +1364,16 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
         chosen_direction = random.choice(top_tier)
     else:
-        # All have been researched — pick highest priority first, then non-saturated, then oldest researched
+        # All have been researched — pick highest priority first, then non-saturated,
+        # then higher merge rate, then oldest researched
+        for d in active_directions:
+            did = d.get("id", "?")
+            merge_rate = _compute_merge_rate(d)
+            logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f}")
         active_directions.sort(key=lambda d: (
             priority_rank.get(d.get("priority", "medium"), 1),
             1 if d.get("possibly_saturated") else 0,
+            -_compute_merge_rate(d),  # higher merge rate preferred
             d.get("last_researched_at") or ""
         ))
         chosen_direction = active_directions[0]
@@ -1430,6 +1447,10 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
     }
+    if is_undirected:
+        anomalies = await _compute_research_anomalies(project.id, session)
+        if anomalies:
+            research_payload["anomaly_signals"] = anomalies
     if is_undirected:
         direction_text = "Cross-cutting codebase analysis"
         logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{total_research_count})")
@@ -2804,8 +2825,8 @@ def _compute_saturation(history: list) -> bool:
 
 
 def _parse_research_context(text: str) -> dict:
-    """Parse a research_context string into its 3 sections."""
-    result: dict = {"established": [], "failed": [], "open_questions": []}
+    """Parse a research_context string into its 3 sections and optional eviction summary."""
+    result: dict = {"established": [], "failed": [], "open_questions": [], "eviction_summary": None}
     if not text:
         return result
     section_map = {
@@ -2814,13 +2835,65 @@ def _parse_research_context(text: str) -> dict:
         "## Open Questions": "open_questions",
     }
     current_key: Optional[str] = None
+    in_eviction = False
+    eviction_lines: list = []
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped in section_map:
+        if stripped == "## Eviction Summary":
+            in_eviction = True
+            current_key = None
+        elif stripped in section_map:
+            in_eviction = False
             current_key = section_map[stripped]
+        elif in_eviction and stripped:
+            eviction_lines.append(stripped)
         elif current_key and stripped.startswith("- "):
             result[current_key].append(stripped[2:])
+    if eviction_lines:
+        result["eviction_summary"] = "\n".join(eviction_lines)
     return result
+
+
+def _parse_eviction_counts(summary_text: Optional[str]) -> dict:
+    """Parse counts and failed titles from an eviction summary body."""
+    result: dict = {"established": 0, "failed": 0, "open_questions": 0, "failed_titles": []}
+    if not summary_text:
+        return result
+    for line in summary_text.splitlines():
+        line = line.strip()
+        # Check "Failed:" prefix before "evicted" keyword — titles may themselves contain "evicted"
+        if line.startswith("Failed:"):
+            titles_str = line[len("Failed:"):].strip()
+            result["failed_titles"] = [t.strip() for t in titles_str.split(";") if t.strip()]
+        elif "evicted" in line:
+            m = re.search(r'(\d+) established', line)
+            if m:
+                result["established"] = int(m.group(1))
+            m = re.search(r'(\d+) failed', line)
+            if m:
+                result["failed"] = int(m.group(1))
+            m = re.search(r'(\d+) open question', line)
+            if m:
+                result["open_questions"] = int(m.group(1))
+    return result
+
+
+def _format_eviction_body(established: int, failed: int, open_questions: int, failed_titles: list) -> str:
+    """Format the eviction summary body content (without the ## header line)."""
+    count_parts = []
+    if established > 0:
+        count_parts.append(f"{established} established")
+    if failed > 0:
+        count_parts.append(f"{failed} failed")
+    if open_questions > 0:
+        plural = "s" if open_questions != 1 else ""
+        count_parts.append(f"{open_questions} open question{plural}")
+    lines = []
+    if count_parts:
+        lines.append(", ".join(count_parts) + " evicted")
+    if failed_titles:
+        lines.append("Failed: " + "; ".join(failed_titles))
+    return "\n".join(lines)
 
 
 def _build_research_context(
@@ -2832,6 +2905,9 @@ def _build_research_context(
 ) -> str:
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
+
+    # Parse prior eviction summary for accumulation
+    prior_eviction = _parse_eviction_counts(parsed["eviction_summary"])
 
     # Append new findings to Established Findings as (proposed)
     for i, title in enumerate(finding_titles):
@@ -2850,8 +2926,12 @@ def _build_research_context(
             parsed["open_questions"].append(insight)
             existing_oq.add(insight)
 
-    def _format_doc(sections: dict) -> str:
+    def _format_doc(sections: dict, eviction_body: Optional[str] = None) -> str:
         parts: list = []
+        if eviction_body:
+            parts.append("## Eviction Summary")
+            parts.append(eviction_body)
+            parts.append("")
         for header, key in [
             ("## Established Findings", "established"),
             ("## Failed Approaches", "failed"),
@@ -2863,13 +2943,28 @@ def _build_research_context(
             parts.append("")
         return "\n".join(parts).strip() + "\n"
 
+    MAX_MAIN_CHARS = 3500
+    EVICTION_MAX = 500
+    TOTAL_MAX = MAX_MAIN_CHARS + EVICTION_MAX  # 4000
+
     doc = _format_doc(parsed)
-    MAX_CHARS = 4000
-    if len(doc) <= MAX_CHARS:
+    if len(doc) <= MAX_MAIN_CHARS:
+        # No trimming needed; preserve any existing eviction summary
+        if prior_eviction["established"] or prior_eviction["failed"] or prior_eviction["open_questions"]:
+            eviction_body = _format_eviction_body(
+                prior_eviction["established"],
+                prior_eviction["failed"],
+                prior_eviction["open_questions"],
+                prior_eviction["failed_titles"],
+            )
+            return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
         return doc
 
-    # Trim oldest entries (from top of each section) to stay under limit
-    while len(doc) > MAX_CHARS:
+    # Snapshot sections before trimming
+    before = {k: list(v) for k, v in parsed.items() if k in ("established", "failed", "open_questions")}
+
+    # Trim oldest entries (from top of each section) to stay under main limit
+    while len(doc) > MAX_MAIN_CHARS:
         trimmed = False
         for key in sorted(
             ["established", "failed", "open_questions"],
@@ -2883,7 +2978,128 @@ def _build_research_context(
             break
         doc = _format_doc(parsed)
 
-    return doc[:MAX_CHARS]
+    # Compute newly evicted entries
+    new_established = len(before["established"]) - len(parsed["established"])
+    new_failed = len(before["failed"]) - len(parsed["failed"])
+    new_oq = len(before["open_questions"]) - len(parsed["open_questions"])
+
+    evicted_failed_titles = [e[:60] for e in before["failed"][:new_failed]] if new_failed > 0 else []
+
+    # Merge with prior eviction summary
+    total_established = prior_eviction["established"] + new_established
+    total_failed = prior_eviction["failed"] + new_failed
+    total_oq = prior_eviction["open_questions"] + new_oq
+    all_failed_titles = prior_eviction["failed_titles"] + evicted_failed_titles
+
+    eviction_body = _format_eviction_body(total_established, total_failed, total_oq, all_failed_titles)
+    return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
+
+
+async def _compute_research_anomalies(project_id, session: AsyncSession) -> list:
+    """Analyze recent task data to identify pipeline anomalies for undirected research focus.
+
+    Returns a list of {signal: str, severity: 'high'|'medium', details: str} dicts.
+    """
+    now = _utcnow()
+    window_48h = now - timedelta(hours=48)
+    prior_window_start = now - timedelta(hours=96)
+
+    # Query last 50 terminal tasks for this project
+    terminal_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        ).order_by(Task.created_at.desc()).limit(50)
+    )).scalars().all()
+
+    anomalies = []
+
+    # --- Failure class analysis ---
+    recent_failures = [t for t in terminal_tasks if t.created_at and t.created_at >= window_48h]
+    prior_failures = [t for t in terminal_tasks if t.created_at and prior_window_start <= t.created_at < window_48h]
+
+    # Group by failure class
+    recent_by_class: dict = {}
+    for t in recent_failures:
+        cls = classify_failure(t)
+        recent_by_class.setdefault(cls, []).append(t)
+
+    prior_by_class: dict = {}
+    for t in prior_failures:
+        cls = classify_failure(t)
+        prior_by_class[cls] = prior_by_class.get(cls, 0) + 1
+
+    for cls, tasks in recent_by_class.items():
+        count = len(tasks)
+        prior_count = prior_by_class.get(cls, 0)
+        if count > 3 and prior_count > 0 and count >= prior_count * 2:
+            anomalies.append({
+                "signal": f"{cls} failures increased {prior_count}x → {count}x in last 48h",
+                "severity": "high",
+                "details": (
+                    f"{cls} failure count rose from {prior_count} to {count} between the prior "
+                    f"48h window and the current one. Investigate common error patterns."
+                ),
+            })
+        elif count > 3:
+            anomalies.append({
+                "signal": f"{cls} failures: {count} occurrences in last 48h",
+                "severity": "medium",
+                "details": (
+                    f"{count} tasks failed with class {cls} in the last 48h. "
+                    "Consider investigating shared root causes."
+                ),
+            })
+
+    # --- Direction merge rate and failure rate analysis ---
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalar_one_or_none()
+    if project:
+        for direction in (project.directions or []):
+            if direction.get("status") != "active":
+                continue
+            history = direction.get("research_history") or []
+            d_id = direction.get("id", "?")
+            d_text = (direction.get("text") or "")[:60]
+
+            # Declining merge rate across last 3 cycles
+            if len(history) >= 3:
+                last3 = history[-3:]
+                rates = []
+                for entry in last3:
+                    created = entry.get("tasks_created", 0)
+                    merged = entry.get("prs_merged", 0)
+                    rates.append(merged / created if created > 0 else 0.0)
+                if rates[0] > rates[1] > rates[2] and rates[0] > 0.1:
+                    anomalies.append({
+                        "signal": f"Direction '{d_id}' merge rate declining: {rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}",
+                        "severity": "medium",
+                        "details": (
+                            f"Direction \"{d_text}\" (id: {d_id}) has seen a consistent decline in "
+                            f"merge rate over the last 3 cycles ({rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}). "
+                            "May indicate implementation barriers or stale findings."
+                        ),
+                    })
+
+            # High failure rate in last 2 cycles (>50%)
+            if len(history) >= 2:
+                last2 = history[-2:]
+                total_created = sum(e.get("tasks_created", 0) for e in last2)
+                total_failed = sum(e.get("tasks_failed", 0) for e in last2)
+                if total_created > 0 and total_failed / total_created > 0.5:
+                    fail_pct = int(total_failed / total_created * 100)
+                    anomalies.append({
+                        "signal": f"Direction '{d_id}' has {fail_pct}% task failure rate in last 2 cycles",
+                        "severity": "high",
+                        "details": (
+                            f"Direction \"{d_text}\" (id: {d_id}) had {total_failed}/{total_created} tasks fail "
+                            f"in the last 2 research cycles ({fail_pct}% failure rate). "
+                            "The findings may be generating unimplementable tasks."
+                        ),
+                    })
+
+    return anomalies
 
 
 def _check_direction_health(direction: dict) -> Optional[str]:
@@ -4239,8 +4455,12 @@ async def _update_direction_research_outcomes(
                                 new_established.append(item)
                         parsed["established"] = new_established
 
-                # Reassemble the document
+                # Reassemble the document (preserve eviction summary if present)
                 parts: list = []
+                if parsed.get("eviction_summary"):
+                    parts.append("## Eviction Summary")
+                    parts.append(parsed["eviction_summary"])
+                    parts.append("")
                 for header, key in [
                     ("## Established Findings", "established"),
                     ("## Failed Approaches", "failed"),

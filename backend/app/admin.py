@@ -3495,6 +3495,138 @@ async def get_global_diagnostics(
     }
 
 
+async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID) -> Dict[str, Any]:
+    """Compute lightweight pipeline health metrics for the last 24 hours.
+
+    Returns a dict with:
+    - success_rate: float or None
+    - trend: 'improving' | 'stable' | 'declining' | None
+    - failure_distribution: {failure_class: count} top 3
+    - direction_stats: [{direction_id, merge_rate, cycles, possibly_saturated}]
+    """
+    from app.main import classify_failure as _classify_failure
+
+    _now = _utcnow()
+    window_start = _now - timedelta(hours=24)
+    prev_window_start = window_start - timedelta(hours=24)
+
+    def _derive_completed_at(t: Task):
+        if t.status_log:
+            try:
+                return datetime.fromisoformat(t.status_log[-1]["t"])
+            except (KeyError, ValueError):
+                pass
+        return t.created_at
+
+    # Query tasks from extended 48h window to compute both current and previous period
+    tasks_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_at >= prev_window_start,
+        )
+    )
+    all_tasks = tasks_result.scalars().all()
+
+    # Post-filter by completion timestamp
+    completed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.COMPLETED and _derive_completed_at(t) >= window_start
+    ]
+    failed_tasks = [
+        t for t in all_tasks
+        if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
+    ]
+
+    total_terminal = len(completed_tasks) + len(failed_tasks)
+    success_rate = round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+
+    # Previous window for trend comparison
+    prev_completed = [
+        t for t in all_tasks
+        if t.status == TaskStatus.COMPLETED
+        and prev_window_start <= _derive_completed_at(t) < window_start
+    ]
+    prev_failed = [
+        t for t in all_tasks
+        if t.status == TaskStatus.FAILED
+        and prev_window_start <= _derive_completed_at(t) < window_start
+    ]
+    prev_total = len(prev_completed) + len(prev_failed)
+    prev_success_rate = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
+
+    trend: Optional[str] = None
+    if success_rate is not None and prev_success_rate is not None:
+        delta = success_rate - prev_success_rate
+        if delta > 0.05:
+            trend = "improving"
+        elif delta < -0.05:
+            trend = "declining"
+        else:
+            trend = "stable"
+
+    # Failure distribution (top 3 by count)
+    failure_counts: Dict[str, int] = {}
+    for t in failed_tasks:
+        cls = _classify_failure(t)
+        failure_counts[cls] = failure_counts.get(cls, 0) + 1
+    failure_distribution = dict(
+        sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    )
+
+    # Direction stats: merge_rate and cycle count per active direction
+    direction_stats: List[Dict[str, Any]] = []
+    project = await session.get(Project, project_id)
+    if project:
+        active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+
+        dir_tasks: Dict[str, list] = {}
+        for t in all_tasks:
+            did = (t.context or {}).get("direction_id")
+            if did:
+                dir_tasks.setdefault(str(did), []).append(t)
+
+        for d in active_directions:
+            did = str(d.get("id") or d.get("direction_id") or "")
+            if not did:
+                continue
+
+            tasks_for_dir = dir_tasks.get(did, [])
+            cycles = sum(
+                1 for t in tasks_for_dir
+                if t.status == TaskStatus.COMPLETED
+                and (t.first_payload).get("type", "create") == "research"
+                and _derive_completed_at(t) >= window_start
+            )
+
+            if cycles == 0:
+                continue
+
+            prs_merged = 0
+            for entry in d.get("research_history") or []:
+                try:
+                    entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                    if entry_ts >= window_start:
+                        prs_merged += entry.get("prs_merged") or 0
+                except (ValueError, TypeError):
+                    pass
+
+            direction_stats.append({
+                "direction_id": did,
+                "merge_rate": round(prs_merged / cycles, 2),
+                "cycles": cycles,
+                "possibly_saturated": bool(d.get("possibly_saturated", False)),
+            })
+
+        direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
+
+    return {
+        "success_rate": success_rate,
+        "trend": trend,
+        "failure_distribution": failure_distribution,
+        "direction_stats": direction_stats,
+    }
+
+
 @router.get("/digest")
 async def get_digest(
     hours: int = Query(24, ge=1, le=168),

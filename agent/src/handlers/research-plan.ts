@@ -340,6 +340,18 @@ ${hotspotsSection}
     }
   }
 
+  // Build anomaly signals section for undirected research cycles
+  let anomalySection = '';
+  if (!currentDirectionId) {
+    const rawAnomalies = payload.anomaly_signals;
+    if (Array.isArray(rawAnomalies) && rawAnomalies.length > 0) {
+      const anomalyLines = (rawAnomalies as Array<{signal: string; severity: string; details: string}>)
+        .map(a => `- [${strVal(a.severity)}] ${strVal(a.signal)}. ${strVal(a.details)}`)
+        .join('\n');
+      anomalySection = `\n## Suggested Investigation Areas\nBased on pipeline performance analysis:\n${anomalyLines}\n`;
+    }
+  }
+
   const contextPrefix = buildContextPrefix(task);
 
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
@@ -377,7 +389,7 @@ Direction maturity — the MORE cycles, the BIGGER the findings:
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
 # SECTION 3: DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
-
+${anomalySection}
 # SECTION 4: DEDUP — do not re-propose these
 ${recentlyCompleted.length > 0
   ? recentlyCompleted.map(t => {

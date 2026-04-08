@@ -285,6 +285,50 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
     const candidateContent = candidateLines.join('\n');
     if (candidateContent.length <= budget) {
       lessonsLines = candidateLines;
+      budget -= candidateContent.length;
+    }
+  }
+
+  // Build pipeline health section — only if budget allows, capped at 400 chars
+  const pipelineHealth = ctx.pipeline_health as Record<string, unknown> | null | undefined;
+  let healthLines: string[] = [];
+  if (pipelineHealth) {
+    const parts: string[] = [];
+
+    const successRate = pipelineHealth.success_rate;
+    const trend = pipelineHealth.trend as string | undefined;
+    if (successRate !== null && successRate !== undefined) {
+      const pct = Math.round((successRate as number) * 100);
+      const trendStr = trend ? ` (${trend})` : '';
+      parts.push(`Success rate: ${pct}%${trendStr}.`);
+    }
+
+    const failureDist = pipelineHealth.failure_distribution as Record<string, number> | undefined;
+    if (failureDist && Object.keys(failureDist).length > 0) {
+      const failStr = Object.entries(failureDist)
+        .map(([cls, cnt]) => `${cls} (${cnt})`)
+        .join(', ');
+      parts.push(`Top failures: ${failStr}.`);
+    }
+
+    const dirStats = pipelineHealth.direction_stats as Array<Record<string, unknown>> | undefined;
+    if (dirStats && dirStats.length > 0) {
+      const dirStr = dirStats
+        .map((d) => {
+          const did = strVal(d.direction_id).slice(-8);
+          const sat = d.possibly_saturated ? ', saturated' : '';
+          return `d-${did} merge rate ${d.merge_rate} (${d.cycles} cycles${sat})`;
+        })
+        .join(', ');
+      parts.push(`Direction ROI: ${dirStr}.`);
+    }
+
+    if (parts.length > 0) {
+      const body = parts.join(' ');
+      const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
+      if (candidate.length <= 400 && candidate.length <= budget) {
+        healthLines = ['### Pipeline Health (last 24h)', body, ''];
+      }
     }
   }
 
@@ -296,6 +340,6 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...healthLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }

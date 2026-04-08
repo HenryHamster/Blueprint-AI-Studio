@@ -17,7 +17,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id
+from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id, _compute_merge_rate
 
 
 @pytest.fixture(autouse=True)
@@ -845,3 +845,128 @@ async def test_patch_settings_wave_size_invalid_returns_400(client: AsyncClient)
 
     resp2 = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 51})
     assert resp2.status_code == 400
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone tests for _compute_merge_rate (no DB required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComputeMergeRate:
+    """Unit tests for _compute_merge_rate — pure function, no DB."""
+
+    def test_never_researched_returns_neutral(self):
+        """A direction with no history returns 0.5 (neutral/unknown)."""
+        d = {"id": "d1", "priority": "medium"}
+        assert _compute_merge_rate(d) == 0.5
+
+    def test_empty_history_returns_neutral(self):
+        """Explicit empty lists also return 0.5."""
+        d = {"id": "d1", "research_history": [], "history_aggregate": {}}
+        assert _compute_merge_rate(d) == 0.5
+
+    def test_history_with_no_merges(self):
+        """Cycles present but zero merges → rate = 0.0."""
+        d = {
+            "research_history": [
+                {"prs_merged": 0},
+                {"prs_merged": 0},
+            ]
+        }
+        assert _compute_merge_rate(d) == 0.0
+
+    def test_history_with_merges(self):
+        """3 cycles, 6 total merges → rate = 2.0."""
+        d = {
+            "research_history": [
+                {"prs_merged": 1},
+                {"prs_merged": 3},
+                {"prs_merged": 2},
+            ]
+        }
+        assert _compute_merge_rate(d) == pytest.approx(6 / 3)
+
+    def test_aggregate_counted(self):
+        """history_aggregate cycles and merges are included in the total."""
+        d = {
+            "research_history": [{"prs_merged": 1}],
+            "history_aggregate": {"total_cycles": 4, "total_prs_merged": 8},
+        }
+        # 1 live cycle + 4 aggregated = 5 total; 1 + 8 = 9 merged
+        assert _compute_merge_rate(d) == pytest.approx(9 / 5)
+
+    def test_higher_merge_rate_sorted_first(self):
+        """Within the same priority tier, higher merge_rate direction is selected first."""
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        now = "2026-01-01T00:00:00"
+
+        # Both medium priority, both researched — differ only by merge rate
+        low_rate = {
+            "id": "low",
+            "priority": "medium",
+            "possibly_saturated": False,
+            "last_researched_at": now,
+            "research_history": [{"prs_merged": 0}, {"prs_merged": 0}],
+        }
+        high_rate = {
+            "id": "high",
+            "priority": "medium",
+            "possibly_saturated": False,
+            "last_researched_at": now,
+            "research_history": [{"prs_merged": 1}, {"prs_merged": 1}],
+        }
+
+        directions = [low_rate, high_rate]
+        directions.sort(key=lambda d: (
+            priority_rank.get(d.get("priority", "medium"), 1),
+            1 if d.get("possibly_saturated") else 0,
+            -_compute_merge_rate(d),
+            d.get("last_researched_at") or "",
+        ))
+        assert directions[0]["id"] == "high"
+
+    def test_never_researched_takes_precedence_over_merge_rate(self):
+        """Directions with no last_researched_at are picked first (never_researched path)."""
+        import random
+        random.seed(42)
+
+        # Simulate the never_researched branch: a direction with high merge rate
+        # that has been researched should NOT beat a never-researched direction.
+        never = {"id": "never", "priority": "medium", "last_researched_at": None}
+        productive = {
+            "id": "productive",
+            "priority": "medium",
+            "last_researched_at": "2026-01-01T00:00:00",
+            "research_history": [{"prs_merged": 5}],
+        }
+
+        never_researched = [d for d in [never, productive] if not d.get("last_researched_at")]
+        assert never_researched == [never], "Only the never-researched direction qualifies"
+
+    def test_saturated_deprioritized_regardless_of_merge_rate(self):
+        """Saturated directions sort after non-saturated ones even with higher merge rate."""
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        now = "2026-01-01T00:00:00"
+
+        saturated_high = {
+            "id": "sat",
+            "priority": "medium",
+            "possibly_saturated": True,
+            "last_researched_at": now,
+            "research_history": [{"prs_merged": 10}],
+        }
+        unsaturated_low = {
+            "id": "unsat",
+            "priority": "medium",
+            "possibly_saturated": False,
+            "last_researched_at": now,
+            "research_history": [{"prs_merged": 0}],
+        }
+
+        directions = [saturated_high, unsaturated_low]
+        directions.sort(key=lambda d: (
+            priority_rank.get(d.get("priority", "medium"), 1),
+            1 if d.get("possibly_saturated") else 0,
+            -_compute_merge_rate(d),
+            d.get("last_researched_at") or "",
+        ))
+        assert directions[0]["id"] == "unsat"

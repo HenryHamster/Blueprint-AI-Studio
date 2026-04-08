@@ -461,6 +461,15 @@ async def claim_task(
                     "task_type": (sib.first_payload).get("type", ""),
                 })
 
+        # Pipeline health summary for research agents
+        pipeline_health = None
+        if task_type == "research":
+            try:
+                from app.admin import compute_pipeline_health_summary
+                pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
+            except Exception:
+                pass  # non-critical — don't fail the request
+
         response["project_context"] = {
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
@@ -468,6 +477,7 @@ async def claim_task(
             "open_prs": list(open_prs_rows),
             "sibling_tasks": sibling_tasks,
             "lessons": lessons,
+            "pipeline_health": pipeline_health,
         }
 
     return response
