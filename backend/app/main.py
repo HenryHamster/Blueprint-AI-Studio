@@ -1326,6 +1326,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
     active_directions = []
     auto_paused_any = False
+    directions_modified = False
     for d in (project.directions or []):
         if d.get("status") != "active":
             continue
@@ -1361,8 +1362,21 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             continue
+        # Positive completion detection — mark for user review but don't pause
+        completion_suggestion = _check_direction_completion(d)
+        if completion_suggestion:
+            if not d.get("possibly_complete"):
+                d["possibly_complete"] = True
+                d["completion_suggestion"] = completion_suggestion
+                logger.info(f"[AUTONOMOUS] Direction {did} possibly complete: {completion_suggestion}")
+                directions_modified = True
+        else:
+            if d.get("possibly_complete"):
+                d.pop("possibly_complete", None)
+                d.pop("completion_suggestion", None)
+                directions_modified = True
         active_directions.append(d)
-    if auto_paused_any:
+    if auto_paused_any or directions_modified:
         flag_modified(project, "directions")
         session.add(project)
         await session.commit()
@@ -1463,6 +1477,9 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
     }
+    if not is_undirected and chosen_direction.get("possibly_complete"):
+        research_payload["direction_possibly_complete"] = True
+        research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
     if is_undirected:
         anomalies = await _compute_research_anomalies(project.id, session)
         if anomalies:
@@ -1669,11 +1686,19 @@ async def _check_idle_research():
         async with AsyncSessionLocal() as session:
             from sqlalchemy import func
 
+            # Expire stale proposals before processing
+            await _expire_stale_proposals(session)
+
             projects = (await session.execute(
                 select(Project).where(Project.autonomous_enabled.is_(True))
             )).scalars().all()
 
             for project in projects:
+                # Log pending proposals awaiting review
+                pending_proposals = [d for d in (project.directions or []) if d.get("status") == "proposed"]
+                if pending_proposals:
+                    logger.info(f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review")
+
                 active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
                 if not active_directions:
                     continue
@@ -1691,6 +1716,10 @@ async def _check_idle_research():
 
                     for task_type in ("security_audit", "qa", "deps"):
                         await _spawn_periodic_task(project, task_type, session)
+
+                # Check persistent anomalies for direction proposals (regardless of VM slots)
+                await _check_anomaly_proposals(project, session)
+                await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
@@ -3117,7 +3146,141 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                         ),
                     })
 
+    # --- Persist anomaly tracking ---
+    proj_key = str(project_id)
+    proj_anomalies = _shared_state.persistent_anomalies.setdefault(proj_key, {})
+    now_iso = now.isoformat()
+    seen_keys: set = set()
+    for a in anomalies:
+        # Build a stable key from the signal's failure class or direction id
+        signal = a["signal"]
+        # Extract anomaly key: e.g. "CODE_ERROR" from "CODE_ERROR failures..."
+        # or "Direction_d-abc123" from "Direction 'd-abc123' ..."
+        if signal.startswith("Direction '"):
+            # Include direction ID to avoid key collisions across directions
+            parts = signal.split("'")
+            anomaly_key = f"Direction_{parts[1]}" if len(parts) > 1 else signal.split()[0]
+        else:
+            parts = signal.split()
+            anomaly_key = parts[0] if parts else signal
+        if anomaly_key in seen_keys:
+            # Already processed this key this cycle — update metadata only, don't double-count
+            if anomaly_key in proj_anomalies:
+                proj_anomalies[anomaly_key]["last_seen"] = now_iso
+                if a["severity"] == "high":
+                    proj_anomalies[anomaly_key]["severity"] = "high"
+                    proj_anomalies[anomaly_key]["latest_details"] = a["details"]
+            continue
+        seen_keys.add(anomaly_key)
+        if anomaly_key in proj_anomalies:
+            proj_anomalies[anomaly_key]["occurrence_count"] += 1
+            proj_anomalies[anomaly_key]["last_seen"] = now_iso
+            proj_anomalies[anomaly_key]["severity"] = a["severity"]
+            proj_anomalies[anomaly_key]["latest_details"] = a["details"]
+        else:
+            proj_anomalies[anomaly_key] = {
+                "first_seen": now_iso,
+                "last_seen": now_iso,
+                "occurrence_count": 1,
+                "severity": a["severity"],
+                "latest_details": a["details"],
+            }
+    # Expire anomalies not seen for 48h
+    stale_cutoff = (now - timedelta(hours=48)).isoformat()
+    for key in list(proj_anomalies):
+        if key not in seen_keys and proj_anomalies[key]["last_seen"] < stale_cutoff:
+            del proj_anomalies[key]
+
     return anomalies
+
+
+async def _check_anomaly_proposals(project, session):
+    """Generate direction proposals from persistent anomalies (occurrence_count >= 3).
+
+    Creates at most 1 proposal per call. Proposals require human approval (status='proposed').
+    """
+    proj_key = str(project.id)
+    proj_anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
+    if not proj_anomalies:
+        return
+
+    proj_directions = list(project.directions or [])
+    rejected_proposals = [d for d in proj_directions if d.get("status") == "rejected"]
+    pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
+    max_proposals = 10
+
+    if pending_count >= max_proposals:
+        return
+
+    now_iso = _utcnow().isoformat()
+    for anomaly_key, info in sorted(proj_anomalies.items(), key=lambda x: x[1].get("occurrence_count", 0), reverse=True):
+        if info["occurrence_count"] < 3:
+            continue
+
+        # Build proposal text based on the anomaly key pattern
+        details = info.get("latest_details", "")
+        if anomaly_key.startswith("Direction_"):
+            # Direction-level anomaly (declining merge rate / high failure)
+            proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
+        else:
+            # Failure class anomaly (e.g. CODE_ERROR, PROVISION_FAILURE)
+            proposal_text = f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
+
+        if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
+            logger.info(f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction")
+            continue
+
+        new_direction = {
+            "id": f"d-{uuid.uuid4().hex[:8]}",
+            "text": proposal_text,
+            "priority": "high" if info["severity"] == "high" else "medium",
+            "paths": [],
+            "added_at": now_iso,
+            "status": "proposed",
+            "proposed_by": "ANOMALY_DETECTOR",
+            "proposal_rationale": (
+                f"Anomaly '{anomaly_key}' detected {info['occurrence_count']} times "
+                f"since {info['first_seen']}. Severity: {info['severity']}."
+            )[:500],
+            "proposed_at": now_iso,
+        }
+        proj_directions.append(new_direction)
+        project.directions = proj_directions
+        flag_modified(project, "directions")
+        session.add(project)
+        logger.info(f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}")
+
+        # Reset occurrence count so we don't re-propose until it recurs
+        info["occurrence_count"] = 0
+
+        # Cap at 1 anomaly-driven proposal per cycle
+        break
+
+
+async def _expire_stale_proposals(session) -> int:
+    """Expire direction proposals older than 30 days across all projects."""
+    cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    projects = (await session.execute(
+        select(Project).where(Project.autonomous_enabled.is_(True))
+    )).scalars().all()
+    total_expired = 0
+    for project in projects:
+        dirs = list(project.directions or [])
+        expired_count = 0
+        for d in dirs:
+            if d.get("status") == "proposed" and (d.get("proposed_at") or d.get("added_at", "")) < cutoff:
+                d["status"] = "expired"
+                d["expired_at"] = _utcnow().isoformat()
+                expired_count += 1
+        if expired_count:
+            project.directions = dirs
+            flag_modified(project, "directions")
+            session.add(project)
+            total_expired += expired_count
+            logger.info(f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}")
+    if total_expired:
+        await session.commit()
+    return total_expired
 
 
 def _check_direction_health(direction: dict) -> Optional[str]:
@@ -3150,6 +3313,25 @@ def _check_direction_health(direction: dict) -> Optional[str]:
         if total_created_3 > 0 and total_failed_3 / total_created_3 > 0.7:
             return "High failure rate: >70% of spawned tasks failed in last 3 cycles"
 
+    return None
+
+
+def _check_direction_completion(direction: dict) -> Optional[str]:
+    """Return a completion suggestion string if this direction appears successfully complete, else None."""
+    history = direction.get("research_history") or []
+    if len(history) < 4:
+        return None
+    total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+    if total_merged < 3:
+        return None
+    recent2 = history[-2:]
+    recent_created = sum(e.get("tasks_created", 0) for e in recent2)
+    recent_merged = sum(e.get("prs_merged", 0) for e in recent2)
+    if recent_created <= 2 and recent_merged <= 1:
+        return (
+            f"Direction appears complete: {total_merged} PRs merged across "
+            f"{len(history)} cycles, last 2 cycles low-yield"
+        )
     return None
 
 

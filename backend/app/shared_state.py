@@ -56,6 +56,10 @@ runtime_config: Dict = {
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures
 last_idle_check: Optional[datetime] = None
 
+# --- Persistent Anomaly Tracking ---
+# project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
+persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
+
 # --- Circuit Breaker (Hystrix-inspired) ---
 # Per-project circuit breaker state for autonomous task spawning
 # States: CLOSED (normal), OPEN (tripped), HALF_OPEN (testing one task)

@@ -24,7 +24,7 @@ interface Direction {
   text: string;
   priority: 'high' | 'medium' | 'low';
   added_at: string;
-  status: 'active' | 'completed' | 'paused' | 'proposed';
+  status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
   paths?: string[];
   last_researched_at?: string | null;
   proposed_by?: string;
@@ -32,6 +32,8 @@ interface Direction {
   proposed_at?: string;
   research_history?: ResearchHistoryEntry[];
   possibly_saturated?: boolean;
+  possibly_complete?: boolean;
+  completion_suggestion?: string;
   pending_update?: {
     suggested_text?: string;
     suggested_priority?: string;
@@ -90,15 +92,17 @@ const statusColors: Record<string, string> = {
   completed: 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50',
   paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
   proposed: 'bg-purple-950/40 text-purple-400 border-purple-900/50',
+  expired: 'bg-neutral-800/40 text-neutral-500 border-neutral-700/50',
 };
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'; label: string }> = [
+const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired'; label: string }> = [
   { key: 'proposed', label: 'Proposed by Agent' },
   { key: 'active', label: 'Active' },
   { key: 'paused', label: 'Paused' },
   { key: 'completed', label: 'Completed' },
+  { key: 'expired', label: 'Expired' },
 ];
 
 export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void }) {
@@ -122,12 +126,12 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed'>('active');
+  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>('active');
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');
 
-  // Collapsible sections — all expanded by default
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  // Collapsible sections — expired collapsed by default, others expanded
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ expired: true });
 
   // Research history open state per direction
   const [historyOpenIds, setHistoryOpenIds] = useState<Record<string, boolean>>({});
@@ -326,6 +330,21 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     }
   }
 
+  async function markDirectionComplete(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'completed' }),
+      });
+      if (!res.ok) throw new Error('Failed to mark direction as complete');
+      fetchDirections();
+    } catch {
+      setError('Failed to mark direction as complete. Please try again.');
+    }
+  }
+
   async function approveProposal(id: string) {
     setError(null);
     try {
@@ -354,6 +373,22 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       fetchDirections();
     } catch {
       setError('Failed to reject proposal. Please try again.');
+    }
+  }
+
+  async function reviveProposal(id: string) {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'proposed' }),
+      });
+      if (!res.ok) throw new Error('Failed to revive proposal');
+      addToast('Expired proposal revived', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to revive proposal. Please try again.');
     }
   }
 
@@ -753,7 +788,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     {!isCollapsed && (
                       <div className="space-y-2">
                         {items.map(d => (
-                          <div key={d.id} className={`border rounded-lg p-3 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
+                          <div key={d.id} className={`border rounded-lg p-3 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
                             {d.status === 'proposed' ? (
                               /* Proposed direction — approve or reject */
                               <div>
@@ -790,7 +825,48 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                   </span>
                                   {d.proposed_at && (
                                     <span className="text-[10px] text-neutral-600 ml-auto">
-                                      {formatRelativeTime(d.proposed_at)}
+                                      proposed {formatRelativeTime(d.proposed_at)}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : d.status === 'expired' ? (
+                              /* Expired direction — revive or approve */
+                              <div>
+                                <div className="flex items-start gap-2">
+                                  <p className="text-sm text-neutral-400 flex-1">{d.text}</p>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <button
+                                      onClick={() => reviveProposal(d.id)}
+                                      title="Revive — move back to proposed"
+                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-purple-950/60 border-purple-900/50 text-purple-400 hover:bg-purple-900/50"
+                                    >
+                                      Revive
+                                    </button>
+                                    <button
+                                      onClick={() => approveProposal(d.id)}
+                                      title="Approve — activate this direction"
+                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
+                                    >
+                                      Approve
+                                    </button>
+                                  </div>
+                                </div>
+                                {d.proposal_rationale && (
+                                  <blockquote className="mt-2 border-l-2 border-neutral-700/50 pl-2 text-[11px] text-neutral-500 italic leading-relaxed">
+                                    {d.proposal_rationale}
+                                  </blockquote>
+                                )}
+                                <div className="flex items-center gap-2 mt-2">
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
+                                    {d.priority}
+                                  </span>
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.expired}`}>
+                                    Expired
+                                  </span>
+                                  {d.proposed_at && (
+                                    <span className="text-[10px] text-neutral-600 ml-auto">
+                                      proposed {formatRelativeTime(d.proposed_at)}
                                     </span>
                                   )}
                                 </div>
@@ -976,6 +1052,12 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                     {d.paused_at && <span className="text-neutral-600"> · paused {formatRelativeTime(d.paused_at)}</span>}
                                   </p>
                                 )}
+                                {/* Positive completion suggestion */}
+                                {d.possibly_complete && d.completion_suggestion && (
+                                  <p className="text-[10px] text-emerald-500/80 mt-0.5 leading-relaxed">
+                                    {d.completion_suggestion}
+                                  </p>
+                                )}
                                 <div className="flex items-center gap-2 mt-2">
                                   <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
                                     {d.priority}
@@ -1000,6 +1082,15 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                       className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
                                     >
                                       Reactivate
+                                    </button>
+                                  )}
+                                  {/* Mark Complete button for possibly-complete directions */}
+                                  {d.possibly_complete && key === 'active' && (
+                                    <button
+                                      onClick={() => markDirectionComplete(d.id)}
+                                      className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
+                                    >
+                                      Mark Complete
                                     </button>
                                   )}
                                   {/* Cooldown badge */}
@@ -1078,6 +1169,11 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                                       {d.possibly_saturated && (
                                         <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
                                           possibly saturated
+                                        </span>
+                                      )}
+                                      {d.possibly_complete && (
+                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 text-emerald-400 border-emerald-900/50">
+                                          possibly complete
                                         </span>
                                       )}
                                     </button>

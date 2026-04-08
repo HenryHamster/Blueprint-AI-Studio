@@ -203,8 +203,8 @@ async def update_direction(
     # Validate inputs
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
         raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
-    if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed"):
-        raise HTTPException(status_code=400, detail="status must be active, completed, paused, or proposed")
+    if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed", "expired"):
+        raise HTTPException(status_code=400, detail="status must be active, completed, paused, proposed, or expired")
     if "text" in payload and (not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1):
         raise HTTPException(status_code=400, detail="text must be 1-500 characters")
     if "paths" in payload and (not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"])):
@@ -223,6 +223,10 @@ async def update_direction(
                     d.pop("paused_reason", None)
                     d.pop("paused_at", None)
                     d.pop("auto_paused", None)
+                    d.pop("expired_at", None)
+                # When reviving from expired back to proposed, clear expired_at
+                if payload["status"] == "proposed":
+                    d.pop("expired_at", None)
             if "text" in payload:
                 d["text"] = payload["text"]
             if "paths" in payload:

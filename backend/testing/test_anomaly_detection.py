@@ -21,6 +21,9 @@ def _make_session(tasks: list, project: Project):
     Second execute() call (project) uses .scalar_one_or_none().
     """
     session = AsyncMock()
+    # session.add is synchronous in SQLAlchemy — use MagicMock to avoid
+    # RuntimeWarning about unawaited coroutines
+    session.add = MagicMock()
 
     tasks_scalars = MagicMock()
     tasks_scalars.all.return_value = tasks
