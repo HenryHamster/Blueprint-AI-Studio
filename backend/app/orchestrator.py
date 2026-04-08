@@ -888,6 +888,8 @@ async def orchestrator_worker():
                     ci_loop = (ci_task.context or {}).get("review_loop", {})
                     if not ci_loop.get("ci_waiting"):
                         continue
+                    if ci_loop.get("conflict_fix_spawned"):
+                        continue  # Already handled — fix task spawned for merge conflicts
                     ci_pr_number = ci_loop.get("pr_number")
                     if not ci_pr_number:
                         continue
@@ -999,6 +1001,11 @@ async def orchestrator_worker():
                             if fix_task:
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
+                                # Clear ci_waiting and mark as handled to prevent duplicate fix spawns
+                                ci_loop_ctx = dict(ci_loop)
+                                ci_loop_ctx["ci_waiting"] = False
+                                ci_loop_ctx["conflict_fix_spawned"] = str(fix_task.id)
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop_ctx}
                                 logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
                             else:
                                 # Fix not spawned — likely duplicate guard (fix already running) or iteration cap
