@@ -379,47 +379,69 @@ async def orchestrator_worker():
                     narrow_broken = 0
                     if stuck_tasks:
                         stuck_ids = {t.id for t in stuck_tasks}
+
+                        # Batch all dependency UUIDs across all stuck tasks into one query
+                        all_dep_ids: set[uuid.UUID] = set()
+                        task_dep_uuids: dict = {}
                         for stask in stuck_tasks:
-                            dep_uuids = set()
+                            dep_uuids: set[uuid.UUID] = set()
                             for d in (stask.depends_on or []):
                                 try:
                                     dep_uuids.add(uuid.UUID(d))
                                 except (ValueError, AttributeError):
                                     continue
-                            # Verify each dep's actual DB status before clearing
-                            # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
+                            task_dep_uuids[stask.id] = dep_uuids
+                            all_dep_ids.update(dep_uuids)
+
+                        dep_status: dict = {}
+                        if all_dep_ids:
+                            dep_rows = await session.execute(select(Task).where(Task.id.in_(all_dep_ids)))
+                            for dep_task in dep_rows.scalars().all():
+                                dep_status[dep_task.id] = dep_task.status
+
+                        # Verify each dep's actual DB status before clearing
+                        # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
+                        deadlocked_ids: list = []
+                        for stask in stuck_tasks:
+                            dep_uuids = task_dep_uuids[stask.id]
+                            if not dep_uuids:
+                                continue
                             genuinely_blocked = True
-                            async with AsyncSessionLocal() as check_session:
-                                for dep_id in dep_uuids:
-                                    if dep_id in stuck_ids:
-                                        continue  # Stuck in this pool — potential cycle
-                                    dep_task = await check_session.get(Task, dep_id)
-                                    if dep_task is None:
-                                        continue  # Deleted dep — genuinely unresolvable
-                                    if dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                        continue  # Terminal — genuinely unresolvable
-                                    if dep_task.status == TaskStatus.QUEUED:
-                                        # QUEUED but outside fetch window — NOT a deadlock, just low priority
-                                        genuinely_blocked = False
-                                        break
-                                    if dep_task.status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
-                                        # Still running — NOT a deadlock
-                                        genuinely_blocked = False
-                                        break
-                            if genuinely_blocked and dep_uuids:
-                                async with AsyncSessionLocal() as fix_session:
-                                    fix_task = await fix_session.get(Task, stask.id)
+                            for dep_id in dep_uuids:
+                                if dep_id in stuck_ids:
+                                    continue  # Stuck in this pool — potential cycle
+                                status = dep_status.get(dep_id)
+                                if status is None:
+                                    continue  # Deleted dep — genuinely unresolvable
+                                if status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                    continue  # Terminal — genuinely unresolvable
+                                if status == TaskStatus.QUEUED:
+                                    # QUEUED but outside fetch window — NOT a deadlock, just low priority
+                                    genuinely_blocked = False
+                                    break
+                                if status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+                                    # Still running — NOT a deadlock
+                                    genuinely_blocked = False
+                                    break
+                            if genuinely_blocked:
+                                deadlocked_ids.append(stask.id)
+
+                        # Fix all narrow-scan deadlocked tasks in a single session
+                        if deadlocked_ids:
+                            async with AsyncSessionLocal() as fix_session:
+                                for task_id in deadlocked_ids:
+                                    fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock: clearing depends_on "
-                                            f"for task {stask.id} (had {len(dep_uuids)} stuck/failed deps)"
+                                            f"for task {task_id} (had {len(task_dep_uuids[task_id])} stuck/failed deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected"
                                         fix_session.add(fix_task)
-                                        await fix_session.commit()
-                                eligible_ids.append(stask.id)
-                                narrow_broken += 1
+                                    eligible_ids.append(task_id)
+                                    narrow_broken += 1
+                                await fix_session.commit()
 
                     # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
@@ -429,42 +451,69 @@ async def orchestrator_worker():
                         Task.requires_approval.is_(False),
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
-                    broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
+                    candidate_task_ids = {t.id for t in candidate_tasks}
+                    broad_stuck = [t for t in broad_stuck
+                                   if (t.depends_on or [])
+                                   and t.id not in eligible_ids
+                                   and t.id not in candidate_task_ids]
                     broad_broken = 0
                     if broad_stuck:
                         broad_stuck_ids = {t.id for t in broad_stuck}
+
+                        # Batch all dependency UUIDs for broad scan into one query
+                        all_dep_ids_broad: set[uuid.UUID] = set()
+                        broad_task_dep_uuids: dict = {}
                         for stask in broad_stuck:
-                            if stask.id in {t.id for t in candidate_tasks}:
-                                continue  # Already checked above
-                            dep_uuids = set()
+                            dep_uuids_b: set[uuid.UUID] = set()
                             for d in (stask.depends_on or []):
                                 try:
-                                    dep_uuids.add(uuid.UUID(d))
+                                    dep_uuids_b.add(uuid.UUID(d))
                                 except (ValueError, AttributeError):
                                     continue
+                            broad_task_dep_uuids[stask.id] = dep_uuids_b
+                            all_dep_ids_broad.update(dep_uuids_b)
+
+                        broad_dep_status: dict = {}
+                        if all_dep_ids_broad:
+                            broad_dep_rows = await session.execute(
+                                select(Task).where(Task.id.in_(all_dep_ids_broad))
+                            )
+                            for dep_task in broad_dep_rows.scalars().all():
+                                broad_dep_status[dep_task.id] = dep_task.status
+
+                        broad_deadlocked_ids: list = []
+                        for stask in broad_stuck:
+                            dep_uuids_b = broad_task_dep_uuids[stask.id]
+                            if not dep_uuids_b:
+                                continue
                             genuinely_blocked = True
-                            async with AsyncSessionLocal() as check_session:
-                                for dep_id in dep_uuids:
-                                    if dep_id in broad_stuck_ids:
-                                        continue
-                                    dep_task = await check_session.get(Task, dep_id)
-                                    if dep_task is None or dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                        continue
-                                    genuinely_blocked = False
-                                    break
-                            if genuinely_blocked and dep_uuids:
-                                async with AsyncSessionLocal() as fix_session:
-                                    fix_task = await fix_session.get(Task, stask.id)
+                            for dep_id in dep_uuids_b:
+                                if dep_id in broad_stuck_ids:
+                                    continue
+                                status = broad_dep_status.get(dep_id)
+                                if status is None or status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                    continue
+                                genuinely_blocked = False
+                                break
+                            if genuinely_blocked:
+                                broad_deadlocked_ids.append(stask.id)
+
+                        # Fix all broad-scan deadlocked tasks in a single session
+                        if broad_deadlocked_ids:
+                            async with AsyncSessionLocal() as fix_session:
+                                for task_id in broad_deadlocked_ids:
+                                    fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
-                                            f"for task {stask.id} (stuck >{10}min with {len(dep_uuids)} unresolvable deps)"
+                                            f"for task {task_id} (stuck >{10}min with {len(broad_task_dep_uuids[task_id])} unresolvable deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
                                         fix_session.add(fix_task)
-                                        await fix_session.commit()
-                                broad_broken += 1
+                                    broad_broken += 1
+                                await fix_session.commit()
+
                     total_broken = narrow_broken + broad_broken
                     if total_broken > 0:
                         logger.warning(
