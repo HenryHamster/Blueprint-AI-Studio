@@ -337,6 +337,8 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
                 message_count = 1
             # We can handle client-to-server messages here if needed
     except WebSocketDisconnect:
+        pass
+    finally:
         await manager.disconnect(websocket, project_id)
 
 # --- Agent APIs ---

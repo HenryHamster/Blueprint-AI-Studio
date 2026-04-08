@@ -704,12 +704,12 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     if (effort) args.push('--effort', effort);
     const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true });
 
-    // Kill Claude if it exceeds 30 minutes — kill entire process group (negative PID)
+    // Kill Claude if it exceeds 45 minutes — kill entire process group (negative PID)
     // so child processes (npm, pytest, etc.) are also terminated
     const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
     const killTimer = setTimeout(() => {
-      log('Claude Code process timed out after 30 minutes — killing process group');
-      sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 30-minute time limit\n');
+      log('Claude Code process timed out after 45 minutes — killing process group');
+      sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 45-minute time limit\n');
       const pid = claude.pid;
       if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ } }
       setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
