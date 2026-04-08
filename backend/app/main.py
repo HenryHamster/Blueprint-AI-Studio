@@ -83,7 +83,7 @@ def _utcnow() -> datetime:
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0030"
+EXPECTED_SCHEMA_REVISION = "0031"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
