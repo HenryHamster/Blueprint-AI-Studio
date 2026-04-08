@@ -236,6 +236,25 @@ async def _check_evaluating_timeouts():
                     )
                     session.add(task)
 
+                    # Cascade-cancel non-terminal children
+                    from app.main import _ensure_vm_deleted, release_max_plan_account  # noqa: PLC0415
+                    non_terminal_children = [c for c in children if c.status not in TERMINAL]
+                    vms_to_delete = []
+                    for child in non_terminal_children:
+                        child.status = TaskStatus.CANCELLED
+                        child.latest_status_message = "Cancelled: parent task timed out"
+                        if child.vm_instance_id:
+                            vms_to_delete.append(child)
+                        child_acct = (child.context or {}).get("max_plan_account_id")
+                        if child_acct:
+                            await release_max_plan_account(child_acct)
+                        session.add(child)
+                    if non_terminal_children:
+                        logger.info(
+                            f"[EVAL TIMEOUT] Cascade-cancelled {len(non_terminal_children)} "
+                            f"children of timed-out task {str(task.id)[:8]}"
+                        )
+
                     # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
                     await _maybe_create_failure_alert(
                         task, session,
@@ -246,6 +265,13 @@ async def _check_evaluating_timeouts():
                         str(task.project_id), "task_updated",
                         {"task_id": str(task.id), "status": task.status},
                     )
+                    for child in non_terminal_children:
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(child.id), "status": child.status},
+                        )
+                    for child_vm in vms_to_delete:
+                        await _ensure_vm_deleted(child_vm, reason="parent_eval_timeout")
                     continue
 
                 # 2-hour warning
