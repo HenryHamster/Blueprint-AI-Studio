@@ -3692,6 +3692,8 @@ async def get_digest(
             "pr_url": pr_artifact_map.get(tid),
             "waiting_since": waiting_since.isoformat() if waiting_since else None,
             "waiting_hours": waiting_hours,
+            "approval_reason": t.latest_status_message,
+            "touched_critical": (t.context or {}).get("touched_critical", []),
         })
     needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
 
@@ -3849,81 +3851,95 @@ async def get_digest(
             "failed": _p_failed,
         })
 
+    # Action-first narrative: executives want "what do I need to do?" before "how did things go?"
     narrative_parts = []
 
-    if trend == "declining":
-        narrative_parts.append("Pipeline health declining —")
-    elif trend == "improving":
-        narrative_parts.append("Good progress —")
-
-    if completed_count > 0:
-        shipped = f"{completed_count} task{'s' if completed_count != 1 else ''} completed"
+    # All clear shortcut: nothing needs attention and there are completions
+    if pending_approval_count == 0 and failed_count == 0 and completed_count > 0:
+        all_clear = f"All clear — {completed_count} task{'s' if completed_count != 1 else ''} completed"
         if pr_count > 0:
-            shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
-        if completed_delta > 0:
-            shipped += f" (up from {prev_completed_count} last period)"
-        elif completed_delta < 0:
-            shipped += f" (down from {prev_completed_count} last period)"
-        narrative_parts.append(shipped + ".")
-
-    if failed_count > 0:
-        dominant_group = failure_groups[0] if failure_groups else None
-        dominant_msg = None
-        if dominant_group and dominant_group["count"] >= 2 and dominant_group["count"] / failed_count >= 0.6:
-            cls = dominant_group["failure_class"]
-            cnt = dominant_group["count"]
-            _root_cause_msgs = {
-                "RATE_LIMIT": f"Most failures ({cnt}/{failed_count}) are rate-limit errors — consider pausing until account recovery.",
-                "PROVISION_FAILURE": f"Most failures ({cnt}/{failed_count}) are provisioning issues — check GCP quota and zone health.",
-                "EXTERNAL_API": f"Most failures ({cnt}/{failed_count}) are external API errors — GitHub/Claude API may be experiencing issues.",
-                "AGENT_TIMEOUT": f"Most failures ({cnt}/{failed_count}) are agent timeouts — tasks may need complexity reduction.",
-                "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
-            }
-            dominant_msg = _root_cause_msgs.get(cls)
-        if dominant_msg:
-            narrative_parts.append(dominant_msg)
-        else:
-            failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
-            failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
-            if failure_titles:
-                failed_str += f" ({', '.join(failure_titles)})"
-            narrative_parts.append(failed_str + ".")
-
-    if pending_approval_count > 0:
-        approval_items = [
-            x for x in needs_attention if x["reason"] == "approval_required"
-        ]
-        max_wait = max((x.get("waiting_hours") or 0 for x in approval_items), default=0)
-        approval_str = f"{pending_approval_count} task{'s' if pending_approval_count != 1 else ''} awaiting approval"
-        if max_wait > 0:
-            approval_str += f" ({max_wait}h)"
-        narrative_parts.append(approval_str + ".")
-
-    if project_id and direction_progress_list:
-        dir_summaries = []
-        for dp in direction_progress_list:
-            dt = (dp["direction_text"] or "")[:40]
-            if dp["prs_merged"] > 0:
-                dir_summaries.append(f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged")
-            elif dp.get("possibly_saturated"):
-                dir_summaries.append(f"{dt}: may be saturated")
-            elif dp["tasks_created"] > 0:
-                dir_summaries.append(f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress")
-        if dir_summaries:
-            narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
-
-    if running_count > 0 or queued_count > 0:
-        pipeline_parts = []
-        if running_count > 0:
-            pipeline_parts.append(f"{running_count} running")
-        if queued_count > 0:
-            pipeline_parts.append(f"{queued_count} queued")
-        narrative_parts.append(", ".join(pipeline_parts) + ".")
-
-    if narrative_parts:
-        narrative_summary = " ".join(narrative_parts)
+            all_clear += f" with {pr_count} PR{'s' if pr_count != 1 else ''} merged"
+        all_clear += ", no action needed."
+        narrative_summary = all_clear
     else:
-        narrative_summary = f"All quiet — no activity in the last {hours}h."
+        # FIRST: Approval items — most actionable, lead with them
+        if pending_approval_count > 0:
+            approval_items = [
+                x for x in needs_attention if x["reason"] == "approval_required"
+            ]
+            max_wait = max((x.get("waiting_hours") or 0 for x in approval_items), default=0)
+            approval_str = f"{pending_approval_count} task{'s' if pending_approval_count != 1 else ''} awaiting your approval"
+            if max_wait > 0:
+                approval_str += f" ({max_wait}h)"
+            narrative_parts.append(approval_str + ".")
+
+        # SECOND: Failures with root cause
+        if failed_count > 0:
+            dominant_group = failure_groups[0] if failure_groups else None
+            dominant_msg = None
+            if dominant_group and dominant_group["count"] >= 2 and dominant_group["count"] / failed_count >= 0.6:
+                cls = dominant_group["failure_class"]
+                cnt = dominant_group["count"]
+                _root_cause_msgs = {
+                    "RATE_LIMIT": f"Most failures ({cnt}/{failed_count}) are rate-limit errors — consider pausing until account recovery.",
+                    "PROVISION_FAILURE": f"Most failures ({cnt}/{failed_count}) are provisioning issues — check GCP quota and zone health.",
+                    "EXTERNAL_API": f"Most failures ({cnt}/{failed_count}) are external API errors — GitHub/Claude API may be experiencing issues.",
+                    "AGENT_TIMEOUT": f"Most failures ({cnt}/{failed_count}) are agent timeouts — tasks may need complexity reduction.",
+                    "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
+                }
+                dominant_msg = _root_cause_msgs.get(cls)
+            if dominant_msg:
+                narrative_parts.append(dominant_msg)
+            else:
+                failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
+                failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+                if failure_titles:
+                    failed_str += f" ({', '.join(failure_titles)})"
+                narrative_parts.append(failed_str + ".")
+
+        # THIRD: Completion stats with trend prefix embedded
+        if completed_count > 0:
+            trend_prefix = ""
+            if trend == "declining":
+                trend_prefix = "Pipeline health declining — "
+            elif trend == "improving":
+                trend_prefix = "Good progress — "
+            shipped = f"{trend_prefix}{completed_count} task{'s' if completed_count != 1 else ''} completed"
+            if pr_count > 0:
+                shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
+            if completed_delta > 0:
+                shipped += f" (up from {prev_completed_count} last period)"
+            elif completed_delta < 0:
+                shipped += f" (down from {prev_completed_count} last period)"
+            narrative_parts.append(shipped + ".")
+
+        # FOURTH: Direction progress
+        if project_id and direction_progress_list:
+            dir_summaries = []
+            for dp in direction_progress_list:
+                dt = (dp["direction_text"] or "")[:40]
+                if dp["prs_merged"] > 0:
+                    dir_summaries.append(f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged")
+                elif dp.get("possibly_saturated"):
+                    dir_summaries.append(f"{dt}: may be saturated")
+                elif dp["tasks_created"] > 0:
+                    dir_summaries.append(f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress")
+            if dir_summaries:
+                narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
+
+        # FIFTH: Pipeline status
+        if running_count > 0 or queued_count > 0:
+            pipeline_parts = []
+            if running_count > 0:
+                pipeline_parts.append(f"{running_count} running")
+            if queued_count > 0:
+                pipeline_parts.append(f"{queued_count} queued")
+            narrative_parts.append(", ".join(pipeline_parts) + ".")
+
+        if narrative_parts:
+            narrative_summary = " ".join(narrative_parts)
+        else:
+            narrative_summary = f"All quiet — no activity in the last {hours}h."
 
     return {
         "window_hours": hours,

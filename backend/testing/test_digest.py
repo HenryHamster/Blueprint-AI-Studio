@@ -772,7 +772,12 @@ async def test_narrative_no_trend_prefix_when_stable(client: AsyncClient, db_ses
 
 @pytest.mark.asyncio
 async def test_narrative_up_from_x(client: AsyncClient, db_session):
-    """Narrative includes 'up from X' when current window has more completions than previous."""
+    """completed_delta is correct when current window has more completions than previous.
+
+    With only completions and no failures/approvals, the narrative takes the 'All clear'
+    path and does not include the delta phrase — but completed_delta is still reported.
+    Add a failure to force the standard path and verify 'up from X' appears there.
+    """
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -785,13 +790,18 @@ async def test_narrative_up_from_x(client: AsyncClient, db_session):
         created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
     ))
 
-    # Current window: 2 completed → completed_delta = 2 - 1 = 1 > 0 → "(up from 1 last period)"
+    # Current window: 2 completed + 1 failed → forces standard narrative path
+    # completed_delta = 2 - 1 = 1 > 0 → "(up from 1 last period)"
     curr = _curr_ts()
     for _ in range(2):
         db_session.add(make_task(
             project_id=project.id, status=TaskStatus.COMPLETED,
             created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
         ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -1114,3 +1124,78 @@ async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db
     assert counts == sorted(counts, reverse=True)
     assert data["failure_groups"][0]["failure_class"] == "CODE_ERROR"
     assert data["failure_groups"][0]["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Narrative ordering tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_narrative_approval_before_completion(client: AsyncClient, db_session):
+    """Approval message appears before completion stats in the narrative (action-first ordering)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # One completed task
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+    ))
+    # One task awaiting approval
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Approval Task",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        created_at=curr,
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    narrative = data["narrative_summary"]
+    assert isinstance(narrative, str)
+    assert "awaiting your approval" in narrative
+    assert "completed" in narrative
+    # Approval message must appear before completion stats
+    assert narrative.index("awaiting your approval") < narrative.index("completed")
+
+
+@pytest.mark.asyncio
+async def test_narrative_all_clear_when_no_attention_needed(client: AsyncClient, db_session):
+    """Narrative is a single 'All clear' sentence when only completions exist (no failures, no approvals)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["completed_count"] == 3
+    assert data["failed_count"] == 0
+    assert data["pending_approval_count"] == 0
+
+    narrative = data["narrative_summary"]
+    assert "All clear" in narrative
+    assert "no action needed" in narrative
+    assert "3 tasks completed" in narrative
+    # No trend prefix or failure language
+    assert "Good progress" not in narrative
+    assert "Pipeline health declining" not in narrative
+    assert "failed" not in narrative

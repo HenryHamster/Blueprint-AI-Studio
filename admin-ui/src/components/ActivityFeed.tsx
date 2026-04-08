@@ -33,6 +33,7 @@ interface ActivityFeedProps {
   onClose: () => void;
   lastVisitTimestamp?: number | null;
   onEventsChange?: (events: ActivityEvent[]) => void;
+  initialFilter?: string;
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -135,12 +136,12 @@ function getTimeRangeSince(range: TimeRangeOption, lastVisitTimestamp?: number |
   return new Date(now - 7 * 24 * 3600 * 1000).toISOString();
 }
 
-export default function ActivityFeed({ selectedProjectId, refreshInterval, onSelectTask, onClose, lastVisitTimestamp, onEventsChange }: ActivityFeedProps) {
+export default function ActivityFeed({ selectedProjectId, refreshInterval, onSelectTask, onClose, lastVisitTimestamp, onEventsChange, initialFilter }: ActivityFeedProps) {
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
-  const [activeFilter, setActiveFilter] = useState<FilterOption>('ALL');
+  const [activeFilter, setActiveFilter] = useState<FilterOption>((initialFilter as FilterOption) ?? 'ALL');
   const [timeRange, setTimeRange] = useState<TimeRangeOption>(lastVisitTimestamp != null ? 'last_visit' : 'all');
 
   const fetchEvents = useCallback(async () => {

@@ -173,6 +173,7 @@ export default function App() {
   }, [showProjectMembers, s.selectedProjectId, s.fetchProjectMembers]);
 
   const [activityEvents, setActivityEvents] = useState<import('./components/ActivityFeed').ActivityEvent[]>([]);
+  const [activityFeedFilter, setActivityFeedFilter] = useState<string | undefined>();
   const newActivityCount = useMemo(() => {
     if (!s.lastActivityFeedOpen) return 0;
     return activityEvents.filter(e => new Date(e.timestamp).getTime() > s.lastActivityFeedOpen!).length;
@@ -479,7 +480,7 @@ export default function App() {
               s.addToast('Could not load task — it may have been deleted', 'error');
             });
           }}
-          onOpenActivityFeed={() => s.setShowActivityFeed(true)}
+          onOpenActivityFeed={(filter) => { setActivityFeedFilter(filter); s.setShowActivityFeed(true); }}
           onApprove={(taskId) => s.handleApprove(taskId)}
           onRetry={(taskId) => s.handleRetry(taskId)}
           onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
@@ -564,9 +565,10 @@ export default function App() {
               s.addToast('Could not load task — it may have been deleted', 'error');
             });
           }}
-          onClose={() => s.setShowActivityFeed(false)}
+          onClose={() => { s.setShowActivityFeed(false); setActivityFeedFilter(undefined); }}
           lastVisitTimestamp={s.prevLastActivityFeedOpen}
           onEventsChange={setActivityEvents}
+          initialFilter={activityFeedFilter}
         />
       ) : s.showArchive ? (
         <ArchiveView

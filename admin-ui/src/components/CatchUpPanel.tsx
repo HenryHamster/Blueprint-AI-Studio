@@ -12,6 +12,8 @@ interface NeedsAttentionItem {
   pr_url: string | null;
   waiting_since?: string;
   waiting_hours?: number;
+  approval_reason?: string;
+  touched_critical?: string[];
 }
 
 interface RecentFailure {
@@ -103,7 +105,7 @@ export interface CatchUpPanelProps {
   lastVisitTimestamp: number | null;
   refreshInterval: number;
   onSelectTask: (task: { id: string }) => void;
-  onOpenActivityFeed?: () => void;
+  onOpenActivityFeed?: (filter?: string) => void;
   needsAttentionCount?: number;
   onApprove?: (taskId: string) => void;
   onRetry?: (taskId: string) => void;
@@ -216,28 +218,79 @@ function SkeletonRow() {
 }
 
 function DirectionProgressSection({ directions }: { directions: DirectionProgress[] }) {
+  const [expandedDirections, setExpandedDirections] = useState<Set<string>>(new Set());
+
+  const toggleDirection = (id: string) => {
+    setExpandedDirections(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   return (
     <div className="flex flex-col gap-1">
       <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
-      {directions.map(dp => (
-        <div key={dp.direction_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded">
-          <span className="flex-1 truncate text-neutral-400">
-            {(dp.direction_text || dp.direction_id).slice(0, 50)}
-          </span>
-          <div className="shrink-0 flex items-center gap-1">
-            {dp.prs_merged > 0 && (
-              <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
-                {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
+      {directions.map(dp => {
+        const isExpanded = expandedDirections.has(dp.direction_id);
+        return (
+          <div key={dp.direction_id}>
+            <div
+              className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30"
+              onClick={() => toggleDirection(dp.direction_id)}
+            >
+              {isExpanded ? <ChevronUp className="w-3 h-3 shrink-0 text-neutral-600" /> : <ChevronDown className="w-3 h-3 shrink-0 text-neutral-600" />}
+              <span className="flex-1 truncate text-neutral-400">
+                {(dp.direction_text || dp.direction_id).slice(0, 50)}
               </span>
-            )}
-            {dp.possibly_saturated && (
-              <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">
-                saturated
-              </span>
+              <div className="shrink-0 flex items-center gap-1">
+                {dp.cycles_in_window > 0 && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                    {dp.cycles_in_window} cycle{dp.cycles_in_window !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {dp.tasks_created > 0 && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-500 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                    {dp.tasks_created} task{dp.tasks_created !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {dp.prs_merged > 0 && (
+                  <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                    {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {dp.possibly_saturated && (
+                  <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                    saturated
+                  </span>
+                )}
+              </div>
+            </div>
+            {isExpanded && (
+              <div className="mt-1 ml-5 flex flex-col gap-1">
+                {dp.recent_finding_titles && dp.recent_finding_titles.length > 0 && (
+                  <div className="flex flex-col gap-0.5">
+                    {dp.recent_finding_titles.slice(0, 3).map((title, i) => (
+                      <span key={i} className="text-[10px] text-neutral-400">· {title}</span>
+                    ))}
+                  </div>
+                )}
+                {dp.latest_insights && dp.latest_insights.length > 0 && (
+                  <div className="flex flex-col gap-0.5">
+                    {dp.latest_insights.slice(0, 2).map((insight, i) => (
+                      <span key={i} className="text-[10px] text-neutral-500 italic">{insight}</span>
+                    ))}
+                  </div>
+                )}
+                {dp.latest_research_at && (
+                  <span className="text-[9px] text-neutral-600">Last researched: {formatRelativeTime(dp.latest_research_at)}</span>
+                )}
+              </div>
             )}
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -450,7 +503,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
           )}
           {collapsed && digest && (
             <span className="text-[10px] text-neutral-500 font-mono ml-1 normal-case tracking-normal font-normal">
-              {digest.completed_count} shipped · {digest.success_rate != null ? `${Math.round(digest.success_rate * 100)}%` : '—'}
+              {digest.completed_count} shipped
+              {digest.failed_count > 0 && (
+                <span className="text-red-400"> · {digest.failed_count}F</span>
+              )}
+              {digest.pending_approval_count > 0 && (
+                <span className="text-amber-400"> · {digest.pending_approval_count}A</span>
+              )}
+              {' · '}{digest.success_rate != null ? `${Math.round(digest.success_rate * 100)}%` : '—'}
               {digest.trend && (
                 <>
                   {' · '}
@@ -485,6 +545,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
           </div>
         )}
       </div>
+
+      {collapsed && digest?.narrative_summary && (
+        <div className="text-[10px] text-neutral-500 mt-0.5 pl-7 truncate max-w-xl">
+          {digest.narrative_summary.slice(0, 100)}{digest.narrative_summary.length > 100 ? '…' : ''}
+        </div>
+      )}
 
       {!collapsed && (
         <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4">
@@ -552,7 +618,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </span>
                 )}
                 {digest!.completed_count > 0 && (
-                  <span className="flex items-center gap-1">
+                  <span
+                    className="flex items-center gap-1 cursor-pointer hover:text-emerald-300 transition-colors"
+                    onClick={() => onOpenActivityFeed?.('TASK_COMPLETED')}
+                  >
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
                     {digest!.completed_count} completed
                     {digest!.completed_delta != null && digest!.completed_delta !== 0 && (
@@ -563,7 +632,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </span>
                 )}
                 {digest!.failed_count > 0 && (
-                  <span className="flex items-center gap-1">
+                  <span
+                    className="flex items-center gap-1 cursor-pointer hover:text-red-300 transition-colors"
+                    onClick={() => onOpenActivityFeed?.('TASK_FAILED')}
+                  >
                     <XCircle className="w-3 h-3 text-red-500" />
                     {digest!.failed_count} failed
                     {digest!.failed_delta != null && digest!.failed_delta !== 0 && (
@@ -692,6 +764,18 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                               )}
                             </div>
                           </div>
+                          {item.reason === 'approval_required' && item.approval_reason && (
+                            <div className="flex items-center gap-1.5 px-2">
+                              <span className="text-[10px] text-neutral-500 italic truncate">
+                                {item.approval_reason.length > 100 ? item.approval_reason.slice(0, 100) + '…' : item.approval_reason}
+                              </span>
+                              {item.touched_critical && item.touched_critical.length > 0 && (
+                                <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                                  critical files
+                                </span>
+                              )}
+                            </div>
+                          )}
                           {item.error_snippet && (
                             <div className="px-2">
                               <button
@@ -932,7 +1016,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
               })()}
               {onOpenActivityFeed && (
                 <button
-                  onClick={onOpenActivityFeed}
+                  onClick={() => onOpenActivityFeed?.()}
                   className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors mt-1 self-end"
                 >
                   View full activity ↗
