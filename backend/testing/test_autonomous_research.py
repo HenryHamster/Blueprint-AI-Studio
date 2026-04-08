@@ -1500,8 +1500,8 @@ async def test_research_context_accumulates_across_cycles(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_research_context_truncated_under_4000_chars(db_session, mocker):
-    """research_context stays under 4000 chars even with many findings."""
+async def test_research_context_truncated_under_8000_chars(db_session, mocker):
+    """research_context stays under 8000 chars even with many findings."""
     direction_id = "d-ctx0002"
     direction = _active_direction(direction_id, "Truncation test")
     project = Project(
@@ -1550,7 +1550,7 @@ async def test_research_context_truncated_under_4000_chars(db_session, mocker):
     assert d is not None
     ctx = d.get("research_context", "")
     assert ctx, "research_context should exist after 6 cycles"
-    assert len(ctx) <= 4000, f"research_context should be ≤4000 chars, got {len(ctx)}"
+    assert len(ctx) <= 8000, f"research_context should be ≤8000 chars, got {len(ctx)}"
 
 
 @pytest.mark.asyncio

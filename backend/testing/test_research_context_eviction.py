@@ -88,7 +88,7 @@ class TestFormatEvictionBody:
 
 class TestNoEvictionWhenUnderLimit:
     def test_fresh_small_context_has_no_eviction_summary(self):
-        """Contexts under 4000 chars built from scratch have no eviction summary."""
+        """Contexts under 8000 chars built from scratch have no eviction summary."""
         result = _build_research_context(
             prior_context=None,
             finding_titles=["Finding A", "Finding B"],
@@ -98,10 +98,10 @@ class TestNoEvictionWhenUnderLimit:
         )
         assert "## Eviction Summary" not in result
         assert "## Established Findings" in result
-        assert len(result) <= 4000
+        assert len(result) <= 8000
 
     def test_moderate_context_has_no_eviction_summary(self):
-        """A context with reasonable content stays under 4000 chars with no eviction."""
+        """A context with reasonable content stays under 8000 chars with no eviction."""
         prior = _make_large_context(established_count=5, failed_count=3, oq_count=3)
         result = _build_research_context(
             prior_context=prior,
@@ -111,7 +111,7 @@ class TestNoEvictionWhenUnderLimit:
             history_entry={},
         )
         assert "## Eviction Summary" not in result
-        assert len(result) <= 4000
+        assert len(result) <= 8000
 
 
 # ── _build_research_context: eviction summary when over limit ────────────────
@@ -119,7 +119,7 @@ class TestNoEvictionWhenUnderLimit:
 class TestEvictionSummaryWhenOverLimit:
     def test_eviction_summary_present_when_over_limit(self):
         """Contexts that exceed the limit should include an ## Eviction Summary section."""
-        prior = _make_large_context(established_count=40, failed_count=10, entry_len=90)
+        prior = _make_large_context(established_count=80, failed_count=20, entry_len=90)
         result = _build_research_context(
             prior_context=prior,
             finding_titles=["New finding"],
@@ -129,7 +129,7 @@ class TestEvictionSummaryWhenOverLimit:
         )
         assert "## Eviction Summary" in result
         assert "evicted" in result
-        assert len(result) <= 4000
+        assert len(result) <= 8000
 
     def test_eviction_preserves_failed_approach_first_60_chars(self):
         """Evicted Failed Approaches entries appear truncated to 60 chars in the summary."""
@@ -138,8 +138,8 @@ class TestEvictionSummaryWhenOverLimit:
         # if failed section is largest, otherwise established entries get evicted).
         # Use many failed approaches to ensure the failed section is evicted from.
         specific_approach = "Specific approach to evict: tried using X pattern and it collapsed"
-        filler_approaches = [f"Approach filler {i}: " + "a" * 60 for i in range(25)]
-        filler_established = [f"Established filler {i}: " + "b" * 90 for i in range(25)]
+        filler_approaches = [f"Approach filler {i}: " + "a" * 60 for i in range(50)]
+        filler_established = [f"Established filler {i}: " + "b" * 90 for i in range(50)]
 
         parts = ["## Established Findings"]
         for e in filler_established:
@@ -164,7 +164,7 @@ class TestEvictionSummaryWhenOverLimit:
         )
 
         assert "## Eviction Summary" in result
-        assert len(result) <= 4000
+        assert len(result) <= 8000
 
         parsed = _parse_research_context(result)
         eviction_text = parsed["eviction_summary"] or ""
@@ -175,7 +175,7 @@ class TestEvictionSummaryWhenOverLimit:
 
     def test_only_established_count_preserved_not_text(self):
         """Evicted Established entries contribute only to the count, not full text."""
-        prior = _make_large_context(established_count=40, failed_count=2, entry_len=90)
+        prior = _make_large_context(established_count=80, failed_count=2, entry_len=90)
         result = _build_research_context(
             prior_context=prior,
             finding_titles=["New finding"],
@@ -227,7 +227,7 @@ class TestEvictionSummaryAccumulation:
         # Build a prior context with an existing eviction summary (5 established, 3 failed)
         # and large enough main content to trigger new evictions when more content is added.
         large_established = "\n".join(
-            [f"- Established finding {i}: " + "x" * 90 for i in range(35)]
+            [f"- Established finding {i}: " + "x" * 90 for i in range(70)]
         )
         prior_with_summary = (
             "## Eviction Summary\n"
@@ -250,7 +250,7 @@ class TestEvictionSummaryAccumulation:
         )
 
         assert "## Eviction Summary" in result
-        assert len(result) <= 4000
+        assert len(result) <= 8000
 
         parsed = _parse_research_context(result)
         eviction_text = parsed["eviction_summary"] or ""

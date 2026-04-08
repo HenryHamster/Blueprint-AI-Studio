@@ -899,15 +899,31 @@ def cmd_update_direction(args):
 
     Usage:
         tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
-        tasks.py update-direction <direction_id> --reset-context   — wipe research_context (established findings)
-        tasks.py update-direction <direction_id> --reset-history   — wipe research_history (past cycle records)
-        tasks.py update-direction all --reset-context              — wipe research_context for ALL directions
+        tasks.py update-direction <direction_id> --reset-context        — wipe research_context
+        tasks.py update-direction <direction_id> --reset-history        — wipe research_history
+        tasks.py update-direction <direction_id> --reset-agent-notes    — remove agent-added notes (keep user notes)
+        tasks.py update-direction all --reset-all                       — full blank slate (context + history + agent notes)
     """
     from blueprint_api import api, get_project_id
     if not args:
-        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...] [--reset-context] [--reset-history]")
+        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...] [--reset-context] [--reset-history] [--reset-agent-notes] [--reset-all]")
         return
     did = args[0]
+    reset_all = "--reset-all" in args
+
+    def _build_reset_patch(direction_data):
+        """Build patch dict for reset flags, optionally using direction data for note filtering."""
+        patch = {}
+        if "--reset-context" in args or reset_all:
+            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
+        if "--reset-history" in args or reset_all:
+            patch["research_history"] = []
+        if "--reset-agent-notes" in args or reset_all:
+            notes = direction_data.get("notes", []) if direction_data else []
+            # Keep only user-added notes (no added_by_task field)
+            user_notes = [n for n in notes if not n.get("added_by_task")]
+            patch["notes"] = user_notes
+        return patch
 
     # Handle "all" target for bulk resets
     if did.lower() == "all":
@@ -917,14 +933,19 @@ def cmd_update_direction(args):
         for d in all_dirs:
             d_id = d.get("id", "?")
             d_name = (d.get("text") or "?")[:50]
-            patch = {}
-            if "--reset-context" in args:
-                patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-            if "--reset-history" in args:
-                patch["research_history"] = []
+            patch = _build_reset_patch(d)
             if patch:
                 api("PATCH", f"/api/admin/projects/{pid}/directions/{d_id}", patch)
-                print(f"  Reset {d_id[:12]} ({d_name}): {', '.join(patch.keys())}")
+                actions = []
+                if "research_context" in patch:
+                    actions.append("context")
+                if "research_history" in patch:
+                    actions.append("history")
+                if "notes" in patch:
+                    kept = len(patch["notes"])
+                    removed = len(d.get("notes", [])) - kept
+                    actions.append(f"notes (-{removed}, kept {kept} user)")
+                print(f"  Reset {d_id[:12]} ({d_name}): {', '.join(actions)}")
         return
 
     patch = {}
@@ -935,10 +956,20 @@ def cmd_update_direction(args):
             patch["priority"] = args[i + 1]
         if a == "--status" and i + 1 < len(args):
             patch["status"] = args[i + 1]
-        if a == "--reset-context":
+        if a == "--reset-context" or reset_all:
             patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
-        if a == "--reset-history":
+        if a == "--reset-history" or reset_all:
             patch["research_history"] = []
+        if a == "--reset-agent-notes" or reset_all:
+            # Need direction data for filtering — fetch it
+            pid_tmp = get_project_id()
+            dirs_tmp = api("GET", f"/api/admin/projects/{pid_tmp}/directions")
+            all_tmp = dirs_tmp if isinstance(dirs_tmp, list) else dirs_tmp.get("directions", [])
+            for dt in all_tmp:
+                if dt.get("id") == did:
+                    user_notes = [n for n in dt.get("notes", []) if not n.get("added_by_task")]
+                    patch["notes"] = user_notes
+                    break
     if not patch:
         print("Nothing to update. Use --text, --priority, or --status.")
         return

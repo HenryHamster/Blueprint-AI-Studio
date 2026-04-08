@@ -237,6 +237,9 @@ async def update_direction(
             if "research_history" in payload:
                 if payload["research_history"] is None or (isinstance(payload["research_history"], list) and len(payload["research_history"]) == 0):
                     d["research_history"] = []
+            if "notes" in payload:
+                if isinstance(payload["notes"], list):
+                    d["notes"] = payload["notes"]
             updated = True
             break
 
