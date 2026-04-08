@@ -279,29 +279,57 @@ ${hotspotsSection}
           statsLine = `\n  Stats: ${parts.join(', ')}`;
         }
 
-        // Research context (synthesized knowledge) — show in full, this is the good stuff
-        const researchCtx = typeof d.research_context === 'string' && d.research_context.length > 0
-          ? `\n  Accumulated knowledge:\n${d.research_context}`
-          : '';
+        // Research context — restructure to avoid anchoring on small past findings.
+        // Show failed approaches and open questions in full (high-signal steering).
+        // Summarize established findings as a count to inform without anchoring scope.
+        let researchCtx = '';
+        if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
+          const rawCtx = d.research_context as string;
+          const sections: Record<string, string[]> = { established: [], failed: [], open: [] };
+          let currentSection = '';
+          for (const line of rawCtx.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
+            if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
+            if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
+            if (trimmed.startsWith('- ') && currentSection) {
+              sections[currentSection].push(trimmed);
+            }
+          }
 
-        // Condensed history: titles only from last 3 cycles
+          const ctxParts: string[] = [];
+          if (sections.established.length > 0) {
+            ctxParts.push(`  ${sections.established.length} findings already completed for this direction (do not re-propose similar scope work).`);
+          }
+          if (sections.failed.length > 0) {
+            ctxParts.push(`  Failed approaches (avoid these):\n${sections.failed.join('\n')}`);
+          }
+          if (sections.open.length > 0) {
+            ctxParts.push(`  Open questions:\n${sections.open.join('\n')}`);
+          }
+          if (ctxParts.length > 0) {
+            researchCtx = `\n  Context:\n${ctxParts.join('\n')}`;
+          }
+        }
+
+        // History titles: purely for dedup — framed as "already done", not as examples
         let historySection = '';
         if (history.length > 0) {
-          const historySlice = history.slice(-3);
+          const historySlice = history.slice(-5);
           const allTitles = historySlice.flatMap(h =>
             Array.isArray(h.finding_titles) ? h.finding_titles as string[] : []
           );
           if (allTitles.length > 0) {
-            historySection = `\n  Previous findings (titles — do NOT re-propose): ${allTitles.join(', ')}`;
+            historySection = `\n  Already completed (dedup only — do NOT use as scope examples): ${allTitles.join(', ')}`;
           }
         }
 
-        // Notes: last 2, truncated to 80 chars
+        // Notes: show all notes in full (user-written guidance, highest signal)
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
         if (notes.length > 0) {
-          const recent = notes.slice(-2).map(n => `  \u2022 ${n.text.slice(0, 80)}`).join('\n');
-          notesSection = `\n  Notes:\n${recent}`;
+          const rendered = notes.map(n => `  * ${n.text}`).join('\n');
+          notesSection = `\n  Notes:\n${rendered}`;
         }
 
         const saturationNote = d.possibly_saturated

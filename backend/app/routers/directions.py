@@ -229,6 +229,14 @@ async def update_direction(
                 d["paths"] = payload["paths"]
             if "pending_update" in payload:
                 d["pending_update"] = payload["pending_update"]
+            if "research_context" in payload:
+                if payload["research_context"] is None:
+                    d.pop("research_context", None)
+                elif isinstance(payload["research_context"], str):
+                    d["research_context"] = payload["research_context"]
+            if "research_history" in payload:
+                if payload["research_history"] is None or (isinstance(payload["research_history"], list) and len(payload["research_history"]) == 0):
+                    d["research_history"] = []
             updated = True
             break
 

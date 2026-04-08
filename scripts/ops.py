@@ -189,19 +189,57 @@ def cmd_pool(_args):
         print(f"Pool: error ({e})")
 
 
+def _resolve_account(query):
+    """Resolve an account by name (case-insensitive substring) or ID prefix."""
+    s = api("GET", "/api/admin/settings")
+    accounts = s.get('max_plan_accounts', [])
+    q = query.lower()
+    for a in accounts:
+        if a['id'].lower().startswith(q) or q in a.get('name', '').lower():
+            return a
+    return None
+
+
 def cmd_accounts(args):
-    """Manage Max Plan accounts. Show pool with --disable/--enable/--remove for mutations."""
-    if args and args[0] == '--disable' and len(args) > 1:
-        result = api("PATCH", f"/api/admin/max-plan-accounts/{args[1]}", {"enabled": False})
-        print(f"Disabled: {result.get('name', args[1])}")
-        return
-    if args and args[0] == '--enable' and len(args) > 1:
-        result = api("PATCH", f"/api/admin/max-plan-accounts/{args[1]}", {"enabled": True})
-        print(f"Enabled: {result.get('name', args[1])}")
+    """Manage Max Plan accounts. Show pool with --disable/--enable/--remove for mutations.
+
+    Account can be specified by full ID, ID prefix, or name (case-insensitive substring).
+    Examples:
+        python scripts/ops.py accounts --enable henry
+        python scripts/ops.py accounts --enable all
+        python scripts/ops.py accounts --disable evan
+    """
+    if args and args[0] in ('--disable', '--enable') and len(args) > 1:
+        enable = args[0] == '--enable'
+        target = args[1]
+        if target.lower() == 'all':
+            s = api("GET", "/api/admin/settings")
+            accounts = s.get('max_plan_accounts', [])
+            for a in accounts:
+                if a.get('enabled', True) != enable:
+                    result = api("PATCH", f"/api/admin/max-plan-accounts/{a['id']}", {"enabled": enable})
+                    verb = "Enabled" if enable else "Disabled"
+                    print(f"  {verb}: {result.get('name', a['id'][:8])}")
+                else:
+                    state = "enabled" if enable else "disabled"
+                    print(f"  {a.get('name', a['id'][:8])}: already {state}")
+            return
+        acct = _resolve_account(target)
+        if not acct:
+            print(f"Account not found: {target}")
+            return
+        result = api("PATCH", f"/api/admin/max-plan-accounts/{acct['id']}", {"enabled": enable})
+        verb = "Enabled" if enable else "Disabled"
+        print(f"{verb}: {result.get('name', acct['id'][:8])}")
         return
     if args and args[0] == '--remove' and len(args) > 1:
+        target = args[1]
         force = '--force' in args
-        path = f"/api/admin/max-plan-accounts/{args[1]}"
+        acct = _resolve_account(target)
+        if not acct:
+            print(f"Account not found: {target}")
+            return
+        path = f"/api/admin/max-plan-accounts/{acct['id']}"
         if force:
             path += "?force=true"
         result = api("DELETE", path)

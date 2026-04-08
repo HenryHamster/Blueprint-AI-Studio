@@ -2947,9 +2947,9 @@ def _build_research_context(
             parts.append("")
         return "\n".join(parts).strip() + "\n"
 
-    MAX_MAIN_CHARS = 3500
+    MAX_MAIN_CHARS = 7500
     EVICTION_MAX = 500
-    TOTAL_MAX = MAX_MAIN_CHARS + EVICTION_MAX  # 4000
+    TOTAL_MAX = MAX_MAIN_CHARS + EVICTION_MAX  # 8000
 
     doc = _format_doc(parsed)
     if len(doc) <= MAX_MAIN_CHARS:
@@ -3869,9 +3869,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     insights = _parse_research_insights(str(task.id))
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
+        task.plan_output = []
         session.add(task)
         await session.commit()
         return
+
+    # Store all findings for admin visibility before filtering
+    task.plan_output = findings
+    session.add(task)
+    await session.commit()
 
     # Separate direction proposals and notes from actionable findings — these are processed
     # separately and must not enter the hash-based deduplication loop (they never create tasks,
@@ -4475,7 +4481,7 @@ async def _update_direction_research_outcomes(
                         parts.append(f"- {item}")
                     parts.append("")
                 updated_ctx = "\n".join(parts).strip() + "\n"
-                d["research_context"] = updated_ctx[:4000]
+                d["research_context"] = updated_ctx[:8000]
 
             updated = True
             break

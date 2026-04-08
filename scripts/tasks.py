@@ -20,6 +20,8 @@ Usage:
     python scripts/tasks.py requeue-ci
     python scripts/tasks.py trigger-rollup [<parent_id>]
     python scripts/tasks.py archive [--completed]          — archive old terminal tasks
+    python scripts/tasks.py research [--limit N] [-v]     — recent research results + findings
+    python scripts/tasks.py research <id> [-v]            — detailed view of one research task
 """
 import json
 import sys
@@ -895,13 +897,36 @@ def cmd_add_direction(args):
 def cmd_update_direction(args):
     """Update a direction's text, priority, or status.
 
-    Usage: tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
+    Usage:
+        tasks.py update-direction <direction_id> [--text "new text"] [--priority high|medium|low] [--status active|paused|completed]
+        tasks.py update-direction <direction_id> --reset-context   — wipe research_context (established findings)
+        tasks.py update-direction <direction_id> --reset-history   — wipe research_history (past cycle records)
+        tasks.py update-direction all --reset-context              — wipe research_context for ALL directions
     """
     from blueprint_api import api, get_project_id
     if not args:
-        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...]")
+        print("Usage: tasks.py update-direction <direction_id> [--text '...'] [--priority ...] [--status ...] [--reset-context] [--reset-history]")
         return
     did = args[0]
+
+    # Handle "all" target for bulk resets
+    if did.lower() == "all":
+        pid = get_project_id()
+        dirs_data = api("GET", f"/api/admin/projects/{pid}/directions")
+        all_dirs = dirs_data if isinstance(dirs_data, list) else dirs_data.get("directions", [])
+        for d in all_dirs:
+            d_id = d.get("id", "?")
+            d_name = (d.get("text") or "?")[:50]
+            patch = {}
+            if "--reset-context" in args:
+                patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
+            if "--reset-history" in args:
+                patch["research_history"] = []
+            if patch:
+                api("PATCH", f"/api/admin/projects/{pid}/directions/{d_id}", patch)
+                print(f"  Reset {d_id[:12]} ({d_name}): {', '.join(patch.keys())}")
+        return
+
     patch = {}
     for i, a in enumerate(args):
         if a == "--text" and i + 1 < len(args):
@@ -910,6 +935,10 @@ def cmd_update_direction(args):
             patch["priority"] = args[i + 1]
         if a == "--status" and i + 1 < len(args):
             patch["status"] = args[i + 1]
+        if a == "--reset-context":
+            patch["research_context"] = "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
+        if a == "--reset-history":
+            patch["research_history"] = []
     if not patch:
         print("Nothing to update. Use --text, --priority, or --status.")
         return
@@ -1014,6 +1043,148 @@ def cmd_payload(args):
         print(json.dumps(ctx, indent=2, default=str))
 
 
+def cmd_research(args):
+    """Show recent research results — findings, proposed tasks, and outcomes.
+
+    Usage:
+        tasks.py research                — last 5 completed research tasks
+        tasks.py research --limit 10     — last N
+        tasks.py research <id>           — detailed view of one research task
+        tasks.py research -v             — verbose (show full finding prompts)
+    """
+    from blueprint_api import api
+
+    verbose = "-v" in args or "--verbose" in args
+    limit = 5
+    query = None
+    for i, a in enumerate(args):
+        if a == "--limit" and i + 1 < len(args):
+            limit = int(args[i + 1])
+        elif not a.startswith("-"):
+            query = a
+
+    # Single research task detail
+    if query:
+        t = _resolve_task(query)
+        if not t:
+            print(f"Task '{query}' not found.")
+            return
+        try:
+            full = api("GET", f"/api/admin/tasks/{t['id']}")
+            t = full.get("task", full)
+        except Exception:
+            pass
+        _print_research_detail(t, verbose)
+        return
+
+    # List recent research tasks
+    all_completed = list_tasks(status="COMPLETED", limit=100)
+    all_evaluating = list_tasks(status="EVALUATING", limit=50)
+    all_failed = list_tasks(status="FAILED", limit=50)
+    research_tasks = [t for t in all_completed + all_evaluating + all_failed
+                      if t.get("task_type") == "research"][:limit]
+
+    if not research_tasks:
+        print("No recent research tasks found.")
+        return
+
+    for t in research_tasks:
+        try:
+            full = api("GET", f"/api/admin/tasks/{t['id']}")
+            t = full.get("task", full)
+        except Exception:
+            pass
+        _print_research_detail(t, verbose)
+        print()
+
+
+def _print_research_detail(t, verbose=False):
+    """Print a research task's findings and child task outcomes."""
+    tid = t["id"][:8]
+    status = t.get("status", "?")
+    title = t.get("title", "?")
+    icons = {"COMPLETED": "ok", "EVALUATING": "eval", "FAILED": "FAIL", "QUEUED": "wait", "IN_PROGRESS": "run"}
+    icon = icons.get(status, status)
+    msg = (t.get("latest_status_message") or "")[:120]
+
+    print(f"=== {tid} [{icon}] {_safe(title, 80)} ===")
+    print(f"  Status: {msg}")
+
+    # Direction context
+    ctx = t.get("context") or {}
+    direction = ctx.get("direction_summary") or ctx.get("research_question", "")
+    if direction:
+        print(f"  Direction: {_safe(direction, 120)}")
+
+    # Findings from plan_output
+    findings = t.get("plan_output") or []
+    children = _get_children(t["id"][:8])
+
+    if not findings:
+        # Reconstruct from children for historical tasks missing plan_output
+        if children:
+            impl_children = [c for c in children
+                             if c.get("task_type") not in ("review", "fix", "debug", "smoketest")]
+            if impl_children:
+                print(f"\n  Findings: (not stored — reconstructed from {len(impl_children)} children)")
+                for i, c in enumerate(impl_children):
+                    ctitle = _safe(c.get("title", ""), 80)
+                    ctype = c.get("task_type", "?")
+                    print(f"    {i+1}. [{ctype}] {ctitle}")
+            else:
+                print("  Findings: (none stored)")
+        else:
+            print("  Findings: (none stored)")
+
+    if findings:
+        print(f"\n  Findings ({len(findings)}):")
+        for i, f in enumerate(findings):
+            if isinstance(f, str):
+                print(f"    {i+1}. {_safe(f, 100)}")
+                continue
+            ftitle = f.get("title", "?")
+            ftype = f.get("task_type") or f.get("type", "?")
+            severity = f.get("severity", "")
+            sev_tag = f" [{severity}]" if severity else ""
+            print(f"    {i+1}. [{ftype}]{sev_tag} {_safe(ftitle, 80)}")
+
+            # Show prompt preview or full
+            prompt = f.get("prompt", "")
+            if prompt:
+                if verbose:
+                    for line in prompt.split("\n")[:15]:
+                        print(f"       {_safe(line, 120)}")
+                else:
+                    print(f"       {_safe(prompt, 120)}")
+
+    # Children outcomes
+    if children:
+        # Filter out review/fix/debug children for the summary
+        impl_children = [c for c in children
+                         if c.get("task_type") not in ("review", "fix", "debug", "smoketest")]
+        if not impl_children:
+            impl_children = children
+
+        merged = sum(1 for c in impl_children if (c.get("context") or {}).get("pr_merged"))
+        failed = sum(1 for c in impl_children if c["status"] == "FAILED")
+        completed = sum(1 for c in impl_children if c["status"] == "COMPLETED")
+
+        print(f"\n  Children: {len(impl_children)} total, {merged} merged, {completed} completed, {failed} failed")
+        for c in impl_children:
+            cid = c["id"][:8]
+            cstatus = c.get("status", "?")
+            ctitle = _safe(c.get("title", ""), 65)
+            c_arts = c.get("artifacts") or {}
+            cpr = ""
+            if isinstance(c_arts, list) and c_arts:
+                cpr = c_arts[0].get("pr_url", "")
+            elif isinstance(c_arts, dict):
+                cpr = c_arts.get("pr_url", "")
+            pr_tag = f" PR: {cpr.split('/')[-1]}" if cpr and "/" in cpr else ""
+            cm = " MERGED" if (c.get("context") or {}).get("pr_merged") else ""
+            print(f"    [{cstatus:10}] {cid}  {ctitle}{pr_tag}{cm}")
+
+
 COMMANDS = {
     "list": cmd_list,
     "show": cmd_show,
@@ -1037,6 +1208,7 @@ COMMANDS = {
     "update-direction": cmd_update_direction,
     "autonomy-debug": cmd_autonomy_debug,
     "archive": cmd_archive,
+    "research": cmd_research,
 }
 
 if __name__ == "__main__":

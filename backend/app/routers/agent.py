@@ -367,7 +367,7 @@ async def claim_task(
             research_findings_summary = None
             for a in task_artifacts:
                 if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                    research_findings_summary = a.logs[:4000]
+                    research_findings_summary = a.logs[:8000]
                     break
             recently_completed_tasks.append({
                 "id": str(t.id),
