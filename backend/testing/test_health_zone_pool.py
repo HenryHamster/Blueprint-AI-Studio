@@ -11,6 +11,7 @@ from httpx import AsyncClient, ASGITransport
 
 import app.shared_state as _shared_state
 import app.main as _main_module
+import app.orchestrator as _orch_module
 from app.main import (
     app,
     select_max_plan_account,
@@ -73,10 +74,10 @@ def clean_max_plan_pool():
 @pytest.fixture()
 def healthy_orchestrator():
     """Set _orchestrator_last_cycle to now so /health sees a live orchestrator."""
-    original = _main_module._orchestrator_last_cycle
-    _main_module._orchestrator_last_cycle = datetime.utcnow()
+    original = _orch_module._orchestrator_last_cycle
+    _orch_module._orchestrator_last_cycle = datetime.utcnow()
     yield
-    _main_module._orchestrator_last_cycle = original
+    _orch_module._orchestrator_last_cycle = original
 
 
 @pytest.fixture()
@@ -174,8 +175,8 @@ class TestHealthEndpoint:
         self, health_client: AsyncClient, all_deps_healthy
     ):
         """Returns 503 when the orchestrator has never completed a cycle."""
-        original = _main_module._orchestrator_last_cycle
-        _main_module._orchestrator_last_cycle = None
+        original = _orch_module._orchestrator_last_cycle
+        _orch_module._orchestrator_last_cycle = None
         try:
             resp = await health_client.get("/health")
             assert resp.status_code == 503
@@ -184,29 +185,29 @@ class TestHealthEndpoint:
             assert data["orchestrator_alive"] is False
             assert data["orchestrator_cycle_age_seconds"] is None
         finally:
-            _main_module._orchestrator_last_cycle = original
+            _orch_module._orchestrator_last_cycle = original
 
     @pytest.mark.asyncio
     async def test_health_stale_orchestrator_returns_503(
         self, health_client: AsyncClient, all_deps_healthy
     ):
         """Returns 503 when the orchestrator last ran more than 60 seconds ago."""
-        original = _main_module._orchestrator_last_cycle
-        _main_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=90)
+        original = _orch_module._orchestrator_last_cycle
+        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=90)
         try:
             resp = await health_client.get("/health")
             assert resp.status_code == 503
             assert resp.json()["status"] == "unhealthy"
         finally:
-            _main_module._orchestrator_last_cycle = original
+            _orch_module._orchestrator_last_cycle = original
 
     @pytest.mark.asyncio
     async def test_health_cycle_age_seconds_reflects_elapsed_time(
         self, health_client: AsyncClient, all_deps_healthy
     ):
         """orchestrator_cycle_age_seconds is roughly the time since last cycle."""
-        original = _main_module._orchestrator_last_cycle
-        _main_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=10)
+        original = _orch_module._orchestrator_last_cycle
+        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(seconds=10)
         try:
             resp = await health_client.get("/health")
             age = resp.json().get("orchestrator_cycle_age_seconds")
@@ -214,7 +215,7 @@ class TestHealthEndpoint:
             # Allow generous tolerance for test execution time
             assert 5 <= age <= 30
         finally:
-            _main_module._orchestrator_last_cycle = original
+            _orch_module._orchestrator_last_cycle = original
 
     @pytest.mark.asyncio
     async def test_health_external_deps_contains_all_deps(

@@ -2252,7 +2252,7 @@ async def restart_orchestrator(
     """Restart the orchestrator background task without restarting the entire service."""
     import asyncio
     from app.shared_state import background_tasks
-    from app.main import orchestrator_worker
+    from app.orchestrator import orchestrator_worker
 
     old_task = background_tasks.get("orchestrator")
     if old_task and not old_task.done():
@@ -3160,7 +3160,8 @@ async def reset_circuit_breaker(
     """Manually reset a project's circuit breaker to CLOSED state."""
     await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
     import app.shared_state as _shared_state
-    from app.main import _persist_circuit_breakers, broadcast_to_project
+    from app.orchestrator import _persist_circuit_breakers
+    from app.main import broadcast_to_project
 
     key = str(project_id)
     breaker = _shared_state.circuit_breakers.get(key)
