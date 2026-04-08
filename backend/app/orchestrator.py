@@ -1082,7 +1082,13 @@ async def orchestrator_worker():
                     except Exception as e:
                         logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
                         try:
-                            ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
+                            status_code = getattr(e, "status_code", None)
+                            if status_code == 404:
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
+                                logger.error(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
+                            else:
+                                ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
                             session.add(ci_task)
                             await session.commit()
                         except Exception as e:
@@ -1092,6 +1098,7 @@ async def orchestrator_worker():
                             except Exception:
                                 pass
 
+            _orchestrator_consecutive_errors = 0
             logger.info('orchestrator_cycle_complete', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                 'tasks_dispatched': len(queued_tasks),
