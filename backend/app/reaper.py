@@ -164,6 +164,7 @@ async def reaper_service():
                     if fresh_task is None or fresh_task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
                         logger.info(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
                         continue
+                    task = fresh_task  # Use fresh data for all subsequent reads and writes
 
                     # Determine why the reaper flagged this task (use fresh_task for accurate data)
                     if fresh_task.last_heartbeat:

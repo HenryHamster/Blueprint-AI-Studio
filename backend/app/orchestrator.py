@@ -8,12 +8,14 @@ EVALUATING tasks.
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
+from fastapi import HTTPException
 from sqlalchemy import func as _func
 from sqlmodel import select
 
@@ -155,7 +157,6 @@ async def orchestrator_worker():
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
         try:
-            _orchestrator_consecutive_errors = 0
             _orchestrator_cycle_started = _utcnow()
             cycle_start = time.monotonic()
             tasks_recovered = 0
@@ -378,47 +379,69 @@ async def orchestrator_worker():
                     narrow_broken = 0
                     if stuck_tasks:
                         stuck_ids = {t.id for t in stuck_tasks}
+
+                        # Batch all dependency UUIDs across all stuck tasks into one query
+                        all_dep_ids: set[uuid.UUID] = set()
+                        task_dep_uuids: dict = {}
                         for stask in stuck_tasks:
-                            dep_uuids = set()
+                            dep_uuids: set[uuid.UUID] = set()
                             for d in (stask.depends_on or []):
                                 try:
                                     dep_uuids.add(uuid.UUID(d))
                                 except (ValueError, AttributeError):
                                     continue
-                            # Verify each dep's actual DB status before clearing
-                            # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
+                            task_dep_uuids[stask.id] = dep_uuids
+                            all_dep_ids.update(dep_uuids)
+
+                        dep_status: dict = {}
+                        if all_dep_ids:
+                            dep_rows = await session.execute(select(Task).where(Task.id.in_(all_dep_ids)))
+                            for dep_task in dep_rows.scalars().all():
+                                dep_status[dep_task.id] = dep_task.status
+
+                        # Verify each dep's actual DB status before clearing
+                        # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
+                        deadlocked_ids: list = []
+                        for stask in stuck_tasks:
+                            dep_uuids = task_dep_uuids[stask.id]
+                            if not dep_uuids:
+                                continue
                             genuinely_blocked = True
-                            async with AsyncSessionLocal() as check_session:
-                                for dep_id in dep_uuids:
-                                    if dep_id in stuck_ids:
-                                        continue  # Stuck in this pool — potential cycle
-                                    dep_task = await check_session.get(Task, dep_id)
-                                    if dep_task is None:
-                                        continue  # Deleted dep — genuinely unresolvable
-                                    if dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                        continue  # Terminal — genuinely unresolvable
-                                    if dep_task.status == TaskStatus.QUEUED:
-                                        # QUEUED but outside fetch window — NOT a deadlock, just low priority
-                                        genuinely_blocked = False
-                                        break
-                                    if dep_task.status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
-                                        # Still running — NOT a deadlock
-                                        genuinely_blocked = False
-                                        break
-                            if genuinely_blocked and dep_uuids:
-                                async with AsyncSessionLocal() as fix_session:
-                                    fix_task = await fix_session.get(Task, stask.id)
+                            for dep_id in dep_uuids:
+                                if dep_id in stuck_ids:
+                                    continue  # Stuck in this pool — potential cycle
+                                status = dep_status.get(dep_id)
+                                if status is None:
+                                    continue  # Deleted dep — genuinely unresolvable
+                                if status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                    continue  # Terminal — genuinely unresolvable
+                                if status == TaskStatus.QUEUED:
+                                    # QUEUED but outside fetch window — NOT a deadlock, just low priority
+                                    genuinely_blocked = False
+                                    break
+                                if status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+                                    # Still running — NOT a deadlock
+                                    genuinely_blocked = False
+                                    break
+                            if genuinely_blocked:
+                                deadlocked_ids.append(stask.id)
+
+                        # Fix all narrow-scan deadlocked tasks in a single session
+                        if deadlocked_ids:
+                            async with AsyncSessionLocal() as fix_session:
+                                for task_id in deadlocked_ids:
+                                    fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock: clearing depends_on "
-                                            f"for task {stask.id} (had {len(dep_uuids)} stuck/failed deps)"
+                                            f"for task {task_id} (had {len(task_dep_uuids[task_id])} stuck/failed deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected"
                                         fix_session.add(fix_task)
-                                        await fix_session.commit()
-                                eligible_ids.append(stask.id)
-                                narrow_broken += 1
+                                    eligible_ids.append(task_id)
+                                    narrow_broken += 1
+                                await fix_session.commit()
 
                     # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
@@ -428,42 +451,69 @@ async def orchestrator_worker():
                         Task.requires_approval.is_(False),
                     )
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
-                    broad_stuck = [t for t in broad_stuck if (t.depends_on or []) and t.id not in eligible_ids]
+                    candidate_task_ids = {t.id for t in candidate_tasks}
+                    broad_stuck = [t for t in broad_stuck
+                                   if (t.depends_on or [])
+                                   and t.id not in eligible_ids
+                                   and t.id not in candidate_task_ids]
                     broad_broken = 0
                     if broad_stuck:
                         broad_stuck_ids = {t.id for t in broad_stuck}
+
+                        # Batch all dependency UUIDs for broad scan into one query
+                        all_dep_ids_broad: set[uuid.UUID] = set()
+                        broad_task_dep_uuids: dict = {}
                         for stask in broad_stuck:
-                            if stask.id in {t.id for t in candidate_tasks}:
-                                continue  # Already checked above
-                            dep_uuids = set()
+                            dep_uuids_b: set[uuid.UUID] = set()
                             for d in (stask.depends_on or []):
                                 try:
-                                    dep_uuids.add(uuid.UUID(d))
+                                    dep_uuids_b.add(uuid.UUID(d))
                                 except (ValueError, AttributeError):
                                     continue
+                            broad_task_dep_uuids[stask.id] = dep_uuids_b
+                            all_dep_ids_broad.update(dep_uuids_b)
+
+                        broad_dep_status: dict = {}
+                        if all_dep_ids_broad:
+                            broad_dep_rows = await session.execute(
+                                select(Task).where(Task.id.in_(all_dep_ids_broad))
+                            )
+                            for dep_task in broad_dep_rows.scalars().all():
+                                broad_dep_status[dep_task.id] = dep_task.status
+
+                        broad_deadlocked_ids: list = []
+                        for stask in broad_stuck:
+                            dep_uuids_b = broad_task_dep_uuids[stask.id]
+                            if not dep_uuids_b:
+                                continue
                             genuinely_blocked = True
-                            async with AsyncSessionLocal() as check_session:
-                                for dep_id in dep_uuids:
-                                    if dep_id in broad_stuck_ids:
-                                        continue
-                                    dep_task = await check_session.get(Task, dep_id)
-                                    if dep_task is None or dep_task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                        continue
-                                    genuinely_blocked = False
-                                    break
-                            if genuinely_blocked and dep_uuids:
-                                async with AsyncSessionLocal() as fix_session:
-                                    fix_task = await fix_session.get(Task, stask.id)
+                            for dep_id in dep_uuids_b:
+                                if dep_id in broad_stuck_ids:
+                                    continue
+                                status = broad_dep_status.get(dep_id)
+                                if status is None or status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                                    continue
+                                genuinely_blocked = False
+                                break
+                            if genuinely_blocked:
+                                broad_deadlocked_ids.append(stask.id)
+
+                        # Fix all broad-scan deadlocked tasks in a single session
+                        if broad_deadlocked_ids:
+                            async with AsyncSessionLocal() as fix_session:
+                                for task_id in broad_deadlocked_ids:
+                                    fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
                                         logger.warning(
                                             f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
-                                            f"for task {stask.id} (stuck >{10}min with {len(dep_uuids)} unresolvable deps)"
+                                            f"for task {task_id} (stuck >{10}min with {len(broad_task_dep_uuids[task_id])} unresolvable deps)"
                                         )
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
                                         fix_session.add(fix_task)
-                                        await fix_session.commit()
-                                broad_broken += 1
+                                        broad_broken += 1
+                                await fix_session.commit()
+
                     total_broken = narrow_broken + broad_broken
                     if total_broken > 0:
                         logger.warning(
@@ -816,7 +866,43 @@ async def orchestrator_worker():
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
 
                         # Re-fetch current PR head to handle force-pushes
-                        pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                        try:
+                            pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                        except HTTPException as exc:
+                            if exc.status_code in (404, 410):
+                                _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
+                                logger.error(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = _pr_gone_msg
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                                continue
+                            raise
+
+                        if not pr_data:
+                            _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
+                            ci_loop["pr_fetch_failures"] = _fetch_failures
+                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                            session.add(ci_task)
+                            await session.commit()
+                            if _fetch_failures >= 5:
+                                _empty_msg = f"PR #{ci_pr_number} returned empty response {_fetch_failures} times consecutively"
+                                logger.error(f"[CI] {_empty_msg} for task {ci_task.id}")
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = _empty_msg
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(ci_task, session, _empty_msg)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                            continue
+
+                        if ci_loop.get("pr_fetch_failures"):
+                            ci_loop["pr_fetch_failures"] = 0
+
                         pr_state = pr_data.get("state", "open")
 
                         # Check if PR was already merged (prevents double merge)
@@ -996,7 +1082,13 @@ async def orchestrator_worker():
                     except Exception as e:
                         logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
                         try:
-                            ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
+                            status_code = getattr(e, "status_code", None)
+                            if status_code == 404:
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
+                                logger.error(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
+                            else:
+                                ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
                             session.add(ci_task)
                             await session.commit()
                         except Exception as e:
@@ -1006,6 +1098,7 @@ async def orchestrator_worker():
                             except Exception:
                                 pass
 
+            _orchestrator_consecutive_errors = 0
             logger.info('orchestrator_cycle_complete', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                 'tasks_dispatched': len(queued_tasks),
@@ -1017,7 +1110,7 @@ async def orchestrator_worker():
             break
         except Exception:
             _orchestrator_consecutive_errors += 1
-            backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
+            backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60) * random.uniform(0.8, 1.2)
             logger.error('orchestrator_cycle_error', extra={
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                 'consecutive_errors': _orchestrator_consecutive_errors,
@@ -1054,16 +1147,16 @@ async def orchestrator_worker():
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1
-            monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+            monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60) * random.uniform(0.8, 1.2)
             logger.error(f"[ORCHESTRATOR] Monitoring check error (consecutive={_orchestrator_consecutive_monitoring_errors}, backoff={monitoring_backoff:.1f}s): {e}", exc_info=True)
 
         # Sleep based on whether we found tasks
         try:
             if _orchestrator_consecutive_errors > 0:
-                backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60)
+                backoff = min(0.5 * (2 ** (_orchestrator_consecutive_errors - 1)), 60) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(backoff)
             elif _orchestrator_consecutive_monitoring_errors > 0:
-                monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60)
+                monitoring_backoff = min(0.5 * (2 ** (_orchestrator_consecutive_monitoring_errors - 1)), 60) * random.uniform(0.8, 1.2)
                 await asyncio.sleep(monitoring_backoff)
             elif queued_tasks:
                 await asyncio.sleep(0.5)
