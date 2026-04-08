@@ -128,6 +128,7 @@ async def orchestrator_worker():
         select_max_plan_account,
         recheck_disabled_accounts,
         _extract_task_model,
+        _account_available_for_model,
         _verify_pr_merged,
         _maybe_create_failure_alert,
         _spawn_pipeline_task,
@@ -666,6 +667,19 @@ async def orchestrator_worker():
                             task.payloads[0]["model"] = task_model
                             from sqlalchemy.orm.attributes import flag_modified
                             flag_modified(task, "payloads")
+                            session.add(task)
+                    # Prune stale blacklist entries — accounts whose model cooldown has expired
+                    # should be eligible again, otherwise rate-limited tasks get stuck forever
+                    if _blacklist:
+                        async with _max_plan_pool_lock:
+                            _blacklist = [
+                                aid for aid in _blacklist
+                                if aid in _account_by_id and not _account_available_for_model(_account_by_id[aid], task_model)
+                            ]
+                        if _blacklist != (task.context or {}).get("blacklisted_accounts"):
+                            task.context = {**(task.context or {}), "blacklisted_accounts": _blacklist or None}
+                            if not _blacklist:
+                                task.context.pop("blacklisted_accounts", None)
                             session.add(task)
                     account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_blacklist)
                     oauth_token = None
