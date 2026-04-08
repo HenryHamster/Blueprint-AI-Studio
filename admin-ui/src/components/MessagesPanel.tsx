@@ -113,7 +113,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
         body: JSON.stringify({ resolution: resolveInputs[msgId] || '' }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setResolveInputs(prev => { const next = { ...prev }; delete next[msgId]; return next; });
+      setResolveInputs(prev => Object.fromEntries(Object.entries(prev).filter(([k]) => k !== msgId)));
       await fetchMessages();
     } catch {
       addToast('Failed to resolve message', 'error');

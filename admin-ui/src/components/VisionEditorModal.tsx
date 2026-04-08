@@ -76,7 +76,7 @@ export function VisionEditorModal({ projectId, initialVision, onSave, onClose }:
     setSaving(true);
     setError(null);
     // Strip internal fields before spreading
-    const { _strategic_failures: _, ...cleanVision } = initialVision as Record<string, unknown> & { _strategic_failures?: unknown };
+    const cleanVision = Object.fromEntries(Object.entries(initialVision).filter(([k]) => !k.startsWith('_')));
     const visionPayload: Record<string, unknown> = {
       ...cleanVision,
       purpose: purpose.trim(),
