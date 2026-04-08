@@ -49,6 +49,7 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
+    "autonomous_research_wave_size": 3,
 }
 
 # --- Autonomous Loop State ---

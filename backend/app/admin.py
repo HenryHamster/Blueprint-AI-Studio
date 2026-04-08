@@ -1641,6 +1641,18 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             state.runtime_max_global_autonomous_tasks_per_hour = _runtime_config.get("max_global_autonomous_tasks_per_hour")
             state.runtime_autonomous_research_interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
             state.runtime_autonomous_direction_cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+            # Persist dict/list config fields to JSONB column
+            try:
+                state.runtime_config_json = {
+                    "task_type_models": _runtime_config.get("task_type_models", {}),
+                    "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
+                    "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
+                    "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
+                    "health_check_urls": _runtime_config.get("health_check_urls", []),
+                    "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
+                }
+            except AttributeError:
+                pass  # Column not yet added (rolling deploy, old schema)
             session.add(state)
             await session.commit()
             logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")

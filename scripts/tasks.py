@@ -878,16 +878,26 @@ def cmd_add_direction(args):
     """Add a new research direction.
 
     Usage: tasks.py add-direction "direction text" [--priority high|medium|low]
+           tasks.py add-direction --text "direction text" --priority high
     """
     from blueprint_api import api, get_project_id
     if not args:
         print("Usage: tasks.py add-direction 'direction text' [--priority high|medium|low]")
         return
-    text = args[0]
+    text = None
     priority = "medium"
     for i, a in enumerate(args):
         if a == "--priority" and i + 1 < len(args):
             priority = args[i + 1]
+        elif a == "--text" and i + 1 < len(args):
+            text = args[i + 1]
+    # If no --text flag, first non-flag arg is the text
+    if text is None:
+        positional = [a for a in args if not a.startswith("--") and a not in (priority,)]
+        text = positional[0] if positional else None
+    if not text:
+        print("Error: direction text required")
+        return
     pid = get_project_id()
     result = api("POST", f"/api/admin/projects/{pid}/directions", {"text": text, "priority": priority})
     d = result.get("direction", {})

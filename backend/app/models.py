@@ -281,6 +281,8 @@ class DeploymentState(SQLModel, table=True):
     circuit_breaker_states: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Persisted zone health/cooldown — prevents retry storms after restart
     zone_health_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Persisted dict/list runtime config (task_type_models, agent_prompt_suffixes, etc.)
+    runtime_config_json: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Timestamp when HALTED state was entered — used for auto-recovery timer
     halted_at: Optional[datetime] = Field(default=None)
 

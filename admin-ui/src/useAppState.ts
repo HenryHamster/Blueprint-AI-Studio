@@ -846,6 +846,15 @@ export function useAppState() {
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
+        // Seed localStorage with server-authoritative task type defaults
+        const serverModels = (data.task_type_models ?? {}) as Record<string, string>;
+        const serverEfforts = (data.task_type_efforts ?? {}) as Record<string, string>;
+        for (const [t, m] of Object.entries(serverModels)) {
+          localStorage.setItem(`blueprint-admin:taskTypeModel:${t}`, JSON.stringify(m));
+        }
+        for (const [t, e] of Object.entries(serverEfforts)) {
+          localStorage.setItem(`blueprint-admin:taskTypeEffort:${t}`, JSON.stringify(e));
+        }
       }
     } catch (err) {
       console.error('Failed to fetch settings:', err);
@@ -926,7 +935,7 @@ export function useAppState() {
   };
 
   const syncTaskTypeDefaults = async () => {
-    const types = ['create', 'plan', 'research', 'review', 'fix', 'security_audit', 'qa', 'deps', 'docs'];
+    const types = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps'];
     const models: Record<string, string> = {};
     const efforts: Record<string, string> = {};
     for (const t of types) {

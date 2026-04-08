@@ -512,6 +512,19 @@ async def _init_deployment_state():
                 _runtime_config["autonomous_direction_cooldown_minutes"] = state.runtime_autonomous_direction_cooldown_minutes
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
+        # Restore dict/list runtime config from JSONB column
+        try:
+            config_json = getattr(state, 'runtime_config_json', None)
+            if config_json and isinstance(config_json, dict):
+                for key in ("task_type_models", "task_type_efforts", "agent_prompt_suffixes",
+                             "autonomous_periodic_tasks", "health_check_urls"):
+                    if key in config_json:
+                        _runtime_config[key] = config_json[key]
+                if "autonomous_research_wave_size" in config_json:
+                    _runtime_config["autonomous_research_wave_size"] = int(config_json["autonomous_research_wave_size"])
+                logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)
         # Restore circuit breaker state — prevents deploy from clearing tripped breakers
         try:
             if state.circuit_breaker_states:
@@ -1243,7 +1256,8 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         return
     # Guard: don't spawn if user has no available accounts (avoids immediate failure)
     user_pool = _max_plan_pools.get(project.user_id, [])
-    has_available = any(_account_available_for_model(a, None) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    research_model = _runtime_config.get("task_type_models", {}).get("research")
+    has_available = any(_account_available_for_model(a, research_model) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
     if not has_available:
         logger.info(f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts")
         return
@@ -6141,27 +6155,22 @@ async def update_agent_status(
                     model = _extract_task_model(task)
                     if acct_id:
                         await release_max_plan_account(acct_id)
+                        # Mark slot as released so the fallback release (line ~6232) doesn't double-release
+                        task.context = {**(task.context or {}), "_slot_released": True}
                         if failure_class == "RATE_LIMIT":
+                            # Default to sonnet when model is unknown (agent's default model)
+                            rl_model = model or "claude-sonnet-4-6"
                             # Disable only the specific model on this account
                             async with _max_plan_pool_lock:
                                 acct = _account_by_id.get(acct_id)
-                                if acct and model:
+                                if acct:
                                     dm = acct.setdefault("disabled_models", {})
-                                    info = dm.setdefault(model, {"hits": 0})
+                                    info = dm.setdefault(rl_model, {"hits": 0})
                                     info["hits"] += 1
                                     info["at"] = _utcnow()
                                     cooldown = min(30 * (2 ** (info["hits"] - 1)), 240)
                                     cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
-                                    # Disable top-level only if ALL known models are disabled
-                                    logger.warning(f"[POOL] Account {acct['name']} model {model} disabled (hit #{info['hits']}, cooldown {cooldown:.0f}min)")
-                                elif acct:
-                                    # No model info — fall back to disabling entire account
-                                    acct["enabled"] = False
-                                    acct["disabled_at"] = _utcnow()
-                                    acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
-                                    cooldown = min(30 * (2 ** (acct["rl_hit_count"] - 1)), 240)
-                                    cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
-                                    logger.warning(f"[POOL] Disabled account {acct['name']} — rate limited (hit #{acct['rl_hit_count']}, cooldown {cooldown:.0f}min)")
+                                    logger.warning(f"[POOL] Account {acct['name']} model {rl_model} disabled (hit #{info['hits']}, cooldown {cooldown:.0f}min)")
                                 # Persist rate-limit state to DB so it survives deploys
                                 if acct:
                                     try:
@@ -6208,8 +6217,10 @@ async def update_agent_status(
                         task.last_heartbeat = None
                         task.started_at = None
                         task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
-                        # Clear stale retry_after so dispatcher picks it up immediately
+                        # Clear stale state so dispatcher picks it up fresh
                         ctx.pop("retry_after", None)
+                        ctx.pop("max_plan_account_id", None)
+                        ctx.pop("_slot_released", None)
                         task.context = ctx
                         session.add(task)
                         await session.commit()

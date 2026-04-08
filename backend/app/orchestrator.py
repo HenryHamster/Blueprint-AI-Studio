@@ -551,7 +551,15 @@ async def orchestrator_worker():
                         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
                         should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
                         if should_defer:
-                            logger.info(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {', '.join(sorted(overlap))}")
+                            overlapping_files = ', '.join(sorted(overlap))[:120]
+                            blocking_task = next((t for t in active_tasks_result if t.status == TaskStatus.IN_PROGRESS
+                                                  and set((t.context or {}).get("related_files", [])) & overlap), None)
+                            blocking_title = f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
+                            defer_msg = f"Waiting: file conflict on {overlapping_files}{blocking_title}"
+                            if candidate.latest_status_message != defer_msg:
+                                candidate.latest_status_message = defer_msg
+                                session.add(candidate)
+                            logger.info(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}")
                         else:
                             non_conflicting.append(eid)
                     eligible_ids = non_conflicting
@@ -604,6 +612,12 @@ async def orchestrator_worker():
                     if not task_model:
                         task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                         task_model = _runtime_config.get("task_type_models", {}).get(task_type)
+                        # Persist resolved model into payload so rate-limit handler can read it later
+                        if task_model and task.payloads:
+                            task.payloads[0]["model"] = task_model
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(task, "payloads")
+                            session.add(task)
                     account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_blacklist)
                     oauth_token = None
                     claude_config_json = None

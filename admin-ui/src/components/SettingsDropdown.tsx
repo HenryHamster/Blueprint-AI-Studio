@@ -92,7 +92,7 @@ const REFRESH_PRESETS = [
 const PAGE_PRESETS = [25, 50, 100, 200];
 const ALL_PAGE_SIZE = 10000;
 
-const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as const;
+const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps'] as const;
 type TaskType = typeof TASK_TYPES[number];
 
 const ALL_PROMPT_SUFFIX_TYPES = [
