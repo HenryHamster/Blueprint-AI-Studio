@@ -11,7 +11,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMessage, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 
@@ -328,4 +328,134 @@ async def create_direction_research_task(
         "title": new_task.title,
         "status": new_task.status,
         "vm_instance_id": new_task.vm_instance_id,
+    }
+
+
+@router.post("/projects/{project_id}/strategic-cycle")
+async def trigger_strategic_cycle(
+    project_id: uuid.UUID,
+    phase: str = "design_doc",
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Manually trigger a strategic cycle. Phase: 'design_doc' (Phase 1 → chains to Phase 2) or 'strategic_review' (Phase 2 only)."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+
+    # Guard: no strategic task already running
+    active = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active:
+        t_type = (t.first_payload).get("type")
+        if t_type in ("design_doc_update", "strategic_review"):
+            raise HTTPException(status_code=409, detail=f"A {t_type} task is already active: {t.id}")
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    if phase == "design_doc":
+        # Fetch open messages
+        open_msgs_result = await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.status == "open",
+            ).order_by(ProjectMessage.created_at.asc()).limit(20)
+        )
+        open_msgs = [
+            {"id": str(m.id), "type": m.message_type, "content": m.content,
+             "context": m.context, "from": m.from_type,
+             "created_at": m.created_at.isoformat() if m.created_at else None}
+            for m in open_msgs_result.scalars().all()
+        ]
+        doc_model = _runtime_config.get("task_type_models", {}).get("design_doc_update") or \
+                    _runtime_config.get("task_type_models", {}).get("research") or None
+        doc_effort = _runtime_config.get("task_type_efforts", {}).get("design_doc_update") or \
+                     _runtime_config.get("task_type_efforts", {}).get("research") or None
+        payload = {
+            "type": "design_doc_update",
+            "design_doc": project.design_doc or {},
+            "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
+            "project_name": project.name,
+            "vision": project.vision or {},
+            "open_messages": open_msgs,
+            "base_branch": "main",
+            **({"model": doc_model} if doc_model else {}),
+            **({"effort": doc_effort} if doc_effort else {}),
+        }
+        title = f"Architecture review: {project.name}"
+    elif phase == "strategic_review":
+        # Build direction stats
+        from app.main import _build_outcome_evaluation
+        all_active = [d for d in (project.directions or []) if d.get("status") == "active"]
+        direction_stats = []
+        for d in all_active:
+            history = d.get("research_history", [])
+            agg = d.get("history_aggregate", {})
+            total_cycles = len(history) + (agg.get("total_cycles") or 0)
+            total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+            total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
+            direction_stats.append({
+                "id": d.get("id"), "text": d.get("text"), "priority": d.get("priority"),
+                "status": d.get("status"), "total_cycles": total_cycles,
+                "prs_merged": total_merged, "tasks_failed": total_failed,
+            })
+        open_msgs_result = await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.status == "open",
+            ).order_by(ProjectMessage.created_at.asc()).limit(20)
+        )
+        open_msgs = [
+            {"id": str(m.id), "type": m.message_type, "content": m.content,
+             "context": m.context, "from": m.from_type,
+             "created_at": m.created_at.isoformat() if m.created_at else None}
+            for m in open_msgs_result.scalars().all()
+        ]
+        review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
+                       _runtime_config.get("task_type_models", {}).get("research") or None
+        review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
+                        _runtime_config.get("task_type_efforts", {}).get("research") or None
+        payload = {
+            "type": "strategic_review",
+            "research_mode": "strategic",
+            "design_doc": project.design_doc or {},
+            "vision": project.vision or {},
+            "directions_summary": direction_stats,
+            "outcome_evaluation": _build_outcome_evaluation(project),
+            "project_name": project.name,
+            "open_messages": open_msgs,
+            "base_branch": "main",
+            **({"model": review_model} if review_model else {}),
+            **({"effort": review_effort} if review_effort else {}),
+        }
+        title = f"Strategic review: {project.name}"
+    else:
+        raise HTTPException(status_code=400, detail="Phase must be 'design_doc' or 'strategic_review'")
+
+    new_task = Task(
+        project_id=project.id,
+        title=title,
+        description=title,
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+    )
+    session.add(new_task)
+    history = TaskHistory(
+        task_id=new_task.id, action="CREATED",
+        details={"created_by": "USER", "method": "manual_strategic_cycle", "phase": phase},
+    )
+    session.add(history)
+    await session.commit()
+    await session.refresh(new_task)
+
+    return {
+        "id": str(new_task.id),
+        "project_id": str(project.id),
+        "title": new_task.title,
+        "status": new_task.status,
+        "phase": phase,
     }
