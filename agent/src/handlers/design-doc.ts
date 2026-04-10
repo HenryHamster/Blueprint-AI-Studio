@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  readClaudeMd, buildContextPrefix, buildFileTree,
+  readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
 } from '../prompt.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
@@ -26,6 +26,8 @@ export async function handleDesignDocUpdate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+
+  configureAgentPermissions('design_doc_update');
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();

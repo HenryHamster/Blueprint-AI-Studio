@@ -3,6 +3,38 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import { sendLog, WORKSPACE } from './index.js';
 
+// ── Agent Permission Enforcement ────────────────────────────────────────
+// Write .claude/settings.json in the workspace to restrict what the inner
+// Claude Code agent can do.  Each task type gets appropriate permissions.
+
+const READ_ONLY_TYPES = new Set([
+  'research', 'plan', 'review', 'security_audit', 'smoketest',
+  'debug', 'perf', 'investigate', 'design_doc_update', 'strategic_review',
+]);
+
+// Write types get no restrictions (default behavior). Listed for documentation:
+// create, fix, refactor, docs, qa, deps, migrate
+
+/**
+ * Configure Claude Code permissions for the current task type.
+ * Read-only agents get Write/Edit denied. Write agents get no restrictions.
+ * Call this AFTER cloning the repo but BEFORE running Claude Code.
+ */
+export function configureAgentPermissions(taskType: string): void {
+  const claudeDir = `${WORKSPACE}/.claude`;
+  fs.mkdirSync(claudeDir, { recursive: true });
+
+  if (READ_ONLY_TYPES.has(taskType)) {
+    fs.writeFileSync(`${claudeDir}/settings.json`, JSON.stringify({
+      permissions: {
+        deny: ['Write', 'Edit', 'NotebookEdit'],
+      },
+    }));
+  }
+  // Write types: no restrictions needed (default behavior)
+  // Unknown types: no restrictions (safe default — let them work)
+}
+
 function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }

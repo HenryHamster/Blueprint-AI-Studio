@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  readClaudeMd, buildContextPrefix, buildFileTree,
+  readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
 } from '../prompt.js';
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -28,6 +28,7 @@ export async function handlePlan(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  configureAgentPermissions('plan');
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -205,6 +206,7 @@ export async function handleResearch(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
