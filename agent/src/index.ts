@@ -743,6 +743,9 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     if (process.env.ANTHROPIC_API_KEY) {
       claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
     }
+    if (process.env.ORCHESTRATOR_URL) {
+      claudeEnv.ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL;
+    }
 
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
     if (model) args.push('--model', model);
