@@ -30,6 +30,15 @@ export function configureAgentPermissions(taskType: string): void {
         deny: ['Write', 'Edit', 'NotebookEdit'],
       },
     }));
+
+    // Block git push/commit via pre-commit and pre-push hooks
+    const hooksDir = `${WORKSPACE}/.git/hooks`;
+    try {
+      fs.mkdirSync(hooksDir, { recursive: true });
+      const blockScript = '#!/bin/sh\necho "ERROR: This is a read-only analysis task. Do NOT commit or push." >&2\nexit 1\n';
+      fs.writeFileSync(`${hooksDir}/pre-commit`, blockScript, { mode: 0o755 });
+      fs.writeFileSync(`${hooksDir}/pre-push`, blockScript, { mode: 0o755 });
+    } catch { /* hooks dir may not exist before clone completes */ }
   }
   // Write types: no restrictions needed (default behavior)
   // Unknown types: no restrictions (safe default — let them work)

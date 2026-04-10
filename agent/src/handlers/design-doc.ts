@@ -157,10 +157,13 @@ a dependency graph or data model inventory), create it.
 
 # Instructions
 
-1. Explore the codebase systematically:
-   - Read entry points, configs, module boundaries first
+1. Explore the codebase THOROUGHLY — use subagents for parallel exploration:
+   - Spawn multiple subagents to explore different directories simultaneously
+   - One for backend, one for frontend, one for agent, one for infra/CI
+   - Read entry points, configs, module boundaries, key source files
    - Understand how components connect, not individual function details
-   - Look at directory structure, CI setup, test structure
+   - Use TodoWrite to track what you've explored and what's left
+   - This should be a deep analysis, not a quick skim
 
 2. Save pages as you go. For each major system you discover:
    - \`./design-doc set "systems/<id>" '{"id": "...", "name": "...", "status": "mature|functional|partial|stub|missing", "description": "...", "modules": [...]}'
