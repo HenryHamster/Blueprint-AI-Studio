@@ -75,7 +75,9 @@ export async function handleDesignDocUpdate(
 
   // Write the design-doc helper script that the inner agent can call via bash
   const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-  const agentToken = process.env.AGENT_TOKEN || '';
+  // Read the current token from apiHeaders (not env — token may have been refreshed)
+  const { getAgentToken } = await import('../index.js');
+  const agentToken = getAgentToken();
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API
 # Usage:
@@ -88,7 +90,7 @@ KEY="\$2"
 VALUE="\$3"
 
 if [ "$OP" = "list" ]; then
-  curl -sf -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
     -H "X-Agent-Token: ${agentToken}" \\
     -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
@@ -96,7 +98,7 @@ elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  curl -sf -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
     -H "X-Agent-Token: ${agentToken}" \\
     -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"$KEY\\", \\"value\\": $VALUE}"
@@ -104,7 +106,7 @@ elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  curl -sf -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
     -H "X-Agent-Token: ${agentToken}" \\
     -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"$KEY\\"}"

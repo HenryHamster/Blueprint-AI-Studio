@@ -21,6 +21,9 @@ let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 export const WORKSPACE = '/tmp/workspace';
 
+/** Get the current agent token (may have been refreshed since startup). */
+export function getAgentToken(): string { return AGENT_TOKEN; }
+
 const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
   'X-Agent-Token': AGENT_TOKEN,
