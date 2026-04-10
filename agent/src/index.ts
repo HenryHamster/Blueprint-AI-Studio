@@ -746,6 +746,10 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     if (process.env.ORCHESTRATOR_URL) {
       claudeEnv.ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL;
     }
+    // Pass agent token via env (not disk) so helpers like ./design-doc can auth
+    if (AGENT_TOKEN) {
+      claudeEnv.AGENT_API_TOKEN = AGENT_TOKEN;
+    }
 
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
     if (model) args.push('--model', model);

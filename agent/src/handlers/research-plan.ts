@@ -542,6 +542,35 @@ ${hotspotsSection}
       ? JSON.stringify(designDoc, null, 2)
       : '';
 
+    // Write the strategic helper script (same pattern as design-doc)
+    const strategicHelper = `#!/bin/bash
+# Strategic review tool — updates vision, directions, and messages via API
+# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env
+OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message <args>}"
+shift
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+
+case "\$OP" in
+  set-vision)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"set_vision\\", \\"data\\": \$1}" ;;
+  create-direction)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"create_direction\\", \\"data\\": \$1}" ;;
+  update-direction)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"update_direction\\", \\"data\\": \$1}" ;;
+  retire-direction)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"retire_direction\\", \\"data\\": \$1}" ;;
+  create-message)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"create_message\\", \\"data\\": \$1}" ;;
+  resolve-message)
+    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"resolve_message\\", \\"data\\": \$1}" ;;
+  *) echo "Unknown op: \$OP" >&2; exit 1 ;;
+esac
+echo ""
+`;
+    fs.writeFileSync(`${WORKSPACE}/strategic`, strategicHelper, { mode: 0o755 });
+
     const strategicPrompt = `${contextPrefix}You are a strategic product architect. You decide WHERE this project goes.
 
 The design document tells you what IS. The vision tells you what SHOULD BE.
@@ -596,41 +625,32 @@ ${openMessagesText ? `# Open Messages\nMessages from users or previous cycles. A
 Messages are async — never wait for answers. Make your best judgment and note assumptions.
 Judge by impact, not activity. Think big — what fundamental changes would move this project forward?
 
-# Output
+# How to apply your decisions
 
-Write to /tmp/strategic_output_${taskId}.json:
+Use the \`./strategic\` command to save decisions as you make them. Each call updates the database immediately.
 
-\`\`\`json
-{
-  "vision": {
-    "purpose": "What this product is and who it's for",
-    "success_criteria": ["Outcome-level goals"],
-    "systems": [
-      {
-        "id": "sys-short-id",
-        "name": "System Name",
-        "description": "What and why",
-        "status": "planned | in_progress | functional | mature",
-        "depends_on": ["sys-other-id"]
-      }
-    ],
-    "priorities": ["sys-id-1", "sys-id-2"],
-    "context": "Free-form notes — confidence gaps, strategic reasoning, open questions"
-  },
-  "direction_operations": [
-    { "op": "create", "text": "Direction description", "priority": "high|medium|low", "system_id": "sys-id from vision", "rationale": "Why" },
-    { "op": "update", "direction_id": "d-xxx", "changes": { "text": "...", "priority": "...", "system_id": "sys-id" }, "rationale": "Why" },
-    { "op": "retire", "direction_id": "d-xxx", "rationale": "Why" }
-  ],
-  "messages": [
-    { "type": "question|blocker|note", "content": "Your question or note", "context": {} }
-  ],
-  "resolved_messages": [{"id": "uuid-of-message", "resolution": "How you addressed it"}]
-}
+\`\`\`bash
+# Set or update the vision
+./strategic set-vision '{"purpose": "What this product is", "success_criteria": ["Goal 1"], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "notes"}'
+
+# Create a new direction (max 5 per cycle)
+./strategic create-direction '{"text": "Direction description", "priority": "high", "system_id": "sys-x", "rationale": "Why this matters"}'
+
+# Update an existing direction
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "system_id": "sys-y"}, "rationale": "Why"}'
+
+# Retire a completed/irrelevant direction
+./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "Why retiring"}'
+
+# Ask the user a question
+./strategic create-message '{"type": "question", "content": "Your question"}'
+
+# Resolve a message you addressed
+./strategic resolve-message '{"message_id": "uuid", "resolution": "How you addressed it"}'
 \`\`\`
 
-The vision schema is flexible — add fields if they help capture your understanding.
-Direction operations only — no implementation findings. If something is urgent, create or reprioritize a direction for it.
+Apply decisions AS YOU REASON. Don't wait until the end.
+Do NOT create files, write JSON to /tmp/, or open PRs. Only use ./strategic.
 Max 10 direction operations per cycle (max 5 creates). Focus on the most impactful changes.`;
 
     statusRef.value = 'Running strategic vision review...';

@@ -23,7 +23,12 @@ const READ_ONLY_TYPES = new Set([
  */
 export function configureAgentPermissions(taskType: string): string[] {
   if (READ_ONLY_TYPES.has(taskType)) {
-    // Block git push/commit via pre-commit and pre-push hooks
+    // Strip GitHub token from git remote so the agent can't push
+    try {
+      execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/readonly/readonly.git'], { cwd: WORKSPACE });
+    } catch { /* git dir may not exist yet */ }
+
+    // Block git commit via pre-commit hook (backup enforcement)
     const hooksDir = `${WORKSPACE}/.git/hooks`;
     try {
       fs.mkdirSync(hooksDir, { recursive: true });
@@ -36,7 +41,6 @@ export function configureAgentPermissions(taskType: string): string[] {
   }
   // Write types: no restrictions
   return [];
-  // Unknown types: no restrictions (safe default — let them work)
 }
 
 function strVal(v: unknown, fallback = ''): string {

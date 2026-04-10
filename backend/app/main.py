@@ -4522,14 +4522,41 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
 
 
 async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSession):
-    """Parse strategic vision output and update project vision + directions."""
+    """Handle strategic review completion.
+
+    Vision and direction updates were already applied incrementally via POST /api/agent/strategic
+    during agent execution. This handler just records final status and checks for issues.
+    Falls back to log parsing for backward compatibility if the agent used the old approach.
+    """
+    project = await session.get(Project, task.project_id)
+    if not project:
+        logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
+        return
+
+    vision_rev = (project.vision or {}).get("revision", 0)
+    active_dirs = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+
+    # Check if the agent used the new API (vision was updated during execution)
+    # by comparing vision revision to what it was when the task was spawned
+    task_payload = task.first_payload
+    spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
+    api_was_used = vision_rev > spawned_vision_rev
+
+    if api_was_used:
+        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
+        session.add(task)
+        await session.commit()
+        logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
+        return
+
+    # Fallback: try log-based parsing for backward compatibility
     try:
         parsed = json.loads(logs[:500_000]) if logs else None
     except (json.JSONDecodeError, ValueError):
         parsed = None
 
     if not parsed or not isinstance(parsed, dict):
-        # Increment failure counter so force_strategic doesn't loop indefinitely
+        # No API calls and no parseable output — record failure
         project = await session.get(Project, task.project_id)
         if project:
             current_vision = project.vision or {}
@@ -6912,6 +6939,187 @@ async def update_design_doc(
     await session.commit()
 
     return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
+
+
+class StrategicOp(BaseModel):
+    """Incremental strategic review operation from an agent."""
+    task_id: uuid.UUID
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message"
+    data: dict = {}
+
+
+@app.post("/api/agent/strategic")
+@limiter.limit("60/minute")
+async def strategic_operation(
+    request: Request,
+    payload: StrategicOp,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent endpoint for incremental strategic review operations."""
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Lock project for atomic update
+    result = await session.execute(
+        select(Project).where(Project.id == task.project_id).with_for_update()
+    )
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    data = payload.data
+
+    if payload.op == "set_vision":
+        if not isinstance(data, dict) or not data.get("purpose"):
+            raise HTTPException(status_code=400, detail="Vision must have a 'purpose' field")
+        current = dict(project.vision or {})
+        old_rev = current.get("revision", 0)
+        # Merge: keep _strategic_failures if present, add metadata
+        new_vision = dict(data)
+        new_vision["revision"] = (old_rev or 0) + 1
+        new_vision["last_updated"] = _utcnow().isoformat()
+        new_vision.pop("_strategic_failures", None)  # Reset on success
+        project.vision = new_vision
+        flag_modified(project, "vision")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})")
+        return {"status": "ok", "op": "set_vision", "revision": new_vision["revision"]}
+
+    elif payload.op == "create_direction":
+        text = str(data.get("text", "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Direction text is required")
+        text = text[:500]
+        raw_priority = data.get("priority", "medium")
+        priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
+        rationale = str(data.get("rationale", ""))[:500]
+        directions = list(project.directions or [])
+        # Dedup: skip if same text exists
+        if any(d.get("text", "").strip().lower() == text.lower() for d in directions if d.get("status") in ("active", "proposed")):
+            return {"status": "skipped", "reason": "duplicate"}
+        new_dir: dict = {
+            "id": f"d-{uuid.uuid4().hex[:8]}",
+            "text": text,
+            "status": "active",
+            "priority": priority,
+            "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
+            "research_history": [],
+        }
+        if data.get("system_id"):
+            new_dir["system_id"] = str(data["system_id"])[:40]
+        if data.get("paths"):
+            new_dir["paths"] = data["paths"]
+        directions.append(new_dir)
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}")
+        return {"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]}
+
+    elif payload.op == "update_direction":
+        dir_id = data.get("direction_id")
+        changes = data.get("changes", {})
+        if not dir_id or not changes:
+            raise HTTPException(status_code=400, detail="direction_id and changes required")
+        rationale = str(data.get("rationale", ""))[:500]
+        directions = list(project.directions or [])
+        updated = False
+        for d in directions:
+            if d.get("id") == dir_id:
+                if "text" in changes:
+                    d["text"] = str(changes["text"])[:500]
+                if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
+                    d["priority"] = changes["priority"]
+                if "system_id" in changes:
+                    d["system_id"] = str(changes["system_id"])[:40] if changes["system_id"] else None
+                if "status" in changes and changes["status"] in ("active", "paused", "expired"):
+                    if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
+                        return {"status": "blocked", "reason": "Cannot reactivate user-paused direction"}
+                    d["status"] = changes["status"]
+                if rationale:
+                    notes = d.get("notes", [])
+                    notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
+                    d["notes"] = notes[-20:]
+                updated = True
+                break
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
+        return {"status": "ok", "op": "update_direction", "direction_id": dir_id}
+
+    elif payload.op == "retire_direction":
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = str(data.get("rationale", ""))[:500]
+        directions = list(project.directions or [])
+        retired = False
+        for d in directions:
+            if d.get("id") == dir_id:
+                d["status"] = "expired"
+                notes = d.get("notes", [])
+                notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
+                d["notes"] = notes[-20:]
+                retired = True
+                break
+        if not retired:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
+        return {"status": "ok", "op": "retire_direction", "direction_id": dir_id}
+
+    elif payload.op == "create_message":
+        content = str(data.get("content", "")).strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="Message content required")
+        try:
+            msg_type = MessageType(str(data.get("type", "NOTE")).upper())
+        except ValueError:
+            msg_type = MessageType.NOTE
+        new_msg = ProjectMessage(
+            project_id=project.id,
+            message_type=msg_type,
+            from_type="strategic",
+            from_task_id=task.id,
+            content=content[:5000],
+            context=data.get("context") or {},
+        )
+        session.add(new_msg)
+        await session.commit()
+        return {"status": "ok", "op": "create_message", "message_id": str(new_msg.id)}
+
+    elif payload.op == "resolve_message":
+        msg_id = data.get("message_id")
+        if not msg_id:
+            raise HTTPException(status_code=400, detail="message_id required")
+        try:
+            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid message_id")
+        if not msg or msg.project_id != project.id:
+            raise HTTPException(status_code=404, detail="Message not found")
+        if msg.status == "resolved":
+            return {"status": "already_resolved"}
+        msg.status = "resolved"
+        msg.resolution = str(data.get("resolution", "Addressed by strategic review"))[:5000]
+        msg.resolved_at = _utcnow()
+        session.add(msg)
+        await session.commit()
+        return {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 
 
 @app.post("/api/agent/status")

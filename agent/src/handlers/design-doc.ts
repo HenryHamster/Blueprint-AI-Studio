@@ -73,13 +73,12 @@ export async function handleDesignDocUpdate(
       }).join('\n')
     : '';
 
-  // Write the design-doc helper script that the inner agent can call via bash
-  const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
-  // Read the current token from apiHeaders (not env — token may have been refreshed)
-  const { getAgentToken } = await import('../index.js');
-  const agentToken = getAgentToken();
+  // Write the design-doc helper script that the inner agent can call via bash.
+  // The script reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (passed by runClaudeCode)
+  // so the token is never written to disk.
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API
+# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
 # Usage:
 #   ./design-doc set <key> '<json-value>'
 #   ./design-doc delete <key>
@@ -88,30 +87,32 @@ export async function handleDesignDocUpdate(
 OP="\${1:?Usage: design-doc set|delete|list <key> [json-value]}"
 KEY="\$2"
 VALUE="\$3"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 
-if [ "$OP" = "list" ]; then
-  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+if [ "\$OP" = "list" ]; then
+  curl -f -X POST "\$API/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: ${agentToken}" \\
+    -H "X-Agent-Token: \$TOKEN" \\
     -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
-elif [ "$OP" = "set" ]; then
-  if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
+elif [ "\$OP" = "set" ]; then
+  if [ -z "\$KEY" ] || [ -z "\$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+  curl -f -X POST "\$API/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: ${agentToken}" \\
-    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"$KEY\\", \\"value\\": $VALUE}"
-elif [ "$OP" = "delete" ]; then
-  if [ -z "$KEY" ]; then
+    -H "X-Agent-Token: \$TOKEN" \\
+    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"\$KEY\\", \\"value\\": \$VALUE}"
+elif [ "\$OP" = "delete" ]; then
+  if [ -z "\$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  curl -f -X POST "${orchestratorUrl}/api/agent/design-doc" \\
+  curl -f -X POST "\$API/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: ${agentToken}" \\
-    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"$KEY\\"}"
+    -H "X-Agent-Token: \$TOKEN" \\
+    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"\$KEY\\"}"
 else
-  echo "Unknown op: $OP. Use set, delete, or list." >&2; exit 1
+  echo "Unknown op: \$OP. Use set, delete, or list." >&2; exit 1
 fi
 echo ""
 `;
