@@ -27,7 +27,7 @@ export async function handleDesignDocUpdate(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
 
-  configureAgentPermissions('design_doc_update');
+  const disallowedTools = configureAgentPermissions('design_doc_update');
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
@@ -187,7 +187,7 @@ Do NOT create any files in the repo. Do NOT commit or push. Only use ./design-do
 ${openMessagesText ? `\n# Open Messages\n${openMessagesText}\n` : ''}`;
 
   statusRef.value = 'Running architecture review...';
-  const { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort);
+  const { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);
 
   // Completion — design doc was updated incrementally via API.
   // Just report status; the backend handler chains to strategic review.

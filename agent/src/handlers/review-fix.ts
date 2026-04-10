@@ -38,7 +38,7 @@ export async function handleReview(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('review');
+  const disallowedTools = configureAgentPermissions('review');
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -136,7 +136,7 @@ If changes are needed before merging:
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running code review...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
 
@@ -193,7 +193,7 @@ export async function handleFix(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('fix');
+  const disallowedToolsFix = configureAgentPermissions('fix');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
@@ -287,7 +287,7 @@ export async function handleFix(
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
-  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort, disallowedToolsFix);
 
   // Check for uncommitted changes (from Claude's fixes)
   const diff = git(['status', '--porcelain']);

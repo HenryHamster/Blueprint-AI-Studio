@@ -720,7 +720,7 @@ interface ClaudeOutput {
   result?: string;
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string): Promise<{
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[]): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
   let allOutput = '';
@@ -747,6 +747,11 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
     if (model) args.push('--model', model);
     if (effort) args.push('--effort', effort);
+    if (disallowedTools && disallowedTools.length > 0) {
+      for (const tool of disallowedTools) {
+        args.push('--disallowedTools', tool);
+      }
+    }
     const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true });
 
     // Kill Claude if it exceeds 45 minutes — kill entire process group (negative PID)

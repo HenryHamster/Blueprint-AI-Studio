@@ -23,7 +23,7 @@ export async function handleSecurityAudit(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('security_audit');
+  const disallowedTools = configureAgentPermissions('security_audit');
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -77,7 +77,7 @@ Rules:
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const secTypeHint = TASK_TYPE_HINTS['security_audit'] ? '\n\n' + TASK_TYPE_HINTS['security_audit'] : '';
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -120,7 +120,7 @@ export async function handleMigrate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('migrate');
+  const disallowedTools = configureAgentPermissions('migrate');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', 'Blueprint Agent']);
@@ -185,7 +185,7 @@ CRITICAL RULES:
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePrompt + migratePromptSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePrompt + migratePromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -260,7 +260,7 @@ export async function handleSmoketest(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('smoketest');
+  const disallowedTools = configureAgentPermissions('smoketest');
 
   const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
@@ -304,7 +304,7 @@ Set top-level "passed" to true only if ALL suites passed and there are no guardr
 IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
 
   statusRef.value = 'Running smoke tests...';
-  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
   const smoketestResult = readHandlerOutput<{ passed: boolean; tests: Array<{ name: string; status: string; message: string }> }>(taskId, 'smoketest_result', ws);
@@ -373,7 +373,7 @@ export async function handleDebug(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', rawBaseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('debug');
+  const disallowedTools = configureAgentPermissions('debug');
 
   // Gather git context upfront to include in the prompt
   const gitLog = git(['log', '--oneline', '-20']);
@@ -437,7 +437,7 @@ Set confidence to:
 IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
-  const { allOutput } = await runClaudeCode(debugPrompt, ws, statusRef, model, effort);
+  const { allOutput } = await runClaudeCode(debugPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput<{ root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string }>(taskId, 'debug_report', ws);
 
@@ -473,7 +473,7 @@ export async function handlePerf(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('perf');
+  const disallowedTools = configureAgentPermissions('perf');
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
@@ -518,7 +518,7 @@ Rules:
   const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const perfTypeHint = TASK_TYPE_HINTS['perf'] ? '\n\n' + TASK_TYPE_HINTS['perf'] : '';
   statusRef.value = 'Running performance analysis...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -554,7 +554,7 @@ export async function handleInvestigate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('investigate');
+  const disallowedTools = configureAgentPermissions('investigate');
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 
@@ -584,7 +584,7 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
-  const { exitCode } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort);
+  const { exitCode } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort, disallowedTools);
 
   const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {

@@ -70,13 +70,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const finalPrompt = claudeMdPrefix + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
-  configureAgentPermissions(taskTypeKey);
+  const disallowedTools = configureAgentPermissions(taskTypeKey);
 
   const fileTree = buildFileTree(ws);
   const finalPromptWithTree = fileTree + finalPrompt;
 
   statusRef.value = 'Running Claude Code...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPromptWithTree, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPromptWithTree, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;

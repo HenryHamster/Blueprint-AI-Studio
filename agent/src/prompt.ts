@@ -17,20 +17,12 @@ const READ_ONLY_TYPES = new Set([
 
 /**
  * Configure Claude Code permissions for the current task type.
- * Read-only agents get Write/Edit denied. Write agents get no restrictions.
+ * Returns a list of disallowed tools to pass to runClaudeCode's --disallowedTools flag.
+ * Also installs git hooks to block commit/push for read-only agents.
  * Call this AFTER cloning the repo but BEFORE running Claude Code.
  */
-export function configureAgentPermissions(taskType: string): void {
-  const claudeDir = `${WORKSPACE}/.claude`;
-  fs.mkdirSync(claudeDir, { recursive: true });
-
+export function configureAgentPermissions(taskType: string): string[] {
   if (READ_ONLY_TYPES.has(taskType)) {
-    fs.writeFileSync(`${claudeDir}/settings.json`, JSON.stringify({
-      permissions: {
-        deny: ['Write', 'Edit', 'NotebookEdit'],
-      },
-    }));
-
     // Block git push/commit via pre-commit and pre-push hooks
     const hooksDir = `${WORKSPACE}/.git/hooks`;
     try {
@@ -39,8 +31,11 @@ export function configureAgentPermissions(taskType: string): void {
       fs.writeFileSync(`${hooksDir}/pre-commit`, blockScript, { mode: 0o755 });
       fs.writeFileSync(`${hooksDir}/pre-push`, blockScript, { mode: 0o755 });
     } catch { /* hooks dir may not exist before clone completes */ }
+
+    return ['Write', 'Edit', 'NotebookEdit'];
   }
-  // Write types: no restrictions needed (default behavior)
+  // Write types: no restrictions
+  return [];
   // Unknown types: no restrictions (safe default — let them work)
 }
 

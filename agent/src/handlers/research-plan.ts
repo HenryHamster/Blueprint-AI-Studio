@@ -28,7 +28,7 @@ export async function handlePlan(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions('plan');
+  const disallowedTools = configureAgentPermissions('plan');
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -101,7 +101,7 @@ Rules:
 - IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
 
   statusRef.value = 'Running Claude Code for planning...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing
   let logs = '';
@@ -206,7 +206,7 @@ export async function handleResearch(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
+  const disallowedTools = configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
@@ -634,7 +634,7 @@ Direction operations only — no implementation findings. If something is urgent
 Max 10 direction operations per cycle (max 5 creates). Focus on the most impactful changes.`;
 
     statusRef.value = 'Running strategic vision review...';
-    const { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort);
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort, disallowedTools);
 
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
     let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
@@ -807,7 +807,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);
