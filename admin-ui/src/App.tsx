@@ -4,6 +4,7 @@ import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, Layout
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { DirectionsPanel } from './components/DirectionsPanel';
+import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
@@ -784,6 +785,8 @@ export default function App() {
               onDismiss={s.handleDismiss}
               onArchive={s.handleArchiveTask}
               onViewLogs={s.handleViewLogs}
+              onTrack={s.trackTask}
+              trackedTaskIds={s.trackedTaskIds}
             />
             </ErrorBoundary>
           ) : s.viewMode === 'timeline' ? (
@@ -902,6 +905,16 @@ export default function App() {
           }}
         />
         </ErrorBoundary>
+      )}
+
+      {s.trackedTaskIds.size > 0 && (
+        <TaskStreamPanel
+          trackedTaskIds={s.trackedTaskIds}
+          trackedLogs={s.trackedLogs}
+          tasks={s.tasks}
+          onUntrack={s.untrackTask}
+          onUntrackAll={s.untrackAll}
+        />
       )}
 
       {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} addToast={s.addToast} />}

@@ -85,12 +85,14 @@ interface KanbanBoardProps {
   onDismiss: (id: string) => void;
   onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
+  onTrack?: (task: Task) => void;
+  trackedTaskIds?: Set<string>;
   groupBy?: 'status' | 'type' | 'project';
   projects?: Project[];
   hasActiveFilters?: boolean;
 }
 
-function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, colIdx, cardIdx, cardRef, onNavigate }: {
+function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
@@ -106,6 +108,8 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
   onDismiss: (id: string) => void;
   onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
+  onTrack?: (task: Task) => void;
+  isTracked?: boolean;
   colIdx?: number;
   cardIdx?: number;
   cardRef?: (el: HTMLDivElement | null) => void;
@@ -143,6 +147,8 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
           onDismiss={onDismiss}
           onArchive={onArchive}
           onViewLogs={onViewLogs}
+          onTrack={onTrack}
+          isTracked={isTracked}
         />
       </div>
     </div>
@@ -165,6 +171,8 @@ interface SortableCardProps {
   onDismiss: (id: string) => void;
   onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
+  onTrack?: (task: Task) => void;
+  isTracked?: boolean;
   isOverlay?: boolean;
   colIdx: number;
   cardIdx: number;
@@ -188,6 +196,8 @@ function SortableCard({
   onDismiss,
   onArchive,
   onViewLogs,
+  onTrack,
+  isTracked,
   isOverlay = false,
   colIdx,
   cardIdx,
@@ -252,6 +262,8 @@ function SortableCard({
           onDismiss={onDismiss}
           onArchive={onArchive}
           onViewLogs={onViewLogs}
+          onTrack={onTrack}
+          isTracked={isTracked}
         />
       </div>
     </div>
@@ -325,6 +337,8 @@ export function KanbanBoard({
   onDismiss,
   onArchive,
   onViewLogs,
+  onTrack,
+  trackedTaskIds,
   groupBy = 'status',
   projects = [],
 }: KanbanBoardProps) {
@@ -490,7 +504,7 @@ export function KanbanBoard({
     return map;
   }, [projects]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack };
 
   return (
     <DndContext
@@ -561,6 +575,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
                               cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
@@ -610,6 +625,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
                               cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
@@ -649,6 +665,8 @@ export function KanbanBoard({
                       onDismiss={onDismiss}
                       onArchive={onArchive}
                       onViewLogs={onViewLogs}
+                      onTrack={onTrack}
+                      isTracked={trackedTaskIds?.has(task.id)}
                     />
                   ))}
                 </SortableContext>
@@ -739,6 +757,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
                               cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
@@ -788,6 +807,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
                               cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
@@ -827,6 +847,8 @@ export function KanbanBoard({
                       onDismiss={onDismiss}
                       onArchive={onArchive}
                       onViewLogs={onViewLogs}
+                      onTrack={onTrack}
+                      isTracked={trackedTaskIds?.has(task.id)}
                     />
                   ))}
                 </SortableContext>
@@ -947,6 +969,8 @@ export function KanbanBoard({
             onDismiss={onDismiss}
             onArchive={onArchive}
             onViewLogs={onViewLogs}
+            onTrack={onTrack}
+            isTracked={trackedTaskIds?.has(activeTask.id)}
             isOverlay
           />
         )}

@@ -44,3 +44,12 @@ export interface Task {
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
 }
+
+export type TrackLogType = 'log' | 'status' | 'artifact' | 'error' | 'system';
+
+export interface TrackLogEntry {
+  id: number;
+  t: string;
+  type: TrackLogType;
+  msg: string;
+}

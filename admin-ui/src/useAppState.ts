@@ -65,6 +65,7 @@ export function useAppState() {
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
   // ── Remaining state ─────────────────────────────────────────────────────
@@ -1419,6 +1420,8 @@ export function useAppState() {
     showShortcutHelp, setShowShortcutHelp, shortcutHelpRef,
     // Status bar
     apiHealthy, wsConnected, lastFetchTime,
+    // Task tracking
+    trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
     // Deploy state
     deployState, handlePausePipeline, handleResumePipeline, handleResetHealth,
     handleRollback, handleMarkStable, handleRepairState,

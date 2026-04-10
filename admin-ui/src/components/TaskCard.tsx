@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal } from 'lucide-react';
+import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio } from 'lucide-react';
 
 export type { ResearchFinding } from '../types/task';
 import type { ResearchFinding } from '../types/task';
@@ -82,6 +82,8 @@ interface TaskCardProps {
   onDismiss: (id: string) => void;
   onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
+  onTrack?: (task: Task) => void;
+  isTracked?: boolean;
 }
 
 function formatDuration(ms: number): string {
@@ -199,7 +201,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, maxRetries, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, maxRetries, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -545,6 +547,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               <Activity className="w-3 h-3" />
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
             </div>
+          ) : null}
+
+          {task.status !== 'QUEUED' && onTrack ? (
+            <button
+              onClick={(e) => { e.stopPropagation(); onTrack(task); }}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors text-[10px] ${isTracked ? 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800'}`}
+              title={isTracked ? 'Tracking live' : 'Track task'}
+            >
+              <Radio className="w-3 h-3" />
+              {isTracked ? 'Live' : 'Track'}
+            </button>
           ) : null}
 
           {task.status !== 'QUEUED' ? (
