@@ -402,6 +402,7 @@ export default function App() {
         maxPlanAccounts={s.maxPlanAccounts}
         onToggleAccount={s.toggleMaxPlanAccount}
         onRemoveAccount={s.removeMaxPlanAccount}
+        onResetRateLimits={s.resetAccountRateLimits}
         newAccountName={s.newAccountName}
         setNewAccountName={s.setNewAccountName}
         newAccountToken={s.newAccountToken}

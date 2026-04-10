@@ -1070,18 +1070,31 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
             );
           })()}
 
-          {/* ── Design Document (Architecture) ───────────────────── */}
+          {/* ── Design Document (Architecture) — page-based wiki ───────── */}
           {(() => {
-            const docSummary = typeof designDoc.summary === 'string' ? designDoc.summary : '';
-            const docSystems = Array.isArray(designDoc.systems) ? designDoc.systems as Array<Record<string, unknown>> : [];
-            const docCapabilities = (typeof designDoc.capabilities === 'object' && designDoc.capabilities && !Array.isArray(designDoc.capabilities))
-              ? designDoc.capabilities as Record<string, Record<string, string>>
-              : {};
-            const docRisks = Array.isArray(designDoc.risks) ? designDoc.risks as string[] : [];
+            // Extract pages from the flat key-value design doc (skip _meta)
+            const pages = Object.entries(designDoc).filter(([k]) => !k.startsWith('_'));
+            const meta = (designDoc._meta || {}) as Record<string, unknown>;
+            const docSummary = typeof designDoc.summary === 'string' ? designDoc.summary as string : '';
             const docArch = (typeof designDoc.architecture === 'object' && designDoc.architecture && !Array.isArray(designDoc.architecture))
-              ? designDoc.architecture as Record<string, unknown>
-              : {};
-            const hasContent = docSummary || docSystems.length > 0 || Object.keys(docCapabilities).length > 0;
+              ? designDoc.architecture as Record<string, unknown> : null;
+
+            // Group pages by prefix
+            const systemPages = pages.filter(([k]) => k.startsWith('systems/'))
+              .map(([k, v]) => {
+                const obj = typeof v === 'object' && v ? v as Record<string, unknown> : {};
+                return { key: k, id: String(obj.id || k), name: String(obj.name || k.replace('systems/', '')), status: String(obj.status || 'missing'), description: typeof obj.description === 'string' ? obj.description : '' };
+              });
+            const capPages = pages.filter(([k]) => k.startsWith('capabilities/'))
+              .map(([k, v]) => {
+                const obj = typeof v === 'object' && v ? v as Record<string, unknown> : {};
+                return { key: k, name: k.replace('capabilities/', ''), status: String(obj.status || 'missing'), notes: typeof obj.notes === 'string' ? obj.notes : '' };
+              });
+            const risksPage = designDoc.risks;
+            const docRisks = Array.isArray(risksPage) ? risksPage as string[] : [];
+            const otherPages = pages.filter(([k]) => !k.startsWith('systems/') && !k.startsWith('capabilities/') && k !== 'summary' && k !== 'architecture' && k !== 'risks');
+
+            const hasContent = pages.length > 0;
 
             const capStatusColors: Record<string, string> = {
               mature: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
@@ -1090,11 +1103,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
               missing: 'bg-red-500/20 text-red-400 border-red-500/30',
             };
             const sysStatusColors: Record<string, string> = {
-              mature: 'text-cyan-400',
-              functional: 'text-emerald-400',
-              partial: 'text-amber-400',
-              stub: 'text-orange-400',
-              missing: 'text-red-400',
+              mature: 'text-cyan-400', functional: 'text-emerald-400',
+              partial: 'text-amber-400', stub: 'text-orange-400', missing: 'text-red-400',
             };
 
             if (!hasContent && !designDocExpanded) return null;
@@ -1113,26 +1123,26 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                   <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
                     Architecture
                   </span>
-                  {typeof designDoc.last_updated === 'string' && (
+                  {typeof meta.last_updated === 'string' && (
                     <span className="text-[9px] text-neutral-600 font-mono ml-1">
-                      {formatRelativeTime(designDoc.last_updated as string)}
+                      {formatRelativeTime(meta.last_updated as string)}
                     </span>
                   )}
-                  {docSystems.length > 0 && !designDocExpanded && (
-                    <span className="text-[9px] text-neutral-600 ml-1">{docSystems.length} systems</span>
+                  {!designDocExpanded && (
+                    <span className="text-[9px] text-neutral-600 ml-1">{pages.length} pages</span>
                   )}
                 </button>
               </div>
 
-              {/* Collapsed: capability status bar */}
-              {!designDocExpanded && Object.keys(docCapabilities).length > 0 && (
+              {/* Collapsed: capability badges */}
+              {!designDocExpanded && capPages.length > 0 && (
                 <div className="px-1.5">
                   <div className="flex flex-wrap gap-1">
-                    {Object.entries(docCapabilities).slice(0, 8).map(([name, cap]) => {
-                      const status = typeof cap === 'object' ? (cap.status || 'missing') : 'missing';
+                    {capPages.slice(0, 8).map(cap => {
+                      const status = String(cap.status || 'missing');
                       return (
-                        <span key={name} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`}>
-                          {name}
+                        <span key={cap.key} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`}>
+                          {cap.name}
                         </span>
                       );
                     })}
@@ -1143,28 +1153,26 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
               {/* Expanded */}
               {designDocExpanded && hasContent && (
                 <div className="bg-neutral-900/60 border border-neutral-800 rounded-lg p-3 space-y-3 text-xs">
-                  {docSummary && (
-                    <p className="text-neutral-300">{docSummary}</p>
-                  )}
+                  {docSummary && <p className="text-neutral-300">{docSummary}</p>}
 
-                  {typeof docArch.type === 'string' && (
+                  {docArch && typeof docArch.type === 'string' && (
                     <div>
                       <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Architecture</span>
-                      <p className="text-neutral-400 mt-0.5">{String(docArch.type)}{docArch.description ? ` — ${String(docArch.description).slice(0, 200)}` : ''}</p>
+                      <p className="text-neutral-400 mt-0.5">{String(docArch.type)}{typeof docArch.description === 'string' ? ` — ${docArch.description.slice(0, 200)}` : ''}</p>
                     </div>
                   )}
 
-                  {docSystems.length > 0 && (
+                  {systemPages.length > 0 && (
                     <div>
                       <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Systems</span>
                       <div className="mt-1 space-y-1">
-                        {docSystems.map((sys, i) => (
-                          <div key={i} className="flex items-start gap-2">
+                        {systemPages.map(sys => (
+                          <div key={sys.key} className="flex items-start gap-2">
                             <span className={`text-[9px] font-mono ${sysStatusColors[String(sys.status || 'missing')] || 'text-neutral-500'}`}>
                               {String(sys.status || '?').toUpperCase()}
                             </span>
                             <div className="flex-1 min-w-0">
-                              <span className="text-neutral-200 font-medium">{String(sys.name || sys.id || '?')}</span>
+                              <span className="text-neutral-200 font-medium">{String(sys.name || sys.id || sys.key)}</span>
                               {typeof sys.description === 'string' && <span className="text-neutral-500 ml-1.5">{sys.description.slice(0, 120)}</span>}
                             </div>
                           </div>
@@ -1173,19 +1181,15 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     </div>
                   )}
 
-                  {Object.keys(docCapabilities).length > 0 && (
+                  {capPages.length > 0 && (
                     <div>
                       <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Capabilities</span>
                       <div className="mt-1 flex flex-wrap gap-1.5">
-                        {Object.entries(docCapabilities).map(([name, cap]) => {
-                          const status = typeof cap === 'object' ? (cap.status || 'missing') : 'missing';
-                          const notes = typeof cap === 'object' ? (cap.notes || '') : '';
-                          return (
-                            <span key={name} className={`text-[9px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`} title={notes}>
-                              {name}: {status}
+                        {capPages.map(cap => (
+                            <span key={cap.key} className={`text-[9px] px-1.5 py-0.5 rounded border ${capStatusColors[cap.status] || capStatusColors.missing}`} title={cap.notes}>
+                              {cap.name}: {cap.status}
                             </span>
-                          );
-                        })}
+                          ))}
                       </div>
                     </div>
                   )}
@@ -1204,10 +1208,22 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     </div>
                   )}
 
+                  {otherPages.length > 0 && (
+                    <div>
+                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Other Pages</span>
+                      <div className="mt-1 space-y-1">
+                        {otherPages.map(([key, val]) => (
+                          <div key={key} className="text-neutral-400">
+                            <span className="text-neutral-300 font-medium">{key}</span>
+                            <span className="text-neutral-600 ml-1.5">{JSON.stringify(val).slice(0, 100)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="text-[9px] text-neutral-600 pt-1 border-t border-neutral-800/50">
-                    rev {String(designDoc.revision || 0)}
-                    {typeof designDoc.updated_by_task === 'string' && ' (agent)'}
-                    {designDoc.updated_by === 'user' && ' (user)'}
+                    rev {String(meta.revision || 0)} — {pages.length} pages
                   </div>
                 </div>
               )}

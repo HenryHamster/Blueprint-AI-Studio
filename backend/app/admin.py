@@ -1791,10 +1791,10 @@ async def remove_max_plan_account(
     if db_account.user_id != current_user["user_id"]:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # Check for active tasks using this account
+    # Check for active tasks using this account (PROVISIONING and IN_PROGRESS both hold slots)
     active_using = (await session.execute(
         select(Task.id).where(
-            Task.status == TaskStatus.IN_PROGRESS,
+            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]),
             Task.context["max_plan_account_id"].as_string() == account_id
         )
     )).scalars().all()
@@ -1804,6 +1804,16 @@ async def remove_max_plan_account(
             detail=f"Account has {len(active_using)} active task(s). "
                    f"Pass ?force=true to remove anyway (tasks will fail on next token refresh)."
         )
+    if active_using and force:
+        logger.warning(f"[POOL] Force-deleting account {account_id} with {len(active_using)} active tasks — slots will reconcile next cycle")
+
+    # Clean up Secret Manager secret if stored there
+    if db_account.oauth_token and db_account.oauth_token.startswith("projects/"):
+        try:
+            from app.secrets_manager import delete_user_secret
+            await delete_user_secret(db_account.oauth_token)
+        except Exception as e:
+            logger.warning(f"[POOL] Failed to delete Secret Manager secret for account {account_id}: {e}")
 
     await session.delete(db_account)
     await session.commit()
@@ -1870,11 +1880,12 @@ async def update_max_plan_account(
         db_account.claude_config_json = payload["claude_config_json"]
     db_account.updated_at = _utcnow()
     session.add(db_account)
-    await session.commit()
 
-    # Sync to in-memory pool
+    # Commit and sync to in-memory pool atomically under lock to prevent
+    # dispatch seeing stale state between DB commit and pool update
     from app.main import _max_plan_pool_lock
     async with _max_plan_pool_lock:
+        await session.commit()
         mem_account = _account_by_id.get(account_id)
         if mem_account:
             if "enabled" in payload:
@@ -1888,6 +1899,49 @@ async def update_max_plan_account(
                 mem_account["claude_config_json"] = db_account.claude_config_json
 
     return {"id": account_id, "name": db_account.name, "enabled": db_account.enabled}
+
+
+@router.post("/max-plan-accounts/{account_id}/reset-rate-limits")
+async def reset_account_rate_limits(
+    account_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Clear all rate-limit state (disabled_models) for a Max plan account."""
+    from app.main import _account_by_id, _max_plan_pool_lock, _pending_rl_persists
+
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if db_account.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # Clear in-memory rate-limit state under lock
+    async with _max_plan_pool_lock:
+        mem_account = _account_by_id.get(account_id)
+        if mem_account:
+            mem_account.pop("disabled_models", None)
+            mem_account["enabled"] = True
+            mem_account.pop("disabled_at", None)
+            mem_account.pop("rl_hit_count", None)
+
+    # Clear DB rate-limit state
+    db_account.rate_limit_state = None
+    db_account.enabled = True
+    db_account.updated_at = _utcnow()
+    session.add(db_account)
+    await session.commit()
+
+    # Clear from pending persist retry queue
+    if account_id in _pending_rl_persists:
+        _pending_rl_persists.remove(account_id)
+
+    logger.info(f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}")
+    return {"message": f"Rate-limit state cleared for account {db_account.name}"}
 
 
 # --- GitHub Repository & Branch Discovery ---

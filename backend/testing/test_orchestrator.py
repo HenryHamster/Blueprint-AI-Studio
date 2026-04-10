@@ -701,6 +701,7 @@ class TestResearchSpawning:
             user_id="user1",
             autonomous_enabled=True,
             directions=[{"id": "d1", "status": "active", "text": "performance review"}],
+            vision={"purpose": "test"},
         )
         db_session.add(project)
         await db_session.commit()

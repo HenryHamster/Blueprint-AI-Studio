@@ -327,6 +327,7 @@ async def test_spawn_skipped_at_per_project_rate_limit(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-ratelm01")],
+        vision={"purpose": "test"},
     )
     db_session.add(project)
     await db_session.commit()
@@ -369,6 +370,7 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-globrl01")],
+        vision={"purpose": "test"},
     )
     db_session.add(project)
     await db_session.commit()

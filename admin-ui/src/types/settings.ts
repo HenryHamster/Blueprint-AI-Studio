@@ -29,6 +29,8 @@ export interface MaxPlanAccount {
   active_tasks: number;
   total_tasks: number;
   token_created_at: string | null;
+  rl_hit_count?: number;
+  disabled_models?: Record<string, { hits: number; at: string | null }>;
 }
 
 export interface OrchestratorHealth {

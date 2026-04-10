@@ -50,6 +50,7 @@ _TEST_USER = "test-user-123"
 def _add_to_pool(entry: dict):
     """Helper: add an account entry to the test user's pool and flat lookup."""
     entry.setdefault("user_id", _TEST_USER)
+    entry.setdefault("oauth_token", "sk-ant-test-token")  # Accounts need a token to be selectable
     _max_plan_pools.setdefault(_TEST_USER, []).append(entry)
     _account_by_id[entry["id"]] = entry
 
@@ -520,6 +521,22 @@ class TestMaxPlanAccountPool:
         """Returns None when all pool accounts are disabled."""
         _add_to_pool({"id": "a1", "name": "acct1", "enabled": False, "active_tasks": 0})
         _add_to_pool({"id": "a2", "name": "acct2", "enabled": False, "active_tasks": 0})
+        assert await select_max_plan_account(_TEST_USER) is None
+
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_skips_null_token(self, clean_max_plan_pool):
+        """Accounts with no oauth_token (e.g. Secret Manager failure) are skipped."""
+        _add_to_pool({"id": "a1", "name": "no_token", "enabled": True, "active_tasks": 0, "oauth_token": None})
+        _add_to_pool({"id": "a2", "name": "has_token", "enabled": True, "active_tasks": 0})
+        result = await select_max_plan_account(_TEST_USER)
+        assert result is not None
+        assert result["id"] == "a2"
+
+    @pytest.mark.asyncio
+    async def test_select_max_plan_account_all_null_tokens_returns_none(self, clean_max_plan_pool):
+        """Returns None when all accounts have null tokens."""
+        _add_to_pool({"id": "a1", "name": "no_token1", "enabled": True, "active_tasks": 0, "oauth_token": None})
+        _add_to_pool({"id": "a2", "name": "no_token2", "enabled": True, "active_tasks": 0, "oauth_token": None})
         assert await select_max_plan_account(_TEST_USER) is None
 
     @pytest.mark.asyncio

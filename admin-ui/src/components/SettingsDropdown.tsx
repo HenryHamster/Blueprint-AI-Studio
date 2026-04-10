@@ -45,6 +45,7 @@ interface SettingsDropdownProps {
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string) => void;
+  onResetRateLimits: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountToken: string;
@@ -140,6 +141,7 @@ export function SettingsDropdown({
   maxPlanAccounts,
   onToggleAccount,
   onRemoveAccount,
+  onResetRateLimits,
   newAccountName,
   setNewAccountName,
   newAccountToken,
@@ -752,12 +754,12 @@ export function SettingsDropdown({
             <h4 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Max Plan Accounts</h4>
             {maxPlanAccounts.length > 0 && (() => {
               const total = maxPlanAccounts.length;
-              const available = maxPlanAccounts.filter(a => a.enabled).length;
+              const available = maxPlanAccounts.filter(a => a.enabled && !Object.keys(a.disabled_models || {}).length).length;
               const warn = available < total;
               return (
                 <div className={`flex items-center justify-between text-[11px] mb-2 px-2 py-1 rounded border ${warn ? 'bg-amber-950/30 border-amber-900/50 text-amber-400' : 'bg-neutral-950 border-neutral-800 text-neutral-400'}`}>
                   <span>Pool: <span className={warn ? 'text-amber-300 font-medium' : 'text-neutral-200 font-medium'}>{available}/{total}</span> available</span>
-                  {warn && <span className="text-amber-500 text-[10px]">⚠ degraded</span>}
+                  {warn && <span className="text-amber-500 text-[10px]">degraded</span>}
                 </div>
               );
             })()}
@@ -776,20 +778,45 @@ export function SettingsDropdown({
                 else if (days < 30) tokenAge = `${days}d old`;
                 else tokenAge = `${Math.floor(days / 30)}mo old`;
               }
+              const disabledModels = Object.entries(a.disabled_models || {});
+              const isRateLimited = disabledModels.length > 0;
               return (
-                <div key={a.id} className="flex items-center gap-2 mb-2 bg-neutral-950 rounded p-2 border border-neutral-800">
-                  <button onClick={() => onToggleAccount(a.id, !a.enabled)}
-                    className={`w-2 h-2 rounded-full shrink-0 ${a.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
-                    title={a.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'} />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs text-neutral-200 truncate">{a.name}</div>
-                    <div className="text-[10px] text-neutral-500 font-mono">
-                      {a.active_tasks} active
-                      {tokenAge && <span className={`ml-1.5 ${isExpiring ? 'text-amber-400' : ''}`}>· token {tokenAge}</span>}
+                <div key={a.id} className={`mb-2 bg-neutral-950 rounded p-2 border ${isRateLimited ? 'border-amber-900/60' : 'border-neutral-800'}`}>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => onToggleAccount(a.id, !a.enabled)}
+                      className={`w-2 h-2 rounded-full shrink-0 ${isRateLimited ? 'bg-amber-500' : a.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
+                      title={isRateLimited ? 'Rate-limited' : a.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-neutral-200 truncate">{a.name}</div>
+                      <div className="text-[10px] text-neutral-500 font-mono">
+                        {a.active_tasks} active
+                        {tokenAge && <span className={`ml-1.5 ${isExpiring ? 'text-amber-400' : ''}`}>· token {tokenAge}</span>}
+                      </div>
                     </div>
+                    <button onClick={() => onRemoveAccount(a.id)}
+                      className="text-neutral-600 hover:text-red-400 text-xs transition-colors shrink-0">&times;</button>
                   </div>
-                  <button onClick={() => onRemoveAccount(a.id)}
-                    className="text-neutral-600 hover:text-red-400 text-xs transition-colors shrink-0">&times;</button>
+                  {isRateLimited && (
+                    <div className="mt-1.5 pt-1.5 border-t border-neutral-800/50">
+                      {disabledModels.map(([model, info]) => {
+                        const cooldownMin = Math.min(30 * Math.pow(2, (info.hits - 1)), 240);
+                        const disabledAt = info.at ? new Date(info.at) : null;
+                        const recoveryAt = disabledAt ? new Date(disabledAt.getTime() + cooldownMin * 60000) : null;
+                        const remaining = recoveryAt ? Math.max(0, Math.round((recoveryAt.getTime() - Date.now()) / 60000)) : null;
+                        const shortModel = model.replace('claude-', '').replace('-4-6', '');
+                        return (
+                          <div key={model} className="flex items-center justify-between text-[10px] text-amber-400/80">
+                            <span className="font-mono">{shortModel} <span className="text-amber-500/60">hit #{info.hits}</span></span>
+                            <span className="text-amber-500/60">{remaining !== null && remaining > 0 ? `${remaining}m left` : 'recovering'}</span>
+                          </div>
+                        );
+                      })}
+                      <button onClick={() => onResetRateLimits(a.id)}
+                        className="mt-1 w-full text-[10px] text-amber-400/70 hover:text-amber-300 bg-amber-950/30 hover:bg-amber-950/50 rounded px-1.5 py-0.5 transition-colors">
+                        Clear rate limits
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}

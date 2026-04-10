@@ -71,6 +71,7 @@ export interface HeaderBarProps {
   maxPlanAccounts: MaxPlanAccount[];
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string) => void;
+  onResetRateLimits: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountToken: string;
@@ -168,6 +169,7 @@ export function HeaderBar(props: HeaderBarProps) {
     maxPlanAccounts,
     onToggleAccount,
     onRemoveAccount,
+    onResetRateLimits,
     newAccountName,
     setNewAccountName,
     newAccountToken,
@@ -363,6 +365,7 @@ export function HeaderBar(props: HeaderBarProps) {
           maxPlanAccounts={maxPlanAccounts}
           onToggleAccount={onToggleAccount}
           onRemoveAccount={onRemoveAccount}
+          onResetRateLimits={onResetRateLimits}
           newAccountName={newAccountName}
           setNewAccountName={setNewAccountName}
           newAccountToken={newAccountToken}

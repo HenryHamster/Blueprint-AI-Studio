@@ -917,6 +917,20 @@ export function useAppState() {
     } catch (err) { console.error('Failed to toggle account:', err); addToast('Failed to update account', 'error'); }
   };
 
+  const resetAccountRateLimits = async (id: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}/reset-rate-limits`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (res.ok) {
+        addToast('Rate limits cleared', 'success');
+        fetchSettings();
+      } else {
+        addToast('Failed to reset rate limits', 'error');
+      }
+    } catch (err) { console.error('Failed to reset rate limits:', err); addToast('Failed to reset rate limits', 'error'); }
+  };
+
   const connectGitHub = async () => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/github/oauth/authorize`);
@@ -1382,7 +1396,7 @@ export function useAppState() {
     healthCheckUrls, updateHealthCheckUrls,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
-    addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount,
+    addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     // Orchestrator
     handleRestartOrchestrator,
     // GitHub

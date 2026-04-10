@@ -103,6 +103,11 @@ _account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
 _pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
 
+# Rate-limit keyword patterns — shared between classify_failure() and reaper
+RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "429", "credit", "billing",
+                       "usage limit", "usage exhausted", "too many requests",
+                       "resource_exhausted", "daily limit", "tokens per minute"]
+
 # Backward compat: flat view for code that needs all accounts
 def _all_accounts() -> List[Dict[str, Any]]:
     return list(_account_by_id.values())
@@ -172,11 +177,16 @@ async def load_max_plan_pool():
 
 def _account_available_for_model(acct: dict, model: Optional[str]) -> bool:
     """Check if an account is available for the given model."""
+    if not acct.get("oauth_token"):
+        return False  # Token missing (Secret Manager failure at startup)
     if not acct.get("enabled", True):
         return False  # Entirely disabled (legacy path)
-    if not model:
-        return True   # No model specified, any enabled account works
     dm = acct.get("disabled_models", {})
+    if not model:
+        # No model specified — account is available only if it has no disabled models.
+        # Most tasks don't carry an explicit model, so we must respect per-model disables
+        # even when model is None, otherwise rate-limited accounts get re-selected.
+        return len(dm) == 0
     return model not in dm
 
 
@@ -314,14 +324,17 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
 
     # Transient API overload — server-side, not account-specific (must be checked before RATE_LIMIT
     # because "overloaded" would otherwise trigger the rate limit classifier and disable accounts)
-    if "overloaded" in combined and "usage" not in combined:
+    if "overloaded" in combined and not any(kw in combined for kw in ["usage limit", "usage exhausted", "billing", "credit"]):
+        return "EXTERNAL_API"
+
+    # GitHub rate limits (429, "rate limit") — external API issue, NOT Claude account exhaustion.
+    # Must be checked before generic RATE_LIMIT to prevent disabling Claude accounts for GitHub outages.
+    if any(gh_kw in combined for gh_kw in ["github", "api.github.com"]) and \
+       any(kw in combined for kw in ["rate limit", "429", "too many requests"]):
         return "EXTERNAL_API"
 
     # Rate limit — Claude API usage exhausted, account-level billing/quota issues
-    if any(kw in combined for kw in ["rate limit", "rate_limit", "429", "credit", "billing",
-                                      "usage limit", "usage exhausted",
-                                      "too many requests", "resource_exhausted", "daily limit",
-                                      "tokens per minute"]):
+    if any(kw in combined for kw in RATE_LIMIT_KEYWORDS):
         return "RATE_LIMIT"
 
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
@@ -897,18 +910,19 @@ async def _check_external_health():
         # the pipeline can continue with remaining enabled accounts.
         all_accounts = list(_account_by_id.values())
         if all_accounts:
-            enabled_accounts = [a for a in all_accounts if a.get("enabled", True)]
-            if not enabled_accounts:
+            # Use _account_available_for_model to check: has token, enabled, not all models disabled
+            available_accounts = [a for a in all_accounts if _account_available_for_model(a, None)]
+            if not available_accounts:
                 ext["claude_api"] = False
                 failed.append("claude_api")
                 disabled_names = [a["name"] for a in all_accounts]
-                logger.warning(f"[HEALTH] All Claude API accounts rate-limited: {', '.join(disabled_names)}")
+                logger.warning(f"[HEALTH] All Claude API accounts unavailable: {', '.join(disabled_names)}")
             else:
                 ext["claude_api"] = True
                 # Log partial degradation for visibility (not a pipeline pause)
-                disabled_accounts = [a for a in all_accounts if not a.get("enabled", True)]
-                if disabled_accounts:
-                    logger.info(f"[HEALTH] Claude API degraded — {len(disabled_accounts)}/{len(all_accounts)} accounts rate-limited, {len(enabled_accounts)} still available")
+                unavailable_accounts = [a for a in all_accounts if not _account_available_for_model(a, None)]
+                if unavailable_accounts:
+                    logger.info(f"[HEALTH] Claude API degraded — {len(unavailable_accounts)}/{len(all_accounts)} accounts unavailable, {len(available_accounts)} still available")
         else:
             # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
             # since there's no per-account cooldown mechanism for a single key.
@@ -1746,6 +1760,22 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 
+    # Strategic cycle check — runs BEFORE the research blocking guard so it's
+    # never blocked by an active tactical research task.  The design_doc_update
+    # and strategic_review use their own task types and run in parallel.
+    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    total_research_count = sum(
+        len(d.get("research_history", [])) for d in all_active_directions
+    )
+    strategic_frequency = _runtime_config.get("strategic_research_frequency", 6)
+    is_strategic = (
+        (strategic_frequency > 0 and total_research_count > 0 and total_research_count % strategic_frequency == 0)
+        or force_strategic
+    )
+    if is_strategic:
+        await _spawn_design_doc_update(project, session)
+        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{total_research_count}, vision rev {(project.vision or {}).get('revision', 0)})")
+
     # Guard: no research task actively running (queued/provisioning/in_progress).
     # EVALUATING parents are just waiting on children — they don't block new research.
     active_tasks = (await session.execute(
@@ -1783,6 +1813,11 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
+    # If no active directions exist (e.g., all paused), only strategic runs (already spawned above).
+    # Don't attempt tactical research — chosen_direction would be None.
+    if not active_directions:
+        return
+
     # Autonomous research creates independent tasks (no parent_task_id), so they
     # must always branch from main.  Staging branches (research/*, plan/*) are
     # ephemeral — they get deleted when their parent's rollup merges.  An
@@ -1795,34 +1830,15 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
     research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
-    # Include all active directions so the agent can see cross-direction context,
-    # but mark which one is the current research target.
     # Every Nth cycle is "undirected" — the agent explores the whole codebase
     # without a specific direction lens, finding cross-cutting improvements.
-    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
     undirected_frequency = _runtime_config.get("undirected_research_frequency", 4)
-    total_research_count = sum(
-        len(d.get("research_history", [])) for d in all_active_directions
-    )
     is_undirected = undirected_frequency > 0 and total_research_count > 0 and total_research_count % undirected_frequency == 0
-
-    # Strategic vision cycle: runs every Nth research cycle, or forced when vision is empty
-    strategic_frequency = _runtime_config.get("strategic_research_frequency", 6)
-    is_strategic = (
-        (strategic_frequency > 0 and total_research_count > 0 and total_research_count % strategic_frequency == 0)
-        or force_strategic  # Includes empty vision, missing purpose, etc.
-    )
-    # Strategic cycle: spawn design doc update (Phase 1) as a side-channel.
-    # This does NOT block tactical research — it uses a separate task type.
-    # Phase 1 chains to Phase 2 (strategic_review) on completion.
+    # Don't run undirected on strategic cycles
     if is_strategic:
         is_undirected = False
-        await _spawn_design_doc_update(project, session)
-        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{total_research_count}, vision rev {(project.vision or {}).get('revision', 0)})")
-        # Fall through to spawn tactical research normally
-        is_strategic = False
 
-    # Build tactical research payload (always, even on strategic cycles)
+    # Build tactical research payload
     if True:
         research_payload: dict = {
             "type": "research",
@@ -2276,6 +2292,37 @@ async def _maybe_create_circuit_breaker_alert(
         {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
     )
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
+
+
+async def _create_strategic_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    message: str,
+) -> None:
+    """Create a WARNING alert for strategic cycle failures. Deduplicates by title."""
+    title = "Strategic cycle issue"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first():
+        return  # Don't spam duplicate alerts
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message[:1000],
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id), "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
+    )
 
 
 async def broadcast_deploy_state():
@@ -4432,119 +4479,46 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
 
 
 async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSession):
-    """Handle Phase 1 completion: update project.design_doc, then chain to Phase 2."""
-    import json as _json
+    """Handle Phase 1 completion: chain to Phase 2 (strategic review).
 
-    # Parse design doc output from logs
-    new_doc = None
-    proposal_resolutions = []
-    try:
-        parsed = _json.loads(logs)
-        if isinstance(parsed, dict):
-            new_doc = parsed.get("design_doc")
-            proposal_resolutions = parsed.get("proposal_resolutions", [])
-    except (ValueError, TypeError):
-        # Try extracting JSON from mixed output
-        match = re.search(r'\{[\s\S]*"design_doc"[\s\S]*\}', logs)
-        if match:
-            try:
-                parsed = _json.loads(match.group(0))
-                new_doc = parsed.get("design_doc")
-                proposal_resolutions = parsed.get("proposal_resolutions", [])
-            except (ValueError, TypeError):
-                pass
-
-    # Lock project for update
+    The design doc itself was already updated incrementally via POST /api/agent/design-doc
+    during agent execution. This handler records status and spawns the next phase.
+    Chain and status are committed together so a failed Phase 2 spawn doesn't leave
+    the task marked COMPLETED with no follow-up.
+    """
     result = await session.execute(
         select(Project).where(Project.id == task.project_id).with_for_update()
     )
     project = result.scalars().first()
     if not project:
         logger.error(f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found")
+        await _create_strategic_alert(task.project_id, session,
+            f"Design doc update failed: project not found (task {str(task.id)[:8]})")
         return
 
-    if new_doc and isinstance(new_doc, dict):
-        old_revision = (project.design_doc or {}).get("revision", 0)
-        new_doc["revision"] = (old_revision or 0) + 1
-        new_doc["last_updated"] = _utcnow().isoformat()
-        new_doc["updated_by_task"] = str(task.id)
+    doc = project.design_doc or {}
+    rev = doc.get("_meta", {}).get("revision", 0)
+    page_count = sum(1 for k in doc if not k.startswith("_"))
+    logger.info(f"[DESIGN DOC] Task {task.id} completed: {page_count} pages, rev {rev}")
 
-        # Process proposal resolutions: remove accepted/rejected, keep still-pending
-        resolved_ids = set()
-        for res in proposal_resolutions:
-            if isinstance(res, dict) and res.get("id"):
-                resolved_ids.add(res["id"])
-        existing_proposals = (project.design_doc or {}).get("proposed_changes", [])
-        still_pending = [p for p in existing_proposals if p.get("id") not in resolved_ids and p.get("status") == "pending"]
-        new_doc["proposed_changes"] = still_pending
-
-        project.design_doc = new_doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-        await session.commit()
-        logger.info(f"[DESIGN DOC] Updated design doc for project {project.id} (rev {new_doc['revision']}, {len(resolved_ids)} proposals resolved)")
-
-        # Store raw output for debugging
-        task.plan_output = logs[:50000]
-        task.latest_status_message = f"Design doc updated to rev {new_doc['revision']}"
-        session.add(task)
-        await session.commit()
-    else:
-        task.latest_status_message = "Design doc review: no updates produced"
-        session.add(task)
-        await session.commit()
-        logger.warning(f"[DESIGN DOC] Task {task.id}: no design_doc in output")
-
-    # Process messages from design doc agent (architecture questions)
-    if parsed and isinstance(parsed, dict):
-        msgs_created = 0
-        for msg_entry in (parsed.get("messages") or [])[:3]:
-            if not isinstance(msg_entry, dict):
-                continue
-            content = (msg_entry.get("content") or "").strip()
-            if not content:
-                continue
-            try:
-                msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
-            except ValueError:
-                msg_type = MessageType.NOTE
-            new_msg = ProjectMessage(
-                project_id=project.id,
-                message_type=msg_type,
-                from_type="design_doc",
-                from_task_id=task.id,
-                content=content[:5000],
-                context=msg_entry.get("context") or {},
-            )
-            session.add(new_msg)
-            msgs_created += 1
-
-        # Resolve messages the agent addressed
-        msgs_resolved = 0
-        resolved_entries = parsed.get("resolved_messages") or []
-        if not resolved_entries:
-            resolved_entries = [{"id": mid} for mid in (parsed.get("resolved_message_ids") or [])]
-        for entry in resolved_entries[:10]:
-            try:
-                msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
-                resolution_text = entry.get("resolution", "Addressed by architecture review") if isinstance(entry, dict) else "Addressed by architecture review"
-                msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
-                if msg and msg.project_id == project.id and msg.status == "open":
-                    msg.status = "resolved"
-                    msg.resolution = str(resolution_text)[:5000] if resolution_text else "Addressed by architecture review"
-                    msg.resolved_at = _utcnow()
-                    session.add(msg)
-                    msgs_resolved += 1
-            except (ValueError, TypeError):
-                pass
-        if msgs_created or msgs_resolved:
-            await session.commit()
-            logger.info(f"[DESIGN DOC] Messages: {msgs_created} created, {msgs_resolved} resolved")
+    if page_count == 0:
+        await _create_strategic_alert(task.project_id, session,
+            f"Design doc update produced 0 pages (task {str(task.id)[:8]})")
 
     # Chain: spawn Phase 2 (strategic review)
-    # Refresh project to get the just-committed design_doc
-    await session.refresh(project)
-    await _spawn_strategic_review(project, session)
+    # Do this BEFORE committing task status so a failed spawn doesn't leave
+    # the task as COMPLETED with no Phase 2 follow-up.
+    try:
+        await session.refresh(project)
+        await _spawn_strategic_review(project, session)
+        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
+    except Exception as chain_exc:
+        logger.error(f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}", exc_info=True)
+        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[:500]
+        await _create_strategic_alert(task.project_id, session,
+            f"Strategic review failed to spawn after design doc update (task {str(task.id)[:8]}): {chain_exc!r}")
+    session.add(task)
+    await session.commit()
 
 
 async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSession):
@@ -4569,6 +4543,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         await session.commit()
         failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
         logger.warning(f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})")
+        if project:
+            await _create_strategic_alert(task.project_id, session,
+                f"Strategic review could not parse agent output (failure #{failure_num}, task {str(task.id)[:8]})")
         return
 
     new_vision = parsed.get("vision")
@@ -4628,6 +4605,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         project.vision = current_vision
         flag_modified(project, "vision")
         logger.warning(f"[STRATEGIC] Task {task.id}: no vision produced (failure #{failures})")
+        if failures >= 2:
+            await _create_strategic_alert(task.project_id, session,
+                f"Strategic review produced no vision ({failures} consecutive failures, task {str(task.id)[:8]})")
 
     # Process direction operations (capped to prevent flooding)
     MAX_DIRECTION_OPS = 10
@@ -6858,6 +6838,80 @@ async def _process_post_commit(
             "status": "received",
             "message": f"Status update for task {payload.task_id} recorded."
         }
+
+
+class DesignDocUpdate(BaseModel):
+    """Incremental design doc page update from an agent."""
+    task_id: uuid.UUID
+    op: str  # "set", "delete", "list"
+    key: Optional[str] = None
+    value: Optional[Any] = None
+
+
+@app.post("/api/agent/design-doc")
+@limiter.limit("60/minute")
+async def update_design_doc(
+    request: Request,
+    payload: DesignDocUpdate,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent endpoint for incremental design doc updates. Each call updates one page."""
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if payload.op == "list":
+        project = await session.get(Project, task.project_id)
+        doc = project.design_doc or {} if project else {}
+        return {"keys": [k for k in doc.keys() if not k.startswith("_")]}
+
+    if not payload.key or not isinstance(payload.key, str):
+        raise HTTPException(status_code=400, detail="key is required for set/delete")
+    key = payload.key.strip()
+    if not key or len(key) > 100 or key.startswith("_"):
+        raise HTTPException(status_code=400, detail="Invalid key (max 100 chars, no _ prefix)")
+
+    # Lock project for atomic update
+    result = await session.execute(
+        select(Project).where(Project.id == task.project_id).with_for_update()
+    )
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    doc = dict(project.design_doc or {})
+    meta = doc.get("_meta", {"revision": 0})
+
+    if payload.op == "set":
+        if payload.value is None:
+            raise HTTPException(status_code=400, detail="value is required for set")
+        # Size check: individual value max 50KB, total doc max 500KB
+        import json as _json
+        val_size = len(_json.dumps(payload.value))
+        if val_size > 50_000:
+            raise HTTPException(status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)")
+        doc[key] = payload.value
+        total_size = len(_json.dumps(doc))
+        if total_size > 500_000:
+            del doc[key]  # rollback
+            raise HTTPException(status_code=400, detail=f"Total design doc too large ({total_size} bytes, max 500KB)")
+    elif payload.op == "delete":
+        doc.pop(key, None)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
+
+    meta["revision"] = meta.get("revision", 0) + 1
+    meta["last_updated"] = _utcnow().isoformat()
+    meta["updated_by_task"] = str(task.id)
+    doc["_meta"] = meta
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
 
 
 @app.post("/api/agent/status")

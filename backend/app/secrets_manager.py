@@ -45,6 +45,27 @@ async def store_user_secret(user_id: str, secret_name: str, secret_value: str) -
         logger.error(f"Failed to store secret {full_secret_id}: {e}")
         raise e
 
+async def delete_user_secret(secret_resource_name: str) -> None:
+    """
+    Deletes a secret from Google Secret Manager (best-effort).
+    Accepts either a version path (projects/.../versions/N) or a secret path (projects/.../secrets/X).
+    """
+    # Strip /versions/N suffix if present — delete_secret needs the parent secret path
+    secret_path = secret_resource_name.split("/versions/")[0]
+    logger.info(f"Deleting secret {secret_path} from Secret Manager...")
+
+    def _delete():
+        client = secretmanager.SecretManagerServiceClient()
+        client.delete_secret(request={"name": secret_path})
+
+    try:
+        await asyncio.to_thread(_delete)
+        logger.info(f"Deleted secret: {secret_path}")
+    except Exception as e:
+        logger.warning(f"Failed to delete secret {secret_path}: {e}")
+        raise e
+
+
 async def get_user_secret(secret_resource_name: str) -> str:
     """
     Retrieves a sensitive token (like a GitHub PAT) from Google Secret Manager.

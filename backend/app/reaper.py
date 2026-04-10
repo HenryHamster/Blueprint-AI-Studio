@@ -206,10 +206,11 @@ async def reaper_service():
 
                     # Rate-limited tasks: requeue without burning retry budget
                     # Check both status message and error_logs for rate-limit indicators
+                    from app.main import RATE_LIMIT_KEYWORDS  # noqa: PLC0415 — deferred to avoid circular import
                     msg_lower = (task.latest_status_message or "").lower()
                     error_lower = ((task.context or {}).get("last_error") or "").lower()
                     is_rate_limited = any(kw in msg_lower + " " + error_lower
-                                         for kw in ["rate limit", "usage exhausted", "rate_limit"])
+                                         for kw in RATE_LIMIT_KEYWORDS)
                     if is_rate_limited:
                         logger.info(f"[REAPER] Task {task.id} rate-limited — requeuing without burning retry")
                         task.status = TaskStatus.QUEUED
