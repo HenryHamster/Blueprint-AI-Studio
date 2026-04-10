@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
-  apiPost, cloneWithRetry, runClaudeCode,
+  apiPost, apiGet, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -571,95 +571,115 @@ echo ""
 `;
     fs.writeFileSync(`${WORKSPACE}/strategic`, strategicHelper, { mode: 0o755 });
 
-    const strategicPrompt = `${contextPrefix}You are a strategic product architect. You decide WHERE this project goes.
+    // Also write design-doc helper so strategic agent can add notes
+    const designDocHelper = `#!/bin/bash
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+OP="\${1:?Usage: design-doc set|delete|list <key> [json-value]}"
+KEY="\$2"
+VALUE="\$3"
+if [ "\$OP" = "list" ]; then
+  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
+elif [ "\$OP" = "set" ]; then
+  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"\$KEY\\", \\"value\\": \$VALUE}"
+elif [ "\$OP" = "delete" ]; then
+  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"\$KEY\\"}"
+fi
+echo ""
+`;
+    fs.writeFileSync(`${WORKSPACE}/design-doc`, designDocHelper, { mode: 0o755 });
 
-The design document tells you what IS. The vision tells you what SHOULD BE.
-The outcome evaluation tells you what CHANGED. Your job is to close the gap.
+    // CLAUDE.md as persistent reminder
+    fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
+      `# Strategic Review Agent\nCRITICAL: Your ONLY output is via \`./strategic\` and \`./design-doc\` commands.\nAny text you write will be DISCARDED. Only API calls persist.\nBefore finishing, confirm you called ./strategic set-vision at least once.\n`
+    );
 
-# Current architecture (design document)
-${designDocJson || 'No design document exists yet. The architecture agent will build one. For now, use the file tree below.'}
+    const strategicPrompt = `${contextPrefix}# YOUR ONLY OUTPUT MECHANISM
 
-# Current vision
-${visionJson || 'No vision exists yet. Build one from the design document and project context.'}
-${outcomeSection}
-# Current research directions
-${dirSummaryText}
-
-# Project
-${projectName}
-
-# Reference
-${codebaseSummary}${fileTreeSection}
-${openMessagesText ? `# Open Messages\nMessages from users or previous cycles. Address them through direction changes where appropriate.\n${openMessagesText}\n` : ''}
-# Instructions
-
-1. **Study the design document.** This is ground truth about what exists. The architecture
-   agent just analyzed the codebase — trust its assessment over your own guesses about code.
-
-2. **Review the outcome evaluation.** What actually shipped since the last vision update?
-   For each direction, judge: is the confirmed work meaningful toward its vision system,
-   or is it low-impact churn? A direction that merges 5 trivial PRs is less valuable than
-   one that merges 1 architectural foundation.
-
-3. **Compare architecture against vision.** Where are the gaps?
-   - Systems in the vision that the design doc shows as "missing" or "stub" → need directions
-   - Capabilities the design doc shows as "missing" → may need new vision systems + directions
-   - Systems the design doc shows as "mature" → may not need active directions
-   - If the design doc doesn't exist yet, use the file tree and project context to form an initial vision
-
-4. **Update the vision based on reality:**
-   - Update system statuses to match what the design doc shows
-   - Adjust priorities based on confirmed outcomes, not hoped-for outcomes
-   - Don't plan systems the project clearly doesn't need
-   - Add systems for gaps the design doc identified
-
-5. **Manage directions:**
-   - Create directions for the most impactful gaps between doc and vision
-   - Retire directions for work the design doc shows is already complete
-   - Reprioritize based on what's actually working vs stuck
-   - Tag each direction with system_id — this drives research priority
-   - Think about sequencing — what depends on what
-
-6. Address open messages. Create messages only for genuine design questions. Max 3 per cycle.
-
-Messages are async — never wait for answers. Make your best judgment and note assumptions.
-Judge by impact, not activity. Think big — what fundamental changes would move this project forward?
-
-# How to apply your decisions
-
-Use the \`./strategic\` command to save decisions as you make them. Each call updates the database immediately.
+Your text output will be DISCARDED. The ONLY way to save your work is via these commands:
 
 \`\`\`bash
-# Set or update the vision
+# 1. Set the vision (REQUIRED — do this first)
 ./strategic set-vision '{"purpose": "What this product is", "success_criteria": ["Goal 1"], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "notes"}'
 
-# Create a new direction (max 5 per cycle)
-./strategic create-direction '{"text": "Direction description", "priority": "high", "system_id": "sys-x", "rationale": "Why this matters"}'
+# 2. Create directions for the most impactful work (max 5)
+./strategic create-direction '{"text": "Direction description", "priority": "high", "system_id": "sys-x", "rationale": "Why"}'
 
-# Update an existing direction
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "system_id": "sys-y"}, "rationale": "Why"}'
+# 3. Update existing directions if needed
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium"}, "rationale": "Why"}'
 
-# Retire a completed/irrelevant direction
-./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "Why retiring"}'
+# 4. Retire completed/irrelevant directions
+./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "Why"}'
 
-# Ask the user a question
+# 5. Save notes for future reference (optional)
+./design-doc set "notes/strategic-review" '"Your observations about project direction, risks, opportunities"'
+
+# 6. Ask user a question or resolve a message (optional)
 ./strategic create-message '{"type": "question", "content": "Your question"}'
-
-# Resolve a message you addressed
-./strategic resolve-message '{"message_id": "uuid", "resolution": "How you addressed it"}'
+./strategic resolve-message '{"message_id": "uuid", "resolution": "How addressed"}'
 \`\`\`
 
-Apply decisions AS YOU REASON. Don't wait until the end.
-Do NOT create files, write JSON to /tmp/, or open PRs. Only use ./strategic.
-Max 10 direction operations per cycle (max 5 creates). Focus on the most impactful changes.`;
+Call these commands AS YOU REASON. Each call saves immediately. Do NOT wait until the end.
+Do NOT create files, write JSON to /tmp/, or open PRs.
+
+# Context for your decisions
+
+## Project: ${projectName}
+
+## Architecture (design document — what IS)
+${designDocJson || 'No design document yet. Use the file tree to understand the codebase.'}
+
+## Vision (what SHOULD BE)
+${visionJson || 'No vision yet. Create one with ./strategic set-vision.'}
+${outcomeSection}
+## Current directions
+${dirSummaryText}
+${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
+## Reference
+${codebaseSummary}${fileTreeSection}
+
+# What to do
+
+1. Read the design doc and vision. Explore the codebase if needed for context.
+2. Call \`./strategic set-vision\` with an updated vision reflecting reality.
+3. Create directions for the most impactful gaps. Retire completed ones. Max 5 creates.
+4. Tag directions with system_id from the vision. This drives research priority.
+5. Save any observations worth preserving via \`./design-doc set "notes/..."\`.
+
+Judge by impact, not activity. Think big — what fundamental changes would move this project forward?`;
 
     statusRef.value = 'Running strategic vision review...';
-    const { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort, disallowedTools);
+    let { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort, disallowedTools);
 
+    // Post-check: verify the agent actually called ./strategic
+    // Compare vision revision to what was in the payload
+    const spawnedVisionRev = (payload.vision as Record<string, unknown> || {}).revision as number || 0;
+    try {
+      const projectData = await apiGet(`/api/admin/projects/${strVal((task.project_id ?? payload.project_id) as string)}`);
+      const currentVisionRev = (projectData as Record<string, unknown>)?.vision
+        ? ((projectData as Record<string, unknown>).vision as Record<string, unknown>).revision as number || 0
+        : 0;
+      if (exitCode === 0 && currentVisionRev <= spawnedVisionRev) {
+        sendLog(ws, '\n[WARNING] Strategic review completed but no ./strategic calls were made. Retrying with reminder...\n');
+        const retryResult = await runClaudeCode(
+          'You completed your analysis but did NOT call ./strategic to save your decisions. Your text output was discarded.\n\n' +
+          'You MUST call ./strategic set-vision now, followed by ./strategic create-direction for each direction.\n' +
+          'The ./strategic command is a bash script in the current directory. Run it via Bash.\n\n' +
+          'Review the codebase context you already explored and call the commands now.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+        allOutput += retryResult.allOutput;
+        lastResultText = retryResult.lastResultText;
+      }
+    } catch (e) {
+      sendLog(ws, `[WARNING] Could not verify strategic API calls: ${e}\n`);
+    }
+
+    // Legacy: try to read /tmp output file (backward compat)
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
     let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
     if (!logs) {
-      // Fall back to parsing output for JSON
       const jsonMatch = allOutput.match(/\{[\s\S]*?"vision"[\s\S]*?"direction_operations"[\s\S]*?\}\s*$/);
       logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
     }

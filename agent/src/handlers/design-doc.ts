@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
-  apiPost, cloneWithRetry, runClaudeCode,
+  apiPost, apiGet, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -118,77 +118,75 @@ echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/design-doc`, helperScript, { mode: 0o755 });
 
-  const prompt = `${contextPrefix}${codebaseSummary}${fileTreeSection}
+  // CLAUDE.md as persistent reminder
+  fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
+    `# Design Doc Agent\nCRITICAL: Your ONLY output is via \`./design-doc set\` commands.\nAny text you write will be DISCARDED. Only ./design-doc calls persist.\nBefore finishing, confirm you called ./design-doc set at least once.\n`
+  );
 
-# Project
-${projectName}
+  const prompt = `${contextPrefix}# YOUR ONLY OUTPUT MECHANISM
 
-You are an architecture analyst. Your job is to analyze this codebase and build a
-design document describing what exists. Do NOT create files in the repository,
-do NOT open pull requests, do NOT make any code changes. This is a read-only analysis.
-
-# Current design document pages
-${existingPagesText}
-${visionSection}
-# How to update the design document
-
-Use the \`./design-doc\` command to save pages as you discover things. Each call
-saves immediately to the database. Update pages AS YOU EXPLORE — don't wait until the end.
+Your text output will be DISCARDED. The ONLY way to save your work is the \`./design-doc\` command:
 
 \`\`\`bash
-# Set a page (key = page name, value = any JSON)
-./design-doc set "summary" '"Brief project description here"'
-./design-doc set "architecture" '{"type": "monolith", "description": "FastAPI + React + Node agent", "key_decisions": ["JSONB for flexible schemas", "Event-driven task dispatch"]}'
-./design-doc set "systems/sys-auth" '{"id": "sys-auth", "name": "Authentication", "status": "functional", "description": "Firebase auth with JWT", "modules": ["backend/app/auth.py"]}'
-./design-doc set "systems/sys-pipeline" '{"id": "sys-pipeline", "name": "Task Pipeline", "status": "mature", "description": "Orchestrator loop dispatching to agent VMs", "modules": ["backend/app/main.py"]}'
-./design-doc set "capabilities/testing" '{"status": "partial", "notes": "Unit tests exist, no integration tests"}'
-./design-doc set "capabilities/monitoring" '{"status": "missing"}'
-./design-doc set "risks" '["Single monolithic main.py (7000+ lines)", "No rate limiting on public API"]'
-
-# Delete a page
-./design-doc delete "systems/sys-old-removed"
-
-# List all page keys
+./design-doc set "summary" '"Brief project description"'
+./design-doc set "architecture" '{"type": "monolith", "description": "...", "key_decisions": [...]}'
+./design-doc set "systems/sys-auth" '{"id": "sys-auth", "name": "Auth", "status": "functional", "description": "...", "modules": ["backend/app/auth.py"]}'
+./design-doc set "capabilities/testing" '{"status": "partial", "notes": "Unit tests only"}'
+./design-doc set "risks" '["Risk 1", "Risk 2"]'
+./design-doc set "notes/observations" '"Any notes for future reference"'
+./design-doc delete "systems/sys-removed"
 ./design-doc list
 \`\`\`
 
-Use prefixes to organize: \`systems/*\`, \`capabilities/*\`, etc. You can create
-any pages you want — if you discover something that deserves its own page (like
-a dependency graph or data model inventory), create it.
+Call \`./design-doc set\` AS YOU EXPLORE. Each call saves immediately. Do NOT wait until the end.
+Do NOT create files in the repo. Do NOT commit or push. Only use ./design-doc.
 
-# Instructions
+# Context
 
-1. Explore the codebase THOROUGHLY — use subagents for parallel exploration:
-   - Spawn multiple subagents to explore different directories simultaneously
-   - One for backend, one for frontend, one for agent, one for infra/CI
-   - Read entry points, configs, module boundaries, key source files
-   - Understand how components connect, not individual function details
-   - Use TodoWrite to track what you've explored and what's left
-   - This should be a deep analysis, not a quick skim
+## Project: ${projectName}
 
-2. Save pages as you go. For each major system you discover:
-   - \`./design-doc set "systems/<id>" '{"id": "...", "name": "...", "status": "mature|functional|partial|stub|missing", "description": "...", "modules": [...]}'
-   - Status: mature (battle-tested), functional (works), partial (incomplete), stub (scaffolded), missing (needed but absent)
+## Current pages
+${existingPagesText}
+${visionSection}
+${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
+## Codebase
+${codebaseSummary}${fileTreeSection}
 
-3. For missing or planned systems (in the vision but absent from code), include a spec:
-   \`./design-doc set "systems/<id>" '{"id": "...", "name": "...", "status": "missing", "spec": {"approach": "...", "technology": [...], "integration_points": [...]}}'
+# What to do
 
-4. Document capabilities (cross-cutting concerns):
-   \`./design-doc set "capabilities/<name>" '{"status": "...", "notes": "..."}'
-
-5. Document risks:
-   \`./design-doc set "risks" '[...]'
-
-6. Keep system IDs stable across revisions (e.g., sys-auth, sys-pipeline, sys-frontend).
-
-7. Focus on WHAT IS, not what should be. Document missing things as missing.
-   Only write specs for systems that are missing/stub AND appear in the vision.
-
-Do NOT create any files in the repo. Do NOT commit or push. Only use ./design-doc to save findings.
-${openMessagesText ? `\n# Open Messages\n${openMessagesText}\n` : ''}`;
+1. Explore the codebase THOROUGHLY — use subagents for parallel exploration.
+2. For each system you find: \`./design-doc set "systems/<id>" '{...}'\`
+   Status: mature | functional | partial | stub | missing
+3. For capabilities: \`./design-doc set "capabilities/<name>" '{...}'\`
+4. For risks: \`./design-doc set "risks" '[...]'\`
+5. For notes/observations: \`./design-doc set "notes/<topic>" '"..."'\`
+6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
+7. Focus on WHAT IS. Document missing things as missing.`;
 
   statusRef.value = 'Running architecture review...';
-  const { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);
+  let { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);
+
+  // Post-check: verify the agent actually called ./design-doc
+  try {
+    const projectData = await apiGet(`/api/admin/projects`) as Array<Record<string, unknown>>;
+    const proj = projectData.find(p => p.name === projectName);
+    const doc = (proj?.design_doc || {}) as Record<string, unknown>;
+    const pageCount = Object.keys(doc).filter(k => !k.startsWith('_')).length;
+    if (exitCode === 0 && pageCount === 0) {
+      sendLog(ws, '\n[WARNING] Architecture review completed but no ./design-doc calls were made. Retrying...\n');
+      const retryResult = await runClaudeCode(
+        'You completed your analysis but did NOT call ./design-doc to save any pages. Your text was discarded.\n\n' +
+        'You MUST call ./design-doc set now to save your findings.\n' +
+        'The ./design-doc command is a bash script in the current directory. Run it via Bash.\n' +
+        'Start with: ./design-doc set "summary" \'"Your project summary"\'\n' +
+        'Then save systems, capabilities, and risks.',
+        ws, statusRef, model, effort, disallowedTools
+      );
+      exitCode = retryResult.exitCode;
+    }
+  } catch (e) {
+    sendLog(ws, `[WARNING] Could not verify design doc API calls: ${e}\n`);
+  }
 
   // Completion — design doc was updated incrementally via API.
   // Just report status; the backend handler chains to strategic review.

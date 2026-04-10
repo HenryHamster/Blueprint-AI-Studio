@@ -955,19 +955,24 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     >
                       View last strategic review
                     </button>
-                    <button
-                      onClick={async () => {
-                        try {
-                          const h = await authHeaders();
-                          const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/strategic-cycle?phase=design_doc`, { method: 'POST', headers: h });
-                          if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || `HTTP ${res.status}`); }
-                          addToast('Strategic cycle triggered (design doc → strategic review)', 'success');
-                        } catch (err) { addToast(`Failed: ${err instanceof Error ? err.message : String(err)}`, 'error'); }
-                      }}
-                      className="text-purple-500 hover:text-purple-400 transition-colors underline underline-offset-2"
-                    >
-                      Trigger strategic cycle
-                    </button>
+                    {(['design_doc', 'strategic_review', 'both'] as const).map(phase => (
+                      <button
+                        key={phase}
+                        onClick={async () => {
+                          try {
+                            const h = await authHeaders();
+                            const p = phase === 'both' ? 'design_doc' : phase;
+                            const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/strategic-cycle?phase=${p}`, { method: 'POST', headers: h });
+                            if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || `HTTP ${res.status}`); }
+                            const labels = { design_doc: 'Architecture review', strategic_review: 'Strategic review', both: 'Full cycle (arch → strategic)' };
+                            addToast(`${labels[phase]} triggered`, 'success');
+                          } catch (err) { addToast(`Failed: ${err instanceof Error ? err.message : String(err)}`, 'error'); }
+                        }}
+                        className="text-purple-500 hover:text-purple-400 transition-colors underline underline-offset-2"
+                      >
+                        {phase === 'design_doc' ? 'Arch review' : phase === 'strategic_review' ? 'Strategic only' : 'Full cycle'}
+                      </button>
+                    ))}
                   </div>
                 </div>
                 );
