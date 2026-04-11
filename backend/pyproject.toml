@@ -67,6 +67,7 @@ timeout_method = "thread"  # works with asyncio
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",
+    "integration: End-to-end tests requiring agent subprocess (run via --integration)",
 ]
 
 [tool.coverage.run]
