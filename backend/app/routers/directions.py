@@ -25,12 +25,25 @@ router = APIRouter(
 
 
 DIRECTION_TEXT_MAX = 2000
+COMPLETION_CRITERIA_MAX = 500
+
+
+def _compute_direction_merge_rate(d: dict) -> float:
+    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    if total_cycles == 0:
+        return 0.5
+    return total_merged / total_cycles
 
 
 class DirectionPayload(BaseModel):
     text: str = Field(..., min_length=1, max_length=DIRECTION_TEXT_MAX)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
     paths: Optional[List[str]] = None
+    completion_criteria: Optional[str] = Field(default=None, max_length=COMPLETION_CRITERIA_MAX)
 
 
 @router.get("/projects/{project_id}/directions")
@@ -40,7 +53,11 @@ async def get_directions(
     current_user: dict = Depends(get_current_user)
 ):
     project = await _get_user_project(project_id, current_user["user_id"], session)
-    return {"directions": project.directions or [], "autonomous_enabled": project.autonomous_enabled, "vision": project.vision or {}, "design_doc": project.design_doc or {}}
+    directions = project.directions or []
+    directions_with_rate = [
+        {**d, "merge_rate": _compute_direction_merge_rate(d)} for d in directions
+    ]
+    return {"directions": directions_with_rate, "autonomous_enabled": project.autonomous_enabled, "vision": project.vision or {}, "design_doc": project.design_doc or {}}
 
 
 @router.post("/projects/{project_id}/directions")
@@ -52,6 +69,15 @@ async def add_direction(
 ):
     project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
+    from app.shared_state import runtime_config as _runtime_config
+    max_active = _runtime_config.get("max_active_directions", 5)
+    active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+    if active_count >= max_active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Direction cap reached: max {max_active} active directions allowed"
+        )
+
     direction = {
         "id": f"d-{uuid.uuid4().hex[:8]}",
         "text": payload.text,
@@ -60,6 +86,11 @@ async def add_direction(
         "added_at": _utcnow().isoformat(),
         "status": "active",
     }
+    if payload.completion_criteria:
+        direction["completion_criteria"] = payload.completion_criteria
+    else:
+        logger.warning("Direction created without completion_criteria: %s", direction["id"])
+
     directions = list(project.directions or [])
     directions.append(direction)
     project.directions = directions
@@ -212,6 +243,24 @@ async def update_direction(
         raise HTTPException(status_code=400, detail=f"text must be 1-{DIRECTION_TEXT_MAX} characters")
     if "paths" in payload and (not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"])):
         raise HTTPException(status_code=400, detail="paths must be a list of strings")
+    if "completion_criteria" in payload and payload["completion_criteria"] is not None:
+        if not isinstance(payload["completion_criteria"], str) or len(payload["completion_criteria"]) > COMPLETION_CRITERIA_MAX:
+            raise HTTPException(status_code=400, detail=f"completion_criteria must be a string of at most {COMPLETION_CRITERIA_MAX} characters")
+
+    # Direction cap check: if reactivating, ensure we won't exceed the cap
+    if payload.get("status") == "active":
+        from app.shared_state import runtime_config as _runtime_config
+        max_active = _runtime_config.get("max_active_directions", 5)
+        # Count active directions, excluding the one being updated (it may already be active)
+        active_count = sum(
+            1 for d in (project.directions or [])
+            if d.get("status") == "active" and d.get("id") != direction_id
+        )
+        if active_count >= max_active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Direction cap reached: max {max_active} active directions allowed"
+            )
 
     directions = list(project.directions or [])
     updated = False
@@ -247,6 +296,11 @@ async def update_direction(
             if "notes" in payload:
                 if isinstance(payload["notes"], list):
                     d["notes"] = payload["notes"]
+            if "completion_criteria" in payload:
+                if payload["completion_criteria"] is None:
+                    d.pop("completion_criteria", None)
+                elif isinstance(payload["completion_criteria"], str):
+                    d["completion_criteria"] = payload["completion_criteria"]
             updated = True
             break
 
@@ -399,11 +453,14 @@ async def trigger_strategic_cycle(
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
             total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
             total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
-            direction_stats.append({
+            stat = {
                 "id": d.get("id"), "text": d.get("text"), "priority": d.get("priority"),
                 "status": d.get("status"), "total_cycles": total_cycles,
                 "prs_merged": total_merged, "tasks_failed": total_failed,
-            })
+            }
+            if d.get("completion_criteria"):
+                stat["completion_criteria"] = d["completion_criteria"]
+            direction_stats.append(stat)
         open_msgs_result = await session.execute(
             select(ProjectMessage).where(
                 ProjectMessage.project_id == project.id,

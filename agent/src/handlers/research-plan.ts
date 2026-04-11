@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
-  apiPost, cloneWithRetry, runClaudeCode,
+  apiPost, persistAndPostStatus, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -182,7 +182,7 @@ Rules:
   }
 
   try {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
       ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
@@ -744,7 +744,7 @@ ${analysisText.slice(0, 50_000)}
     }
 
     try {
-      await apiPost('/api/agent/status', {
+      await persistAndPostStatus(taskId, {
         task_id: taskId,
         status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
         ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
@@ -923,7 +923,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
   }
 
   try {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
       ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),

@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  apiPost, apiGet, git, cloneWithRetry,
+  persistAndPostStatus, apiGet, git, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -167,7 +167,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
     logs = sanitize(lastResultText || allOutput.slice(-50_000));
   }
 
-  await apiPost('/api/agent/status', {
+  await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
@@ -398,15 +398,15 @@ export async function handleFix(
       git(['push', '--force-with-lease', 'origin', branch]);
       sendLog(ws, `Pushed fixes to ${branch}\n`);
 
-      await apiPost('/api/agent/status', {
+      await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
         commit_hash: localHead, repo_url: `https://github.com/${owner}/${repo}`,
       });
     } else {
-      await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
+      await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
     }
   } else {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
     });
   }

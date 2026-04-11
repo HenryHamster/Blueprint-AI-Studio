@@ -116,6 +116,21 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
   throw new Error(`POST ${path} failed after ${retries} retries`);
 }
 
+/** Persist result payload to disk before POSTing status, then clean up on success.
+ *  If the POST fails (network error, VM kill), the file survives for retry on next startup. */
+export async function persistAndPostStatus(taskId: string, payload: Record<string, unknown>) {
+  const resultPath = `/tmp/task_${taskId}_result.json`;
+  fs.writeFileSync(resultPath, JSON.stringify(payload), 'utf-8');
+  try {
+    const result = await apiPost('/api/agent/status', payload);
+    try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
+    return result;
+  } catch (e) {
+    // File intentionally left on disk — retried on next agent startup
+    throw e;
+  }
+}
+
 export async function apiGet(path: string, retries = API_MAX_RETRIES) {
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -919,6 +934,27 @@ async function main() {
     log(`Token validation error (continuing): ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
+  try {
+    const staleFiles = fs.readdirSync('/tmp').filter(f => /^task_.+_result\.json$/.test(f));
+    for (const file of staleFiles) {
+      const filePath = `/tmp/${file}`;
+      try {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        const stalePayload = JSON.parse(raw) as Record<string, unknown>;
+        const staleTaskId = strVal(stalePayload.task_id) || file.replace(/^task_/, '').replace(/_result\.json$/, '');
+        log(`Found stale result file for task ${staleTaskId} — retrying POST`);
+        await apiPost('/api/agent/status', stalePayload);
+        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        log(`Stale result for task ${staleTaskId} posted successfully`);
+      } catch (e) {
+        log(`WARNING: Failed to retry stale result from ${file}: ${String(e)} — reaper will handle it`);
+      }
+    }
+  } catch (e) {
+    log(`WARNING: Stale result scan failed: ${String(e)}`);
+  }
+
   // Claim task
   const task = await apiPost('/api/agent/claim') as Record<string, unknown>;
   const taskId = strVal(task.task_id);
@@ -968,7 +1004,7 @@ async function main() {
     // Keep heartbeat alive during retries so the reaper doesn't kill us mid-report.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await apiPost('/api/agent/status', {
+        await persistAndPostStatus(taskId, {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: sanitize(`Fatal error: ${errMsg}`),
         });

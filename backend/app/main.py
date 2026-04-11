@@ -1677,12 +1677,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             for d in active_directions:
                 did = d.get("id", "?")
                 merge_rate = _compute_merge_rate(d)
-                logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f} vision_rank={_vision_rank(d)}")
+                momentum = _compute_momentum_factor(d)
+                logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
             active_directions.sort(key=lambda d: (
                 priority_rank.get(d.get("priority", "medium"), 1),
                 _vision_rank(d),  # vision-aligned directions get researched sooner
                 1 if d.get("possibly_saturated") else 0,
-                -_compute_merge_rate(d),  # higher merge rate preferred
+                -(_compute_merge_rate(d) * _compute_momentum_factor(d)),  # higher merge rate × momentum preferred
                 d.get("last_researched_at") or ""
             ))
             chosen_direction = active_directions[0]
@@ -2726,6 +2727,7 @@ from app.task_completion import (  # noqa: E402 — re-exports for backward comp
     _handle_design_doc_completion,
     _handle_strategic_completion,
     _handle_research_completion,
+    _compute_momentum_factor,
 )
 
 
@@ -3538,6 +3540,10 @@ async def update_agent_status(
                         if api_retries > 3:
                             logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
                             should_requeue = False
+                        else:
+                            delay = min(2 ** api_retries * 120, 1800)
+                            ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
+                            logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
@@ -3547,7 +3553,8 @@ async def update_agent_status(
                         task.started_at = None
                         task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
                         # Clear stale state so dispatcher picks it up fresh
-                        ctx.pop("retry_after", None)
+                        if failure_class != "EXTERNAL_API":
+                            ctx.pop("retry_after", None)
                         ctx.pop("max_plan_account_id", None)
                         ctx.pop("_slot_released", None)
                         task.context = ctx

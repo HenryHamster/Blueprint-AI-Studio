@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
-  apiPost, apiGet, cloneWithRetry, runClaudeCode,
+  persistAndPostStatus, apiGet, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -206,7 +206,7 @@ ${codebaseSummary}${fileTreeSection}
 
   // Completion — design doc was updated incrementally via API.
   // Just report status; the backend handler chains to strategic review.
-  await apiPost('/api/agent/status', {
+  await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     logs: exitCode === 0 ? 'Architecture review completed. Design doc updated via API.' : 'Architecture review failed.',

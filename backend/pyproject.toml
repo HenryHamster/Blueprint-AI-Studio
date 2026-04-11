@@ -64,6 +64,7 @@ warn_return_any = false
 asyncio_mode = "auto"
 timeout = 60  # seconds; prevents hung async tests from blocking CI
 timeout_method = "thread"  # works with asyncio
+addopts = "-m 'not integration'"
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",

@@ -27,6 +27,8 @@ import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal
 from app.github import create_branch, create_pr_comment, get_branch_sha, get_open_pull_requests
 from app.models import (
+    Alert,
+    AlertSeverity,
     Artifact,
     ArtifactType,
     Project,
@@ -46,6 +48,16 @@ logger = logging.getLogger(__name__)
 def _utcnow() -> datetime:
     """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _compute_momentum_factor(d: dict) -> float:
+    """Return a momentum multiplier based on recent research history productivity."""
+    history = d.get("research_history", [])
+    if len(history) >= 2 and all(e.get("tasks_created", 0) > 0 for e in history[-2:]):
+        return 2.0  # hot streak: last 2 cycles both productive
+    if len(history) >= 3 and all(e.get("tasks_created", 0) == 0 for e in history[-3:]):
+        return 0.5  # stalled: last 3 cycles all empty
+    return 1.0  # neutral
 
 
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2140,6 +2152,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         cycle_insights=[i["summary"][:200] for i in insights[:3]],
                         history_entry=entry,
                     )
+
+                    # Auto-complete direction if saturated with sufficient merged PRs
+                    if (
+                        d.get("status") == "active"
+                        and d.get("possibly_saturated")
+                        and entry.get("tasks_created", 0) > 0
+                    ):
+                        history = d.get("research_history", [])
+                        agg = d.get("history_aggregate", {})
+                        total_merged = (
+                            sum(e.get("prs_merged", 0) for e in history)
+                            + (agg.get("total_prs_merged") or 0)
+                        )
+                        if total_merged >= 3:
+                            total_cycles = len(history) + (agg.get("total_cycles") or 0)
+                            d["status"] = "completed"
+                            d["completed_at"] = _utcnow().isoformat()
+                            d["auto_completed"] = True
+                            d["auto_completed_reason"] = (
+                                f"Auto-completed: direction saturated with {total_merged} "
+                                f"total PRs merged across {total_cycles} cycles"
+                            )
+                            alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.INFO,
+                                title="Direction auto-completed",
+                                message=(
+                                    f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
+                                    f"saturated with {total_merged} PRs merged across {total_cycles} cycles."
+                                ),
+                            )
+                            session.add(alert)
+
             project.directions = directions
             flag_modified(project, "directions")
             session.add(project)

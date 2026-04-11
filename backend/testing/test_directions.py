@@ -16,8 +16,8 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _compute_merge_rate
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.main import _spawn_research_task, _handle_research_completion, _compute_merge_rate, _compute_momentum_factor
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -974,3 +974,448 @@ class TestComputeMergeRate:
             d.get("last_researched_at") or "",
         ))
         assert directions[0]["id"] == "unsat"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Direction Cap, completion_criteria, and merge_rate in list
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_direction_cap_blocks_excess_active(client: AsyncClient, mocker):
+    """Creating a 6th active direction returns 409 when cap is 5."""
+    project_id = await _deploy_project(client, mocker)
+    for i in range(5):
+        resp = await client.post(
+            f"/api/admin/projects/{project_id}/directions",
+            json={"text": f"Direction {i + 1}", "priority": "medium"},
+        )
+        assert resp.status_code == 200
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Direction 6 - should be blocked", "priority": "medium"},
+    )
+    assert resp.status_code == 409
+    assert "Direction cap reached" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_direction_cap_allows_non_active(client: AsyncClient, mocker):
+    """proposed and paused directions do not count toward the cap."""
+    project_id = await _deploy_project(client, mocker)
+    # Create 5 active directions to hit the cap
+    for i in range(5):
+        await client.post(
+            f"/api/admin/projects/{project_id}/directions",
+            json={"text": f"Active {i + 1}", "priority": "medium"},
+        )
+    # Pause one to make room
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    directions = resp.json()["directions"]
+    first_id = directions[0]["id"]
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{first_id}",
+        json={"status": "paused"},
+    )
+    # Now we have 4 active, 1 paused — creating another active should succeed
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Direction 6 - now allowed", "priority": "medium"},
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
+    """PATCH setting status to 'active' returns 409 when cap is already at 5."""
+    project_id = await _deploy_project(client, mocker)
+    # Create 5 active + 1 paused
+    for i in range(5):
+        await client.post(
+            f"/api/admin/projects/{project_id}/directions",
+            json={"text": f"Active {i + 1}", "priority": "medium"},
+        )
+    paused_resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "To be paused", "priority": "low"},
+    )
+    # We can't create it as active since cap is now hit — create via DB directly
+    # Instead: pause the 5th, create a 6th, then re-activate the paused one
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    directions = resp.json()["directions"]
+    # Pause one to allow creating the 6th
+    first_id = directions[0]["id"]
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{first_id}",
+        json={"status": "paused"},
+    )
+    # Now create 6th active direction (4 active + 1 paused = OK)
+    sixth_resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Sixth direction", "priority": "medium"},
+    )
+    assert sixth_resp.status_code == 200
+    # Now we have 5 active + 1 paused. Trying to reactivate the paused one should fail
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{first_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 409
+    assert "Direction cap reached" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
+    """GET directions returns merge_rate for each direction based on research_history."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction with history")
+    direction_id = direction["id"]
+
+    # Directly set research_history on the direction in the DB
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [{"prs_merged": 1}, {"prs_merged": 0}]
+    from sqlalchemy.orm.attributes import flag_modified
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+    assert "merge_rate" in target
+    assert abs(target["merge_rate"] - 0.5) < 0.001  # 1 merged / 2 cycles = 0.5
+
+
+@pytest.mark.asyncio
+async def test_completion_criteria_stored(client: AsyncClient, mocker):
+    """POST direction with completion_criteria stores and returns it."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Direction with criteria", "priority": "medium", "completion_criteria": "All auth tests pass"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert d["completion_criteria"] == "All auth tests pass"
+
+    # Verify it's returned in the GET list too
+    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    dirs = get_resp.json()["directions"]
+    stored = next(x for x in dirs if x["id"] == d["id"])
+    assert stored["completion_criteria"] == "All auth tests pass"
+
+
+@pytest.mark.asyncio
+async def test_completion_criteria_optional(client: AsyncClient, mocker):
+    """POST direction without completion_criteria succeeds."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Direction without criteria", "priority": "low"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert "completion_criteria" not in d or d.get("completion_criteria") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-completion
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_auto_completion_triggers(db_session, mocker):
+    """Direction auto-completes when saturated with >= 3 total merged PRs and current cycle has findings."""
+    direction_id = "d-autocomp"
+    direction = {
+        "id": direction_id,
+        "text": "Autocompletion target",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 2, "prs_merged": 1},
+            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-03T01:00:00", "task_id": "t3", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+
+    project = Project(
+        name="Auto-completion Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Autocompletion target",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.task_completion._parse_research_findings",
+        return_value=[{
+            "title": "Final improvement",
+            "description": "Last polish",
+            "prompt": "Do the thing",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == direction_id)
+    assert d["status"] == "completed"
+    assert d["auto_completed"] is True
+    assert "auto_completed_reason" in d
+    assert "3" in d["auto_completed_reason"]  # mentions the PR count
+
+    # Verify an INFO alert was created
+    result = await db_session.execute(
+        select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.severity == AlertSeverity.INFO,
+        )
+    )
+    alerts = result.scalars().all()
+    assert len(alerts) == 1
+    assert "auto-completed" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_auto_completion_skips_unsaturated(db_session, mocker):
+    """Direction stays active when not saturated, even with enough PRs."""
+    direction_id = "d-nosat01"
+    direction = {
+        "id": direction_id,
+        "text": "Unsaturated direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 5, "prs_merged": 2},
+            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 4, "prs_merged": 2},
+        ],
+    }
+
+    project = Project(
+        name="Unsaturated Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Unsaturated direction",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.task_completion._parse_research_findings",
+        return_value=[{
+            "title": "Active finding",
+            "description": "Lots to do",
+            "prompt": "Keep going",
+            "priority": "medium",
+            "scope": "medium",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == direction_id)
+    assert d["status"] == "active"
+    assert d.get("auto_completed") is not True
+
+
+@pytest.mark.asyncio
+async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
+    """Direction stays active when saturated but with fewer than 3 total merged PRs."""
+    direction_id = "d-fewprs1"
+    direction = {
+        "id": direction_id,
+        "text": "Few PRs direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # 3 cycles with <=1 tasks each triggers saturation, but only 2 PRs merged
+        "research_history": [
+            {"timestamp": "2026-01-01T01:00:00", "task_id": "t1", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T01:00:00", "task_id": "t2", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-03T01:00:00", "task_id": "t3", "tasks_created": 0, "prs_merged": 0},
+        ],
+    }
+
+    project = Project(
+        name="Few PRs Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Few PRs direction",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.task_completion._parse_research_findings",
+        return_value=[{
+            "title": "Small finding",
+            "description": "Minor tweak",
+            "prompt": "Fix the thing",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == direction_id)
+    assert d["status"] == "active"
+    assert d.get("auto_completed") is not True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Momentum factor
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComputeMomentumFactor:
+    """Unit tests for _compute_momentum_factor — pure function, no DB needed."""
+
+    def test_momentum_factor_hot_streak(self):
+        """Last 2 cycles both productive → 2.0 multiplier."""
+        d = {"research_history": [
+            {"tasks_created": 3},
+            {"tasks_created": 2},
+        ]}
+        assert _compute_momentum_factor(d) == 2.0
+
+    def test_momentum_factor_hot_streak_longer_history(self):
+        """Hot streak detected even with older stalled entries."""
+        d = {"research_history": [
+            {"tasks_created": 0},
+            {"tasks_created": 0},
+            {"tasks_created": 5},
+            {"tasks_created": 1},
+        ]}
+        assert _compute_momentum_factor(d) == 2.0
+
+    def test_momentum_factor_stalled(self):
+        """Last 3 cycles all empty → 0.5 multiplier."""
+        d = {"research_history": [
+            {"tasks_created": 0},
+            {"tasks_created": 0},
+            {"tasks_created": 0},
+        ]}
+        assert _compute_momentum_factor(d) == 0.5
+
+    def test_momentum_factor_neutral_mixed(self):
+        """Mixed history → 1.0 multiplier."""
+        d = {"research_history": [
+            {"tasks_created": 3},
+            {"tasks_created": 0},
+            {"tasks_created": 2},
+        ]}
+        assert _compute_momentum_factor(d) == 1.0
+
+    def test_momentum_factor_neutral_short_history(self):
+        """Only 1 entry — too short for either streak → 1.0."""
+        d = {"research_history": [
+            {"tasks_created": 0},
+        ]}
+        assert _compute_momentum_factor(d) == 1.0
+
+    def test_momentum_factor_empty_history(self):
+        """No history at all → 1.0."""
+        d = {"research_history": []}
+        assert _compute_momentum_factor(d) == 1.0
+
+    def test_momentum_factor_no_history_key(self):
+        """Missing research_history key → 1.0."""
+        assert _compute_momentum_factor({}) == 1.0

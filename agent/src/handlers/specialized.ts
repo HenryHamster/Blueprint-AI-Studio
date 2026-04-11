@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  apiPost, apiGet, git, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
+  apiPost, persistAndPostStatus, apiGet, git, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -94,7 +94,7 @@ Rules:
     }
   }
 
-  await apiPost('/api/agent/status', {
+  await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'SECURITY_REPORT' }),
@@ -239,14 +239,14 @@ CRITICAL RULES:
       sendLog(ws, `PR created: ${prUrl}\n`);
     } catch (e) { sendLog(ws, `Failed to create PR: ${String(e)}\n`); }
 
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: 'No migration changes generated.' });
+    await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: 'No migration changes generated.' });
   } else {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
     });
   }
@@ -349,7 +349,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;
     sendLog(ws, `\n${summary}\n`);
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: passed ? 'COMPLETED' : 'FAILED',
       artifact_type: 'SMOKETEST_RESULT',
@@ -357,7 +357,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
       repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
     });
@@ -455,7 +455,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   if (debugResult) {
     sendLog(ws, `\nDebug analysis complete (confidence: ${debugResult.confidence})\n`);
     sendLog(ws, `Root cause: ${debugResult.root_cause.slice(0, 500)}\n`);
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'COMPLETED',
       artifact_type: 'DEBUG_RESULT',
@@ -463,7 +463,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
       repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
     });
@@ -544,7 +544,7 @@ Rules:
     }
   }
 
-  await apiPost('/api/agent/status', {
+  await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'PERF_REPORT' }),
@@ -603,7 +603,7 @@ IMPORTANT:
 
   const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
@@ -613,7 +613,7 @@ IMPORTANT:
   }
 
   const logs = sanitize(JSON.stringify(investigationResult));
-  await apiPost('/api/agent/status', {
+  await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'INVESTIGATION_REPORT' }),

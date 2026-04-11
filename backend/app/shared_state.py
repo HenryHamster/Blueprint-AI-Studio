@@ -51,6 +51,7 @@ runtime_config: Dict = {
     "autonomous_direction_cooldown_minutes": 240,
     "autonomous_research_wave_size": 3,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
+    "max_active_directions": 5,
 }
 
 # --- Autonomous Loop State ---

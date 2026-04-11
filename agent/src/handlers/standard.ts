@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  apiPost, git, setupWorkspace, pushAndCreatePR,
+  persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop,
 } from '../index.js';
 import {
@@ -104,7 +104,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     if (failOnTestFailure && testFailuresDetected && !testsPassed) {
       sendLog(ws, 'Tests failed after max fix attempts — marking task as FAILED.\n');
-      await apiPost('/api/agent/status', {
+      await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`,
       });
@@ -125,14 +125,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `${prTitlePrefix} ${taskTitle}`, prBody, ws, statusRef);
     const commitHash = git(['rev-parse', 'HEAD']);
 
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else if (exitCode === 0) {
-    await apiPost('/api/agent/status', { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
+    await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
   } else {
-    await apiPost('/api/agent/status', {
+    await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
     });
   }

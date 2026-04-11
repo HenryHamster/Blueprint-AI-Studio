@@ -644,3 +644,87 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
                 ws.send_json({"token": "not-a-valid-jwt-token"})
                 ws.receive_text()
         assert exc_info.value.code == 1008
+
+
+@pytest.mark.asyncio
+async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient, db_session, mocker):
+    """
+    Tests that EXTERNAL_API failures requeue with exponential backoff in retry_after.
+    - 1st retry: ~2 min delay (2^1 * 120 = 240s)
+    - 2nd retry: ~8 min delay (2^2 * 120 = 480s)
+    - 3rd retry: ~30 min delay (2^3 * 120 = 960s, but capped at 1800s — not capped here)
+    - After 3 retries, task is not requeued
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.main.broadcast_to_project", return_value=None)
+
+    project = Project(name="Backoff Test", user_id="test-user-backoff")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for retry_num in range(1, 4):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"cmd": "test"}],
+            vm_instance_id=f"agent-vm-backoff-{retry_num}",
+            status=TaskStatus.IN_PROGRESS,
+            context={"_api_failure_retries": retry_num - 1},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-backoff-{retry_num}")
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_class": "EXTERNAL_API",
+            "logs": "api.github.com returned 503",
+        }
+        before = datetime.utcnow()
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        after = datetime.utcnow()
+        assert resp.status_code == 200
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED, f"retry {retry_num}: expected QUEUED"
+        ctx = task.context or {}
+        assert "retry_after" in ctx, f"retry {retry_num}: retry_after not set"
+
+        retry_after_dt = datetime.fromisoformat(ctx["retry_after"])
+        expected_delay = min(2 ** retry_num * 120, 1800)
+        actual_delay = (retry_after_dt - before).total_seconds()
+        assert actual_delay >= expected_delay - 2, f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
+        assert actual_delay <= expected_delay + 5, f"retry {retry_num}: delay {actual_delay} too large"
+
+    # 4th attempt: api_retries=3, increments to 4 > 3 → EXTERNAL_API early-requeue path is skipped
+    # Falls through to general retry (task.attempt_count < max_retries), so no retry_after is set
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        vm_instance_id="agent-vm-backoff-4",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_api_failure_retries": 3},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-backoff-4")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_class": "EXTERNAL_API",
+        "logs": "api.github.com returned 503",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
+    ctx = task.context or {}
+    assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
