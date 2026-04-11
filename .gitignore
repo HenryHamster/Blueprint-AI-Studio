@@ -19,7 +19,11 @@ database.sqlite
 .blueprint-config.json
 *.tsbuildinfo
 backend/CLAUDE.md
-# Agent runtime tool scripts (auto-generated, must not be committed)
+# Agent runtime tool scripts (auto-generated in workspace, must not be committed)
 /note
 /messages
 /playbook
+/design-doc
+/strategic
+/suggest
+research-*.md
