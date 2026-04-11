@@ -124,10 +124,11 @@ ${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Co
 - Are there tests for the new/changed behavior?
 - Do existing tests still pass given these changes?
 
-**Build & Type Safety:**
-- For TypeScript changes (admin-ui/ or agent/): run \`cd admin-ui && npx tsc --noEmit\` and/or \`cd agent && npx tsc --noEmit\` and report any type errors
-- For Python changes: verify imports are correct and consistent with existing patterns
-- Include build/type check results in your verdict feedback
+**Build & Type Safety (MUST run these — do not skip):**
+- For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
+- For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
+- For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
+- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.
 
 After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
 
@@ -259,7 +260,8 @@ export async function handleFix(
     const conflictFiles = git(['diff', '--name-only', '--diff-filter=U']);
     if (conflictFiles.trim()) {
       hasConflicts = true;
-      enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}\n\nThis is the PRIMARY task — resolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file listed above. Keep the intent of this PR's changes (HEAD) while incorporating upstream updates from ${baseBranch}.\n\nAfter resolving conflicts, stage the files with git add and ensure no conflict markers remain.\n\n${basePrompt}`;
+      const prGoal = originalPrompt ? `\n\nThis PR's goal: ${originalPrompt.slice(0, 500)}\n` : '';
+      enrichedPrompt = `MERGE CONFLICTS DETECTED in the following files:\n${conflictFiles}${prGoal}\n\nResolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file listed above.\n\nIMPORTANT: ${baseBranch} is the source of truth. It may have received many commits since this branch diverged. When resolving conflicts:\n- ALWAYS keep ${baseBranch}'s version of code that was refactored, moved, or restructured upstream\n- Only re-apply this PR's specific changes (described above) on top of ${baseBranch}'s current state\n- If a file was heavily rewritten on ${baseBranch}, adapt this PR's changes to the new structure rather than reverting to the old one\n- When in doubt, prefer ${baseBranch}'s version and carefully layer this PR's additions back in\n\nAfter resolving conflicts, stage the files with git add and ensure no conflict markers remain.\n\n${basePrompt}`;
       sendLog(ws, `Conflicting files:\n${conflictFiles}\n`);
     }
   } catch { /* no unmerged files */ }
@@ -268,7 +270,7 @@ export async function handleFix(
     try {
       const markerCheck = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (markerCheck) {
-        enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}\n\nThis is the PRIMARY task — resolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file. Keep the intent of this PR's changes while incorporating upstream updates from ${baseBranch}.\n\n${basePrompt}`;
+        enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}${originalPrompt ? `\n\nThis PR's goal: ${originalPrompt.slice(0, 500)}` : ''}\n\nResolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file. ${baseBranch} is the source of truth — keep its refactors and restructuring, and re-apply only this PR's specific changes (described above) on top.\n\n${basePrompt}`;
         sendLog(ws, `Files with conflict markers:\n${markerCheck}\n`);
       }
     } catch { /* no markers found, good */ }
@@ -339,12 +341,27 @@ export async function handleFix(
     }
   }
 
-  // Check for remaining conflict markers — warn but don't block push
+  // Check for remaining conflict markers — give Claude one chance to fix them
   if (exitCode === 0) {
     try {
       const remainingMarkers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
       if (remainingMarkers) {
-        sendLog(ws, `WARNING: Conflict markers still present in:\n${remainingMarkers}\nPushing anyway — review pipeline will continue resolving.\n`);
+        sendLog(ws, `Conflict markers still present in:\n${remainingMarkers}\nAsking Claude to resolve...\n`);
+        await runClaudeCode(
+          `CRITICAL: These files still have git conflict markers (<<<<<<<, =======, >>>>>>>):\n${remainingMarkers}\n\nResolve ALL conflict markers in every file listed. The base branch is the source of truth — keep its code structure and only re-apply this PR's specific additions. After resolving, stage with git add.`,
+          ws, statusRef, model, effort
+        );
+        git(['add', '-A']);
+        try {
+          execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: resolve remaining conflict markers'], { encoding: 'utf-8' });
+        } catch { /* nothing to commit — markers may have already been staged */ }
+        // Final check — if markers persist after retry, warn but proceed
+        try {
+          const stillConflicting = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+          if (stillConflicting) {
+            sendLog(ws, `WARNING: Conflict markers persist after retry in:\n${stillConflicting}\n`);
+          }
+        } catch { /* no markers — resolved successfully */ }
       }
     } catch { /* grep found nothing — no markers, good */ }
   }

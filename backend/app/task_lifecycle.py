@@ -1031,16 +1031,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
                         except Exception:
                             files_list = "  (could not fetch file list)"
+                        parent_goal = (parent.description or parent.title or "")[:500]
                         fix_prompt = (
                             f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
                             f"Error: {merge_msg}\n\n"
+                            f"Rollup goal: {parent_goal}\n\n"
                             f"Files in this PR:\n{files_list}\n\n"
                             f"Steps to resolve:\n"
                             f"1. Run: git fetch origin {target_branch}\n"
                             f"2. Run: git rebase origin/{target_branch}\n"
-                            f"3. Resolve any conflicts — keep the intent of the subtask changes while incorporating upstream updates\n"
-                            f"4. Run: git rebase --continue after resolving each file\n\n"
-                            f"Preserve the intent of the existing changes."
+                            f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
+                            f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
+                            f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
+                            f"4. Run: git rebase --continue after resolving each file"
                         )
                         fix_task = await _spawn_pipeline_task(
                             parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
@@ -1663,17 +1666,27 @@ async def _process_post_commit(
                                 files_list = "  (could not fetch file list)"
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Spawning fix task to rebase and resolve conflicts.")
+                            orig_goal = ""
+                            if original_task_id:
+                                try:
+                                    orig_t = await session.get(Task, uuid.UUID(original_task_id))
+                                    if orig_t:
+                                        orig_goal = (orig_t.description or orig_t.title or "")[:500]
+                                except Exception:
+                                    pass
                             fix_prompt = (
                                 f"This PR (#{pr_number}) was approved but could not be merged.\n"
-                                f"Error: {merge_msg}\n\n"
-                                f"Files changed in this PR:\n{files_list}\n\n"
+                                f"Error: {merge_msg}\n"
+                                + (f"\nPR goal: {orig_goal}\n" if orig_goal else "") +
+                                f"\nFiles changed in this PR:\n{files_list}\n\n"
                                 f"Steps to resolve:\n"
                                 f"1. Run: git fetch origin {base_branch}\n"
                                 f"2. Run: git rebase origin/{base_branch}\n"
-                                f"3. If rebase conflicts occur, resolve them in each file — keep the intent of the PR changes while incorporating upstream updates\n"
+                                f"3. If rebase conflicts occur: {base_branch} is the source of truth. Keep its refactors and restructuring.\n"
+                                f"   Re-apply only the changes that serve the PR goal (described above) on top of {base_branch}'s current state.\n"
+                                f"   If files were heavily rewritten on {base_branch}, adapt this PR's changes to the new structure.\n"
                                 f"4. Run: git rebase --continue after resolving each conflicting file\n"
-                                f"5. If rebase is too complex, abort with git rebase --abort, then use git merge origin/{base_branch} and resolve conflict markers\n\n"
-                                f"Preserve the intent of the existing PR changes. Do not alter logic unless necessary to resolve conflicts."
+                                f"5. If rebase is too complex, abort with git rebase --abort, then use git merge origin/{base_branch} and resolve conflict markers"
                             )
                             fix_task = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
