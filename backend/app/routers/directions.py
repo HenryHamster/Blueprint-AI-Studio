@@ -11,7 +11,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMessage, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 
@@ -462,3 +462,68 @@ async def trigger_strategic_cycle(
         "status": new_task.status,
         "phase": phase,
     }
+
+
+# ── Messages ─────────────────────────────────────────────────────────────
+
+
+class CreateMessage(BaseModel):
+    content: str
+    message_type: str = "NOTE"  # NOTE, FEEDBACK, BUG_REPORT, QUESTION, BLOCKER
+
+
+@router.post("/projects/{project_id}/messages")
+async def create_message(
+    project_id: str,
+    payload: CreateMessage,
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+):
+    """Create a message from the user to the autonomous system."""
+    project = await _get_user_project(project_id, user, session)
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    if len(payload.content) > 5000:
+        raise HTTPException(status_code=400, detail="Content exceeds 5000 character limit")
+
+    try:
+        msg_type = MessageType(payload.message_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid message type: {payload.message_type}")
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=msg_type,
+        from_type="user",
+        content=payload.content.strip(),
+    )
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+
+    return {"id": str(msg.id), "status": "created"}
+
+
+@router.get("/projects/{project_id}/messages")
+async def list_messages(
+    project_id: str,
+    status: Optional[str] = "open",
+    session: AsyncSession = Depends(get_session),
+    user: dict = Depends(get_current_user),
+):
+    """List messages for a project."""
+    project = await _get_user_project(project_id, user, session)
+    stmt = select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+    if status:
+        stmt = stmt.where(ProjectMessage.status == status)
+    stmt = stmt.order_by(ProjectMessage.created_at.desc()).limit(50)
+    result = await session.execute(stmt)
+    msgs = result.scalars().all()
+    return [
+        {
+            "id": str(m.id), "type": m.message_type, "content": m.content,
+            "from": m.from_type, "status": m.status, "context": m.context,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in msgs
+    ]

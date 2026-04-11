@@ -21,6 +21,8 @@ Usage:
     python scripts/ops.py circuit-breaker [--reset PROJECT_ID] — circuit breaker state
     python scripts/ops.py requeue-failed            — requeue all failed tasks
     python scripts/ops.py restart-orchestrator      — restart background loops
+    python scripts/ops.py message "text"            — send a message to the autonomous system
+    python scripts/ops.py messages [--all]          — list open messages
 """
 import json
 import sys
@@ -490,6 +492,56 @@ def cmd_restart_orchestrator(_args):
     print(f"Restart: {json.dumps(result, indent=2)}")
 
 
+def cmd_message(args):
+    """Send a message to the autonomous system.
+
+    Usage: ops.py message "your message here" [--type NOTE|FEEDBACK|BUG_REPORT|QUESTION|BLOCKER]
+    """
+    if not args:
+        print("Usage: ops.py message \"your message\" [--type NOTE]")
+        return
+    msg_type = "FEEDBACK"
+    content_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == '--type' and i + 1 < len(args):
+            msg_type = args[i + 1]
+            i += 2
+        else:
+            content_parts.append(args[i])
+            i += 1
+    content = ' '.join(content_parts)
+    if not content:
+        print("Error: message content required")
+        return
+    pid = get_project_id()
+    result = api("POST", f"/api/projects/{pid}/messages", {
+        "content": content,
+        "message_type": msg_type,
+    })
+    print(f"Message sent: {result.get('id', '?')}")
+
+
+def cmd_messages(args):
+    """List open messages."""
+    pid = get_project_id()
+    status = "open"
+    if args and args[0] == '--all':
+        status = ""
+    url = f"/api/projects/{pid}/messages"
+    if status:
+        url += f"?status={status}"
+    msgs = api("GET", url)
+    if not msgs:
+        print("No messages.")
+        return
+    for m in msgs:
+        icon = {"BUG_REPORT": "BUG", "FEEDBACK": "FB", "NOTE": "NOTE", "QUESTION": "Q", "BLOCKER": "BLOCK"}.get(m.get("type", ""), "?")
+        src = m.get("from", "?")
+        age = m.get("created_at", "?")[:16] if m.get("created_at") else "?"
+        print(f"  [{icon}] ({src}, {age}) {m['content'][:120]}")
+
+
 COMMANDS = {
     'status': cmd_status,
     'resume': cmd_resume,
@@ -510,6 +562,8 @@ COMMANDS = {
     'circuit-breaker': cmd_circuit_breaker,
     'requeue-failed': cmd_requeue_failed,
     'restart-orchestrator': cmd_restart_orchestrator,
+    'message': cmd_message,
+    'messages': cmd_messages,
 }
 
 if __name__ == '__main__':

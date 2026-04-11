@@ -845,7 +845,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
 - Use scope=large freely — the pipeline has a plan agent for safe decomposition.
 - direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
-- direction_note: add context to a direction (fields: direction_id, description max 500 chars). Be honest about progress.
+- direction_note: add context to a direction (fields: direction_id, description max 2000 chars). Be honest about progress.
 - direction_proposal: propose a new standing direction (max 2 per cycle, held for user approval).
 - design_doc_observation: flag an architectural observation for the design document (fields: description, section). Use when you discover something about the system's architecture — module patterns, missing capabilities, structural risks. These are reviewed by the architecture agent, not acted on directly. Max 3 per cycle.
 - Optional: /tmp/research_insights_${taskId}.json with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;

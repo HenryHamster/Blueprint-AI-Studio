@@ -5304,7 +5304,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             changed = False
             for note_finding in direction_notes:
                 target_id = note_finding.get("direction_id")
-                note_text = (note_finding.get("description") or note_finding.get("prompt") or "")[:500]
+                raw_note = note_finding.get("description") or note_finding.get("prompt") or ""
+                if len(raw_note) > STRATEGIC_RATIONALE_MAX:
+                    logger.warning(f"[RESEARCH] Task {task.id}: truncating direction note {len(raw_note)}→{STRATEGIC_RATIONALE_MAX} chars for direction {target_id}")
+                note_text = raw_note[:STRATEGIC_RATIONALE_MAX]
                 if not note_text or not target_id:
                     continue
                 for d in note_directions:
@@ -5315,7 +5318,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "added_at": _utcnow().isoformat(),
                             "added_by_task": str(task.id),
                         })
-                        d["notes"] = notes[-20:]  # keep last 20 notes
+                        if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                            logger.warning(f"[RESEARCH] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {target_id}")
+                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         changed = True
                         break
             if changed:
