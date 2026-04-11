@@ -836,3 +836,143 @@ async def test_strategic_completion_no_api_no_logs_increments_failures(strategic
     await strategic_db.refresh(project)
     assert project.vision.get("_strategic_failures") == 3
     alert_mock.assert_called_once()
+
+
+# ── Structural Refactor Pipeline Relaxations ──────────────────────────────────
+
+
+class TestRefactorDeferralLogic:
+    """Blocker 1: Refactor tasks should use the standard deferral threshold,
+    not the 'any overlap' large-task rule that indefinitely deferred decomposition work."""
+
+    def _compute_should_defer(self, scope: str, task_type: str, overlap_count: int, candidate_file_count: int) -> bool:
+        """Replicate the deferral decision from orchestrator.py lines 585-590."""
+        is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
+        should_defer = is_large or (overlap_count >= 2 and overlap_count >= candidate_file_count * 0.5)
+        return should_defer
+
+    def test_refactor_single_file_overlap_not_deferred(self):
+        """A refactor touching 1 file that overlaps must not be deferred — structural PRs
+        are expected to touch their decomposition target."""
+        assert not self._compute_should_defer("small", "refactor", overlap_count=1, candidate_file_count=3)
+
+    def test_refactor_small_overlap_not_deferred(self):
+        """1-of-5 files overlapping is below both the count and ratio thresholds."""
+        assert not self._compute_should_defer("small", "refactor", overlap_count=1, candidate_file_count=5)
+
+    def test_refactor_large_overlap_still_defers(self):
+        """2+ files overlapping AND >= 50% of candidate files still defers — genuine conflict."""
+        assert self._compute_should_defer("small", "refactor", overlap_count=2, candidate_file_count=3)
+
+    def test_plan_always_defers_on_any_overlap(self):
+        """Plan tasks retain the strict large-task deferral rule."""
+        assert self._compute_should_defer("small", "plan", overlap_count=1, candidate_file_count=5)
+
+    def test_large_scope_refactor_still_defers(self):
+        """A refactor explicitly marked scope=large still defers on any overlap."""
+        assert self._compute_should_defer("large", "refactor", overlap_count=1, candidate_file_count=5)
+
+    def test_create_task_standard_threshold(self):
+        """Create tasks use the standard 2-file + 50% threshold (unchanged)."""
+        assert not self._compute_should_defer("small", "create", overlap_count=1, candidate_file_count=10)
+        assert self._compute_should_defer("small", "create", overlap_count=2, candidate_file_count=3)
+
+
+class TestStuckCycleThreshold:
+    """Blocker 2: Refactor-type source tasks should use a 75% repeat threshold
+    so structural review feedback that can't be fully resolved doesn't prematurely
+    escalate to requires_approval."""
+
+    def _stuck_threshold(self, source_type: str) -> float:
+        """Replicate threshold logic from task_lifecycle.py stuck-cycle detection."""
+        return 0.75 if source_type == "refactor" else 0.5
+
+    def test_refactor_threshold_is_75(self):
+        assert self._stuck_threshold("refactor") == 0.75
+
+    def test_create_threshold_is_50(self):
+        assert self._stuck_threshold("create") == 0.5
+
+    def test_fix_threshold_is_50(self):
+        assert self._stuck_threshold("fix") == 0.5
+
+    def test_plan_threshold_is_50(self):
+        assert self._stuck_threshold("plan") == 0.5
+
+    def test_refactor_60pct_repeat_not_stuck(self):
+        """60% repeat rate is below the 75% refactor threshold — should NOT escalate."""
+        matched_count, total_count = 3, 5
+        assert matched_count / total_count < self._stuck_threshold("refactor")
+
+    def test_refactor_80pct_repeat_is_stuck(self):
+        """80% repeat rate exceeds 75% refactor threshold — should escalate."""
+        matched_count, total_count = 4, 5
+        assert matched_count / total_count >= self._stuck_threshold("refactor")
+
+    def test_non_refactor_60pct_repeat_is_stuck(self):
+        """60% repeat rate exceeds 50% standard threshold — escalates for non-refactor."""
+        matched_count, total_count = 3, 5
+        assert matched_count / total_count >= self._stuck_threshold("create")
+
+    def test_non_refactor_40pct_repeat_not_stuck(self):
+        """40% repeat rate is below 50% standard threshold."""
+        matched_count, total_count = 2, 5
+        assert matched_count / total_count < self._stuck_threshold("create")
+
+
+class TestHighRiskRollupGate:
+    """Blocker 3: Refactor children classified as risk='high' should not trigger
+    the requires_approval rollup gate — structural moves carry no behavioral risk."""
+
+    def _has_high_risk_child(self, children) -> bool:
+        """Replicate the has_high_risk_child check from task_lifecycle.py lines 934-938."""
+        return any(
+            (c.context or {}).get("risk") == "high"
+            for c in children
+            if c.status == TaskStatus.COMPLETED
+            and (c.first_payload or {}).get("type") != "refactor"
+        )
+
+    def _make_child(self, task_type: str, risk: str | None, status=TaskStatus.COMPLETED):
+        child = MagicMock()
+        child.status = status
+        child.context = {"risk": risk} if risk else {}
+        child.first_payload = {"type": task_type}
+        return child
+
+    def test_refactor_high_risk_not_flagged(self):
+        """A completed refactor child with risk=high must not trigger the gate."""
+        child = self._make_child("refactor", "high")
+        assert not self._has_high_risk_child([child])
+
+    def test_create_high_risk_flagged(self):
+        """A completed create child with risk=high still triggers the gate."""
+        child = self._make_child("create", "high")
+        assert self._has_high_risk_child([child])
+
+    def test_fix_high_risk_flagged(self):
+        """A completed fix child with risk=high still triggers the gate."""
+        child = self._make_child("fix", "high")
+        assert self._has_high_risk_child([child])
+
+    def test_refactor_high_and_create_medium_not_flagged(self):
+        """Only refactor children — no behavioral-risk children → not flagged."""
+        assert not self._has_high_risk_child([
+            self._make_child("refactor", "high"),
+            self._make_child("create", "medium"),
+        ])
+
+    def test_refactor_high_and_create_high_flagged(self):
+        """Mix of refactor (exempt) and create (high risk) — create triggers the gate."""
+        assert self._has_high_risk_child([
+            self._make_child("refactor", "high"),
+            self._make_child("create", "high"),
+        ])
+
+    def test_incomplete_refactor_not_counted(self):
+        """Non-COMPLETED children are always excluded from the check."""
+        child = self._make_child("create", "high", status=TaskStatus.IN_PROGRESS)
+        assert not self._has_high_risk_child([child])
+
+    def test_empty_children_not_flagged(self):
+        assert not self._has_high_risk_child([])

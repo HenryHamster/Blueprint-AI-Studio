@@ -356,7 +356,11 @@ async def _spawn_pipeline_task(
                 if any(desc in prev_desc or prev_desc in desc for prev_desc in prev_critical_major)
             )
             total_count = len(curr_critical_major)
-            if matched_count / total_count >= 0.5:
+            # Refactor tasks get a higher threshold — structural review feedback often repeats
+            # because the fix agent cannot fully resolve architectural concerns in scope
+            source_type = (source_task.first_payload or {}).get("type", "")
+            stuck_threshold = 0.75 if source_type == "refactor" else 0.5
+            if matched_count / total_count >= stuck_threshold:
                 logger.warning(
                     f"[PIPELINE] Stuck cycle detected for PR #{pr_number}: "
                     f"{matched_count}/{total_count} issues repeated"
@@ -930,11 +934,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     logger.info(f"[ROLLUP] Concurrent sibling created rollup PR for parent {parent.id} — yielding")
                     return
 
-                # Check if any child task was high-risk — if so, require approval on the final merge
+                # Check if any child task was high-risk — if so, require approval on the final merge.
+                # Refactor tasks are structural (move code, no behavior change) and should not
+                # trigger the high-risk gate even when classified as risk='high' by plan agents.
                 has_high_risk_child = any(
                     (c.context or {}).get("risk") == "high"
                     for c in children
                     if c.status == TaskStatus.COMPLETED
+                    and (c.first_payload or {}).get("type") != "refactor"  # refactors are structural, not behavioral risk
                 )
                 if has_high_risk_child and not is_target_intermediate:
                     parent.requires_approval = True

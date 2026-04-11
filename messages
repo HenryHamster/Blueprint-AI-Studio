@@ -1,0 +1,31 @@
+#!/bin/bash
+# Message tool — send messages to the project owner or resolve open messages
+# Usage:
+#   ./messages send '<content>'                    # send a NOTE message
+#   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
+#   ./messages resolve <message-id> '<resolution>' # resolve an open message
+
+OP="${1:?Usage: messages send|resolve ...}"
+API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="a7c61f5f-36f2-4124-8321-5ed9d9e68ec8"
+CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
+
+if [ "$OP" = "send" ]; then
+  CONTENT="${2:?send requires '<content>'}"
+  MSG_TYPE="${3:-NOTE}"
+  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \
+    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \
+    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+elif [ "$OP" = "resolve" ]; then
+  MSG_ID="${2:?resolve requires <message-id>}"
+  RESOLUTION="${3:-Addressed}"
+  jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \
+    '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \
+    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+else
+  echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
+fi
+echo ""

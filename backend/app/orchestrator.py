@@ -582,10 +582,11 @@ async def orchestrator_worker():
                         if not overlap:
                             non_conflicting.append(eid)
                             continue
-                        # Large scope tasks (refactors, etc.) defer on any overlap
+                        # Large scope tasks defer on any overlap; refactors use standard threshold
+                        # (refactors are expected to touch decomposition targets — overlap is intentional)
                         scope = (candidate.context or {}).get("scope", "small")
                         task_type = (candidate.first_payload).get("type", "")
-                        is_large = scope == "large" or task_type in ("refactor", "plan")
+                        is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
                         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
                         should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
                         if should_defer:
