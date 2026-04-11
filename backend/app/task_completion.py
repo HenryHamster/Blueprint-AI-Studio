@@ -52,6 +52,19 @@ def _utcnow() -> datetime:
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 
 
+def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
+    """Find a cycle entry by cycle_id in project.vision and apply updates in-place."""
+    vision = dict(project.vision or {})
+    cycle_history = list(vision.get("_strategic_cycle_history") or [])
+    for entry in cycle_history:
+        if entry.get("cycle_id") == cycle_id:
+            entry.update(updates)
+            break
+    vision["_strategic_cycle_history"] = cycle_history
+    project.vision = vision
+    flag_modified(project, "vision")
+
+
 # ---------------------------------------------------------------------------
 # Parser / Validator helpers
 # ---------------------------------------------------------------------------
@@ -1352,15 +1365,24 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
     # Chain: spawn Phase 2 (strategic review)
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
+    cycle_id = (task.context or {}).get("strategic_cycle_id")
     try:
         await session.refresh(project)
-        await _spawn_strategic_review(project, session)
+        await _spawn_strategic_review(project, session, cycle_id=cycle_id)
         task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
     except Exception as chain_exc:
         logger.error(f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}", exc_info=True)
         task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[:500]
         await _create_strategic_alert(task.project_id, session,
             f"Strategic review failed to spawn after design doc update (task {str(task.id)[:8]}): {chain_exc!r}")
+        # Save a retry marker so the next research spawn can retry the strategic review
+        project.vision = {**(project.vision or {}), '_pending_strategic_review': {
+            'design_doc_task_id': str(task.id),
+            'failed_at': _utcnow().isoformat(),
+            'error': str(chain_exc)[:200],
+        }}
+        flag_modified(project, 'vision')
+        session.add(project)
     session.add(task)
     await session.commit()
 
@@ -1389,6 +1411,14 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     api_was_used = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
 
     if api_was_used:
+        cycle_id = (task.context or {}).get("strategic_cycle_id")
+        if cycle_id:
+            _update_cycle_history(project, cycle_id, {
+                "phase2_completed_at": _utcnow().isoformat(),
+                "vision_updated": True,
+                "outcome": "completed",
+            })
+            session.add(project)
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
         session.add(task)
         await session.commit()
@@ -1410,6 +1440,12 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             current_vision["_strategic_failures"] = failures
             project.vision = current_vision
             flag_modified(project, "vision")
+            cycle_id = (task.context or {}).get("strategic_cycle_id")
+            if cycle_id:
+                _update_cycle_history(project, cycle_id, {
+                    "phase2_completed_at": _utcnow().isoformat(),
+                    "outcome": "failed",
+                })
             session.add(project)
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
@@ -1467,6 +1503,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         new_vision["revision"] = (db_vision_rev or 0) + 1
         new_vision["last_updated"] = _utcnow().isoformat()
         new_vision.pop("_strategic_failures", None)  # Reset failure counter on success
+        # Preserve internal tracking fields not produced by the agent
+        if "_strategic_cycle_history" in current_vision:
+            new_vision["_strategic_cycle_history"] = current_vision["_strategic_cycle_history"]
         project.vision = new_vision
         flag_modified(project, "vision")
         logger.info(f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}")
@@ -1609,6 +1648,20 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         if ops_applied > 0:
             project.directions = directions
             flag_modified(project, "directions")
+
+    # Update cycle history with final outcome
+    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    if cycle_id:
+        dirs_created = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "create")
+        dirs_retired = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "retire")
+        vision_produced = bool(new_vision and isinstance(new_vision, dict))
+        _update_cycle_history(project, cycle_id, {
+            "phase2_completed_at": _utcnow().isoformat(),
+            "vision_updated": vision_produced,
+            "directions_created": dirs_created,
+            "directions_retired": dirs_retired,
+            "outcome": "completed" if vision_produced else "failed",
+        })
 
     session.add(project)
 

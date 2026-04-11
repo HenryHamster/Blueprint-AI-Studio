@@ -2989,6 +2989,7 @@ async def get_autonomy_debug(
         },
         "directions": directions_info,
         "next_check_at": next_check_at,
+        "strategic_cycle_history": (project.vision or {}).get("_strategic_cycle_history", []),
     }
 
 
@@ -3017,17 +3018,20 @@ async def reset_circuit_breaker(
 
     await _persist_circuit_breakers()
 
-    # Also clear _strategic_failures so the strategic cycle can recover
+    # Also clear strategic cycle state so the cycle can recover
     from app.models import Project
     from sqlalchemy.orm.attributes import flag_modified
     project = await session.get(Project, project_id)
-    if project and project.vision and "_strategic_failures" in project.vision:
-        project.vision = {**project.vision}
-        project.vision.pop("_strategic_failures", None)
-        flag_modified(project, "vision")
-        session.add(project)
-        await session.commit()
-        logger.info(f"[ADMIN] Cleared _strategic_failures for project {project_id}")
+    if project and project.vision:
+        vision_keys_to_clear = {"_strategic_failures", "_pending_strategic_review"}
+        if vision_keys_to_clear & project.vision.keys():
+            project.vision = {**project.vision}
+            for key in vision_keys_to_clear:
+                project.vision.pop(key, None)
+            flag_modified(project, "vision")
+            session.add(project)
+            await session.commit()
+            logger.info(f"[ADMIN] Cleared strategic cycle state (_strategic_failures, _pending_strategic_review) for project {project_id}")
 
     user_email = current_user.get("email", current_user.get("sub", "unknown"))
     logger.info(f"[ADMIN] Circuit breaker manually reset for project {project_id} by {user_email}")

@@ -1331,6 +1331,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
         **({"model": doc_model} if doc_model else {}),
         **({"effort": doc_effort} if doc_effort else {}),
     }
+    cycle_id = "sc-" + uuid.uuid4().hex[:8]
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -1339,6 +1340,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        context={"strategic_cycle_id": cycle_id},
     )
     session.add(new_task)
     history = TaskHistory(
@@ -1346,11 +1348,30 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "design_doc_update"},
     )
     session.add(history)
+    # Record cycle start in vision history (keep last 10 entries)
+    vision = dict(project.vision or {})
+    cycle_history = list(vision.get("_strategic_cycle_history") or [])
+    cycle_history.append({
+        "cycle_id": cycle_id,
+        "started_at": _utcnow().isoformat(),
+        "phase1_task_id": str(new_task.id),
+        "phase1_completed_at": None,
+        "phase2_task_id": None,
+        "phase2_completed_at": None,
+        "directions_created": 0,
+        "directions_retired": 0,
+        "vision_updated": False,
+        "outcome": "in_progress",
+    })
+    vision["_strategic_cycle_history"] = cycle_history[-10:]
+    project.vision = vision
+    flag_modified(project, "vision")
+    session.add(project)
     await session.commit()
-    logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id}")
+    logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})")
 
 
-async def _spawn_strategic_review(project: Project, session: AsyncSession):
+async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: Optional[str] = None):
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
@@ -1432,6 +1453,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession):
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        context={"strategic_cycle_id": cycle_id} if cycle_id else {},
     )
     session.add(new_task)
     history = TaskHistory(
@@ -1439,6 +1461,19 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession):
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
     )
     session.add(history)
+    if cycle_id:
+        # Record phase1 completion and phase2 task id in cycle history
+        vision = dict(project.vision or {})
+        cycle_history = list(vision.get("_strategic_cycle_history") or [])
+        for entry in cycle_history:
+            if entry.get("cycle_id") == cycle_id:
+                entry["phase1_completed_at"] = _utcnow().isoformat()
+                entry["phase2_task_id"] = str(new_task.id)
+                break
+        vision["_strategic_cycle_history"] = cycle_history
+        project.vision = vision
+        flag_modified(project, "vision")
+        session.add(project)
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
 
@@ -1642,6 +1677,23 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             chosen_direction = active_directions[0]
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
+
+    # Check for a pending strategic review from a previously failed chain.
+    # If the design_doc → strategic_review spawn failed last cycle, retry it now
+    # rather than waiting up to 6 more research spawns (~3+ hours).
+    pending_sr = (project.vision or {}).get('_pending_strategic_review')
+    if pending_sr:
+        try:
+            await _spawn_strategic_review(project, session)
+            project.vision = {**project.vision}
+            project.vision.pop('_pending_strategic_review', None)
+            flag_modified(project, 'vision')
+            session.add(project)
+            logger.info(f'[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get("failed_at")})')
+        except Exception as retry_exc:
+            logger.error(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}: {retry_exc}')
+            # Leave the marker — will retry on the next research spawn cycle
+        return  # Don't spawn tactical research this cycle
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update
