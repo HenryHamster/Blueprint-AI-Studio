@@ -188,7 +188,8 @@ _local_processes: dict[str, subprocess.Popen] = {}
 
 
 async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
-                              oauth_token: str | None = None, claude_config_json: str | None = None):
+                              oauth_token: str | None = None, claude_config_json: str | None = None,
+                              task_type: str = ""):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -221,8 +222,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                 f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
             )
     if LOCAL_MODE:
-        return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token)
-    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json)
+        return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token, task_type=task_type)
+    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json, task_type=task_type)
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -259,10 +260,10 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
 
 # ─── Local Mode Implementation ──────────────────────────────────────────────
 
-async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None, oauth_token: str | None = None):
+async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None, oauth_token: str | None = None, task_type: str = ""):
     logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
 
-    agent_jwt = create_agent_token(str(task_id), vm_instance_id)
+    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
 
     env = {
         **os.environ,
@@ -446,12 +447,13 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
 
 
 async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
-                         oauth_token: str | None = None, claude_config_json: str | None = None):
+                         oauth_token: str | None = None, claude_config_json: str | None = None,
+                         task_type: str = ""):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
 
-    agent_jwt = create_agent_token(str(task_id), vm_instance_id)
+    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
 
     # Build the env file content that will be stored in Secret Manager.
     # No credentials are embedded in the startup script metadata — all secrets

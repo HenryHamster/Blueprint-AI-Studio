@@ -67,14 +67,16 @@ def verify_ws_ticket(ticket: str) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid ticket")
 
-def create_agent_token(task_id: str, vm_instance_id: str) -> str:
+def create_agent_token(task_id: str, vm_instance_id: str, task_type: str = "") -> str:
     """
     Generate a short-lived JWT for a specific agent VM.
+    Includes task_type so endpoints can authorize by agent role.
     """
     expire = datetime.now(timezone.utc) + timedelta(hours=2)  # VM TTL is 1h, 2h gives margin
     to_encode = {
         "sub": str(task_id),
         "vm_instance_id": vm_instance_id,
+        "task_type": task_type,
         "exp": expire
     }
     encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)

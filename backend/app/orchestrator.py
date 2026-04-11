@@ -775,8 +775,10 @@ async def orchestrator_worker():
                                 except Exception as e:
                                     logger.error(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}", exc_info=True)
 
+                            t_type = (payloads[0] or {}).get("type", "") if payloads else ""
                             success = await provision_agent_vm(vm_id, t_id, payload_uri,
-                                                               oauth_token=token, claude_config_json=config_json)
+                                                               oauth_token=token, claude_config_json=config_json,
+                                                               task_type=t_type)
                             if success:
                                 # Verify the task still wants this VM — stale recovery may have
                                 # requeued the task with a new vm_id while we were provisioning.

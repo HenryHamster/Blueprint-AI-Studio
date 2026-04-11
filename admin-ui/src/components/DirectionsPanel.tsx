@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Settings, Zap } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
 import { VisionEditorModal } from './VisionEditorModal';
+import DesignDocViewer from './DesignDocViewer';
 
 interface Project {
   id: string;
@@ -116,7 +117,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [vision, setVision] = useState<Record<string, unknown>>({});
   const [visionExpanded, setVisionExpanded] = useState(false);
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
-  const [designDocExpanded, setDesignDocExpanded] = useState(false);
+  const [activeTab, setActiveTab] = useState<'directions' | 'design-doc'>('directions');
   const [showVisionEditor, setShowVisionEditor] = useState(false);
   const [showStrategicOutput, setShowStrategicOutput] = useState(false);
   const [strategicOutput, setStrategicOutput] = useState<Record<string, unknown> | null>(null);
@@ -569,12 +570,12 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
 
       {/* Panel */}
-      <div className="relative ml-auto w-full sm:max-w-lg h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden">
+      <div className={`relative ml-auto w-full ${activeTab === 'design-doc' ? 'sm:max-w-3xl' : 'sm:max-w-lg'} h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden transition-[max-width] duration-200`}>
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-neutral-800 shrink-0">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800 shrink-0">
           <div className="flex items-center gap-2">
-            <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Directions</h2>
-            {proposedCount > 0 && (
+            <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Strategic</h2>
+            {proposedCount > 0 && activeTab === 'directions' && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-purple-950/60 text-purple-400 border border-purple-900/50">
                 {proposedCount} pending
               </span>
@@ -585,21 +586,51 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
           </button>
         </div>
 
-        {/* Project selector + Autonomous toggle */}
-        <div className="px-5 py-3 border-b border-neutral-800 space-y-3 shrink-0">
-          <div>
-            <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Project</label>
-            <select
-              value={selectedProjectId}
-              onChange={e => setSelectedProjectId(e.target.value)}
-              className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-            >
-              {projects.map(p => (
-                <option key={p.id} value={p.id}>{p.name || p.id}</option>
-              ))}
-            </select>
-          </div>
+        {/* Project selector (shared) */}
+        <div className="px-5 py-2 border-b border-neutral-800 shrink-0">
+          <select
+            value={selectedProjectId}
+            onChange={e => setSelectedProjectId(e.target.value)}
+            className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          >
+            {projects.map(p => (
+              <option key={p.id} value={p.id}>{p.name || p.id}</option>
+            ))}
+          </select>
+        </div>
 
+        {/* Tabs */}
+        <div className="flex items-center border-b border-neutral-800 shrink-0">
+          <button
+            onClick={() => setActiveTab('directions')}
+            className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+              activeTab === 'directions'
+                ? 'text-neutral-100 border-b-2 border-blue-500'
+                : 'text-neutral-500 hover:text-neutral-300'
+            }`}
+          >
+            Directions
+          </button>
+          <button
+            onClick={() => setActiveTab('design-doc')}
+            className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+              activeTab === 'design-doc'
+                ? 'text-neutral-100 border-b-2 border-purple-500'
+                : 'text-neutral-500 hover:text-neutral-300'
+            }`}
+          >
+            Design Doc
+            {(() => {
+              const pc = Object.keys(designDoc).filter(k => !k.startsWith('_')).length;
+              return pc > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({pc})</span> : null;
+            })()}
+          </button>
+        </div>
+
+        {/* === Directions tab content === */}
+        {activeTab === 'directions' && (<>
+        {/* Autonomous toggle + config */}
+        <div className="px-5 py-3 border-b border-neutral-800 space-y-3 shrink-0">
           {selectedProjectId && (
             <>
               <div className="flex items-center justify-between">
@@ -1088,167 +1119,48 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
             );
           })()}
 
-          {/* ── Design Document (Architecture) — page-based wiki ───────── */}
+          {/* ── Architecture quick-link → Design Doc tab ───────── */}
           {(() => {
-            // Extract pages from the flat key-value design doc (skip _meta)
             const pages = Object.entries(designDoc).filter(([k]) => !k.startsWith('_'));
             const meta = (designDoc._meta || {}) as Record<string, unknown>;
-            const docSummary = typeof designDoc.summary === 'string' ? designDoc.summary as string : '';
-            const docArch = (typeof designDoc.architecture === 'object' && designDoc.architecture && !Array.isArray(designDoc.architecture))
-              ? designDoc.architecture as Record<string, unknown> : null;
-
-            // Group pages by prefix
-            const systemPages = pages.filter(([k]) => k.startsWith('systems/'))
-              .map(([k, v]) => {
-                const obj = typeof v === 'object' && v ? v as Record<string, unknown> : {};
-                return { key: k, id: String(obj.id || k), name: String(obj.name || k.replace('systems/', '')), status: String(obj.status || 'missing'), description: typeof obj.description === 'string' ? obj.description : '' };
-              });
             const capPages = pages.filter(([k]) => k.startsWith('capabilities/'))
               .map(([k, v]) => {
                 const obj = typeof v === 'object' && v ? v as Record<string, unknown> : {};
-                return { key: k, name: k.replace('capabilities/', ''), status: String(obj.status || 'missing'), notes: typeof obj.notes === 'string' ? obj.notes : '' };
+                return { key: k, name: k.replace('capabilities/', ''), status: String(obj.status || 'missing') };
               });
-            const risksPage = designDoc.risks;
-            const docRisks = Array.isArray(risksPage) ? risksPage as string[] : [];
-            const otherPages = pages.filter(([k]) => !k.startsWith('systems/') && !k.startsWith('capabilities/') && k !== 'summary' && k !== 'architecture' && k !== 'risks');
-
-            const hasContent = pages.length > 0;
-
             const capStatusColors: Record<string, string> = {
               mature: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
               functional: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
               partial: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
               missing: 'bg-red-500/20 text-red-400 border-red-500/30',
             };
-            const sysStatusColors: Record<string, string> = {
-              mature: 'text-cyan-400', functional: 'text-emerald-400',
-              partial: 'text-amber-400', stub: 'text-orange-400', missing: 'text-red-400',
-            };
-
-            if (!hasContent && !designDocExpanded) return null;
-
+            if (pages.length === 0) return null;
             return (
             <div className="mb-5">
-              <div className="flex items-center gap-2 mb-1.5">
-                <button
-                  onClick={() => setDesignDocExpanded(prev => !prev)}
-                  className="flex items-center gap-2 flex-1 text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1 transition-colors"
-                >
-                  {designDocExpanded
-                    ? <ChevronDown className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
-                    : <ChevronRight className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
-                  }
-                  <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
-                    Architecture
+              <button
+                onClick={() => setActiveTab('design-doc')}
+                className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
+              >
+                <ChevronRight className="w-3.5 h-3.5 text-purple-500/60 group-hover:text-purple-400 transition-colors" />
+                <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+                  Architecture
+                </span>
+                {typeof meta.last_updated === 'string' && (
+                  <span className="text-[9px] text-neutral-600 font-mono ml-1">
+                    {formatRelativeTime(meta.last_updated as string)}
                   </span>
-                  {typeof meta.last_updated === 'string' && (
-                    <span className="text-[9px] text-neutral-600 font-mono ml-1">
-                      {formatRelativeTime(meta.last_updated as string)}
-                    </span>
-                  )}
-                  {!designDocExpanded && (
-                    <span className="text-[9px] text-neutral-600 ml-1">{pages.length} pages</span>
-                  )}
-                </button>
-              </div>
-
-              {/* Collapsed: capability badges */}
-              {!designDocExpanded && capPages.length > 0 && (
-                <div className="px-1.5">
+                )}
+                <span className="text-[9px] text-neutral-600 ml-1">{pages.length} pages</span>
+              </button>
+              {capPages.length > 0 && (
+                <div className="px-1.5 mt-0.5">
                   <div className="flex flex-wrap gap-1">
-                    {capPages.slice(0, 8).map(cap => {
-                      const status = String(cap.status || 'missing');
-                      return (
-                        <span key={cap.key} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[status] || capStatusColors.missing}`}>
-                          {cap.name}
-                        </span>
-                      );
-                    })}
+                    {capPages.slice(0, 8).map(cap => (
+                      <span key={cap.key} className={`text-[8px] px-1.5 py-0.5 rounded border ${capStatusColors[cap.status] || capStatusColors.missing}`}>
+                        {cap.name}
+                      </span>
+                    ))}
                   </div>
-                </div>
-              )}
-
-              {/* Expanded */}
-              {designDocExpanded && hasContent && (
-                <div className="bg-neutral-900/60 border border-neutral-800 rounded-lg p-3 space-y-3 text-xs">
-                  {docSummary && <p className="text-neutral-300">{docSummary}</p>}
-
-                  {docArch && typeof docArch.type === 'string' && (
-                    <div>
-                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Architecture</span>
-                      <p className="text-neutral-400 mt-0.5">{String(docArch.type)}{typeof docArch.description === 'string' ? ` — ${docArch.description.slice(0, 200)}` : ''}</p>
-                    </div>
-                  )}
-
-                  {systemPages.length > 0 && (
-                    <div>
-                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Systems</span>
-                      <div className="mt-1 space-y-1">
-                        {systemPages.map(sys => (
-                          <div key={sys.key} className="flex items-start gap-2">
-                            <span className={`text-[9px] font-mono ${sysStatusColors[String(sys.status || 'missing')] || 'text-neutral-500'}`}>
-                              {String(sys.status || '?').toUpperCase()}
-                            </span>
-                            <div className="flex-1 min-w-0">
-                              <span className="text-neutral-200 font-medium">{String(sys.name || sys.id || sys.key)}</span>
-                              {typeof sys.description === 'string' && <span className="text-neutral-500 ml-1.5">{sys.description.slice(0, 120)}</span>}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {capPages.length > 0 && (
-                    <div>
-                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Capabilities</span>
-                      <div className="mt-1 flex flex-wrap gap-1.5">
-                        {capPages.map(cap => (
-                            <span key={cap.key} className={`text-[9px] px-1.5 py-0.5 rounded border ${capStatusColors[cap.status] || capStatusColors.missing}`} title={cap.notes}>
-                              {cap.name}: {cap.status}
-                            </span>
-                          ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {docRisks.length > 0 && (
-                    <div>
-                      <span className="text-[9px] font-semibold text-red-500/70 uppercase tracking-wider">Risks</span>
-                      <ul className="mt-1 space-y-0.5">
-                        {docRisks.map((risk, i) => (
-                          <li key={i} className="text-neutral-400 flex items-start gap-1.5">
-                            <span className="text-red-500/50 mt-0.5">-</span>
-                            <span>{String(risk).slice(0, 200)}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {otherPages.length > 0 && (
-                    <div>
-                      <span className="text-[9px] font-semibold text-neutral-500 uppercase tracking-wider">Other Pages</span>
-                      <div className="mt-1 space-y-1">
-                        {otherPages.map(([key, val]) => (
-                          <div key={key} className="text-neutral-400">
-                            <span className="text-neutral-300 font-medium">{key}</span>
-                            <span className="text-neutral-600 ml-1.5">{JSON.stringify(val).slice(0, 100)}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="text-[9px] text-neutral-600 pt-1 border-t border-neutral-800/50">
-                    rev {String(meta.revision || 0)} — {pages.length} pages
-                  </div>
-                </div>
-              )}
-
-              {designDocExpanded && !hasContent && (
-                <div className="bg-neutral-900/60 border border-neutral-800 border-dashed rounded-lg p-4 text-center">
-                  <p className="text-xs text-neutral-500">No design document yet. The architecture agent will build one on the next strategic cycle.</p>
                 </div>
               )}
             </div>
@@ -1729,6 +1641,14 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
             </div>
           )}
         </div>
+        </>)}
+
+        {/* === Design Doc tab content === */}
+        {activeTab === 'design-doc' && (
+          <div className="flex-1 overflow-hidden">
+            <DesignDocViewer designDoc={designDoc} />
+          </div>
+        )}
       </div>
     </div>
   );

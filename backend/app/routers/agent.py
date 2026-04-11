@@ -229,7 +229,7 @@ async def agent_refresh_token(request: Request, token: dict = Depends(verify_age
     """
     Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
     """
-    new_token = create_agent_token(token["sub"], token["vm_instance_id"])
+    new_token = create_agent_token(token["sub"], token["vm_instance_id"], task_type=token.get("task_type", ""))
     return {"token": new_token}
 
 

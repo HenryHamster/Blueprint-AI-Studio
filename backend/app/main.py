@@ -4536,11 +4536,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     vision_rev = (project.vision or {}).get("revision", 0)
     active_dirs = sum(1 for d in (project.directions or []) if d.get("status") == "active")
 
-    # Check if the agent used the new API (vision was updated during execution)
-    # by comparing vision revision to what it was when the task was spawned
+    # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
-    api_was_used = vision_rev > spawned_vision_rev
+    api_was_used = (task.context or {}).get("_strategic_api_used", False) or vision_rev > spawned_vision_rev
 
     if api_was_used:
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
@@ -6884,6 +6883,11 @@ async def update_design_doc(
     token: dict = Depends(verify_agent_token),
 ):
     """Agent endpoint for incremental design doc updates. Each call updates one page."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+    if token.get("task_type") not in ("design_doc_update",):
+        raise HTTPException(status_code=403, detail="Endpoint restricted to design_doc_update agents")
+
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -6957,9 +6961,20 @@ async def strategic_operation(
     token: dict = Depends(verify_agent_token),
 ):
     """Agent endpoint for incremental strategic review operations."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+    if token.get("task_type") not in ("strategic_review",):
+        raise HTTPException(status_code=403, detail="Endpoint restricted to strategic_review agents")
+
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Stamp task so the completion handler knows the API was used
+    if not (task.context or {}).get("_strategic_api_used"):
+        task.context = {**(task.context or {}), "_strategic_api_used": True}
+        flag_modified(task, "context")
+        session.add(task)
 
     # Lock project for atomic update
     result = await session.execute(
@@ -6970,6 +6985,10 @@ async def strategic_operation(
         raise HTTPException(status_code=404, detail="Project not found")
 
     data = payload.data
+
+    # Size guard — prevent agents from bloating project JSONB columns
+    if len(json.dumps(data, default=str)) > 100_000:
+        raise HTTPException(status_code=400, detail="Data payload too large (max 100KB)")
 
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
