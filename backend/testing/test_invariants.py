@@ -144,3 +144,95 @@ class TestAgentRestrictions:
         assert "alembic" in content.lower(), (
             "CLAUDE.md must mention alembic as a restricted path"
         )
+
+
+# ── main.py Size and Symbol Count Regression Guard ──────────────────────────
+# Direction d-3d050b18: no new functions added to main.py; all new functionality
+# goes in extracted modules.
+
+MAIN_PY_MAX_LINES = 3900      # Ratchet down as extractions land
+MAIN_PY_MAX_FUNCTIONS = 66    # Ratchet down as extractions land
+MAIN_PY_MAX_EXTERNAL_IMPORTS = 60  # Ratchet down as import redirects land
+
+
+def _get_main_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "main.py")
+
+
+class TestMainPyFreeze:
+    """Enforce the main.py freeze: no new functions, no line growth."""
+
+    def test_main_py_line_count(self):
+        """main.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to main.py.
+        New code must go in an extracted module (e.g. backend/app/<domain>.py).
+        Once a line-reducing extraction lands, ratchet MAIN_PY_MAX_LINES down.
+        """
+        main_path = _get_main_py_path()
+        with open(main_path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= MAIN_PY_MAX_LINES, (
+            f"main.py has {count} lines, exceeding the ceiling of {MAIN_PY_MAX_LINES}. "
+            "New functionality must go in extracted modules, not main.py. "
+            "See direction d-3d050b18."
+        )
+
+    def test_main_py_function_count(self):
+        """main.py must not gain new functions.
+
+        If this fails: a new function was added to main.py.
+        New functions must be added to an appropriate extracted module instead.
+        Once a function-removing extraction lands, ratchet MAIN_PY_MAX_FUNCTIONS down.
+        """
+        import ast
+        main_path = _get_main_py_path()
+        with open(main_path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= MAIN_PY_MAX_FUNCTIONS, (
+            f"main.py has {func_count} functions, exceeding the ceiling of {MAIN_PY_MAX_FUNCTIONS}. "
+            "New functions must go in extracted modules, not main.py. "
+            "See direction d-3d050b18."
+        )
+
+    def test_main_py_external_import_count(self):
+        """Other backend modules must not import more symbols from app.main than the ceiling.
+
+        If this fails: a new import from app.main was added elsewhere.
+        As extractions re-export symbols from their new modules, update imports at
+        the call sites to point to the extracted module and ratchet
+        MAIN_PY_MAX_EXTERNAL_IMPORTS down.
+        """
+        import ast
+        import glob
+
+        app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
+        main_path = os.path.realpath(_get_main_py_path())
+
+        imported_names: set = set()
+        for path in glob.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
+            if os.path.realpath(path) == main_path:
+                continue
+            try:
+                with open(path) as f:
+                    tree = ast.parse(f.read())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module in ("app.main", "main"):
+                    for alias in node.names:
+                        imported_names.add(alias.name)
+
+        count = len(imported_names)
+        assert count <= MAIN_PY_MAX_EXTERNAL_IMPORTS, (
+            f"{count} unique symbols are imported from app.main by other modules, "
+            f"exceeding the ceiling of {MAIN_PY_MAX_EXTERNAL_IMPORTS}. "
+            "Update import sites to point to the extracted module instead of app.main. "
+            "See direction d-3d050b18."
+        )
