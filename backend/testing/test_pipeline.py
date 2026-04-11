@@ -270,6 +270,53 @@ class TestFailureClassification:
         task = self._make_task("node process killed by SIGTERM")
         assert classify_failure(task) == "AGENT_TIMEOUT"
 
+    # New EXTERNAL_API DNS/network keywords
+    def test_external_api_could_not_resolve_hostname(self):
+        task = self._make_task("could not resolve hostname: api.example.com")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_name_or_service_not_known(self):
+        task = self._make_task("name or service not known")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_network_unreachable(self):
+        task = self._make_task("network unreachable")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    # New PROVISION_FAILURE keywords
+    def test_provision_failure_service_temporarily_unavailable(self):
+        task = self._make_task("service is temporarily unavailable")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_provision_failure_compute_googleapis(self):
+        task = self._make_task("compute.googleapis.com returned 503")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_provision_failure_resource_not_found(self):
+        task = self._make_task("resource not found: projects/foo/zones/us-central1-a/instances/vm-123")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_provision_failure_container_killed(self):
+        task = self._make_task("container killed by orchestrator")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    # New AGENT_TIMEOUT keywords
+    def test_agent_timeout_killed_by_linux_kernel(self):
+        task = self._make_task("Killed by Linux kernel for memory")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_cgroup_memory(self):
+        task = self._make_task("memory cgroup out of memory")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_exit_code_124(self):
+        task = self._make_task("process exited with exit code 124")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_agent_timeout_exit_code_139(self):
+        task = self._make_task("process exited with exit code 139")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
 
 # ── Deployment Monitoring ───────────────────────────────────────────────────
 
@@ -1265,6 +1312,110 @@ async def test_default_priority_50_source_produces_priority_50_review(spawn_db, 
 
     assert result is not None
     assert result.priority == 50, f"Expected priority 50 but got {result.priority}"
+
+
+# ── Error Message Fingerprinting ────────────────────────────────────────────
+
+class TestErrorMessageFingerprinting:
+    """Tests for _normalize_error_message and _error_fingerprint in task_completion."""
+
+    def setup_method(self):
+        from app.task_completion import _normalize_error_message, _error_fingerprint
+        self._normalize = _normalize_error_message
+        self._fp = _error_fingerprint
+
+    def test_identical_messages_same_fingerprint(self):
+        msg = "process exited with code 1"
+        assert self._fp(msg) == self._fp(msg)
+
+    def test_messages_differing_only_in_pr_number_same_fingerprint(self):
+        msg1 = "Rollup PR #839 created but review not spawned"
+        msg2 = "Rollup PR #712 created but review not spawned"
+        assert self._fp(msg1) == self._fp(msg2)
+
+    def test_messages_differing_only_in_uuid_same_fingerprint(self):
+        msg1 = "Task 3f6e8a12-0001-4abc-8def-000000000001 failed with exit code 1"
+        msg2 = "Task 9ab12cde-f001-4abc-8def-aabbccddeeff failed with exit code 1"
+        # UUIDs are stripped so both normalize the same way
+        assert self._fp(msg1) == self._fp(msg2)
+
+    def test_different_root_causes_different_fingerprint(self):
+        msg1 = "process exited with code 1"
+        msg2 = "could not resolve hostname api.github.com"
+        assert self._fp(msg1) != self._fp(msg2)
+
+    def test_normalize_strips_uuid(self):
+        msg = "Task a1b2c3d4-e5f6-7890-abcd-ef1234567890 failed"
+        normalized = self._normalize(msg)
+        assert "a1b2c3d4" not in normalized
+        assert "<uuid>" in normalized
+
+    def test_normalize_strips_pr_number(self):
+        normalized = self._normalize("Blocked: PR #1234 not merged")
+        assert "#1234" not in normalized
+        assert "<pr>" in normalized
+
+    def test_normalize_strips_timestamp(self):
+        normalized = self._normalize("Last seen at 2026-04-11T12:34:56.789Z")
+        assert "2026-04-11" not in normalized
+        assert "<ts>" in normalized
+
+    def test_empty_message_returns_empty(self):
+        assert self._normalize("") == ""
+        assert self._fp("") == self._fp("")  # consistent hash of empty
+
+
+@pytest.mark.asyncio
+async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
+    """When >3 failures share a class, anomaly dict includes top_patterns."""
+    from app.task_completion import _compute_research_anomalies
+
+    mocker.patch(
+        "app.task_completion._compute_research_anomalies.__module__",
+        create=True,
+    )
+    # Patch classify_failure to return CODE_ERROR for all tasks
+    mocker.patch("app.main.classify_failure", return_value="CODE_ERROR")
+
+    project = Project(name="AnomalyTest", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)  # naive UTC, matches DB
+    recent = now - _dt.timedelta(hours=12)
+
+    # Create 4 failed tasks with 2 distinct error patterns
+    msgs = [
+        "process exited with code 1 on PR #100",
+        "process exited with code 1 on PR #101",
+        "process exited with code 1 on PR #102",
+        "could not resolve hostname api.github.com",
+    ]
+    for msg in msgs:
+        t = Task(
+            project_id=project.id,
+            title="failing task",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            created_at=recent,
+        )
+        spawn_db.add(t)
+    await spawn_db.commit()
+
+    anomalies = await _compute_research_anomalies(project.id, spawn_db)
+
+    assert len(anomalies) >= 1
+    anomaly = anomalies[0]
+    assert "top_patterns" in anomaly
+    patterns = anomaly["top_patterns"]
+    assert len(patterns) >= 1
+    # The "process exited" pattern should appear 3 times (same fingerprint)
+    counts = sorted([p["count"] for p in patterns], reverse=True)
+    assert counts[0] == 3, f"Expected top pattern count=3, got {counts}"
+    assert counts[1] == 1
 
 
 @pytest.mark.asyncio

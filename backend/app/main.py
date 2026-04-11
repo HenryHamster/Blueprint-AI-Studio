@@ -193,7 +193,9 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "timed out waiting for operation", "sshd", "startup script",
                                       "no space left on device", "disk quota exceeded",
                                       "filesystem is full",
-                                      "address already in use", "failed to connect"]):
+                                      "address already in use", "failed to connect",
+                                      "service is temporarily unavailable", "compute.googleapis.com",
+                                      "resource not found", "container killed"]):
         return "PROVISION_FAILURE"
 
     # Transient API overload — server-side, not account-specific (must be checked before RATE_LIMIT
@@ -217,7 +219,9 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "github api error", "claude api",
                                       "connection timed out", "name resolution failed",
                                       "ssl", "certificate",
-                                      "context_length_exceeded", "token limit exceeded"]):
+                                      "context_length_exceeded", "token limit exceeded",
+                                      "could not resolve hostname", "name or service not known",
+                                      "network unreachable"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
@@ -230,8 +234,9 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "out of memory", "oom-kill", "memory limit exceeded",
                                       "cannot allocate memory",
                                       "exit code 137", "exit code 143",
+                                      "exit code 124", "exit code 139",
                                       "node process killed",
-                                      "oom killer",
+                                      "oom killer", "killed by", "cgroup",
                                       "[fatal:", "fatal error", "process crashed"]):
         return "AGENT_TIMEOUT"
 

@@ -332,6 +332,33 @@ def _build_research_context(
     return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
 
 
+def _normalize_error_message(msg: str) -> str:
+    """Strip task-specific identifiers from an error message so identical root causes group together.
+
+    Removes UUIDs, PR numbers, branch names, timestamps, and numeric IDs so that
+    messages differing only in task-specific details produce the same fingerprint.
+    """
+    if not msg:
+        return ""
+    # Strip UUIDs (8-4-4-4-12 hex)
+    normalized = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<uuid>', msg, flags=re.IGNORECASE)
+    # Strip PR numbers (e.g. PR #123, #123, pr/123)
+    normalized = re.sub(r'(?:PR\s*)?#\d+', '<pr>', normalized, flags=re.IGNORECASE)
+    # Strip branch names like blueprint/task-abc123 or feature/some-branch-42
+    normalized = re.sub(r'\b[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*\b', '<branch>', normalized, flags=re.IGNORECASE)
+    # Strip ISO timestamps (2026-04-11T12:34:56.789Z etc.)
+    normalized = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?', '<ts>', normalized)
+    # Strip remaining standalone numbers (keep short words that happen to be digits like exit codes)
+    normalized = re.sub(r'\b\d{4,}\b', '<id>', normalized)
+    return normalized.strip()
+
+
+def _error_fingerprint(msg: str) -> str:
+    """Return a short hash fingerprint of a normalized error message."""
+    normalized = _normalize_error_message(msg or "")
+    return hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+
 async def _compute_research_anomalies(project_id, session: AsyncSession) -> list:
     """Analyze recent task data to identify pipeline anomalies for undirected research focus.
 
@@ -372,24 +399,50 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     for cls, tasks in recent_by_class.items():
         count = len(tasks)
         prior_count = prior_by_class.get(cls, 0)
+
+        # Build top error patterns when there are enough failures to be interesting
+        top_patterns: list[dict] = []
+        if count > 3:
+            pattern_counts: dict[str, dict] = {}
+            for t in tasks:
+                msg = t.latest_status_message or ""
+                fp = _error_fingerprint(msg)
+                if fp not in pattern_counts:
+                    pattern_counts[fp] = {"fingerprint": fp, "count": 0, "example_message": msg}
+                pattern_counts[fp]["count"] += 1
+            # Sort descending by count, take top 3
+            top_patterns = sorted(pattern_counts.values(), key=lambda x: x["count"], reverse=True)[:3]
+
         if count > 3 and prior_count > 0 and count >= prior_count * 2:
-            anomalies.append({
+            anomaly: dict = {
                 "signal": f"{cls} failures increased {prior_count}x → {count}x in last 48h",
                 "severity": "high",
                 "details": (
                     f"{cls} failure count rose from {prior_count} to {count} between the prior "
                     f"48h window and the current one. Investigate common error patterns."
                 ),
-            })
+            }
+            if top_patterns:
+                anomaly["top_patterns"] = top_patterns
+            anomalies.append(anomaly)
         elif count > 3:
-            anomalies.append({
+            pattern_summary = "; ".join(
+                f"({p['count']}x) \"{p['example_message'][:80]}\"" for p in top_patterns
+            ) if top_patterns else ""
+            detail_msg = (
+                f"{count} tasks failed with class {cls} in the last 48h. "
+                "Consider investigating shared root causes."
+            )
+            if pattern_summary:
+                detail_msg += f" Top patterns: {pattern_summary}"
+            anomaly = {
                 "signal": f"{cls} failures: {count} occurrences in last 48h",
                 "severity": "medium",
-                "details": (
-                    f"{count} tasks failed with class {cls} in the last 48h. "
-                    "Consider investigating shared root causes."
-                ),
-            })
+                "details": detail_msg,
+            }
+            if top_patterns:
+                anomaly["top_patterns"] = top_patterns
+            anomalies.append(anomaly)
 
     # --- Direction merge rate and failure rate analysis ---
     project = (await session.execute(
