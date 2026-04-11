@@ -8,7 +8,8 @@ import {
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  TASK_TYPE_HINTS, readClaudeMd, formatProjectContext, configureAgentPermissions,
+  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
+  writePlaybookHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
@@ -38,6 +39,7 @@ export async function handleReview(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
@@ -87,7 +89,8 @@ export async function handleReview(
   const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
 
   // Build review prompt — Claude has full repo access, not just a diff blob
-  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
+  const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
 ${iterationPreamble}
 
@@ -193,6 +196,7 @@ export async function handleFix(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
@@ -274,16 +278,20 @@ export async function handleFix(
     enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${strVal(fixParentCtx.parent_title)}**\nParent goal: ${strVal(fixParentCtx.parent_prompt)}\n\n${enrichedPrompt}`;
   }
 
-  // Prepend CLAUDE.md instructions
+  // Prepend CLAUDE.md instructions + playbook
   const fixClaudeMd = readClaudeMd();
+  const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
   if (fixClaudeMd) {
-    enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${enrichedPrompt}`;
+    enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${fixPlaybookSection}${enrichedPrompt}`;
+  } else if (fixPlaybookSection) {
+    enrichedPrompt = `${fixPlaybookSection}${enrichedPrompt}`;
   }
 
-  // Append fix-specific task type hint
+  // Append fix-specific task type hint and playbook guidance
   if (TASK_TYPE_HINTS['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${TASK_TYPE_HINTS['fix']}`;
   }
+  enrichedPrompt = `${enrichedPrompt}${PLAYBOOK_GUIDANCE}`;
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';

@@ -400,6 +400,215 @@ async def test_agent_claim_active_tasks_related_files_defaults_to_empty(client: 
     assert active_tasks[0]["related_files"] == []
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_set_and_get(client: AsyncClient, db_session):
+    """Tests setting and retrieving playbook entries via POST /api/agent/playbook."""
+    project = Project(name="Playbook Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-playbook1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook1")
+    headers = {"x-agent-token": token}
+
+    # Set two playbook entries
+    resp = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "set", "key": "build-commands", "value": "npm run build"
+    }, headers=headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["op"] == "set"
+    assert data["key"] == "build-commands"
+    assert data["revision"] == 1
+
+    resp2 = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "set", "key": "lint-rules", "value": "eslint --max-warnings 0"
+    }, headers=headers)
+    assert resp2.status_code == 200
+    assert resp2.json()["revision"] == 2
+
+    # Verify stored in design_doc
+    await db_session.refresh(project)
+    assert project.design_doc is not None
+    assert "playbook/build-commands" in project.design_doc
+    assert project.design_doc["playbook/build-commands"]["content"] == "npm run build"
+    assert project.design_doc["playbook/build-commands"]["source_task_id"] == str(task.id)
+    assert "playbook/lint-rules" in project.design_doc
+
+    # Get all playbook entries
+    resp3 = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "get"
+    }, headers=headers)
+    assert resp3.status_code == 200
+    data3 = resp3.json()
+    assert data3["status"] == "ok"
+    assert data3["op"] == "get"
+    entries = data3["entries"]
+    assert "build-commands" in entries
+    assert entries["build-commands"]["content"] == "npm run build"
+    assert "lint-rules" in entries
+
+    # List keys
+    resp4 = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "list"
+    }, headers=headers)
+    assert resp4.status_code == 200
+    data4 = resp4.json()
+    assert set(data4["keys"]) == {"build-commands", "lint-rules"}
+
+    # Delete one entry
+    resp5 = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "delete", "key": "lint-rules"
+    }, headers=headers)
+    assert resp5.status_code == 200
+    assert resp5.json()["status"] == "ok"
+
+    await db_session.refresh(project)
+    assert "playbook/lint-rules" not in project.design_doc
+    assert "playbook/build-commands" in project.design_doc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_size_limits(client: AsyncClient, db_session):
+    """Tests that per-entry 2KB and total 30KB size limits are enforced."""
+    project = Project(name="Playbook Size Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix it"}],
+        vm_instance_id="agent-vm-playbook2",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook2")
+    headers = {"x-agent-token": token}
+
+    # Per-entry limit: value > 2048 bytes should be rejected
+    oversized_value = "x" * 2049
+    resp = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "set", "key": "too-big", "value": oversized_value
+    }, headers=headers)
+    assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
+    assert "2KB" in resp.json()["error"]["message"]
+
+    # Total playbook limit: fill up to near 30KB then overflow
+    # Each entry ~2000 chars; 16 entries = ~32KB total
+    large_value = "y" * 2000
+    for i in range(14):
+        r = await client.post("/api/agent/playbook", json={
+            "task_id": str(task.id), "op": "set", "key": f"entry-{i:02d}", "value": large_value
+        }, headers=headers)
+        assert r.status_code == 200, f"Entry {i} failed: {r.json()}"
+
+    # The 15th entry should push past 30KB
+    resp2 = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "set", "key": "overflow-entry", "value": large_value
+    }, headers=headers)
+    assert resp2.status_code == 400, f"Expected 400, got: {resp2.json()}"
+    assert "30KB" in resp2.json()["error"]["message"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_any_task_type_allowed(client: AsyncClient, db_session):
+    """Tests that any task type (not just design_doc_update) can use the playbook endpoint."""
+    project = Project(name="Playbook Any Type Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Use task type "create" — unlike the design-doc endpoint which restricts by type
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build something"}],
+        vm_instance_id="agent-vm-playbook3",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook3")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post("/api/agent/playbook", json={
+        "task_id": str(task.id), "op": "set", "key": "test-pattern", "value": "use pytest fixtures"
+    }, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_response_includes_playbook(client: AsyncClient, db_session):
+    """Tests that claim endpoint injects playbook entries into the response."""
+    project = Project(name="Claim Playbook Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed playbook entries directly in design_doc
+    from sqlalchemy.orm.attributes import flag_modified
+    project.design_doc = {
+        "playbook/build-steps": {
+            "content": "run npm run build",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+        "playbook/test-commands": {
+            "content": "bash scripts/test-backend.sh",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-claim-playbook",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-claim-playbook")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "playbook" in data, f"Expected 'playbook' in claim response, got keys: {list(data.keys())}"
+    playbook = data["playbook"]
+    assert "build-steps" in playbook
+    assert playbook["build-steps"] == "run npm run build"
+    assert "test-commands" in playbook
+    assert playbook["test-commands"] == "bash scripts/test-backend.sh"
+
+
 def test_agent_ws_invalid_token_closes_with_1008(mocker):
     """
     Tests that connecting to the agent WebSocket without a valid token causes

@@ -62,6 +62,61 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg".';
 
+// ── Playbook helpers ─────────────────────────────────────────────────────────
+
+export function writePlaybookHelper(taskId: string): void {
+  const helperScript = `#!/bin/bash
+OP="\${1:?Usage: playbook get|set|list|delete <key> [content]}"
+KEY="\$2"
+VALUE="\$3"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+
+if [ "\$OP" = "get" ]; then
+  printf '{"task_id":"%s","op":"get"}' "\$TASK" | \\
+    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+elif [ "\$OP" = "set" ]; then
+  [ -z "\$KEY" ] || [ -z "\$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
+  jq -n --arg tid "\$TASK" --arg k "\$KEY" --arg v "\$VALUE" \\
+    '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
+    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+elif [ "\$OP" = "delete" ]; then
+  jq -n --arg tid "\$TASK" --arg k "\$KEY" \\
+    '{task_id: $tid, op: "delete", key: $k}' | \\
+    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+elif [ "\$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "\$TASK" | \\
+    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+fi
+echo ""
+`;
+  fs.writeFileSync(`${WORKSPACE}/playbook`, helperScript, { mode: 0o755 });
+}
+
+export function formatPlaybook(playbook: Record<string, string> | undefined): string {
+  if (!playbook || Object.keys(playbook).length === 0) return '';
+  const lines = Object.entries(playbook)
+    .map(([key, content]) => `### ${key}\n${content}`)
+    .join('\n\n');
+  return `## Operational Playbook (knowledge from past agents)\n\nThese notes were left by previous agents working on this codebase. Trust them as operational guidance.\n\n${lines}\n\n`;
+}
+
+export const PLAYBOOK_GUIDANCE = `
+## Operational Playbook
+If you discover operational knowledge that would help future agents working on this codebase, save it using the playbook tool:
+\`\`\`bash
+./playbook set "build" "Run backend tests with: bash scripts/test-backend.sh. Do NOT use pytest directly."
+./playbook set "gotchas" "Barrel file imports cause frontend build failures. Import from specific modules."
+\`\`\`
+Only save knowledge that is NOT already in CLAUDE.md and would prevent future agents from making mistakes.
+Do not save task-specific details — only reusable operational knowledge.
+`;
+
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
 export function readClaudeMd(): string {
   const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;

@@ -7036,6 +7036,116 @@ async def update_design_doc(
     return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
 
 
+# ── Agent Playbook ───────────────────────────────────────────────────────
+# Any agent task type can read/write persistent operational knowledge stored
+# as playbook/* keys in the project's design_doc JSONB column.
+
+class PlaybookUpdate(BaseModel):
+    task_id: uuid.UUID
+    op: str  # "get", "set", "delete", "list"
+    key: Optional[str] = None  # alphanumeric + hyphens, max 50 chars
+    value: Optional[str] = None  # plain text, max 2KB
+
+
+_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
+
+
+@app.post("/api/agent/playbook")
+@limiter.limit("120/minute")
+async def update_playbook(
+    request: Request,
+    payload: PlaybookUpdate,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Agent endpoint for persistent operational playbook. Any task type may call this."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+    # NOTE: unlike design-doc, no task_type restriction — any agent may use playbook
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    op = payload.op
+    if op not in ("get", "set", "delete", "list"):
+        raise HTTPException(status_code=400, detail=f"Unknown op: {op}")
+
+    if op == "list":
+        project = await session.get(Project, task.project_id)
+        doc = project.design_doc or {} if project else {}
+        keys = [k[len("playbook/"):] for k in doc if k.startswith("playbook/")]
+        return {"status": "ok", "op": op, "keys": keys}
+
+    if op == "get":
+        project = await session.get(Project, task.project_id)
+        doc = project.design_doc or {} if project else {}
+        entries = {}
+        for k, v in doc.items():
+            if k.startswith("playbook/") and isinstance(v, dict):
+                short_key = k[len("playbook/"):]
+                entries[short_key] = {
+                    "content": v.get("content", ""),
+                    "updated_at": v.get("updated_at", ""),
+                    "source_task_id": v.get("source_task_id", ""),
+                }
+        return {"status": "ok", "op": op, "entries": entries}
+
+    # set / delete require a valid key
+    if not payload.key:
+        raise HTTPException(status_code=400, detail="key is required for set/delete")
+    key = payload.key.strip()
+    if key.startswith("_") or not _PLAYBOOK_KEY_RE.match(key):
+        raise HTTPException(status_code=400, detail="Invalid key: must be alphanumeric+hyphens, max 50 chars, no _ prefix")
+
+    # Lock project for atomic update
+    result = await session.execute(
+        select(Project).where(Project.id == task.project_id).with_for_update()
+    )
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    import json as _json
+    doc = dict(project.design_doc or {})
+    meta = doc.get("_meta", {"revision": 0})
+
+    if op == "set":
+        if payload.value is None:
+            raise HTTPException(status_code=400, detail="value is required for set")
+        if len(payload.value) > 2048:
+            raise HTTPException(status_code=400, detail=f"Value too large ({len(payload.value)} bytes, max 2KB)")
+        playbook_key = f"playbook/{key}"
+        existing = doc.get(playbook_key, {})
+        doc[playbook_key] = {
+            "content": payload.value,
+            "source_task_id": str(task.id),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": existing.get("confirmed_count", 0),
+        }
+        # Size check: all playbook/* keys combined max 30KB
+        playbook_total = sum(
+            len(_json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
+        )
+        if playbook_total > 30_000:
+            del doc[playbook_key]  # rollback
+            raise HTTPException(status_code=400, detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)")
+    elif op == "delete":
+        doc.pop(f"playbook/{key}", None)
+
+    meta["revision"] = meta.get("revision", 0) + 1
+    meta["last_updated"] = _utcnow().isoformat()
+    meta["updated_by_task"] = str(task.id)
+    doc["_meta"] = meta
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    return {"status": "ok", "op": op, "key": key, "revision": meta["revision"]}
+
+
 # ── Agent Annotations ───────────────────────────────────────────────────
 # Any agent can leave comments, issues, or vision suggestions.
 # Stored as ProjectMessages so design-doc and strategic agents pick them up

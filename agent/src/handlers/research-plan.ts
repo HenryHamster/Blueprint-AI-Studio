@@ -7,7 +7,8 @@ import {
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  writePlaybookHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -28,14 +29,16 @@ export async function handlePlan(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
 
   const contextPrefix = buildContextPrefix(task);
 
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const planPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
 
-  const planPrompt = `${claudeMdPrefix}${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+  const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}
@@ -98,7 +101,7 @@ Rules:
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
 - For subtasks that involve the agent system (agent/src/index.ts), note that the agent is a monolithic file — be aware of potential conflicts with parallel subtasks touching the same file.
-- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}`;
+- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}${PLAYBOOK_GUIDANCE}`;
 
   statusRef.value = 'Running Claude Code for planning...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -206,6 +209,7 @@ export async function handleResearch(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
 
   let gitLogOutput = '';
@@ -255,6 +259,7 @@ ${hotspotsSection}
   const codebaseSummary = claudeMd
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
+  const researchPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
 
   const fileTreeSection = buildFileTree(ws);
 
@@ -611,7 +616,7 @@ ${outcomeSection}
 ${dirSummaryText}
 ${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
 ## Codebase
-${codebaseSummary}${fileTreeSection}
+${codebaseSummary}${researchPlaybookSection}${fileTreeSection}
 
 # Your task
 
@@ -746,7 +751,7 @@ ${analysisText.slice(0, 50_000)}
     ? `# ARCHITECTURE (Design Document)\nFull architectural context. Your direction's specific context is highlighted above.\n${JSON.stringify(tacticalDesignDoc, null, 2)}\n\n`
     : '';
 
-  const researchPrompt = `${contextPrefix}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
+  const researchPrompt = `${contextPrefix}${researchPlaybookSection}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
 
@@ -854,7 +859,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + PLAYBOOK_GUIDANCE, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);

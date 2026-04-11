@@ -6,7 +6,8 @@ import {
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  TASK_TYPE_HINTS, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  writePlaybookHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
@@ -23,6 +24,7 @@ export async function handleSecurityAudit(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('security_audit');
 
   const contextPrefix = buildContextPrefix(task);
@@ -33,11 +35,12 @@ export async function handleSecurityAudit(
     : '';
 
   const fileTreeSection = buildFileTree(ws);
+  const secPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
 
   const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
 
-  const securityPrompt = `${codebaseSummary}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
+  const securityPrompt = `${codebaseSummary}${secPlaybookSection}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
 
 Analyze the codebase for the following vulnerability categories:
 1. OWASP Top 10 vulnerabilities
@@ -120,6 +123,7 @@ export async function handleMigrate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('migrate');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
@@ -183,9 +187,10 @@ CRITICAL RULES:
 
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
+  const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePrompt + migratePromptSuffix, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePlaybookSection + migratePrompt + PLAYBOOK_GUIDANCE + migratePromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
   const hasChanges = diff.length > 0;
@@ -260,6 +265,7 @@ export async function handleSmoketest(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('smoketest');
 
   const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
@@ -373,6 +379,7 @@ export async function handleDebug(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', rawBaseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('debug');
 
   // Gather git context upfront to include in the prompt
@@ -473,6 +480,7 @@ export async function handlePerf(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('perf');
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
@@ -554,6 +562,7 @@ export async function handleInvestigate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions('investigate');
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.

@@ -6,8 +6,9 @@ import {
   runClaudeCode, lintFixLoop, testFixLoop,
 } from '../index.js';
 import {
-  TASK_TYPE_HINTS, DEFAULT_TOOL_GUIDANCE,
+  TASK_TYPE_HINTS, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
+  writePlaybookHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
@@ -67,9 +68,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
-  const finalPrompt = claudeMdPrefix + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const playbookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const finalPrompt = claudeMdPrefix + playbookSection + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
+  writePlaybookHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
   const fileTree = buildFileTree(ws);

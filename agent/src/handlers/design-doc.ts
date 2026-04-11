@@ -8,6 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  writePlaybookHelper,
 } from '../prompt.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
@@ -26,6 +27,7 @@ export async function handleDesignDocUpdate(
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
 
   const disallowedTools = configureAgentPermissions('design_doc_update');
 
@@ -169,7 +171,10 @@ ${codebaseSummary}${fileTreeSection}
 6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
 7. Focus on WHAT IS. Document missing things as missing.
 8. Review open messages — if any are agent annotations (comments, issues),
-   incorporate valid observations into the relevant pages and update accordingly.`;
+   incorporate valid observations into the relevant pages and update accordingly.
+9. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
+   and validate that entries reflect the current codebase state. Use ./playbook delete <key>
+   for stale entries.`;
 
   statusRef.value = 'Running architecture review...';
   let { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);

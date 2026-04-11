@@ -480,6 +480,18 @@ async def claim_task(
             "pipeline_health": pipeline_health,
         }
 
+
+    # Inject playbook for ALL task types (outside the project_context gate)
+    project_for_playbook = await session.get(Project, task.project_id)
+    if project_for_playbook and project_for_playbook.design_doc:
+        playbook_entries = {}
+        for k, v in (project_for_playbook.design_doc or {}).items():
+            if k.startswith("playbook/") and isinstance(v, dict):
+                short_key = k[len("playbook/"):]
+                playbook_entries[short_key] = v.get("content", "")
+        if playbook_entries:
+            response["playbook"] = playbook_entries
+
     return response
 
 @router.post("/artifacts/upload-url")
