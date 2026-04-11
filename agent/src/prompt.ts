@@ -446,6 +446,14 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
       parts.push(`Success rate: ${pct}%${trendStr}.`);
     }
 
+    const fasr = pipelineHealth.first_attempt_success_rate as Record<string, unknown> | undefined;
+    if (fasr && fasr.overall !== null && fasr.overall !== undefined && (fasr.sample_size as number) > 0) {
+      const faPct = Math.round((fasr.overall as number) * 100);
+      const faTrend = fasr.trend as string | undefined;
+      const faTrendStr = faTrend ? ` (${faTrend})` : '';
+      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${fasr.sample_size}.`);
+    }
+
     const failureDist = pipelineHealth.failure_distribution as Record<string, number> | undefined;
     if (failureDist && Object.keys(failureDist).length > 0) {
       const failStr = Object.entries(failureDist)

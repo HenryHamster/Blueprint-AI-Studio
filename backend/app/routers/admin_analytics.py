@@ -424,8 +424,25 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if rate is not None:
             first_attempt_by_type[task_type] = rate
 
+    current_first_attempt_rate = _first_attempt_rate(terminal_tasks_24h)
+
+    # Previous window for first_attempt trend comparison
+    prev_terminal_tasks = prev_completed + prev_failed
+    prev_first_attempt_rate = _first_attempt_rate(prev_terminal_tasks)
+
+    first_attempt_trend: Optional[str] = None
+    if current_first_attempt_rate is not None and prev_first_attempt_rate is not None:
+        fa_delta = current_first_attempt_rate - prev_first_attempt_rate
+        if fa_delta > 0.05:
+            first_attempt_trend = "improving"
+        elif fa_delta < -0.05:
+            first_attempt_trend = "declining"
+        else:
+            first_attempt_trend = "stable"
+
     first_attempt_success_rate = {
-        "overall": _first_attempt_rate(terminal_tasks_24h),
+        "overall": current_first_attempt_rate,
+        "trend": first_attempt_trend,
         "with_playbook": _first_attempt_rate(tasks_with_playbook) if tasks_with_playbook else None,
         "without_playbook": _first_attempt_rate(tasks_without_playbook) if tasks_without_playbook else None,
         "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),
