@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
-  apiPost, apiGet, cloneWithRetry, runClaudeCode,
+  apiPost, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -543,28 +543,33 @@ ${hotspotsSection}
       : '';
 
     // Write the strategic helper script (same pattern as design-doc)
+    // Uses printf + pipe to avoid shell expansion of JSON in curl -d
     const strategicHelper = `#!/bin/bash
 # Strategic review tool — updates vision, directions, and messages via API
 # Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env
-OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message <args>}"
+OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message <json>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
+DATA="\$1"
+
+_call() {
+  printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
+    curl -f -sS --max-time 30 --connect-timeout 10 \\
+      -X POST "\$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" \\
+      -H "X-Agent-Token: \$TOKEN" \\
+      --data-binary @-
+}
 
 case "\$OP" in
-  set-vision)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"set_vision\\", \\"data\\": \$1}" ;;
-  create-direction)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"create_direction\\", \\"data\\": \$1}" ;;
-  update-direction)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"update_direction\\", \\"data\\": \$1}" ;;
-  retire-direction)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"retire_direction\\", \\"data\\": \$1}" ;;
-  create-message)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"create_message\\", \\"data\\": \$1}" ;;
-  resolve-message)
-    curl -f -X POST "\$API/api/agent/strategic" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"\$TASK\\", \\"op\\": \\"resolve_message\\", \\"data\\": \$1}" ;;
+  set-vision)        _call "set_vision" ;;
+  create-direction)  _call "create_direction" ;;
+  update-direction)  _call "update_direction" ;;
+  retire-direction)  _call "retire_direction" ;;
+  create-message)    _call "create_message" ;;
+  resolve-message)   _call "resolve_message" ;;
   *) echo "Unknown op: \$OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -589,92 +594,92 @@ echo ""
 `;
     fs.writeFileSync(`${WORKSPACE}/design-doc`, designDocHelper, { mode: 0o755 });
 
-    // CLAUDE.md as persistent reminder
-    fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
-      `# Strategic Review Agent\nCRITICAL: Your ONLY output is via \`./strategic\` and \`./design-doc\` commands.\nAny text you write will be DISCARDED. Only API calls persist.\nBefore finishing, confirm you called ./strategic set-vision at least once.\n`
-    );
+    // ── Pass 1: Thinker — analyze freely, write prose ──
+    // Let the agent do what it's good at: read code, reason about architecture,
+    // write a strategic analysis. No API constraints, no JSON formatting.
+    const thinkerPrompt = `${contextPrefix}You are a strategic product architect reviewing this project.
 
-    const strategicPrompt = `${contextPrefix}# YOUR ONLY OUTPUT MECHANISM
+# Project: ${projectName}
 
-Your text output will be DISCARDED. The ONLY way to save your work is via these commands:
+## Architecture (design document — current state)
+${designDocJson || 'No design document yet.'}
 
-\`\`\`bash
-# 1. Set the vision (REQUIRED — do this first)
-./strategic set-vision '{"purpose": "What this product is", "success_criteria": ["Goal 1"], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "notes"}'
-
-# 2. Create directions for the most impactful work (max 5)
-./strategic create-direction '{"text": "Direction description", "priority": "high", "system_id": "sys-x", "rationale": "Why"}'
-
-# 3. Update existing directions if needed
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium"}, "rationale": "Why"}'
-
-# 4. Retire completed/irrelevant directions
-./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "Why"}'
-
-# 5. Save notes for future reference (optional)
-./design-doc set "notes/strategic-review" '"Your observations about project direction, risks, opportunities"'
-
-# 6. Ask user a question or resolve a message (optional)
-./strategic create-message '{"type": "question", "content": "Your question"}'
-./strategic resolve-message '{"message_id": "uuid", "resolution": "How addressed"}'
-\`\`\`
-
-Call these commands AS YOU REASON. Each call saves immediately. Do NOT wait until the end.
-Do NOT create files, write JSON to /tmp/, or open PRs.
-
-# Context for your decisions
-
-## Project: ${projectName}
-
-## Architecture (design document — what IS)
-${designDocJson || 'No design document yet. Use the file tree to understand the codebase.'}
-
-## Vision (what SHOULD BE)
-${visionJson || 'No vision yet. Create one with ./strategic set-vision.'}
+## Vision (current)
+${visionJson || 'No vision set yet.'}
 ${outcomeSection}
-## Current directions
+## Current research directions
 ${dirSummaryText}
 ${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
-## Reference
+## Codebase
 ${codebaseSummary}${fileTreeSection}
 
-# What to do
+# Your task
 
-1. Read the design doc and vision. Explore the codebase if needed for context.
-2. Call \`./strategic set-vision\` with an updated vision reflecting reality.
-3. Create directions for the most impactful gaps. Retire completed ones. Max 5 creates.
-4. Tag directions with system_id from the vision. This drives research priority.
-5. Save any observations worth preserving via \`./design-doc set "notes/..."\`.
+Analyze this project and write a strategic review. Cover:
 
-Judge by impact, not activity. Think big — what fundamental changes would move this project forward?`;
+1. **Vision**: What should this project's purpose, success criteria, and key systems be?
+   Define systems with IDs (sys-xxx), names, descriptions, statuses (planned/in_progress/functional/mature), and dependencies.
+   Order priorities — which systems matter most right now?
 
-    statusRef.value = 'Running strategic vision review...';
-    let { exitCode, allOutput, lastResultText } = await runClaudeCode(strategicPrompt, ws, statusRef, model, effort, disallowedTools);
+2. **Directions**: What are the 3-5 most impactful research directions?
+   For each: a clear description, priority (high/medium/low), which system_id it serves, and rationale.
+   If existing directions should be updated or retired, say so with rationale.
 
-    // Post-check: verify the agent actually called ./strategic
-    // Compare vision revision to what was in the payload
-    const spawnedVisionRev = (payload.vision as Record<string, unknown> || {}).revision as number || 0;
-    try {
-      const projectData = await apiGet(`/api/admin/projects/${strVal((task.project_id ?? payload.project_id) as string)}`);
-      const currentVisionRev = (projectData as Record<string, unknown>)?.vision
-        ? ((projectData as Record<string, unknown>).vision as Record<string, unknown>).revision as number || 0
-        : 0;
-      if (exitCode === 0 && currentVisionRev <= spawnedVisionRev) {
-        sendLog(ws, '\n[WARNING] Strategic review completed but no ./strategic calls were made. Retrying with reminder...\n');
-        const retryResult = await runClaudeCode(
-          'You completed your analysis but did NOT call ./strategic to save your decisions. Your text output was discarded.\n\n' +
-          'You MUST call ./strategic set-vision now, followed by ./strategic create-direction for each direction.\n' +
-          'The ./strategic command is a bash script in the current directory. Run it via Bash.\n\n' +
-          'Review the codebase context you already explored and call the commands now.',
-          ws, statusRef, model, effort, disallowedTools
-        );
-        exitCode = retryResult.exitCode;
-        allOutput += retryResult.allOutput;
-        lastResultText = retryResult.lastResultText;
-      }
-    } catch (e) {
-      sendLog(ws, `[WARNING] Could not verify strategic API calls: ${e}\n`);
-    }
+3. **Notes**: Any strategic observations worth preserving for future cycles.
+
+Think big. Focus on fundamental improvements, not incremental fixes.
+Write your analysis as structured prose — it will be processed by a follow-up step.`;
+
+    statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
+    const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
+    const analysisText = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
+
+    // ── Pass 2: Executor — translate analysis into API calls ──
+    // Short, focused pass. The analysis is done. This just calls the tools.
+    fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
+      `# Executor Agent\nYour ONLY job is to call ./strategic and ./design-doc commands.\nDo NOT analyze code. Do NOT write prose. Just run the bash commands.\n`
+    );
+
+    const executorPrompt = `You are an executor. Your ONLY job is to translate the strategic analysis below into API calls using ./strategic and ./design-doc bash commands.
+
+Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Just run the commands.
+
+# Commands available
+
+\`\`\`bash
+# Set the vision (REQUIRED)
+./strategic set-vision '{"purpose": "...", "success_criteria": ["..."], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "..."}'
+
+# Create research directions (max 5)
+./strategic create-direction '{"text": "...", "priority": "high|medium|low", "system_id": "sys-x", "rationale": "..."}'
+
+# Update existing directions
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium"}, "rationale": "..."}'
+
+# Retire directions
+./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+
+# Save notes
+./design-doc set "notes/strategic-review" '"..."'
+\`\`\`
+
+# Existing directions (for update/retire operations)
+${dirSummaryText}
+
+# Strategic analysis to execute
+
+${analysisText.slice(0, 50_000)}
+
+# Instructions
+
+1. Run ./strategic set-vision with the vision described in the analysis.
+2. Run ./strategic create-direction for each new direction recommended.
+3. Run ./strategic retire-direction for any directions the analysis says to retire.
+4. Run ./design-doc set "notes/strategic-review" with key observations.
+5. Done. Do not write anything else.`;
+
+    statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
+    const { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
 
     // Legacy: try to read /tmp output file (backward compat)
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);

@@ -76,6 +76,7 @@ export async function handleDesignDocUpdate(
   // Write the design-doc helper script that the inner agent can call via bash.
   // The script reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (passed by runClaudeCode)
   // so the token is never written to disk.
+  // Uses printf + pipe to avoid shell expansion of JSON values in curl -d.
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API
 # Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
@@ -89,28 +90,33 @@ KEY="\$2"
 VALUE="\$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
 
 if [ "\$OP" = "list" ]; then
-  curl -f -X POST "\$API/api/agent/design-doc" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: \$TOKEN" \\
-    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
+  printf '{"task_id":"%s","op":"list"}' "\$TASK" | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+      -H "Content-Type: application/json" \\
+      -H "X-Agent-Token: \$TOKEN" \\
+      --data-binary @-
 elif [ "\$OP" = "set" ]; then
   if [ -z "\$KEY" ] || [ -z "\$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  curl -f -X POST "\$API/api/agent/design-doc" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: \$TOKEN" \\
-    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"\$KEY\\", \\"value\\": \$VALUE}"
+  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "\$TASK" "\$KEY" "\$VALUE" | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+      -H "Content-Type: application/json" \\
+      -H "X-Agent-Token: \$TOKEN" \\
+      --data-binary @-
 elif [ "\$OP" = "delete" ]; then
   if [ -z "\$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  curl -f -X POST "\$API/api/agent/design-doc" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: \$TOKEN" \\
-    -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"\$KEY\\"}"
+  printf '{"task_id":"%s","op":"delete","key":"%s"}' "\$TASK" "\$KEY" | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+      -H "Content-Type: application/json" \\
+      -H "X-Agent-Token: \$TOKEN" \\
+      --data-binary @-
 else
   echo "Unknown op: \$OP. Use set, delete, or list." >&2; exit 1
 fi
