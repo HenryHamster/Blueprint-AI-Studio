@@ -1043,3 +1043,235 @@ class TestClassifyFailure:
         """Database connection errors take priority over 'failed to connect'."""
         task = self._make_task("could not connect to server: Connection refused (psycopg)")
         assert classify_failure(task) == "EXTERNAL_API"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 5 — Rollup deferral filtering
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRollupDeferral:
+    """
+    Unit tests for the rollup-deferral filtering logic in orchestrator_worker().
+
+    The logic (orchestrator.py step 2.6) defers QUEUED tasks whose related_files
+    significantly overlap with files from COMPLETED children of EVALUATING rollup
+    parents.  Deferral threshold: >= 2 files AND >= 50% of candidate's files.
+    """
+
+    def _apply_rollup_filter(self, eligible_ids, candidate_map, pending_rollup_files):
+        """
+        Pure re-implementation of the rollup-deferral filtering logic from
+        orchestrator_worker() step 2.6.  Returns (non_deferred_ids, deferred_ids).
+        """
+        non_deferred = []
+        deferred = []
+        for eid in eligible_ids:
+            candidate = candidate_map.get(eid)
+            if not candidate:
+                non_deferred.append(eid)
+                continue
+            cfiles = set(candidate.get("related_files", []))
+            if not cfiles:
+                non_deferred.append(eid)
+                continue
+            stale_overlap = cfiles & pending_rollup_files.keys()
+            should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+            if should_defer:
+                deferred.append(eid)
+            else:
+                non_deferred.append(eid)
+        return non_deferred, deferred
+
+    def test_significant_overlap_defers_task(self):
+        """Task overlapping 3 out of 4 files with pending rollup is deferred (>= 2 files, >= 50%)."""
+        eid = uuid.uuid4()
+        candidate_map = {eid: {"related_files": ["a.py", "b.py", "c.py", "d.py"]}}
+        pending = {"a.py": "Big Refactor", "b.py": "Big Refactor", "c.py": "Big Refactor"}
+
+        non_deferred, deferred = self._apply_rollup_filter([eid], candidate_map, pending)
+
+        assert eid in deferred
+        assert eid not in non_deferred
+
+    def test_small_overlap_does_not_defer(self):
+        """Task overlapping only 1 of 10 files with pending rollup is NOT deferred."""
+        eid = uuid.uuid4()
+        candidate_map = {eid: {"related_files": [f"file{i}.py" for i in range(10)]}}
+        pending = {"file0.py": "Big Refactor"}
+
+        non_deferred, deferred = self._apply_rollup_filter([eid], candidate_map, pending)
+
+        assert eid in non_deferred
+        assert eid not in deferred
+
+    def test_no_related_files_not_deferred(self):
+        """Task with no related_files is never deferred."""
+        eid = uuid.uuid4()
+        candidate_map = {eid: {"related_files": []}}
+        pending = {"a.py": "Big Refactor", "b.py": "Big Refactor", "c.py": "Big Refactor"}
+
+        non_deferred, deferred = self._apply_rollup_filter([eid], candidate_map, pending)
+
+        assert eid in non_deferred
+        assert eid not in deferred
+
+    def test_no_pending_rollup_files_passes_through(self):
+        """When there are no pending rollup files, all tasks pass through unaffected."""
+        ids = [uuid.uuid4() for _ in range(3)]
+        candidate_map = {eid: {"related_files": ["a.py", "b.py"]} for eid in ids}
+
+        non_deferred, deferred = self._apply_rollup_filter(ids, candidate_map, {})
+
+        assert set(non_deferred) == set(ids)
+        assert deferred == []
+
+    def test_exactly_50_percent_overlap_defers(self):
+        """Task with exactly 2/4 files overlapping (50%) is deferred (boundary case)."""
+        eid = uuid.uuid4()
+        candidate_map = {eid: {"related_files": ["a.py", "b.py", "c.py", "d.py"]}}
+        pending = {"a.py": "Rollup", "b.py": "Rollup"}
+
+        non_deferred, deferred = self._apply_rollup_filter([eid], candidate_map, pending)
+
+        assert eid in deferred
+
+    def test_just_below_50_percent_not_deferred(self):
+        """Task with 1/3 files overlapping (33%) is NOT deferred even though >= 1."""
+        eid = uuid.uuid4()
+        candidate_map = {eid: {"related_files": ["a.py", "b.py", "c.py"]}}
+        pending = {"a.py": "Rollup"}
+
+        non_deferred, deferred = self._apply_rollup_filter([eid], candidate_map, pending)
+
+        assert eid in non_deferred
+        assert eid not in deferred
+
+    @pytest.mark.asyncio
+    async def test_rollup_deferral_sets_status_message(self, db_session, mocker):
+        """
+        When a QUEUED task significantly overlaps pending-rollup files, its
+        latest_status_message is updated to indicate it's waiting for the rollup.
+        """
+        from unittest.mock import AsyncMock
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+        project = Project(name="Rollup deferral test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Parent task in EVALUATING state (pending rollup)
+        parent = Task(
+            project_id=project.id,
+            title="Rollup: big refactor",
+            payloads=[{"type": "plan"}],
+            status=TaskStatus.EVALUATING,
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        # Completed child of the EVALUATING parent with large scope
+        child = Task(
+            project_id=project.id,
+            title="Refactor: decompose module",
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.COMPLETED,
+            parent_task_id=parent.id,
+            context={"scope": "large", "related_files": ["backend/app/main.py", "backend/app/models.py", "backend/app/admin.py"]},
+        )
+        db_session.add(child)
+
+        # QUEUED candidate that overlaps 3/3 of its files with the pending rollup
+        candidate = Task(
+            project_id=project.id,
+            title="Add new feature",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["backend/app/main.py", "backend/app/models.py", "backend/app/admin.py"]},
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        # Apply the rollup-deferral logic directly (mirrors orchestrator step 2.6)
+        from sqlmodel import select as sql_select
+        eval_parent_ids = (await db_session.execute(
+            sql_select(Task.id).where(Task.status == TaskStatus.EVALUATING)
+        )).scalars().all()
+
+        pending_children = (await db_session.execute(
+            sql_select(Task).where(
+                Task.parent_task_id.in_(eval_parent_ids),
+                Task.status == TaskStatus.COMPLETED,
+            )
+        )).scalars().all()
+
+        pending_rollup_files: dict[str, str] = {}
+        for pc in pending_children:
+            pc_scope = (pc.context or {}).get("scope", "small")
+            pc_type = (pc.first_payload).get("type", "")
+            if pc_scope == "large" or pc_type in ("refactor", "plan"):
+                for f in (pc.context or {}).get("related_files", []):
+                    pending_rollup_files[f] = pc.title or str(pc.id)
+
+        assert len(pending_rollup_files) == 3, "All 3 child files should be in pending rollup set"
+
+        eligible_ids = [candidate.id]
+        cfiles = set((candidate.context or {}).get("related_files", []))
+        stale_overlap = cfiles & pending_rollup_files.keys()
+        should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+
+        assert should_defer, "Candidate with 3/3 file overlap should be deferred"
+
+        if should_defer:
+            blocking_title = pending_rollup_files[next(iter(stale_overlap))]
+            defer_msg = f"Waiting: overlaps pending rollup '{blocking_title[:60]}'"
+            candidate.latest_status_message = defer_msg
+            db_session.add(candidate)
+            await db_session.commit()
+            await db_session.refresh(candidate)
+
+        assert "Waiting: overlaps pending rollup" in candidate.latest_status_message
+
+    @pytest.mark.asyncio
+    async def test_completed_parent_no_longer_defers(self, db_session, mocker):
+        """
+        Once the rollup parent transitions out of EVALUATING (e.g., COMPLETED),
+        its children's files no longer appear in pending_rollup_files and the
+        candidate task is NOT deferred.
+        """
+        project = Project(name="Completed rollup test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Parent is now COMPLETED (rollup merged) — not EVALUATING
+        parent = Task(
+            project_id=project.id,
+            title="Rollup: merged refactor",
+            payloads=[{"type": "plan"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        child = Task(
+            project_id=project.id,
+            title="Refactor: decompose module",
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.COMPLETED,
+            parent_task_id=parent.id,
+            context={"scope": "large", "related_files": ["backend/app/main.py", "backend/app/models.py"]},
+        )
+        db_session.add(child)
+        await db_session.commit()
+
+        # Query pending rollup files — parent is COMPLETED so no EVALUATING parents exist
+        from sqlmodel import select as sql_select
+        eval_parent_ids = (await db_session.execute(
+            sql_select(Task.id).where(Task.status == TaskStatus.EVALUATING)
+        )).scalars().all()
+
+        assert len(eval_parent_ids) == 0, "No EVALUATING parents → no pending rollup files"

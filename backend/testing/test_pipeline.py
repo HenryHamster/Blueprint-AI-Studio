@@ -23,7 +23,7 @@ from app.main import (
     should_rollback,
 )
 from app.task_completion import _handle_strategic_completion
-from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup
+from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup, _spawn_pipeline_task
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
 
@@ -1001,3 +1001,187 @@ class TestHighRiskRollupGate:
 
     def test_empty_children_not_flagged(self):
         assert not self._has_high_risk_child([])
+
+
+# ── Priority Inheritance ──────────────────────────────────────────────────────
+
+@pytest_asyncio.fixture()
+async def spawn_db(mocker):
+    """Isolated in-memory DB for _spawn_pipeline_task priority tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+    mocker.patch("app.task_lifecycle.AsyncSessionLocal", _Session)
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+async def _make_spawn_task(session, project_id, priority=50, task_type="create", context=None):
+    t = Task(
+        project_id=project_id,
+        title="Source task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        priority=priority,
+        context=context or {},
+    )
+    session.add(t)
+    await session.commit()
+    await session.refresh(t)
+    return t
+
+
+@pytest.mark.asyncio
+async def test_review_task_inherits_priority_100(spawn_db, mocker):
+    """Review task spawned for a priority-100 source inherits priority 100."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    source = await _make_spawn_task(spawn_db, project.id, priority=100)
+
+    result = await _spawn_pipeline_task(
+        source_task=source,
+        task_type="review",
+        pr_number=42,
+        branch="feature",
+        base_branch="main",
+        original_task_id=str(source.id),
+        session=spawn_db,
+    )
+
+    assert result is not None
+    assert result.priority == 100, f"Expected priority 100 but got {result.priority}"
+
+
+@pytest.mark.asyncio
+async def test_fix_task_inherits_priority_from_original(spawn_db, mocker):
+    """Fix task spawned for a priority-100 review (whose original was priority-100) inherits priority 100."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    # original task at priority 100
+    original = await _make_spawn_task(spawn_db, project.id, priority=100)
+
+    # review task spawned from original (priority inherited)
+    review = Task(
+        project_id=project.id,
+        title="Review PR #42",
+        payloads=[{"type": "review", "pr_number": 42}],
+        status=TaskStatus.COMPLETED,
+        priority=100,
+        context={"review_loop": {"pr_number": 42, "branch": "feature",
+                                  "base_branch": "main",
+                                  "original_task_id": str(original.id),
+                                  "iteration": 1}},
+    )
+    spawn_db.add(review)
+    await spawn_db.commit()
+    await spawn_db.refresh(review)
+
+    result = await _spawn_pipeline_task(
+        source_task=review,
+        task_type="fix",
+        pr_number=42,
+        branch="feature",
+        base_branch="main",
+        original_task_id=str(original.id),
+        fix_prompt="Fix the issues",
+        session=spawn_db,
+    )
+
+    assert result is not None
+    assert result.priority == 100, f"Expected priority 100 but got {result.priority}"
+
+
+@pytest.mark.asyncio
+async def test_default_priority_50_source_produces_priority_50_review(spawn_db, mocker):
+    """Default priority-50 source task produces a priority-50 review."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    source = await _make_spawn_task(spawn_db, project.id, priority=50)
+
+    result = await _spawn_pipeline_task(
+        source_task=source,
+        task_type="review",
+        pr_number=7,
+        branch="feat",
+        base_branch="main",
+        original_task_id=str(source.id),
+        session=spawn_db,
+    )
+
+    assert result is not None
+    assert result.priority == 50, f"Expected priority 50 but got {result.priority}"
+
+
+@pytest.mark.asyncio
+async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
+    """Priority is preserved across multiple fix->review iterations."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    # Original high-priority task
+    original = await _make_spawn_task(spawn_db, project.id, priority=80)
+
+    # Simulate iteration 2 fix task
+    fix2 = Task(
+        project_id=project.id,
+        title="Fix PR #10",
+        payloads=[{"type": "fix", "pr_number": 10}],
+        status=TaskStatus.COMPLETED,
+        priority=80,
+        context={"review_loop": {"pr_number": 10, "branch": "b", "base_branch": "main",
+                                  "original_task_id": str(original.id),
+                                  "iteration": 2}},
+    )
+    spawn_db.add(fix2)
+    await spawn_db.commit()
+    await spawn_db.refresh(fix2)
+
+    result = await _spawn_pipeline_task(
+        source_task=fix2,
+        task_type="review",
+        pr_number=10,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original.id),
+        session=spawn_db,
+    )
+
+    assert result is not None
+    assert result.priority == 80, f"Expected priority 80 but got {result.priority}"

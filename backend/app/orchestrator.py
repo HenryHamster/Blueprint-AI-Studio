@@ -608,7 +608,7 @@ async def orchestrator_worker():
                             non_conflicting.append(eid)
                     eligible_ids = non_conflicting
 
-                # Observability: detect "near-miss" dispatches against pending-rollup refactors
+                # Step 2.6: Defer tasks that overlap with pending-rollup files
                 # EVALUATING parents = rollups not yet merged to main; their children's files are stale
                 if eligible_ids:
                     eval_parent_ids = (await session.execute(
@@ -629,19 +629,45 @@ async def orchestrator_worker():
                                 for f in (pc.context or {}).get("related_files", []):
                                     pending_rollup_files[f] = pc.title or str(pc.id)
                         if pending_rollup_files:
+                            non_rollup_conflicting = []
                             for eid in eligible_ids:
                                 candidate = next((t for t in candidate_tasks if t.id == eid), None)
                                 if not candidate:
+                                    non_rollup_conflicting.append(eid)
                                     continue
                                 cfiles = set((candidate.context or {}).get("related_files", []))
+                                if not cfiles:
+                                    non_rollup_conflicting.append(eid)
+                                    continue
                                 stale_overlap = cfiles & pending_rollup_files.keys()
-                                if stale_overlap:
+                                # Only defer on significant overlap: 2+ files AND >= 50% of candidate's files
+                                should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+                                if should_defer:
                                     blocking_title = pending_rollup_files[next(iter(stale_overlap))]
                                     logger.warning(
-                                        f"[DISPATCH] Near-miss: task {eid} overlaps {len(stale_overlap)} file(s) "
+                                        f"[DISPATCH] Near-miss: deferring task {eid} — overlaps {len(stale_overlap)} file(s) "
                                         f"with pending-rollup refactor '{blocking_title[:60]}': "
                                         f"{', '.join(sorted(stale_overlap)[:3])}"
                                     )
+                                    defer_msg = f"Waiting: overlaps pending rollup '{blocking_title[:60]}'"
+                                    if candidate.latest_status_message != defer_msg:
+                                        candidate.latest_status_message = defer_msg
+                                        session.add(candidate)
+                                        try:
+                                            await broadcast_to_project(str(candidate.project_id), "task_updated",
+                                                {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
+                                        except Exception:
+                                            logger.debug(f"Failed to broadcast rollup deferral for {eid}", exc_info=True)
+                                else:
+                                    if stale_overlap:
+                                        blocking_title = pending_rollup_files[next(iter(stale_overlap))]
+                                        logger.warning(
+                                            f"[DISPATCH] Near-miss: task {eid} overlaps {len(stale_overlap)} file(s) "
+                                            f"with pending-rollup refactor '{blocking_title[:60]}': "
+                                            f"{', '.join(sorted(stale_overlap)[:3])}"
+                                        )
+                                    non_rollup_conflicting.append(eid)
+                            eligible_ids = non_rollup_conflicting
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

@@ -265,12 +265,15 @@ async def _spawn_pipeline_task(
     # create task under the plan/research parent), falling back to original task itself
     resolved_original_id = original_task_id or str(source_task.id)
     parent_id = None
+    inherited_priority = source_task.priority
     try:
         orig = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig and orig.parent_task_id:
             parent_id = orig.parent_task_id
         elif orig:
             parent_id = orig.id
+        if orig:
+            inherited_priority = orig.priority
     except Exception:
         pass
 
@@ -392,6 +395,7 @@ async def _spawn_pipeline_task(
         title=title,
         description=fix_prompt or f"Automated {task_type} for PR #{pr_number}",
         parent_task_id=parent_id,
+        priority=inherited_priority,
         payloads=[payload_data],
         context={"scope": propagated_scope,
                  "review_loop": {"pr_number": pr_number, "branch": branch,
