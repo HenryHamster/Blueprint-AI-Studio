@@ -577,3 +577,99 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
            "dependencies cleared" in (updated_b.latest_status_message or "").lower(), (
         f"Expected deadlock message on task B, got: {updated_b.latest_status_message!r}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 7 — CI-waiting backstop timeout
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
+    """A CI-waiting EVALUATING task with missing ci_wait_started should be failed
+    by the 90-minute backstop in _check_evaluating_timeouts().
+
+    Scenario: task has ci_waiting=True in context but no ci_wait_started field,
+    and has been EVALUATING for >90 minutes.  The orchestrator's normal CI timeout
+    is silently skipped (it can't parse the field).  The backstop must catch it.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="CI Backstop Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # CI-waiting task with NO ci_wait_started — exactly the corrupt/missing case
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "backstop test task"}],
+        status=TaskStatus.EVALUATING,
+        context={"ci_waiting": True},  # ci_wait_started deliberately absent
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    # Set task to appear 100 minutes into EVALUATING (> 90-min backstop)
+    evaluating_since = _naive_utc_ago(minutes=100)
+    task.status_log = [
+        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+    ]
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        f"Expected CI-waiting task with missing ci_wait_started to be FAILED after "
+        f"90-min backstop, got {task.status}"
+    )
+    assert "backstop" in (task.latest_status_message or "").lower(), (
+        f"Expected 'backstop' in status message, got: {task.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
+    """A CI-waiting task that is UNDER the 90-minute backstop threshold must NOT
+    be failed by _check_evaluating_timeouts() — normal CI timeout handles it.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="CI Backstop Under Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "under threshold task"}],
+        status=TaskStatus.EVALUATING,
+        context={"ci_waiting": True},  # ci_wait_started absent but under threshold
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    # Only 20 minutes into EVALUATING — well under the 90-min backstop
+    evaluating_since = _naive_utc_ago(minutes=20)
+    task.status_log = [
+        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+    ]
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Expected CI-waiting task under 90-min threshold to remain EVALUATING, "
+        f"got {task.status}"
+    )

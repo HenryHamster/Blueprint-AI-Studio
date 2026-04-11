@@ -43,6 +43,7 @@ from app.routers.directions import router as directions_router
 from app.routers.deploy import router as deploy_router
 from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
+from app.routers.admin_analytics import router as admin_analytics_router
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -2244,7 +2245,6 @@ async def broadcast_deploy_state():
         logger.warning(f"[WS] Failed to broadcast deploy state: {e}")
 
 
-
 app = FastAPI(
     title="Blueprint Orchestrator",
     description="Secure Orchestration & State Management",
@@ -2264,6 +2264,7 @@ app.include_router(directions_router)
 app.include_router(deploy_router)
 app.include_router(admin_users_router)
 app.include_router(admin_notifications_router)
+app.include_router(admin_analytics_router)
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""

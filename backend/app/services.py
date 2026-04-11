@@ -376,6 +376,7 @@ async def _check_evaluating_timeouts():
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
+    CI_BACKSTOP_SECONDS = 90 * 60         # 90 minutes — 3x the normal 30-min CI wait timeout
     TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
     try:
@@ -390,10 +391,76 @@ async def _check_evaluating_timeouts():
 
             for task in evaluating_tasks:
                 ctx = task.context or {}
-                # Skip CI-waiting tasks — they have their own timeout
-                if ctx.get("ci_waiting") is True:
-                    continue
-                if ctx.get("review_loop", {}).get("ci_waiting") is True:
+                ci_waiting = (
+                    ctx.get("ci_waiting") is True
+                    or ctx.get("review_loop", {}).get("ci_waiting") is True
+                )
+                if ci_waiting:
+                    # CI-waiting tasks have their own 30-min timeout in orchestrator.py,
+                    # but if ci_wait_started is missing/corrupt that timeout is silently
+                    # skipped. Apply a 90-minute absolute backstop so tasks can never
+                    # hang forever regardless of field state.
+                    evaluating_since = None
+                    for entry in reversed(task.status_log or []):
+                        msg = entry.get("msg", "")
+                        if "→ EVALUATING" in msg:
+                            try:
+                                evaluating_since = datetime.fromisoformat(entry["t"])
+                            except (KeyError, ValueError, TypeError):
+                                pass
+                            break
+                    if evaluating_since is None:
+                        evaluating_since = task.started_at or task.created_at
+
+                    elapsed = (now - evaluating_since).total_seconds()
+                    if elapsed <= CI_BACKSTOP_SECONDS:
+                        # Under backstop threshold — let normal CI timeout handle it
+                        continue
+                    # Over backstop threshold — fall through to hard timeout logic
+                    hours = round(elapsed / 3600, 1)
+                    logger.error(
+                        f"[EVAL TIMEOUT] CI-waiting task {str(task.id)[:8]} has been "
+                        f"EVALUATING for {hours}h — backstop timeout (ci_wait_started "
+                        f"missing or corrupt), marking FAILED"
+                    )
+                    task.status = TaskStatus.FAILED
+                    task.latest_status_message = (
+                        f"CI wait backstop timeout after {hours}h "
+                        "(ci_wait_started missing or corrupt — no timeout was applied)"
+                    )
+                    session.add(task)
+                    children = (await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id)
+                    )).scalars().all()
+                    from app.main import _ensure_vm_deleted  # noqa: PLC0415
+                    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
+                    non_terminal_children = [c for c in children if c.status not in TERMINAL]
+                    vms_to_delete = []
+                    for child in non_terminal_children:
+                        child.status = TaskStatus.CANCELLED
+                        child.latest_status_message = "Cancelled: parent task timed out"
+                        if child.vm_instance_id:
+                            vms_to_delete.append(child)
+                        child_acct = (child.context or {}).get("max_plan_account_id")
+                        if child_acct:
+                            await release_max_plan_account(child_acct)
+                        session.add(child)
+                    await _maybe_create_failure_alert(
+                        task, session,
+                        f"CI wait backstop timeout after {hours}h — ci_wait_started missing or corrupt",
+                    )
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id), "task_updated",
+                        {"task_id": str(task.id), "status": task.status},
+                    )
+                    for child in non_terminal_children:
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(child.id), "status": child.status},
+                        )
+                    for child_vm in vms_to_delete:
+                        await _ensure_vm_deleted(child_vm, reason="ci_backstop_timeout")
                     continue
 
                 # Determine how long the task has been EVALUATING

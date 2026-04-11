@@ -465,7 +465,7 @@ async def claim_task(
         pipeline_health = None
         if task_type == "research":
             try:
-                from app.admin import compute_pipeline_health_summary
+                from app.routers.admin_analytics import compute_pipeline_health_summary
                 pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
             except Exception:
                 pass  # non-critical — don't fail the request

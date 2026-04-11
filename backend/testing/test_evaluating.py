@@ -165,8 +165,9 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
 
 @pytest.mark.asyncio
 async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
-    """Tasks with context['ci_waiting'] = True must be skipped entirely by the
-    timeout sweep — not timed out even after many hours."""
+    """Tasks with context['ci_waiting'] = True must be skipped by the timeout
+    sweep while under the 90-minute CI backstop threshold — the normal 30-min
+    CI timeout in orchestrator.py handles them instead."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_rollup = mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
@@ -185,9 +186,9 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    # Set an elapsed time that would normally trigger both the warning and the
-    # hard-timeout, proving ci_waiting is evaluated before any time-based check.
-    evaluating_since = _naive_utc_ago(hours=10)
+    # 30 minutes — well under the 90-minute CI backstop threshold.
+    # The normal orchestrator CI timeout should handle it, not this sweep.
+    evaluating_since = _naive_utc_ago(minutes=30)
     parent.status_log = [
         {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
     ]
