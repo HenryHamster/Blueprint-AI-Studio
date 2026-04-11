@@ -23,6 +23,7 @@ from app.main import (
     should_rollback,
     MAX_REVIEW_FIX_ITERATIONS,
     _check_and_trigger_rollup,
+    _handle_strategic_completion,
 )
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
@@ -703,3 +704,136 @@ async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker
     assert "pipeline tasks" in (parent.latest_status_message or "").lower() or \
            "review/fix" in (parent.latest_status_message or "").lower(), \
         f"Unexpected status message: {parent.latest_status_message}"
+
+
+# ── Strategic Completion Handler ─────────────────────────────────────────────
+
+@pytest_asyncio.fixture()
+async def strategic_db(mocker):
+    """Isolated in-memory DB for strategic completion handler tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+    mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+async def _make_strategic_task(session, project, context=None, vision_rev=0):
+    """Helper: create a strategic_review task with the given context."""
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "run strategic review",
+                   "vision": {"revision": vision_rev}}],
+        context=context or {},
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_vision_set_flag_is_success(strategic_db, mocker):
+    """A task with _strategic_vision_set=True should be treated as success (no failure increment)."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(strategic_db, project,
+                                      context={"_strategic_vision_set": True},
+                                      vision_rev=1)
+
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    # Success path: _strategic_failures should NOT be incremented
+    assert project.vision.get("_strategic_failures", 0) == 0
+    assert "complete" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_create_direction_only_is_not_success(strategic_db, mocker):
+    """A task that called create_direction but NOT set_vision should NOT be treated as success."""
+    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    # No _strategic_vision_set flag, vision_rev unchanged (1 == 1)
+    task = await _make_strategic_task(strategic_db, project,
+                                      context={},
+                                      vision_rev=1)
+
+    # Unparseable logs → should fall through to failure recording
+    await _handle_strategic_completion(task, "not json", strategic_db)
+
+    await strategic_db.refresh(project)
+    failures = project.vision.get("_strategic_failures", 0)
+    assert failures == 1, f"Expected 1 failure but got {failures}"
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_vision_rev_increase_is_success(strategic_db, mocker):
+    """When vision_rev increased since task spawn, treat as success even without the flag."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    # Project vision is at rev 2, task was spawned at rev 1 → rev increased
+    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 2})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(strategic_db, project,
+                                      context={},
+                                      vision_rev=1)
+
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    assert project.vision.get("_strategic_failures", 0) == 0
+    assert "complete" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_no_api_no_logs_increments_failures(strategic_db, mocker):
+    """No API calls and unparseable logs should increment _strategic_failures."""
+    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 0,
+                                                        "_strategic_failures": 2})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(strategic_db, project, context={}, vision_rev=0)
+
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    assert project.vision.get("_strategic_failures") == 3
+    alert_mock.assert_called_once()

@@ -4578,7 +4578,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
-    api_was_used = (task.context or {}).get("_strategic_api_used", False) or vision_rev > spawned_vision_rev
+    api_was_used = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
 
     if api_was_used:
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
@@ -7245,12 +7245,6 @@ async def strategic_operation(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Stamp task so the completion handler knows the API was used
-    if not (task.context or {}).get("_strategic_api_used"):
-        task.context = {**(task.context or {}), "_strategic_api_used": True}
-        flag_modified(task, "context")
-        session.add(task)
-
     # Lock project for atomic update
     result = await session.execute(
         select(Project).where(Project.id == task.project_id).with_for_update()
@@ -7284,6 +7278,10 @@ async def strategic_operation(
         project.vision = new_vision
         flag_modified(project, "vision")
         session.add(project)
+        # Stamp task so the completion handler knows a real vision update occurred
+        task.context = {**(task.context or {}), "_strategic_vision_set": True}
+        flag_modified(task, "context")
+        session.add(task)
         await session.commit()
         logger.info(f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})")
         return _resp({"status": "ok", "op": "set_vision", "revision": new_vision["revision"]})
