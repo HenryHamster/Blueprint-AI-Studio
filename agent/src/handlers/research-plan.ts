@@ -814,9 +814,11 @@ ${recentlyCompleted.length > 0
 - **Building features on a foundation?** If research context shows a foundation was confirmed
   (e.g., "(confirmed)" entries), output findings that USE it. These are typically scope=medium.
 
-Don't output 10 incremental findings when the direction needs 1 foundational change.
-1 well-designed large finding that builds the right architecture is worth more than
-10 small fixes that don't add up to a system.
+Output ALL meaningful findings you discover — don't stop at one.
+A direction may need both foundational work AND incremental improvements.
+If you find 5 things worth doing, output 5 findings. Be ambitious — propose
+infrastructure, new systems, and architectural changes when the direction calls
+for it. Use scope=large freely. The pipeline handles decomposition and review.
 
 # OUTPUT FORMAT
 

@@ -605,6 +605,41 @@ async def orchestrator_worker():
                             non_conflicting.append(eid)
                     eligible_ids = non_conflicting
 
+                # Observability: detect "near-miss" dispatches against pending-rollup refactors
+                # EVALUATING parents = rollups not yet merged to main; their children's files are stale
+                if eligible_ids:
+                    eval_parent_ids = (await session.execute(
+                        select(Task.id).where(Task.status == TaskStatus.EVALUATING)
+                    )).scalars().all()
+                    if eval_parent_ids:
+                        pending_children = (await session.execute(
+                            select(Task).where(
+                                Task.parent_task_id.in_(eval_parent_ids),
+                                Task.status == TaskStatus.COMPLETED,
+                            )
+                        )).scalars().all()
+                        pending_rollup_files: dict[str, str] = {}
+                        for pc in pending_children:
+                            pc_scope = (pc.context or {}).get("scope", "small")
+                            pc_type = (pc.first_payload).get("type", "")
+                            if pc_scope == "large" or pc_type in ("refactor", "plan"):
+                                for f in (pc.context or {}).get("related_files", []):
+                                    pending_rollup_files[f] = pc.title or str(pc.id)
+                        if pending_rollup_files:
+                            for eid in eligible_ids:
+                                candidate = next((t for t in candidate_tasks if t.id == eid), None)
+                                if not candidate:
+                                    continue
+                                cfiles = set((candidate.context or {}).get("related_files", []))
+                                stale_overlap = cfiles & pending_rollup_files.keys()
+                                if stale_overlap:
+                                    blocking_title = pending_rollup_files[next(iter(stale_overlap))]
+                                    logger.warning(
+                                        f"[DISPATCH] Near-miss: task {eid} overlaps {len(stale_overlap)} file(s) "
+                                        f"with pending-rollup refactor '{blocking_title[:60]}': "
+                                        f"{', '.join(sorted(stale_overlap)[:3])}"
+                                    )
+
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 
@@ -906,6 +941,8 @@ async def orchestrator_worker():
                         continue
                     if ci_loop.get("conflict_fix_spawned"):
                         continue  # Already handled — fix task spawned for merge conflicts
+                    if ci_loop.get("ci_fix_spawned"):
+                        continue  # Already handled — fix task spawned for CI failure
                     ci_pr_number = ci_loop.get("pr_number")
                     if not ci_pr_number:
                         continue
@@ -1115,7 +1152,7 @@ async def orchestrator_worker():
                             # CI failed — check for existing active fix before spawning
                             active_tasks = (await session.execute(
                                 select(Task).where(
-                                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
                                 )
                             )).scalars().all()
                             existing_fix = next(
@@ -1148,6 +1185,10 @@ async def orchestrator_worker():
                                 fix_reason="ci_failure"
                             )
                             if fix_task:
+                                ci_loop_ctx = dict(ci_loop)
+                                ci_loop_ctx["ci_waiting"] = False
+                                ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop_ctx}
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
                                 logger.error(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")

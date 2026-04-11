@@ -5983,6 +5983,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")
+                        # Observability: check if concurrent rollups may explain this conflict
+                        try:
+                            recent_rollups = (await session.execute(
+                                select(_func.count()).select_from(Task).where(
+                                    Task.status == TaskStatus.COMPLETED,
+                                    Task.id != parent.id,
+                                    Task.updated_at >= _utcnow() - timedelta(hours=1),
+                                    Task.context["rollup_pr_url"].as_string().is_not(None),
+                                )
+                            )).scalar() or 0
+                            if recent_rollups > 0:
+                                logger.warning(
+                                    f"[ROLLUP] Conflict on PR #{rollup_pr_number} may be stale-window: "
+                                    f"{recent_rollups} other rollup(s) merged to {target_branch} in the last hour"
+                                )
+                        except Exception:
+                            pass
                         parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked: {merge_msg} — spawning fix task"
                         try:
@@ -7330,6 +7347,8 @@ async def update_agent_status(
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return {"status": "already_terminal", "task_id": str(task.id)}
+    if task.status == TaskStatus.EVALUATING:
+        return {"status": "already_evaluating", "task_id": str(task.id)}
 
     # 2. Update task status
     task.status = payload.status
