@@ -383,7 +383,8 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "context_length_exceeded", "token limit exceeded"]):
         return "EXTERNAL_API"
 
-    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM
+    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
+    # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
                                       "execution timed out", "killed", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",
@@ -391,7 +392,8 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
                                       "exit code 137", "exit code 143",
                                       "non-zero exit code", "process exited",
                                       "container exited", "node process killed",
-                                      "oom killer"]):
+                                      "oom killer",
+                                      "[fatal:", "fatal error", "process crashed"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error

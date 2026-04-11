@@ -9,7 +9,7 @@ from datetime import timedelta
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from app.main import _compute_research_anomalies
+from app.main import _compute_research_anomalies, classify_failure
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
@@ -179,6 +179,46 @@ async def test_provision_failures_detected_separately_from_code_errors():
     signals = [a["signal"] for a in result]
     assert any("PROVISION_FAILURE" in s for s in signals)
     assert any("CODE_ERROR" in s for s in signals)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# classify_failure — agent crash report classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_classify_failure_uncaught_exception_is_agent_timeout():
+    """[FATAL:uncaughtException] crash reports must classify as AGENT_TIMEOUT, not CODE_ERROR."""
+    task = make_task(
+        latest_status_message="[512MB cg:2048MB] [FATAL:uncaughtException] TypeError: Cannot read properties of undefined",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_unhandled_rejection_is_agent_timeout():
+    """[FATAL:unhandledRejection] crash reports must classify as AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="[256MB cg:2048MB] [FATAL:unhandledRejection] Promise rejected: connection lost",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_sigterm_still_works():
+    """[FATAL:SIGTERM] must continue to classify as AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="[256MB cg:2048MB] [FATAL:SIGTERM] Agent received shutdown signal",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_genuine_code_error_no_fatal_prefix():
+    """Errors without [FATAL: prefix and no other timeout keywords stay as CODE_ERROR."""
+    task = make_task(
+        latest_status_message="AttributeError: 'NoneType' object has no attribute 'foo'",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "CODE_ERROR"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
