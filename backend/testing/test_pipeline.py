@@ -23,7 +23,7 @@ from app.main import (
     should_rollback,
 )
 from app.task_completion import _handle_strategic_completion
-from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, _check_and_trigger_rollup
+from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
 
@@ -243,6 +243,31 @@ class TestFailureClassification:
         """Logs are checked alongside status message."""
         task = self._make_task("some generic error")
         assert classify_failure(task, "failed to provision VM") == "PROVISION_FAILURE"
+
+    def test_http_timed_out_is_not_agent_timeout(self):
+        """'HTTP request timed out' should be CODE_ERROR, not AGENT_TIMEOUT."""
+        task = self._make_task("HTTP request timed out connecting to API")
+        assert classify_failure(task) != "AGENT_TIMEOUT"
+
+    def test_process_exited_code_1_is_code_error(self):
+        """Normal process exit with code 1 is a code error, not a timeout."""
+        task = self._make_task("process exited with code 1")
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_non_zero_exit_code_is_code_error(self):
+        """Non-zero exit code (not 137/143) is a code error, not a timeout."""
+        task = self._make_task("Task failed with non-zero exit code")
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_oom_killer_is_agent_timeout(self):
+        """Process killed by OOM killer is an agent timeout."""
+        task = self._make_task("process killed by OOM killer")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
+
+    def test_node_process_killed_is_agent_timeout(self):
+        """Node process killed by SIGTERM is an agent timeout."""
+        task = self._make_task("node process killed by SIGTERM")
+        assert classify_failure(task) == "AGENT_TIMEOUT"
 
 
 # ── Deployment Monitoring ───────────────────────────────────────────────────
@@ -657,7 +682,7 @@ async def rollup_db(mocker):
 async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker):
     """When all children are review/fix types (excluded from ROLLUP_TYPES),
     the parent should be marked COMPLETED rather than incorrectly CANCELLED."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Rollup Test", user_id="user1")
@@ -884,8 +909,8 @@ class TestStuckCycleThreshold:
     escalate to requires_approval."""
 
     def _stuck_threshold(self, source_type: str) -> float:
-        """Replicate threshold logic from task_lifecycle.py stuck-cycle detection."""
-        return 0.75 if source_type == "refactor" else 0.5
+        """Threshold logic from task_lifecycle.py stuck-cycle detection."""
+        return STUCK_CYCLE_THRESHOLD_REFACTOR if source_type == "refactor" else STUCK_CYCLE_THRESHOLD_DEFAULT
 
     def test_refactor_threshold_is_75(self):
         assert self._stuck_threshold("refactor") == 0.75

@@ -37,6 +37,7 @@ from app.github import (
     create_branch,
     create_pull_request,
 )
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +267,6 @@ async def claim_task(
     await session.refresh(task)
 
     # Broadcast status change to frontend
-    from app.main import broadcast_to_project
     await broadcast_to_project(
         str(task.project_id),
         "task_updated",

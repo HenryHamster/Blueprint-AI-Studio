@@ -14,7 +14,7 @@ import os
 class TestSafetyConstants:
     def test_max_review_fix_iterations(self):
         """MAX_REVIEW_FIX_ITERATIONS must stay at 8."""
-        from app.main import MAX_REVIEW_FIX_ITERATIONS
+        from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS
         assert MAX_REVIEW_FIX_ITERATIONS == 8, (
             f"MAX_REVIEW_FIX_ITERATIONS changed to {MAX_REVIEW_FIX_ITERATIONS} — "
             "this controls review-fix loop runaway. Do not change without approval."
@@ -151,7 +151,7 @@ class TestAgentRestrictions:
 # goes in extracted modules.
 
 MAIN_PY_MAX_LINES = 3900      # Ratchet down as extractions land
-MAIN_PY_MAX_FUNCTIONS = 66    # Ratchet down as extractions land
+MAIN_PY_MAX_FUNCTIONS = 55    # Ratchet down as extractions land
 MAIN_PY_MAX_EXTERNAL_IMPORTS = 60  # Ratchet down as import redirects land
 
 

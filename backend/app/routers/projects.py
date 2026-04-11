@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import re
 import time
 import uuid
 from typing import Optional
@@ -24,33 +23,11 @@ from app.models import (
 )
 from app.schemas import DeployPayload
 from app.shared_state import limiter
+from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["projects"])
-
-# Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
-# that bypass agent-side sanitization (compromised agent, direct WS injection)
-_SANITIZE_PATTERNS = [
-    (re.compile(r'https://x-access-token:[^@]+@'), 'https://x-access-token:***@'),
-    (re.compile(r'ghp_[A-Za-z0-9_]+'), 'ghp_***'),
-    (re.compile(r'ghs_[A-Za-z0-9_]+'), 'ghs_***'),
-    (re.compile(r'github_pat_[A-Za-z0-9_]+'), 'github_pat_***'),
-    (re.compile(r'sk-ant-[A-Za-z0-9_\-]+'), 'sk-ant-***'),
-    (re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'), 'eyJ***'),
-    (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), 'Bearer ***'),
-    (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), 'oauth_token=***'),
-    (re.compile(r'-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----'), '***PRIVATE KEY***'),
-]
-
-
-def _sanitize_log(text: str) -> str:
-    """Redact secrets from log text before broadcasting to WebSocket clients."""
-    if not text:
-        return text
-    for pattern, replacement in _SANITIZE_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
 
 
 @router.post("/api/deploy")
@@ -282,8 +259,6 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     WebSocket endpoint for real-time updates.
     The frontend connects to this to receive live status changes and logs.
     """
-    from app.main import manager
-
     await websocket.accept()
 
     try:
@@ -348,8 +323,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     """
     WebSocket endpoint for agents to stream high-throughput logs and real-time events.
     """
-    from app.main import manager, broadcast_to_project
-
     await websocket.accept()
 
     # Require the client to send the token as the first message
@@ -434,7 +407,7 @@ async def cancel_project(
     """
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
-    from app.main import _ensure_vm_deleted, broadcast_to_project
+    from app.main import _ensure_vm_deleted  # noqa: PLC0415
 
     member = (await session.execute(
         select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == current_user["user_id"])

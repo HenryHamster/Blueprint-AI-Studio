@@ -31,6 +31,7 @@ from app.schemas import AgentStatusPayload
 from app.routers.agent import _has_local_cycle
 from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
-    from app.main import broadcast_to_project, _maybe_create_failure_alert  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
 
     # Don't resurrect a cancelled parent
     if parent.status == TaskStatus.CANCELLED:
@@ -146,6 +147,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
 MAX_REVIEW_FIX_ITERATIONS = 8
 
+STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
+STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
+
 
 def _max_review_iterations(task: Task) -> int:
     """Scope-aware review-fix iteration limit."""
@@ -177,8 +181,6 @@ async def _spawn_pipeline_task(
     """Spawn a review or fix task as part of the automated review pipeline.
     Returns None if the review-fix cycle limit has been reached.
     Returns the existing active task if a review/fix is already active for this PR."""
-    from app.main import broadcast_to_project  # noqa: PLC0415
-
     # Guard: don't spawn if PR is already merged
     orig_id = original_task_id or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "") or (source_task.first_payload).get("original_task_id", "")
     if orig_id:
@@ -359,7 +361,7 @@ async def _spawn_pipeline_task(
             # Refactor tasks get a higher threshold — structural review feedback often repeats
             # because the fix agent cannot fully resolve architectural concerns in scope
             source_type = (source_task.first_payload or {}).get("type", "")
-            stuck_threshold = 0.75 if source_type == "refactor" else 0.5
+            stuck_threshold = STUCK_CYCLE_THRESHOLD_REFACTOR if source_type == "refactor" else STUCK_CYCLE_THRESHOLD_DEFAULT
             if matched_count / total_count >= stuck_threshold:
                 logger.warning(
                     f"[PIPELINE] Stuck cycle detected for PR #{pr_number}: "

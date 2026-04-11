@@ -21,6 +21,7 @@ from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Ar
 from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -598,7 +599,6 @@ async def bulk_action_tasks(
                                         )
                                         session.add(history_st)
                                         await session.commit()
-                                        from app.main import broadcast_to_project
                                         await broadcast_to_project(
                                             str(task.project_id), "task_updated",
                                             {"task_id": str(smoketest_task.id), "status": TaskStatus.QUEUED}
@@ -1182,7 +1182,6 @@ async def modify_task(
                                 )
                                 session.add(history)
                                 await session.commit()
-                                from app.main import broadcast_to_project
                                 await broadcast_to_project(
                                     str(task.project_id), "task_updated",
                                     {"task_id": str(smoketest_task.id), "status": TaskStatus.QUEUED}
@@ -3003,7 +3002,6 @@ async def reset_circuit_breaker(
     await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
     import app.shared_state as _shared_state
     from app.orchestrator import _persist_circuit_breakers
-    from app.main import broadcast_to_project
 
     key = str(project_id)
     breaker = _shared_state.circuit_breakers.get(key)
@@ -3018,6 +3016,18 @@ async def reset_circuit_breaker(
     breaker["half_open_task_id"] = None
 
     await _persist_circuit_breakers()
+
+    # Also clear _strategic_failures so the strategic cycle can recover
+    from app.models import Project
+    from sqlalchemy.orm.attributes import flag_modified
+    project = await session.get(Project, project_id)
+    if project and project.vision and "_strategic_failures" in project.vision:
+        project.vision = {**project.vision}
+        project.vision.pop("_strategic_failures", None)
+        flag_modified(project, "vision")
+        session.add(project)
+        await session.commit()
+        logger.info(f"[ADMIN] Cleared _strategic_failures for project {project_id}")
 
     user_email = current_user.get("email", current_user.get("sub", "unknown"))
     logger.info(f"[ADMIN] Circuit breaker manually reset for project {project_id} by {user_email}")
@@ -3074,7 +3084,7 @@ def _classify_stuck_failure(task: Task) -> Optional[str]:
         return "RATE_LIMIT"
     if any(kw in msg for kw in ["api.github.com", "api.anthropic.com", "502", "503", "ssl", "certificate"]):
         return "EXTERNAL_API"
-    if any(kw in msg for kw in ["no heartbeat", "reaped", "timed out", "killed", "sigterm"]):
+    if any(kw in msg for kw in ["no heartbeat", "reaped", "execution timed out", "node process killed", "oom kill", "oom killer", "killed by oom", "sigterm", "exit code 137", "exit code 143"]):
         return "AGENT_TIMEOUT"
     return None
 

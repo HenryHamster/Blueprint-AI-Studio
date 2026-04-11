@@ -100,7 +100,7 @@ async def orch_db(mocker):
     mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
 
     # Patch app.main functions imported lazily by orchestrator_worker()
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.main._get_actual_gcp_vm_count", return_value=0)
     mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
@@ -230,7 +230,7 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
 async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     """When a parent EVALUATING task times out (>6h), all non-terminal children
     must be set to CANCELLED with an appropriate status message."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
 
     project = Project(name="Cascade Cancel Test", user_id="user1")

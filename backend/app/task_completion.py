@@ -38,6 +38,7 @@ from app.models import (
 )
 from app.routers.agent import get_github_token_for_task
 from app.shared_state import runtime_config as _runtime_config
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -807,8 +808,8 @@ async def _ensure_branch(
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
-    # Deferred imports to avoid circular dependency
-    from app.main import broadcast_to_project, _maybe_create_failure_alert  # noqa: PLC0415
+    # Deferred import to avoid circular dependency
+    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
 
     plan_data = _parse_plan_output(logs)
     if not plan_data or not plan_data.get("subtasks"):
@@ -1065,9 +1066,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
 async def _handle_security_audit_completion(task: Task, logs: str, session: AsyncSession):
     """Parse security audit findings and spawn create tasks for critical/high severity issues."""
-    # Deferred import to avoid circular dependency
-    from app.main import broadcast_to_project  # noqa: PLC0415
-
     # Parse the JSON findings array from logs
     findings = None
     try:
@@ -1196,9 +1194,6 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     """Parse perf findings and spawn create tasks for high-severity issues."""
-    # Deferred import to avoid circular dependency
-    from app.main import broadcast_to_project  # noqa: PLC0415
-
     findings = None
     try:
         json_str = _extract_json_array(logs, "severity")
@@ -1682,9 +1677,6 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
-    # Deferred import to avoid circular dependency
-    from app.main import broadcast_to_project  # noqa: PLC0415
-
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)

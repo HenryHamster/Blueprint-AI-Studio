@@ -178,7 +178,7 @@ def mock_delete_vm(mocker):
 @pytest.fixture
 def mock_broadcast(mocker):
     from unittest.mock import AsyncMock
-    return mocker.patch('app.main.broadcast_to_project', new_callable=AsyncMock)
+    return mocker.patch('app.broadcast.broadcast_to_project', new_callable=AsyncMock)
 
 
 async def assert_alert_exists(

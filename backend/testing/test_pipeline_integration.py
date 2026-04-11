@@ -71,7 +71,7 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch("app.main.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
 
     # ------------------------------------------------------------------
@@ -255,7 +255,7 @@ async def test_create_task_spawns_review_on_pr_completion(
     """create task COMPLETED with PULL_REQUEST artifact → review task spawned."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch("app.main.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
 
     project = Project(name="Spawn Review Test", user_id="test-user-123")
@@ -314,7 +314,7 @@ async def test_review_request_changes_spawns_fix(
     """review task COMPLETED with REQUEST_CHANGES verdict → fix task spawned."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Spawn Fix Test", user_id="test-user-123")
     db_session.add(project)
@@ -386,7 +386,7 @@ async def test_fix_task_spawns_review_on_completion(
     """fix task COMPLETED → new review task spawned with iteration+1."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Respawn Review Test", user_id="test-user-123")
     db_session.add(project)
@@ -460,7 +460,7 @@ async def test_review_approve_does_not_spawn_fix(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Approve No Fix Test", user_id="test-user-123")
     db_session.add(project)
@@ -527,7 +527,7 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Idempotency Test", user_id="test-user-123")
     db_session.add(project)
@@ -606,7 +606,7 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Verdict Fallback Test", user_id="test-user-123")
     db_session.add(project)
@@ -679,7 +679,7 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Duplicate Guard Test", user_id="test-user-123")
     db_session.add(project)
@@ -779,7 +779,7 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Cap Enforcement Test", user_id="test-user-123")
     db_session.add(project)
@@ -874,7 +874,7 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="CI Failure Cap Test", user_id="test-user-123")
     db_session.add(project)
@@ -966,7 +966,7 @@ async def test_review_fix_cap_sets_status_message(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Cap Status Message Test", user_id="test-user-123")
     db_session.add(project)
@@ -1052,7 +1052,7 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Stuck Cycle Test", user_id="test-user-123")
     db_session.add(project)
@@ -1172,7 +1172,7 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.main.broadcast_to_project")
+    mocker.patch("app.broadcast.broadcast_to_project")
 
     project = Project(name="Stuck Cycle No-OrigID Test", user_id="test-user-123")
     db_session.add(project)

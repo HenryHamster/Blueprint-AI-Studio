@@ -77,7 +77,7 @@ async def eval_db(mocker):
 async def test_evaluating_all_children_terminal_triggers_rollup(eval_db, mocker):
     """When all children are terminal but the parent is still EVALUATING, the
     missed-rollup recovery path should call _check_and_trigger_rollup."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_rollup = mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
     project = Project(name="Eval Rollup Test", user_id="user1")
@@ -115,7 +115,7 @@ async def test_evaluating_all_children_terminal_triggers_rollup(eval_db, mocker)
 async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     """A task that has been EVALUATING for >6 hours with non-terminal children
     should be marked FAILED with an appropriate status message."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Hard Timeout Test", user_id="user1")
     eval_db.add(project)
@@ -167,7 +167,7 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
 async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     """Tasks with context['ci_waiting'] = True must be skipped entirely by the
     timeout sweep — not timed out even after many hours."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_rollup = mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
     project = Project(name="CI Waiting Test", user_id="user1")
@@ -207,7 +207,7 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
 async def test_evaluating_warning_alert_created(eval_db, mocker):
     """A task EVALUATING for >2 hours (the warning threshold) with non-terminal
     children should produce an undismissed WARNING alert."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Warning Alert Test", user_id="user1")
     eval_db.add(project)
@@ -262,7 +262,7 @@ async def test_evaluating_warning_alert_created(eval_db, mocker):
 async def test_rollup_empty_children_after_filter(eval_db, mocker):
     """When every child is a review/fix type (excluded from ROLLUP_TYPES),
     _check_and_trigger_rollup should mark the parent COMPLETED — not CANCELLED."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Rollup Filter Test", user_id="user1")
@@ -314,7 +314,7 @@ async def test_evaluating_unmerged_pr_verification(eval_db, mocker):
     _check_and_trigger_rollup, which invokes _verify_pr_merged on each COMPLETED
     child.  If _verify_pr_merged returns True (e.g. GitHub confirms merge), the
     child's context.pr_merged flag should be set and persisted."""
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="PR Verify Test", user_id="user1")
     eval_db.add(project)

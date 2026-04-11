@@ -18,9 +18,9 @@ import app.shared_state as _shared_state
 from app.main import (
     reaper_service,
     _spawn_research_task,
-    _handle_research_completion,
     classify_failure,
 )
+from app.task_completion import _handle_research_completion
 from app.max_plan_pool import (
     load_max_plan_pool,
     select_max_plan_account,
@@ -57,15 +57,15 @@ class _FakeSessionFactory:
 @pytest.fixture(autouse=False)
 def reset_max_plan_pool():
     """Save and restore the in-memory Max Plan pool around each test."""
-    orig_pools = {k: list(v) for k, v in _main_module._max_plan_pools.items()}
-    orig_by_id = dict(_main_module._account_by_id)
-    _main_module._max_plan_pools.clear()
-    _main_module._account_by_id.clear()
+    orig_pools = {k: list(v) for k, v in _max_plan_pools.items()}
+    orig_by_id = dict(_account_by_id)
+    _max_plan_pools.clear()
+    _account_by_id.clear()
     yield
-    _main_module._max_plan_pools.clear()
-    _main_module._account_by_id.clear()
-    _main_module._max_plan_pools.update(orig_pools)
-    _main_module._account_by_id.update(orig_by_id)
+    _max_plan_pools.clear()
+    _account_by_id.clear()
+    _max_plan_pools.update(orig_pools)
+    _account_by_id.update(orig_by_id)
 
 
 # ── Fixture: reset circuit breaker state for a project ───────────────────────
@@ -102,7 +102,7 @@ class TestReaperService:
         must be marked FAILED and its VM deleted.
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -142,7 +142,7 @@ class TestReaperService:
         be left alone by the reaper.
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -181,7 +181,7 @@ class TestReaperService:
         NOT marked FAILED.
         """
         mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -219,7 +219,7 @@ class TestReaperService:
         must be skipped — the reaper only acts on tasks with real VMs.
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -263,7 +263,7 @@ class TestReaperService:
         detects the status change during re-validation and does nothing.
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         StopLoop = self._stop_after_one_cycle(mocker)
 
         project = make_project(name="Skip-locked test", user_id="user1")
@@ -329,7 +329,7 @@ class TestReaperService:
         database-level guarantee that prevents double-reaping after the first pass.
         """
         mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -415,8 +415,8 @@ class TestMaxPlanPool:
 
         await load_max_plan_pool()
 
-        assert len(_main_module._account_by_id) == 1
-        entry = _main_module._account_by_id[str(acct_id)]
+        assert len(_account_by_id) == 1
+        entry = _account_by_id[str(acct_id)]
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
@@ -433,8 +433,8 @@ class TestMaxPlanPool:
 
         await load_max_plan_pool()
 
-        assert len(_main_module._account_by_id) == 2
-        names = {a["name"] for a in _main_module._account_by_id.values()}
+        assert len(_account_by_id) == 2
+        names = {a["name"] for a in _account_by_id.values()}
         assert names == {"enabled-acct", "disabled-acct"}
 
     # ── Test 3: select_max_plan_account returns lowest active count ──────────
@@ -488,7 +488,7 @@ class TestMaxPlanPool:
     @pytest.mark.asyncio
     async def test_select_max_plan_account_returns_none_for_empty_pool(self, reset_max_plan_pool):
         """Empty pool returns None without raising."""
-        assert len(_main_module._account_by_id) == 0
+        assert len(_account_by_id) == 0
         assert await select_max_plan_account(_TEST_USER) is None
 
     # ── Test 7: release decrements active_tasks ──────────────────────────────
@@ -753,7 +753,7 @@ class TestResearchCompletion:
         Findings whose titles share 3+ meaningful words with an existing task title
         must be deduplicated — no new child task should be created for them.
         """
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
@@ -823,7 +823,7 @@ class TestResearchCompletion:
         When findings carry explicit depends_on_indices, the resulting child tasks
         must have their depends_on field set to the UUIDs of the referenced tasks.
         """
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
@@ -893,7 +893,7 @@ class TestResearchCompletion:
         naturally runs high-priority tasks first without blocking low-priority
         ones behind artificial dependency chains.
         """
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
@@ -975,17 +975,17 @@ class TestClassifyFailure:
         task = self._make_task("Process terminated with exit code 143")
         assert classify_failure(task) == "AGENT_TIMEOUT"
 
-    def test_container_exited_is_agent_timeout(self):
+    def test_container_exited_is_code_error(self):
         task = self._make_task("container exited unexpectedly")
-        assert classify_failure(task) == "AGENT_TIMEOUT"
+        assert classify_failure(task) == "CODE_ERROR"
 
-    def test_non_zero_exit_code_is_agent_timeout(self):
+    def test_non_zero_exit_code_is_code_error(self):
         task = self._make_task("non-zero exit code returned by agent runner")
-        assert classify_failure(task) == "AGENT_TIMEOUT"
+        assert classify_failure(task) == "CODE_ERROR"
 
-    def test_process_exited_is_agent_timeout(self):
+    def test_process_exited_is_code_error(self):
         task = self._make_task("process exited with status 1")
-        assert classify_failure(task) == "AGENT_TIMEOUT"
+        assert classify_failure(task) == "CODE_ERROR"
 
     def test_node_process_killed_is_agent_timeout(self):
         task = self._make_task("node process killed by system")

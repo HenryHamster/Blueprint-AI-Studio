@@ -73,7 +73,7 @@ class TestClassifyStuckFailure:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API", kw
 
     def test_agent_timeout_keywords(self):
-        for kw in ["no heartbeat received", "reaped by watchdog", "timed out waiting", "killed by oom", "sigterm received"]:
+        for kw in ["no heartbeat received", "reaped by watchdog", "execution timed out", "node process killed", "oom kill", "killed by oom", "sigterm received", "exit code 137", "exit code 143"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "AGENT_TIMEOUT", kw
 
     def test_empty_message_returns_none(self):

@@ -20,7 +20,9 @@ from sqlalchemy import select
 
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _update_direction_research_outcomes
+from app.main import _spawn_research_task
+from app.task_completion import _handle_research_completion
+from app.task_lifecycle import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -72,7 +74,7 @@ async def _add_direction(
 def _patch_research_externals(mocker):
     """Patch all external calls needed by _handle_research_completion."""
     mocker.patch("app.task_completion._ensure_branch", new=AsyncMock(return_value=True))
-    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
 
@@ -212,7 +214,7 @@ async def test_spawn_skipped_when_directions_empty(db_session):
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
+        vision={"purpose": "test", "_strategic_failures": 3},  # At failure cap so force_strategic doesn't fire
     )
     db_session.add(project)
     await db_session.commit()
@@ -235,7 +237,7 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
             {**_active_direction("d-paused01", "Paused A"), "status": "paused"},
             {**_active_direction("d-done0001", "Completed B"), "status": "completed"},
         ],
-        vision={"purpose": "test"},  # Non-empty vision so force_strategic doesn't bypass
+        vision={"purpose": "test", "_strategic_failures": 3},  # At failure cap so force_strategic doesn't fire
     )
     db_session.add(project)
     await db_session.commit()

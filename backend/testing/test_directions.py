@@ -387,7 +387,7 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     )
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
-    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(
@@ -514,7 +514,7 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
-    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(
@@ -596,7 +596,7 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
-    mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(

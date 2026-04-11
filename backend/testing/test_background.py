@@ -6,7 +6,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 from app.models import Project, Task, TaskStatus
-from app.main import reaper_service, broadcast_to_project, manager
+from app.main import reaper_service
+from app.broadcast import broadcast_to_project, manager
 
 
 # The reaper creates its own DB sessions via AsyncSessionLocal. Tests must

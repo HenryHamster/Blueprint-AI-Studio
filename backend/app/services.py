@@ -12,6 +12,7 @@ from app.models import (
     Task, TaskStatus, Artifact, ArtifactType, Alert, AlertSeverity,
 )
 import app.shared_state as _shared_state
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ async def _check_evaluating_timeouts():
     - If evaluating >6h → FAIL with ERROR alert.
     - Skips CI-waiting tasks (they have their own 30-min timeout).
     """
-    from app.main import _maybe_create_failure_alert, broadcast_to_project  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
     from app.task_lifecycle import _check_and_trigger_rollup  # noqa: PLC0415
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
@@ -313,7 +314,7 @@ async def _check_evaluating_timeouts():
 
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
-    from app.main import broadcast_to_project, get_github_token_for_task  # noqa: PLC0415
+    from app.main import get_github_token_for_task  # noqa: PLC0415
     from app.task_lifecycle import _spawn_pipeline_task  # noqa: PLC0415
 
     try:

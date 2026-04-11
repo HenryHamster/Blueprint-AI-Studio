@@ -218,13 +218,15 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
     # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
-    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started", "timed out",
-                                      "execution timed out", "killed", "sigterm",
+    # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
+    # "non-zero exit code" and "process exited" are code errors, not timeouts.
+    # Only use specific forms: "execution timed out", "node process killed", "oom killer".
+    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
+                                      "execution timed out", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",
                                       "cannot allocate memory",
                                       "exit code 137", "exit code 143",
-                                      "non-zero exit code", "process exited",
-                                      "container exited", "node process killed",
+                                      "node process killed",
                                       "oom killer",
                                       "[fatal:", "fatal error", "process crashed"]):
         return "AGENT_TIMEOUT"
@@ -1579,7 +1581,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
     vision_data = project.vision or {}
     strategic_failures = vision_data.get("_strategic_failures", 0)
-    force_strategic = not vision_data.get("purpose") and strategic_failures < 3
+    # Check if ANY direction is active in the project (ignoring cooldown filter).
+    # active_directions only contains non-cooldown directions, so a project with
+    # active-but-cooling directions should not trigger a strategic cycle.
+    any_active_in_project = any(d.get("status") == "active" for d in (project.directions or []))
+    force_strategic = strategic_failures < 3 and (
+        not vision_data.get("purpose") or not any_active_in_project
+    )
     if not active_directions and not force_strategic:
         return
     # Pick ONE direction per research task to avoid putting all on cooldown at once.
@@ -1989,7 +1997,10 @@ async def _check_idle_research():
                 active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
                 # Allow projects with no directions through if vision needs bootstrapping
                 vision_needs_bootstrap = not (project.vision or {}).get("purpose")
-                if not active_directions and not vision_needs_bootstrap:
+                strategic_recovery_needed = not active_directions and (
+                    (project.vision or {}).get("_strategic_failures", 0) < 3
+                )
+                if not active_directions and not vision_needs_bootstrap and not strategic_recovery_needed:
                     continue
 
                 # Spawn if VM slots are available — count only tasks consuming VMs,
@@ -2013,110 +2024,14 @@ async def _check_idle_research():
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
 
-def _get_websocket_client_ip(websocket: WebSocket) -> str:
-    """Return the real client IP for a WebSocket connection.
-
-    In Cloud Run, the GCP load balancer terminates external TLS and forwards
-    traffic over an internal (RFC-1918) TCP connection.  We trust
-    X-Forwarded-For only when the direct TCP peer is a private IP, because
-    external attackers cannot forge their TCP source address.  If the direct
-    connection is already from a public IP (e.g. local dev, direct access),
-    we use it as-is and ignore X-Forwarded-For to prevent spoofing.
-    """
-    if not websocket.client:
-        return "unknown"
-    direct_ip = websocket.client.host
-    try:
-        is_private = ipaddress.ip_address(direct_ip).is_private
-    except ValueError:
-        return direct_ip
-    if is_private:
-        xff = websocket.headers.get("x-forwarded-for", "")
-        if xff:
-            return xff.split(",")[-1].strip()
-    return direct_ip
-
-
-# --- In-Memory Event Bus for WebSockets ---
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-        self.ip_connections: Dict[str, int] = {}
-        self.MAX_CONNECTIONS_PER_IP = 20
-        self._lock = asyncio.Lock()
-
-    async def check_and_add_ip(self, websocket: WebSocket) -> bool:
-        client_ip = _get_websocket_client_ip(websocket)
-        if client_ip != "unknown":
-            if self.ip_connections.get(client_ip, 0) >= self.MAX_CONNECTIONS_PER_IP:
-                await websocket.close(code=1008, reason="Too many connections from this IP")
-                return False
-            self.ip_connections[client_ip] = self.ip_connections.get(client_ip, 0) + 1
-        return True
-
-    def _remove_ip(self, websocket: WebSocket):
-        client_ip = _get_websocket_client_ip(websocket)
-        if client_ip != "unknown" and client_ip in self.ip_connections:
-            self.ip_connections[client_ip] -= 1
-            if self.ip_connections[client_ip] <= 0:
-                del self.ip_connections[client_ip]
-
-    # Keep old name for any external callers
-    def remove_ip(self, websocket: WebSocket):
-        self._remove_ip(websocket)
-
-    async def connect(self, websocket: WebSocket, project_id: str) -> bool:
-        async with self._lock:
-            if not await self.check_and_add_ip(websocket):
-                return False
-
-            if project_id not in self.active_connections:
-                self.active_connections[project_id] = []
-            self.active_connections[project_id].append(websocket)
-            return True
-
-    async def disconnect(self, websocket: WebSocket, project_id: str):
-        async with self._lock:
-            if project_id in self.active_connections:
-                if websocket in self.active_connections[project_id]:
-                    self.active_connections[project_id].remove(websocket)
-                if not self.active_connections[project_id]:
-                    del self.active_connections[project_id]
-
-            self._remove_ip(websocket)
-
-    async def broadcast(self, project_id: str, event_type: str, data: dict):
-        async with self._lock:
-            if project_id not in self.active_connections:
-                return
-            connections = list(self.active_connections[project_id])  # noqa: PERF101 — snapshot under lock
-        message = {"event": event_type, "data": data}
-        for connection in connections:
-            try:
-                await asyncio.wait_for(connection.send_json(message), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"[WS] Send timeout for client (project={project_id}, event={event_type})")
-                await self.disconnect(connection, project_id)
-            except Exception as e:
-                logger.warning(f"[WS] Failed to send message to client (project={project_id}, event={event_type}): {e}")
-                await self.disconnect(connection, project_id)
-
-    async def broadcast_to_all(self, event_type: str, data: dict):
-        """Broadcasts a message to all connected WebSocket clients across all projects."""
-        for project_id in list(self.active_connections.keys()):  # noqa: PERF101 — broadcast() can remove entries via disconnect()
-            await self.broadcast(project_id, event_type, data)
-
-manager = ConnectionManager()
-
-async def broadcast_to_project(project_id: str, event_type: str, data: dict):
-    """Broadcasts a message to all WebSocket clients listening to a specific project.
-
-    Swallows exceptions to prevent crashing HTTP handlers after DB commits.
-    """
-    try:
-        await manager.broadcast(project_id, event_type, data)
-    except Exception as e:
-        logger.warning(f"[WS] Broadcast failed (project={project_id}, event={event_type}): {e}")
+from app.broadcast import (  # re-exports for backward compat
+    _get_websocket_client_ip,
+    ConnectionManager,
+    manager,
+    broadcast_to_project,
+    _SANITIZE_PATTERNS,
+    _sanitize_log,
+)
 
 
 async def _maybe_create_failure_alert(
@@ -2641,28 +2556,6 @@ def read_root():
     return {"status": "online", "service": "Blueprint Orchestrator"}
 
 # --- Agent APIs ---
-
-# Log sanitization patterns — mirrors agent/src/index.ts sanitize() to catch secrets
-# that bypass agent-side sanitization (compromised agent, direct WS injection)
-_SANITIZE_PATTERNS = [
-    (re.compile(r'https://x-access-token:[^@]+@'), 'https://x-access-token:***@'),
-    (re.compile(r'ghp_[A-Za-z0-9_]+'), 'ghp_***'),
-    (re.compile(r'ghs_[A-Za-z0-9_]+'), 'ghs_***'),
-    (re.compile(r'github_pat_[A-Za-z0-9_]+'), 'github_pat_***'),
-    (re.compile(r'sk-ant-[A-Za-z0-9_\-]+'), 'sk-ant-***'),
-    (re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'), 'eyJ***'),
-    (re.compile(r'Bearer\s+[^\s,\'"]+', re.IGNORECASE), 'Bearer ***'),
-    (re.compile(r'oauth_token[=:]\s*[^\s&\'"]+', re.IGNORECASE), 'oauth_token=***'),
-    (re.compile(r'-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----'), '***PRIVATE KEY***'),
-]
-
-def _sanitize_log(text: str) -> str:
-    """Redact secrets from log text before broadcasting to WebSocket clients."""
-    if not text:
-        return text
-    for pattern, replacement in _SANITIZE_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
 
 @app.websocket("/api/agent/ws/{task_id}")
 async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
