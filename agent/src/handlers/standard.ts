@@ -8,7 +8,7 @@ import {
 import {
   TASK_TYPE_HINTS, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
-  writePlaybookHelper, formatPlaybook,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
@@ -73,6 +73,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
   const fileTree = buildFileTree(ws);

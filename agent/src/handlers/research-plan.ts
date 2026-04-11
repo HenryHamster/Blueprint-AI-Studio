@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, formatPlaybook,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -30,6 +30,7 @@ export async function handlePlan(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
 
   const contextPrefix = buildContextPrefix(task);
@@ -210,6 +211,7 @@ export async function handleResearch(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
 
   let gitLogOutput = '';
@@ -666,11 +668,16 @@ Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Jus
 
 # Save notes
 ./design-doc set "notes/strategic-review" '"..."'
+
+# Respond to or resolve user messages
+./messages resolve <message-id> 'How it was addressed'
+./messages send 'Response or note to the user'
 \`\`\`
 
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
+${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\n${openMessagesText}\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}
@@ -681,7 +688,8 @@ ${analysisText.slice(0, 50_000)}
 2. Run ./strategic create-direction for each new direction recommended.
 3. Run ./strategic retire-direction for any directions the analysis says to retire.
 4. Run ./design-doc set "notes/strategic-review" with key observations.
-5. Done. Do not write anything else.`;
+5. Review open messages — resolve any that have been addressed, respond to user questions.
+6. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

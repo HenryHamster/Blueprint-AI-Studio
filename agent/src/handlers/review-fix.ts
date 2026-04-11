@@ -9,7 +9,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
-  writePlaybookHelper, formatPlaybook,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
@@ -40,6 +40,7 @@ export async function handleReview(
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
@@ -197,6 +198,7 @@ export async function handleFix(
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);

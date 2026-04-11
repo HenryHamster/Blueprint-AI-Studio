@@ -2028,7 +2028,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if did:
             direction_ids_with_findings.add(did)
     # If all findings were deduped, still put the current direction on cooldown
-    current_direction_id = (task.context or {}).get("direction_id")
+    current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
     all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
     if all_deduped and current_direction_id:
         direction_ids_with_findings.add(current_direction_id)

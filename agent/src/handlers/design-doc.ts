@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper,
+  writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
@@ -125,6 +125,7 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/design-doc`, helperScript, { mode: 0o755 });
+  writeMessagesHelper(taskId);
 
   // CLAUDE.md as persistent reminder
   fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
@@ -170,8 +171,10 @@ ${codebaseSummary}${fileTreeSection}
 5. For notes/observations: \`./design-doc set "notes/<topic>" '"..."'\`
 6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
 7. Focus on WHAT IS. Document missing things as missing.
-8. Review open messages — if any are agent annotations (comments, issues),
-   incorporate valid observations into the relevant pages and update accordingly.
+8. Review open messages — respond to user questions/feedback and resolve addressed messages:
+   \`./messages resolve <message-id> 'Brief explanation of how it was addressed'\`
+   \`./messages send 'Your response or note' QUESTION\`
+   Incorporate valid observations into the relevant pages. Resolve messages you've addressed.
 9. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
    and validate that entries reflect the current codebase state. Use ./playbook delete <key>
    for stale entries.`;

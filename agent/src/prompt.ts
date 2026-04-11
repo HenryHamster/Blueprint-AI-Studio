@@ -60,7 +60,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'investigate': 'This is a read-only investigation. Do NOT modify any files. Write your findings to the output JSON only.',
 };
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg".';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
 // ── Playbook helpers ─────────────────────────────────────────────────────────
 
@@ -96,6 +96,42 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/playbook`, helperScript, { mode: 0o755 });
+}
+
+export function writeMessagesHelper(taskId: string): void {
+  const helperScript = `#!/bin/bash
+# Message tool — send messages to the project owner or resolve open messages
+# Usage:
+#   ./messages send '<content>'                    # send a NOTE message
+#   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
+#   ./messages resolve <message-id> '<resolution>' # resolve an open message
+
+OP="\${1:?Usage: messages send|resolve ...}"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
+
+if [ "\$OP" = "send" ]; then
+  CONTENT="\${2:?send requires '<content>'}"
+  MSG_TYPE="\${3:-NOTE}"
+  jq -n --arg tid "\$TASK" --arg t "\$MSG_TYPE" --arg c "\$CONTENT" \\
+    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+elif [ "\$OP" = "resolve" ]; then
+  MSG_ID="\${2:?resolve requires <message-id>}"
+  RESOLUTION="\${3:-Addressed}"
+  jq -n --arg tid "\$TASK" --arg mid "\$MSG_ID" --arg r "\$RESOLUTION" \\
+    '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+else
+  echo "Unknown op: \$OP. Use send or resolve." >&2; exit 1
+fi
+echo ""
+`;
+  fs.writeFileSync(`${WORKSPACE}/messages`, helperScript, { mode: 0o755 });
 }
 
 export function formatPlaybook(playbook: Record<string, string> | undefined): string {

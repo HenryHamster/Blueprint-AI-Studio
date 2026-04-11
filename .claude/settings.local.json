@@ -5,7 +5,10 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/admin.py''\\).read\\(\\)\\); print\\(''OK: admin.py''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/compute.py''\\).read\\(\\)\\); print\\(''OK: compute.py''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/compute.py''\\).read\\(\\)\\); print\\(''OK: compute.py''\\)\")",
+      "Bash(git ls-files:*)",
+      "Bash(export PATH=\"/c/Program Files/Docker/Docker/resources/bin:$PATH\")",
+      "Bash(bash scripts/test-backend.sh)"
     ]
   }
 }

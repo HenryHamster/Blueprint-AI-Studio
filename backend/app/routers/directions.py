@@ -364,7 +364,7 @@ async def trigger_strategic_cycle(
             select(ProjectMessage).where(
                 ProjectMessage.project_id == project.id,
                 ProjectMessage.status == "open",
-            ).order_by(ProjectMessage.created_at.asc()).limit(20)
+            ).order_by(ProjectMessage.created_at.asc()).limit(50)
         )
         open_msgs = [
             {"id": str(m.id), "type": m.message_type, "content": m.content,
@@ -408,7 +408,7 @@ async def trigger_strategic_cycle(
             select(ProjectMessage).where(
                 ProjectMessage.project_id == project.id,
                 ProjectMessage.status == "open",
-            ).order_by(ProjectMessage.created_at.asc()).limit(20)
+            ).order_by(ProjectMessage.created_at.asc()).limit(50)
         )
         open_msgs = [
             {"id": str(m.id), "type": m.message_type, "content": m.content,

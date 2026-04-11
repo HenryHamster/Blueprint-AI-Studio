@@ -7,7 +7,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, formatPlaybook,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
 
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
@@ -25,6 +25,7 @@ export async function handleSecurityAudit(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('security_audit');
 
   const contextPrefix = buildContextPrefix(task);
@@ -124,6 +125,7 @@ export async function handleMigrate(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('migrate');
 
   git(['config', 'user.email', 'blueprint-agent@automated.dev']);
@@ -266,6 +268,7 @@ export async function handleSmoketest(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('smoketest');
 
   const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
@@ -380,6 +383,7 @@ export async function handleDebug(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', rawBaseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('debug');
 
   // Gather git context upfront to include in the prompt
@@ -481,6 +485,7 @@ export async function handlePerf(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('perf');
 
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
@@ -563,6 +568,7 @@ export async function handleInvestigate(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
   writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('investigate');
 
   const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.

@@ -1309,7 +1309,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
         select(ProjectMessage).where(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
-        ).order_by(ProjectMessage.created_at.asc()).limit(20)
+        ).order_by(ProjectMessage.created_at.asc()).limit(50)
     )
     open_msgs = [
         {"id": str(m.id), "type": m.message_type, "content": m.content,
@@ -1395,7 +1395,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession):
         select(ProjectMessage).where(
             ProjectMessage.project_id == project.id,
             ProjectMessage.status == "open",
-        ).order_by(ProjectMessage.created_at.asc()).limit(20)
+        ).order_by(ProjectMessage.created_at.asc()).limit(50)
     )
     open_msgs = [
         {"id": str(m.id), "type": m.message_type, "content": m.content,
@@ -1493,16 +1493,19 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
 
-    # Build set of direction IDs that still have an unrolled research cycle
-    # (EVALUATING parent = children still running/merging, not rolled up yet)
+    # Build set of direction IDs that already have an active research cycle
+    # (any non-terminal state: QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)
     busy_direction_ids: set = set()
-    evaluating_research = (await session.execute(
+    active_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.status == TaskStatus.EVALUATING,
+            Task.status.in_([
+                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            ]),
         )
     )).scalars().all()
-    for t in evaluating_research:
+    for t in active_research:
         payload = t.first_payload
         if payload.get("type") == "research":
             # New-format tasks include all active directions but only one is targeted
@@ -1526,7 +1529,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         # Skip directions with an unrolled research cycle still in progress
         if did and did in busy_direction_ids:
             logger.debug(
-                f"[RESEARCH] Skipping direction {did}: previous research cycle not yet rolled up"
+                f"[RESEARCH] Skipping direction {did}: research cycle already active"
             )
             continue
         last_researched = d.get("last_researched_at")
@@ -1636,17 +1639,28 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # never blocked by an active tactical research task.  The design_doc_update
     # and strategic_review use their own task types and run in parallel.
     all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
-    total_research_count = sum(
-        len(d.get("research_history", [])) for d in all_active_directions
-    )
+    # Use a stored spawn counter instead of derived research_history count.
+    # The history-based count doesn't increment when cycles produce no novel
+    # findings, causing undirected/strategic cycles to repeat indefinitely.
+    # Seed from research_history on first access so existing projects don't reset.
+    research_spawn_count = (project.vision or {}).get("_research_spawn_count")
+    if research_spawn_count is None:
+        research_spawn_count = sum(
+            len(d.get("research_history", [])) + d.get("history_aggregate", {}).get("total_cycles", 0)
+            for d in all_active_directions
+        )
+        project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
+        flag_modified(project, "vision")
+        session.add(project)
+        logger.info(f"[RESEARCH] Seeded _research_spawn_count={research_spawn_count} from research_history")
     strategic_frequency = _runtime_config.get("strategic_research_frequency", 6)
     is_strategic = (
-        (strategic_frequency > 0 and total_research_count > 0 and total_research_count % strategic_frequency == 0)
+        (strategic_frequency > 0 and research_spawn_count > 0 and research_spawn_count % strategic_frequency == 0)
         or force_strategic
     )
     if is_strategic:
         await _spawn_design_doc_update(project, session)
-        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{total_research_count}, vision rev {(project.vision or {}).get('revision', 0)})")
+        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{research_spawn_count}, vision rev {(project.vision or {}).get('revision', 0)})")
 
     # Guard: no research task actively running (queued/provisioning/in_progress).
     # EVALUATING parents are just waiting on children — they don't block new research.
@@ -1705,7 +1719,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Every Nth cycle is "undirected" — the agent explores the whole codebase
     # without a specific direction lens, finding cross-cutting improvements.
     undirected_frequency = _runtime_config.get("undirected_research_frequency", 4)
-    is_undirected = undirected_frequency > 0 and total_research_count > 0 and total_research_count % undirected_frequency == 0
+    is_undirected = undirected_frequency > 0 and research_spawn_count > 0 and research_spawn_count % undirected_frequency == 0
     # Don't run undirected on strategic cycles
     if is_strategic:
         is_undirected = False
@@ -1755,7 +1769,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                 research_payload["anomaly_signals"] = anomalies
         if is_undirected:
             direction_text = "Cross-cutting codebase analysis"
-            logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{total_research_count})")
+            logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})")
         else:
             direction_text = (chosen_direction.get("text") or "general improvement")[:80]
     new_task = Task(
@@ -1768,6 +1782,10 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
+    # Increment spawn counter so undirected/strategic frequency checks advance
+    project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count + 1}
+    flag_modified(project, "vision")
+    session.add(project)
     history = TaskHistory(
         task_id=new_task.id, action="SPAWNED",
         details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}
@@ -3038,8 +3056,11 @@ async def strategic_operation(
     """Agent endpoint for incremental strategic review operations."""
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-    if token.get("task_type") not in ("strategic_review",):
-        raise HTTPException(status_code=403, detail="Endpoint restricted to strategic_review agents")
+    # Message ops (create/resolve) are available to all agent types.
+    # Direction/vision ops are restricted to strategic_review only.
+    MESSAGE_OPS = ("create_message", "resolve_message")
+    if payload.op not in MESSAGE_OPS and token.get("task_type") not in ("strategic_review",):
+        raise HTTPException(status_code=403, detail="Only strategic_review agents can modify directions/vision")
 
     task = await session.get(Task, payload.task_id)
     if not task:

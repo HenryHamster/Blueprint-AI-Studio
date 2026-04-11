@@ -56,6 +56,11 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
   const revision = typeof vision.revision === 'number' ? vision.revision : 0;
   const lastUpdated = typeof vision.last_updated === 'string' ? vision.last_updated : '';
   const activeCount = directions.filter(d => d.status === 'active').length;
+  const spawnCount = typeof vision._research_spawn_count === 'number' ? vision._research_spawn_count : 0;
+  const strategicFreq = 6;
+  const undirectedFreq = 4;
+  const nextStrategic = strategicFreq > 0 && spawnCount > 0 ? strategicFreq - (spawnCount % strategicFreq) : strategicFreq;
+  const nextUndirected = undirectedFreq > 0 && spawnCount > 0 ? undirectedFreq - (spawnCount % undirectedFreq) : undirectedFreq;
 
   const statusCounts = systems.reduce<Record<string, number>>((acc, s) => {
     const st = String(s.status || 'planned');
@@ -141,6 +146,11 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
           <div className="flex items-center gap-2 text-xs text-neutral-500">
             {revision > 0 && <span>rev {revision}</span>}
             {lastUpdated && <span>updated {formatRelativeTime(lastUpdated)}</span>}
+            {spawnCount > 0 && (
+              <span className="text-neutral-600" title={`Research cycle ${spawnCount}. Strategic in ${nextStrategic}, crosscutting in ${nextUndirected}`}>
+                cycle {spawnCount} (arch {nextStrategic === strategicFreq ? 'now' : `in ${nextStrategic}`})
+              </span>
+            )}
           </div>
         </div>
         <button
