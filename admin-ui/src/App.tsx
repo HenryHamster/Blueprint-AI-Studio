@@ -125,6 +125,7 @@ function ColumnsPicker({ prefs, onPrefsChange }: { prefs: ColumnPref[]; onPrefsC
 export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [drawerWidth, setDrawerWidth] = useState(0);
   const [sortBy, setSortBy] = useState<SortBy>(() => {
     try {
       const stored = localStorage.getItem(SORT_KEY);
@@ -893,6 +894,7 @@ export default function App() {
           onRetry={s.handleRetry}
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
+          onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);
             if (target) {
@@ -914,6 +916,7 @@ export default function App() {
           tasks={s.tasks}
           onUntrack={s.untrackTask}
           onUntrackAll={s.untrackAll}
+          offsetRight={s.logTask ? drawerWidth : 0}
         />
       )}
 

@@ -19,6 +19,7 @@ interface TaskDetailDrawerProps {
   onEditPrompt: (id: string, newPrompt: string) => void;
   onDismiss: (id: string) => void;
   onNavigateToTask?: (taskId: string) => void;
+  onWidthChange?: (width: number) => void;
 }
 
 type Tab = 'details' | 'logs';
@@ -735,6 +736,7 @@ export function TaskDetailDrawer({
   onEditPrompt,
   onDismiss,
   onNavigateToTask,
+  onWidthChange,
 }: TaskDetailDrawerProps) {
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
@@ -747,6 +749,11 @@ export function TaskDetailDrawer({
   const [drawerWidth, setDrawerWidth] = useState(680);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  // Report drawer width to parent so sibling panels can offset
+  useEffect(() => {
+    onWidthChange?.(isFullscreen ? window.innerWidth : drawerWidth);
+  }, [drawerWidth, isFullscreen, onWidthChange]);
 
   // Reset log filter when task changes
   useEffect(() => {

@@ -12,7 +12,7 @@ import uuid
 import asyncio
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Literal, Optional
 from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -80,6 +80,43 @@ logger = logging.getLogger(__name__)
 def _utcnow() -> datetime:
     """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None) -> str:
+    """Cap a string field, appending a human-readable warning if truncation occurred."""
+    s = str(value) if value is not None else ""
+    if len(s) > max_len:
+        if warnings is not None:
+            warnings.append(
+                f"{field_name} was truncated from {len(s)} to {max_len} chars — "
+                f"resubmit with content under {max_len} chars to avoid losing text"
+            )
+        return s[:max_len]
+    return s
+
+
+def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[List[str]] = None) -> list:
+    """Cap a list to the last N items, warning if older items were dropped."""
+    if len(lst) > max_items:
+        dropped = len(lst) - max_items
+        if warnings is not None:
+            warnings.append(
+                f"{field_name} kept only the newest {max_items} of {len(lst)} items — "
+                f"{dropped} oldest item(s) were dropped"
+            )
+        return lst[-max_items:]
+    return lst
+
+
+# Strategic / agent-facing input caps — raised from previous 500/40/5000 values.
+# Any truncation at these caps must surface a warning in the API response.
+STRATEGIC_DIRECTION_TEXT_MAX = 2000
+STRATEGIC_RATIONALE_MAX = 2000
+STRATEGIC_SYSTEM_ID_MAX = 100
+STRATEGIC_NOTES_HISTORY_MAX = 50
+STRATEGIC_MESSAGE_CONTENT_MAX = 20000
+STRATEGIC_RESOLUTION_MAX = 20000
+STATUS_LATEST_MESSAGE_MAX = 2000
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
@@ -4650,7 +4687,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             if not isinstance(op_entry, dict):
                 continue
             op = op_entry.get("op")
-            rationale = op_entry.get("rationale", "")
+            rationale = str(op_entry.get("rationale", ""))
+            if len(rationale) > STRATEGIC_RATIONALE_MAX:
+                logger.warning(f"[STRATEGIC] Task {task.id}: truncating rationale {len(rationale)}→{STRATEGIC_RATIONALE_MAX} chars")
+                rationale = rationale[:STRATEGIC_RATIONALE_MAX]
 
             if op == "create":
                 if creates_count >= MAX_DIRECTION_CREATES:
@@ -4658,7 +4698,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 text = op_entry.get("text", "").strip()
                 if not text:
                     continue
-                text = text[:500]  # Match user API text length limit
+                if len(text) > STRATEGIC_DIRECTION_TEXT_MAX:
+                    logger.warning(f"[STRATEGIC] Task {task.id}: truncating direction text {len(text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars")
+                text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
                 # Dedup: skip if an active/proposed direction has very similar text
                 text_lower = text.lower()
                 if any(d.get("status") in ("active", "proposed") and
@@ -4679,7 +4721,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 if op_entry.get("system_id"):
-                    new_dir["system_id"] = str(op_entry["system_id"])[:40]
+                    sid = str(op_entry["system_id"])
+                    if len(sid) > STRATEGIC_SYSTEM_ID_MAX:
+                        logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
+                    new_dir["system_id"] = sid[:STRATEGIC_SYSTEM_ID_MAX]
                 directions.append(new_dir)
                 ops_applied += 1
                 creates_count += 1
@@ -4693,13 +4738,22 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 for d in directions:
                     if d.get("id") == dir_id:
                         if "text" in changes:
-                            d["text"] = str(changes["text"])[:500]
+                            new_text = str(changes["text"])
+                            if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
+                                logger.warning(f"[STRATEGIC] Task {task.id}: truncating direction text {len(new_text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars")
+                            d["text"] = new_text[:STRATEGIC_DIRECTION_TEXT_MAX]
                         if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
                             d["priority"] = changes["priority"]
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
                         if "system_id" in changes:
-                            d["system_id"] = str(changes["system_id"])[:40] if changes["system_id"] else None
+                            if changes["system_id"]:
+                                sid_new = str(changes["system_id"])
+                                if len(sid_new) > STRATEGIC_SYSTEM_ID_MAX:
+                                    logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid_new)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
+                                d["system_id"] = sid_new[:STRATEGIC_SYSTEM_ID_MAX]
+                            else:
+                                d["system_id"] = None
                         if "status" in changes and changes["status"] in ("active", "paused", "expired"):
                             # Block reactivating a direction the user manually paused
                             if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
@@ -4710,7 +4764,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
-                            d["notes"] = notes[-20:]  # Keep last 20
+                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                logger.warning(f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}")
+                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
                         logger.info(f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}")
                         break
@@ -4725,7 +4781,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
-                            d["notes"] = notes[-20:]
+                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                logger.warning(f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}")
+                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
                         logger.info(f"[STRATEGIC] Retired direction {dir_id} for project {project.id}")
                         break
@@ -4744,6 +4802,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         content = (msg_entry.get("content") or "").strip()
         if not content:
             continue
+        if len(content) > STRATEGIC_MESSAGE_CONTENT_MAX:
+            logger.warning(f"[STRATEGIC] Task {task.id}: truncating message content {len(content)}→{STRATEGIC_MESSAGE_CONTENT_MAX} chars")
+            content = content[:STRATEGIC_MESSAGE_CONTENT_MAX]
         try:
             msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
         except ValueError:
@@ -4753,7 +4814,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
-            content=content[:5000],
+            content=content,
             context=msg_entry.get("context") or {},
         )
         session.add(new_msg)
@@ -4773,7 +4834,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
             if msg and msg.project_id == project.id and msg.status == "open":
                 msg.status = "resolved"
-                msg.resolution = str(resolution_text)[:5000] if resolution_text else "Addressed by strategic review"
+                if resolution_text:
+                    rt = str(resolution_text)
+                    if len(rt) > STRATEGIC_RESOLUTION_MAX:
+                        logger.warning(f"[STRATEGIC] Task {task.id}: truncating resolution {len(rt)}→{STRATEGIC_RESOLUTION_MAX} chars")
+                    msg.resolution = rt[:STRATEGIC_RESOLUTION_MAX]
+                else:
+                    msg.resolution = "Addressed by strategic review"
                 msg.resolved_at = _utcnow()
                 session.add(msg)
                 msgs_resolved += 1
@@ -6885,8 +6952,8 @@ async def update_design_doc(
     """Agent endpoint for incremental design doc updates. Each call updates one page."""
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-    if token.get("task_type") not in ("design_doc_update",):
-        raise HTTPException(status_code=403, detail="Endpoint restricted to design_doc_update agents")
+    if token.get("task_type") not in ("design_doc_update", "strategic_review"):
+        raise HTTPException(status_code=403, detail="Endpoint restricted to design_doc_update/strategic_review agents")
 
     task = await session.get(Task, payload.task_id)
     if not task:
@@ -6945,6 +7012,80 @@ async def update_design_doc(
     return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
 
 
+# ── Agent Annotations ───────────────────────────────────────────────────
+# Any agent can leave comments, issues, or vision suggestions.
+# Stored as ProjectMessages so design-doc and strategic agents pick them up
+# via the existing open_messages flow.
+
+class AgentAnnotation(BaseModel):
+    task_id: uuid.UUID
+    annotation_type: Literal["comment", "issue", "vision"]
+    content: str
+    target_page: Optional[str] = None  # design doc page key (for comments)
+    severity: Optional[str] = None     # low/medium/high (for issues)
+
+
+_ANNOTATION_TYPE_MAP = {
+    "comment": MessageType.NOTE,
+    "issue": MessageType.BUG_REPORT,
+    "vision": MessageType.FEEDBACK,
+}
+
+
+@app.post("/api/agent/annotate")
+@limiter.limit("30/minute")
+async def agent_annotate(
+    request: Request,
+    payload: AgentAnnotation,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Any agent can leave annotations — comments, issues, or vision suggestions."""
+    if str(payload.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    if len(payload.content) > 2000:
+        raise HTTPException(status_code=400, detail="Content exceeds 2000 character limit")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    if payload.severity and payload.severity not in ("low", "medium", "high"):
+        raise HTTPException(status_code=400, detail="Severity must be low, medium, or high")
+    if payload.target_page and len(payload.target_page) > 100:
+        raise HTTPException(status_code=400, detail="Target page key too long")
+
+    task = await session.get(Task, payload.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Cap: max 10 annotations per task
+    count_stmt = select(_func.count()).select_from(ProjectMessage).where(
+        ProjectMessage.from_task_id == task.id,
+        ProjectMessage.from_type == "agent",
+    )
+    count = (await session.execute(count_stmt)).scalar() or 0
+    if count >= 10:
+        raise HTTPException(status_code=429, detail="Max 10 annotations per task")
+
+    msg = ProjectMessage(
+        project_id=task.project_id,
+        message_type=_ANNOTATION_TYPE_MAP[payload.annotation_type],
+        from_type="agent",
+        from_task_id=task.id,
+        content=payload.content.strip(),
+        context={
+            "annotation_type": payload.annotation_type,
+            "task_type": token.get("task_type", ""),
+            **({"target_page": payload.target_page} if payload.target_page else {}),
+            **({"severity": payload.severity} if payload.severity else {}),
+        },
+    )
+    session.add(msg)
+    await session.commit()
+
+    logger.info(f"[ANNOTATE] {payload.annotation_type} from task {task.id} ({token.get('task_type', '?')})")
+    return {"status": "ok", "annotation_id": str(msg.id)}
+
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
     task_id: uuid.UUID
@@ -6985,10 +7126,16 @@ async def strategic_operation(
         raise HTTPException(status_code=404, detail="Project not found")
 
     data = payload.data
+    warnings: List[str] = []
 
     # Size guard — prevent agents from bloating project JSONB columns
     if len(json.dumps(data, default=str)) > 100_000:
         raise HTTPException(status_code=400, detail="Data payload too large (max 100KB)")
+
+    def _resp(body: dict) -> dict:
+        if warnings:
+            body["warnings"] = list(warnings)
+        return body
 
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
@@ -7005,20 +7152,20 @@ async def strategic_operation(
         session.add(project)
         await session.commit()
         logger.info(f"[STRATEGIC API] Vision updated for project {project.id} (rev {new_vision['revision']})")
-        return {"status": "ok", "op": "set_vision", "revision": new_vision["revision"]}
+        return _resp({"status": "ok", "op": "set_vision", "revision": new_vision["revision"]})
 
     elif payload.op == "create_direction":
-        text = str(data.get("text", "")).strip()
-        if not text:
+        raw_text = str(data.get("text", "")).strip()
+        if not raw_text:
             raise HTTPException(status_code=400, detail="Direction text is required")
-        text = text[:500]
+        text = _cap_str(raw_text, STRATEGIC_DIRECTION_TEXT_MAX, "text", warnings)
         raw_priority = data.get("priority", "medium")
         priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
-        rationale = str(data.get("rationale", ""))[:500]
+        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
         directions = list(project.directions or [])
         # Dedup: skip if same text exists
         if any(d.get("text", "").strip().lower() == text.lower() for d in directions if d.get("status") in ("active", "proposed")):
-            return {"status": "skipped", "reason": "duplicate"}
+            return _resp({"status": "skipped", "reason": "duplicate"})
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
@@ -7028,7 +7175,7 @@ async def strategic_operation(
             "research_history": [],
         }
         if data.get("system_id"):
-            new_dir["system_id"] = str(data["system_id"])[:40]
+            new_dir["system_id"] = _cap_str(data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings)
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         directions.append(new_dir)
@@ -7037,32 +7184,32 @@ async def strategic_operation(
         session.add(project)
         await session.commit()
         logger.info(f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}")
-        return {"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]}
+        return _resp({"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]})
 
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
         changes = data.get("changes", {})
         if not dir_id or not changes:
             raise HTTPException(status_code=400, detail="direction_id and changes required")
-        rationale = str(data.get("rationale", ""))[:500]
+        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
         directions = list(project.directions or [])
         updated = False
         for d in directions:
             if d.get("id") == dir_id:
                 if "text" in changes:
-                    d["text"] = str(changes["text"])[:500]
+                    d["text"] = _cap_str(changes["text"], STRATEGIC_DIRECTION_TEXT_MAX, "changes.text", warnings)
                 if "priority" in changes and changes["priority"] in ("high", "medium", "low"):
                     d["priority"] = changes["priority"]
                 if "system_id" in changes:
-                    d["system_id"] = str(changes["system_id"])[:40] if changes["system_id"] else None
+                    d["system_id"] = _cap_str(changes["system_id"], STRATEGIC_SYSTEM_ID_MAX, "changes.system_id", warnings) if changes["system_id"] else None
                 if "status" in changes and changes["status"] in ("active", "paused", "expired"):
                     if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
-                        return {"status": "blocked", "reason": "Cannot reactivate user-paused direction"}
+                        return _resp({"status": "blocked", "reason": "Cannot reactivate user-paused direction"})
                     d["status"] = changes["status"]
                 if rationale:
                     notes = d.get("notes", [])
                     notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})
-                    d["notes"] = notes[-20:]
+                    d["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
                 updated = True
                 break
         if not updated:
@@ -7072,13 +7219,13 @@ async def strategic_operation(
         session.add(project)
         await session.commit()
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
-        return {"status": "ok", "op": "update_direction", "direction_id": dir_id}
+        return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
 
     elif payload.op == "retire_direction":
         dir_id = data.get("direction_id")
         if not dir_id:
             raise HTTPException(status_code=400, detail="direction_id required")
-        rationale = str(data.get("rationale", ""))[:500]
+        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
         directions = list(project.directions or [])
         retired = False
         for d in directions:
@@ -7086,7 +7233,7 @@ async def strategic_operation(
                 d["status"] = "expired"
                 notes = d.get("notes", [])
                 notes.append({"text": f"Retired by strategic review: {rationale}", "added_at": _utcnow().isoformat()})
-                d["notes"] = notes[-20:]
+                d["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
                 retired = True
                 break
         if not retired:
@@ -7096,12 +7243,13 @@ async def strategic_operation(
         session.add(project)
         await session.commit()
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
-        return {"status": "ok", "op": "retire_direction", "direction_id": dir_id}
+        return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
 
     elif payload.op == "create_message":
-        content = str(data.get("content", "")).strip()
-        if not content:
+        raw_content = str(data.get("content", "")).strip()
+        if not raw_content:
             raise HTTPException(status_code=400, detail="Message content required")
+        content = _cap_str(raw_content, STRATEGIC_MESSAGE_CONTENT_MAX, "content", warnings)
         try:
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
@@ -7111,12 +7259,12 @@ async def strategic_operation(
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
-            content=content[:5000],
+            content=content,
             context=data.get("context") or {},
         )
         session.add(new_msg)
         await session.commit()
-        return {"status": "ok", "op": "create_message", "message_id": str(new_msg.id)}
+        return _resp({"status": "ok", "op": "create_message", "message_id": str(new_msg.id)})
 
     elif payload.op == "resolve_message":
         msg_id = data.get("message_id")
@@ -7129,13 +7277,14 @@ async def strategic_operation(
         if not msg or msg.project_id != project.id:
             raise HTTPException(status_code=404, detail="Message not found")
         if msg.status == "resolved":
-            return {"status": "already_resolved"}
+            return _resp({"status": "already_resolved"})
         msg.status = "resolved"
-        msg.resolution = str(data.get("resolution", "Addressed by strategic review"))[:5000]
+        resolution_raw = data.get("resolution", "Addressed by strategic review")
+        msg.resolution = _cap_str(resolution_raw, STRATEGIC_RESOLUTION_MAX, "resolution", warnings)
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
-        return {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
+        return _resp({"status": "ok", "op": "resolve_message", "message_id": str(msg.id)})
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

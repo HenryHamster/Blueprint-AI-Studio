@@ -24,8 +24,11 @@ router = APIRouter(
 )
 
 
+DIRECTION_TEXT_MAX = 2000
+
+
 class DirectionPayload(BaseModel):
-    text: str = Field(..., min_length=1, max_length=500)
+    text: str = Field(..., min_length=1, max_length=DIRECTION_TEXT_MAX)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
     paths: Optional[List[str]] = None
 
@@ -87,8 +90,8 @@ async def replace_directions(
             raise HTTPException(status_code=400, detail=f"Invalid priority: {entry.get('priority')}")
         if not isinstance(entry.get("text"), str) or not entry["text"].strip():
             raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
-        if len(entry["text"]) > 500:
-            raise HTTPException(status_code=400, detail="Direction text must not exceed 500 characters")
+        if len(entry["text"]) > DIRECTION_TEXT_MAX:
+            raise HTTPException(status_code=400, detail=f"Direction text must not exceed {DIRECTION_TEXT_MAX} characters")
         if "status" not in entry:
             entry["status"] = "active"
         normalized.append(entry)
@@ -205,8 +208,8 @@ async def update_direction(
         raise HTTPException(status_code=400, detail="priority must be high, medium, or low")
     if "status" in payload and payload["status"] not in ("active", "completed", "paused", "proposed", "expired"):
         raise HTTPException(status_code=400, detail="status must be active, completed, paused, proposed, or expired")
-    if "text" in payload and (not isinstance(payload["text"], str) or len(payload["text"]) > 500 or len(payload["text"]) < 1):
-        raise HTTPException(status_code=400, detail="text must be 1-500 characters")
+    if "text" in payload and (not isinstance(payload["text"], str) or len(payload["text"]) > DIRECTION_TEXT_MAX or len(payload["text"]) < 1):
+        raise HTTPException(status_code=400, detail=f"text must be 1-{DIRECTION_TEXT_MAX} characters")
     if "paths" in payload and (not isinstance(payload["paths"], list) or not all(isinstance(p, str) for p in payload["paths"])):
         raise HTTPException(status_code=400, detail="paths must be a list of strings")
 

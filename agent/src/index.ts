@@ -730,6 +730,57 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
   sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
   log('Spawning Claude Code CLI...');
 
+  // Write ./note helper for agent annotations (available to all task types)
+  try {
+    if (fs.existsSync(WORKSPACE)) {
+      const noteScript = `#!/bin/bash
+# Agent annotation tool — leave comments, issues, or vision suggestions
+# Usage:
+#   ./note comment "This module uses deprecated API" --page systems/sys-auth
+#   ./note issue "Tests fail on large repos" --severity high
+#   ./note vision "Consider adding agent reliability metrics"
+
+TYPE="\${1:?Usage: note comment|issue|vision <content> [--page <key>] [--severity low|medium|high]}"
+shift
+
+CONTENT=""
+PAGE=""
+SEVERITY=""
+
+while [ $# -gt 0 ]; do
+  case "\$1" in
+    --page) PAGE="\$2"; shift 2 ;;
+    --severity) SEVERITY="\$2"; shift 2 ;;
+    *) CONTENT="\${CONTENT:+\$CONTENT }\$1"; shift ;;
+  esac
+done
+
+if [ -z "\$CONTENT" ]; then
+  echo "Error: content is required" >&2; exit 1
+fi
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="\${TASK_ID:?TASK_ID not set}"
+CURL_OPTS="-f -sS --max-time 15 --connect-timeout 10"
+
+# Build JSON with printf to avoid shell expansion issues
+JSON="{\\"task_id\\":\\"\$TASK\\",\\"annotation_type\\":\\"\$TYPE\\",\\"content\\":\\"\$(echo "\$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
+[ -n "\$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"\$PAGE\\""
+[ -n "\$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"\$SEVERITY\\""
+JSON="\${JSON}}"
+
+printf '%s' "\$JSON" | \\
+  curl \$CURL_OPTS -X POST "\$API/api/agent/annotate" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Agent-Token: \$TOKEN" \\
+    --data-binary @-
+echo ""
+`;
+      fs.writeFileSync(`${WORKSPACE}/note`, noteScript, { mode: 0o755 });
+    }
+  } catch { /* workspace may not exist yet for some handlers */ }
+
   const exitCode = await new Promise<number>((resolve) => {
     const claudeEnv: Record<string, string> = {
       HOME: process.env.HOME || '/home/agent',
@@ -749,6 +800,9 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
     // Pass agent token via env (not disk) so helpers like ./design-doc can auth
     if (AGENT_TOKEN) {
       claudeEnv.AGENT_API_TOKEN = AGENT_TOKEN;
+    }
+    if (process.env.TASK_ID) {
+      claudeEnv.TASK_ID = process.env.TASK_ID;
     }
 
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];

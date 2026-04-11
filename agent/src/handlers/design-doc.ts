@@ -167,7 +167,9 @@ ${codebaseSummary}${fileTreeSection}
 4. For risks: \`./design-doc set "risks" '[...]'\`
 5. For notes/observations: \`./design-doc set "notes/<topic>" '"..."'\`
 6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
-7. Focus on WHAT IS. Document missing things as missing.`;
+7. Focus on WHAT IS. Document missing things as missing.
+8. Review open messages — if any are agent annotations (comments, issues),
+   incorporate valid observations into the relevant pages and update accordingly.`;
 
   statusRef.value = 'Running architecture review...';
   let { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);

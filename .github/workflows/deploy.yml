@@ -108,6 +108,7 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: false
 
       - uses: google-github-actions/setup-gcloud@v2
 
@@ -147,6 +148,7 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER_NAME }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: false
 
       - uses: google-github-actions/setup-gcloud@v2
 

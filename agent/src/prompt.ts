@@ -60,7 +60,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'investigate': 'This is a read-only investigation. Do NOT modify any files. Write your findings to the output JSON only.',
 };
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work.';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg".';
 
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
 export function readClaudeMd(): string {

@@ -146,6 +146,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
       const wsUrl = (API_BASE_URL || window.location.origin).replace(/^http/, 'ws');
       const ws = new WebSocket(`${wsUrl}/api/projects/${projectId}/ws`);
       wsRef.current = ws;
+      trackingProjectIdRef.current = projectId;
       let wasConnected = false;
 
       ws.onopen = () => {
@@ -213,6 +214,22 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
   }, [handleWsMessage, appendTrackLog]);
 
   const handleViewLogs = useCallback((task: Task) => {
+    // Update drawer state immediately (non-destructive)
+    setLogTask(task);
+    setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
+    fetchTask(task.id).then(fresh => setLogTask(fresh)).catch(() => {/* keep stale data */});
+    setWsDisconnected(false);
+
+    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;
+    if (!task.project_id) return;
+
+    // If WS is already connected to the same project, reuse it
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN
+        && trackingProjectIdRef.current === task.project_id) {
+      return;
+    }
+
+    // Different project or no WS — tear down and reconnect
     if (wsReconnectTimerRef.current) {
       clearTimeout(wsReconnectTimerRef.current);
       wsReconnectTimerRef.current = null;
@@ -222,15 +239,6 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
       wsRef.current = null;
     }
     wsReconnectAttemptRef.current = 0;
-    setLogTask(task);
-    setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
-    // Fetch fresh task data in the background; show stale list data immediately
-    fetchTask(task.id).then(fresh => setLogTask(fresh)).catch(() => {/* keep stale data */});
-    setWsDisconnected(false);
-
-    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;
-    if (!task.project_id) return;
-
     setLogsConnecting(true);
     connectWs(task.project_id);
   }, [connectWs]);
