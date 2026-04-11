@@ -1670,3 +1670,62 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     # Merged task's finding should be promoted from (proposed) to (confirmed)
     assert "Improve caching layer (confirmed)" in ctx
     assert "Improve caching layer (proposed)" not in ctx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _strategic_failures auto-decay
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session):
+    """When _strategic_failures >= 3 but last failure was >48h ago, force_strategic fires."""
+    old_timestamp = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+    project = Project(
+        name="Decay Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],  # No active directions — needs force_strategic to spawn anything
+        vision={
+            "purpose": "test purpose",
+            "_strategic_failures": 5,
+            "_strategic_failures_at": old_timestamp,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # force_strategic should have fired — a design_doc_update task should be created
+    # (design_doc_update is Phase 1 of the strategic cycle, chaining to strategic_review)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1, "Expected one strategic task to be spawned after decay"
+    assert tasks[0].payloads[0].get("type") == "design_doc_update"
+
+
+@pytest.mark.asyncio
+async def test_strategic_failures_no_decay_when_recent(db_session):
+    """When _strategic_failures >= 3 and last failure was recent (<48h), force_strategic stays blocked."""
+    recent_timestamp = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+    project = Project(
+        name="No Decay Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test purpose",
+            "_strategic_failures": 5,
+            "_strategic_failures_at": recent_timestamp,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 0, "Expected no task: decay should not apply for recent failure"

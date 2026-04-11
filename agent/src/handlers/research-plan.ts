@@ -562,12 +562,21 @@ TASK="${taskId}"
 DATA="\$1"
 
 _call() {
-  printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
-    curl -f -sS --max-time 30 --connect-timeout 10 \\
-      -X POST "\$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: \$TOKEN" \\
-      --data-binary @-
+  local attempt=0
+  while [ \$attempt -lt 3 ]; do
+    if printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
+      curl -f -sS --max-time 30 --connect-timeout 10 \\
+        -X POST "\$API/api/agent/strategic" \\
+        -H "Content-Type: application/json" \\
+        -H "X-Agent-Token: \$TOKEN" \\
+        --data-binary @-; then
+      return 0
+    fi
+    attempt=\$((attempt + 1))
+    [ \$attempt -lt 3 ] && echo "[RETRY \$attempt/3] \$1 failed, retrying in 5s..." >&2 && sleep 5
+  done
+  echo "[ERROR] \$1 failed after 3 attempts" >&2
+  return 1
 }
 
 case "\$OP" in
@@ -635,11 +644,19 @@ Analyze this project and write a strategic review. Cover:
 3. **Notes**: Any strategic observations worth preserving for future cycles.
 
 Think big. Focus on fundamental improvements, not incremental fixes.
-Write your analysis as structured prose — it will be processed by a follow-up step.`;
+Write your analysis as structured prose — it will be processed by a follow-up step.
+
+IMPORTANT: End your analysis with a section titled '## Structured Output' containing:
+- A JSON block with the complete vision object (purpose, success_criteria, systems, priorities)
+- A list of direction operations (create/update/retire with all required parameters)
+This structured section will be used directly by the executor. Make it complete and self-contained.`;
 
     statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
     const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
-    const analysisText = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
+    const rawAnalysis = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
+    // Prefer the structured output section if present — it's compact and complete for the executor
+    const structuredMatch = rawAnalysis.match(/## Structured Output[\s\S]*$/i);
+    const analysisText = structuredMatch ? structuredMatch[0] + '\n\n---\nFull analysis:\n' + rawAnalysis.slice(0, 20_000) : rawAnalysis;
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.
@@ -692,7 +709,31 @@ ${analysisText.slice(0, 50_000)}
 6. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
-    const { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
+    let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
+
+    // Post-check: verify the executor actually called ./strategic set-vision.
+    // Check the output for the set_vision response.
+    // Matches the design-doc.ts post-check + retry pattern (lines 185-205).
+    try {
+      // Check: look for set_vision success response in executor output
+      const visionSetInOutput = /"op"\s*:\s*"set_vision"/.test(allOutput);
+
+      if (exitCode === 0 && !visionSetInOutput) {
+        sendLog(ws, '\n[WARNING] Strategic executor completed but ./strategic set-vision was not called. Retrying...\n');
+        const retryResult = await runClaudeCode(
+          'Your previous attempt did not call ./strategic set-vision. This is REQUIRED.\n\n' +
+          'Run this command NOW with the vision from your analysis:\n' +
+          './strategic set-vision \'{"purpose": "...", "success_criteria": [...], "systems": [...], "priorities": [...]}\'\n' +
+          'Extract the vision from the analysis and call the command. Nothing else.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+        allOutput = allOutput + '\n' + retryResult.allOutput;
+        lastResultText = retryResult.lastResultText || lastResultText;
+      }
+    } catch (e) {
+      sendLog(ws, `[WARNING] Could not verify strategic set-vision call: ${e}\n`);
+    }
 
     // Legacy: try to read /tmp output file (backward compat)
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);

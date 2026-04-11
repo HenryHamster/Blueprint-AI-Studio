@@ -1616,6 +1616,17 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
     vision_data = project.vision or {}
     strategic_failures = vision_data.get("_strategic_failures", 0)
+    # Auto-decay: if last failure was >48h ago, reset counter for recovery purposes
+    if strategic_failures >= 3:
+        failures_at = vision_data.get("_strategic_failures_at")
+        if failures_at:
+            try:
+                last_failure = datetime.fromisoformat(failures_at.replace('Z', '+00:00'))
+                if (_utcnow() - last_failure).total_seconds() > 48 * 3600:
+                    strategic_failures = 0
+                    logger.info(f"[STRATEGIC] Auto-decayed _strategic_failures for project {project.id} (last failure: {failures_at})")
+            except (ValueError, TypeError):
+                pass  # malformed timestamp, keep current value
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.

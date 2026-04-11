@@ -1438,6 +1438,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             current_vision = project.vision or {}
             failures = current_vision.get("_strategic_failures", 0) + 1
             current_vision["_strategic_failures"] = failures
+            current_vision["_strategic_failures_at"] = _utcnow().isoformat()
             project.vision = current_vision
             flag_modified(project, "vision")
             cycle_id = (task.context or {}).get("strategic_cycle_id")
@@ -1514,6 +1515,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         current_vision = dict(project.vision or {})
         failures = current_vision.get("_strategic_failures", 0) + 1
         current_vision["_strategic_failures"] = failures
+        current_vision["_strategic_failures_at"] = _utcnow().isoformat()
         project.vision = current_vision
         flag_modified(project, "vision")
         logger.warning(f"[STRATEGIC] Task {task.id}: no vision produced (failure #{failures})")
