@@ -32,16 +32,15 @@ async def reaper_service():
     Marks them as FAILED and issues a delete command to GCP if they haven't sent a heartbeat in 5 minutes.
     """
     # Deferred imports to avoid circular dependency with app.main
+    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
     from app.main import (  # noqa: PLC0415
-        release_max_plan_account,
         broadcast_to_project,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
-        _requeue_parent_task,
         record_task_result,
-        _check_and_trigger_rollup,
         classify_failure,
     )
+    from app.task_lifecycle import _requeue_parent_task, _check_and_trigger_rollup  # noqa: PLC0415
 
     while True:
         try:
@@ -206,7 +205,7 @@ async def reaper_service():
 
                     # Rate-limited tasks: requeue without burning retry budget
                     # Check both status message and error_logs for rate-limit indicators
-                    from app.main import RATE_LIMIT_KEYWORDS  # noqa: PLC0415 — deferred to avoid circular import
+                    from app.max_plan_pool import RATE_LIMIT_KEYWORDS  # noqa: PLC0415 — deferred to avoid circular import
                     msg_lower = (task.latest_status_message or "").lower()
                     error_lower = ((task.context or {}).get("last_error") or "").lower()
                     is_rate_limited = any(kw in msg_lower + " " + error_lower

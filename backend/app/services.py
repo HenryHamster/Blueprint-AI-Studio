@@ -162,7 +162,8 @@ async def _check_evaluating_timeouts():
     - If evaluating >6h → FAIL with ERROR alert.
     - Skips CI-waiting tasks (they have their own 30-min timeout).
     """
-    from app.main import _check_and_trigger_rollup, _maybe_create_failure_alert, broadcast_to_project  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert, broadcast_to_project  # noqa: PLC0415
+    from app.task_lifecycle import _check_and_trigger_rollup  # noqa: PLC0415
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
@@ -237,7 +238,8 @@ async def _check_evaluating_timeouts():
                     session.add(task)
 
                     # Cascade-cancel non-terminal children
-                    from app.main import _ensure_vm_deleted, release_max_plan_account  # noqa: PLC0415
+                    from app.main import _ensure_vm_deleted  # noqa: PLC0415
+                    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
                     vms_to_delete = []
                     for child in non_terminal_children:
@@ -311,7 +313,8 @@ async def _check_evaluating_timeouts():
 
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
-    from app.main import broadcast_to_project, _spawn_pipeline_task, get_github_token_for_task  # noqa: PLC0415
+    from app.main import broadcast_to_project, get_github_token_for_task  # noqa: PLC0415
+    from app.task_lifecycle import _spawn_pipeline_task  # noqa: PLC0415
 
     try:
         async with AsyncSessionLocal() as session:

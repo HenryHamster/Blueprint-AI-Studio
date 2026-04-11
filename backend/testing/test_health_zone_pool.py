@@ -12,8 +12,8 @@ from httpx import AsyncClient, ASGITransport
 import app.shared_state as _shared_state
 import app.main as _main_module
 import app.orchestrator as _orch_module
-from app.main import (
-    app,
+from app.main import app
+from app.max_plan_pool import (
     select_max_plan_account,
     release_max_plan_account,
     recheck_disabled_accounts,

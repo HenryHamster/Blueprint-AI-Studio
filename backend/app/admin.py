@@ -510,7 +510,7 @@ async def bulk_action_tasks(
                 task.status = TaskStatus.QUEUED
                 task_type = (task.first_payload).get("type", "")
                 is_parent_type = task_type in ("research", "plan")
-                from app.main import _requeue_parent_task
+                from app.task_lifecycle import _requeue_parent_task
                 children = []
                 if is_parent_type:
                     children = (await session.execute(
@@ -552,7 +552,8 @@ async def bulk_action_tasks(
                     if rollup_pr_number:
                         # Rollup PR approval: merge the rollup PR directly
                         try:
-                            from app.main import get_github_token_for_task, _cleanup_branches, _runtime_config
+                            from app.main import get_github_token_for_task, _runtime_config
+                            from app.task_lifecycle import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment
                             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                             merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
@@ -645,7 +646,7 @@ async def bulk_action_tasks(
                                     task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
                                     logger.error(f"[ADMIN] Bulk-approved merge failed: {e}", exc_info=True)
                             else:
-                                from app.main import _spawn_pipeline_task
+                                from app.task_lifecycle import _spawn_pipeline_task
                                 original_prompt = task_payload.get("prompt", task.description or "")
                                 review_task = await _spawn_pipeline_task(
                                     task, "review", session, pr_number, branch, base_branch,
@@ -944,7 +945,7 @@ async def request_changes(
     task_payload = task.first_payload
     base_branch = task_payload.get("base_branch", "main")
 
-    from app.main import _spawn_pipeline_task
+    from app.task_lifecycle import _spawn_pipeline_task
     if payload.action == "fix":  # noqa: SIM108 — two distinct multi-line async calls, ternary unreadable
         spawned = await _spawn_pipeline_task(
             task, "fix", session, pr_number, branch, base_branch,
@@ -1043,7 +1044,7 @@ async def modify_task(
                 await _ensure_vm_deleted(task, reason="admin_terminal")
                 acct_id = (task.context or {}).get("max_plan_account_id")
                 if acct_id:
-                    from app.main import release_max_plan_account
+                    from app.max_plan_pool import release_max_plan_account
                     await release_max_plan_account(acct_id)
 
             # For low-priority tasks cancelled by user, store suppress_until so the
@@ -1051,7 +1052,7 @@ async def modify_task(
             if new_status == TaskStatus.CANCELLED and task.context and task.context.get("finding_hash"):
                 task_priority = task.priority if task.priority is not None else 50
                 if task_priority == 0:  # low priority tasks map to 0 in TASK_PRIORITY_MAP
-                    from app.main import _utcnow
+                    from app.models import _utcnow
                     suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
                     task.context = {**task.context, "suppress_until": suppress_until}
                     flag_modified(task, "context")
@@ -1059,7 +1060,8 @@ async def modify_task(
 
             # Cascade cancellation to active children
             if new_status == TaskStatus.CANCELLED:
-                from app.main import _ensure_vm_deleted as _cancel_vm, release_max_plan_account as _cancel_release
+                from app.main import _ensure_vm_deleted as _cancel_vm
+                from app.max_plan_pool import release_max_plan_account as _cancel_release
                 active_children = (await session.execute(
                     select(Task).where(
                         Task.parent_task_id == task.id,
@@ -1085,7 +1087,7 @@ async def modify_task(
                 # because they have incidental debug children.
                 task_type = (task.first_payload).get("type", "")
                 is_parent_type = task_type in ("research", "plan")
-                from app.main import _requeue_parent_task
+                from app.task_lifecycle import _requeue_parent_task
                 children = []
                 if is_parent_type:
                     children = (await session.execute(
@@ -1132,7 +1134,8 @@ async def modify_task(
             if rollup_pr_number:
                 # Rollup PR approval: merge the rollup PR directly
                 try:
-                    from app.main import get_github_token_for_task, _cleanup_branches, _runtime_config
+                    from app.main import get_github_token_for_task, _runtime_config
+                    from app.task_lifecycle import _cleanup_branches
                     from app.github import merge_pull_request, create_pr_comment
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
@@ -1234,7 +1237,7 @@ async def modify_task(
                             logger.error(f"[ADMIN] Approved merge failed: {e}", exc_info=True)
                     else:
                         # Security scan approval: review hasn't happened yet, spawn it
-                        from app.main import _spawn_pipeline_task
+                        from app.task_lifecycle import _spawn_pipeline_task
                         original_prompt = task_payload.get("prompt", task.description or "")
                         review_task = await _spawn_pipeline_task(
                             task, "review", session, pr_number, branch, base_branch,
@@ -1329,7 +1332,7 @@ async def modify_task(
             await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 
         # Trigger rollup check if child status/context changed
-        from app.main import _check_and_trigger_rollup, _cleanup_branches
+        from app.task_lifecycle import _check_and_trigger_rollup, _cleanup_branches
         should_check_rollup = False
         if "status" in payload and task.parent_task_id:
             new_status = TaskStatus(payload["status"])
@@ -1386,7 +1389,8 @@ async def trigger_rollup(
     current_user: dict = Depends(get_current_user)
 ):
     """Manually trigger rollup PR for an EVALUATING parent task."""
-    from app.main import get_github_token_for_task, _spawn_pipeline_task
+    from app.main import get_github_token_for_task
+    from app.task_lifecycle import _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 
     task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
@@ -1457,7 +1461,7 @@ async def get_settings(
     current_user: dict = Depends(get_current_user)
 ):
     from app.shared_state import runtime_config as _runtime_config
-    from app.main import _max_plan_pools
+    from app.max_plan_pool import _max_plan_pools
     from app.models import UserIntegration
 
     # Check if the user has a GitHub integration
@@ -1707,7 +1711,7 @@ async def add_max_plan_account(
 ):
     """Add a Max plan account. Provide 'name' and 'oauth_token' (sk-ant-oat01-... from `claude setup-token`).
     Optionally provide 'claude_config_json' (content of ~/.claude.json for onboarding bypass)."""
-    from app.main import _max_plan_pools, _account_by_id
+    from app.max_plan_pool import _max_plan_pools, _account_by_id
     name = payload.get("name")
     oauth_token = payload.get("oauth_token")
     if not name or not oauth_token:
@@ -1751,7 +1755,7 @@ async def add_max_plan_account(
         # Fallback: raw token stays in DB (backward compat)
 
     # Sync to in-memory pool (always use the raw token for runtime)
-    from app.main import _max_plan_pool_lock
+    from app.max_plan_pool import _max_plan_pool_lock
     entry = {
         "id": str(db_account.id),
         "user_id": current_user["user_id"],
@@ -1778,7 +1782,7 @@ async def remove_max_plan_account(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _max_plan_pools, _account_by_id
+    from app.max_plan_pool import _max_plan_pools, _account_by_id
 
     # Delete from database
     try:
@@ -1819,7 +1823,7 @@ async def remove_max_plan_account(
     await session.commit()
 
     # Remove from in-memory pool
-    from app.main import _max_plan_pool_lock
+    from app.max_plan_pool import _max_plan_pool_lock
     async with _max_plan_pool_lock:
         user_id = current_user["user_id"]
         if user_id in _max_plan_pools:
@@ -1835,7 +1839,7 @@ async def update_max_plan_account(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    from app.main import _account_by_id
+    from app.max_plan_pool import _account_by_id
 
     # Update in database
     try:
@@ -1883,7 +1887,7 @@ async def update_max_plan_account(
 
     # Commit and sync to in-memory pool atomically under lock to prevent
     # dispatch seeing stale state between DB commit and pool update
-    from app.main import _max_plan_pool_lock
+    from app.max_plan_pool import _max_plan_pool_lock
     async with _max_plan_pool_lock:
         await session.commit()
         mem_account = _account_by_id.get(account_id)
@@ -1908,7 +1912,7 @@ async def reset_account_rate_limits(
     current_user: dict = Depends(get_current_user)
 ):
     """Clear all rate-limit state (disabled_models) for a Max plan account."""
-    from app.main import _account_by_id, _max_plan_pool_lock, _pending_rl_persists
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _pending_rl_persists
 
     try:
         acct_uuid = uuid.UUID(account_id)

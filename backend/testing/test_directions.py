@@ -17,7 +17,8 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id, _compute_merge_rate
+from app.main import _spawn_research_task, _handle_research_completion, _compute_merge_rate
+from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
 @pytest.fixture(autouse=True)
@@ -381,16 +382,16 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
 
     # Mock all external calls made inside _handle_research_completion
     mocker.patch(
-        "app.main.get_github_token_for_task",
+        "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("fake-token", "owner", "repo")),
     )
-    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
-    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=[])
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[{
             "title": "Add unit tests for directions",
             "description": "Improve coverage of the directions module",
@@ -455,7 +456,7 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.main._parse_research_findings", return_value=[])  # no findings
+    mocker.patch("app.task_completion._parse_research_findings", return_value=[])  # no findings
 
     await _handle_research_completion(task, "", db_session)
 
@@ -510,14 +511,14 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.main.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
-    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
-    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=[])
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[{
             "type": "direction_update",
             "direction_id": direction_id,
@@ -592,14 +593,14 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.main.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
-    mocker.patch("app.main.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
-    mocker.patch("app.main.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_completion.get_github_token_for_task", new=AsyncMock(return_value=("tok", "o", "r")))
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=[])
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[{
             "type": "direction_note",
             "direction_id": direction_id,

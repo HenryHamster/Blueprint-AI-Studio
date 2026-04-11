@@ -120,15 +120,20 @@ async def orchestrator_worker():
     This ensures tasks are not lost if the server restarts before provisioning.
     """
     # Late imports to avoid circular dependency with app.main
-    from app.main import (
+    from app.max_plan_pool import (
         load_max_plan_pool,
-        _get_actual_gcp_vm_count,
-        _ensure_vm_deleted,
         release_max_plan_account,
         select_max_plan_account,
         recheck_disabled_accounts,
         _extract_task_model,
         _account_available_for_model,
+        _account_by_id,
+        _max_plan_pools,
+        _max_plan_pool_lock,
+    )
+    from app.main import (
+        _get_actual_gcp_vm_count,
+        _ensure_vm_deleted,
         _verify_pr_merged,
         _maybe_create_failure_alert,
         _spawn_pipeline_task,
@@ -141,9 +146,6 @@ async def orchestrator_worker():
         _check_pause_mode,
         _check_idle_research,
         _create_orchestrator_error_alerts,
-        _account_by_id,
-        _max_plan_pools,
-        _max_plan_pool_lock,
         get_github_token_for_task,
         manager as ws_manager,
     )

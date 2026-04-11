@@ -20,7 +20,8 @@ from sqlalchemy import select
 
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task, _handle_research_completion, _max_plan_pools, _account_by_id, _update_direction_research_outcomes
+from app.main import _spawn_research_task, _handle_research_completion, _update_direction_research_outcomes
+from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
 @pytest.fixture(autouse=True)
@@ -70,10 +71,10 @@ async def _add_direction(
 
 def _patch_research_externals(mocker):
     """Patch all external calls needed by _handle_research_completion."""
-    mocker.patch("app.main._ensure_branch", new=AsyncMock(return_value=True))
+    mocker.patch("app.task_completion._ensure_branch", new=AsyncMock(return_value=True))
     mocker.patch("app.main.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.main._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.main._log_file_overlaps", return_value=[])
+    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
 
 
 def _make_finding(
@@ -406,7 +407,7 @@ async def test_depth_limit_prevents_child_tasks(db_session, mocker):
     task = await _make_research_task(project, direction, db_session, depth=3)
 
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=direction["id"])],
     )
 
@@ -457,7 +458,7 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[{
             "title": dup_title,
             "description": dup_desc,
@@ -508,7 +509,7 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[{
             # "database", "connection", "pooling", "configuration" overlap existing → ≥3 words
             "title": "tune database connection pooling configuration settings",
@@ -560,7 +561,7 @@ async def test_unique_findings_are_not_deduplicated(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[
             _make_finding("Upgrade authentication to OAuth2", direction["id"]),
             _make_finding("Add input validation to signup form", direction["id"]),
@@ -598,7 +599,7 @@ async def test_child_task_direction_id_set_in_context(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=direction_id)],
     )
 
@@ -629,7 +630,7 @@ async def test_child_task_has_research_task_as_parent(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=direction["id"])],
     )
 
@@ -660,7 +661,7 @@ async def test_research_task_status_becomes_evaluating(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=direction["id"])],
     )
 
@@ -685,7 +686,7 @@ async def test_multiple_findings_each_create_a_child_task(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[
             _make_finding("Add request tracing middleware to all routes", direction["id"]),
             _make_finding("Implement exponential backoff on external API calls", direction["id"]),
@@ -719,7 +720,7 @@ async def test_child_task_carries_research_depth_plus_one(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=direction["id"])],
     )
 
@@ -754,7 +755,7 @@ async def test_finding_type_research_spawns_research_subtask(db_session, mocker)
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(
             "Investigate query performance bottlenecks in depth",
             direction["id"],
@@ -789,7 +790,7 @@ async def test_finding_scope_large_spawns_plan_task(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(
             "Migrate entire payment processing system to new provider",
             direction["id"],
@@ -824,7 +825,7 @@ async def test_finding_scope_small_spawns_create_task(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(
             "Add null check to user profile endpoint handler",
             direction["id"],
@@ -859,7 +860,7 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(
             "Audit authentication module for injection vulnerabilities",
             direction["id"],
@@ -903,7 +904,7 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(finding_title, direction_id)],
     )
 
@@ -951,7 +952,7 @@ async def test_research_history_capped_at_10_entries(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding("Brand new finding for cap test", direction_id)],
     )
 
@@ -990,7 +991,7 @@ async def test_research_history_only_updated_for_directions_with_findings(db_ses
     _patch_research_externals(mocker)
     # Only direction A produces a finding
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_finding(direction_id=dir_a_id)],
     )
 
@@ -1043,7 +1044,7 @@ async def test_research_completion_creates_direction_proposals(db_session, mocke
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_direction_proposal(proposal_prompt, proposal_rationale, "high")],
     )
 
@@ -1079,7 +1080,7 @@ async def test_direction_proposals_not_converted_to_tasks(db_session, mocker):
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[
             _make_direction_proposal("Add observability layer"),
             _make_finding("A real improvement finding", direction_id),
@@ -1120,7 +1121,7 @@ async def test_direction_proposals_capped_at_5_per_call(db_session, mocker):
 
     proposals = [_make_direction_proposal(f"Proposal {i}") for i in range(8)]
     _patch_research_externals(mocker)
-    mocker.patch("app.main._parse_research_findings", return_value=proposals)
+    mocker.patch("app.task_completion._parse_research_findings", return_value=proposals)
 
     await _handle_research_completion(task, "", db_session)
 
@@ -1162,7 +1163,7 @@ async def test_direction_proposals_capped_at_10_pending_total(db_session, mocker
 
     _patch_research_externals(mocker)
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         return_value=[_make_direction_proposal("New proposal that should be blocked")],
     )
 
@@ -1466,9 +1467,9 @@ async def test_research_context_accumulates_across_cycles(db_session, mocker):
     await db_session.refresh(project)
 
     _patch_research_externals(mocker)
-    mocker.patch("app.main._parse_research_insights", return_value=[])
+    mocker.patch("app.task_completion._parse_research_insights", return_value=[])
     mocker.patch(
-        "app.main._parse_research_findings",
+        "app.task_completion._parse_research_findings",
         side_effect=[
             [_make_finding(title="Finding Alpha", direction_id=direction_id)],
             [_make_finding(title="Finding Beta", direction_id=direction_id)],
@@ -1520,7 +1521,7 @@ async def test_research_context_truncated_under_8000_chars(db_session, mocker):
     await db_session.refresh(project)
 
     _patch_research_externals(mocker)
-    mocker.patch("app.main._parse_research_insights", return_value=[])
+    mocker.patch("app.task_completion._parse_research_insights", return_value=[])
 
     # Build findings with long descriptions to generate large research_context entries
     findings_per_cycle = []
@@ -1540,7 +1541,7 @@ async def test_research_context_truncated_under_8000_chars(db_session, mocker):
             })
         findings_per_cycle.append(cycle_findings)
 
-    mocker.patch("app.main._parse_research_findings", side_effect=findings_per_cycle)
+    mocker.patch("app.task_completion._parse_research_findings", side_effect=findings_per_cycle)
 
     for i in range(6):
         await db_session.refresh(project)

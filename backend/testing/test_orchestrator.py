@@ -17,12 +17,14 @@ import app.main as _main_module
 import app.shared_state as _shared_state
 from app.main import (
     reaper_service,
-    load_max_plan_pool,
-    select_max_plan_account,
-    release_max_plan_account,
     _spawn_research_task,
     _handle_research_completion,
     classify_failure,
+)
+from app.max_plan_pool import (
+    load_max_plan_pool,
+    select_max_plan_account,
+    release_max_plan_account,
     _max_plan_pools,
     _account_by_id,
 )
@@ -373,7 +375,7 @@ class TestMaxPlanPool:
         On startup/restart, load_max_plan_pool() counts the actual PROVISIONING/IN_PROGRESS
         tasks per account in the DB — not trusting any stale in-memory counters.
         """
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.max_plan_pool.AsyncSessionLocal", _FakeSessionFactory(db_session))
 
         acct_id = uuid.uuid4()
         account = MaxPlanAccount(
@@ -423,7 +425,7 @@ class TestMaxPlanPool:
     @pytest.mark.asyncio
     async def test_load_max_plan_pool_includes_disabled_accounts(self, db_session, mocker, reset_max_plan_pool):
         """load_max_plan_pool() loads all accounts regardless of enabled flag."""
-        mocker.patch("app.main.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        mocker.patch("app.max_plan_pool.AsyncSessionLocal", _FakeSessionFactory(db_session))
 
         db_session.add(MaxPlanAccount(user_id=_TEST_USER, name="enabled-acct", oauth_token="tok-a", enabled=True, total_tasks=0))
         db_session.add(MaxPlanAccount(user_id=_TEST_USER, name="disabled-acct", oauth_token="tok-b", enabled=False, total_tasks=0))
@@ -752,9 +754,9 @@ class TestResearchCompletion:
         must be deduplicated — no new child task should be created for them.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
-        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Dedup findings test", user_id="user1")
         db_session.add(project)
@@ -822,9 +824,9 @@ class TestResearchCompletion:
         must have their depends_on field set to the UUIDs of the referenced tasks.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
-        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Deps ordering test", user_id="user1")
         db_session.add(project)
@@ -892,9 +894,9 @@ class TestResearchCompletion:
         ones behind artificial dependency chains.
         """
         mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
-        mocker.patch("app.main.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
-        mocker.patch("app.main.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
-        mocker.patch("app.main.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
 
         project = Project(name="Priority ordering test", user_id="user1")
         db_session.add(project)
