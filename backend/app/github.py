@@ -589,6 +589,66 @@ async def delete_branch(
     return False
 
 
+async def list_branches(
+    token: str, owner: str, repo: str,
+    prefixes: list | None = None,
+    max_branches: int = 500,
+) -> list:
+    """List repository branches, optionally filtered by name prefixes.
+
+    Returns a list of dicts with 'name' and 'sha' keys.
+    Returns empty list on auth error or API failure.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    branches = []
+    url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100"
+
+    while url and len(branches) < max_branches:
+        response = await _github_request("GET", url, headers)
+        if response.status_code == 401:
+            logger.warning(f"[GITHUB] Unauthorized listing branches for {owner}/{repo}")
+            return []
+        if response.status_code != 200:
+            logger.error(f"[GITHUB] Failed to list branches for {owner}/{repo}: {response.status_code}")
+            return []
+        data = response.json()
+        for b in data:
+            name = b["name"]
+            if prefixes is None or any(name.startswith(p) for p in prefixes):
+                branches.append({"name": name, "sha": b["commit"]["sha"]})
+        url = response.links.get("next", {}).get("url")
+
+    return branches
+
+
+async def get_commit_date(
+    token: str, owner: str, repo: str, sha: str
+) -> "datetime | None":
+    """Get the committer date for a commit SHA. Returns None on error."""
+    from datetime import datetime as _dt
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}", headers
+    )
+    if response.status_code != 200:
+        return None
+    date_str = response.json().get("commit", {}).get("committer", {}).get("date")
+    if not date_str:
+        return None
+    try:
+        return _dt.fromisoformat(date_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
 async def create_pull_request(
     token: str,
     owner: str,

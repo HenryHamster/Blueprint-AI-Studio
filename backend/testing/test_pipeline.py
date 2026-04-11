@@ -22,6 +22,7 @@ from app.main import (
     record_task_result,
     should_rollback,
 )
+from app.task_completion import _compute_first_attempt_succeeded
 from app.task_completion import _handle_strategic_completion
 from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup, _spawn_pipeline_task
 from app.models import Project, Task, TaskStatus, DeploymentStatus
@@ -1001,6 +1002,127 @@ class TestHighRiskRollupGate:
 
     def test_empty_children_not_flagged(self):
         assert not self._has_high_risk_child([])
+
+
+# ── First-Attempt Success Rate ────────────────────────────────────────────────
+
+
+class TestFirstAttemptMetrics:
+    """Tests for _first_attempt_succeeded and _had_playbook context tracking."""
+
+    def test_first_attempt_success_sets_true(self):
+        """Task completed on first try → _first_attempt_succeeded=True."""
+        assert _compute_first_attempt_succeeded(0, TaskStatus.COMPLETED) is True
+
+    def test_second_attempt_success_is_not_first(self):
+        """Task completed after one retry → _first_attempt_succeeded=False (attempt_count=2)."""
+        assert _compute_first_attempt_succeeded(2, TaskStatus.COMPLETED) is False
+
+    def test_failed_task_is_not_first_attempt_success(self):
+        """A failed task → _first_attempt_succeeded=False regardless of attempt count."""
+        assert _compute_first_attempt_succeeded(0, TaskStatus.FAILED) is False
+
+    def test_attempt_count_1_is_within_first_attempt_threshold(self):
+        """attempt_count=1 (reaper retried once) still counts as first-attempt bucket."""
+        assert _compute_first_attempt_succeeded(1, TaskStatus.COMPLETED) is True
+
+
+@pytest_asyncio.fixture()
+async def metrics_db(mocker):
+    """Isolated in-memory DB for first-attempt metrics tests."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_compute_pipeline_health_includes_first_attempt_rate(metrics_db):
+    """compute_pipeline_health_summary returns first_attempt_success_rate field."""
+    from app.admin import compute_pipeline_health_summary
+    from datetime import timezone
+
+    project = Project(name="Test", user_id="u1")
+    metrics_db.add(project)
+    await metrics_db.commit()
+    await metrics_db.refresh(project)
+
+    # Task that succeeded on first attempt with playbook
+    task_ok = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        context={"_first_attempt_succeeded": True, "_had_playbook": True},
+    )
+    # Task that failed (retries exhausted) without playbook
+    task_fail = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.FAILED,
+        context={"_first_attempt_succeeded": False, "_had_playbook": False},
+    )
+    metrics_db.add(task_ok)
+    metrics_db.add(task_fail)
+    await metrics_db.commit()
+
+    result = await compute_pipeline_health_summary(metrics_db, project.id)
+
+    assert "first_attempt_success_rate" in result
+    fasr = result["first_attempt_success_rate"]
+    assert "overall" in fasr
+    assert "with_playbook" in fasr
+    assert "without_playbook" in fasr
+    assert "sample_size" in fasr
+    assert "by_type" in fasr
+    assert fasr["sample_size"] == 2
+    assert fasr["overall"] == 0.5  # 1 success out of 2 measured
+    assert fasr["with_playbook"] == 1.0  # task_ok succeeded
+    assert fasr["without_playbook"] == 0.0  # task_fail failed
+
+
+@pytest.mark.asyncio
+async def test_compute_pipeline_health_no_metrics_returns_none(metrics_db):
+    """When no tasks have _first_attempt_succeeded recorded, overall is None."""
+    from app.admin import compute_pipeline_health_summary
+
+    project = Project(name="Test2", user_id="u2")
+    metrics_db.add(project)
+    await metrics_db.commit()
+    await metrics_db.refresh(project)
+
+    # Task without metric recorded
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    metrics_db.add(task)
+    await metrics_db.commit()
+
+    result = await compute_pipeline_health_summary(metrics_db, project.id)
+    fasr = result["first_attempt_success_rate"]
+    assert fasr["overall"] is None
+    assert fasr["sample_size"] == 0
 
 
 # ── Priority Inheritance ──────────────────────────────────────────────────────

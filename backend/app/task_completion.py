@@ -50,6 +50,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -> bool:
+    """Return True if the task completed successfully on its first attempt (attempt_count <= 1)."""
+    return attempt_count <= 1 and status == TaskStatus.COMPLETED
+
+
 def _compute_momentum_factor(d: dict) -> float:
     """Return a momentum multiplier based on recent research history productivity."""
     history = d.get("research_history", [])

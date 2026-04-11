@@ -105,6 +105,214 @@ async def secret_reconciliation_service():
             break
 
 
+_STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
+_PROTECTED_BRANCHES = frozenset(["main", "master", "develop", "dev"])
+_MAX_DELETES_PER_PROJECT = 20
+_MAX_DELETES_TOTAL = 50
+_STALE_BRANCH_AGE_DAYS = 7
+
+
+async def _get_project_github_token(project, session):
+    """Retrieve a GitHub token for a project via its UserIntegration."""
+    from app.models import UserIntegration  # noqa: PLC0415
+    from app.github import (  # noqa: PLC0415
+        generate_installation_access_token,
+        get_repo_installation_token,
+    )
+    from app.secrets_manager import get_user_secret  # noqa: PLC0415
+
+    integration = (await session.execute(
+        select(UserIntegration).where(UserIntegration.user_id == project.user_id)
+    )).scalars().first()
+
+    if integration and integration.github_installation_id:
+        return await generate_installation_access_token(
+            integration.github_installation_id,
+            repositories=[project.github_repo],
+        )
+    if integration and integration.github_pat:
+        return await get_user_secret(integration.github_pat)
+    # Fallback: discover via GitHub App
+    return await get_repo_installation_token(project.github_owner, project.github_repo)
+
+
+async def _run_stale_branch_cleanup():
+    """Delete branches that have no active task and are older than N days."""
+    from app.models import Project  # noqa: PLC0415
+    from app.github import list_branches, delete_branch, get_commit_date  # noqa: PLC0415
+
+    stale_age = timedelta(days=_STALE_BRANCH_AGE_DAYS)
+    total_deleted = 0
+
+    async with AsyncSessionLocal() as session:
+        # Projects with GitHub repos configured
+        projects = (await session.execute(
+            select(Project).where(
+                Project.github_owner.is_not(None),
+                Project.github_repo.is_not(None),
+            )
+        )).scalars().all()
+
+        # Collect all branch names referenced by non-terminal tasks
+        ACTIVE_STATUSES = [
+            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        ]
+        active_tasks = (await session.execute(
+            select(Task).where(Task.status.in_(ACTIVE_STATUSES))
+        )).scalars().all()
+
+        active_branches: set = set()
+        for task in active_tasks:
+            ctx = task.context or {}
+            # Review loop branch
+            rl_branch = ctx.get("review_loop", {}).get("branch")
+            if rl_branch:
+                active_branches.add(rl_branch)
+            # Staging branches
+            for key in ("plan_branch", "research_branch", "branch"):
+                b = ctx.get(key)
+                if b:
+                    active_branches.add(b)
+            # Payload branches
+            for payload in (task.payloads or []):
+                pb = payload.get("branch")
+                if pb:
+                    active_branches.add(pb)
+            # Computed branch name from task ID (covers cases not in context)
+            task_type = task.first_payload.get("type", "task")
+            type_prefix = {
+                "create": "task", "fix": "fix", "refactor": "refactor",
+                "docs": "docs", "deps": "deps", "migrate": "migrate",
+            }.get(task_type, "task")
+            short_id = str(task.id).replace("-", "")[:8]
+            active_branches.add(f"blueprint/{type_prefix}-{short_id}")
+
+        now = _utcnow()
+
+        for project in projects:
+            if total_deleted >= _MAX_DELETES_TOTAL:
+                logger.info(f"[BRANCH CLEANUP] Global cap ({_MAX_DELETES_TOTAL}) reached, stopping")
+                break
+
+            try:
+                token = await _get_project_github_token(project, session)
+                if not token:
+                    logger.warning(f"[BRANCH CLEANUP] No token for project {project.id}, skipping")
+                    continue
+            except Exception as e:
+                logger.warning(f"[BRANCH CLEANUP] Token error for project {project.id}: {e}")
+                continue
+
+            owner, repo = project.github_owner, project.github_repo
+
+            try:
+                branches = await list_branches(
+                    token, owner, repo,
+                    prefixes=list(_STALE_BRANCH_PREFIXES),
+                    max_branches=500,
+                )
+            except Exception as e:
+                logger.warning(f"[BRANCH CLEANUP] Failed to list branches for {owner}/{repo}: {e}")
+                continue
+
+            project_deleted = 0
+            for branch_info in branches:
+                if project_deleted >= _MAX_DELETES_PER_PROJECT:
+                    break
+                if total_deleted >= _MAX_DELETES_TOTAL:
+                    break
+
+                name = branch_info["name"]
+                sha = branch_info["sha"]
+
+                # Safety: never touch protected branches
+                if name in _PROTECTED_BRANCHES:
+                    continue
+
+                # Skip if referenced by an active task
+                if name in active_branches:
+                    continue
+
+                # Get commit date to check age
+                try:
+                    commit_date = await get_commit_date(token, owner, repo, sha)
+                except Exception:
+                    continue
+                if commit_date is None:
+                    continue
+
+                # Normalise to naive UTC for comparison
+                if commit_date.tzinfo is not None:
+                    commit_date = commit_date.replace(tzinfo=None)
+                if (now - commit_date) < stale_age:
+                    continue
+
+                # Delete the stale branch
+                try:
+                    deleted = await delete_branch(token, owner, repo, name)
+                    if deleted:
+                        age_days = (now - commit_date).days
+                        logger.info(
+                            f"[BRANCH CLEANUP] Deleted {name} from {owner}/{repo} "
+                            f"(age: {age_days}d)"
+                        )
+                        project_deleted += 1
+                        total_deleted += 1
+                except Exception as e:
+                    logger.warning(f"[BRANCH CLEANUP] Failed to delete {name}: {e}")
+
+            if project_deleted > 0:
+                logger.info(
+                    f"[BRANCH CLEANUP] Deleted {project_deleted} stale branch(es) "
+                    f"from {owner}/{repo}"
+                )
+
+            # INFO alert when many branches cleaned in one cycle
+            if project_deleted > 10:
+                try:
+                    alert = Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.INFO,
+                        title=f"Cleaned up {project_deleted} stale branches",
+                        message=(
+                            f"Stale branch cleanup removed {project_deleted} branches from "
+                            f"{owner}/{repo} that were older than {_STALE_BRANCH_AGE_DAYS} days "
+                            f"with no corresponding active tasks."
+                        ),
+                    )
+                    session.add(alert)
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(project.id), "alert_created",
+                        {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+                    )
+                except Exception as e:
+                    logger.warning(f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}")
+
+    if total_deleted > 0:
+        logger.info(f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted}")
+
+
+async def stale_branch_cleanup_service():
+    """Periodic cleanup of stale blueprint/research/plan branches (default every 6 hours)."""
+    while True:
+        try:
+            await _run_stale_branch_cleanup()
+        except asyncio.CancelledError:
+            logger.info("[BRANCH CLEANUP] Service shutting down.")
+            break
+        except Exception as e:
+            logger.error(f"[BRANCH CLEANUP] Error: {e}", exc_info=True)
+
+        interval_minutes = _shared_state.runtime_config.get("branch_cleanup_interval_minutes", 360)
+        try:
+            await asyncio.sleep(interval_minutes * 60)
+        except asyncio.CancelledError:
+            logger.info("[BRANCH CLEANUP] Service shutting down.")
+            break
+
+
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
     from app.main import _get_deploy_state_for_update  # noqa: PLC0415

@@ -287,9 +287,9 @@ async def test_direction_with_zero_cycles_excluded():
 
 @pytest.mark.asyncio
 async def test_return_structure_has_all_required_keys():
-    """Result always contains all four required keys regardless of data."""
+    """Result always contains all required keys regardless of data."""
     session = _make_mock_session(tasks=[], project=make_project(directions=[]))
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate"}

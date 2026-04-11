@@ -33,12 +33,16 @@ from app.secrets_manager import store_user_secret, get_user_secret
 from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
+from app.routers.admin_projects import router as admin_projects_router
+from app.routers.admin_settings import router as admin_settings_router
 from app.routers.agent import router as agent_router
 from app.routers.agent import verify_agent_token, get_github_token_for_task, invalidate_github_token_cache, _github_token_cache, _has_local_cycle
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
 from app.routers.directions import router as directions_router
 from app.routers.deploy import router as deploy_router
+from app.routers.admin_users import router as admin_users_router
+from app.routers.admin_notifications import router as admin_notifications_router
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -1483,6 +1487,36 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
+
+    # One-time playbook auto-seed: if no playbook entries exist, seed defaults now
+    _doc = project.design_doc or {}
+    _has_playbook = any(k.startswith("playbook/") for k in _doc)
+    if not _has_playbook:
+        try:
+            from app.routers.admin_notifications import _SEED_ENTRIES
+            _new_doc = dict(_doc)
+            _now_iso = _utcnow().isoformat()
+            for _key, _value in _SEED_ENTRIES.items():
+                _playbook_key = f"playbook/{_key}"
+                if _playbook_key not in _new_doc:
+                    _new_doc[_playbook_key] = {
+                        "content": _value,
+                        "source_task_id": None,
+                        "updated_at": _now_iso,
+                        "confirmed_count": 0,
+                    }
+            _meta = _new_doc.get("_meta", {"revision": 0})
+            _meta["revision"] = _meta.get("revision", 0) + 1
+            _meta["last_updated"] = _now_iso
+            _meta["updated_by"] = "auto-seed"
+            _new_doc["_meta"] = _meta
+            project.design_doc = _new_doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+            await session.commit()
+            logger.info(f"[PLAYBOOK] Auto-seeded {len(_SEED_ENTRIES)} default playbook entries for project {project.id}")
+        except Exception as _seed_err:
+            logger.warning(f"[PLAYBOOK] Auto-seed failed for project {project.id}: {_seed_err}")
     # Guard: don't spawn if user has no available accounts (avoids immediate failure)
     user_pool = _max_plan_pools.get(project.user_id, [])
     research_model = _runtime_config.get("task_type_models", {}).get("research")
@@ -2216,11 +2250,15 @@ app = FastAPI(
 setup_telemetry(app, engine)
 
 app.include_router(admin_router)
+app.include_router(admin_projects_router)
+app.include_router(admin_settings_router)
 app.include_router(agent_router)
 app.include_router(github_router)
 app.include_router(projects_router)
 app.include_router(directions_router)
 app.include_router(deploy_router)
+app.include_router(admin_users_router)
+app.include_router(admin_notifications_router)
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""
@@ -2728,6 +2766,7 @@ from app.task_completion import (  # noqa: E402 — re-exports for backward comp
     _handle_strategic_completion,
     _handle_research_completion,
     _compute_momentum_factor,
+    _compute_first_attempt_succeeded,
 )
 
 
@@ -3638,6 +3677,26 @@ async def update_agent_status(
                         + existing_msg[:300]
                     ).strip()
                     session.add(task)
+
+        # Record first-attempt success metrics for playbook effectiveness tracking
+        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            try:
+                _ctx = dict(task.context or {})
+                _ctx["_first_attempt_succeeded"] = _compute_first_attempt_succeeded(
+                    task.attempt_count, payload.status
+                )
+                try:
+                    _proj = await session.get(Project, task.project_id)
+                    _playbook_count = sum(
+                        1 for k in (_proj.design_doc or {}) if k.startswith("playbook/")
+                    ) if _proj else 0
+                except Exception:
+                    _playbook_count = 0
+                _ctx["_had_playbook"] = bool(_playbook_count)
+                task.context = _ctx
+                session.add(task)
+            except Exception as _e:
+                logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload

@@ -51,6 +51,7 @@ async def lifespan(app):
         secret_reconciliation_service,
         _send_webhook_notification,
     )
+    from app.services import stale_branch_cleanup_service
     from app.orchestrator import orchestrator_worker
     from app.github import close_github_client
 
@@ -78,6 +79,9 @@ async def lifespan(app):
     # Start Secret Reconciliation Service (orphaned agent-creds-* cleanup)
     secret_recon_task = asyncio.create_task(secret_reconciliation_service())
 
+    # Start Stale Branch Cleanup Service (removes old blueprint/research/plan branches)
+    stale_branch_task = asyncio.create_task(stale_branch_cleanup_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -87,6 +91,7 @@ async def lifespan(app):
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
     _bg_tasks["secret_reconciliation"] = secret_recon_task
+    _bg_tasks["stale_branch_cleanup"] = stale_branch_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
@@ -97,6 +102,7 @@ async def lifespan(app):
             "reaper": reaper_service,
             "gcp_cleanup": gcp_cleanup_service,
             "secret_reconciliation": secret_reconciliation_service,
+            "stale_branch_cleanup": stale_branch_cleanup_service,
         }
         while True:
             try:
@@ -166,7 +172,7 @@ async def lifespan(app):
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, orchestrator_task, monitor_task]
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, monitor_task]
     for t in tasks_to_cancel:
         t.cancel()
     try:

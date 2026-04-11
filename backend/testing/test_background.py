@@ -8,6 +8,7 @@ from sqlmodel import SQLModel
 from app.models import Project, Task, TaskStatus
 from app.main import reaper_service
 from app.broadcast import broadcast_to_project, manager
+from app.services import _run_stale_branch_cleanup
 
 
 # The reaper creates its own DB sessions via AsyncSessionLocal. Tests must
@@ -242,6 +243,115 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
 
     await reaper_db.refresh(coordinator)
     assert coordinator.status == TaskStatus.EVALUATING
+
+
+@pytest_asyncio.fixture()
+async def cleanup_db(mocker):
+    """Isolated in-memory DB for stale branch cleanup tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    Session = sessionmaker(
+        bind=engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+    mocker.patch("app.services.AsyncSessionLocal", Session)
+
+    async with Session() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, mocker):
+    """Branches referenced by active tasks must not be deleted."""
+    project = Project(name="Cleanup Test", user_id="user1", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    # Active task with a known branch in its context
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={"review_loop": {"branch": "blueprint/task-abc12345"}},
+    )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    # Mock GitHub: one stale branch belonging to the active task
+    old_date = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-abc12345", "sha": "sha1"},
+    ])
+    mocker.patch("app.github.get_commit_date", return_value=datetime.utcnow() - timedelta(days=30))
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    # Branch belongs to an active task — must not be deleted
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
+    """Branches older than 7 days with no active task should be deleted."""
+    project = Project(name="Cleanup Test 2", user_id="user2", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    # No active tasks — branch is truly orphaned
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-deadbeef", "sha": "sha2"},
+    ])
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(days=10),
+    )
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_called_once_with("tok", "org", "repo", "blueprint/task-deadbeef")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_spares_protected_branches(cleanup_db, mocker):
+    """Protected branches (main, master, develop) must never be deleted."""
+    project = Project(name="Cleanup Test 3", user_id="user3", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    # These start with "blueprint/" so they pass the prefix filter, but names are protected
+    # Use realistic names that start with the allowed prefixes — the protected check is by exact name
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "main", "sha": "sha3"},
+        {"name": "master", "sha": "sha4"},
+        {"name": "develop", "sha": "sha5"},
+    ])
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(days=30),
+    )
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_not_called()
 
 
 @pytest.mark.asyncio
