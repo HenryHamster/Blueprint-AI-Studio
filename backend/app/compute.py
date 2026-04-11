@@ -536,22 +536,10 @@ STATICENV
         gsutil cp "$PAYLOAD_URI_DECODED" /etc/agent_payload.json
     fi
 
-    # 6. Pull latest agent source from GCS (hotfix: deploys with orchestrator, no Packer rebuild needed)
-    echo "Pulling latest agent source from GCS..."
-    HOTFIX_TMP="/tmp/agent-hotfix-index.ts"
-    gsutil -q cp gs://{ARTIFACT_BUCKET_NAME}/agent-hotfix/index.ts "$HOTFIX_TMP" 2>/dev/null && {{
-        # Validate hotfix before replacing baked-in source
-        cp /opt/agent/src/index.ts /opt/agent/src/index.ts.bak
-        cp "$HOTFIX_TMP" /opt/agent/src/index.ts
-        chown agent:agent /opt/agent/src/index.ts
-        if su agent -c "cd /opt/agent && npx tsx --no-warnings -e 'process.exit(0)'" 2>/dev/null; then
-            echo "Agent source updated from GCS hotfix (validated)."
-        else
-            echo "GCS hotfix failed validation — reverting to baked-in source."
-            mv /opt/agent/src/index.ts.bak /opt/agent/src/index.ts
-        fi
-        rm -f /opt/agent/src/index.ts.bak "$HOTFIX_TMP"
-    }} || echo "No GCS hotfix found, using baked-in agent source."
+    # 6. Agent diagnostics — log baked-in code version for debugging
+    echo "Agent source files:"
+    ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
+    head -1 /opt/agent/src/index.ts 2>/dev/null || echo "  (index.ts missing)"
 
     # 7. Start the systemd service
     echo "Starting blueprint-agent service..."

@@ -823,6 +823,8 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
 // ── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
+  log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
+  log(`Agent source: ${import.meta.url}`);
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
   // Auth: CLAUDE_CODE_OAUTH_TOKEN env var is read directly by Claude Code CLI (no file needed)
