@@ -293,7 +293,7 @@ export async function handleFix(
   if (TASK_TYPE_HINTS['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${TASK_TYPE_HINTS['fix']}`;
   }
-  enrichedPrompt = `${enrichedPrompt}${PLAYBOOK_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n`;
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';

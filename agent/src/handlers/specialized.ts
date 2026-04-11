@@ -448,7 +448,7 @@ Set confidence to:
 IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
-  const { allOutput } = await runClaudeCode(debugPrompt, ws, statusRef, model, effort, disallowedTools);
+  const { allOutput } = await runClaudeCode(debugPrompt + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n', ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput<{ root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string }>(taskId, 'debug_report', ws);
 
@@ -599,7 +599,7 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
-  const { exitCode } = await runClaudeCode(investigatePrompt, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode } = await runClaudeCode(investigatePrompt + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n', ws, statusRef, model, effort, disallowedTools);
 
   const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {

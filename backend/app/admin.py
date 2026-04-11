@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any, List, TypedDict
 import os
+import re
 import uuid
 import json
 import httpx
@@ -4243,3 +4244,238 @@ async def cost_summary(
         'by_task_type': dict(by_type),
         'total_estimated_cost': sum(v['estimated_cost'] for v in by_type.values()),
     }
+
+
+# ── Admin Playbook ─────────────────────────────────────────────────────────
+# Endpoints for viewing, managing, and seeding the persistent operational
+# playbook stored as playbook/* keys in Project.design_doc JSONB.
+
+_ADMIN_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
+
+_SEED_ENTRIES: Dict[str, str] = {
+    "build-backend": (
+        "Run backend tests with: `bash scripts/test-backend.sh` (builds Docker, runs full suite). "
+        "Specific file: `bash scripts/test-backend.sh testing/test_file.py`. "
+        "Standalone (no DB): `bash scripts/test-backend.sh --standalone`. "
+        "Do NOT use pytest directly."
+    ),
+    "build-frontend": (
+        "Frontend validation: `cd admin-ui && npm run build && npx eslint .`. "
+        "Both build and lint must pass."
+    ),
+    "build-agent": (
+        "Agent type checking: `cd agent && npx tsc --noEmit`. "
+        "No runtime tests — type checking only."
+    ),
+    "file-restrictions": (
+        "NEVER modify: .github/workflows/ (CI managed separately, GitHub App token can't push), "
+        "backend/alembic/ migrations (generated, not hand-edited), "
+        "scripts/ (unless explicitly asked)."
+    ),
+    "main-py-policy": (
+        "main.py is being decomposed. Do NOT add new functions. "
+        "Use extracted modules: task_completion.py (completion handlers), "
+        "task_lifecycle.py (pipeline/lifecycle), max_plan_pool.py (account pool). "
+        "A regression guard in test_invariants.py enforces the function count cap."
+    ),
+    "task-accessor": (
+        "Use task.first_payload for the first payload element. "
+        "Never use (task.payloads or [{}])[0]."
+    ),
+    "admin-auth": (
+        "New admin endpoints require @require_project_access or @require_role decorators. "
+        "Follow the pattern in admin.py using _get_user_project_with_role()."
+    ),
+    "import-from-source": (
+        "Import from extracted modules directly, not via main.py re-exports. "
+        "task_completion.py has completion handlers, task_lifecycle.py has pipeline/review/merge logic, "
+        "max_plan_pool.py has account pooling."
+    ),
+    "test-diagnosis": (
+        "When fixing test failures, FIRST diagnose: is the failure in the CODE or the TEST? "
+        "Don't delete or skip tests to make them pass. "
+        "Only remove tests when the tested functionality itself was removed."
+    ),
+    "circular-dep-warning": (
+        "main.py and orchestrator.py have a circular dependency. "
+        "Orchestrator imports completion handlers from main, main imports orchestrator state. "
+        "Use extracted modules to avoid deepening this cycle."
+    ),
+}
+
+
+class AdminPlaybookSet(BaseModel):
+    key: str = Field(..., description="Playbook key: alphanumeric + hyphens, max 50 chars")
+    value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
+
+
+@router.get("/projects/{project_id}/playbook")
+@limiter.limit("60/minute")
+async def admin_playbook_list(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List all playbook entries for a project with full metadata."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    doc = project.design_doc or {}
+    entries = {}
+    for k, v in doc.items():
+        if k.startswith("playbook/") and isinstance(v, dict):
+            short_key = k[len("playbook/"):]
+            entries[short_key] = {
+                "content": v.get("content", ""),
+                "source_task_id": v.get("source_task_id"),
+                "updated_at": v.get("updated_at", ""),
+                "confirmed_count": v.get("confirmed_count", 0),
+            }
+    return {"entries": entries, "count": len(entries)}
+
+
+@router.put("/projects/{project_id}/playbook")
+@limiter.limit("30/minute")
+async def admin_playbook_set(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: AdminPlaybookSet,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create or update a playbook entry."""
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+
+    key = payload.key.strip()
+    if not _ADMIN_PLAYBOOK_KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid key: must match ^[a-zA-Z0-9][a-zA-Z0-9\\-]{0,49}$",
+        )
+    if len(payload.value) > 2048:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Value too large ({len(payload.value)} bytes, max 2048)",
+        )
+
+    result = await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )
+    project = result.scalars().first()
+
+    doc = dict(project.design_doc or {})
+    playbook_key = f"playbook/{key}"
+    existing = doc.get(playbook_key, {})
+    doc[playbook_key] = {
+        "content": payload.value,
+        "source_task_id": None,
+        "updated_at": _utcnow().isoformat(),
+        "confirmed_count": existing.get("confirmed_count", 0) if isinstance(existing, dict) else 0,
+    }
+
+    playbook_total = sum(
+        len(json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
+    )
+    if playbook_total > 30_000:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
+        )
+
+    meta = doc.get("_meta", {"revision": 0})
+    meta["revision"] = meta.get("revision", 0) + 1
+    meta["last_updated"] = _utcnow().isoformat()
+    meta["updated_by"] = "admin"
+    doc["_meta"] = meta
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    return {"status": "ok", "key": key, "revision": meta["revision"]}
+
+
+@router.delete("/projects/{project_id}/playbook/{key}")
+@limiter.limit("30/minute")
+async def admin_playbook_delete(
+    request: Request,
+    project_id: uuid.UUID,
+    key: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a playbook entry by key."""
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+
+    result = await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )
+    project = result.scalars().first()
+
+    doc = dict(project.design_doc or {})
+    playbook_key = f"playbook/{key}"
+    if playbook_key not in doc:
+        raise HTTPException(status_code=404, detail=f"Playbook key '{key}' not found")
+
+    del doc[playbook_key]
+
+    meta = doc.get("_meta", {"revision": 0})
+    meta["revision"] = meta.get("revision", 0) + 1
+    meta["last_updated"] = _utcnow().isoformat()
+    meta["updated_by"] = "admin"
+    doc["_meta"] = meta
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    return {"status": "ok", "key": key, "deleted": True}
+
+
+@router.post("/projects/{project_id}/playbook/seed")
+@limiter.limit("10/minute")
+async def admin_playbook_seed(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Populate the playbook with default operational knowledge. Skips entries that already exist."""
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+
+    result = await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update()
+    )
+    project = result.scalars().first()
+
+    doc = dict(project.design_doc or {})
+    added = []
+    skipped = []
+
+    for key, value in _SEED_ENTRIES.items():
+        playbook_key = f"playbook/{key}"
+        if playbook_key in doc:
+            skipped.append(key)
+            continue
+        doc[playbook_key] = {
+            "content": value,
+            "source_task_id": None,
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+        }
+        added.append(key)
+
+    if added:
+        meta = doc.get("_meta", {"revision": 0})
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "admin-seed"
+        doc["_meta"] = meta
+
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        await session.commit()
+
+    return {"status": "ok", "added": added, "skipped": skipped}

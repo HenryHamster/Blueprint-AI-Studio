@@ -69,7 +69,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const playbookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
-  const finalPrompt = claudeMdPrefix + playbookSection + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const finalPrompt = claudeMdPrefix + playbookSection + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
   writePlaybookHelper(taskId);

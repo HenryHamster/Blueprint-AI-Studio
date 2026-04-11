@@ -139,18 +139,30 @@ export function formatPlaybook(playbook: Record<string, string> | undefined): st
   const lines = Object.entries(playbook)
     .map(([key, content]) => `### ${key}\n${content}`)
     .join('\n\n');
-  return `## Operational Playbook (knowledge from past agents)\n\nThese notes were left by previous agents working on this codebase. Trust them as operational guidance.\n\n${lines}\n\n`;
+  return `## Operational Playbook (knowledge from past agents)\n\nThese notes were left by previous agents working on this codebase. Trust and follow them — they represent hard-won operational knowledge.\n\n${lines}\n\n`;
 }
 
 export const PLAYBOOK_GUIDANCE = `
-## Operational Playbook
-If you discover operational knowledge that would help future agents working on this codebase, save it using the playbook tool:
+## Operational Playbook — Save What You Learn
+The playbook persists operational knowledge across all agent tasks in this project. Use \`./playbook set <key> <value>\` to save reusable knowledge. Use \`./playbook get\` to review existing entries.
+
+**When to save (trigger conditions):**
+- After fixing a lint, build, or test error: save the root cause pattern and fix
+- After discovering a non-obvious configuration, path, or workaround: save it
+- After wasting time on a wrong approach: save what didn't work and why
+- After finding an undocumented dependency between modules: save the relationship
+- After learning that a test requires special setup: save the setup steps
+
+**What NOT to save:**
+- Anything already in CLAUDE.md (check first)
+- Task-specific details (PR numbers, branch names, specific bug descriptions)
+- Obvious patterns that any developer would know
+
+**Before completing your task**, briefly reflect: did you learn anything that would save the next agent time? If so, save it now. Even one good entry per task compounds across hundreds of tasks.
+
 \`\`\`bash
-./playbook set "build" "Run backend tests with: bash scripts/test-backend.sh. Do NOT use pytest directly."
-./playbook set "gotchas" "Barrel file imports cause frontend build failures. Import from specific modules."
+./playbook set "key-name" "Concise operational knowledge here."
 \`\`\`
-Only save knowledge that is NOT already in CLAUDE.md and would prevent future agents from making mistakes.
-Do not save task-specific details — only reusable operational knowledge.
 `;
 
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────

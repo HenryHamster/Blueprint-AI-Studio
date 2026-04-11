@@ -4,7 +4,7 @@ KEY="$2"
 VALUE="$3"
 API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="852a1c36-8bda-49b7-b4f6-a4b7fea79c8e"
+TASK="11dcf5c1-8045-4bde-a9ea-0a0e368e053b"
 
 if [ "$OP" = "get" ]; then
   printf '{"task_id":"%s","op":"get"}' "$TASK" | \

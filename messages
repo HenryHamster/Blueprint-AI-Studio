@@ -8,7 +8,7 @@
 OP="${1:?Usage: messages send|resolve ...}"
 API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="852a1c36-8bda-49b7-b4f6-a4b7fea79c8e"
+TASK="11dcf5c1-8045-4bde-a9ea-0a0e368e053b"
 CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
 
 if [ "$OP" = "send" ]; then

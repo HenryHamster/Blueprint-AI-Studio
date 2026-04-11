@@ -1,0 +1,249 @@
+import pytest
+from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models import Project, ProjectMember
+from testing.factories import make_membership
+
+
+@pytest.fixture
+async def project_with_member(db_session):
+    """Create a project with test-user-123 as owner."""
+    project = Project(name="Playbook Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_list(client: AsyncClient, db_session, project_with_member):
+    """GET /playbook returns entries with metadata."""
+    project = project_with_member
+
+    # Seed two entries directly
+    project.design_doc = {
+        "playbook/alpha": {
+            "content": "do alpha things",
+            "source_task_id": "task-abc",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+        },
+        "playbook/beta": {
+            "content": "do beta things",
+            "source_task_id": None,
+            "updated_at": "2026-01-02T00:00:00",
+            "confirmed_count": 0,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/playbook")
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()
+    assert data["count"] == 2
+    entries = data["entries"]
+    assert "alpha" in entries
+    assert entries["alpha"]["content"] == "do alpha things"
+    assert entries["alpha"]["confirmed_count"] == 2
+    assert entries["alpha"]["source_task_id"] == "task-abc"
+    assert "beta" in entries
+    assert entries["beta"]["source_task_id"] is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_list_empty(client: AsyncClient, db_session, project_with_member):
+    """GET /playbook returns empty entries when no playbook keys exist."""
+    resp = await client.get(f"/api/admin/projects/{project_with_member.id}/playbook")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["count"] == 0
+    assert data["entries"] == {}
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_set(client: AsyncClient, db_session, project_with_member):
+    """PUT /playbook creates a new entry with correct metadata."""
+    project = project_with_member
+
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "my-tip", "value": "always run tests first"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["key"] == "my-tip"
+    assert data["revision"] >= 1
+
+    # Verify persisted correctly
+    await db_session.refresh(project)
+    entry = project.design_doc.get("playbook/my-tip")
+    assert entry is not None
+    assert entry["content"] == "always run tests first"
+    assert entry["source_task_id"] is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_set_update(client: AsyncClient, db_session, project_with_member):
+    """PUT /playbook updates an existing entry, preserving confirmed_count."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/existing": {
+            "content": "old content",
+            "source_task_id": "task-old",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 5,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "existing", "value": "updated content"},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    entry = project.design_doc.get("playbook/existing")
+    assert entry["content"] == "updated content"
+    assert entry["confirmed_count"] == 5  # preserved
+    assert entry["source_task_id"] is None  # user-seeded
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_delete(client: AsyncClient, db_session, project_with_member):
+    """DELETE /playbook/{key} removes the entry."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/remove-me": {
+            "content": "delete this",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/admin/projects/{project.id}/playbook/remove-me")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["deleted"] is True
+    assert data["key"] == "remove-me"
+
+    await db_session.refresh(project)
+    assert "playbook/remove-me" not in (project.design_doc or {})
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_delete_404(client: AsyncClient, db_session, project_with_member):
+    """DELETE /playbook/{key} returns 404 for missing key."""
+    resp = await client.delete(
+        f"/api/admin/projects/{project_with_member.id}/playbook/does-not-exist"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_seed(client: AsyncClient, db_session, project_with_member):
+    """POST /seed populates all default entries on an empty playbook."""
+    project = project_with_member
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/playbook/seed")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert len(data["added"]) == 10
+    assert data["skipped"] == []
+
+    # Verify entries exist in DB
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    assert "playbook/build-backend" in doc
+    assert "playbook/build-frontend" in doc
+    assert "playbook/build-agent" in doc
+    assert "playbook/file-restrictions" in doc
+    assert "playbook/main-py-policy" in doc
+    assert "playbook/task-accessor" in doc
+    assert "playbook/admin-auth" in doc
+    assert "playbook/import-from-source" in doc
+    assert "playbook/test-diagnosis" in doc
+    assert "playbook/circular-dep-warning" in doc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_seed_skips_existing(client: AsyncClient, db_session, project_with_member):
+    """POST /seed skips entries that already exist."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/build-backend": {
+            "content": "custom override",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/playbook/seed")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "build-backend" in data["skipped"]
+    assert "build-backend" not in data["added"]
+    assert len(data["added"]) == 9
+
+    # Existing entry should be unchanged
+    await db_session.refresh(project)
+    assert project.design_doc["playbook/build-backend"]["content"] == "custom override"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_size_limits(client: AsyncClient, db_session, project_with_member):
+    """PUT /playbook rejects values over 2048 bytes and invalid key formats."""
+    project = project_with_member
+
+    # Value too large
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "too-big", "value": "x" * 2049},
+    )
+    assert resp.status_code == 400
+    assert "too large" in resp.json()["error"]["message"].lower()
+
+    # Invalid key: contains space and special char
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "bad key!", "value": "value"},
+    )
+    assert resp.status_code == 400
+    assert "invalid key" in resp.json()["error"]["message"].lower()
+
+    # Key too long (51 chars, starting with letter)
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "a" * 51, "value": "value"},
+    )
+    assert resp.status_code == 400
