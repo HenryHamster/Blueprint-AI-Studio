@@ -328,6 +328,8 @@ async def _init_deployment_state():
                     _runtime_config["autonomous_research_wave_size"] = int(config_json["autonomous_research_wave_size"])
                 if "strategic_research_frequency" in config_json:
                     _runtime_config["strategic_research_frequency"] = int(config_json["strategic_research_frequency"])
+                if "require_approval_gates" in config_json:
+                    _runtime_config["require_approval_gates"] = bool(config_json["require_approval_gates"])
                 logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)

@@ -54,6 +54,7 @@ runtime_config: Dict = {
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "max_active_directions": 5,
     "max_parallel_research_per_project": 2,
+    "require_approval_gates": True,
 }
 
 # --- Autonomous Loop State ---

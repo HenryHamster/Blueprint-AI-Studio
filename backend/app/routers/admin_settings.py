@@ -245,6 +245,7 @@ async def get_settings(
         "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
         "github_account": github_account,
+        "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
@@ -408,6 +409,11 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (0 <= val <= 100):
             raise HTTPException(status_code=400, detail="strategic_research_frequency must be between 0 and 100 (0 = disabled)")
         _runtime_config["strategic_research_frequency"] = val
+    if "require_approval_gates" in payload:
+        val = payload["require_approval_gates"]
+        if not isinstance(val, bool):
+            raise HTTPException(status_code=400, detail="require_approval_gates must be a boolean")
+        _runtime_config["require_approval_gates"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -442,6 +448,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
                     "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
                     "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
+                    "require_approval_gates": _runtime_config.get("require_approval_gates", True),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
