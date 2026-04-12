@@ -307,6 +307,9 @@ TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategi
 TASK_LIFECYCLE_MAX_LINES = 2100      # Ratchet down as extractions land
 TASK_LIFECYCLE_MAX_FUNCTIONS = 12    # Ratchet down as extractions land
 
+ORCHESTRATOR_MAX_LINES = 1450        # Current 1,373 + ~5% headroom
+ORCHESTRATOR_MAX_FUNCTIONS = 10      # Current 6 + 4 slots
+
 
 def _get_task_completion_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "task_completion.py")
@@ -314,6 +317,10 @@ def _get_task_completion_py_path() -> str:
 
 def _get_task_lifecycle_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "task_lifecycle.py")
+
+
+def _get_orchestrator_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "orchestrator.py")
 
 
 class TestTaskCompletionFreeze:
@@ -406,5 +413,51 @@ class TestTaskLifecycleFreeze:
             f"task_lifecycle.py has {func_count} functions, exceeding the ceiling of "
             f"{TASK_LIFECYCLE_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules (e.g., review_pipeline.py). "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestOrchestratorFreeze:
+    """Enforce the orchestrator.py freeze: no new functions, no line growth."""
+
+    def test_orchestrator_line_count(self):
+        """orchestrator.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to orchestrator.py.
+        New functionality must go in extracted modules. The orchestrator_worker
+        function (1,257 lines) is the primary extraction candidate.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_orchestrator_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= ORCHESTRATOR_MAX_LINES, (
+            f"orchestrator.py has {count} lines, exceeding the ceiling of "
+            f"{ORCHESTRATOR_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_orchestrator_function_count(self):
+        """orchestrator.py must not gain new functions.
+
+        If this fails: a new function was added to orchestrator.py.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_orchestrator_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= ORCHESTRATOR_MAX_FUNCTIONS, (
+            f"orchestrator.py has {func_count} functions, exceeding the ceiling of "
+            f"{ORCHESTRATOR_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
             "Once a line-reducing extraction lands, ratchet the ceiling down."
         )

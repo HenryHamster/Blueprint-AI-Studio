@@ -16,6 +16,7 @@ from sqlmodel import select
 
 from app.models import Project, ProjectMessage, MessageType, Task, TaskStatus
 from app.research_completion import _update_cycle_history, _compute_saturation
+from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +298,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     if len(sid) > STRATEGIC_SYSTEM_ID_MAX:
                         logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
                     new_dir["system_id"] = sid[:STRATEGIC_SYSTEM_ID_MAX]
+                current_active = sum(1 for d in directions if d.get('status') == 'active')
+                if current_active >= _runtime_config.get('max_active_directions', 5):
+                    logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')
+                    continue
                 directions.append(new_dir)
                 ops_applied += 1
                 creates_count += 1

@@ -1598,3 +1598,145 @@ async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-cstmcld1")
     assert d["status"] == "paused", "Direction should stay paused within the custom 100h cooldown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction cap enforcement in autonomous creation paths
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_strategic_batch_create_respects_cap(db_session, mocker):
+    """_handle_strategic_completion batch creates should not exceed max_active_directions."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    # Seed runtime config cap to 3 to make the test fast
+    original_cap = _runtime_config.get("max_active_directions")
+    _runtime_config["max_active_directions"] = 3
+
+    try:
+        # Project already has 3 active directions (at cap)
+        existing_dirs = [
+            {"id": f"d-exist{i}", "text": f"Existing {i}", "status": "active", "priority": "medium",
+             "notes": [], "research_history": []}
+            for i in range(3)
+        ]
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={"purpose": "test", "revision": 1},
+            directions=existing_dirs,
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review", "prompt": "review",
+                       "vision": {"revision": 1}}],
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Log output tries to create 2 new directions
+        import json
+        logs = json.dumps({
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {"op": "create", "text": "New direction A", "priority": "medium", "rationale": "needed"},
+                {"op": "create", "text": "New direction B", "priority": "low", "rationale": "needed"},
+            ],
+        })
+
+        await _handle_strategic_completion(task, logs, db_session)
+
+        await db_session.refresh(project)
+        active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+        assert active_count <= 3, f"Expected at most 3 active directions, got {active_count}"
+    finally:
+        if original_cap is None:
+            _runtime_config.pop("max_active_directions", None)
+        else:
+            _runtime_config["max_active_directions"] = original_cap
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
+    """POST /api/agent/strategic with op=create_direction should skip when cap is reached."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    original_cap = _runtime_config.get("max_active_directions")
+    _runtime_config["max_active_directions"] = 2
+
+    try:
+        # Project with 2 active directions (at cap)
+        existing_dirs = [
+            {"id": f"d-sapi{i}", "text": f"Strategic API Dir {i}", "status": "active", "priority": "medium",
+             "notes": [], "research_history": []}
+            for i in range(2)
+        ]
+        project = Project(
+            name="P-strategic-api",
+            user_id="u1",
+            vision={"purpose": "test", "revision": 1},
+            directions=existing_dirs,
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            user_id="u1",
+            task_type="strategic_review",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"command": "review", "vision": {"revision": 1}}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        task_id = str(task.id)
+
+        async def _override_session():
+            yield db_session
+
+        app.dependency_overrides[get_session] = _override_session
+        app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/agent/strategic",
+                    json={"op": "create_direction", "task_id": task_id,
+                          "data": {"text": "Overcap direction", "priority": "medium"}},
+                )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["status"] == "skipped"
+            assert "cap" in body.get("reason", "").lower()
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            app.dependency_overrides.pop(verify_agent_token, None)
+
+        # Confirm no new direction was added
+        await db_session.refresh(project)
+        active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+        assert active_count == 2, f"Expected 2 active directions, got {active_count}"
+    finally:
+        if original_cap is None:
+            _runtime_config.pop("max_active_directions", None)
+        else:
+            _runtime_config["max_active_directions"] = original_cap
