@@ -833,6 +833,17 @@ async def get_pr_files(
     return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
 
 
+def _unique(*values: int | None) -> list[int]:
+    """Return deduplicated non-None values preserving order."""
+    seen: set[int] = set()
+    result: list[int] = []
+    for v in values:
+        if v is not None and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
 async def get_check_runs(
     token: str, owner: str, repo: str, ref: str
 ) -> dict:
@@ -891,35 +902,66 @@ async def get_check_runs(
     failed_logs = ""
     if failed_names:
         log_lines = []
+
+        # Pre-fetch actual job IDs via workflow runs API (check run ID != job ID sometimes)
+        job_id_by_name: dict[str, int] = {}
+        try:
+            runs_resp = await _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/actions/runs?head_sha={ref}&per_page=5",
+                headers, timeout=5.0,
+            )
+            if runs_resp.status_code == 200:
+                wf_runs = runs_resp.json().get("workflow_runs", [])
+                jobs_coros = [
+                    _github_request(
+                        "GET",
+                        f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{wf_run['id']}/jobs?filter=latest&per_page=30",
+                        headers, timeout=5.0,
+                    )
+                    for wf_run in wf_runs
+                ]
+                jobs_results = await asyncio.gather(*jobs_coros, return_exceptions=True)
+                for result in jobs_results:
+                    if isinstance(result, Exception) or result.status_code != 200:
+                        continue
+                    for job in result.json().get("jobs", []):
+                        if job.get("conclusion") == "failure":
+                            job_id_by_name[job.get("name", "")] = job["id"]
+        except Exception as exc:
+            logger.debug(f"[GITHUB] Workflow runs pre-fetch failed for {ref}: {exc}")
+
         for cr in check_runs:
             if cr.get("conclusion") != "failure":
                 continue
             cr_id = cr.get("id")
             name = cr.get("name", "unknown")
 
-            # Try to fetch actual job logs (GitHub Actions job ID == check run ID)
-            try:
-                log_response = await _github_request(
-                    "GET",
-                    f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{cr_id}/logs",
-                    headers, follow_redirects=True, timeout=10.0,
-                )
-                if log_response.status_code == 200:
-                    raw_log = log_response.text
-                    # Extract the last N lines which typically contain the error
-                    lines = raw_log.strip().split("\n")
-                    # Find lines with error-like content for a focused excerpt
-                    error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "\u00d7"])]  # \u00d7 matches multiplication sign used as error marker in some CI tools
-                    if error_lines:
-                        log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {ln.strip()}" for ln in error_lines[-30:]))
-                    else:
-                        # Just take the last 30 lines
-                        log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {ln.strip()}" for ln in lines[-30:]))
-                    continue
-            except Exception:
-                pass
+            # Try to fetch actual job logs (check run ID often == job ID)
+            got_logs = False
+            for job_id in _unique(cr_id, job_id_by_name.get(name)):
+                try:
+                    log_response = await _github_request(
+                        "GET",
+                        f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+                        headers, follow_redirects=True, timeout=10.0,
+                    )
+                    if log_response.status_code == 200:
+                        raw_log = log_response.text
+                        lines = raw_log.strip().split("\n")
+                        error_lines = [ln for ln in lines if any(kw in ln.lower() for kw in ["error", "failed", "err!", "✗", "\u00d7"])]
+                        if error_lines:
+                            log_lines.append(f"  [{name}] Errors:\n" + "\n".join(f"    {ln.strip()}" for ln in error_lines[-30:]))
+                        else:
+                            log_lines.append(f"  [{name}] (last 30 lines):\n" + "\n".join(f"    {ln.strip()}" for ln in lines[-30:]))
+                        got_logs = True
+                        break
+                except Exception:
+                    pass
+            if got_logs:
+                continue
 
-            # Fallback: fetch annotations
+            # Fallback: fetch annotations (errors/failures only — skip warnings like deprecation notices)
             try:
                 ann_response = await _github_request(
                     "GET",
@@ -928,6 +970,8 @@ async def get_check_runs(
                 )
                 if ann_response.status_code == 200:
                     for ann in ann_response.json():
+                        if ann.get("annotation_level") not in ("failure", "error"):
+                            continue
                         msg = ann.get("message", "")
                         path = ann.get("path", "")
                         line = ann.get("start_line", "")

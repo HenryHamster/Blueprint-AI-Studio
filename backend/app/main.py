@@ -1387,6 +1387,19 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
     """
+    # Guard: no design_doc_update or strategic_review already running
+    active = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    for t in active:
+        t_type = (t.first_payload).get("type")
+        if t_type in ("design_doc_update", "strategic_review"):
+            logger.debug(f"[STRATEGIC] Skipping strategic review — {t_type} task {t.id} already active")
+            return
+
     # Build direction stats with rich data (same as previous strategic payload)
     all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
     direction_stats = []
@@ -1772,7 +1785,11 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )
     if is_strategic:
         await _spawn_design_doc_update(project, session)
-        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{research_spawn_count}, vision rev {(project.vision or {}).get('revision', 0)})")
+        research_spawn_count += 1
+        project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
+        flag_modified(project, "vision")
+        session.add(project)
+        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{research_spawn_count - 1}, vision rev {(project.vision or {}).get('revision', 0)})")
 
     # Guard: no research task actively running (queued/provisioning/in_progress).
     # EVALUATING parents are just waiting on children — they don't block new research.
