@@ -732,7 +732,7 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
 
 @pytest.mark.asyncio
 async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncClient, db_session, mocker):
-    """Non-research task claim includes pipeline_health in project_context."""
+    """Non-gated task type (docs) receives pipeline_health via the else-branch."""
     project = Project(name="Pipeline Health Test", user_id="test-user-ph")
     db_session.add(project)
     await db_session.commit()
@@ -740,7 +740,7 @@ async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncCl
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "cmd": "build feature"}],
+        payloads=[{"type": "docs", "cmd": "write docs"}],
         vm_instance_id="agent-vm-ph-1",
     )
     db_session.add(task)
@@ -778,7 +778,8 @@ async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_sessi
     """
     Claim endpoint filters playbook entries by applicable_types:
     - entry with applicable_types=["create","fix"] is excluded for 'research' tasks
-    - entry with applicable_types=None is included for all task types
+    - entry with applicable_types=None is excluded for 'research' (not in _PLAYBOOK_DEFAULT_TYPES)
+    - entry with applicable_types=None IS included for 'fix' (in _PLAYBOOK_DEFAULT_TYPES)
     """
     project = Project(name="Playbook Filter Test", user_id="test-user-pbf")
     project.design_doc = {
@@ -789,8 +790,8 @@ async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_sessi
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 0,
         },
-        "playbook/universal": {
-            "content": "shown to all types",
+        "playbook/untagged": {
+            "content": "untagged operational entry",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 0,
@@ -800,26 +801,47 @@ async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_sessi
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(
+    # research task: both entries should be excluded
+    task_research = Task(
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "investigate something"}],
         vm_instance_id="agent-vm-pbf-1",
     )
-    db_session.add(task)
+    db_session.add(task_research)
     await db_session.commit()
-    await db_session.refresh(task)
+    await db_session.refresh(task_research)
 
-    token = create_agent_token(str(task.id), "agent-vm-pbf-1")
+    token = create_agent_token(str(task_research.id), "agent-vm-pbf-1")
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     data = resp.json()
 
-    assert "playbook" in data
-    # Entry restricted to create/fix must be excluded for research task
-    assert "write-only" not in data["playbook"]
-    # Entry with no applicable_types must be included for all task types
-    assert "universal" in data["playbook"]
-    assert data["playbook"]["universal"] == "shown to all types"
+    # No playbook entries should be present for research task
+    playbook = data.get("playbook", {})
+    assert "write-only" not in playbook
+    assert "untagged" not in playbook
+
+    # fix task: untagged entry should be included
+    task_fix = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "fix the bug"}],
+        vm_instance_id="agent-vm-pbf-2",
+    )
+    db_session.add(task_fix)
+    await db_session.commit()
+    await db_session.refresh(task_fix)
+
+    token2 = create_agent_token(str(task_fix.id), "agent-vm-pbf-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+
+    assert "playbook" in data2
+    # write-only entry has applicable_types=["create","fix"] so included for fix
+    assert "write-only" in data2["playbook"]
+    # untagged entry is included for fix (in _PLAYBOOK_DEFAULT_TYPES)
+    assert "untagged" in data2["playbook"]
+    assert data2["playbook"]["untagged"] == "untagged operational entry"
 
 
 @pytest.mark.asyncio

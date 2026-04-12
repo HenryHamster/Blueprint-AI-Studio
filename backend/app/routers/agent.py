@@ -461,7 +461,7 @@ async def claim_task(
                     "task_type": (sib.first_payload).get("type", ""),
                 })
 
-        # Pipeline health summary for all task types
+        # Pipeline health summary (for gated task types; else-branch covers the rest)
         pipeline_health = None
         try:
             from app.routers.admin_analytics import compute_pipeline_health_summary
@@ -478,7 +478,22 @@ async def claim_task(
             "lessons": lessons,
             "pipeline_health": pipeline_health,
         }
+    else:
+        # Lightweight pipeline health for all other task types
+        try:
+            from app.routers.admin_analytics import compute_pipeline_health_summary
+            pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
+            if pipeline_health:
+                response["project_context"] = {"pipeline_health": pipeline_health}
+        except Exception:
+            pass
 
+    # Task types that benefit from untagged operational playbook entries.
+    # Types not in this set only receive entries with explicit applicable_types matching them.
+    _PLAYBOOK_DEFAULT_TYPES = {
+        "create", "fix", "refactor", "review", "qa", "smoketest",
+        "deps", "migrate", "debug", "docs",
+    }
 
     # Inject playbook for ALL task types (outside the project_context gate)
     project_for_playbook = await session.get(Project, task.project_id)
@@ -488,7 +503,10 @@ async def claim_task(
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 applicable_types = v.get("applicable_types")
-                if applicable_types is not None and task_type not in applicable_types:
+                if applicable_types is not None:
+                    if task_type not in applicable_types:
+                        continue
+                elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
                 playbook_entries[short_key] = v.get("content", "")
