@@ -804,6 +804,14 @@ printf '%s' "\$JSON" | \\
 echo ""
 `;
       fs.writeFileSync(`${WORKSPACE}/note`, noteScript, { mode: 0o755 });
+      // Exclude agent helper scripts from git so they don't get committed into PRs
+      try {
+        const excludePath = `${WORKSPACE}/.git/info/exclude`;
+        const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
+        if (!existing.includes('/note')) {
+          fs.appendFileSync(excludePath, '/note\n');
+        }
+      } catch { /* shallow clone may lack .git/info */ }
     }
   } catch { /* workspace may not exist yet for some handlers */ }
 

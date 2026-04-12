@@ -388,35 +388,10 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if not project.autonomous_enabled:
         return
 
-    # One-time playbook auto-seed: if no playbook entries exist, seed defaults now
-    _doc = project.design_doc or {}
-    _has_playbook = any(k.startswith("playbook/") for k in _doc)
-    if not _has_playbook:
-        try:
-            from app.routers.admin_notifications import _SEED_ENTRIES
-            _new_doc = dict(_doc)
-            _now_iso = _utcnow().isoformat()
-            for _key, _value in _SEED_ENTRIES.items():
-                _playbook_key = f"playbook/{_key}"
-                if _playbook_key not in _new_doc:
-                    _new_doc[_playbook_key] = {
-                        "content": _value,
-                        "source_task_id": None,
-                        "updated_at": _now_iso,
-                        "confirmed_count": 0,
-                    }
-            _meta = _new_doc.get("_meta", {"revision": 0})
-            _meta["revision"] = _meta.get("revision", 0) + 1
-            _meta["last_updated"] = _now_iso
-            _meta["updated_by"] = "auto-seed"
-            _new_doc["_meta"] = _meta
-            project.design_doc = _new_doc
-            flag_modified(project, "design_doc")
-            session.add(project)
-            await session.commit()
-            logger.info(f"[PLAYBOOK] Auto-seeded {len(_SEED_ENTRIES)} default playbook entries for project {project.id}")
-        except Exception as _seed_err:
-            logger.warning(f"[PLAYBOOK] Auto-seed failed for project {project.id}: {_seed_err}")
+    # Playbook auto-seed removed: the hardcoded seed entries were specific to the
+    # Blueprint pipeline repo and polluted new projects with wrong build/test
+    # instructions. Agents discover the correct playbook entries by exploring
+    # the actual codebase and writing them via `./playbook set`.
     # Guard: don't spawn if user has no available accounts (avoids immediate failure)
     user_pool = _max_plan_pools.get(project.user_id, [])
     research_model = _runtime_config.get("task_type_models", {}).get("research")

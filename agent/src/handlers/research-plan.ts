@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers,
 } from '../prompt.js';
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -591,6 +591,7 @@ esac
 echo ""
 `;
     fs.writeFileSync(`${WORKSPACE}/strategic`, strategicHelper, { mode: 0o755 });
+    excludeAgentHelpers();
 
     // Also write design-doc helper so strategic agent can add notes
     const designDocHelper = `#!/bin/bash
@@ -609,6 +610,7 @@ fi
 echo ""
 `;
     fs.writeFileSync(`${WORKSPACE}/design-doc`, designDocHelper, { mode: 0o755 });
+    excludeAgentHelpers();
 
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,

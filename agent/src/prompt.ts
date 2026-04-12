@@ -63,6 +63,25 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
+// ── Git exclude for agent helper scripts ────────────────────────────────────
+// Agent helper scripts (playbook, messages, note, strategic, design-doc) are
+// written to WORKSPACE for Claude Code to use. Exclude them from git so they
+// don't get committed into PRs via `git add -A`.
+const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc'];
+
+export function excludeAgentHelpers(): void {
+  const excludePath = `${WORKSPACE}/.git/info/exclude`;
+  try {
+    const existing = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
+    const lines = existing.split('\n');
+    const missing = AGENT_HELPER_NAMES.filter(name => !lines.includes(`/${name}`));
+    if (missing.length > 0) {
+      const append = missing.map(name => `/${name}`).join('\n') + '\n';
+      fs.appendFileSync(excludePath, append);
+    }
+  } catch { /* .git/info may not exist in shallow clones */ }
+}
+
 // ── Playbook helpers ─────────────────────────────────────────────────────────
 
 export function writePlaybookHelper(taskId: string): void {
@@ -97,6 +116,7 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/playbook`, helperScript, { mode: 0o755 });
+  excludeAgentHelpers();
 }
 
 export function writeMessagesHelper(taskId: string): void {
@@ -133,6 +153,7 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/messages`, helperScript, { mode: 0o755 });
+  excludeAgentHelpers();
 }
 
 export function formatPlaybook(playbook: Record<string, string> | undefined): string {

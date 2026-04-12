@@ -872,7 +872,9 @@ async def get_check_runs(
     check_runs = data.get("check_runs", [])
 
     if not check_runs:
-        return {"status": "pending", "conclusion": None, "details": [], "failed_logs": ""}
+        # No CI configured on this repo — treat as passed so the
+        # orchestrator doesn't wait 30 min for checks that will never arrive.
+        return {"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""}
 
     details = []
     failed_names = []

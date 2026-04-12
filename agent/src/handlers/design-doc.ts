@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper,
+  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers,
 } from '../prompt.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
@@ -125,6 +125,7 @@ fi
 echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/design-doc`, helperScript, { mode: 0o755 });
+  excludeAgentHelpers();
   writeMessagesHelper(taskId);
 
   // CLAUDE.md as persistent reminder
