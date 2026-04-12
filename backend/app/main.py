@@ -616,13 +616,11 @@ def should_rollback() -> tuple:
     # Not enough signal to attribute to deploy
     return False, f"Failure rate {post_failure_rate:.0%} — monitoring, not yet attributable", "SELF_HEAL"
 
-
 async def _get_deploy_state_for_update(session: AsyncSession) -> "DeploymentState | None":
     """Fetch DeploymentState with FOR UPDATE to prevent concurrent overwrites."""
     return (await session.execute(
         select(DeploymentState).where(DeploymentState.id == 1).with_for_update()
     )).scalars().first()
-
 
 async def _check_monitoring_window():
     """Called each orchestrator cycle. If monitoring window has elapsed without issues, mark STABLE."""
@@ -709,7 +707,6 @@ async def _check_monitoring_window():
             })
 
     deploy_monitoring["window_start"] = None
-
 
 async def _check_external_health():
     """Periodic check of external dependencies. Updates shared_state.external_health."""
@@ -850,11 +847,9 @@ async def _check_external_health():
     if failed:
         logger.error(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
 
-
 _pause_failure_streak: int = 0  # consecutive health check cycles with critical failures
 _health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
-
 
 async def _send_webhook_notification(event_type: str, title: str, details: str) -> None:
     """Fire-and-forget webhook notification for critical pipeline events."""
@@ -875,7 +870,6 @@ async def _send_webhook_notification(event_type: str, title: str, details: str) 
                 logger.warning(f"[WEBHOOK] POST returned {resp.status_code}")
     except Exception as e:
         logger.warning(f"[WEBHOOK] Failed to send notification: {e}")
-
 
 async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
@@ -911,7 +905,6 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         )
     await _send_webhook_notification("AUTO_PAUSED", title, msg)
 
-
 async def _create_auto_resume_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes."""
     pause_title = "Pipeline auto-paused: external dependencies down"
@@ -944,7 +937,6 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
             "alert_created",
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
         )
-
 
 async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_errors: int) -> None:
     """Create ERROR alerts on all projects when the orchestrator hits repeated errors (deduplicated)."""
@@ -979,7 +971,6 @@ async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_e
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
 
-
 async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last_known_good: str, halted_at: "datetime") -> None:
     """Create ERROR alerts on all projects when deployment enters HALTED state."""
     title = f"Deployment HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
@@ -1004,7 +995,6 @@ async def _create_halted_alerts(session: AsyncSession, rollback_count: int, last
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
     await _send_webhook_notification("PIPELINE_HALTED", title, msg)
-
 
 async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, rolled_back_to: str) -> None:
     """Create WARNING alerts on all projects when an automatic rollback is detected.
@@ -1039,7 +1029,6 @@ async def _create_rollback_alerts(session: AsyncSession, rolled_back_from: str, 
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
 
-
 async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
@@ -1071,7 +1060,6 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
             "alert_created",
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
         )
-
 
 async def _check_pause_mode():
     """Auto-pause when critical external deps fail, auto-resume when they recover."""
@@ -1130,7 +1118,6 @@ async def _check_pause_mode():
                 logger.info(f"[PAUSE] Auto-resumed pipeline with {initial_vms} VMs (target: {restore})")
                 await broadcast_deploy_state()
 
-
 def _compute_merge_rate(d: dict) -> float:
     """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
     history = d.get("research_history", [])
@@ -1140,7 +1127,6 @@ def _compute_merge_rate(d: dict) -> float:
     if total_cycles == 0:
         return 0.5  # unknown, neutral
     return total_merged / total_cycles
-
 
 def _build_outcome_evaluation(project) -> dict:
     """Build a planned-vs-actual assessment for the strategic agent.
@@ -1278,7 +1264,6 @@ def _build_outcome_evaluation(project) -> dict:
         result["directions"] = direction_outcomes
     return result
 
-
 async def _spawn_design_doc_update(project: Project, session: AsyncSession):
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -1366,7 +1351,6 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
     session.add(project)
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})")
-
 
 async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: Optional[str] = None):
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
@@ -1486,7 +1470,6 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         session.add(project)
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
-
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
     """Spawn a research task for a project if conditions are met."""
@@ -1916,7 +1899,6 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
     logger.info(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
 
-
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
     from sqlalchemy import func
@@ -2047,7 +2029,6 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     logger.info(f"[AUTONOMOUS] Spawned periodic {task_type} task {new_task.id} for project {project.id}")
 
-
 async def _check_autonomous_research(owner: str, repo: str):
     """Post-merge hook: check if we should spawn a research task."""
     try:
@@ -2075,7 +2056,6 @@ async def _check_autonomous_research(owner: str, repo: str):
                     await _spawn_research_task(project, session)
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
-
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
@@ -2131,7 +2111,6 @@ async def _check_idle_research():
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
-
 from app.broadcast import (  # re-exports for backward compat
     _get_websocket_client_ip,
     ConnectionManager,
@@ -2140,7 +2119,6 @@ from app.broadcast import (  # re-exports for backward compat
     _SANITIZE_PATTERNS,
     _sanitize_log,
 )
-
 
 async def _maybe_create_failure_alert(
     task: "Task",
@@ -2172,7 +2150,6 @@ async def _maybe_create_failure_alert(
         "alert_created",
         {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
     )
-
 
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
@@ -2206,7 +2183,6 @@ async def _maybe_create_circuit_breaker_alert(
     )
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
-
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
@@ -2237,7 +2213,6 @@ async def _create_strategic_alert(
         {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
     )
 
-
 async def broadcast_deploy_state():
     """Assemble and broadcast current deploy state to all connected WebSocket clients."""
     try:
@@ -2247,7 +2222,6 @@ async def broadcast_deploy_state():
         await manager.broadcast_to_all("deploy_state", payload)
     except Exception as e:
         logger.warning(f"[WS] Failed to broadcast deploy state: {e}")
-
 
 app = FastAPI(
     title="Blueprint Orchestrator",
@@ -2277,7 +2251,6 @@ def _get_zone_health_summary() -> dict:
         return get_zone_health_summary()
     except Exception:
         return {"total_zones": 0, "available": 0, "exhausted": []}
-
 
 @app.get("/api/debug/orchestrator")
 async def debug_orchestrator(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
@@ -2365,7 +2338,6 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
         },
         "zone_health": _get_zone_health_summary(),
     }
-
 
 @app.get("/api/health/detailed")
 async def health_detailed(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
@@ -2479,7 +2451,6 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
 
     return {"status": overall, "components": components}
 
-
 @app.get("/api/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
     """Return the authenticated user's profile and role."""
@@ -2489,12 +2460,10 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "role": current_user["role"],
     }
 
-
 @app.get("/api/version")
 async def get_version():
     """Public endpoint returning current backend version for frontend compatibility checks."""
     return {"sha": _current_sha, "revision": _current_revision}
-
 
 @app.get("/health")
 async def health_check():
@@ -2542,7 +2511,6 @@ async def health_check():
     )
 
 _METRICS_TOKEN = os.getenv("METRICS_TOKEN", "")
-
 
 @app.get("/metrics")
 async def prometheus_metrics(request: Request):
@@ -2597,7 +2565,6 @@ async def prometheus_metrics(request: Request):
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
-
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
@@ -2656,7 +2623,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
 )
-
 
 from app.schemas import (
     DeployPayload,
@@ -2746,7 +2712,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     finally:
         manager.remove_ip(websocket)
 
-
 from app.task_completion import (  # noqa: E402 — re-exports for backward compatibility
     _parse_plan_output,
     _extract_json_array,
@@ -2791,16 +2756,12 @@ from app.strategic_completion import (  # noqa: E402
     _handle_strategic_completion,
 )
 
-
-
-
 class DesignDocUpdate(BaseModel):
     """Incremental design doc page update from an agent."""
     task_id: uuid.UUID
     op: str  # "set", "delete", "list"
     key: Optional[str] = None
     value: Optional[Any] = None
-
 
 @app.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
@@ -2872,7 +2833,6 @@ async def update_design_doc(
 
     return {"status": "ok", "op": payload.op, "key": key, "revision": meta["revision"]}
 
-
 # ── Agent Playbook ───────────────────────────────────────────────────────
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
@@ -2883,9 +2843,7 @@ class PlaybookUpdate(BaseModel):
     key: Optional[str] = None  # alphanumeric + hyphens, max 50 chars
     value: Optional[str] = None  # plain text, max 2KB
 
-
 _PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
-
 
 @app.post("/api/agent/playbook")
 @limiter.limit("120/minute")
@@ -2982,7 +2940,6 @@ async def update_playbook(
 
     return {"status": "ok", "op": op, "key": key, "revision": meta["revision"]}
 
-
 # ── Agent Annotations ───────────────────────────────────────────────────
 # Any agent can leave comments, issues, or vision suggestions.
 # Stored as ProjectMessages so design-doc and strategic agents pick them up
@@ -2995,13 +2952,11 @@ class AgentAnnotation(BaseModel):
     target_page: Optional[str] = None  # design doc page key (for comments)
     severity: Optional[str] = None     # low/medium/high (for issues)
 
-
 _ANNOTATION_TYPE_MAP = {
     "comment": MessageType.NOTE,
     "issue": MessageType.BUG_REPORT,
     "vision": MessageType.FEEDBACK,
 }
-
 
 @app.post("/api/agent/annotate")
 @limiter.limit("30/minute")
@@ -3056,13 +3011,11 @@ async def agent_annotate(
     logger.info(f"[ANNOTATE] {payload.annotation_type} from task {task.id} ({token.get('task_type', '?')})")
     return {"status": "ok", "annotation_id": str(msg.id)}
 
-
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
     task_id: uuid.UUID
     op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message"
     data: dict = {}
-
 
 @app.post("/api/agent/strategic")
 @limiter.limit("60/minute")
@@ -3259,7 +3212,6 @@ async def strategic_operation(
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
-
 
 @app.post("/api/agent/status")
 @limiter.limit("120/minute")
@@ -3872,7 +3824,6 @@ async def update_agent_status(
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
         return await _process_post_commit(task.id, payload, _session_factory=_factory)
-
 
 # _github_token_cache, invalidate_github_token_cache, get_github_token_for_task,
 # and GitHub proxy endpoints — moved to app.routers.agent
