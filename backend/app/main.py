@@ -1749,7 +1749,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     pending_sr = (project.vision or {}).get('_pending_strategic_review')
     if pending_sr:
         try:
-            await _spawn_strategic_review(project, session)
+            await _spawn_strategic_review(project, session, cycle_id=pending_sr.get('cycle_id'))
             project.vision = {**project.vision}
             project.vision.pop('_pending_strategic_review', None)
             flag_modified(project, 'vision')
@@ -2760,7 +2760,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         manager.remove_ip(websocket)
 
 
-
 from app.task_completion import (  # noqa: E402 — re-exports for backward compatibility
     _parse_plan_output,
     _extract_json_array,
@@ -3110,12 +3109,11 @@ async def strategic_operation(
         if not isinstance(data, dict) or not data.get("purpose"):
             raise HTTPException(status_code=400, detail="Vision must have a 'purpose' field")
         current = dict(project.vision or {})
-        old_rev = current.get("revision", 0)
-        # Merge: keep _strategic_failures if present, add metadata
-        new_vision = dict(data)
-        new_vision["revision"] = (old_rev or 0) + 1
-        new_vision["last_updated"] = _utcnow().isoformat()
-        new_vision.pop("_strategic_failures", None)  # Reset on success
+        new_vision = {**dict(data), "revision": (current.get("revision", 0) or 0) + 1, "last_updated": _utcnow().isoformat()}
+        # Preserve internal tracking fields; reset failure counters on success
+        new_vision.update({k: v for k, v in current.items() if k.startswith("_") and k not in new_vision})
+        new_vision.pop("_strategic_failures", None)
+        new_vision.pop("_strategic_failures_at", None)
         project.vision = new_vision
         flag_modified(project, "vision")
         session.add(project)

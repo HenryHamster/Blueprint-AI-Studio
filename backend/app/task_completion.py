@@ -1450,7 +1450,14 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
             'design_doc_task_id': str(task.id),
             'failed_at': _utcnow().isoformat(),
             'error': str(chain_exc)[:200],
+            'cycle_id': cycle_id,
         }}
+        if cycle_id:
+            _update_cycle_history(project, cycle_id, {
+                "phase1_completed_at": _utcnow().isoformat(),
+                "outcome": "failed_phase2_spawn",
+                "error": str(chain_exc)[:200],
+            })
         flag_modified(project, 'vision')
         session.add(project)
     session.add(task)

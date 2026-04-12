@@ -911,6 +911,73 @@ async def test_strategic_completion_no_api_no_logs_increments_failures(strategic
     alert_mock.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocker):
+    """set_vision must not wipe _-prefixed internal fields from the old vision."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    # Create project with internal tracking fields in vision
+    project = Project(
+        name="P", user_id="u1",
+        vision={
+            "purpose": "old purpose",
+            "revision": 3,
+            "_strategic_cycle_history": [{"cycle": 1, "outcome": "success"}],
+            "_research_spawn_count": 5,
+            "_pending_strategic_review": True,
+        },
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(task)
+    await strategic_db.commit()
+    await strategic_db.refresh(task)
+
+    task_id = str(task.id)
+
+    # Override get_session and verify_agent_token so the endpoint uses our test DB
+    async def _override_session():
+        yield strategic_db
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "set_vision", "task_id": task_id, "data": {"purpose": "new purpose"}},
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "ok"
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+    await strategic_db.refresh(project)
+    vision = project.vision
+    assert vision["purpose"] == "new purpose"
+    assert vision["revision"] == 4
+    assert vision["_strategic_cycle_history"] == [{"cycle": 1, "outcome": "success"}]
+    assert vision["_research_spawn_count"] == 5
+    assert vision["_pending_strategic_review"] is True
+    # Failure fields should NOT carry over (reset on success)
+    assert "_strategic_failures" not in vision
+    assert "_strategic_failures_at" not in vision
+
+
 # ── Structural Refactor Pipeline Relaxations ──────────────────────────────────
 
 
