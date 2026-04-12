@@ -148,7 +148,8 @@ async def orchestrator_worker():
         _check_pause_mode,
     )
     from app.autonomous_research import _check_idle_research  # noqa: PLC0415
-    from app.task_lifecycle import _verify_pr_merged, _spawn_pipeline_task  # noqa: PLC0415
+    from app.task_lifecycle import _verify_pr_merged  # noqa: PLC0415
+    from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
     from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
     from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts  # noqa: PLC0415
     from app.routers.agent import get_github_token_for_task  # noqa: PLC0415

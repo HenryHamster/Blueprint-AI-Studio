@@ -485,7 +485,7 @@ async def bulk_action_tasks(
                                     task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"
                                     logger.error(f"[ADMIN] Bulk-approved merge failed: {e}", exc_info=True)
                             else:
-                                from app.task_lifecycle import _spawn_pipeline_task
+                                from app.review_pipeline import _spawn_pipeline_task
                                 original_prompt = task_payload.get("prompt", task.description or "")
                                 review_task = await _spawn_pipeline_task(
                                     task, "review", session, pr_number, branch, base_branch,
@@ -781,7 +781,7 @@ async def request_changes(
     task_payload = task.first_payload
     base_branch = task_payload.get("base_branch", "main")
 
-    from app.task_lifecycle import _spawn_pipeline_task
+    from app.review_pipeline import _spawn_pipeline_task
     if payload.action == "fix":  # noqa: SIM108 — two distinct multi-line async calls, ternary unreadable
         spawned = await _spawn_pipeline_task(
             task, "fix", session, pr_number, branch, base_branch,
@@ -1070,7 +1070,7 @@ async def modify_task(
                             logger.error(f"[ADMIN] Approved merge failed: {e}", exc_info=True)
                     else:
                         # Security scan approval: review hasn't happened yet, spawn it
-                        from app.task_lifecycle import _spawn_pipeline_task
+                        from app.review_pipeline import _spawn_pipeline_task
                         original_prompt = task_payload.get("prompt", task.description or "")
                         review_task = await _spawn_pipeline_task(
                             task, "review", session, pr_number, branch, base_branch,
@@ -1221,7 +1221,7 @@ async def trigger_rollup(
 ):
     """Manually trigger rollup PR for an EVALUATING parent task."""
     from app.routers.agent import get_github_token_for_task
-    from app.task_lifecycle import _spawn_pipeline_task
+    from app.review_pipeline import _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 
     task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")

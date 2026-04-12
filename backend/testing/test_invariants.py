@@ -14,7 +14,7 @@ import os
 class TestSafetyConstants:
     def test_max_review_fix_iterations(self):
         """MAX_REVIEW_FIX_ITERATIONS must stay at 16."""
-        from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS
+        from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS
         assert MAX_REVIEW_FIX_ITERATIONS == 16, (
             f"MAX_REVIEW_FIX_ITERATIONS changed to {MAX_REVIEW_FIX_ITERATIONS} — "
             "this controls review-fix loop runaway. Do not change without approval."
@@ -320,8 +320,11 @@ class TestMainPyFreeze:
 TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategic extraction
 TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
 
-TASK_LIFECYCLE_MAX_LINES = 2100      # Ratchet down as extractions land
-TASK_LIFECYCLE_MAX_FUNCTIONS = 12    # Ratchet down as extractions land
+TASK_LIFECYCLE_MAX_LINES = 1800      # Ratcheted down after review_pipeline.py extraction
+TASK_LIFECYCLE_MAX_FUNCTIONS = 10    # Ratcheted down after review_pipeline.py extraction
+
+REVIEW_PIPELINE_MAX_LINES = 350
+REVIEW_PIPELINE_MAX_FUNCTIONS = 4
 
 ORCHESTRATOR_MAX_LINES = 1450        # Current 1,373 + ~5% headroom
 ORCHESTRATOR_MAX_FUNCTIONS = 10      # Current 6 + 4 slots
@@ -337,6 +340,10 @@ def _get_task_lifecycle_py_path() -> str:
 
 def _get_orchestrator_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "orchestrator.py")
+
+
+def _get_review_pipeline_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "review_pipeline.py")
 
 
 class TestTaskCompletionFreeze:
@@ -429,6 +436,46 @@ class TestTaskLifecycleFreeze:
             f"task_lifecycle.py has {func_count} functions, exceeding the ceiling of "
             f"{TASK_LIFECYCLE_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules (e.g., review_pipeline.py). "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestReviewPipelineFreeze:
+    """Enforce the review_pipeline.py freeze: no new functions, no line growth."""
+
+    def test_review_pipeline_line_count(self):
+        """review_pipeline.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to review_pipeline.py beyond
+        the extracted review/fix spawning logic. Once a line-reducing extraction
+        lands, ratchet the ceiling down.
+        """
+        path = _get_review_pipeline_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= REVIEW_PIPELINE_MAX_LINES, (
+            f"review_pipeline.py has {count} lines, exceeding the ceiling of "
+            f"{REVIEW_PIPELINE_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_review_pipeline_function_count(self):
+        """review_pipeline.py must not gain new functions."""
+        import ast
+        path = _get_review_pipeline_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= REVIEW_PIPELINE_MAX_FUNCTIONS, (
+            f"review_pipeline.py has {func_count} functions, exceeding the ceiling of "
+            f"{REVIEW_PIPELINE_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
             "Once a line-reducing extraction lands, ratchet the ceiling down."
         )
 
