@@ -1274,20 +1274,33 @@ async def update_design_doc(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """Agent endpoint for incremental design doc updates. Each call updates one page."""
+    """Agent endpoint for design doc operations. Read (list/get) is open to all agents.
+    Write (set/delete) is restricted to design_doc_update/strategic_review agents."""
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
-    if token.get("task_type") not in ("design_doc_update", "strategic_review"):
-        raise HTTPException(status_code=403, detail="Endpoint restricted to design_doc_update/strategic_review agents")
 
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    # Write operations restricted to strategic agents; reads open to all
+    if payload.op not in ("list", "get") and token.get("task_type") not in ("design_doc_update", "strategic_review"):
+        raise HTTPException(status_code=403, detail="Write operations restricted to design_doc_update/strategic_review agents")
+
     if payload.op == "list":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
         return {"keys": [k for k in doc.keys() if not k.startswith("_")]}
+
+    if payload.op == "get":
+        project = await session.get(Project, task.project_id)
+        doc = project.design_doc or {} if project else {}
+        if not payload.key:
+            raise HTTPException(status_code=400, detail="key is required for get")
+        value = doc.get(payload.key)
+        if value is None:
+            raise HTTPException(status_code=404, detail=f"Key '{payload.key}' not found")
+        return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):
         raise HTTPException(status_code=400, detail="key is required for set/delete")

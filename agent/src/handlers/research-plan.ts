@@ -593,15 +593,17 @@ echo ""
     fs.writeFileSync(`${WORKSPACE}/strategic`, strategicHelper, { mode: 0o755 });
     excludeAgentHelpers();
 
-    // Also write design-doc helper so strategic agent can add notes
+    // Also write design-doc helper so strategic agent can read/write sections
     const designDocHelper = `#!/bin/bash
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-OP="\${1:?Usage: design-doc set|delete|list <key> [json-value]}"
+OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
 KEY="\$2"
 VALUE="\$3"
 if [ "\$OP" = "list" ]; then
   curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
+elif [ "\$OP" = "get" ]; then
+  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"get\\", \\"key\\": \\"\$KEY\\"}"
 elif [ "\$OP" = "set" ]; then
   curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"\$KEY\\", \\"value\\": \$VALUE}"
 elif [ "\$OP" = "delete" ]; then
@@ -799,9 +801,20 @@ ${analysisText.slice(0, 50_000)}
     designDocHighlight = lines.join('\n') + '\n';
   }
 
-  const designDocSection = tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0
-    ? `# ARCHITECTURE (Design Document)\nFull architectural context. Your direction's specific context is highlighted above.\n${JSON.stringify(tacticalDesignDoc, null, 2)}\n\n`
-    : '';
+  // Design doc: only include key listing + playbook. Full sections available via ./design-doc get <key>.
+  let designDocSection = '';
+  if (tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0) {
+    const docKeys = (tacticalDesignDoc._keys as string[]) || Object.keys(tacticalDesignDoc).filter(k => !k.startsWith('_') && !k.startsWith('playbook/'));
+    const playbookEntries = Object.entries(tacticalDesignDoc)
+      .filter(([k]) => k.startsWith('playbook/'))
+      .map(([k, v]) => `- **${k.replace('playbook/', '')}**: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+      .join('\n');
+    designDocSection = `# ARCHITECTURE (Design Document)
+Available sections (use \`./design-doc get <key>\` to read): ${docKeys.join(', ')}
+
+${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
+`;
+  }
 
   const researchPrompt = `${contextPrefix}${researchPlaybookSection}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 

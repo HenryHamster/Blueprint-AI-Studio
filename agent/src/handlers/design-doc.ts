@@ -83,11 +83,12 @@ export async function handleDesignDocUpdate(
 # Design doc wiki tool — updates pages incrementally via API
 # Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
 # Usage:
-#   ./design-doc set <key> '<json-value>'
+#   ./design-doc get <key>                — read a section
+#   ./design-doc set <key> '<json-value>' — write a section
 #   ./design-doc delete <key>
-#   ./design-doc list
+#   ./design-doc list                     — list all section keys
 
-OP="\${1:?Usage: design-doc set|delete|list <key> [json-value]}"
+OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
 KEY="\$2"
 VALUE="\$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -97,6 +98,15 @@ CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
 
 if [ "\$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "\$TASK" | \\
+    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+      -H "Content-Type: application/json" \\
+      -H "X-Agent-Token: \$TOKEN" \\
+      --data-binary @-
+elif [ "\$OP" = "get" ]; then
+  if [ -z "\$KEY" ]; then
+    echo "Error: get requires <key>" >&2; exit 1
+  fi
+  printf '{"task_id":"%s","op":"get","key":"%s"}' "\$TASK" "\$KEY" | \\
     curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
       -H "Content-Type: application/json" \\
       -H "X-Agent-Token: \$TOKEN" \\
@@ -120,7 +130,7 @@ elif [ "\$OP" = "delete" ]; then
       -H "X-Agent-Token: \$TOKEN" \\
       --data-binary @-
 else
-  echo "Unknown op: \$OP. Use set, delete, or list." >&2; exit 1
+  echo "Unknown op: \$OP. Use get, set, delete, or list." >&2; exit 1
 fi
 echo ""
 `;

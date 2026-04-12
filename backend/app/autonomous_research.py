@@ -772,11 +772,44 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
+        # Build lightweight direction summaries — full histories are available
+        # via the API. This keeps the payload under the OS E2BIG limit (~128KB).
+        direction_summaries = []
+        for d in all_active_directions:
+            summary: dict = {
+                "id": d.get("id"),
+                "text": d.get("text"),
+                "priority": d.get("priority"),
+                "system_id": d.get("system_id"),
+                "possibly_saturated": d.get("possibly_saturated", False),
+                "possibly_complete": d.get("possibly_complete", False),
+            }
+            if d.get("conflicts_with"):
+                summary["conflicts_with"] = d["conflicts_with"]
+            if d.get("completion_criteria"):
+                summary["completion_criteria"] = d["completion_criteria"]
+            # Include compact research context (truncated) — not full history
+            ctx = d.get("research_context")
+            if ctx:
+                summary["research_context"] = ctx[:2000]
+            direction_summaries.append(summary)
+
+        # Design doc summary — just keys and playbook, not full content.
+        # Agent can fetch specific sections via ./design-doc get <key>.
+        doc = project.design_doc or {}
+        design_doc_summary: dict = {
+            "_keys": [k for k in doc if not k.startswith("_") and not k.startswith("playbook/")],
+        }
+        # Include playbook entries (small, operationally critical)
+        for k, v in doc.items():
+            if k.startswith("playbook/") and isinstance(v, dict):
+                design_doc_summary[k] = v.get("content", "")
+
         research_payload: dict = {
             "type": "research",
-            "directions": all_active_directions,
+            "directions": direction_summaries,
             "current_direction_id": None if chosen_direction is None else chosen_direction.get("id"),
-            "design_doc": project.design_doc or {},
+            "design_doc": design_doc_summary,
             "base_branch": base_branch,
             **({"model": research_model} if research_model else {}),
             **({"effort": research_effort} if research_effort else {}),
