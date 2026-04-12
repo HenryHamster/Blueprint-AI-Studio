@@ -139,9 +139,9 @@ async def orchestrator_worker():
         _check_monitoring_window,
         _check_external_health,
         _check_pause_mode,
-        _check_idle_research,
         _create_orchestrator_error_alerts,
     )
+    from app.autonomous_research import _check_idle_research  # noqa: PLC0415
     from app.task_lifecycle import _verify_pr_merged, _spawn_pipeline_task  # noqa: PLC0415
     from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
     from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts  # noqa: PLC0415

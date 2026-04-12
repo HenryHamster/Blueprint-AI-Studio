@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
-from app.main import _spawn_research_task
+from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.task_lifecycle import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id

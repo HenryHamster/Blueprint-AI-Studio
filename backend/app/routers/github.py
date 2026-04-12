@@ -264,7 +264,7 @@ async def github_webhook(
                 if not project_check.scalars().first():
                     logger.info(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
                     return {"status": "ignored"}
-                from app.main import _check_autonomous_research
+                from app.autonomous_research import _check_autonomous_research
                 background_tasks.add_task(_check_autonomous_research, owner, repo)
 
                 # Propagate pr_merged to tasks that created this PR

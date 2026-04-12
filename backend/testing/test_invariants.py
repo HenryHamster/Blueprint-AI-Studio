@@ -210,8 +210,8 @@ class TestDirectionLifecycleInvariants:
 # Direction d-3d050b18: no new functions added to main.py; all new functionality
 # goes in extracted modules.
 
-MAIN_PY_MAX_LINES = 3880      # Ratchet down as extractions land
-MAIN_PY_MAX_FUNCTIONS = 55    # Ratchet down as extractions land
+MAIN_PY_MAX_LINES = 2910      # Ratchet down as extractions land
+MAIN_PY_MAX_FUNCTIONS = 51    # Ratchet down as extractions land
 MAIN_PY_MAX_EXTERNAL_IMPORTS = 30  # Ratchet down as import redirects land
 
 
@@ -414,6 +414,62 @@ class TestTaskLifecycleFreeze:
             f"{TASK_LIFECYCLE_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules (e.g., review_pipeline.py). "
             "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+
+# ── Autonomous Research Module Size Guards ───────────────────────────────────
+# Direction d-3d050b18: autonomous research spawning extracted from main.py
+
+AUTONOMOUS_RESEARCH_MAX_LINES = 1100   # Ratchet down as extractions land
+AUTONOMOUS_RESEARCH_MAX_FUNCTIONS = 12  # Ratchet down as extractions land
+
+
+def _get_autonomous_research_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "autonomous_research.py")
+
+
+class TestAutonomousResearchFreeze:
+    """Enforce the autonomous_research.py freeze: no new functions, no line growth."""
+
+    def test_autonomous_research_line_count(self):
+        """autonomous_research.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to autonomous_research.py.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_autonomous_research_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= AUTONOMOUS_RESEARCH_MAX_LINES, (
+            f"autonomous_research.py has {count} lines, exceeding the ceiling of "
+            f"{AUTONOMOUS_RESEARCH_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_autonomous_research_function_count(self):
+        """autonomous_research.py must not gain new functions.
+
+        If this fails: a new function was added to autonomous_research.py.
+        New functionality must go in an appropriate extracted module instead.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_autonomous_research_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= AUTONOMOUS_RESEARCH_MAX_FUNCTIONS, (
+            f"autonomous_research.py has {func_count} functions, exceeding the ceiling of "
+            f"{AUTONOMOUS_RESEARCH_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
         )
 
 

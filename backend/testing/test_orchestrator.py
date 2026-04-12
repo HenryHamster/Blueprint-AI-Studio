@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock
 import app.main as _main_module
 import app.shared_state as _shared_state
 from app.reaper import reaper_service
+from app.autonomous_research import _spawn_research_task
 from app.main import (
-    _spawn_research_task,
     classify_failure,
 )
 from app.research_completion import _handle_research_completion
