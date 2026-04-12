@@ -1128,6 +1128,30 @@ async def test_completion_criteria_optional(client: AsyncClient, mocker):
     assert "completion_criteria" not in d or d.get("completion_criteria") is None
 
 
+@pytest.mark.asyncio
+async def test_put_directions_with_valid_completion_criteria(client: AsyncClient, mocker):
+    """PUT directions with valid completion_criteria succeeds."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.put(
+        f"/api/admin/projects/{project_id}/directions",
+        json=[{"text": "Direction A", "priority": "medium", "completion_criteria": "All tests pass"}],
+    )
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    assert dirs[0]["completion_criteria"] == "All tests pass"
+
+
+@pytest.mark.asyncio
+async def test_put_directions_completion_criteria_too_long(client: AsyncClient, mocker):
+    """PUT directions with completion_criteria exceeding 500 chars returns 400."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.put(
+        f"/api/admin/projects/{project_id}/directions",
+        json=[{"text": "Direction A", "priority": "medium", "completion_criteria": "x" * 501}],
+    )
+    assert resp.status_code == 400
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto-completion
 # ─────────────────────────────────────────────────────────────────────────────

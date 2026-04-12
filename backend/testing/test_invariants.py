@@ -146,6 +146,66 @@ class TestAgentRestrictions:
         )
 
 
+# -- Direction Lifecycle Regression Guards --
+
+class TestDirectionLifecycleInvariants:
+    def test_max_active_directions_default(self):
+        """max_active_directions must remain at 5 — controls direction sprawl."""
+        from app.shared_state import runtime_config
+        assert runtime_config["max_active_directions"] == 5, (
+            f"max_active_directions changed to {runtime_config['max_active_directions']} — "
+            "this controls direction sprawl and must not change without approval."
+        )
+
+    def test_direction_text_limits(self):
+        """DIRECTION_TEXT_MAX and COMPLETION_CRITERIA_MAX must match spec."""
+        from app.routers.directions import DIRECTION_TEXT_MAX, COMPLETION_CRITERIA_MAX
+        assert DIRECTION_TEXT_MAX == 2000, (
+            f"DIRECTION_TEXT_MAX changed to {DIRECTION_TEXT_MAX} — expected 2000."
+        )
+        assert COMPLETION_CRITERIA_MAX == 500, (
+            f"COMPLETION_CRITERIA_MAX changed to {COMPLETION_CRITERIA_MAX} — expected 500."
+        )
+
+    def test_momentum_factor_contract(self):
+        """_compute_momentum_factor must return canonical values for known inputs."""
+        from app.research_completion import _compute_momentum_factor
+        # Hot streak: last 2 cycles productive → 2.0
+        hot = {"research_history": [{"tasks_created": 3}, {"tasks_created": 2}]}
+        assert _compute_momentum_factor(hot) == 2.0, (
+            f"Hot streak returned {_compute_momentum_factor(hot)}, expected 2.0"
+        )
+        # Stalled: last 3 cycles empty → 0.5
+        stalled = {"research_history": [{"tasks_created": 0}, {"tasks_created": 0}, {"tasks_created": 0}]}
+        assert _compute_momentum_factor(stalled) == 0.5, (
+            f"Stalled returned {_compute_momentum_factor(stalled)}, expected 0.5"
+        )
+        # Neutral: no history → 1.0
+        assert _compute_momentum_factor({}) == 1.0, (
+            f"Neutral returned {_compute_momentum_factor({})}, expected 1.0"
+        )
+
+    def test_auto_completion_pattern_exists(self):
+        """auto_completed flag must exist in research_completion.py — lost in PR #832."""
+        rc_path = os.path.join(os.path.dirname(__file__), "..", "app", "research_completion.py")
+        with open(rc_path) as f:
+            content = f.read()
+        assert 'auto_completed' in content, (
+            "The 'auto_completed' string literal is missing from research_completion.py. "
+            "Auto-completion logic was silently removed in PR #832 and must not be removed again."
+        )
+
+    def test_direction_cap_enforced_in_post(self):
+        """directions.py POST endpoint must check max_active_directions cap — lost in PR #832."""
+        directions_path = os.path.join(os.path.dirname(__file__), "..", "app", "routers", "directions.py")
+        with open(directions_path) as f:
+            content = f.read()
+        assert 'max_active_directions' in content, (
+            "'max_active_directions' cap check is missing from directions.py. "
+            "Direction cap enforcement was lost in PR #832 and must not be removed again."
+        )
+
+
 # ── main.py Size and Symbol Count Regression Guard ──────────────────────────
 # Direction d-3d050b18: no new functions added to main.py; all new functionality
 # goes in extracted modules.

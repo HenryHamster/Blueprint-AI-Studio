@@ -123,6 +123,12 @@ async def replace_directions(
             raise HTTPException(status_code=400, detail="Each direction must have non-empty text")
         if len(entry["text"]) > DIRECTION_TEXT_MAX:
             raise HTTPException(status_code=400, detail=f"Direction text must not exceed {DIRECTION_TEXT_MAX} characters")
+        if "completion_criteria" in entry:
+            cc = entry["completion_criteria"]
+            if cc is not None and not isinstance(cc, str):
+                raise HTTPException(status_code=400, detail="completion_criteria must be a string or null")
+            if cc is not None and len(cc) > COMPLETION_CRITERIA_MAX:
+                raise HTTPException(status_code=400, detail=f"completion_criteria must not exceed {COMPLETION_CRITERIA_MAX} characters")
         if "status" not in entry:
             entry["status"] = "active"
         normalized.append(entry)
