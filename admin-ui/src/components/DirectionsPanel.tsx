@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef } from 'react';
-import { Plus, Pencil, Trash2, Check, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, ChevronUp, Settings, Zap } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Plus, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
 import DesignDocViewer from './DesignDocViewer';
 import VisionViewer from './VisionViewer';
+import { DirectionCard } from './DirectionCard';
+import { AutonomousConfigSection } from './AutonomousConfigSection';
+import { useDirectionForm } from '../hooks/useDirectionForm';
+import { useAutonomousConfig } from '../hooks/useAutonomousConfig';
 
 interface Project {
   id: string;
@@ -10,7 +14,7 @@ interface Project {
   [key: string]: unknown;
 }
 
-interface ResearchHistoryEntry {
+export interface ResearchHistoryEntry {
   timestamp: string;
   task_id: string;
   tasks_created: number;
@@ -21,7 +25,7 @@ interface ResearchHistoryEntry {
   cycle_insights?: string[];
 }
 
-interface Direction {
+export interface Direction {
   id: string;
   text: string;
   priority: 'high' | 'medium' | 'low';
@@ -64,41 +68,6 @@ function formatRelativeTime(isoString: string): string {
   return `${Math.floor(diffHrs / 24)}d ago`;
 }
 
-function formatTimeRemaining(isoString: string, cooldownMinutes: number): string {
-  // Ensure UTC interpretation — backend stores naive UTC timestamps without 'Z' suffix
-  const elapsedMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
-  const remainingMs = cooldownMinutes * 60 * 1000 - elapsedMs;
-  if (remainingMs <= 0) return '';
-  const remainingMins = Math.ceil(remainingMs / 60000);
-  if (remainingMins < 60) return `${remainingMins}m left`;
-  const hrs = Math.floor(remainingMins / 60);
-  const mins = remainingMins % 60;
-  return mins > 0 ? `${hrs}h ${mins}m left` : `${hrs}h left`;
-}
-
-function getCooldownStatus(d: Direction, cooldownMinutes: number): 'ready' | 'cooling' | 'never' {
-  if (!d.last_researched_at) return 'never';
-  const ts = d.last_researched_at;
-  const elapsedMs = Date.now() - new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime();
-  return elapsedMs < cooldownMinutes * 60 * 1000 ? 'cooling' : 'ready';
-}
-
-const priorityColors: Record<string, string> = {
-  high: 'bg-red-950/40 text-red-400 border-red-900/50',
-  medium: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
-  low: 'bg-blue-950/40 text-blue-400 border-blue-900/50',
-};
-
-const statusColors: Record<string, string> = {
-  active: 'bg-emerald-950/40 text-emerald-400 border-emerald-900/50',
-  completed: 'bg-neutral-800/40 text-neutral-400 border-neutral-700/50',
-  paused: 'bg-amber-950/40 text-amber-400 border-amber-900/50',
-  proposed: 'bg-purple-950/40 text-purple-400 border-purple-900/50',
-  expired: 'bg-neutral-800/40 text-neutral-500 border-neutral-700/50',
-};
-
-const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
-
 const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed' | 'expired'; label: string }> = [
   { key: 'proposed', label: 'Proposed by Agent' },
   { key: 'active', label: 'Active' },
@@ -106,6 +75,8 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'
   { key: 'completed', label: 'Completed' },
   { key: 'expired', label: 'Expired' },
 ];
+
+const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
 export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -118,22 +89,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
   const [activeTab, setActiveTab] = useState<'directions' | 'vision' | 'design-doc'>('directions');
 
-  // Add form
-  const [newText, setNewText] = useState('');
-  const [newPriority, setNewPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [newPathTags, setNewPathTags] = useState<string[]>([]);
-  const [newPathInput, setNewPathInput] = useState('');
-
   // Error feedback
   const [error, setError] = useState<string | null>(null);
-
-  // Inline edit
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editText, setEditText] = useState('');
-  const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
-  const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>('active');
-  const [editPathTags, setEditPathTags] = useState<string[]>([]);
-  const [editPathInput, setEditPathInput] = useState('');
 
   // Collapsible sections — expired collapsed by default, others expanded
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ expired: true });
@@ -141,64 +98,32 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   // Research history open state per direction
   const [historyOpenIds, setHistoryOpenIds] = useState<Record<string, boolean>>({});
 
-  // Autonomous config settings (global)
-  const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
-  const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
-  const [configWaveSize, setConfigWaveSize] = useState<number>(3);
-  const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
-  const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
-  const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
-
   // Research button state
   const [researchingIds, setResearchingIds] = useState<Record<string, boolean>>({});
   const [researchSuccessIds, setResearchSuccessIds] = useState<Record<string, boolean>>({});
 
-  // Cooldown settings
-  const [cooldownMinutes, setCooldownMinutes] = useState<number>(240);
-
   // Force-research confirmation popover
   const [forceConfirmId, setForceConfirmId] = useState<string | null>(null);
-  const forceConfirmRef = useRef<HTMLDivElement | null>(null);
+
+  // Form state for add/edit
+  const form = useDirectionForm();
+
+  // Autonomous config state + handlers
+  const config = useAutonomousConfig({ setError, addToast });
 
   useEffect(() => {
     fetchProjects();
-    fetchCooldownSetting();
+    config.fetchCooldownSetting();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Close force-confirm popover on outside click
-  useEffect(() => {
-    if (!forceConfirmId) return;
-    function handleClick(e: MouseEvent) {
-      if (forceConfirmRef.current && !forceConfirmRef.current.contains(e.target as Node)) {
-        setForceConfirmId(null);
-      }
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [forceConfirmId]);
 
   useEffect(() => {
     if (selectedProjectId) {
       fetchDirections();
-      fetchSettings();
+      config.fetchSettings();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
-
-  async function fetchCooldownSetting() {
-    try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, { headers: h });
-      if (!res.ok) return;
-      const data = await res.json();
-      const val = data.autonomous_direction_cooldown_minutes;
-      if (typeof val === 'number' && val > 0) setCooldownMinutes(val);
-    } catch (err) {
-      console.error('Failed to fetch cooldown setting:', err);
-      addToast('Failed to load cooldown settings', 'error');
-    }
-  }
 
   async function fetchProjects() {
     try {
@@ -212,36 +137,6 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     } catch (err) {
       console.error('Failed to fetch projects:', err);
       addToast('Failed to load projects', 'error');
-    }
-  }
-
-  async function fetchSettings() {
-    try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, { headers: h });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.autonomous_direction_cooldown_minutes != null) setConfigCooldownHours(data.autonomous_direction_cooldown_minutes / 60);
-      if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
-      if (data.autonomous_research_wave_size != null) setConfigWaveSize(data.autonomous_research_wave_size);
-      if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
-    } catch { /* ignore */ }
-  }
-
-  async function saveConfigField(field: string, value: number) {
-    setSavingConfigField(field);
-    setError(null);
-    try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
-        method: 'PATCH', headers: h,
-        body: JSON.stringify({ [field]: value }),
-      });
-      if (!res.ok) throw new Error('Failed to save setting');
-    } catch {
-      setError('Failed to save setting. Please try again.');
-    } finally {
-      setSavingConfigField(null);
     }
   }
 
@@ -271,19 +166,16 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   }
 
   async function addDirection() {
-    if (!newText.trim() || !selectedProjectId) return;
+    if (!form.newText.trim() || !selectedProjectId) return;
     setError(null);
     try {
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST', headers: h,
-        body: JSON.stringify({ text: newText.trim(), priority: newPriority, paths: newPathTags }),
+        body: JSON.stringify({ text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags }),
       });
       if (!res.ok) throw new Error('Failed to add direction');
-      setNewText('');
-      setNewPriority('medium');
-      setNewPathTags([]);
-      setNewPathInput('');
+      form.resetAddForm();
       fetchDirections();
     } catch {
       setError('Failed to add direction. Please try again.');
@@ -296,10 +188,10 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH', headers: h,
-        body: JSON.stringify({ text: editText, priority: editPriority, status: editStatus, paths: editPathTags }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
-      setEditingId(null);
+      form.setEditingId(null);
       fetchDirections();
     } catch {
       setError('Failed to update direction. Please try again.');
@@ -467,7 +359,6 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
   async function reorderDirections(newOrder: Direction[]) {
     const previousDirections = directions;
-    // Optimistic update: replace directions with new order (non-active directions stay in place)
     setDirections(prev => {
       const nonActive = prev.filter(d => d.status !== 'active');
       return [...newOrder, ...nonActive];
@@ -475,7 +366,6 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     setError(null);
     try {
       const h = await authHeaders();
-      // Full reorder: active in new order, then non-active (proposed/paused/completed) in original order
       const nonActive = previousDirections.filter(d => d.status !== 'active');
       const allOrdered = [...newOrder, ...nonActive];
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/reorder`, {
@@ -507,15 +397,6 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     }
   }
 
-  function startEdit(d: Direction) {
-    setEditingId(d.id);
-    setEditText(d.text);
-    setEditPriority(d.priority);
-    setEditStatus(d.status);
-    setEditPathTags(d.paths ?? []);
-    setEditPathInput('');
-  }
-
   function toggleSection(key: string) {
     setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
   }
@@ -523,7 +404,6 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const grouped = STATUS_GROUPS.map(({ key, label }) => ({
     key,
     label,
-    // Active directions preserve user-defined order; others sort by priority
     items: key === 'active'
       ? directions.filter(d => d.status === key)
       : directions
@@ -532,6 +412,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   }));
 
   const proposedCount = directions.filter(d => d.status === 'proposed').length;
+  const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -626,110 +507,20 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                 Active directions guide the research agent. Only Active directions are included in new tasks.
               </p>
 
-              {/* Autonomous Config collapsible */}
-              <div>
-                <button
-                  onClick={() => setAutonomousConfigOpen(v => !v)}
-                  className="flex items-center gap-1.5 w-full text-left group"
-                >
-                  <Settings className="w-3 h-3 text-neutral-500 group-hover:text-neutral-400 transition-colors" />
-                  <span className="text-[11px] font-medium text-neutral-500 uppercase tracking-wider group-hover:text-neutral-400 transition-colors flex-1">
-                    Autonomous Config
-                  </span>
-                  {autonomousConfigOpen
-                    ? <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
-                    : <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
-                  }
-                </button>
-
-                {autonomousConfigOpen && (
-                  <div className="mt-2 space-y-2">
-                    {/* Cooldown (hours) */}
-                    <div className="flex items-center gap-2">
-                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Cooldown (hours)</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={720}
-                        value={configCooldownHours}
-                        onChange={e => setConfigCooldownHours(Number(e.target.value))}
-                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      />
-                      <button
-                        onClick={() => saveConfigField('autonomous_direction_cooldown_hours', configCooldownHours)}
-                        disabled={savingConfigField === 'autonomous_direction_cooldown_hours'}
-                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
-                        title="Save"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Poll interval (min) */}
-                    <div className="flex items-center gap-2">
-                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Poll interval (min)</label>
-                      <input
-                        type="number"
-                        min={5}
-                        max={1440}
-                        value={configIntervalMinutes}
-                        onChange={e => setConfigIntervalMinutes(Number(e.target.value))}
-                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      />
-                      <button
-                        onClick={() => saveConfigField('autonomous_research_interval_minutes', configIntervalMinutes)}
-                        disabled={savingConfigField === 'autonomous_research_interval_minutes'}
-                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
-                        title="Save"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Wave size */}
-                    <div className="flex items-center gap-2">
-                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Wave size</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={50}
-                        value={configWaveSize}
-                        onChange={e => setConfigWaveSize(Number(e.target.value))}
-                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      />
-                      <button
-                        onClick={() => saveConfigField('autonomous_research_wave_size', configWaveSize)}
-                        disabled={savingConfigField === 'autonomous_research_wave_size'}
-                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
-                        title="Save"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    {/* Max tasks/hour */}
-                    <div className="flex items-center gap-2">
-                      <label className="text-[11px] text-neutral-400 w-32 shrink-0">Max tasks/hour</label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={50}
-                        value={configMaxTasksPerHour}
-                        onChange={e => setConfigMaxTasksPerHour(Number(e.target.value))}
-                        className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      />
-                      <button
-                        onClick={() => saveConfigField('max_autonomous_tasks_per_hour', configMaxTasksPerHour)}
-                        disabled={savingConfigField === 'max_autonomous_tasks_per_hour'}
-                        className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
-                        title="Save"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
+              <AutonomousConfigSection
+                configCooldownHours={config.configCooldownHours}
+                setConfigCooldownHours={config.setConfigCooldownHours}
+                configIntervalMinutes={config.configIntervalMinutes}
+                setConfigIntervalMinutes={config.setConfigIntervalMinutes}
+                configWaveSize={config.configWaveSize}
+                setConfigWaveSize={config.setConfigWaveSize}
+                configMaxTasksPerHour={config.configMaxTasksPerHour}
+                setConfigMaxTasksPerHour={config.setConfigMaxTasksPerHour}
+                autonomousConfigOpen={config.autonomousConfigOpen}
+                setAutonomousConfigOpen={config.setAutonomousConfigOpen}
+                savingConfigField={config.savingConfigField}
+                saveConfigField={config.saveConfigField}
+              />
             </>
           )}
         </div>
@@ -739,15 +530,15 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
           <div className="px-5 py-3 border-b border-neutral-800 shrink-0">
             <div className="flex gap-2">
               <input
-                value={newText}
-                onChange={e => setNewText(e.target.value)}
+                value={form.newText}
+                onChange={e => form.setNewText(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && addDirection()}
                 placeholder="New direction..."
                 className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
               />
               <select
-                value={newPriority}
-                onChange={e => setNewPriority(e.target.value as 'high' | 'medium' | 'low')}
+                value={form.newPriority}
+                onChange={e => form.setNewPriority(e.target.value as 'high' | 'medium' | 'low')}
                 className="bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="high">High</option>
@@ -756,19 +547,19 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
               </select>
               <button
                 onClick={addDirection}
-                disabled={!newText.trim()}
+                disabled={!form.newText.trim()}
                 className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 min-h-[44px] sm:min-h-0 rounded text-xs transition-colors border border-neutral-700 flex items-center"
               >
                 <Plus className="w-3.5 h-3.5" />
               </button>
             </div>
             <div className="mt-1.5 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
-              {newPathTags.map(tag => (
+              {form.newPathTags.map(tag => (
                 <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
                   {tag}
                   <button
                     type="button"
-                    onClick={() => setNewPathTags(prev => prev.filter(t => t !== tag))}
+                    onClick={() => form.setNewPathTags(prev => prev.filter(t => t !== tag))}
                     className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none"
                   >
                     <X className="w-2.5 h-2.5" />
@@ -776,19 +567,19 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                 </span>
               ))}
               <input
-                value={newPathInput}
-                onChange={e => setNewPathInput(e.target.value)}
+                value={form.newPathInput}
+                onChange={e => form.setNewPathInput(e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter' || e.key === ',') {
                     e.preventDefault();
-                    const val = newPathInput.trim();
-                    if (val && !newPathTags.includes(val)) setNewPathTags(prev => [...prev, val]);
-                    setNewPathInput('');
-                  } else if (e.key === 'Backspace' && !newPathInput && newPathTags.length > 0) {
-                    setNewPathTags(prev => prev.slice(0, -1));
+                    const val = form.newPathInput.trim();
+                    if (val && !form.newPathTags.includes(val)) form.setNewPathTags(prev => [...prev, val]);
+                    form.setNewPathInput('');
+                  } else if (e.key === 'Backspace' && !form.newPathInput && form.newPathTags.length > 0) {
+                    form.setNewPathTags(prev => prev.slice(0, -1));
                   }
                 }}
-                placeholder={newPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
+                placeholder={form.newPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
                 className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
               />
             </div>
@@ -807,7 +598,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
         {/* Directions list */}
         <div className="flex-1 overflow-y-auto custom-scrollbar px-5 py-3">
-          {/* ── Vision quick-link → Vision tab ───────── */}
+          {/* Vision quick-link */}
           {selectedProjectId && !loading && (() => {
             const visionSystems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
             const hasPurpose = typeof vision.purpose === 'string' && vision.purpose;
@@ -853,7 +644,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
             );
           })()}
 
-          {/* ── Architecture quick-link → Design Doc tab ───────── */}
+          {/* Architecture quick-link */}
           {(() => {
             const pages = Object.entries(designDoc).filter(([k]) => !k.startsWith('_'));
             const meta = (designDoc._meta || {}) as Record<string, unknown>;
@@ -929,443 +720,45 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                     {!isCollapsed && (
                       <div className="space-y-2">
                         {items.map(d => (
-                          <div key={d.id} className={`border rounded-lg p-3 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
-                            {d.status === 'proposed' ? (
-                              /* Proposed direction — approve or reject */
-                              <div>
-                                <div className="flex items-start gap-2">
-                                  <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-                                  <div className="flex items-center gap-1 shrink-0">
-                                    <button
-                                      onClick={() => approveProposal(d.id)}
-                                      title="Approve — activate this direction"
-                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
-                                    >
-                                      Approve
-                                    </button>
-                                    <button
-                                      onClick={() => rejectProposal(d.id)}
-                                      title="Reject — remove this proposal"
-                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
-                                    >
-                                      Reject
-                                    </button>
-                                  </div>
-                                </div>
-                                {d.proposal_rationale && (
-                                  <blockquote className="mt-2 border-l-2 border-purple-800/50 pl-2 text-[11px] text-purple-300/80 italic leading-relaxed">
-                                    {d.proposal_rationale}
-                                  </blockquote>
-                                )}
-                                <div className="flex items-center gap-2 mt-2">
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
-                                    {d.priority}
-                                  </span>
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.proposed}`}>
-                                    Proposed by agent
-                                  </span>
-                                  {d.proposed_at && (
-                                    <span className="text-[10px] text-neutral-600 ml-auto">
-                                      proposed {formatRelativeTime(d.proposed_at)}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            ) : d.status === 'expired' ? (
-                              /* Expired direction — revive or approve */
-                              <div>
-                                <div className="flex items-start gap-2">
-                                  <p className="text-sm text-neutral-400 flex-1">{d.text}</p>
-                                  <div className="flex items-center gap-1 shrink-0">
-                                    <button
-                                      onClick={() => reviveProposal(d.id)}
-                                      title="Revive — move back to proposed"
-                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-purple-950/60 border-purple-900/50 text-purple-400 hover:bg-purple-900/50"
-                                    >
-                                      Revive
-                                    </button>
-                                    <button
-                                      onClick={() => approveProposal(d.id)}
-                                      title="Approve — activate this direction"
-                                      className="text-[10px] px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
-                                    >
-                                      Approve
-                                    </button>
-                                  </div>
-                                </div>
-                                {d.proposal_rationale && (
-                                  <blockquote className="mt-2 border-l-2 border-neutral-700/50 pl-2 text-[11px] text-neutral-500 italic leading-relaxed">
-                                    {d.proposal_rationale}
-                                  </blockquote>
-                                )}
-                                <div className="flex items-center gap-2 mt-2">
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
-                                    {d.priority}
-                                  </span>
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors.expired}`}>
-                                    Expired
-                                  </span>
-                                  {d.proposed_at && (
-                                    <span className="text-[10px] text-neutral-600 ml-auto">
-                                      proposed {formatRelativeTime(d.proposed_at)}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            ) : editingId === d.id ? (
-                              /* Edit mode */
-                              <div className="space-y-2">
-                                <input
-                                  value={editText}
-                                  onChange={e => setEditText(e.target.value)}
-                                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                                />
-                                <div className="bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
-                                  {editPathTags.map(tag => (
-                                    <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
-                                      {tag}
-                                      <button
-                                        type="button"
-                                        onClick={() => setEditPathTags(prev => prev.filter(t => t !== tag))}
-                                        className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none"
-                                      >
-                                        <X className="w-2.5 h-2.5" />
-                                      </button>
-                                    </span>
-                                  ))}
-                                  <input
-                                    value={editPathInput}
-                                    onChange={e => setEditPathInput(e.target.value)}
-                                    onKeyDown={e => {
-                                      if (e.key === 'Enter' || e.key === ',') {
-                                        e.preventDefault();
-                                        const val = editPathInput.trim();
-                                        if (val && !editPathTags.includes(val)) setEditPathTags(prev => [...prev, val]);
-                                        setEditPathInput('');
-                                      } else if (e.key === 'Backspace' && !editPathInput && editPathTags.length > 0) {
-                                        setEditPathTags(prev => prev.slice(0, -1));
-                                      }
-                                    }}
-                                    placeholder={editPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
-                                    className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
-                                  />
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <select
-                                    value={editPriority}
-                                    onChange={e => setEditPriority(e.target.value as 'high' | 'medium' | 'low')}
-                                    className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                                  >
-                                    <option value="high">High</option>
-                                    <option value="medium">Medium</option>
-                                    <option value="low">Low</option>
-                                  </select>
-                                  <select
-                                    value={editStatus}
-                                    onChange={e => setEditStatus(e.target.value as 'active' | 'completed' | 'paused')}
-                                    className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                                  >
-                                    <option value="active">Active</option>
-                                    <option value="completed">Completed</option>
-                                    <option value="paused">Paused</option>
-                                  </select>
-                                  <div className="flex-1" />
-                                  <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
-                                    <Check className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button onClick={() => setEditingId(null)} className="text-neutral-500 hover:text-neutral-300 transition-colors">
-                                    <X className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (
-                              /* View mode */
-                              <div>
-                                <div className="flex items-start gap-2">
-                                  <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-                                  <div className="flex items-center gap-1 shrink-0">
-                                    {key === 'active' && (() => {
-                                      const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
-                                      const idx = activeItems.findIndex(x => x.id === d.id);
-                                      return (<>
-                                        {idx > 0 && (
-                                          <button
-                                            onClick={() => {
-                                              const next = [...activeItems];
-                                              [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-                                              reorderDirections(next);
-                                            }}
-                                            className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5"
-                                            title="Move up"
-                                          >
-                                            <ChevronUp className="w-3 h-3" />
-                                          </button>
-                                        )}
-                                        {idx < activeItems.length - 1 && (
-                                          <button
-                                            onClick={() => {
-                                              const next = [...activeItems];
-                                              [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
-                                              reorderDirections(next);
-                                            }}
-                                            className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5"
-                                            title="Move down"
-                                          >
-                                            <ChevronDown className="w-3 h-3" />
-                                          </button>
-                                        )}
-                                      </>);
-                                    })()}
-                                    {key === 'active' && (() => {
-                                      const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-                                      const inCooldown = cooldownStatus === 'cooling';
-                                      return (
-                                        <div className="relative flex items-center gap-1">
-                                          <button
-                                            onClick={() => !inCooldown && triggerResearch(d.id)}
-                                            disabled={researchingIds[d.id] || inCooldown}
-                                            title={inCooldown ? 'Direction is in cooldown — use force to bypass' : 'Trigger research for this direction'}
-                                            className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:enabled:text-neutral-200 hover:enabled:bg-neutral-700/60"
-                                          >
-                                            {researchingIds[d.id] ? '…' : researchSuccessIds[d.id] ? 'Queued' : 'Research'}
-                                          </button>
-                                          {inCooldown && (
-                                            <div className="relative">
-                                              <button
-                                                onClick={() => setForceConfirmId(forceConfirmId === d.id ? null : d.id)}
-                                                disabled={researchingIds[d.id]}
-                                                title="Force research (bypass cooldown)"
-                                                className="text-[10px] px-1 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-amber-950/40 border-amber-900/50 text-amber-400 hover:bg-amber-900/40"
-                                              >
-                                                <Zap className="w-2.5 h-2.5" />
-                                              </button>
-                                              {forceConfirmId === d.id && (
-                                                <div
-                                                  ref={forceConfirmRef}
-                                                  className="absolute right-0 top-6 z-10 w-52 bg-neutral-900 border border-amber-900/60 rounded-lg p-3 shadow-xl"
-                                                >
-                                                  <p className="text-[11px] text-amber-300 font-medium mb-1">Force research?</p>
-                                                  <p className="text-[10px] text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
-                                                  <div className="flex gap-2">
-                                                    <button
-                                                      onClick={() => triggerResearch(d.id, true)}
-                                                      className="flex-1 text-[10px] px-2 py-1 rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
-                                                    >
-                                                      Force
-                                                    </button>
-                                                    <button
-                                                      onClick={() => setForceConfirmId(null)}
-                                                      className="flex-1 text-[10px] px-2 py-1 rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
-                                                    >
-                                                      Cancel
-                                                    </button>
-                                                  </div>
-                                                </div>
-                                              )}
-                                            </div>
-                                          )}
-                                        </div>
-                                      );
-                                    })()}
-                                    <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
-                                      <Pencil className="w-3 h-3" />
-                                    </button>
-                                    <button onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
-                                      <Trash2 className="w-3 h-3" />
-                                    </button>
-                                  </div>
-                                </div>
-                                {/* Last researched / cooldown subtitle */}
-                                {key === 'active' && (() => {
-                                  const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-                                  if (cooldownStatus === 'never') {
-                                    return <p className="text-[10px] text-neutral-600 mt-0.5">Never researched</p>;
-                                  }
-                                  if (cooldownStatus === 'cooling') {
-                                    return <p className="text-[10px] text-amber-500/80 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
-                                  }
-                                  return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
-                                })()}
-                                {/* Auto-pause reason subtitle */}
-                                {key === 'paused' && d.paused_reason && (
-                                  <p className="text-[10px] text-amber-500/80 mt-0.5 leading-relaxed">
-                                    {d.paused_reason}
-                                    {d.paused_at && <span className="text-neutral-600"> · paused {formatRelativeTime(d.paused_at)}</span>}
-                                  </p>
-                                )}
-                                {/* Positive completion suggestion */}
-                                {d.possibly_complete && d.completion_suggestion && (
-                                  <p className="text-[10px] text-emerald-500/80 mt-0.5 leading-relaxed">
-                                    {d.completion_suggestion}
-                                  </p>
-                                )}
-                                <div className="flex items-center gap-2 mt-2">
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
-                                    {d.priority}
-                                  </span>
-                                  {d.status === 'active' || d.status === 'paused' ? (
-                                    <button
-                                      onClick={() => quickToggleStatus(d.id, d.status as 'active' | 'paused')}
-                                      title={d.status === 'active' ? 'Click to pause' : 'Click to activate'}
-                                      className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-70 cursor-pointer ${statusColors[d.status]}`}
-                                    >
-                                      {d.status}
-                                    </button>
-                                  ) : (
-                                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors[d.status]}`}>
-                                      {d.status}
-                                    </span>
-                                  )}
-                                  {/* Reactivate button for auto-paused directions */}
-                                  {d.auto_paused && key === 'paused' && (
-                                    <button
-                                      onClick={() => reactivateDirection(d.id)}
-                                      className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
-                                    >
-                                      Reactivate
-                                    </button>
-                                  )}
-                                  {/* Mark Complete button for possibly-complete directions */}
-                                  {d.possibly_complete && key === 'active' && (
-                                    <button
-                                      onClick={() => markDirectionComplete(d.id)}
-                                      className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
-                                    >
-                                      Mark Complete
-                                    </button>
-                                  )}
-                                  {/* Cooldown badge */}
-                                  {key === 'active' && (() => {
-                                    const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
-                                    if (cooldownStatus === 'cooling') {
-                                      return (
-                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
-                                          Cooling down · {formatTimeRemaining(d.last_researched_at ?? '', cooldownMinutes)}
-                                        </span>
-                                      );
-                                    }
-                                    return (
-                                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 text-emerald-400 border-emerald-900/50">
-                                        Ready
-                                      </span>
-                                    );
-                                  })()}
-                                  <span className="text-[10px] text-neutral-600 ml-auto">
-                                    {new Date(d.added_at).toLocaleDateString()}
-                                  </span>
-                                  {(taskCounts[d.id] ?? 0) > 0 && (
-                                    <span className="text-[10px] text-neutral-500">
-                                      {taskCounts[d.id]} {taskCounts[d.id] === 1 ? 'task' : 'tasks'}
-                                    </span>
-                                  )}
-                                </div>
-                                {d.paths && d.paths.length > 0 && (
-                                  <div className="flex flex-wrap gap-1 mt-1.5">
-                                    {d.paths.map(p => (
-                                      <span key={p} className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 border border-neutral-700/60 text-neutral-400 font-mono">
-                                        {p}
-                                      </span>
-                                    ))}
-                                  </div>
-                                )}
-                                {d.notes && d.notes.length > 0 && (
-                                  <div className="mt-2 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
-                                    <div className="text-neutral-500 font-medium mb-1">Agent notes ({d.notes.length}):</div>
-                                    {d.notes.slice(-3).map((n, ni) => (
-                                      <div key={ni} className="text-neutral-500 leading-relaxed">• {n.text.slice(0, 120)}</div>
-                                    ))}
-                                  </div>
-                                )}
-                                {d.pending_update && (
-                                  <div className="mt-2 p-2 bg-amber-950/20 border border-amber-900/30 rounded text-xs">
-                                    <div className="text-amber-400 font-medium mb-1">Agent suggests update:</div>
-                                    {d.pending_update.suggested_text && d.pending_update.suggested_text !== d.text && (
-                                      <div className="text-neutral-300">Text: &ldquo;{d.pending_update.suggested_text.slice(0, 150)}&rdquo;</div>
-                                    )}
-                                    {d.pending_update.suggested_priority && d.pending_update.suggested_priority !== d.priority && (
-                                      <div className="text-neutral-400">Priority: {d.priority} → {d.pending_update.suggested_priority}</div>
-                                    )}
-                                    {d.pending_update.rationale && (
-                                      <div className="text-neutral-500 italic mt-1">{d.pending_update.rationale}</div>
-                                    )}
-                                    <div className="flex gap-2 mt-2">
-                                      <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
-                                      <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
-                                    </div>
-                                  </div>
-                                )}
-                                {d.research_history && d.research_history.length > 0 && (
-                                  <div className="mt-2">
-                                    <button
-                                      onClick={() => setHistoryOpenIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
-                                      className="flex items-center gap-1.5 w-full text-left group"
-                                    >
-                                      {historyOpenIds[d.id]
-                                        ? <ChevronDown className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
-                                        : <ChevronRight className="w-3 h-3 text-neutral-600 group-hover:text-neutral-400 transition-colors" />
-                                      }
-                                      <span className="text-[10px] font-medium text-neutral-500 uppercase tracking-wider group-hover:text-neutral-400 transition-colors flex-1">
-                                        Research History ({d.research_history.length})
-                                      </span>
-                                      {d.possibly_saturated && (
-                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 text-amber-400 border-amber-900/50">
-                                          possibly saturated
-                                        </span>
-                                      )}
-                                      {d.possibly_complete && (
-                                        <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 text-emerald-400 border-emerald-900/50">
-                                          possibly complete
-                                        </span>
-                                      )}
-                                    </button>
-                                    {historyOpenIds[d.id] && (
-                                      <div className="mt-1.5 space-y-2">
-                                        {[...d.research_history].reverse().slice(0, 5).map((entry, i) => (
-                                          <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-[10px]">
-                                            <div className="flex items-center justify-between mb-1">
-                                              <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>
-                                              <div className="flex items-center gap-1.5 text-neutral-600">
-                                                <span>{entry.tasks_created} created</span>
-                                                {entry.tasks_completed != null && (
-                                                  <span className="text-emerald-600">{entry.tasks_completed} done</span>
-                                                )}
-                                                {entry.tasks_failed != null && entry.tasks_failed > 0 && (
-                                                  <span className="text-red-600">{entry.tasks_failed} failed</span>
-                                                )}
-                                              </div>
-                                            </div>
-                                            {entry.finding_titles.length > 0 && (
-                                              <p className="text-neutral-500 leading-relaxed">
-                                                {entry.finding_titles.join(', ')}
-                                              </p>
-                                            )}
-                                            {entry.key_finding_descriptions.length > 0 && (
-                                              <div className="mt-1 space-y-0.5">
-                                                {entry.key_finding_descriptions.map((desc, j) => (
-                                                  <p key={j} className="text-neutral-600 leading-relaxed">
-                                                    {desc.length > 100 ? desc.slice(0, 100) + '…' : desc}
-                                                  </p>
-                                                ))}
-                                              </div>
-                                            )}
-                                            {entry.cycle_insights && entry.cycle_insights.length > 0 && (
-                                              <div className="mt-1 space-y-0.5 border-t border-neutral-800/60 pt-1">
-                                                {entry.cycle_insights.map((insight, j) => (
-                                                  <p key={j} className="text-blue-500/70 leading-relaxed italic">
-                                                    {insight}
-                                                  </p>
-                                                ))}
-                                              </div>
-                                            )}
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
+                          <DirectionCard
+                            key={d.id}
+                            direction={d}
+                            statusKey={key}
+                            activeItems={activeItems}
+                            editingId={form.editingId}
+                            editText={form.editText}
+                            editPriority={form.editPriority}
+                            editStatus={form.editStatus}
+                            editPathTags={form.editPathTags}
+                            editPathInput={form.editPathInput}
+                            setEditingId={form.setEditingId}
+                            setEditText={form.setEditText}
+                            setEditPriority={form.setEditPriority}
+                            setEditStatus={form.setEditStatus}
+                            setEditPathTags={form.setEditPathTags}
+                            setEditPathInput={form.setEditPathInput}
+                            startEdit={form.startEdit}
+                            updateDirection={updateDirection}
+                            approveProposal={approveProposal}
+                            rejectProposal={rejectProposal}
+                            reviveProposal={reviveProposal}
+                            reactivateDirection={reactivateDirection}
+                            markDirectionComplete={markDirectionComplete}
+                            quickToggleStatus={quickToggleStatus}
+                            deleteDirection={deleteDirection}
+                            applyDirectionUpdate={applyDirectionUpdate}
+                            dismissDirectionUpdate={dismissDirectionUpdate}
+                            triggerResearch={triggerResearch}
+                            reorderDirections={reorderDirections}
+                            taskCounts={taskCounts}
+                            cooldownMinutes={config.cooldownMinutes}
+                            researchingIds={researchingIds}
+                            researchSuccessIds={researchSuccessIds}
+                            forceConfirmId={forceConfirmId}
+                            setForceConfirmId={setForceConfirmId}
+                            historyOpenIds={historyOpenIds}
+                            setHistoryOpenIds={setHistoryOpenIds}
+                          />
                         ))}
                       </div>
                     )}
