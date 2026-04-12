@@ -108,12 +108,16 @@ async def github_oauth_authorize(
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
+    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "")
     url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&state={state}"
         f"&allow_signup=false"
     )
+    if orchestrator_url:
+        from urllib.parse import quote
+        url += f"&redirect_uri={quote(orchestrator_url + '/api/github/oauth/callback', safe='')}"
     return {"url": url}
 
 
@@ -158,10 +162,13 @@ async def github_oauth_callback(
         if not installations:
             return RedirectResponse(url=f"{admin_url}?github_error=no_installations")
 
-        # Use the first installation (most users have one)
+        # Store the first installation ID; collect all account names for display.
+        # Token generation uses dynamic App-level discovery per repo, so the
+        # stored installation_id is a fallback, not the authority.
         installation = installations[0]
         installation_id = str(installation["id"])
-        account_name = installation["account"]["login"]
+        all_account_names = [inst["account"]["login"] for inst in installations]
+        account_name = ", ".join(all_account_names)
 
         # Save to UserIntegration
         stmt = select(UserIntegration).where(UserIntegration.user_id == firebase_user_id)
@@ -181,7 +188,8 @@ async def github_oauth_callback(
         session.add(integration)
         await session.commit()
 
-        return RedirectResponse(url=f"{admin_url}?github_connected={account_name}")
+        display_name = all_account_names[0]
+        return RedirectResponse(url=f"{admin_url}?github_connected={display_name}")
 
     except Exception as e:
         logger.error(f"[GITHUB OAUTH] Error: {e}", exc_info=True)

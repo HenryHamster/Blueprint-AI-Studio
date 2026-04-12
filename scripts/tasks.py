@@ -656,11 +656,32 @@ def cmd_failures(args):
         ctx = t.get("context") or {}
         fc = ctx.get("failure_class", "")
 
-        # Determine root cause from patterns
+        # Determine root cause from patterns.
+        # Check error_logs first (more specific), then status message, then failure_class.
         cause = "UNKNOWN"
-        if "No heartbeat" in msg and "since prov" in msg:
+        if "API usage exhausted" in error or "API usage exhausted" in msg:
+            cause = "API_EXHAUSTED"
+        elif "spawn E2BIG" in error or "spawn E2BIG" in msg:
+            cause = "SPAWN_E2BIG"
+        elif "ZONE_RESOURCE_POOL_EXHAUSTED" in msg or "ZONE_RES" in msg:
+            cause = "ZONE_EXHAUSTED"
+        elif "VM provisioning failed" in msg and "400" in msg:
+            cause = "VM_PROVISION_ERROR"
+        elif "rollup PR creation failed" in msg:
+            cause = "ROLLUP_PR_FAILED"
+        elif "review not spawned (iteration cap)" in msg:
+            cause = "ITERATION_CAP"
+        elif "subtask(s) failed" in msg:
+            cause = "SUBTASK_FAILURES"
+        elif "Evaluation timeout" in msg or "did not complete within" in msg:
+            cause = "EVALUATION_TIMEOUT"
+        elif "Agent startup failed" in msg:
+            cause = "AGENT_STARTUP_FAILURE"
+        elif "No heartbeat" in msg and "since prov" in msg:
             cause = "HEARTBEAT_NEVER_STARTED"
-        elif "No heartbeat" in msg:
+        elif "Provision failed" in msg and "no GCP error" in msg:
+            cause = "AGENT_STARTUP_FAILURE"  # VM created but agent died
+        elif "Provision failed" in msg or "No heartbeat" in msg:
             cause = "HEARTBEAT_STARVATION"
         elif "git clone" in error or "git clone" in msg:
             cause = "GIT_CLONE_FAILED"
@@ -738,10 +759,66 @@ def cmd_failures(args):
         print(f"  ACTION [HEARTBEAT_NEVER_STARTED]: Agent process failed to start on VM.")
         print(f"         Check VM image, systemd journal, or Secret Manager provisioning.")
         print(f"         Requeue with: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["HEARTBEAT_NEVER_STARTED"]))
+    if "AGENT_STARTUP_FAILURE" in buckets:
+        accts = set()
+        for t in buckets["AGENT_STARTUP_FAILURE"]:
+            ba = (t.get("context") or {}).get("blacklisted_accounts") or []
+            accts.update(a[:8] for a in ba)
+            a = (t.get("context") or {}).get("max_plan_account_id", "")
+            if a:
+                accts.add(a[:8])
+        print(f"  ACTION [AGENT_STARTUP_FAILURE]: VM provisioned OK but agent crashed before claiming task.")
+        print(f"         Likely cause: API key exhausted, startup script error, or missing secrets.")
+        print(f"         Accounts involved: {', '.join(sorted(accts)) or '?'}")
+        serial = None
+        for t in buckets["AGENT_STARTUP_FAILURE"]:
+            s = (t.get("context") or {}).get("last_serial_log")
+            if s:
+                serial = s
+                break
+        if serial:
+            print(f"         Last serial log (tail): {_safe(serial, 200)}")
+        print(f"         Check: ops.py pool, ops.py accounts. Requeue: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["AGENT_STARTUP_FAILURE"]))
     if "HEARTBEAT_STARVATION" in buckets:
         print(f"  ACTION [HEARTBEAT_STARVATION]: Agents died mid-work (OOM? GCP preemption?).")
         print(f"         Check for concurrent failures = systemic event (deploy, zone issue).")
         print(f"         Requeue with: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["HEARTBEAT_STARVATION"]))
+    if "API_EXHAUSTED" in buckets:
+        accts = set()
+        for t in buckets["API_EXHAUSTED"]:
+            m = t.get("latest_status_message") or ""
+            if "acct:" in m:
+                accts.add(m.split("acct:")[1].split(")")[0].split(",")[0].strip()[:12])
+        print(f"  ACTION [API_EXHAUSTED]: Claude API usage exhausted on {len(accts) or '?'} account(s).")
+        print(f"         Check account billing/quotas. Disable exhausted accounts with: ops.py accounts --disable <id>")
+        print(f"         Requeue after quota reset: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["API_EXHAUSTED"]))
+    if "SPAWN_E2BIG" in buckets:
+        print(f"  ACTION [SPAWN_E2BIG]: Agent process args/env too large for execve.")
+        print(f"         Likely prompt or context payload exceeds OS limit. Check task payloads.")
+    if "ZONE_EXHAUSTED" in buckets:
+        zones = set()
+        for t in buckets["ZONE_EXHAUSTED"]:
+            m = t.get("latest_status_message") or ""
+            for tok in m.split():
+                if tok.startswith("us-") or tok.startswith("europe-") or tok.startswith("asia-"):
+                    zones.add(tok.rstrip(",.;:"))
+        print(f"  ACTION [ZONE_EXHAUSTED]: GCP zone(s) out of capacity: {', '.join(zones) or '?'}.")
+        print(f"         Requeue (will try another zone): tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["ZONE_EXHAUSTED"]))
+    if "VM_PROVISION_ERROR" in buckets:
+        print(f"  ACTION [VM_PROVISION_ERROR]: GCP Compute API returned 400 — bad request or quota issue.")
+        print(f"         Check: ops.py zones, ops.py pool. Requeue: tasks.py requeue " + " ".join(t["id"][:8] for t in buckets["VM_PROVISION_ERROR"]))
+    if "ROLLUP_PR_FAILED" in buckets:
+        print(f"  ACTION [ROLLUP_PR_FAILED]: Subtasks succeeded but rollup PR creation hit 500.")
+        print(f"         Likely merge conflicts or GitHub API issue. Try: tasks.py trigger-rollup <parent_id>")
+    if "ITERATION_CAP" in buckets:
+        print(f"  ACTION [ITERATION_CAP]: PR created but review/fix cycle hit iteration cap.")
+        print(f"         These PRs exist and may be mergeable. Review manually or raise caps.")
+    if "EVALUATION_TIMEOUT" in buckets:
+        print(f"  ACTION [EVALUATION_TIMEOUT]: Parent research tasks timed out waiting for children.")
+        print(f"         Children likely failed. Fix children first, then requeue parents.")
+    if "SUBTASK_FAILURES" in buckets:
+        print(f"  ACTION [SUBTASK_FAILURES]: Parent tasks failed because all children failed.")
+        print(f"         Diagnose child failures first. Parent IDs: " + " ".join(t["id"][:8] for t in buckets["SUBTASK_FAILURES"]))
 
 
 def cmd_health(args):

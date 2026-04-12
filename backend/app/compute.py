@@ -498,7 +498,29 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
     startup_script = f"""#!/bin/bash
     set -euo pipefail
-    trap 'echo "FATAL: Startup script failed at line $LINENO"; poweroff' ERR
+
+    # Report failures to the orchestrator before powering off — otherwise
+    # the reaper has no signal about WHY the VM died and blindly retries.
+    _report_failure() {{
+      local line=$1
+      echo "FATAL: Startup script failed at line $line"
+      # Best-effort: read agent token from env file if it exists, otherwise
+      # fall back to metadata-embedded values (Secret Manager may not have been reached yet).
+      local TOKEN=""
+      local ORCH="{ORCHESTRATOR_URL}"
+      if [ -f /etc/agent.env ]; then
+        TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
+      fi
+      if [ -n "$TOKEN" ] && [ -n "$ORCH" ]; then
+        curl -sf -X POST "$ORCH/api/agent/heartbeat" \
+          -H "Content-Type: application/json" \
+          -H "X-Agent-Token: $TOKEN" \
+          -d '{{"task_id": "{task_id}", "status_message": "STARTUP_FAILED at line '$line'"}}' \
+          --connect-timeout 5 --max-time 10 || true
+      fi
+      poweroff
+    }}
+    trap '_report_failure $LINENO' ERR
     echo "Starting Agent VM Initialization..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
@@ -515,9 +537,23 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     TTL_PID=$!
 
     # 2. Retrieve credentials from Secret Manager (never stored in instance metadata)
+    # Retry up to 3 times — IAM policy propagation can take up to 60s after secret creation.
     SECRET_VERSION="{secret_version_name}"
     echo "Fetching agent credentials from Secret Manager..."
-    CREDS="$(gcloud secrets versions access "$SECRET_VERSION")"
+    CREDS=""
+    for attempt in 1 2 3; do
+      if CREDS="$(gcloud secrets versions access "$SECRET_VERSION" 2>&1)"; then
+        echo "Secret fetched (attempt $attempt)"
+        break
+      fi
+      echo "Secret fetch failed (attempt $attempt): $CREDS"
+      if [ $attempt -lt 3 ]; then
+        sleep $((attempt * 10))
+      else
+        echo "FATAL: Secret Manager access failed after 3 attempts"
+        false  # Triggers ERR trap
+      fi
+    done
 
     # 3. Write static env vars first, then append secrets from Secret Manager
     cat <<'STATICENV' > /etc/agent.env
@@ -1077,6 +1113,33 @@ def any_zone_available() -> bool:
             if cooldown is None or now >= cooldown:
                 return True
     return False
+
+
+def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None:
+    """Record a zone failure from outside the provisioning path (e.g. reaper).
+
+    Called when a VM was provisioned in a zone but the agent died without
+    heartbeating, indicating the zone may have issues even though the GCP
+    API call succeeded.
+    """
+    with _zone_lock:
+        now_fail = datetime.now(timezone.utc)
+        entering_cooldown = zone not in _zone_failures
+        _zone_failures[zone] = now_fail
+        health = _zone_health.setdefault(zone, {})
+        health["last_failure"] = now_fail
+        old_cf = health.get("consecutive_failures", 0)
+        new_failure_count = old_cf + 1
+        health["consecutive_failures"] = new_failure_count
+        health["last_failure_reason"] = reason
+        cooldown_secs = _zone_cooldown_seconds(old_cf)
+        health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
+
+    if entering_cooldown:
+        logger.warning(
+            f"Zone {zone} entering cooldown (from reaper): {new_failure_count} consecutive failure(s), "
+            f"reason={reason}, cooldown={cooldown_secs}s"
+        )
 
 
 def soonest_zone_recovery() -> Optional[datetime]:

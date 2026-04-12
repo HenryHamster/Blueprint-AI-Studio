@@ -163,23 +163,32 @@ async def get_github_token_for_task(
     integration_stmt = select(UserIntegration).where(UserIntegration.user_id == project.user_id)
     integration = (await session.execute(integration_stmt)).scalars().first()
 
-    if integration and integration.github_installation_id:
-        token = await generate_installation_access_token(
-            integration.github_installation_id,
-            repositories=[project.github_repo]
-        )
-    elif integration and integration.github_pat:
-        token = await get_user_secret(integration.github_pat)
-    else:
-        # Fallback: discover GitHub App installation for this repo directly
-        # This handles admin-created tasks where no UserIntegration exists
-        from app.github import get_repo_installation_token
+    # Prefer dynamic App-level discovery — always finds the correct installation
+    # for this specific repo, even with multiple installations across orgs.
+    token = None
+    from app.github import get_repo_installation_token
+    try:
         token = await get_repo_installation_token(project.github_owner, project.github_repo)
-        if not token:
-            raise HTTPException(
-                status_code=400,
-                detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat."
+    except Exception:
+        logger.debug(f"[GITHUB] App-level discovery failed for {project.github_owner}/{project.github_repo}, trying fallbacks")
+
+    if not token and integration and integration.github_installation_id:
+        try:
+            token = await generate_installation_access_token(
+                integration.github_installation_id,
+                repositories=[project.github_repo]
             )
+        except Exception:
+            logger.debug(f"[GITHUB] Stored installation token failed for {project.github_owner}/{project.github_repo}")
+
+    if not token and integration and integration.github_pat:
+        token = await get_user_secret(integration.github_pat)
+
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat."
+        )
 
     # Track successful GitHub API interaction for passive health checking
     _shared_state.last_github_success = _utcnow()

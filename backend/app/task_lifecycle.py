@@ -889,6 +889,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"deleted out of order. Error: {branch_err}"
                     )
 
+                # Verify staging (head) branch exists — if it was deleted
+                # (e.g., by GitHub auto-delete after a prior PR merge, or
+                # by a cleanup race), fail clearly instead of hitting a
+                # confusing GitHub 422 "head invalid" error.
+                try:
+                    await get_branch_sha(gh_token, owner, repo, staging_branch)
+                except Exception as branch_err:
+                    raise Exception(
+                        f"Staging branch '{staging_branch}' does not exist — "
+                        f"cannot create rollup PR. Child work may have been "
+                        f"lost. Error: {branch_err}"
+                    )
+
                 is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
 
                 # Resume from prior crash — skip PR creation if already done
@@ -1084,11 +1097,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             parent.status = TaskStatus.FAILED
                             parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
-                            try:
-                                await delete_branch(gh_token, owner, repo, staging_branch)
-                                logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (fix spawn failed)")
-                            except Exception as cleanup_err:
-                                logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
+                            # NOTE: Do NOT delete staging_branch here — it contains
+                            # all merged child work and requeueing should be possible.
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
@@ -1103,16 +1113,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.status = TaskStatus.FAILED
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
-                        try:
-                            await delete_branch(gh_token, owner, repo, staging_branch)
-                            logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (review spawn failed)")
-                        except Exception as cleanup_err:
-                            logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
+                        # NOTE: Do NOT delete staging_branch here — it contains
+                        # all merged child work and requeueing should be possible.
             except Exception as e:
                 err_str = str(e).lower()
                 is_transient = any(kw in err_str for kw in [
                     "api.github.com", "502", "503", "connection", "timeout",
                     "rate limit", "ssl", "name resolution",
+                    # Staging branch may have been deleted by a race — retry
+                    # to allow recovery or manual intervention
+                    "staging branch", "validation failed",
                 ])
                 rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
                 if is_transient and rollup_retries <= 3:
@@ -1124,12 +1134,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)
                     parent.status = TaskStatus.FAILED
                     parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
-                    if gh_token:
-                        try:
-                            await delete_branch(gh_token, owner, repo, staging_branch)
-                            logger.info(f"[ROLLUP] Cleaned up staging branch {staging_branch} (rollup exception)")
-                        except Exception as cleanup_err:
-                            logger.warning(f"[ROLLUP] Failed to clean up staging branch {staging_branch}: {cleanup_err}")
+                    # NOTE: Do NOT delete staging_branch here — it contains all
+                    # merged child work. Preserving it allows manual recovery or
+                    # requeue. Branches are cleaned up by _cleanup_branches when
+                    # the parent eventually reaches a terminal state, or by the
+                    # stale branch cleanup service after 7 days.
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"

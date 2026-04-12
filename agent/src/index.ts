@@ -527,21 +527,30 @@ export async function pushAndCreatePR(
 }
 
 // ── Lint / Build Checks ─────────────────────────────────────────────────────
-/** Run lint/build checks on changed files. Throws with error details on failure. */
+/** Run lint/build checks on changed files. Throws with error details on failure.
+ *  Each blocking execFileSync starves the event loop (and heartbeat setInterval),
+ *  so we inject sendHeartbeatSync between operations to prevent the reaper from
+ *  killing us mid-check.  The taskId is read from process.env (set after claim). */
 export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
+  const taskId = process.env.TASK_ID || '';
   const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
   const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
   const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
   if (touchesFrontend) {
     sendLog(ws, 'Running frontend lint + build...\n');
+    sendHeartbeatSync(taskId, 'npm ci (admin-ui)...');
     execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
+    sendHeartbeatSync(taskId, 'eslint (admin-ui)...');
     execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
+    sendHeartbeatSync(taskId, 'npm run build (admin-ui)...');
     execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
     sendLog(ws, 'Frontend checks passed.\n');
   }
   if (touchesAgent) {
     sendLog(ws, 'Running agent type check...\n');
+    sendHeartbeatSync(taskId, 'npm ci (agent)...');
     execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_NPM_TIMEOUT });
+    sendHeartbeatSync(taskId, 'tsc --noEmit (agent)...');
     execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_TSC_TIMEOUT });
     sendLog(ws, 'Agent type check passed.\n');
   }
@@ -696,8 +705,10 @@ export async function testFixLoop(
     sendLog(ws, `Running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...\n`);
 
     const failures: string[] = [];
+    const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
       try {
+        sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
         execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {

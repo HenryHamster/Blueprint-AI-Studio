@@ -11,7 +11,7 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
-from app.compute import get_provision_error
+from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
@@ -229,7 +229,46 @@ async def reaper_service():
 
                     if is_provision_failure:
                         provision_failures += 1
-                        task.context = {**(task.context or {}), "provision_failures": provision_failures}
+                        prov_zone = (task.context or {}).get("provision_zone")
+                        failed_acct = (task.context or {}).get("max_plan_account_id")
+                        if prov_zone:
+                            # VM was created (GCP API succeeded) but agent never claimed.
+                            # Capture serial logs before the VM is deleted — this is the
+                            # only way to diagnose agent startup crashes.
+                            serial_log = None
+                            vm_id = fresh_task.vm_instance_id
+                            if vm_id:
+                                try:
+                                    serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
+                                    if serial_log:
+                                        logger.warning(
+                                            f"[REAPER] Serial log for dying agent {vm_id} "
+                                            f"(task {task.id}):\n{serial_log[-500:]}"
+                                        )
+                                except Exception:
+                                    pass
+
+                            # Blacklist the account so retry uses a different one.
+                            blacklisted = list((task.context or {}).get("blacklisted_accounts") or [])
+                            if failed_acct and failed_acct not in blacklisted:
+                                blacklisted.append(failed_acct)
+                                logger.warning(
+                                    f"[REAPER] Agent startup failure on {prov_zone} acct={failed_acct[:8]} "
+                                    f"— blacklisting account for task {task.id}"
+                                )
+                            new_ctx = {
+                                **(task.context or {}),
+                                "provision_failures": provision_failures,
+                                "blacklisted_accounts": blacklisted or None,
+                            }
+                            if serial_log:
+                                new_ctx["last_serial_log"] = serial_log[-500:]
+                            task.context = new_ctx
+                            record_zone_failure(prov_zone, reason="AGENT_STARTUP_FAILURE")
+                        else:
+                            # No provision_zone — VM may never have been created.
+                            # Record zone failure if we can determine the zone.
+                            task.context = {**(task.context or {}), "provision_failures": provision_failures}
                         can_retry = provision_failures < max_provision_retries
                         if not can_retry:
                             logger.error(f"[REAPER] Task {task.id} provision failed {provision_failures} times — giving up")
@@ -291,10 +330,19 @@ async def reaper_service():
                             acct_id = ctx.get("max_plan_account_id", "no account")
                             gcp_error = get_provision_error(task.vm_instance_id or "") or "no GCP error captured"
                             gcp_error_short = gcp_error[:200]
+                            # Distinguish: VM created but agent died vs. GCP API failure
+                            if provision_zone and provision_zone != "unknown zone":
+                                label = "Agent startup failed"
+                                detail = f"VM created in {provision_zone} but agent never claimed task"
+                                if blacklisted_accounts:
+                                    detail += f" (blacklisted {len(blacklisted_accounts)} account(s))"
+                            else:
+                                label = "Provision failed"
+                                detail = f"GCP error: {gcp_error_short}"
                             task.latest_status_message = (
-                                f"Provision failed {provision_failures}x — "
+                                f"{label} {provision_failures}x — "
                                 f"zone: {provision_zone}, acct: {acct_id}. "
-                                f"GCP error: {gcp_error_short}. "
+                                f"{detail}. "
                                 f"Last reap: {reap_reason}"
                             )
                         else:
