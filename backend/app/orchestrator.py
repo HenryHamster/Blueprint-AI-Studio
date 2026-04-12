@@ -1072,9 +1072,45 @@ async def orchestrator_worker():
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
                             ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
                             ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
+                            # Peek at CI state for this PR's head SHA so the fix task's prompt
+                            # can describe BOTH blockers (conflicts + CI) if they coexist.
+                            # The mergeable state can flip between now and when the fix agent
+                            # runs — so we also tell the agent to re-verify before acting.
+                            ci_preview_section = ""
+                            try:
+                                _conflict_head_sha = pr_data.get("head", {}).get("sha", "")
+                                if _conflict_head_sha:
+                                    _conflict_ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, _conflict_head_sha)
+                                    if _conflict_ci_result.get("status") == "completed":
+                                        _conflict_failed_logs = _conflict_ci_result.get("failed_logs", "")
+                                        if _conflict_failed_logs:
+                                            ci_preview_section = (
+                                                f"\n\nAdditionally, CI checks are currently failing on this PR head "
+                                                f"(the conflict is blocking a re-run, but these failures pre-date the conflict "
+                                                f"or exist independently):\n```\n{_conflict_failed_logs[:1500]}\n```\n"
+                                                f"After resolving conflicts, fix the CI failures above in the same push."
+                                            )
+                            except Exception as _ci_preview_exc:
+                                logger.debug(f"[CI] conflict-fix CI preview fetch failed for PR #{ci_pr_number}: {_ci_preview_exc}")
                             fix_prompt = (
-                                f"PR #{ci_pr_number} has merge conflicts and CI cannot run.\n\n"
-                                f"Rebase the branch onto {ci_base} and resolve all conflicts."
+                                f"PR #{ci_pr_number} is currently blocking the pipeline.\n\n"
+                                f"Orchestrator observation at spawn time: GitHub reported the PR as UNMERGEABLE "
+                                f"(merge conflicts against `{ci_base}`).\n\n"
+                                f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
+                                f"between spawn and execution (a concurrent rollup may have resolved the conflict, "
+                                f"or new commits may have reintroduced one). After cloning:\n"
+                                f"  1. Attempt `git rebase origin/{ci_base}` — note whether it succeeds cleanly.\n"
+                                f"  2. Check `git status` and `git diff --name-only --diff-filter=U` for unmerged paths.\n"
+                                f"  3. If neither shows conflicts, the premise is stale — re-query the PR's "
+                                f"current mergeable state and failing check runs via the GitHub API "
+                                f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
+                                f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
+                                f"and fix whatever is actually blocking the merge now.\n\n"
+                                f"Primary action: rebase onto `{ci_base}` and resolve any conflicts."
+                                f"{ci_preview_section}\n\n"
+                                f"Before declaring done: ensure (a) no conflict markers remain in any file, "
+                                f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
+                                f"every fix — do not leave uncommitted changes."
                             )
                             fix_task = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
@@ -1203,9 +1239,20 @@ async def orchestrator_worker():
                             await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
                                 f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```")
                             ci_fix_prompt = (
-                                f"CI checks failed on PR #{ci_pr_number} (code review already approved).\n\n"
-                                f"CI errors:\n{ci_errors}\n\n"
-                                f"Fix only the build/lint/test errors — the review is already approved."
+                                f"PR #{ci_pr_number} is blocked by failing CI checks (code review already approved).\n\n"
+                                f"IMPORTANT — verify current state before acting. Between when this task was spawned and "
+                                f"when you run, the PR's mergeable state or check-run results may have changed. After cloning:\n"
+                                f"  1. Attempt `git rebase origin/{ci_base}` — if conflicts appear, resolve them first.\n"
+                                f"  2. Inspect the failing checks via the GitHub API "
+                                f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
+                                f"https://api.github.com/repos/{ci_owner}/{ci_repo}/commits/$(git rev-parse HEAD)/check-runs`) "
+                                f"to confirm which checks are still failing on the latest head.\n\n"
+                                f"CI errors captured at spawn time:\n{ci_errors}\n\n"
+                                f"Focus: fix the build/lint/test errors — the code review is already approved, "
+                                f"don't re-architect unrelated code.\n\n"
+                                f"Before declaring done: ensure (a) `git rebase origin/{ci_base}` succeeds cleanly with no "
+                                f"remaining conflict markers, (b) local lint/type/test suites pass on the changed files, "
+                                f"and (c) every fix is committed."
                             )
                             fix_task = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,

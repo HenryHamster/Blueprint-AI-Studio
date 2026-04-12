@@ -53,7 +53,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
-  'fix': 'You are fixing issues from a code review. Read ALL review feedback carefully and address every point. Run the relevant test suite to confirm your fix does not introduce regressions. Verify each feedback item is resolved before committing.',
+  'fix': 'You are fixing issues from a code review or a pipeline failure (merge conflict or failing CI). Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state over the original description. Before declaring done, verify BOTH (a) the branch rebases cleanly onto the base with zero remaining conflict markers anywhere in the tree, AND (b) local lint/type/test suites pass on the changed files. Run the relevant test suite to confirm your fix does not introduce regressions.',
   'docs': 'Read the existing README and documentation files first. Understand the current documentation structure before making changes.',
   'deps': 'Check for breaking changes in major version bumps. Run the full test suite after updating to verify compatibility.',
   'refactor': 'Run the full test suite BEFORE and AFTER changes. Zero test regressions allowed. Do not change external behavior.',
@@ -67,31 +67,31 @@ export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code sear
 export function writePlaybookHelper(taskId: string): void {
   const helperScript = `#!/bin/bash
 OP="\${1:?Usage: playbook get|set|list|delete <key> [content]}"
-KEY="\$2"
-VALUE="\$3"
+KEY="$2"
+VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
 
-if [ "\$OP" = "get" ]; then
-  printf '{"task_id":"%s","op":"get"}' "\$TASK" | \\
-    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
-elif [ "\$OP" = "set" ]; then
-  [ -z "\$KEY" ] || [ -z "\$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
-  jq -n --arg tid "\$TASK" --arg k "\$KEY" --arg v "\$VALUE" \\
+if [ "$OP" = "get" ]; then
+  printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
+    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+elif [ "$OP" = "set" ]; then
+  [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
+  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" \\
     '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
-    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
-elif [ "\$OP" = "delete" ]; then
-  jq -n --arg tid "\$TASK" --arg k "\$KEY" \\
+    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+elif [ "$OP" = "delete" ]; then
+  jq -n --arg tid "$TASK" --arg k "$KEY" \\
     '{task_id: $tid, op: "delete", key: $k}' | \\
-    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
-elif [ "\$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "\$TASK" | \\
-    curl -f -sS --max-time 30 -X POST "\$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+elif [ "$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
+    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 fi
 echo ""
 `;
@@ -112,22 +112,22 @@ TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
 CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
 
-if [ "\$OP" = "send" ]; then
+if [ "$OP" = "send" ]; then
   CONTENT="\${2:?send requires '<content>'}"
   MSG_TYPE="\${3:-NOTE}"
-  jq -n --arg tid "\$TASK" --arg t "\$MSG_TYPE" --arg c "\$CONTENT" \\
+  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \\
     '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
-elif [ "\$OP" = "resolve" ]; then
+    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
-  jq -n --arg tid "\$TASK" --arg mid "\$MSG_ID" --arg r "\$RESOLUTION" \\
+  jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
     '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" --data-binary @-
+    curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 else
-  echo "Unknown op: \$OP. Use send or resolve." >&2; exit 1
+  echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
 echo ""
 `;
@@ -451,7 +451,7 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
       const faPct = Math.round((fasr.overall as number) * 100);
       const faTrend = fasr.trend as string | undefined;
       const faTrendStr = faTrend ? ` (${faTrend})` : '';
-      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${fasr.sample_size}.`);
+      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${String(fasr.sample_size)}.`);
     }
 
     const failureDist = pipelineHealth.failure_distribution as Record<string, number> | undefined;
@@ -468,7 +468,7 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
         .map((d) => {
           const did = strVal(d.direction_id).slice(-8);
           const sat = d.possibly_saturated ? ', saturated' : '';
-          return `d-${did} merge rate ${d.merge_rate} (${d.cycles} cycles${sat})`;
+          return `d-${did} merge rate ${String(d.merge_rate)} (${String(d.cycles)} cycles${sat})`;
         })
         .join(', ');
       parts.push(`Direction ROI: ${dirStr}.`);

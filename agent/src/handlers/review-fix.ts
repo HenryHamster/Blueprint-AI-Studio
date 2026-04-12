@@ -276,6 +276,77 @@ export async function handleFix(
     } catch { /* no markers found, good */ }
   }
 
+  // Stale-premise detection: the orchestrator spawned this task based on a snapshot
+  // of PR state that can be minutes to hours old. If the prompt claims "merge conflicts"
+  // but our rebase came up clean and no markers are present, re-query GitHub directly
+  // and pivot Claude's plan to whatever is actually blocking the PR now.
+  const promptMentionsConflicts = /merge conflicts?|conflict markers|rebase.*resolve/i.test(prompt);
+  if (promptMentionsConflicts && !hasConflicts) {
+    sendLog(ws, `Prompt claims conflicts but rebase was clean — verifying PR state against GitHub...\n`);
+    let currentMergeable: boolean | null | undefined;
+    let failedChecks: Array<{ name: string; conclusion: string; url: string }> = [];
+    try {
+      const prJson = execFileSync('curl', [
+        '-sS', '--fail-with-body', '--max-time', '20',
+        '-H', `Authorization: Bearer ${ghToken}`,
+        '-H', 'Accept: application/vnd.github+json',
+        `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+      ], { encoding: 'utf-8', timeout: 25_000 });
+      const prObj = JSON.parse(prJson) as { mergeable?: boolean | null; head?: { sha?: string } };
+      currentMergeable = prObj.mergeable;
+      const headSha = prObj.head?.sha;
+      if (headSha) {
+        const checksJson = execFileSync('curl', [
+          '-sS', '--fail-with-body', '--max-time', '20',
+          '-H', `Authorization: Bearer ${ghToken}`,
+          '-H', 'Accept: application/vnd.github+json',
+          `https://api.github.com/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`,
+        ], { encoding: 'utf-8', timeout: 25_000 });
+        const checksObj = JSON.parse(checksJson) as { check_runs?: Array<{ name?: string; conclusion?: string; html_url?: string; details_url?: string }> };
+        failedChecks = (checksObj.check_runs || [])
+          .filter(c => c.conclusion === 'failure' || c.conclusion === 'timed_out' || c.conclusion === 'cancelled')
+          .map(c => ({ name: c.name || '(unnamed)', conclusion: c.conclusion || '', url: c.html_url || c.details_url || '' }));
+      }
+      sendLog(ws, `PR #${prNumber}: mergeable=${String(currentMergeable)}, failed_checks=${failedChecks.length}\n`);
+    } catch (e) {
+      sendLog(ws, `Could not fetch current PR state (will proceed with original prompt): ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+
+    if (currentMergeable === true && failedChecks.length > 0) {
+      const failedList = failedChecks.map(c => `  - ${c.name} (${c.conclusion})`).join('\n');
+      enrichedPrompt =
+        `## Stale-premise notice\n` +
+        `This task was spawned because the orchestrator observed PR #${prNumber} as unmergeable, but the branch now ` +
+        `rebases cleanly onto ${baseBranch}. The PR's current blocker is failing CI, not merge conflicts:\n\n` +
+        `${failedList}\n\n` +
+        `Investigate each failing check's logs (use the GitHub API or the details URL above) and fix the underlying ` +
+        `build/lint/test errors. Do NOT hunt for conflict markers — there are none.\n\n` +
+        basePrompt;
+    } else if (currentMergeable === true && failedChecks.length === 0) {
+      // No conflicts, no CI failures. Task is obsolete. Complete cleanly without running Claude.
+      sendLog(ws, `PR #${prNumber} has no conflicts and no failing checks — task is obsolete, completing without changes.\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'COMPLETED',
+        logs: `Task was spawned to fix merge conflicts on PR #${prNumber}, but the branch now rebases cleanly and no CI checks are failing. No action taken (stale premise).`,
+      });
+      return;
+    } else if (currentMergeable === false) {
+      // GitHub still reports unmergeable even though our rebase was clean —
+      // usually means GitHub is mid-recompute. Tell Claude explicitly.
+      enrichedPrompt =
+        `## Stale-premise notice\n` +
+        `The local rebase completed cleanly, but GitHub still reports PR #${prNumber} as unmergeable ` +
+        `(mergeable=false). GitHub may still be recomputing, or the conflict may lie in a file outside the ` +
+        `diff you'd normally check. Before assuming there's nothing to do:\n` +
+        `  1. Run \`git grep '${'<'.repeat(7)}'\` across the whole tree.\n` +
+        `  2. Inspect \`git diff origin/${baseBranch}...HEAD\` for anything that touches files recently refactored upstream.\n` +
+        `  3. If nothing surfaces, push the clean rebase — GitHub will reassess on push.\n\n` +
+        basePrompt;
+    }
+    // If currentMergeable is null/undefined (couldn't query), leave basePrompt alone.
+  }
+
   // Prepend parent context if this fix agent is part of a larger initiative
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {
