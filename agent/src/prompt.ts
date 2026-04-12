@@ -181,7 +181,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   const hasData = Object.keys(projectCtx).some(k => {
     const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
   });
-  return hasData ? formatProjectContext(projectCtx) + '\n\n' : '';
+  const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
+  const payload = payloads[0] as Record<string, unknown> | undefined;
+  const taskType = payload ? strVal(payload.type) : '';
+  return hasData ? formatProjectContext(projectCtx, taskType) + '\n\n' : '';
 }
 
 export function buildFileTree(ws: WebSocket | null): string {
@@ -309,7 +312,7 @@ function parseResearchSummary(raw: string): string {
 }
 
 // ── Shared: Format project_context into a markdown section ────────────────
-export function formatProjectContext(ctx: Record<string, unknown>): string {
+export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''): string {
   const CONTEXT_BUDGET = 8000;
 
   const header = [
@@ -451,7 +454,13 @@ export function formatProjectContext(ctx: Record<string, unknown>): string {
       const faPct = Math.round((fasr.overall as number) * 100);
       const faTrend = fasr.trend as string | undefined;
       const faTrendStr = faTrend ? ` (${faTrend})` : '';
-      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${String(fasr.sample_size)}.`);
+      const byType = fasr.by_type as Record<string, number> | undefined;
+      let perTypeSuffix = '';
+      if (taskType && byType && byType[taskType] !== undefined) {
+        const typePct = Math.round(byType[taskType] * 100);
+        perTypeSuffix = ` Your task type (${taskType}): ${typePct}%.`;
+      }
+      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${String(fasr.sample_size)}.${perTypeSuffix}`);
     }
 
     const failureDist = pipelineHealth.failure_distribution as Record<string, number> | undefined;

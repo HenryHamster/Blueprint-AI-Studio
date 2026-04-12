@@ -1832,11 +1832,17 @@ async def update_design_doc(
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
 
+_VALID_TASK_TYPES = frozenset({
+    "create", "fix", "refactor", "qa", "migrate", "deps",
+    "smoketest", "research", "review", "plan", "debug",
+})
+
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
     op: str  # "get", "set", "delete", "list"
     key: Optional[str] = None  # alphanumeric + hyphens, max 50 chars
     value: Optional[str] = None  # plain text, max 2KB
+    applicable_types: Optional[List[str]] = None  # task types this entry applies to; None = all types
 
 _PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
 
@@ -1905,14 +1911,21 @@ async def update_playbook(
             raise HTTPException(status_code=400, detail="value is required for set")
         if len(payload.value) > 2048:
             raise HTTPException(status_code=400, detail=f"Value too large ({len(payload.value)} bytes, max 2KB)")
+        if payload.applicable_types is not None:
+            invalid = [t for t in payload.applicable_types if t not in _VALID_TASK_TYPES]
+            if invalid:
+                raise HTTPException(status_code=400, detail=f"Invalid task type(s): {invalid}. Must be one of: {sorted(_VALID_TASK_TYPES)}")
         playbook_key = f"playbook/{key}"
         existing = doc.get(playbook_key, {})
-        doc[playbook_key] = {
+        entry: dict = {
             "content": payload.value,
             "source_task_id": str(task.id),
             "updated_at": _utcnow().isoformat(),
             "confirmed_count": existing.get("confirmed_count", 0),
         }
+        if payload.applicable_types is not None:
+            entry["applicable_types"] = payload.applicable_types
+        doc[playbook_key] = entry
         # Size check: all playbook/* keys combined max 30KB
         playbook_total = sum(
             len(_json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")

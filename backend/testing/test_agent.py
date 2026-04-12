@@ -728,3 +728,133 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
     ctx = task.context or {}
     assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncClient, db_session, mocker):
+    """Non-research task claim includes pipeline_health in project_context."""
+    project = Project(name="Pipeline Health Test", user_id="test-user-ph")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "build feature"}],
+        vm_instance_id="agent-vm-ph-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_health = {
+        "success_rate": 0.9,
+        "trend": "improving",
+        "first_attempt_success_rate": {
+            "overall": 0.85,
+            "trend": "stable",
+            "sample_size": 20,
+            "by_type": {"create": 0.85, "fix": 0.62},
+        },
+        "failure_distribution": {},
+        "direction_stats": [],
+    }
+    mocker.patch(
+        "app.routers.admin_analytics.compute_pipeline_health_summary",
+        return_value=fake_health,
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-ph-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "project_context" in data
+    assert data["project_context"]["pipeline_health"] is not None
+    assert data["project_context"]["pipeline_health"]["first_attempt_success_rate"]["by_type"]["create"] == 0.85
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_session):
+    """
+    Claim endpoint filters playbook entries by applicable_types:
+    - entry with applicable_types=["create","fix"] is excluded for 'research' tasks
+    - entry with applicable_types=None is included for all task types
+    """
+    project = Project(name="Playbook Filter Test", user_id="test-user-pbf")
+    project.design_doc = {
+        "playbook/write-only": {
+            "content": "only for write tasks",
+            "applicable_types": ["create", "fix"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+        "playbook/universal": {
+            "content": "shown to all types",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "investigate something"}],
+        vm_instance_id="agent-vm-pbf-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbf-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    # Entry restricted to create/fix must be excluded for research task
+    assert "write-only" not in data["playbook"]
+    # Entry with no applicable_types must be included for all task types
+    assert "universal" in data["playbook"]
+    assert data["playbook"]["universal"] == "shown to all types"
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_includes_entry_when_type_matches(client: AsyncClient, db_session):
+    """
+    Claim endpoint includes playbook entries when task type is in applicable_types.
+    """
+    project = Project(name="Playbook Match Test", user_id="test-user-pbm")
+    project.design_doc = {
+        "playbook/build-hint": {
+            "content": "build instruction",
+            "applicable_types": ["create", "fix", "refactor"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "fix a bug"}],
+        vm_instance_id="agent-vm-pbm-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbm-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    assert "build-hint" in data["playbook"]
+    assert data["playbook"]["build-hint"] == "build instruction"

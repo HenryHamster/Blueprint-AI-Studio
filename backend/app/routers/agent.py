@@ -461,14 +461,13 @@ async def claim_task(
                     "task_type": (sib.first_payload).get("type", ""),
                 })
 
-        # Pipeline health summary for research agents
+        # Pipeline health summary for all task types
         pipeline_health = None
-        if task_type == "research":
-            try:
-                from app.routers.admin_analytics import compute_pipeline_health_summary
-                pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
-            except Exception:
-                pass  # non-critical — don't fail the request
+        try:
+            from app.routers.admin_analytics import compute_pipeline_health_summary
+            pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
+        except Exception:
+            pass  # non-critical — don't fail the request
 
         response["project_context"] = {
             "active_tasks": active_tasks,
@@ -484,9 +483,13 @@ async def claim_task(
     # Inject playbook for ALL task types (outside the project_context gate)
     project_for_playbook = await session.get(Project, task.project_id)
     if project_for_playbook and project_for_playbook.design_doc:
+        task_type = (task.first_payload).get("type", "create")
         playbook_entries = {}
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
+                applicable_types = v.get("applicable_types")
+                if applicable_types is not None and task_type not in applicable_types:
+                    continue
                 short_key = k[len("playbook/"):]
                 playbook_entries[short_key] = v.get("content", "")
         if playbook_entries:

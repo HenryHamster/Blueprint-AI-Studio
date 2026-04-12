@@ -2,7 +2,7 @@
 import re
 import uuid
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -38,61 +38,97 @@ class MessageResolve(BaseModel):
 class AdminPlaybookSet(BaseModel):
     key: str = Field(..., description="Playbook key: alphanumeric + hyphens, max 50 chars")
     value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
+    applicable_types: Optional[List[str]] = Field(None, description="Task types this entry applies to; None = shown to all types")
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _ADMIN_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
 
-_SEED_ENTRIES: Dict[str, str] = {
-    "build-backend": (
-        "Run backend tests with: `bash scripts/test-backend.sh` (builds Docker, runs full suite). "
-        "Specific file: `bash scripts/test-backend.sh testing/test_file.py`. "
-        "Standalone (no DB): `bash scripts/test-backend.sh --standalone`. "
-        "Do NOT use pytest directly."
-    ),
-    "build-frontend": (
-        "Frontend validation: `cd admin-ui && npm run build && npx eslint .`. "
-        "Both build and lint must pass."
-    ),
-    "build-agent": (
-        "Agent type checking: `cd agent && npx tsc --noEmit`. "
-        "No runtime tests — type checking only."
-    ),
-    "file-restrictions": (
-        "NEVER modify: .github/workflows/ (CI managed separately, GitHub App token can't push), "
-        "backend/alembic/ migrations (generated, not hand-edited), "
-        "scripts/ (unless explicitly asked)."
-    ),
-    "main-py-policy": (
-        "main.py is being decomposed. Do NOT add new functions. "
-        "Use extracted modules: task_completion.py (completion handlers), "
-        "task_lifecycle.py (pipeline/lifecycle), max_plan_pool.py (account pool). "
-        "A regression guard in test_invariants.py enforces the function count cap."
-    ),
-    "task-accessor": (
-        "Use task.first_payload for the first payload element. "
-        "Never use (task.payloads or [{}])[0]."
-    ),
-    "admin-auth": (
-        "New admin endpoints require @require_project_access or @require_role decorators. "
-        "Follow the pattern in admin.py using _get_user_project_with_role()."
-    ),
-    "import-from-source": (
-        "Import from extracted modules directly, not via main.py re-exports. "
-        "task_completion.py has completion handlers, task_lifecycle.py has pipeline/review/merge logic, "
-        "max_plan_pool.py has account pooling."
-    ),
-    "test-diagnosis": (
-        "When fixing test failures, FIRST diagnose: is the failure in the CODE or the TEST? "
-        "Don't delete or skip tests to make them pass. "
-        "Only remove tests when the tested functionality itself was removed."
-    ),
-    "circular-dep-warning": (
-        "main.py and orchestrator.py have a circular dependency. "
-        "Orchestrator imports completion handlers from main, main imports orchestrator state. "
-        "Use extracted modules to avoid deepening this cycle."
-    ),
+_VALID_TASK_TYPES = frozenset({
+    "create", "fix", "refactor", "qa", "migrate", "deps",
+    "smoketest", "research", "review", "plan", "debug",
+})
+
+_SEED_ENTRIES: Dict[str, dict] = {
+    "build-backend": {
+        "content": (
+            "Run backend tests with: `bash scripts/test-backend.sh` (builds Docker, runs full suite). "
+            "Specific file: `bash scripts/test-backend.sh testing/test_file.py`. "
+            "Standalone (no DB): `bash scripts/test-backend.sh --standalone`. "
+            "Do NOT use pytest directly."
+        ),
+        "applicable_types": ["create", "fix", "refactor", "qa", "migrate", "deps", "smoketest"],
+    },
+    "build-frontend": {
+        "content": (
+            "Frontend validation: `cd admin-ui && npm run build && npx eslint .`. "
+            "Both build and lint must pass."
+        ),
+        "applicable_types": ["create", "fix", "refactor", "qa", "deps"],
+    },
+    "build-agent": {
+        "content": (
+            "Agent type checking: `cd agent && npx tsc --noEmit`. "
+            "No runtime tests — type checking only."
+        ),
+        "applicable_types": ["create", "fix", "refactor"],
+    },
+    "file-restrictions": {
+        "content": (
+            "NEVER modify: .github/workflows/ (CI managed separately, GitHub App token can't push), "
+            "backend/alembic/ migrations (generated, not hand-edited), "
+            "scripts/ (unless explicitly asked)."
+        ),
+        "applicable_types": None,
+    },
+    "main-py-policy": {
+        "content": (
+            "main.py is being decomposed. Do NOT add new functions. "
+            "Use extracted modules: task_completion.py (completion handlers), "
+            "task_lifecycle.py (pipeline/lifecycle), max_plan_pool.py (account pool). "
+            "A regression guard in test_invariants.py enforces the function count cap."
+        ),
+        "applicable_types": ["create", "fix", "refactor"],
+    },
+    "task-accessor": {
+        "content": (
+            "Use task.first_payload for the first payload element. "
+            "Never use (task.payloads or [{}])[0]."
+        ),
+        "applicable_types": ["create", "fix", "refactor", "review"],
+    },
+    "admin-auth": {
+        "content": (
+            "New admin endpoints require @require_project_access or @require_role decorators. "
+            "Follow the pattern in admin.py using _get_user_project_with_role()."
+        ),
+        "applicable_types": ["create", "fix"],
+    },
+    "import-from-source": {
+        "content": (
+            "Import from extracted modules directly, not via main.py re-exports. "
+            "task_completion.py has completion handlers, task_lifecycle.py has pipeline/review/merge logic, "
+            "max_plan_pool.py has account pooling."
+        ),
+        "applicable_types": ["create", "fix", "refactor"],
+    },
+    "test-diagnosis": {
+        "content": (
+            "When fixing test failures, FIRST diagnose: is the failure in the CODE or the TEST? "
+            "Don't delete or skip tests to make them pass. "
+            "Only remove tests when the tested functionality itself was removed."
+        ),
+        "applicable_types": ["fix", "qa", "debug"],
+    },
+    "circular-dep-warning": {
+        "content": (
+            "main.py and orchestrator.py have a circular dependency. "
+            "Orchestrator imports completion handlers from main, main imports orchestrator state. "
+            "Use extracted modules to avoid deepening this cycle."
+        ),
+        "applicable_types": ["create", "fix", "refactor"],
+    },
 }
 
 
@@ -319,6 +355,7 @@ async def admin_playbook_list(
                 "source_task_id": v.get("source_task_id"),
                 "updated_at": v.get("updated_at", ""),
                 "confirmed_count": v.get("confirmed_count", 0),
+                "applicable_types": v.get("applicable_types"),
             }
     return {"entries": entries, "count": len(entries)}
 
@@ -346,6 +383,13 @@ async def admin_playbook_set(
             status_code=400,
             detail=f"Value too large ({len(payload.value)} bytes, max 2048)",
         )
+    if payload.applicable_types is not None:
+        invalid = [t for t in payload.applicable_types if t not in _VALID_TASK_TYPES]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid task type(s): {invalid}. Must be one of: {sorted(_VALID_TASK_TYPES)}",
+            )
 
     result = await session.execute(
         select(Project).where(Project.id == project_id).with_for_update()
@@ -355,12 +399,15 @@ async def admin_playbook_set(
     doc = dict(project.design_doc or {})
     playbook_key = f"playbook/{key}"
     existing = doc.get(playbook_key, {})
-    doc[playbook_key] = {
+    new_entry: dict = {
         "content": payload.value,
         "source_task_id": None,
         "updated_at": _utcnow().isoformat(),
         "confirmed_count": existing.get("confirmed_count", 0) if isinstance(existing, dict) else 0,
     }
+    if payload.applicable_types is not None:
+        new_entry["applicable_types"] = payload.applicable_types
+    doc[playbook_key] = new_entry
 
     playbook_total = sum(
         len(json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
@@ -443,17 +490,20 @@ async def admin_playbook_seed(
     added = []
     skipped = []
 
-    for key, value in _SEED_ENTRIES.items():
+    for key, entry in _SEED_ENTRIES.items():
         playbook_key = f"playbook/{key}"
         if playbook_key in doc:
             skipped.append(key)
             continue
-        doc[playbook_key] = {
-            "content": value,
+        seed_entry: dict = {
+            "content": entry["content"],
             "source_task_id": None,
             "updated_at": _utcnow().isoformat(),
             "confirmed_count": 0,
         }
+        if entry.get("applicable_types") is not None:
+            seed_entry["applicable_types"] = entry["applicable_types"]
+        doc[playbook_key] = seed_entry
         added.append(key)
 
     if added:
