@@ -49,6 +49,7 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
+    "direction_auto_recovery_hours": 48,
     "autonomous_research_wave_size": 3,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "max_active_directions": 5,

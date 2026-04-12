@@ -1564,9 +1564,27 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                     if did:
                         busy_direction_ids.add(did)
 
+    directions_modified = False
+    # Auto-recovery: reactivate auto-paused directions past cooldown
+    recovery_hours = _runtime_config.get("direction_auto_recovery_hours", 48)
+    for d in (project.directions or []):
+        if d.get("status") != "paused" or not d.get("auto_paused") or not d.get("paused_at"):
+            continue
+        hours = (_utcnow() - datetime.fromisoformat(d["paused_at"])).total_seconds() / 3600
+        if hours < recovery_hours:
+            continue
+        if _check_direction_health(d) is None:
+            d["status"] = "active"
+            for k in ("auto_paused", "paused_reason", "paused_at"):
+                d.pop(k, None)
+            logger.info(f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown")
+            directions_modified = True
+        else:
+            d["paused_at"] = _utcnow().isoformat()
+            logger.info(f"[AUTONOMOUS] Direction {d.get('id')} still unhealthy, extending pause")
+            directions_modified = True
     active_directions = []
     auto_paused_any = False
-    directions_modified = False
     for d in (project.directions or []):
         if d.get("status") != "active":
             continue

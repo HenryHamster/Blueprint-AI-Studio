@@ -1443,3 +1443,157 @@ class TestComputeMomentumFactor:
     def test_momentum_factor_no_history_key(self):
         """Missing research_history key → 1.0."""
         assert _compute_momentum_factor({}) == 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-recovery of auto-paused directions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_paused_direction(did: str, hours_ago: float, healthy_after_cooldown: bool = True) -> dict:
+    """Build a direction that is auto-paused at the given age."""
+    paused_at = (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
+    history = []
+    if not healthy_after_cooldown:
+        # Add saturated history so _check_direction_health still returns a reason
+        history = [{"tasks_created": 0}] * 5
+    return {
+        "id": did,
+        "text": "Paused direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Saturated: last 5 research cycles produced no actionable findings",
+        "paused_at": paused_at,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "possibly_saturated": not healthy_after_cooldown,
+        "research_history": history,
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_after_cooldown(db_session):
+    """Auto-paused direction recovers when health improves after the cooldown."""
+    direction = _make_paused_direction("d-recov001", hours_ago=50, healthy_after_cooldown=True)
+    project = Project(
+        name="Auto-Recovery Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    recovered = next(d for d in project.directions if d["id"] == "d-recov001")
+    assert recovered["status"] == "active", "Direction should be reactivated after cooldown"
+    assert "auto_paused" not in recovered, "auto_paused flag should be removed"
+    assert "paused_reason" not in recovered, "paused_reason should be cleared"
+    assert "paused_at" not in recovered, "paused_at should be cleared"
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_stays_paused_when_still_unhealthy(db_session):
+    """Auto-paused direction stays paused when still unhealthy at cooldown."""
+    direction = _make_paused_direction("d-unhlt001", hours_ago=50, healthy_after_cooldown=False)
+    project = Project(
+        name="Still Unhealthy Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-unhlt001")
+    assert d["status"] == "paused", "Still-unhealthy direction must remain paused"
+    assert d.get("auto_paused") is True, "auto_paused flag must be preserved"
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_before_cooldown_stays_paused(db_session):
+    """Auto-paused direction is not recovered before the cooldown expires."""
+    direction = _make_paused_direction("d-early001", hours_ago=10, healthy_after_cooldown=True)
+    project = Project(
+        name="Early Recovery Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-early001")
+    assert d["status"] == "paused", "Direction should stay paused before cooldown expires"
+
+
+@pytest.mark.asyncio
+async def test_user_paused_direction_never_auto_recovered(db_session):
+    """Directions paused by the user (auto_paused not set) are never auto-recovered."""
+    direction = {
+        "id": "d-usrpaus1",
+        "text": "User-paused direction",
+        "status": "paused",
+        # auto_paused intentionally NOT set
+        "paused_reason": "User manually paused",
+        "paused_at": (datetime.utcnow() - timedelta(hours=100)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+    project = Project(
+        name="User Pause Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-usrpaus1")
+    assert d["status"] == "paused", "User-paused direction must NOT be auto-recovered"
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
+    """direction_auto_recovery_hours runtime config is respected."""
+    import app.shared_state as _ss
+    monkeypatch.setitem(_ss.runtime_config, "direction_auto_recovery_hours", 100)
+
+    # Paused 50 hours ago — within the custom 100h cooldown
+    direction = _make_paused_direction("d-cstmcld1", hours_ago=50, healthy_after_cooldown=True)
+    project = Project(
+        name="Custom Cooldown Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-cstmcld1")
+    assert d["status"] == "paused", "Direction should stay paused within the custom 100h cooldown"
