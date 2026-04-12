@@ -52,7 +52,9 @@ export interface HeaderBarProps {
   onUpdateSoundOnComplete: (value: boolean) => void;
   maxRetries: number;
   maxAutonomousTasksPerHour: number;
+  requireApprovalGates: boolean;
   onUpdateMaxVMs: (value: number) => void;
+  onUpdateRequireApprovalGates: (value: boolean) => void;
   onUpdateMaxRetries: (value: number) => void;
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
@@ -152,8 +154,10 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateSoundOnComplete,
     maxRetries,
     maxAutonomousTasksPerHour,
+    requireApprovalGates,
     onUpdateMaxVMs,
     onUpdateMaxRetries,
+    onUpdateRequireApprovalGates,
     onUpdateMaxAutonomousRate,
     autonomousResearchIntervalMinutes,
     onUpdateAutonomousResearchInterval,
@@ -347,6 +351,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxVMs={onUpdateMaxVMs}
           maxRetries={maxRetries}
           onUpdateMaxRetries={onUpdateMaxRetries}
+          requireApprovalGates={requireApprovalGates}
+          onUpdateRequireApprovalGates={onUpdateRequireApprovalGates}
           maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}

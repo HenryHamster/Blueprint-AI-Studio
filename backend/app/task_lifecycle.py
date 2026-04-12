@@ -610,16 +610,56 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     )
 
                 # Verify staging (head) branch exists — if it was deleted
-                # (e.g., by GitHub auto-delete after a prior PR merge, or
-                # by a cleanup race), fail clearly instead of hitting a
-                # confusing GitHub 422 "head invalid" error.
+                # (e.g., by a child rollup that found an empty diff and cleaned
+                # up, or by GitHub auto-delete after a prior PR merge), check
+                # whether all children completed successfully. If so, the work
+                # already landed on the target branch and we can complete.
                 try:
                     await get_branch_sha(gh_token, owner, repo, staging_branch)
-                except Exception as branch_err:
+                except Exception:
+                    # Check if all children completed — if so, work already landed
+                    all_children_ok = completed_count > 0 and failed_count == 0
+                    if all_children_ok:
+                        logger.info(
+                            f"[ROLLUP] Staging branch '{staging_branch}' gone but all "
+                            f"{completed_count} children completed — work already on {target_branch}"
+                        )
+                        parent.status = TaskStatus.COMPLETED
+                        parent.latest_status_message = (
+                            f"All {completed_count} subtasks completed with no actionable "
+                            f"changes — research produced no new code to merge"
+                        )
+                        # Note on the direction that this cycle found nothing actionable
+                        research_payload = parent.first_payload
+                        dir_id = research_payload.get("current_direction_id")
+                        if dir_id:
+                            project = await session.get(Project, parent.project_id)
+                            if project and project.directions:
+                                directions = list(project.directions)
+                                for d in directions:
+                                    if d.get("id") == dir_id:
+                                        notes = d.get("notes") or []
+                                        notes.append({
+                                            "text": "Research cycle completed with no actionable changes — all findings already implemented or not applicable.",
+                                            "added_at": _utcnow().isoformat(),
+                                            "source": "rollup_empty_diff",
+                                        })
+                                        d["notes"] = notes[-10:]  # Keep last 10
+                                        break
+                                project.directions = directions
+                                flag_modified(project, "directions")
+                                session.add(project)
+                        session.add(parent)
+                        await session.commit()
+                        await _cleanup_branches(parent, session)
+                        await broadcast_to_project(
+                            str(parent.project_id), "task_updated",
+                            {"task_id": str(parent.id), "status": TaskStatus.COMPLETED}
+                        )
+                        return
                     raise Exception(
-                        f"Staging branch '{staging_branch}' does not exist — "
-                        f"cannot create rollup PR. Child work may have been "
-                        f"lost. Error: {branch_err}"
+                        f"Staging branch '{staging_branch}' does not exist and "
+                        f"{failed_count} child(ren) failed — cannot create rollup PR"
                     )
 
                 is_target_intermediate = target_branch.startswith("research/") or target_branch.startswith("plan/")
@@ -704,13 +744,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Check if any child task was high-risk — if so, require approval on the final merge.
                 # Refactor tasks are structural (move code, no behavior change) and should not
                 # trigger the high-risk gate even when classified as risk='high' by plan agents.
+                # Gate is controlled by runtime setting (default True) — disable for repos
+                # that don't need human-in-the-loop approval.
                 has_high_risk_child = any(
                     (c.context or {}).get("risk") == "high"
                     for c in children
                     if c.status == TaskStatus.COMPLETED
                     and (c.first_payload or {}).get("type") != "refactor"  # refactors are structural, not behavioral risk
                 )
-                if has_high_risk_child and not is_target_intermediate:
+                if has_high_risk_child and not is_target_intermediate and _runtime_config.get("require_approval_gates", True):
                     parent.requires_approval = True
                     parent.latest_status_message = (
                         f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting approval "
@@ -1042,25 +1084,28 @@ async def _process_post_commit(
                         await session.commit()
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
-                    # Don't block here — let review run, block at merge time
-                    try:
-                        pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                        INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
-                                       "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
-                                       "agent/src/index.ts", "CLAUDE.md"}
-                        CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
-                        touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
-                        touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
-                        if touched_infra:
-                            task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large",
-                                            "touched_infra": touched_infra, "touched_critical": touched_critical}
-                            task.latest_status_message = f"Infrastructure change flagged: {', '.join(touched_infra)}"
-                            logger.info(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
-                            session.add(task)
-                            await session.commit()
-                            _shared_state.deploy_monitoring["is_extended"] = True
-                    except Exception as e:
-                        logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
+                    # Don't block here — let review run, block at merge time.
+                    # Gated by require_approval_gates — these paths are hardcoded for the
+                    # Blueprint repo and irrelevant for other projects.
+                    if _runtime_config.get("require_approval_gates", True):
+                        try:
+                            pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
+                            INFRA_FILES = {"backend/app/main.py", "backend/app/compute.py", "backend/app/models.py",
+                                           "backend/app/database.py", "backend/app/security.py", "backend/app/auth.py",
+                                           "agent/src/index.ts", "CLAUDE.md"}
+                            CRITICAL_FILES = {"backend/app/security.py", "backend/app/auth.py", "CLAUDE.md"}
+                            touched_infra = [f["filename"] for f in pr_files if f["filename"] in INFRA_FILES]
+                            touched_critical = [f for f in touched_infra if f in CRITICAL_FILES]
+                            if touched_infra:
+                                task.context = {**(task.context or {}), "extended_monitoring": True, "risk_tier": "large",
+                                                "touched_infra": touched_infra, "touched_critical": touched_critical}
+                                task.latest_status_message = f"Infrastructure change flagged: {', '.join(touched_infra)}"
+                                logger.info(f"[PIPELINE] PR #{pr_number} touches infra files: {touched_infra} (critical: {touched_critical})")
+                                session.add(task)
+                                await session.commit()
+                                _shared_state.deploy_monitoring["is_extended"] = True
+                        except Exception as e:
+                            logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
                         review_task = await _spawn_pipeline_task(
@@ -1270,7 +1315,7 @@ async def _process_post_commit(
                             logger.info(f"[CI] PR #{pr_number} CI passed")
 
                         # Critical files gate: block merge if security-critical files were touched
-                        if original_task_id:
+                        if original_task_id and _runtime_config.get("require_approval_gates", True):
                             try:
                                 orig_task = await session.get(Task, uuid.UUID(original_task_id))
                                 critical_touched = (orig_task.context or {}).get("touched_critical", []) if orig_task else []

@@ -320,7 +320,7 @@ class TestMainPyFreeze:
 TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategic extraction
 TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
 
-TASK_LIFECYCLE_MAX_LINES = 1800      # Ratcheted down after review_pipeline.py extraction
+TASK_LIFECYCLE_MAX_LINES = 1815      # Bumped: rollup staging-branch recovery logic
 TASK_LIFECYCLE_MAX_FUNCTIONS = 10    # Ratcheted down after review_pipeline.py extraction
 
 REVIEW_PIPELINE_MAX_LINES = 350

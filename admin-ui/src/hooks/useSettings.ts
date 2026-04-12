@@ -19,6 +19,7 @@ export function useSettings(addToast: AddToast) {
   const [newAccountName, setNewAccountName] = useState('');
   const [newAccountToken, setNewAccountToken] = useState('');
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
+  const [requireApprovalGates, setRequireApprovalGates] = useState(true);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -38,6 +39,7 @@ export function useSettings(addToast: AddToast) {
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
+        setRequireApprovalGates(data.require_approval_gates ?? true);
         // Seed localStorage with server-authoritative task type defaults
         const serverModels = (data.task_type_models ?? {}) as Record<string, string>;
         const serverEfforts = (data.task_type_efforts ?? {}) as Record<string, string>;
@@ -259,6 +261,21 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateRequireApprovalGates = async (value: boolean) => {
+    const prev = requireApprovalGates;
+    setRequireApprovalGates(value);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ require_approval_gates: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setRequireApprovalGates(prev);
+      addToast('Failed to update approval gates setting', 'error');
+    }
+  };
+
   const updateHealthCheckUrls = async (urls: string[]) => {
     const prev = healthCheckUrls;
     setHealthCheckUrls(urls);
@@ -282,6 +299,7 @@ export function useSettings(addToast: AddToast) {
     healthCheckUrls, agentPromptSuffixes, usingMaxPlan,
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     githubAccount, setGithubAccount,
+    requireApprovalGates,
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
@@ -291,6 +309,6 @@ export function useSettings(addToast: AddToast) {
     updateMaxVMs, updateMaxRetries,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
-    updateHealthCheckUrls,
+    updateHealthCheckUrls, updateRequireApprovalGates,
   };
 }

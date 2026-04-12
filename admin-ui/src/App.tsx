@@ -385,8 +385,10 @@ export default function App() {
         settingsRef={s.settingsRef}
         maxRetries={s.maxRetries}
         maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
+        requireApprovalGates={s.requireApprovalGates}
         onUpdateMaxVMs={s.updateMaxVMs}
         onUpdateMaxRetries={s.updateMaxRetries}
+        onUpdateRequireApprovalGates={s.updateRequireApprovalGates}
         onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
         autonomousResearchIntervalMinutes={s.autonomousResearchIntervalMinutes}
         onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}

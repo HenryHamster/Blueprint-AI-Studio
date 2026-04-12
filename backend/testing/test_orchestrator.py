@@ -657,37 +657,41 @@ class TestResearchSpawning:
     @pytest.mark.asyncio
     async def test_spawn_skipped_when_research_task_already_active(self, db_session, reset_circuit_breakers):
         """
-        _spawn_research_task() must not spawn if a research-type task is
-        already QUEUED/PROVISIONING/IN_PROGRESS for the same project.
+        _spawn_research_task() must not spawn beyond the parallel limit if a
+        research-type task is already QUEUED/PROVISIONING/IN_PROGRESS for the same project.
         """
-        project = Project(
-            name="Dedup spawn test",
-            user_id="user1",
-            autonomous_enabled=True,
-            directions=[{"id": "d1", "status": "active", "text": "security scan"}],
-        )
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
+        _main_module._runtime_config["max_parallel_research_per_project"] = 1
+        try:
+            project = Project(
+                name="Dedup spawn test",
+                user_id="user1",
+                autonomous_enabled=True,
+                directions=[{"id": "d1", "status": "active", "text": "security scan"}],
+            )
+            db_session.add(project)
+            await db_session.commit()
+            await db_session.refresh(project)
 
-        # Existing research task already running
-        existing = Task(
-            project_id=project.id,
-            title="Research: existing scan",
-            payloads=[{"type": "research", "base_branch": "main"}],
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-            status=TaskStatus.IN_PROGRESS,
-            created_by="ORCHESTRATOR",
-        )
-        db_session.add(existing)
-        await db_session.commit()
+            # Existing research task already running
+            existing = Task(
+                project_id=project.id,
+                title="Research: existing scan",
+                payloads=[{"type": "research", "base_branch": "main"}],
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+            )
+            db_session.add(existing)
+            await db_session.commit()
 
-        await _spawn_research_task(project, db_session)
+            await _spawn_research_task(project, db_session)
 
-        from sqlmodel import select as sql_select
-        all_tasks = (await db_session.execute(sql_select(Task).where(Task.project_id == project.id))).scalars().all()
-        research_tasks = [t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"]
-        assert len(research_tasks) == 1, "A second research task must not be spawned"
+            from sqlmodel import select as sql_select
+            all_tasks = (await db_session.execute(sql_select(Task).where(Task.project_id == project.id))).scalars().all()
+            research_tasks = [t for t in all_tasks if (t.payloads or [{}])[0].get("type") == "research"]
+            assert len(research_tasks) == 1, "A second research task must not be spawned"
+        finally:
+            _main_module._runtime_config["max_parallel_research_per_project"] = 2
 
     # ── Test 4: rate limit — too many orchestrator tasks this hour ───────────
 

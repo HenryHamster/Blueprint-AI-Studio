@@ -27,6 +27,8 @@ interface SettingsDropdownProps {
   onUpdateMaxVMs: (value: number) => void;
   maxRetries: number;
   onUpdateMaxRetries: (value: number) => void;
+  requireApprovalGates: boolean;
+  onUpdateRequireApprovalGates: (value: boolean) => void;
   maxAutonomousTasksPerHour: number;
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
@@ -123,6 +125,8 @@ export function SettingsDropdown({
   onUpdateMaxVMs,
   maxRetries,
   onUpdateMaxRetries,
+  requireApprovalGates,
+  onUpdateRequireApprovalGates,
   maxAutonomousTasksPerHour,
   onUpdateMaxAutonomousRate,
   autonomousResearchIntervalMinutes,
@@ -457,6 +461,15 @@ export function SettingsDropdown({
               onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(retriesInputVal); if (!isNaN(n) && n >= 0 && n <= 10) onUpdateMaxRetries(n); else setRetriesInputVal(String(maxRetries)); } }}
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
+          </div>
+          <div className="mb-4 flex items-center justify-between">
+            <label className="text-[11px] font-medium text-neutral-400">Require Approval Gates</label>
+            <button
+              onClick={() => onUpdateRequireApprovalGates(!requireApprovalGates)}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${requireApprovalGates ? 'bg-blue-600' : 'bg-neutral-700'}`}
+            >
+              <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${requireApprovalGates ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
+            </button>
           </div>
           <div className="mb-4">
             <label className="block text-[11px] font-medium text-neutral-400 mb-1.5">Max Autonomous Tasks/Hour (1-50)</label>
