@@ -63,7 +63,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const taskTypeKey = strVal(payload.type);
   const taskTypeHint = includeTaskTypeHints && TASK_TYPE_HINTS[taskTypeKey]
-    ? `\n\n${TASK_TYPE_HINTS[taskTypeKey]}`
+    ? `\n\n${TASK_TYPE_HINTS[taskTypeKey].replace(/\{\{BASE_BRANCH\}\}/g, baseBranch)}`
     : '';
 
   const claudeMd = readClaudeMd();

@@ -169,7 +169,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     return retried_count
 
 
-MAX_REVIEW_FIX_ITERATIONS = 8
+MAX_REVIEW_FIX_ITERATIONS = 16
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
@@ -183,16 +183,16 @@ def _max_review_iterations(task: Task) -> int:
 
     # CI-only fixes should converge fast (lint/type/test errors)
     if fix_reason == 'ci_failure':
-        limit = 3
+        limit = 8
     # Small scope tasks: less code, fewer things to fix
     elif scope == 'small':
-        limit = 5
+        limit = 10
     # Medium scope: moderate iteration budget
     elif scope == 'medium':
-        limit = 6
+        limit = 12
     # Large scope or unknown: full budget
     else:
-        limit = 8
+        limit = 16
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
 
