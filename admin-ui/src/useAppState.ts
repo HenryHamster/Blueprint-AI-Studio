@@ -13,6 +13,9 @@ import { useMetrics } from './hooks/useMetrics';
 import { useArchive } from './hooks/useArchive';
 import { useDeploymentState } from './hooks/useDeploymentState';
 import { useLogViewer } from './hooks/useLogViewer';
+import { useSearchFilters } from './hooks/useSearchFilters';
+import { useUIState } from './hooks/useUIState';
+import { useTaskModal } from './hooks/useTaskModal';
 
 export type { DeployState } from './types/settings';
 
@@ -68,6 +71,35 @@ export function useAppState() {
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter } = useSearchFilters();
+
+  const {
+    showResearchBrowser, setShowResearchBrowser,
+    showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
+    showMessages, setShowMessages,
+    showSettings, setShowSettings,
+    showDirections, setShowDirections,
+    showMetrics, setShowMetrics,
+    showDiagnostics, setShowDiagnostics,
+    showShortcutHelp, setShowShortcutHelp,
+    showUserManagement, setShowUserManagement,
+    settingsRef, shortcutHelpRef,
+    selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
+    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
+    confirmDialog, setConfirmDialog,
+  } = useUIState();
+
+  const {
+    showNewTaskModal, setShowNewTaskModal,
+    newTaskRepo, newTaskBranch, newTaskTitle, newTaskPrompt, newTaskType,
+    newTaskPrNumber, newTaskPrBranch, newTaskModel, newTaskEffort,
+    setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
+    setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
+    repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
+    branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef);
+
   // ── Remaining state ─────────────────────────────────────────────────────
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
@@ -80,55 +112,10 @@ export function useAppState() {
   const [limit, setLimit] = usePersistedState<number>('pageSize', 50);
   const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
 
-  // New Task modal state
-  const [showNewTaskModal, setShowNewTaskModal] = useState(false);
-  const [newTaskRepo, setNewTaskRepo] = useState('');
-  const [newTaskBranch, setNewTaskBranch] = useState('main');
-  const [newTaskTitle, setNewTaskTitle] = useState('');
-  const [newTaskPrompt, setNewTaskPrompt] = useState('');
-  const [newTaskType, setNewTaskType] = useState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('create');
-  const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
-  const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
-  const [newTaskModel, setNewTaskModel] = useState('');
-  const [newTaskEffort, setNewTaskEffort] = useState('');
-
-  // GitHub repo/branch dropdown state
-  interface RepoOption { full_name: string; default_branch: string; }
-  const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
-  const [repoLoading, setRepoLoading] = useState(false);
-  const [repoError, setRepoError] = useState<string | null>(null);
-  const [useManualRepo, setUseManualRepo] = useState(false);
-  const [branchOptions, setBranchOptions] = useState<string[]>([]);
-  const [branchLoading, setBranchLoading] = useState(false);
-  const [branchError, setBranchError] = useState<string | null>(null);
-  const [useManualBranch, setUseManualBranch] = useState(false);
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
   const [alerts, setAlerts] = useState<Alert[]>([]);
 
-  // Research browser state
-  const [showResearchBrowser, setShowResearchBrowser] = useState(false);
-
-  // Activity feed state
-  const [showActivityFeed, setShowActivityFeed] = useState(false);
-  const [lastActivityFeedOpen, setLastActivityFeedOpen] = useState<number | null>(() => {
-    const stored = localStorage.getItem('blueprint-admin:lastActivityFeedOpen');
-    return stored ? parseInt(stored, 10) : null;
-  });
-  const [prevLastActivityFeedOpen, setPrevLastActivityFeedOpen] = useState<number | null>(null);
-  useEffect(() => {
-    if (showActivityFeed) {
-      const now = Date.now();
-      setPrevLastActivityFeedOpen(lastActivityFeedOpen);
-      setLastActivityFeedOpen(now);
-      localStorage.setItem('blueprint-admin:lastActivityFeedOpen', String(now));
-    }
-  }, [showActivityFeed]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Messages panel state
-  const [showMessages, setShowMessages] = useState(false);
-
   // Settings state
-  const [showSettings, setShowSettings] = useState(false);
   const [maxConcurrentVMs, setMaxConcurrentVMs] = useState(5);
   const [maxRetries, setMaxRetries] = useState(3);
   const [maxAutonomousTasksPerHour, setMaxAutonomousTasksPerHour] = useState(10);
@@ -138,7 +125,6 @@ export function useAppState() {
   const [healthCheckUrls, setHealthCheckUrls] = useState<string[]>([]);
   const [agentPromptSuffixes, setAgentPromptSuffixes] = useState<Record<string, string>>({});
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
-  const settingsRef = useRef<HTMLDivElement>(null);
   // Max plan pool state
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
   const [newAccountName, setNewAccountName] = useState('');
@@ -166,15 +152,6 @@ export function useAppState() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
 
-  // Directions panel state
-  const [showDirections, setShowDirections] = useState(false);
-
-  // Metrics toggle
-  const [showMetrics, setShowMetrics] = useState(false);
-
-  // Diagnostics panel toggle
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
-
   // Last visit timestamp — captures when the user previously loaded the app
   const [lastVisitTimestamp] = useState<number | null>(() => {
     try {
@@ -193,24 +170,8 @@ export function useAppState() {
   const [apiHealthy, setApiHealthy] = useState(true);
   const [lastFetchTime, setLastFetchTime] = useState<number>(0);
 
-  // Search and filter state
-  const [searchQuery, setSearchQuery] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>(['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor']);
-  const [statusFilter, setStatusFilter] = useState<string[]>(['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED']);
-
   // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
-
-  // Keyboard shortcut help state
-  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
-  const shortcutHelpRef = useRef<HTMLDivElement>(null);
-
-  // Selection mode state
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
-
-  // Confirm dialog state
-  const [confirmDialog, setConfirmDialog] = useState<{ title: string; message: string; confirmLabel: string; onConfirm: () => void } | null>(null);
 
   // ── Effects ─────────────────────────────────────────────────────────────
 
@@ -257,30 +218,6 @@ export function useAppState() {
     return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshInterval, user]);
-
-  // Close settings dropdown on outside click
-  useEffect(() => {
-    if (!showSettings) return;
-    const handleClick = (e: MouseEvent) => {
-      if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) {
-        setShowSettings(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [showSettings]);
-
-  // Close shortcut help on outside click
-  useEffect(() => {
-    if (!showShortcutHelp) return;
-    const handleClick = (e: MouseEvent) => {
-      if (shortcutHelpRef.current && !shortcutHelpRef.current.contains(e.target as Node)) {
-        setShowShortcutHelp(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [showShortcutHelp]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -812,37 +749,6 @@ export function useAppState() {
     setConfirmDialog(null);
   };
 
-  const toggleSelectionMode = () => {
-    setSelectionMode(prev => !prev);
-    setSelectedTaskIds(new Set());
-  };
-
-  const toggleTaskSelection = (taskId: string) => {
-    setSelectedTaskIds(prev => {
-      const next = new Set(prev);
-      if (next.has(taskId)) {
-        next.delete(taskId);
-      } else {
-        next.add(taskId);
-      }
-      return next;
-    });
-  };
-
-  const bulkColumnToggle = (taskIds: string[], selected: boolean) => {
-    setSelectedTaskIds(prev => {
-      const next = new Set(prev);
-      for (const id of taskIds) {
-        if (selected) {
-          next.add(id);
-        } else {
-          next.delete(id);
-        }
-      }
-      return next;
-    });
-  };
-
   const fetchSettings = async () => {
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/settings`);
@@ -1103,145 +1009,6 @@ export function useAppState() {
     });
   };
 
-  const fetchRepoOptions = async () => {
-    setRepoLoading(true);
-    setRepoError(null);
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/github/repos`);
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        setRepoError(errData?.detail || 'Failed to load repositories');
-        setUseManualRepo(true);
-        return;
-      }
-      const data = await res.json();
-      setRepoOptions(data.repositories || []);
-      if (data.repositories?.length === 0) {
-        setRepoError('No repositories found for this GitHub installation');
-        setUseManualRepo(true);
-      }
-    } catch {
-      setRepoError('Failed to connect to server');
-      setUseManualRepo(true);
-    } finally {
-      setRepoLoading(false);
-    }
-  };
-
-  const fetchBranchOptions = async (repo: string) => {
-    setBranchOptions([]);
-    setBranchError(null);
-    setUseManualBranch(false);
-    if (!repo) return;
-    setBranchLoading(true);
-    try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/github/branches?repo=${encodeURIComponent(repo)}`);
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        setBranchError(errData?.detail || 'Failed to load branches');
-        setUseManualBranch(true);
-        return;
-      }
-      const data = await res.json();
-      setBranchOptions(data.branches || []);
-      if (data.branches?.length === 0) {
-        setBranchError('No branches found');
-        setUseManualBranch(true);
-      }
-    } catch {
-      setBranchError('Failed to connect to server');
-      setUseManualBranch(true);
-    } finally {
-      setBranchLoading(false);
-    }
-  };
-
-  const getDefaultModelForType = (taskType: string) => {
-    return JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${taskType}`) ?? 'null') ??
-      JSON.parse(localStorage.getItem('blueprint-admin:defaultModel') ?? 'null') ?? '';
-  };
-
-  const getDefaultEffortForType = (taskType: string) => {
-    return JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${taskType}`) ?? 'null') ??
-      JSON.parse(localStorage.getItem('blueprint-admin:defaultEffort') ?? 'null') ?? '';
-  };
-
-  const openNewTaskModal = () => {
-    setShowNewTaskModal(true);
-    setNewTaskType(defaultTaskType);
-    setNewTaskModel(getDefaultModelForType(defaultTaskType));
-    setNewTaskEffort(getDefaultEffortForType(defaultTaskType));
-    setUseManualRepo(false);
-    setUseManualBranch(false);
-    setBranchOptions([]);
-    setBranchError(null);
-    fetchRepoOptions();
-  };
-
-  const handleRepoChange = (value: string) => {
-    setNewTaskRepo(value);
-    const repoMeta = repoOptions.find(r => r.full_name === value);
-    if (repoMeta) {
-      setNewTaskBranch(repoMeta.default_branch || 'main');
-    } else {
-      setNewTaskBranch('main');
-    }
-    if (value && value.includes('/')) {
-      fetchBranchOptions(value);
-    } else {
-      setBranchOptions([]);
-    }
-  };
-
-  const handleCreateTask = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (newTaskType === 'review' || newTaskType === 'fix') {
-      const prNum = parseInt(newTaskPrNumber, 10);
-      if (!newTaskPrNumber || isNaN(prNum) || prNum < 1) {
-        addToast('PR number must be a positive integer', 'error');
-        return;
-      }
-      if (newTaskType === 'fix' && !newTaskPrBranch) {
-        addToast('PR branch is required for fix tasks', 'error');
-        return;
-      }
-    }
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: JSON.stringify({
-          github_repo: newTaskRepo,
-          title: newTaskTitle,
-          prompt: newTaskPrompt,
-          base_branch: newTaskBranch,
-          task_type: newTaskType,
-          ...(newTaskType === 'review' || newTaskType === 'fix' ? {
-            pr_number: parseInt(newTaskPrNumber, 10),
-            branch: newTaskPrBranch || undefined,
-          } : {}),
-          ...(newTaskModel ? { model: newTaskModel } : {}),
-          ...(newTaskEffort ? { effort: newTaskEffort } : {}),
-        }),
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        addToast(`Failed to create task: ${errData?.detail || errData?.error?.message || res.statusText}`, 'error');
-        return;
-      }
-      setShowNewTaskModal(false);
-      setNewTaskTitle('');
-      setNewTaskPrompt('');
-      setNewTaskPrNumber('');
-      setNewTaskPrBranch('');
-      addToast('Task created successfully', 'success');
-      fetchTasks();
-    } catch (error) {
-      console.error('Failed to create task:', error);
-      addToast('Failed to create task', 'error');
-    }
-  };
-
   const needsAttentionCount = useMemo(() => {
     return tasks.filter(t =>
       t.status === 'FAILED' ||
@@ -1252,7 +1019,6 @@ export function useAppState() {
   // ── User management ──────────────────────────────────────────────────────
   type AllowedUserEntry = { id: string; email: string; role: string; display_name: string | null; last_login_at: string | null; created_at: string | null };
   const [allowedUsers, setAllowedUsers] = useState<AllowedUserEntry[]>([]);
-  const [showUserManagement, setShowUserManagement] = useState(false);
 
   const fetchAllowedUsers = useCallback(async () => {
     try {

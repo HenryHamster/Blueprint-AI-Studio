@@ -536,6 +536,66 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker):
+    """When every finding is deduplicated (zero children), the research task is auto-completed."""
+    direction = _active_direction("d-autocomp1", "Auto-complete direction")
+    project = Project(
+        name="Auto Complete Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Refactor authentication middleware"
+    dup_desc = "Middleware needs cleanup"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Existing task with matching hash — causes deduplication
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "refactor it", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Refactor auth middleware",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, (
+        "Research task must be auto-completed when all findings are deduplicated"
+    )
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    assert len(result.scalars().all()) == 0, "No child tasks should be created when all findings are duplicates"
+
+
+@pytest.mark.asyncio
 async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     """Distinct findings that share fewer than 3 meaningful words each get a child task."""
     direction = _active_direction("d-unique01", "Unique findings direction")

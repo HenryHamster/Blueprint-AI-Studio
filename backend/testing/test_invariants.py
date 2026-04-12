@@ -473,6 +473,138 @@ class TestAutonomousResearchFreeze:
         )
 
 
+# ── Frontend File Size Guards ────────────────────────────────────────────────
+# Enforces line count ceilings on the largest frontend files to prevent unbounded growth.
+
+USEAPPSTATE_MAX_LINES = 1500
+DIRECTIONS_PANEL_MAX_LINES = 1500
+CATCHUP_PANEL_MAX_LINES = 1200
+TASK_DETAIL_DRAWER_MAX_LINES = 1200
+SETTINGS_DROPDOWN_MAX_LINES = 1200
+KANBAN_BOARD_MAX_LINES = 1100
+APP_TSX_MAX_LINES = 1000
+
+
+def _get_frontend_path(relative: str) -> str:
+    """Resolve a path relative to admin-ui/src/ from the test file location."""
+    return os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui", "src", relative)
+
+
+class TestFrontendFreeze:
+    """Enforce line count ceilings on the largest frontend files."""
+
+    @staticmethod
+    def _skip_if_missing(path: str) -> None:
+        import pytest
+        if not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui")):
+            pytest.skip("admin-ui directory not present — skipping frontend size guards")
+
+    def test_useappstate_line_count(self):
+        """useAppState.ts must not grow beyond the ceiling.
+
+        If this fails: new state was added to useAppState.ts.
+        Extract into a standalone hook under admin-ui/src/hooks/ instead.
+        """
+        path = _get_frontend_path("useAppState.ts")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= USEAPPSTATE_MAX_LINES, (
+            f"useAppState.ts has {count} lines, exceeding the ceiling of {USEAPPSTATE_MAX_LINES}. "
+            "Extract into a standalone hook under admin-ui/src/hooks/ instead."
+        )
+
+    def test_directions_panel_line_count(self):
+        """DirectionsPanel.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to DirectionsPanel.tsx.
+        Extract into a sub-component under admin-ui/src/components/ instead.
+        """
+        path = _get_frontend_path("components/DirectionsPanel.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= DIRECTIONS_PANEL_MAX_LINES, (
+            f"DirectionsPanel.tsx has {count} lines, exceeding the ceiling of {DIRECTIONS_PANEL_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+    def test_catchup_panel_line_count(self):
+        """CatchUpPanel.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to CatchUpPanel.tsx.
+        Extract into a sub-component or hook instead.
+        """
+        path = _get_frontend_path("components/CatchUpPanel.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= CATCHUP_PANEL_MAX_LINES, (
+            f"CatchUpPanel.tsx has {count} lines, exceeding the ceiling of {CATCHUP_PANEL_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+    def test_task_detail_drawer_line_count(self):
+        """TaskDetailDrawer.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to TaskDetailDrawer.tsx.
+        Extract into a sub-component or hook instead.
+        """
+        path = _get_frontend_path("components/TaskDetailDrawer.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= TASK_DETAIL_DRAWER_MAX_LINES, (
+            f"TaskDetailDrawer.tsx has {count} lines, exceeding the ceiling of {TASK_DETAIL_DRAWER_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+    def test_settings_dropdown_line_count(self):
+        """SettingsDropdown.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to SettingsDropdown.tsx.
+        Extract into a sub-component or hook instead.
+        """
+        path = _get_frontend_path("components/SettingsDropdown.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= SETTINGS_DROPDOWN_MAX_LINES, (
+            f"SettingsDropdown.tsx has {count} lines, exceeding the ceiling of {SETTINGS_DROPDOWN_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+    def test_kanban_board_line_count(self):
+        """KanbanBoard.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to KanbanBoard.tsx.
+        Extract into a sub-component or hook instead.
+        """
+        path = _get_frontend_path("components/KanbanBoard.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= KANBAN_BOARD_MAX_LINES, (
+            f"KanbanBoard.tsx has {count} lines, exceeding the ceiling of {KANBAN_BOARD_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+    def test_app_tsx_line_count(self):
+        """App.tsx must not grow beyond the ceiling.
+
+        If this fails: new UI was added to App.tsx.
+        Extract into a sub-component or hook instead.
+        """
+        path = _get_frontend_path("App.tsx")
+        self._skip_if_missing(path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= APP_TSX_MAX_LINES, (
+            f"App.tsx has {count} lines, exceeding the ceiling of {APP_TSX_MAX_LINES}. "
+            "Extract into a sub-component or hook instead."
+        )
+
+
 class TestOrchestratorFreeze:
     """Enforce the orchestrator.py freeze: no new functions, no line growth."""
 
