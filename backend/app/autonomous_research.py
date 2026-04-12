@@ -466,17 +466,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
                         busy_direction_ids.add(did)
 
     directions_modified = False
-    # Prune dead directions — expired/completed/rejected directions accumulate
-    # and bloat the JSON column. Keep only active, proposed, and paused.
-    all_dirs = list(project.directions or [])
-    live_dirs = [d for d in all_dirs if d.get("status") in ("active", "proposed", "paused")]
-    if len(live_dirs) < len(all_dirs):
-        pruned_count = len(all_dirs) - len(live_dirs)
+    # Prune dead directions (expired/completed/rejected) to prevent JSON bloat
+    live_dirs = [d for d in (project.directions or []) if d.get("status") in ("active", "proposed", "paused")]
+    if len(live_dirs) < len(project.directions or []):
+        logger.info(f"[AUTONOMOUS] Pruned {len(project.directions or []) - len(live_dirs)} dead directions from {project.id}")
         project.directions = live_dirs
         flag_modified(project, "directions")
         directions_modified = True
-        logger.info(f"[AUTONOMOUS] Pruned {pruned_count} dead directions from project {project.id} ({len(all_dirs)} → {len(live_dirs)})")
-
     # Auto-recovery: reactivate auto-paused directions past cooldown
     recovery_hours = _runtime_config.get("direction_auto_recovery_hours", 48)
     for d in (project.directions or []):
