@@ -60,6 +60,9 @@ _orchestrator_cycle_started: Optional[datetime] = None
 _orchestrator_consecutive_errors: int = 0
 _orchestrator_consecutive_monitoring_errors: int = 0
 
+# Configurable throttle sleep when high failure rate detected
+ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv('ORCHESTRATOR_THROTTLE_SECONDS', '30'))
+
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
 # starving new provisions and creating a cascading failure where no VM can
@@ -274,10 +277,17 @@ async def orchestrator_worker():
                             })
                         except Exception:
                             pass
+                    logger.info('orchestrator_slots_full', extra={
+                        'slots_in_use': effective_count,
+                        'total_slots': _runtime_config['max_concurrent_vms'],
+                    })
                     logger.info('orchestrator_cycle_complete', extra={
                         'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                         'tasks_dispatched': 0,
                         'tasks_recovered': tasks_recovered,
+                        'slots_in_use': effective_count,
+                        'slots_available': 0,
+                        'queue_depth': _shared_state.tasks_queued_gauge,
                     })
                     await asyncio.sleep(5)
                     continue
@@ -291,19 +301,19 @@ async def orchestrator_worker():
                     recent_failures = sum(1 for r in recent_window if r[1] == "failure")
                     recent_rate = recent_failures / len(recent_window)
                     if recent_rate >= 0.8:
-                        logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for 30s")
+                        logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for {ORCHESTRATOR_THROTTLE_SECONDS}s")
                         try:
                             await ws_manager.broadcast_to_all("pipeline_throttle", {
                                 "reason": "high_failure_rate",
                                 "detail": f"{recent_failures}/{len(recent_window)} recent tasks failed",
-                                "recovery_seconds": 30,
+                                "recovery_seconds": ORCHESTRATOR_THROTTLE_SECONDS,
                             })
                         except Exception:
                             pass
                         # Run account re-enablement before sleeping so rate-limited accounts
                         # can recover even while dispatch is throttled
                         await recheck_disabled_accounts()
-                        await asyncio.sleep(30)
+                        await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
                         continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle
@@ -1305,6 +1315,9 @@ async def orchestrator_worker():
                 'cycle_duration_seconds': round(time.monotonic() - cycle_start, 3),
                 'tasks_dispatched': len(queued_tasks),
                 'tasks_recovered': tasks_recovered,
+                'slots_in_use': effective_count,
+                'slots_available': slots_available,
+                'queue_depth': _shared_state.tasks_queued_gauge,
             })
             _orchestrator_last_cycle = _utcnow()
         except asyncio.CancelledError:

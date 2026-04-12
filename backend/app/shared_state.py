@@ -29,7 +29,7 @@ runtime_config_lock = asyncio.Lock()
 
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
-    "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "5")),
+    "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
     "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_autonomous_tasks_per_hour": 5,

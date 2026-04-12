@@ -43,12 +43,12 @@ _vm_zones: dict[str, str] = {}
 # Separate limits for slow insert (up to 300s) vs fast ops (list/delete/get, ~10s)
 # so long-running provisions don't starve orphan cleanup.
 # Local semaphore still used as secondary guard even with Redis (prevents thread starvation).
-_gcp_provision_semaphore = asyncio.Semaphore(6)  # insert/create — long-running (up to 300s)
+_MAX_GLOBAL_PROVISIONS = int(os.getenv('MAX_PROVISION_SLOTS', '10'))
+_gcp_provision_semaphore = asyncio.Semaphore(_MAX_GLOBAL_PROVISIONS)  # insert/create — long-running (up to 300s)
 _gcp_ops_semaphore = asyncio.Semaphore(8)         # list/delete/get — fast ops (~10s)
 
 # Distributed provision semaphore via Redis sorted set (falls back to local-only)
 _PROVISION_REDIS_KEY = "blueprint:active-provisions"
-_MAX_GLOBAL_PROVISIONS = 6
 _PROVISION_SLOT_TTL = 600  # 10 min — auto-reclaim if process crashes
 
 
@@ -86,7 +86,7 @@ async def _release_provision_slot(vm_id: str):
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
-ZONE_COOLDOWN_SECONDS = 300  # 5 minutes — base for exponential backoff
+ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '300'))  # 5 minutes — base for exponential backoff
 
 
 def _zone_cooldown_seconds(consecutive_failures: int) -> int:

@@ -31,6 +31,22 @@ class TestSafetyConstants:
         from app.shared_state import runtime_config
         assert runtime_config["max_autonomous_tasks_per_hour"] == 5
 
+    def test_provision_slots_geq_concurrent_vms(self):
+        """MAX_PROVISION_SLOTS must be >= MAX_CONCURRENT_VMS default.
+
+        If this fails: the provision slot limit (MAX_PROVISION_SLOTS env var) is
+        lower than the concurrent VM limit (MAX_CONCURRENT_VMS env var), which
+        creates a dispatch deadlock — slots would be reserved by active VMs before
+        provisioning can complete.
+        """
+        from app.compute import _MAX_GLOBAL_PROVISIONS
+        from app.shared_state import runtime_config
+        max_concurrent_vms = int(os.getenv("MAX_CONCURRENT_VMS", "8"))
+        assert _MAX_GLOBAL_PROVISIONS >= max_concurrent_vms, (
+            f"MAX_PROVISION_SLOTS ({_MAX_GLOBAL_PROVISIONS}) < MAX_CONCURRENT_VMS ({max_concurrent_vms}) — "
+            "provision slot limit must be >= concurrent VM limit to avoid dispatch deadlock."
+        )
+
 
 # ── VM Self-Destruct Timer ──────────────────────────────────────────────────
 
