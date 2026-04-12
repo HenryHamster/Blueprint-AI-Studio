@@ -69,7 +69,7 @@ _provision_coroutines: Dict[str, asyncio.Task] = {}
 
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
-    from app.main import _get_deploy_state_for_update
+    from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
     try:
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
@@ -92,7 +92,7 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.main import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak  # noqa: PLC0415
     try:
         from app.compute import _zone_health, _zone_lock
         with _zone_lock:
@@ -131,15 +131,17 @@ async def orchestrator_worker():
         _max_plan_pools,
         _max_plan_pool_lock,
     )
-    from app.main import (
+    from app.main import (  # noqa: PLC0415
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
         record_task_result,
+        _create_orchestrator_error_alerts,
+    )
+    from app.deploy_health import (  # noqa: PLC0415
         _check_monitoring_window,
         _check_external_health,
         _check_pause_mode,
-        _create_orchestrator_error_alerts,
     )
     from app.autonomous_research import _check_idle_research  # noqa: PLC0415
     from app.task_lifecycle import _verify_pr_merged, _spawn_pipeline_task  # noqa: PLC0415

@@ -315,7 +315,7 @@ async def stale_branch_cleanup_service():
 
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
-    from app.main import _get_deploy_state_for_update  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
 
     try:
         serializable = {}
@@ -339,8 +339,7 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.main import _get_deploy_state_for_update  # noqa: PLC0415
-    import app.main as _app_main  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak  # noqa: PLC0415
 
     try:
         from app.compute import _zone_health, _zone_lock
@@ -351,8 +350,8 @@ async def _persist_zone_health():
                     k: v.isoformat() if isinstance(v, datetime) else v
                     for k, v in data.items()
                 }
-        snapshot["_pause_failure_streak"] = _app_main._pause_failure_streak
-        snapshot["_health_recovery_streak"] = _app_main._health_recovery_streak
+        snapshot["_pause_failure_streak"] = _pause_failure_streak
+        snapshot["_health_recovery_streak"] = _health_recovery_streak
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:

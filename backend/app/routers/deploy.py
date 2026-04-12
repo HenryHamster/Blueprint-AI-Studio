@@ -53,7 +53,7 @@ async def pause_pipeline(
     old_vms = runtime_config["max_concurrent_vms"]
     runtime_config["max_concurrent_vms"] = 0
     logger.warning(f"[ADMIN] Pipeline PAUSED manually (was max_concurrent_vms={old_vms})")
-    from app.main import broadcast_deploy_state
+    from app.deploy_health import broadcast_deploy_state
     await broadcast_deploy_state()
     return {"status": "paused", "previous_max_vms": old_vms}
 
@@ -89,7 +89,7 @@ async def resume_pipeline(
     session.add(state)
     await session.commit()
     logger.warning(f"[ADMIN] Pipeline RESUMED (max_concurrent_vms={restore_vms})")
-    from app.main import broadcast_deploy_state
+    from app.deploy_health import broadcast_deploy_state
     await broadcast_deploy_state()
     return {"status": "resumed", "max_concurrent_vms": restore_vms}
 
@@ -101,7 +101,6 @@ async def reset_deploy_health(
 ):
     """Force-reset health state and resume the pipeline. Emergency operator escape hatch."""
     from app.shared_state import runtime_config, external_health
-    import app.main as _main_module
 
     state = await session.get(DeploymentState, 1)
     if not state:
@@ -118,10 +117,11 @@ async def reset_deploy_health(
         if key != "failed_deps" and isinstance(external_health[key], bool):
             external_health[key] = True
 
-    # Reset in-memory streak counters in main.py
+    # Reset in-memory streak counters in deploy_health.py
     try:
-        _main_module._pause_failure_streak = 0
-        _main_module._health_recovery_streak = 0
+        import app.deploy_health as _dh
+        _dh._pause_failure_streak = 0
+        _dh._health_recovery_streak = 0
     except Exception:
         pass
 
@@ -148,7 +148,7 @@ async def reset_deploy_health(
     await session.commit()
 
     logger.warning(f"[ADMIN] Health force-reset — pipeline RESUMED (max_concurrent_vms={restore_vms})")
-    from app.main import broadcast_deploy_state
+    from app.deploy_health import broadcast_deploy_state
     await broadcast_deploy_state()
     return await build_deploy_state_payload(session)
 
@@ -176,7 +176,7 @@ async def mark_deploy_stable(
     deploy_monitoring["window_start"] = None
     deploy_monitoring["task_results"] = deque(maxlen=100)
     logger.warning(f"[ADMIN] Deploy manually marked STABLE — failure history cleared (sha={state.current_sha[:8]})")
-    from app.main import broadcast_deploy_state
+    from app.deploy_health import broadcast_deploy_state
     await broadcast_deploy_state()
     return {"status": "stable", "sha": state.current_sha}
 
@@ -203,7 +203,7 @@ async def trigger_rollback(
         raise HTTPException(status_code=400, detail="Already rolled back — use resume or mark-stable first")
 
     # Get causation analysis for the rollback reason
-    from app.main import should_rollback
+    from app.deploy_health import should_rollback
     _, analysis_reason, _ = should_rollback()
 
     # Attempt Cloud Run traffic shift via gcloud
@@ -244,7 +244,7 @@ async def trigger_rollback(
     deploy_monitoring["window_start"] = None
 
     logger.warning(f"[ADMIN] ROLLBACK triggered: {state.current_sha[:8]} → {state.last_known_good_sha[:8]}")
-    from app.main import broadcast_deploy_state
+    from app.deploy_health import broadcast_deploy_state
     await broadcast_deploy_state()
 
     return {

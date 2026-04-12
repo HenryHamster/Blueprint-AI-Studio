@@ -481,6 +481,8 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
         )
     )
     assert len(result.scalars().all()) == 0, "Hash-duplicate finding must not create a task"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, "Research task must be auto-completed when all findings are duplicates"
 
 
 @pytest.mark.asyncio
@@ -533,6 +535,8 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
         )
     )
     assert len(result.scalars().all()) == 0, "Word-overlap duplicate must not create a task"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, "Research task must be auto-completed when all findings are duplicates"
 
 
 @pytest.mark.asyncio

@@ -210,8 +210,8 @@ class TestDirectionLifecycleInvariants:
 # Direction d-3d050b18: no new functions added to main.py; all new functionality
 # goes in extracted modules.
 
-MAIN_PY_MAX_LINES = 2910      # Ratchet down as extractions land
-MAIN_PY_MAX_FUNCTIONS = 51    # Ratchet down as extractions land
+MAIN_PY_MAX_LINES = 2500      # Ratchet down as extractions land
+MAIN_PY_MAX_FUNCTIONS = 40    # Ratchet down as extractions land
 MAIN_PY_MAX_EXTERNAL_IMPORTS = 30  # Ratchet down as import redirects land
 
 
@@ -468,6 +468,62 @@ class TestAutonomousResearchFreeze:
         assert func_count <= AUTONOMOUS_RESEARCH_MAX_FUNCTIONS, (
             f"autonomous_research.py has {func_count} functions, exceeding the ceiling of "
             f"{AUTONOMOUS_RESEARCH_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+# ── Deploy Health Module Size Guards ────────────────────────────────────────
+# Direction d-3d050b18: deploy health functions extracted from main.py
+
+DEPLOY_HEALTH_MAX_LINES = 490
+DEPLOY_HEALTH_MAX_FUNCTIONS = 10
+
+
+def _get_deploy_health_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "deploy_health.py")
+
+
+class TestDeployHealthFreeze:
+    """Enforce the deploy_health.py freeze: no new functions, no line growth."""
+
+    def test_deploy_health_line_count(self):
+        """deploy_health.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to deploy_health.py.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_deploy_health_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= DEPLOY_HEALTH_MAX_LINES, (
+            f"deploy_health.py has {count} lines, exceeding the ceiling of "
+            f"{DEPLOY_HEALTH_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_deploy_health_function_count(self):
+        """deploy_health.py must not gain new functions.
+
+        If this fails: a new function was added to deploy_health.py.
+        New functionality must go in an appropriate extracted module instead.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_deploy_health_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= DEPLOY_HEALTH_MAX_FUNCTIONS, (
+            f"deploy_health.py has {func_count} functions, exceeding the ceiling of "
+            f"{DEPLOY_HEALTH_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules. "
             "Once a function-removing extraction lands, ratchet the ceiling down."
         )
