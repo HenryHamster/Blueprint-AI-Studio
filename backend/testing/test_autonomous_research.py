@@ -964,7 +964,7 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
 
 @pytest.mark.asyncio
 async def test_research_history_entry_has_correct_fields(db_session, mocker):
-    """research_history gets a new entry with timestamp, task_id, tasks_created, finding_titles."""
+    """research_history gets a new entry with timestamp, task_id, tasks_created, summary."""
     direction_id = "d-history1"
     direction = {
         **_active_direction(direction_id, "History fields direction"),
@@ -997,7 +997,7 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
     entry = history[0]
     assert entry["task_id"] == str(task.id)
     assert entry["tasks_created"] == 1
-    assert finding_title in entry.get("finding_titles", [])
+    assert finding_title[:60] in entry.get("summary", "")
     assert datetime.fromisoformat(entry["timestamp"]) >= before
 
 
