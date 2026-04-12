@@ -44,6 +44,7 @@ class DirectionPayload(BaseModel):
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
     paths: Optional[List[str]] = None
     completion_criteria: Optional[str] = Field(default=None, max_length=COMPLETION_CRITERIA_MAX)
+    conflicts_with: Optional[List[str]] = Field(default=None, description="Direction IDs that shouldn't run in parallel with this one")
 
 
 @router.get("/projects/{project_id}/directions")
@@ -90,6 +91,13 @@ async def add_direction(
         direction["completion_criteria"] = payload.completion_criteria
     else:
         logger.warning("Direction created without completion_criteria: %s", direction["id"])
+    if payload.conflicts_with:
+        # Validate referenced IDs exist
+        existing_ids = {d.get("id") for d in (project.directions or [])}
+        invalid = [cid for cid in payload.conflicts_with if cid not in existing_ids]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown direction IDs in conflicts_with: {invalid}")
+        direction["conflicts_with"] = payload.conflicts_with
 
     directions = list(project.directions or [])
     directions.append(direction)
@@ -252,6 +260,13 @@ async def update_direction(
     if "completion_criteria" in payload and payload["completion_criteria"] is not None:
         if not isinstance(payload["completion_criteria"], str) or len(payload["completion_criteria"]) > COMPLETION_CRITERIA_MAX:
             raise HTTPException(status_code=400, detail=f"completion_criteria must be a string of at most {COMPLETION_CRITERIA_MAX} characters")
+    if "conflicts_with" in payload and payload["conflicts_with"] is not None:
+        if not isinstance(payload["conflicts_with"], list) or not all(isinstance(c, str) for c in payload["conflicts_with"]):
+            raise HTTPException(status_code=400, detail="conflicts_with must be a list of direction ID strings")
+        existing_ids = {d.get("id") for d in (project.directions or []) if d.get("id") != direction_id}
+        invalid = [cid for cid in payload["conflicts_with"] if cid not in existing_ids]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown direction IDs in conflicts_with: {invalid}")
 
     # Direction cap check: if reactivating, ensure we won't exceed the cap
     if payload.get("status") == "active":
@@ -307,6 +322,11 @@ async def update_direction(
                     d.pop("completion_criteria", None)
                 elif isinstance(payload["completion_criteria"], str):
                     d["completion_criteria"] = payload["completion_criteria"]
+            if "conflicts_with" in payload:
+                if payload["conflicts_with"] is None or (isinstance(payload["conflicts_with"], list) and len(payload["conflicts_with"]) == 0):
+                    d.pop("conflicts_with", None)
+                elif isinstance(payload["conflicts_with"], list):
+                    d["conflicts_with"] = payload["conflicts_with"]
             updated = True
             break
 

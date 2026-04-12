@@ -563,14 +563,10 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )
     if not active_directions and not force_strategic:
         return
-    # Pick ONE direction per research task to avoid putting all on cooldown at once.
+    # Pick up to N non-conflicting directions for parallel research.
     # active_directions preserves UI drag-order (index 0 = highest priority).
-    # Among eligible directions, prefer those never researched or oldest researched.
-    chosen_direction: Optional[dict] = None
     # Build vision priority lookup: directions tagged with a system_id that appears
-    # earlier in vision.priorities get a lower (better) rank.  This makes vision
-    # operational — the strategic agent's priority ordering actually influences which
-    # direction gets researched next.
+    # earlier in vision.priorities get a lower (better) rank.
     vision_priorities = (vision_data.get("priorities") or []) if vision_data else []
     vision_priority_index: dict = {}
     for idx, sys_id in enumerate(vision_priorities):
@@ -584,36 +580,65 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             return len(vision_priorities)  # neutral — don't penalize untagged
         return vision_priority_index.get(sid, len(vision_priorities) + 1)  # unlisted slightly below neutral
 
+    # Sort all eligible directions by priority for greedy selection
+    chosen_directions: list[dict] = []
     if active_directions:
         import random
         priority_rank = {"high": 0, "medium": 1, "low": 2}
         never_researched = [d for d in active_directions if not d.get("last_researched_at")]
-        if never_researched:
-            # Pick from the highest priority tier among never-researched,
-            # breaking ties by vision alignment
-            best_pri = min(priority_rank.get(d.get("priority", "medium"), 1) for d in never_researched)
-            top_tier = [d for d in never_researched if priority_rank.get(d.get("priority", "medium"), 1) == best_pri]
-            if vision_priorities and len(top_tier) > 1:
-                top_tier.sort(key=_vision_rank)
-                best_vr = _vision_rank(top_tier[0])
-                top_tier = [d for d in top_tier if _vision_rank(d) == best_vr]
-            chosen_direction = random.choice(top_tier)
-        else:
-            # All have been researched — sort by priority, vision alignment,
-            # saturation, merge rate, then oldest researched
-            for d in active_directions:
+        already_researched = [d for d in active_directions if d.get("last_researched_at")]
+
+        # Sort never-researched by priority + vision alignment
+        never_researched.sort(key=lambda d: (
+            priority_rank.get(d.get("priority", "medium"), 1),
+            _vision_rank(d),
+        ))
+        # Sort already-researched by priority, vision, saturation, merge rate, staleness
+        already_researched.sort(key=lambda d: (
+            priority_rank.get(d.get("priority", "medium"), 1),
+            _vision_rank(d),
+            1 if d.get("possibly_saturated") else 0,
+            -(_compute_merge_rate(d) * _compute_momentum_factor(d)),
+            d.get("last_researched_at") or ""
+        ))
+        # Prioritize never-researched, then already-researched
+        sorted_eligible = never_researched + already_researched
+
+        # Greedy selection: pick non-conflicting directions up to the parallel cap.
+        # conflicts_with is a mutual exclusion list — if A lists B, they can't run
+        # at the same time regardless of which was picked first.
+        blocked_ids: set = set(busy_direction_ids)
+        # Expand blocked set from already-running directions' conflicts
+        all_dir_map = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+        for did in busy_direction_ids:
+            d = all_dir_map.get(did)
+            if d:
+                blocked_ids.update(d.get("conflicts_with") or [])
+        for d in (project.directions or []):
+            if any(rid in (d.get("conflicts_with") or []) for rid in busy_direction_ids):
+                blocked_ids.add(d.get("id"))
+
+        max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
+        for d in sorted_eligible:
+            did = d.get("id")
+            if did in blocked_ids:
+                continue
+            chosen_directions.append(d)
+            # Block this direction and its conflicts
+            blocked_ids.add(did)
+            blocked_ids.update(d.get("conflicts_with") or [])
+            for other in sorted_eligible:
+                if did in (other.get("conflicts_with") or []):
+                    blocked_ids.add(other.get("id"))
+            if len(chosen_directions) >= max_parallel:
+                break
+
+        if chosen_directions:
+            for d in chosen_directions:
                 did = d.get("id", "?")
                 merge_rate = _compute_merge_rate(d)
                 momentum = _compute_momentum_factor(d)
-                logger.debug(f"[RESEARCH] Direction {did} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
-            active_directions.sort(key=lambda d: (
-                priority_rank.get(d.get("priority", "medium"), 1),
-                _vision_rank(d),  # vision-aligned directions get researched sooner
-                1 if d.get("possibly_saturated") else 0,
-                -(_compute_merge_rate(d) * _compute_momentum_factor(d)),  # higher merge rate × momentum preferred
-                d.get("last_researched_at") or ""
-            ))
-            chosen_direction = active_directions[0]
+                logger.debug(f"[RESEARCH] Selected direction {did} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 
@@ -665,17 +690,21 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         session.add(project)
         logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{research_spawn_count - 1}, vision rev {(project.vision or {}).get('revision', 0)})")
 
-    # Guard: no research task actively running (queued/provisioning/in_progress).
+    # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
+    max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
     active_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
             Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
     )).scalars().all()
-    for t in active_tasks:
-        if (t.first_payload).get("type") == "research":
-            return
+    active_research_count = sum(1 for t in active_tasks if (t.first_payload).get("type") == "research")
+    if active_research_count >= max_parallel:
+        return
+    # Reduce chosen_directions to the remaining slots
+    remaining_slots = max_parallel - active_research_count
+    chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
     from sqlalchemy import func
     one_hour_ago = _utcnow() - timedelta(hours=1)
@@ -702,9 +731,13 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 
+    # Also cap by per-project rate limit
+    rate_limit_remaining = _runtime_config["max_autonomous_tasks_per_hour"] - recent_research_count
+    if rate_limit_remaining < len(chosen_directions):
+        chosen_directions = chosen_directions[:max(0, rate_limit_remaining)]
+
     # If no active directions exist (e.g., all paused), only strategic runs (already spawned above).
-    # Don't attempt tactical research — chosen_direction would be None.
-    if not active_directions:
+    if not chosen_directions and not active_directions:
         return
 
     # Autonomous research creates independent tasks (no parent_task_id), so they
@@ -727,12 +760,22 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     if is_strategic:
         is_undirected = False
 
-    # Build tactical research payload
-    if True:
+    # Handle undirected cycle (only first slot, rest are directed)
+    anomalies = None
+    if is_undirected:
+        anomalies = await _compute_research_anomalies(project.id, session)
+
+    # Build and spawn research tasks — one per chosen direction (or one undirected)
+    directions_to_spawn = chosen_directions if chosen_directions else [None]  # None = undirected
+    if is_undirected:
+        directions_to_spawn = [None]  # Undirected replaces directed for this cycle
+
+    spawned_tasks = []
+    for chosen_direction in directions_to_spawn:
         research_payload: dict = {
             "type": "research",
             "directions": all_active_directions,
-            "current_direction_id": None if is_undirected else chosen_direction.get("id"),
+            "current_direction_id": None if chosen_direction is None else chosen_direction.get("id"),
             "design_doc": project.design_doc or {},
             "base_branch": base_branch,
             **({"model": research_model} if research_model else {}),
@@ -740,66 +783,64 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
         # Pre-extract design doc context for the current direction's system_id
-        # so the research agent sees relevant architectural context upfront
-        if not is_undirected and chosen_direction:
+        if chosen_direction:
             dir_system_id = chosen_direction.get("system_id")
             if dir_system_id and project.design_doc:
                 doc = project.design_doc
                 doc_systems = doc.get("systems", [])
                 doc_capabilities = doc.get("capabilities", {})
                 relevant: dict = {"system_id": dir_system_id}
-                # Find matching system entry
                 for sys in (doc_systems if isinstance(doc_systems, list) else []):
                     if isinstance(sys, dict) and sys.get("id") == dir_system_id:
                         relevant["system"] = sys
                         break
-                # Find capabilities that might relate (by keyword match on system name/id)
                 if isinstance(doc_capabilities, dict):
-                    sys_name = (relevant.get("system", {}).get("name") or dir_system_id).lower()
-                    related_caps = {}
-                    for cap_name, cap_val in doc_capabilities.items():
-                        if isinstance(cap_val, dict) and cap_val.get("status") in ("missing", "partial"):
-                            related_caps[cap_name] = cap_val
+                    related_caps = {
+                        cap_name: cap_val for cap_name, cap_val in doc_capabilities.items()
+                        if isinstance(cap_val, dict) and cap_val.get("status") in ("missing", "partial")
+                    }
                     if related_caps:
                         relevant["missing_capabilities"] = related_caps
                 research_payload["direction_design_context"] = relevant
-        if not is_undirected and chosen_direction.get("possibly_complete"):
-            research_payload["direction_possibly_complete"] = True
-            research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
-        if is_undirected:
-            anomalies = await _compute_research_anomalies(project.id, session)
+            if chosen_direction.get("possibly_complete"):
+                research_payload["direction_possibly_complete"] = True
+                research_payload["completion_suggestion"] = chosen_direction.get("completion_suggestion", "")
+        if chosen_direction is None:
             if anomalies:
                 research_payload["anomaly_signals"] = anomalies
-        if is_undirected:
             direction_text = "Cross-cutting codebase analysis"
             logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})")
         else:
             direction_text = (chosen_direction.get("text") or "general improvement")[:80]
-    new_task = Task(
-        project_id=project.id,
-        title=f"Research: {direction_text}",
-        description=f"Autonomous research for: {direction_text}",
-        payloads=[research_payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-    )
-    session.add(new_task)
-    # Increment spawn counter so undirected/strategic frequency checks advance
-    await _increment_research_spawn_count(project, session)
-    history = TaskHistory(
-        task_id=new_task.id, action="SPAWNED",
-        details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}
-    )
-    session.add(history)
+
+        new_task = Task(
+            project_id=project.id,
+            title=f"Research: {direction_text}",
+            description=f"Autonomous research for: {direction_text}",
+            payloads=[research_payload],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        await _increment_research_spawn_count(project, session)
+        history = TaskHistory(
+            task_id=new_task.id, action="SPAWNED",
+            details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}
+        )
+        session.add(history)
+        spawned_tasks.append(new_task)
+
     await session.commit()
-    await session.refresh(new_task)
 
-    # Track this task for HALF_OPEN → CLOSED transition
-    if breaker["state"] == "HALF_OPEN":
-        breaker["half_open_task_id"] = str(new_task.id)
+    # Track first task for HALF_OPEN → CLOSED transition
+    if breaker["state"] == "HALF_OPEN" and spawned_tasks:
+        breaker["half_open_task_id"] = str(spawned_tasks[0].id)
 
-    logger.info(f"[AUTONOMOUS] Spawned research task {new_task.id} for project {project.id}")
+    for t in spawned_tasks:
+        logger.info(f"[AUTONOMOUS] Spawned research task {t.id} for project {project.id}")
+    if len(spawned_tasks) > 1:
+        logger.info(f"[AUTONOMOUS] Spawned {len(spawned_tasks)} parallel research tasks for project {project.id}")
 
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):

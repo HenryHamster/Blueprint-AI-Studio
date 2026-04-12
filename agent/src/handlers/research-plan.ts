@@ -677,10 +677,11 @@ Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Jus
 ./strategic set-vision '{"purpose": "...", "success_criteria": ["..."], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "..."}'
 
 # Create research directions (max 5)
-./strategic create-direction '{"text": "...", "priority": "high|medium|low", "system_id": "sys-x", "rationale": "..."}'
+# conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel
+./strategic create-direction '{"text": "...", "priority": "high|medium|low", "system_id": "sys-x", "rationale": "...", "conflicts_with": ["d-xxx"]}'
 
-# Update existing directions
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium"}, "rationale": "..."}'
+# Update existing directions (can set conflicts_with to control parallel execution)
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "conflicts_with": ["d-yyy"]}, "rationale": "..."}'
 
 # Retire directions
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
