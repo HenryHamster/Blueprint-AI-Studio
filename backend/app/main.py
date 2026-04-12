@@ -103,13 +103,15 @@ def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[Lis
         return lst[-max_items:]
     return lst
 
-STRATEGIC_DIRECTION_TEXT_MAX = 2000
-STRATEGIC_RATIONALE_MAX = 2000
-STRATEGIC_SYSTEM_ID_MAX = 100
-STRATEGIC_NOTES_HISTORY_MAX = 50
-STRATEGIC_MESSAGE_CONTENT_MAX = 20000
-STRATEGIC_RESOLUTION_MAX = 20000
-STATUS_LATEST_MESSAGE_MAX = 2000
+from app.strategic_constants import (  # noqa: E402
+    STRATEGIC_DIRECTION_TEXT_MAX,
+    STRATEGIC_RATIONALE_MAX,
+    STRATEGIC_SYSTEM_ID_MAX,
+    STRATEGIC_NOTES_HISTORY_MAX,
+    STRATEGIC_MESSAGE_CONTENT_MAX,
+    STRATEGIC_RESOLUTION_MAX,
+    STATUS_LATEST_MESSAGE_MAX,
+)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
@@ -147,78 +149,6 @@ from app.max_plan_pool import (  # noqa: E402
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
-
-def classify_failure(task: Task, logs: Optional[str] = None) -> str:
-    """Classify a task failure for deployment monitoring.
-    Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
-    status_msg = (task.latest_status_message or "").lower()
-    logs_lower = (logs or "").lower()
-    combined = status_msg + " " + logs_lower
-
-    # Database / internal service unavailable — checked before provision failures because
-    # PostgreSQL errors like "could not connect to server: Connection refused" contain
-    # "connection refused" which would otherwise be misclassified as PROVISION_FAILURE.
-    if any(kw in combined for kw in ["could not connect to server", "connection to server",
-                                      "database connection", "psycopg", "asyncpg",
-                                      "operator does not exist"]):
-        return "EXTERNAL_API"
-
-    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion
-    if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
-                                      "vm failed to start", "failed to provision",
-                                      "connection refused", "connection reset by peer",
-                                      "timed out waiting for operation", "sshd", "startup script",
-                                      "no space left on device", "disk quota exceeded",
-                                      "filesystem is full",
-                                      "address already in use", "failed to connect",
-                                      "service is temporarily unavailable", "compute.googleapis.com",
-                                      "resource not found", "container killed"]):
-        return "PROVISION_FAILURE"
-
-    # Transient API overload — server-side, not account-specific (must be checked before RATE_LIMIT
-    # because "overloaded" would otherwise trigger the rate limit classifier and disable accounts)
-    if "overloaded" in combined and not any(kw in combined for kw in ["usage limit", "usage exhausted", "billing", "credit"]):
-        return "EXTERNAL_API"
-
-    # GitHub rate limits (429, "rate limit") — external API issue, NOT Claude account exhaustion.
-    # Must be checked before generic RATE_LIMIT to prevent disabling Claude accounts for GitHub outages.
-    if any(gh_kw in combined for gh_kw in ["github", "api.github.com"]) and \
-       any(kw in combined for kw in ["rate limit", "429", "too many requests"]):
-        return "EXTERNAL_API"
-
-    # Rate limit — Claude API usage exhausted, account-level billing/quota issues
-    if any(kw in combined for kw in RATE_LIMIT_KEYWORDS):
-        return "RATE_LIMIT"
-
-    # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
-    if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
-                                      "502 bad gateway", "503 service unavailable",
-                                      "github api error", "claude api",
-                                      "connection timed out", "name resolution failed",
-                                      "ssl", "certificate",
-                                      "context_length_exceeded", "token limit exceeded",
-                                      "could not resolve hostname", "name or service not known",
-                                      "network unreachable"]):
-        return "EXTERNAL_API"
-
-    # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
-    # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
-    # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
-    # "non-zero exit code" and "process exited" are code errors, not timeouts.
-    # Only use specific forms: "execution timed out", "node process killed", "oom killer".
-    if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
-                                      "execution timed out", "sigterm",
-                                      "out of memory", "oom-kill", "memory limit exceeded",
-                                      "cannot allocate memory",
-                                      "exit code 137", "exit code 143",
-                                      "exit code 124", "exit code 139",
-                                      "node process killed",
-                                      "oom killer", "killed by", "cgroup",
-                                      "[fatal:", "fatal error", "process crashed"]):
-        return "AGENT_TIMEOUT"
-
-    # Default: code error
-    return "CODE_ERROR"
 
 async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transition") -> bool:
     """Guarantee VM deletion for any terminal state transition.
@@ -2069,6 +1999,7 @@ async def update_agent_status(
 
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
+    from app.failure_classification import classify_failure  # noqa: PLC0415
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         # Record result for deployment monitoring and update Prometheus counters
         # Wrapped in try-except so slot release (below) always runs even if

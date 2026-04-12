@@ -37,8 +37,8 @@ async def reaper_service():
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
         record_task_result,
-        classify_failure,
     )
+    from app.failure_classification import classify_failure  # noqa: PLC0415
     from app.broadcast import broadcast_to_project  # noqa: PLC0415
     from app.task_lifecycle import _requeue_parent_task, _check_and_trigger_rollup  # noqa: PLC0415
 

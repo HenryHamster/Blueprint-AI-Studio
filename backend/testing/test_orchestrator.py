@@ -17,9 +17,7 @@ import app.main as _main_module
 import app.shared_state as _shared_state
 from app.reaper import reaper_service
 from app.autonomous_research import _spawn_research_task
-from app.main import (
-    classify_failure,
-)
+from app.failure_classification import classify_failure
 from app.research_completion import _handle_research_completion
 from app.max_plan_pool import (
     load_max_plan_pool,
@@ -948,6 +946,86 @@ class TestResearchCompletion:
         assert task_high.priority > task_low.priority, (
             f"High-priority task ({task_high.priority}) should have higher numeric priority than low ({task_low.priority})"
         )
+
+    # ── Test 8: all findings deduped → auto-complete with direction note ────
+
+    @pytest.mark.asyncio
+    async def test_all_findings_deduped_auto_completes_task(self, db_session, mocker):
+        """
+        When _handle_research_completion produces 0 child tasks (all findings
+        are duplicates), the research task must transition to COMPLETED (not
+        stuck in EVALUATING) and a direction note must be written.
+        """
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
+        mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+        mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
+
+        direction_id = f"d-{uuid.uuid4().hex[:8]}"
+        direction = {
+            "id": direction_id,
+            "text": "Improve test coverage",
+            "status": "active",
+            "notes": [],
+        }
+        project = Project(
+            name="Zero children test",
+            user_id="user1",
+            autonomous_enabled=True,
+            directions=[direction],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Existing task whose title matches the finding — triggers dedup
+        existing_task = Task(
+            project_id=project.id,
+            title="improve test coverage for auth module",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(existing_task)
+
+        research_task = Task(
+            project_id=project.id,
+            title="Research: test coverage scan",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            context={"direction_id": direction_id},
+        )
+        db_session.add(research_task)
+        await db_session.commit()
+        await db_session.refresh(research_task)
+
+        # Single finding that duplicates the existing task
+        logs = self._findings_json(
+            {
+                "title": "improve test coverage for auth module",
+                "prompt": "Add unit tests for the authentication service.",
+                "priority": "medium",
+            },
+        )
+
+        await _handle_research_completion(research_task, logs, db_session)
+
+        await db_session.refresh(research_task)
+        assert research_task.status == TaskStatus.COMPLETED, (
+            f"Research task with 0 children should be COMPLETED, got {research_task.status}"
+        )
+        assert "auto-completed" in (research_task.latest_status_message or "").lower()
+
+        # Verify direction note was written
+        await db_session.refresh(project)
+        d = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
+        assert d is not None
+        notes = d.get("notes", [])
+        assert len(notes) >= 1, "A direction note should be appended for zero-child completion"
+        assert "0 tasks" in notes[-1].get("msg", "")
 
 
 # ── Tests: classify_failure ──────────────────────────────────────────────────

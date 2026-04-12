@@ -17,7 +17,8 @@ from sqlmodel import SQLModel
 
 from app.research_completion import _parse_research_findings
 from app.task_completion import _validate_plan_dependencies
-from app.main import classify_failure, record_task_result, should_rollback
+from app.failure_classification import classify_failure
+from app.main import record_task_result, should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
 from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup, _spawn_pipeline_task
@@ -1438,7 +1439,7 @@ async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
         create=True,
     )
     # Patch classify_failure to return CODE_ERROR for all tasks
-    mocker.patch("app.main.classify_failure", return_value="CODE_ERROR")
+    mocker.patch("app.failure_classification.classify_failure", return_value="CODE_ERROR")
 
     project = Project(name="AnomalyTest", user_id="u1")
     spawn_db.add(project)

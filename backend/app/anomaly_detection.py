@@ -60,7 +60,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     Returns a list of {signal: str, severity: 'high'|'medium', details: str} dicts.
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
-    from app.main import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure  # noqa: PLC0415
 
     now = _utcnow()
     window_48h = now - timedelta(hours=48)

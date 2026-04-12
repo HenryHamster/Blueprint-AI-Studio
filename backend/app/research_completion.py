@@ -788,7 +788,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Process direction notes — append to the target direction's notes list
     if direction_notes:
         # Deferred import of strategic caps — shared with main.py
-        from app.main import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
+        from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
         note_project = await session.get(Project, task.project_id)
         if note_project:
             note_directions = list(note_project.directions or [])

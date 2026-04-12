@@ -353,7 +353,7 @@ async def claim_task(
         for a in completed_artifacts:
             artifacts_by_completed_task.setdefault(a.task_id, []).append(a)
 
-        from app.main import classify_failure
+        from app.failure_classification import classify_failure
         recently_completed_tasks = []
         for t in completed_tasks_rows:
             p = t.first_payload

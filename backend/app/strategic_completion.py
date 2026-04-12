@@ -249,7 +249,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         creates_count = 0
 
         # Deferred import to avoid circular dependency with app.main.
-        from app.main import (  # noqa: PLC0415
+        from app.strategic_constants import (  # noqa: PLC0415
             STRATEGIC_DIRECTION_TEXT_MAX,
             STRATEGIC_NOTES_HISTORY_MAX,
             STRATEGIC_RATIONALE_MAX,
@@ -386,7 +386,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace
-    from app.main import STRATEGIC_MESSAGE_CONTENT_MAX, STRATEGIC_RESOLUTION_MAX  # noqa: PLC0415
+    from app.strategic_constants import STRATEGIC_MESSAGE_CONTENT_MAX, STRATEGIC_RESOLUTION_MAX  # noqa: PLC0415
 
     # Process messages from agent (questions, blockers, notes)
     msgs_created = 0

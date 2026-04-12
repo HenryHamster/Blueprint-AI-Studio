@@ -271,7 +271,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     - failure_distribution: {failure_class: count} top 3
     - direction_stats: [{direction_id, merge_rate, cycles, possibly_saturated}]
     """
-    from app.main import classify_failure as _classify_failure
+    from app.failure_classification import classify_failure as _classify_failure
 
     _now = _utcnow()
     window_start = _now - timedelta(hours=24)
@@ -678,7 +678,7 @@ async def get_digest(
         })
 
     # --- failure_groups (classify failures by type) ---
-    from app.main import classify_failure as _classify_failure
+    from app.failure_classification import classify_failure as _classify_failure
     _failure_class_labels = {
         "CODE_ERROR": "Code Error",
         "PROVISION_FAILURE": "Provision Failure",
