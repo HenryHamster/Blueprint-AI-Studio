@@ -388,10 +388,10 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "title": "Add unit tests for directions",
             "description": "Improve coverage of the directions module",
@@ -456,7 +456,7 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
     await db_session.commit()
     await db_session.refresh(task)
 
-    mocker.patch("app.task_completion._parse_research_findings", return_value=[])  # no findings
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])  # no findings
 
     await _handle_research_completion(task, "", db_session)
 
@@ -515,10 +515,10 @@ async def test_handle_research_completion_direction_update_sets_pending_update(d
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "type": "direction_update",
             "direction_id": direction_id,
@@ -597,10 +597,10 @@ async def test_handle_research_completion_direction_note_appends_note(db_session
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "type": "direction_note",
             "direction_id": direction_id,
@@ -1180,10 +1180,10 @@ async def test_auto_completion_triggers(db_session, mocker):
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "title": "Final improvement",
             "description": "Last polish",
@@ -1264,10 +1264,10 @@ async def test_auto_completion_skips_unsaturated(db_session, mocker):
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "title": "Active finding",
             "description": "Lots to do",
@@ -1337,10 +1337,10 @@ async def test_auto_completion_skips_insufficient_prs(db_session, mocker):
     mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
     mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
-    mocker.patch("app.task_completion._validate_plan_dependencies", return_value=True)
-    mocker.patch("app.task_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
-        "app.task_completion._parse_research_findings",
+        "app.research_completion._parse_research_findings",
         return_value=[{
             "title": "Small finding",
             "description": "Minor tweak",

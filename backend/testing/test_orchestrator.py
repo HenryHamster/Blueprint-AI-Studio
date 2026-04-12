@@ -20,7 +20,7 @@ from app.main import (
     _spawn_research_task,
     classify_failure,
 )
-from app.task_completion import _handle_research_completion
+from app.research_completion import _handle_research_completion
 from app.max_plan_pool import (
     load_max_plan_pool,
     select_max_plan_account,

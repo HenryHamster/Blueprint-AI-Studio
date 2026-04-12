@@ -236,3 +236,115 @@ class TestMainPyFreeze:
             "Update import sites to point to the extracted module instead of app.main. "
             "See direction d-3d050b18."
         )
+
+
+# ── Orchestrator Module Size Guards ─────────────────────────────────────────
+# Direction d-51edc526: proactive orchestrator decomposition ratchet
+
+TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategic extraction
+TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
+
+TASK_LIFECYCLE_MAX_LINES = 2100      # Ratchet down as extractions land
+TASK_LIFECYCLE_MAX_FUNCTIONS = 10    # Ratchet down as extractions land
+
+
+def _get_task_completion_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "task_completion.py")
+
+
+def _get_task_lifecycle_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "task_lifecycle.py")
+
+
+class TestTaskCompletionFreeze:
+    """Enforce the task_completion.py freeze: no new functions, no line growth."""
+
+    def test_task_completion_line_count(self):
+        """task_completion.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to task_completion.py.
+        New functionality must go in extracted modules (e.g., anomaly_detection.py,
+        research_completion.py). Once a line-reducing extraction lands, ratchet
+        the ceiling down.
+        """
+        path = _get_task_completion_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= TASK_COMPLETION_MAX_LINES, (
+            f"task_completion.py has {count} lines, exceeding the ceiling of "
+            f"{TASK_COMPLETION_MAX_LINES}. "
+            "New functionality must go in extracted modules (e.g., anomaly_detection.py, "
+            "research_completion.py). Once a line-reducing extraction lands, ratchet the "
+            "ceiling down."
+        )
+
+    def test_task_completion_function_count(self):
+        """task_completion.py must not gain new functions.
+
+        If this fails: a new function was added to task_completion.py.
+        New functionality must go in extracted modules (e.g., anomaly_detection.py,
+        research_completion.py). Once a line-reducing extraction lands, ratchet the
+        ceiling down.
+        """
+        import ast
+        path = _get_task_completion_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= TASK_COMPLETION_MAX_FUNCTIONS, (
+            f"task_completion.py has {func_count} functions, exceeding the ceiling of "
+            f"{TASK_COMPLETION_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules (e.g., anomaly_detection.py, "
+            "research_completion.py). Once a line-reducing extraction lands, ratchet the "
+            "ceiling down."
+        )
+
+
+class TestTaskLifecycleFreeze:
+    """Enforce the task_lifecycle.py freeze: no new functions, no line growth."""
+
+    def test_task_lifecycle_line_count(self):
+        """task_lifecycle.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to task_lifecycle.py.
+        New functionality must go in extracted modules (e.g., review_pipeline.py).
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_task_lifecycle_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= TASK_LIFECYCLE_MAX_LINES, (
+            f"task_lifecycle.py has {count} lines, exceeding the ceiling of "
+            f"{TASK_LIFECYCLE_MAX_LINES}. "
+            "New functionality must go in extracted modules (e.g., review_pipeline.py). "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_task_lifecycle_function_count(self):
+        """task_lifecycle.py must not gain new functions.
+
+        If this fails: a new function was added to task_lifecycle.py.
+        New functionality must go in extracted modules (e.g., review_pipeline.py).
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_task_lifecycle_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= TASK_LIFECYCLE_MAX_FUNCTIONS, (
+            f"task_lifecycle.py has {func_count} functions, exceeding the ceiling of "
+            f"{TASK_LIFECYCLE_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules (e.g., review_pipeline.py). "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )

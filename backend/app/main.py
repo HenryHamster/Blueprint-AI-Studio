@@ -92,11 +92,9 @@ from app.task_lifecycle import (  # noqa: F401 — re-exported for backward comp
 
 logger = logging.getLogger(__name__)
 
-
 def _utcnow() -> datetime:
     """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
 
 def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None) -> str:
     """Cap a string field, appending a human-readable warning if truncation occurred."""
@@ -110,7 +108,6 @@ def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[
         return s[:max_len]
     return s
 
-
 def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[List[str]] = None) -> list:
     """Cap a list to the last N items, warning if older items were dropped."""
     if len(lst) > max_items:
@@ -122,7 +119,6 @@ def _cap_list(lst: list, max_items: int, field_name: str, warnings: Optional[Lis
             )
         return lst[-max_items:]
     return lst
-
 
 STRATEGIC_DIRECTION_TEXT_MAX = 2000
 STRATEGIC_RATIONALE_MAX = 2000
@@ -145,7 +141,6 @@ _last_gcp_vm_count: int = 0
 _last_gcp_vm_check: float = 0.0
 _GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
 
-
 # --- Max Plan Account Pool ---
 # Pool state and logic extracted to max_plan_pool.py. Re-exported here for
 # backward compatibility with callers that import from app.main.
@@ -164,13 +159,11 @@ from app.max_plan_pool import (  # noqa: E402
     recheck_disabled_accounts,
 )
 
-
 # --- Deployment State Management ---
 
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
-
 
 def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
@@ -244,7 +237,6 @@ def classify_failure(task: Task, logs: Optional[str] = None) -> str:
     # Default: code error
     return "CODE_ERROR"
 
-
 async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transition") -> bool:
     """Guarantee VM deletion for any terminal state transition.
 
@@ -281,7 +273,6 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
     logger.error(f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep")
     return False
 
-
 async def _get_actual_gcp_vm_count() -> int:
     """Count actual agent-vm-* instances across all GCP zones.
     Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.
@@ -317,7 +308,6 @@ async def _get_actual_gcp_vm_count() -> int:
         logger.warning(f"[GCP] Failed to count VMs: {e}")
         return _last_gcp_vm_count  # Return stale count on failure
 
-
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 # Webhook dedup state moved to app.routers.github
@@ -339,7 +329,6 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
-
 
 async def _verify_schema_version():
     """Verify the database schema matches the expected alembic revision.
@@ -364,7 +353,6 @@ async def _verify_schema_version():
                 logger.warning("[STARTUP] alembic_version table not found — skipping schema check")
                 return
             raise
-
 
 async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
@@ -575,7 +563,6 @@ async def _init_deployment_state():
         session.add(state)
         await session.commit()
         logger.info(f"[DEPLOY] New deploy detected — revision={_current_revision}, status={state.status}, starting monitoring window")
-
 
 def should_rollback() -> tuple:
     """Causation analysis: determine if failures are caused by the new deploy.
@@ -2763,19 +2750,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 from app.task_completion import (  # noqa: E402 — re-exports for backward compatibility
     _parse_plan_output,
     _extract_json_array,
-    _compute_saturation,
-    _parse_research_context,
-    _parse_eviction_counts,
-    _format_eviction_body,
-    _build_research_context,
-    _compute_research_anomalies,
-    _check_anomaly_proposals,
-    _expire_stale_proposals,
-    _check_direction_health,
-    _check_direction_completion,
-    _is_direction_duplicate,
-    _parse_research_findings,
-    _parse_research_insights,
     _validate_plan_dependencies,
     _log_file_overlaps,
     _inject_file_overlap_deps,
@@ -2785,10 +2759,36 @@ from app.task_completion import (  # noqa: E402 — re-exports for backward comp
     _handle_perf_completion,
     _handle_investigation_completion,
     _handle_design_doc_completion,
-    _handle_strategic_completion,
-    _handle_research_completion,
-    _compute_momentum_factor,
     _compute_first_attempt_succeeded,
+    TASK_PRIORITY_MAP,
+)
+
+from app.anomaly_detection import (  # noqa: E402
+    _normalize_error_message,
+    _error_fingerprint,
+    _compute_research_anomalies,
+    _check_anomaly_proposals,
+    _expire_stale_proposals,
+)
+
+from app.research_completion import (  # noqa: E402
+    _compute_momentum_factor,
+    _update_cycle_history,
+    _compute_saturation,
+    _parse_research_context,
+    _parse_eviction_counts,
+    _format_eviction_body,
+    _build_research_context,
+    _parse_research_findings,
+    _parse_research_insights,
+    _handle_research_completion,
+)
+
+from app.strategic_completion import (  # noqa: E402
+    _check_direction_health,
+    _check_direction_completion,
+    _is_direction_duplicate,
+    _handle_strategic_completion,
 )
 
 

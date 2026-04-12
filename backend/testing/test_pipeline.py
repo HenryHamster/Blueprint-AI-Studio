@@ -23,7 +23,7 @@ from app.main import (
     should_rollback,
 )
 from app.task_completion import _compute_first_attempt_succeeded
-from app.task_completion import _handle_strategic_completion
+from app.strategic_completion import _handle_strategic_completion
 from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup, _spawn_pipeline_task
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
@@ -1387,7 +1387,7 @@ class TestErrorMessageFingerprinting:
     """Tests for _normalize_error_message and _error_fingerprint in task_completion."""
 
     def setup_method(self):
-        from app.task_completion import _normalize_error_message, _error_fingerprint
+        from app.anomaly_detection import _normalize_error_message, _error_fingerprint
         self._normalize = _normalize_error_message
         self._fp = _error_fingerprint
 
@@ -1435,10 +1435,10 @@ class TestErrorMessageFingerprinting:
 @pytest.mark.asyncio
 async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
     """When >3 failures share a class, anomaly dict includes top_patterns."""
-    from app.task_completion import _compute_research_anomalies
+    from app.anomaly_detection import _compute_research_anomalies
 
     mocker.patch(
-        "app.task_completion._compute_research_anomalies.__module__",
+        "app.anomaly_detection._compute_research_anomalies.__module__",
         create=True,
     )
     # Patch classify_failure to return CODE_ERROR for all tasks
