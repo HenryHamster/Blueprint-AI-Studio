@@ -22,7 +22,9 @@ from app.models import (
     AlertSeverity,
     Artifact,
     ArtifactType,
+    MessageType,
     Project,
+    ProjectMessage,
     Task,
     TaskHistory,
     TaskStatus,
@@ -884,22 +886,62 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         session.add(summary_artifact)
 
-    task.status = TaskStatus.EVALUATING
     direction_id = (task.context or {}).get("direction_id", "?")
+    status_msg = (
+        f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
+        + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
+        + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
+    )
+
+    if not child_tasks:
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = status_msg + " — auto-completed (no actionable tasks)"
+        task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
+        session.add(task)
+
+        note = (
+            f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks"
+            f" ({skipped_duplicates} duplicates skipped). "
+            "All findings were either already addressed or not actionable."
+        )
+        project = await session.get(Project, task.project_id)
+        if project and str(direction_id) != "?" and direction_id != "crosscutting":
+            directions = list(project.directions or [])
+            for d in directions:
+                if d.get("id") == direction_id:
+                    d.setdefault("notes", [])
+                    d["notes"] = (d["notes"] or [])[-4:] + [{
+                        "t": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                        "msg": note,
+                    }]
+                    break
+            project.directions = directions
+            flag_modified(project, "directions")
+            session.add(project)
+        elif project:
+            msg = ProjectMessage(
+                project_id=task.project_id,
+                message_type=MessageType.NOTE,
+                from_type="agent",
+                from_task_id=task.id,
+                content=note,
+                context={"source": "research_zero_children", "direction_id": str(direction_id)},
+            )
+            session.add(msg)
+
+        await session.commit()
+        logger.info(f"[RESEARCH] Task {task.id}: 0 children created, auto-completed (direction: {str(direction_id)[:8]})")
+    else:
+        task.status = TaskStatus.EVALUATING
+        task.latest_status_message = status_msg
+        task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
+        session.add(task)
+        await session.commit()
+
     logger.info(
         f"[RESEARCH] Task {task.id}: {len(findings)} raw findings, "
         f"{skipped_duplicates} deduped, {len(child_tasks)} tasks created "
         f"(direction: {str(direction_id)[:8]})"
     )
-    task.latest_status_message = (
-        f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
-        + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
-        + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
-    )
-    task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
-    session.add(task)
-    await session.commit()
-
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
-    logger.info(f"[RESEARCH] Created {len(child_tasks)} tasks from research {task.id}")
