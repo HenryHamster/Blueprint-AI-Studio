@@ -35,6 +35,30 @@ from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
+
+async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
+    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review."""
+    active = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalars().all()
+    return any(
+        (t.first_payload).get("type") in ("design_doc_update", "strategic_review")
+        for t in active
+    )
+
+
+async def _increment_research_spawn_count(project: Project, session: AsyncSession) -> int:
+    """Increment _research_spawn_count in project.vision and persist. Returns new count."""
+    new_count = (project.vision or {}).get("_research_spawn_count", 0) + 1
+    project.vision = {**(project.vision or {}), "_research_spawn_count": new_count}
+    flag_modified(project, "vision")
+    session.add(project)
+    return new_count
+
+
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.

@@ -89,6 +89,7 @@ from app.task_lifecycle import (  # noqa: F401 — re-exported for backward comp
     _update_direction_research_outcomes,
     MAX_REVIEW_FIX_ITERATIONS,
 )
+from app.task_lifecycle import _has_active_strategic_task, _increment_research_spawn_count
 
 logger = logging.getLogger(__name__)
 
@@ -1271,17 +1272,9 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
     On completion, it chains to _spawn_strategic_review (Phase 2).
     """
     # Guard: no design_doc_update or strategic_review already running
-    active = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-        )
-    )).scalars().all()
-    for t in active:
-        t_type = (t.first_payload).get("type")
-        if t_type in ("design_doc_update", "strategic_review"):
-            logger.debug(f"[STRATEGIC] Skipping design doc update — {t_type} task {t.id} already active")
-            return
+    if await _has_active_strategic_task(project.id, session):
+        logger.debug(f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}")
+        return
 
     doc_model = _runtime_config.get("task_type_models", {}).get("design_doc_update") or \
                 _runtime_config.get("task_type_models", {}).get("research") or None
@@ -1359,17 +1352,9 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     Uses type 'strategic_review' so it doesn't block tactical research.
     """
     # Guard: no design_doc_update or strategic_review already running
-    active = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-        )
-    )).scalars().all()
-    for t in active:
-        t_type = (t.first_payload).get("type")
-        if t_type in ("design_doc_update", "strategic_review"):
-            logger.debug(f"[STRATEGIC] Skipping strategic review — {t_type} task {t.id} already active")
-            return
+    if await _has_active_strategic_task(project.id, session):
+        logger.debug(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
+        return
 
     # Build direction stats with rich data (same as previous strategic payload)
     all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
@@ -1882,9 +1867,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     )
     session.add(new_task)
     # Increment spawn counter so undirected/strategic frequency checks advance
-    project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count + 1}
-    flag_modified(project, "vision")
-    session.add(project)
+    await _increment_research_spawn_count(project, session)
     history = TaskHistory(
         task_id=new_task.id, action="SPAWNED",
         details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}

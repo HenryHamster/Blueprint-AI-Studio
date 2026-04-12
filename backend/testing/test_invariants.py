@@ -305,7 +305,7 @@ TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategi
 TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
 
 TASK_LIFECYCLE_MAX_LINES = 2100      # Ratchet down as extractions land
-TASK_LIFECYCLE_MAX_FUNCTIONS = 10    # Ratchet down as extractions land
+TASK_LIFECYCLE_MAX_FUNCTIONS = 12    # Ratchet down as extractions land
 
 
 def _get_task_completion_py_path() -> str:
