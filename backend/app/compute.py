@@ -187,14 +187,44 @@ def validate_payload_uri(payload_uri: str) -> None:
 _local_processes: dict[str, subprocess.Popen] = {}
 
 
+async def prepare_and_store_agent_secret(
+    vm_instance_id: str, task_id: uuid.UUID,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    task_type: str = "",
+) -> str | None:
+    """Build agent credentials and store them in Secret Manager.
+
+    Returns the Secret Manager version resource name, or None in LOCAL_MODE.
+    Callers can run this concurrently with upload_json_payload via asyncio.gather()
+    since both are independent I/O operations that feed into the VM startup script.
+    """
+    if LOCAL_MODE:
+        return None
+    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
+    secret_env_lines = [
+        f"AGENT_SECRET_TOKEN={agent_jwt}",
+        f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}" if oauth_token else None,
+        f"ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}" if (not oauth_token and ANTHROPIC_API_KEY) else None,
+    ]
+    if claude_config_json:
+        import base64 as _b64
+        config_b64 = _b64.b64encode(claude_config_json.encode()).decode()
+        secret_env_lines.append(f"CLAUDE_CONFIG_B64={config_b64}")
+    secret_env_content = "\n".join(line for line in secret_env_lines if line)
+    return await asyncio.to_thread(_store_agent_secret, vm_instance_id, secret_env_content)
+
+
 async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
                               oauth_token: str | None = None, claude_config_json: str | None = None,
-                              task_type: str = ""):
+                              task_type: str = "", secret_version_name: str | None = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
     oauth_token: Long-lived OAuth token (sk-ant-oat01-...) for Claude Code CLI.
     claude_config_json: Content of ~/.claude.json for onboarding bypass.
+    secret_version_name: Pre-computed Secret Manager version (from prepare_and_store_agent_secret).
+        If provided, skips the internal secret build+store step.
     """
     if payload_uri:
         validate_payload_uri(payload_uri)
@@ -223,7 +253,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
             )
     if LOCAL_MODE:
         return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token, task_type=task_type)
-    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json, task_type=task_type)
+    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
+                                task_type=task_type, secret_version_name=secret_version_name)
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -448,39 +479,22 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
 
 async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
                          oauth_token: str | None = None, claude_config_json: str | None = None,
-                         task_type: str = ""):
+                         task_type: str = "", secret_version_name: str | None = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
 
-    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
-
-    # Build the env file content that will be stored in Secret Manager.
-    # No credentials are embedded in the startup script metadata — all secrets
-    # (including the agent JWT) are retrieved at runtime from Secret Manager.
-    secret_env_lines = [
-        f"AGENT_SECRET_TOKEN={agent_jwt}",
-        f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}" if oauth_token else None,
-        f"ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}" if (not oauth_token and ANTHROPIC_API_KEY) else None,
-    ]
-    if claude_config_json:
-        # Store claude config as a separate secret
-        import base64 as _b64
-        # We'll embed it as base64 in the credentials secret so one Secret Manager
-        # access retrieves everything the VM needs.
-        config_b64 = _b64.b64encode(claude_config_json.encode()).decode()
-        secret_env_lines.append(f"CLAUDE_CONFIG_B64={config_b64}")
-
-    secret_env_content = "\n".join(line for line in secret_env_lines if line)
+    if secret_version_name is None:
+        # Secret was not pre-computed by the caller — build and store it now.
+        # (Callers that run upload_json_payload concurrently pass secret_version_name
+        # from prepare_and_store_agent_secret to avoid this sequential fallback.)
+        secret_version_name = await prepare_and_store_agent_secret(
+            vm_instance_id, task_id, oauth_token, claude_config_json, task_type
+        )
 
     # payload_uri is validated upstream and safe to embed in the startup script
     import base64
     payload_uri_b64 = base64.b64encode(payload_uri.encode()).decode() if payload_uri else ""
-
-    # Store credentials in Secret Manager and get the version resource name
-    secret_version_name = await asyncio.to_thread(
-        _store_agent_secret, vm_instance_id, secret_env_content
-    )
 
     startup_script = f"""#!/bin/bash
     set -euo pipefail

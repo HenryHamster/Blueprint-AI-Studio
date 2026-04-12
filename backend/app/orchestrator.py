@@ -23,6 +23,7 @@ from app.compute import (
     any_zone_available,
     get_provision_error,
     get_vm_zone,
+    prepare_and_store_agent_secret,
     provision_agent_vm,
     soonest_zone_recovery,
 )
@@ -841,17 +842,28 @@ async def orchestrator_worker():
                                                     acct_id_for_release: str):
                         success = False
                         try:
-                            payload_uri = None
-                            if payloads:
+                            t_type = (payloads[0] or {}).get("type", "") if payloads else ""
+
+                            # Upload payload to GCS and store agent credentials in Secret Manager
+                            # concurrently — both are independent I/O operations (~500ms each)
+                            # that produce inputs for the VM startup script.
+                            async def _upload_payload_safe() -> str | None:
+                                if not payloads:
+                                    return None
                                 try:
-                                    payload_uri = await upload_json_payload(str(t_id), payloads)
+                                    return await upload_json_payload(str(t_id), payloads)
                                 except Exception as e:
                                     logger.error(f"[ORCHESTRATOR] Failed to upload payload for task {t_id}: {e}", exc_info=True)
+                                    return None
 
-                            t_type = (payloads[0] or {}).get("type", "") if payloads else ""
+                            payload_uri, secret_version_name = await asyncio.gather(
+                                _upload_payload_safe(),
+                                prepare_and_store_agent_secret(vm_id, t_id, token, config_json, t_type),
+                            )
+
                             success = await provision_agent_vm(vm_id, t_id, payload_uri,
                                                                oauth_token=token, claude_config_json=config_json,
-                                                               task_type=t_type)
+                                                               task_type=t_type, secret_version_name=secret_version_name)
                             if success:
                                 # Verify the task still wants this VM — stale recovery may have
                                 # requeued the task with a new vm_id while we were provisioning.
