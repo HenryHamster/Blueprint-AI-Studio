@@ -153,7 +153,7 @@ async def delete_project_admin(
     await session.commit()
 
     # Evict from GitHub token cache
-    from app.main import _github_token_cache
+    from app.routers.agent import _github_token_cache
     _github_token_cache.pop(str(project_id), None)
 
     return {"message": f"Project {project_id} deleted", "active_tasks_cancelled": len(active_tasks) if active_tasks else 0}

@@ -391,7 +391,8 @@ async def bulk_action_tasks(
                     if rollup_pr_number:
                         # Rollup PR approval: merge the rollup PR directly
                         try:
-                            from app.main import get_github_token_for_task, _runtime_config
+                            from app.routers.agent import get_github_token_for_task
+                            from app.shared_state import runtime_config as _runtime_config
                             from app.task_lifecycle import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment
                             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -462,7 +463,7 @@ async def bulk_action_tasks(
 
                             if ctx.get("touched_critical"):
                                 try:
-                                    from app.main import get_github_token_for_task
+                                    from app.routers.agent import get_github_token_for_task
                                     from app.github import merge_pull_request, create_pr_comment, delete_branch
                                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                                     merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
@@ -966,7 +967,8 @@ async def modify_task(
             if rollup_pr_number:
                 # Rollup PR approval: merge the rollup PR directly
                 try:
-                    from app.main import get_github_token_for_task, _runtime_config
+                    from app.routers.agent import get_github_token_for_task
+                    from app.shared_state import runtime_config as _runtime_config
                     from app.task_lifecycle import _cleanup_branches
                     from app.github import merge_pull_request, create_pr_comment
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -1042,7 +1044,7 @@ async def modify_task(
                     if ctx.get("touched_critical"):
                         # Critical file approval: review already passed, merge the PR
                         try:
-                            from app.main import get_github_token_for_task
+                            from app.routers.agent import get_github_token_for_task
                             from app.github import merge_pull_request, create_pr_comment, delete_branch
                             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                             merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
@@ -1218,7 +1220,7 @@ async def trigger_rollup(
     current_user: dict = Depends(get_current_user)
 ):
     """Manually trigger rollup PR for an EVALUATING parent task."""
-    from app.main import get_github_token_for_task
+    from app.routers.agent import get_github_token_for_task
     from app.task_lifecycle import _spawn_pipeline_task
     from app.github import create_pull_request, merge_pull_request, delete_branch
 

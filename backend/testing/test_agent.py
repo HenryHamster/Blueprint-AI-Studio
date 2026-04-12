@@ -626,15 +626,15 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
     import app.orchestrator as orchestrator_module
 
     # Prevent startup coroutines from trying to connect to a real database
-    mocker.patch.object(main_module, "load_max_plan_pool", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.load_max_plan_pool", new_callable=AsyncMock)
     mocker.patch.object(main_module, "_verify_schema_version", new_callable=AsyncMock)
     mocker.patch.object(lifecycle_module, "_seed_initial_admin", new_callable=AsyncMock)
     mocker.patch.object(main_module, "_init_deployment_state", new_callable=AsyncMock)
     # Background task coroutines must also be no-ops so the task loop doesn't
     # block the test event loop or attempt DB queries
-    mocker.patch.object(main_module, "reaper_service", new_callable=AsyncMock)
-    mocker.patch.object(main_module, "gcp_cleanup_service", new_callable=AsyncMock)
-    mocker.patch.object(main_module, "secret_reconciliation_service", new_callable=AsyncMock)
+    mocker.patch("app.reaper.reaper_service", new_callable=AsyncMock)
+    mocker.patch("app.services.gcp_cleanup_service", new_callable=AsyncMock)
+    mocker.patch("app.services.secret_reconciliation_service", new_callable=AsyncMock)
     mocker.patch.object(orchestrator_module, "orchestrator_worker", new_callable=AsyncMock)
 
     task_id = uuid.uuid4()

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import app.shared_state as _shared_state
-from app.main import _compute_research_anomalies, _check_anomaly_proposals
+from app.anomaly_detection import _compute_research_anomalies, _check_anomaly_proposals
 from app.models import TaskStatus
 from testing.factories import make_task, make_project, _utcnow
 

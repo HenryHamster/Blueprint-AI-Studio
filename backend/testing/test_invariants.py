@@ -212,7 +212,7 @@ class TestDirectionLifecycleInvariants:
 
 MAIN_PY_MAX_LINES = 3880      # Ratchet down as extractions land
 MAIN_PY_MAX_FUNCTIONS = 55    # Ratchet down as extractions land
-MAIN_PY_MAX_EXTERNAL_IMPORTS = 60  # Ratchet down as import redirects land
+MAIN_PY_MAX_EXTERNAL_IMPORTS = 30  # Ratchet down as import redirects land
 
 
 def _get_main_py_path() -> str:

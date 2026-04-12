@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock
 
 import app.main as _main_module
 import app.shared_state as _shared_state
+from app.reaper import reaper_service
 from app.main import (
-    reaper_service,
     _spawn_research_task,
     classify_failure,
 )

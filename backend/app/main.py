@@ -69,27 +69,10 @@ import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
-from app.reaper import reaper_service  # noqa: F401 — re-exported for test patches
-from app.services import (  # noqa: F401 — re-exported for test patches
-    gcp_cleanup_service,
-    secret_reconciliation_service,
-    _persist_circuit_breakers,
-    _persist_zone_health,
-    _check_evaluating_timeouts,
-    _recover_orphaned_tasks,
+from app.task_lifecycle import (
+    _process_post_commit, _check_and_trigger_rollup,
+    _has_active_strategic_task, _increment_research_spawn_count,
 )
-from app.task_lifecycle import (  # noqa: F401 — re-exported for backward compat / test patches
-    _process_post_commit,
-    _check_and_trigger_rollup,
-    _spawn_pipeline_task,
-    _requeue_parent_task,
-    _cleanup_branches,
-    _verify_pr_merged,
-    _max_review_iterations,
-    _update_direction_research_outcomes,
-    MAX_REVIEW_FIX_ITERATIONS,
-)
-from app.task_lifecycle import _has_active_strategic_task, _increment_research_spawn_count
 
 logger = logging.getLogger(__name__)
 
@@ -2112,14 +2095,8 @@ async def _check_idle_research():
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
 
-from app.broadcast import (  # re-exports for backward compat
-    _get_websocket_client_ip,
-    ConnectionManager,
-    manager,
-    broadcast_to_project,
-    _SANITIZE_PATTERNS,
-    _sanitize_log,
-)
+
+from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 async def _maybe_create_failure_alert(
     task: "Task",
@@ -2756,6 +2733,7 @@ from app.strategic_completion import (  # noqa: E402
     _is_direction_duplicate,
     _handle_strategic_completion,
 )
+
 
 class DesignDocUpdate(BaseModel):
     """Incremental design doc page update from an agent."""

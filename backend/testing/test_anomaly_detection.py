@@ -9,7 +9,8 @@ from datetime import timedelta
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from app.main import _compute_research_anomalies, classify_failure
+from app.anomaly_detection import _compute_research_anomalies
+from app.main import classify_failure
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 

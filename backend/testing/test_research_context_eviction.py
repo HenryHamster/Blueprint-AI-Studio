@@ -5,7 +5,7 @@ No database required — pure function tests.
 import re
 import pytest
 
-from app.main import (
+from app.research_completion import (
     _build_research_context,
     _parse_research_context,
     _parse_eviction_counts,

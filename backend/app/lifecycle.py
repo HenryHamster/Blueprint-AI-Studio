@@ -44,14 +44,12 @@ async def lifespan(app):
     # Late imports to avoid circular dependency with app.main
     from app.main import (
         _verify_schema_version,
-        load_max_plan_pool,
         _init_deployment_state,
-        reaper_service,
-        gcp_cleanup_service,
-        secret_reconciliation_service,
         _send_webhook_notification,
     )
-    from app.services import stale_branch_cleanup_service
+    from app.reaper import reaper_service
+    from app.services import gcp_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service
+    from app.max_plan_pool import load_max_plan_pool
     from app.orchestrator import orchestrator_worker
     from app.github import close_github_client
 

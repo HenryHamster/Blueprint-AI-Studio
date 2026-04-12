@@ -454,7 +454,7 @@ async def _update_direction_research_outcomes(
     Called whenever a child task of a research cycle reaches a terminal status so
     that research_history entries accumulate live outcome statistics.
     """
-    from app.main import _parse_research_context  # noqa: PLC0415
+    from app.research_completion import _parse_research_context  # noqa: PLC0415
 
     project = await session.get(Project, project_id)
     if not project:
@@ -565,7 +565,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     Uses its own session for DB writes to avoid polluting the caller's session state.
     The passed session is only used for reads (artifact lookup).
     """
-    from app.main import get_github_token_for_task, get_pull_request, _maybe_create_failure_alert  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.github import get_pull_request  # noqa: PLC0415
 
     if (task.context or {}).get("pr_merged"):
         return True
@@ -631,7 +633,8 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
 
 async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     """Delete staging and feature branches that are no longer needed."""
-    from app.main import get_github_token_for_task, delete_branch  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.github import delete_branch  # noqa: PLC0415
 
     ctx = task.context or {}
     gh_token = owner = repo = None
@@ -717,12 +720,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     Called after a child task completes, fails, or is cancelled.
     Also called from admin PATCH when status/context changes.
     """
-    from app.main import (  # noqa: PLC0415
-        broadcast_to_project, _maybe_create_failure_alert,
-        get_github_token_for_task, scan_pr_for_injection,
+    from app.main import _maybe_create_failure_alert, _utcnow  # noqa: PLC0415
+    from app.broadcast import broadcast_to_project  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.security import scan_pr_for_injection  # noqa: PLC0415
+    from app.github import (  # noqa: PLC0415
         create_pr_comment, delete_branch, create_pull_request,
         merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
-        _utcnow,
     )
 
     if not child_task.parent_task_id:
@@ -1160,15 +1164,21 @@ async def _process_post_commit(
     status endpoint while making GitHub API calls (which can hang 15-120s).
     _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
-    from app.main import (  # noqa: PLC0415
-        broadcast_to_project, get_github_token_for_task, scan_pr_for_injection,
+    from app.main import _utcnow  # noqa: PLC0415
+    from app.broadcast import broadcast_to_project  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.security import scan_pr_for_injection  # noqa: PLC0415
+    from app.github import (  # noqa: PLC0415
         create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs, _utcnow,
+        get_pr_files, get_check_runs,
+    )
+    from app.task_completion import (  # noqa: PLC0415
         _handle_plan_completion, _handle_design_doc_completion,
-        _handle_strategic_completion, _handle_research_completion,
         _handle_security_audit_completion, _handle_perf_completion,
         _handle_investigation_completion,
     )
+    from app.strategic_completion import _handle_strategic_completion  # noqa: PLC0415
+    from app.research_completion import _handle_research_completion  # noqa: PLC0415
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:

@@ -34,12 +34,12 @@ async def reaper_service():
     # Deferred imports to avoid circular dependency with app.main
     from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
     from app.main import (  # noqa: PLC0415
-        broadcast_to_project,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
         record_task_result,
         classify_failure,
     )
+    from app.broadcast import broadcast_to_project  # noqa: PLC0415
     from app.task_lifecycle import _requeue_parent_task, _check_and_trigger_rollup  # noqa: PLC0415
 
     while True:

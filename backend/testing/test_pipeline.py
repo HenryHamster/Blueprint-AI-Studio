@@ -15,13 +15,9 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
-from app.main import (
-    _parse_research_findings,
-    _validate_plan_dependencies,
-    classify_failure,
-    record_task_result,
-    should_rollback,
-)
+from app.research_completion import _parse_research_findings
+from app.task_completion import _validate_plan_dependencies
+from app.main import classify_failure, record_task_result, should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
 from app.task_lifecycle import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _check_and_trigger_rollup, _spawn_pipeline_task

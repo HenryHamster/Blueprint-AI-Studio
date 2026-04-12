@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy import select
 from sqlmodel import SQLModel
 
-from app.main import _check_evaluating_timeouts
+from app.services import _check_evaluating_timeouts
 from app.task_lifecycle import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
 

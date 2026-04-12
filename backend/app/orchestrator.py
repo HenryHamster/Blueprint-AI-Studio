@@ -134,21 +134,18 @@ async def orchestrator_worker():
     from app.main import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
-        _verify_pr_merged,
         _maybe_create_failure_alert,
-        _spawn_pipeline_task,
         record_task_result,
-        broadcast_to_project,
-        _recover_orphaned_tasks,
-        _check_evaluating_timeouts,
         _check_monitoring_window,
         _check_external_health,
         _check_pause_mode,
         _check_idle_research,
         _create_orchestrator_error_alerts,
-        get_github_token_for_task,
-        manager as ws_manager,
     )
+    from app.task_lifecycle import _verify_pr_merged, _spawn_pipeline_task  # noqa: PLC0415
+    from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
+    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
     from app.github import (
         create_pr_comment,
         get_check_runs,

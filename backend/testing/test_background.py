@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 from app.models import Project, Task, TaskStatus
-from app.main import reaper_service
+from app.reaper import reaper_service
 from app.broadcast import broadcast_to_project, manager
 from app.services import _run_stale_branch_cleanup
 

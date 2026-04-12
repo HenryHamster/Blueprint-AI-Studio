@@ -589,7 +589,7 @@ async def _check_evaluating_timeouts():
 
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
-    from app.main import get_github_token_for_task  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
     from app.task_lifecycle import _spawn_pipeline_task  # noqa: PLC0415
 
     try:

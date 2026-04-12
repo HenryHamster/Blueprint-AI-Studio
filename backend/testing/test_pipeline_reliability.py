@@ -24,7 +24,7 @@ from sqlmodel import SQLModel
 
 import app.orchestrator as _orch_module
 import app.shared_state as _shared_state
-from app.main import _check_evaluating_timeouts
+from app.services import _check_evaluating_timeouts
 from app.models import Project, Task, TaskStatus
 
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
@@ -112,7 +112,7 @@ async def orch_db(mocker):
     mocker.patch("app.main._check_external_health", new_callable=AsyncMock)
     mocker.patch("app.main._check_pause_mode", new_callable=AsyncMock)
     mocker.patch("app.main._check_idle_research", new_callable=AsyncMock)
-    mocker.patch("app.main._recover_orphaned_tasks", new_callable=AsyncMock)
+    mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
     mocker.patch("app.main._create_orchestrator_error_alerts", new_callable=AsyncMock)
     mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
     mocker.patch("app.main._extract_task_model", return_value=None)
@@ -417,7 +417,7 @@ async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
     class _NotFoundError(Exception):
         status_code = 404
 
-    mocker.patch("app.main.get_github_token_for_task",
+    mocker.patch("app.routers.agent.get_github_token_for_task",
                  return_value=("fake-token", "owner", "repo"))
     mocker.patch("app.github.get_pull_request",
                  side_effect=_NotFoundError("PR not found"))
@@ -479,7 +479,7 @@ async def test_ci_polling_transient_failure_retries(orch_db, mocker):
     class _ServerError(Exception):
         status_code = 500
 
-    mocker.patch("app.main.get_github_token_for_task",
+    mocker.patch("app.routers.agent.get_github_token_for_task",
                  return_value=("fake-token", "owner", "repo"))
     mocker.patch("app.github.get_pull_request",
                  side_effect=_ServerError("Internal Server Error"))
