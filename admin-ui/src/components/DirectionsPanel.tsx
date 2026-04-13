@@ -62,6 +62,11 @@ export interface Direction {
   paused_at?: string;
   auto_paused?: boolean;
   merge_rate?: number | null;
+  history_aggregate?: {
+    total_prs_merged?: number | null;
+    total_tasks_failed?: number | null;
+    [key: string]: unknown;
+  } | null;
 }
 
 

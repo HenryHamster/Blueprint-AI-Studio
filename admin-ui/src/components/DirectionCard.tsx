@@ -519,6 +519,45 @@ export function DirectionCard({
               </div>
             </div>
           )}
+          {/* Lifetime outcome metrics */}
+          {d.research_history && d.research_history.length > 0 && (() => {
+            const historyMerged = d.research_history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
+            const historyFailed = d.research_history.reduce((sum, e) => sum + (e.tasks_failed ?? 0), 0);
+            const aggMerged = d.history_aggregate?.total_prs_merged ?? 0;
+            const aggFailed = d.history_aggregate?.total_tasks_failed ?? 0;
+            const totalMerged = historyMerged + (aggMerged as number);
+            const totalFailed = historyFailed + (aggFailed as number);
+            const totalTasks = totalMerged + totalFailed;
+            const successRate = totalTasks >= 3 ? Math.round((totalMerged / totalTasks) * 100) : null;
+
+            // Find most recent entry with prs_merged > 0 and finding_titles
+            const latestShipped = [...d.research_history].reverse().find(e => (e.prs_merged ?? 0) > 0 && e.finding_titles.length > 0);
+            const latestTitle = latestShipped?.finding_titles[0];
+            const truncatedTitle = latestTitle && latestTitle.length > 60 ? latestTitle.slice(0, 60) + '…' : latestTitle;
+
+            return (
+              <div className="mt-1.5 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
+                    {totalMerged} PRs shipped
+                  </span>
+                  {successRate !== null && (() => {
+                    const color = successRate >= 70 ? 'emerald' : successRate >= 40 ? 'amber' : 'red';
+                    return (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                        {successRate}% success
+                      </span>
+                    );
+                  })()}
+                </div>
+                {latestShipped && truncatedTitle && (
+                  <p className="text-[10px] text-neutral-600 italic leading-relaxed">
+                    Latest shipped: {truncatedTitle} <span className="not-italic">({formatRelativeTime(latestShipped.timestamp)})</span>
+                  </p>
+                )}
+              </div>
+            );
+          })()}
           {d.research_history && d.research_history.length > 0 && (
             <div className="mt-2">
               <button
