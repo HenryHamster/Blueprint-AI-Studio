@@ -57,7 +57,10 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
                                       "ssl", "certificate",
                                       "context_length_exceeded", "token limit exceeded",
                                       "could not resolve hostname", "name or service not known",
-                                      "network unreachable"]):
+                                      "network unreachable",
+                                      "failed to create pull request",
+                                      "rollup pr creation failed",
+                                      "staging branch"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.

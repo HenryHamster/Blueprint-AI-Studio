@@ -315,6 +315,18 @@ class TestFailureClassification:
         task = self._make_task("process exited with exit code 139")
         assert classify_failure(task) == "AGENT_TIMEOUT"
 
+    def test_external_api_failed_to_create_pull_request(self):
+        task = self._make_task("Failed to create pull request: GitHub API returned 422")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_rollup_pr_creation_failed(self):
+        task = self._make_task("rollup pr creation failed: could not open PR against main")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_external_api_staging_branch(self):
+        task = self._make_task("staging branch not found or was deleted during rollup")
+        assert classify_failure(task) == "EXTERNAL_API"
+
 
 # ── Deployment Monitoring ───────────────────────────────────────────────────
 
