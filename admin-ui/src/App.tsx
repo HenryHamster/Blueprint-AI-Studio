@@ -17,7 +17,7 @@ import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
-import { SearchFilterBar } from './components/SearchFilterBar';
+import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
@@ -28,8 +28,8 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
 import { MessagesPanel } from './components/MessagesPanel';
-import { StatusBar } from './components/StatusBar';
-import { HealthOverviewCard } from './components/HealthOverviewCard';
+// StatusBar removed — redundant connection info
+// HealthOverviewCard removed — redundant with CatchUp panel
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -443,8 +443,6 @@ export default function App() {
         userRole={s.userRole}
       />
 
-      <StatusBar apiHealthy={s.apiHealthy} wsConnected={s.wsConnected} lastFetchTime={s.lastFetchTime} tasks={s.tasks} />
-
       <div
         className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
         style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
@@ -524,16 +522,6 @@ export default function App() {
         />
       )}
 
-      <HealthOverviewCard
-        selectedProjectId={s.selectedProjectId}
-        onViewTask={(taskId) => {
-          const task = s.tasks.find(t => t.id === taskId);
-          if (task) s.handleViewLogs(task);
-          else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
-        }}
-        addToast={s.addToast}
-      />
-
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
@@ -602,17 +590,16 @@ export default function App() {
               inputRef={searchInputRef}
             />
             {s.viewMode === 'kanban' && (
-              <select
+              <SingleSelectDropdown
+                options={[
+                  { label: 'Newest first', value: 'newest' },
+                  { label: 'Oldest first', value: 'oldest' },
+                  { label: 'Type', value: 'type' },
+                  { label: 'Title', value: 'title' },
+                ]}
                 value={sortBy}
-                onChange={e => setSortBy(e.target.value as SortBy)}
-                className="px-2 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors cursor-pointer"
-                title="Sort tasks"
-              >
-                <option value="newest">Newest first</option>
-                <option value="oldest">Oldest first</option>
-                <option value="type">Type</option>
-                <option value="title">Title</option>
-              </select>
+                onChange={v => setSortBy(v as SortBy)}
+              />
             )}
             {s.viewMode === 'kanban' && (
               <ColumnsPicker prefs={effectiveColumnPrefs} onPrefsChange={s.setColumnPrefs} />
@@ -650,77 +637,6 @@ export default function App() {
               {filteredTasks.length} of {s.tasks.length}
             </span>
           </div>}
-
-          {/* Quick-filter preset buttons */}
-          {s.viewMode !== 'home' && (() => {
-            const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
-            const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
-            const isFailedToday = s.statusFilter.length === 1 && s.statusFilter[0] === 'FAILED' && s.dateRange === '24h' && !s.requiresApproval && s.searchQuery === '';
-            const isStuckHour = s.statusFilter.length === 2 && s.statusFilter.includes('IN_PROGRESS') && s.statusFilter.includes('PROVISIONING') && s.dateRange === '1h' && !s.requiresApproval && s.searchQuery === '';
-            const isNeedsReview = s.requiresApproval && s.statusFilter.length === ALL_STATUSES.length && s.dateRange === 'all' && s.searchQuery === '';
-
-            const clearAll = () => {
-              s.setStatusFilter(ALL_STATUSES);
-              s.setTaskTypeFilter(ALL_TYPES);
-              s.setDateRange('all');
-              s.setRequiresApproval(false);
-              s.setSearchQuery('');
-            };
-
-            const presets = [
-              {
-                label: 'Failed today',
-                active: isFailedToday,
-                apply: () => {
-                  if (isFailedToday) { clearAll(); return; }
-                  s.setStatusFilter(['FAILED']);
-                  s.setDateRange('24h');
-                  s.setRequiresApproval(false);
-                  s.setSearchQuery('');
-                },
-              },
-              {
-                label: 'Active last hour',
-                active: isStuckHour,
-                apply: () => {
-                  if (isStuckHour) { clearAll(); return; }
-                  s.setStatusFilter(['IN_PROGRESS', 'PROVISIONING']);
-                  s.setDateRange('1h');
-                  s.setRequiresApproval(false);
-                  s.setSearchQuery('');
-                },
-              },
-              {
-                label: 'Needs review',
-                active: isNeedsReview,
-                apply: () => {
-                  if (isNeedsReview) { clearAll(); return; }
-                  s.setRequiresApproval(true);
-                  s.setStatusFilter(ALL_STATUSES);
-                  s.setDateRange('all');
-                  s.setSearchQuery('');
-                },
-              },
-            ];
-
-            return (
-              <div className="flex items-center gap-1.5 mb-3">
-                {presets.map(p => (
-                  <button
-                    key={p.label}
-                    onClick={p.apply}
-                    className={`px-2.5 py-0.5 rounded-full text-xs border transition-colors ${
-                      p.active
-                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-                        : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
-                    }`}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
-            );
-          })()}
 
           {s.viewMode === 'home' ? (
             <ErrorBoundary level="panel">
@@ -778,6 +694,14 @@ export default function App() {
                   });
                 }}
                 onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
+                onArchiveGroup={(taskIds) => {
+                  s.setConfirmDialog({
+                    title: 'Archive this group?',
+                    message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
+                    confirmLabel: 'Archive group',
+                    onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+                  });
+                }}
               />
             </main>
             </ErrorBoundary>

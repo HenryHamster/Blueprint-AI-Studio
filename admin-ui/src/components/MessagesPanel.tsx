@@ -31,6 +31,55 @@ const TYPE_CONFIG: Record<string, { icon: typeof MessageSquare; color: string; l
   NOTE: { icon: StickyNote, color: 'text-neutral-400 bg-neutral-500/10 border-neutral-500/30', label: 'Note' },
 };
 
+const MSG_TYPE_OPTIONS = [
+  { label: 'Feedback', value: 'FEEDBACK' },
+  { label: 'Bug Report', value: 'BUG_REPORT' },
+  { label: 'Note', value: 'NOTE' },
+];
+
+function MessageTypeDropdown({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    if (open) document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [open]);
+
+  const current = MSG_TYPE_OPTIONS.find(o => o.value === value);
+
+  return (
+    <div ref={ref} className="relative shrink-0">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300"
+      >
+        <span>{current?.label ?? value}</span>
+        <ChevronDown className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute top-full mt-1 left-0 z-50 min-w-[120px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
+          {MSG_TYPE_OPTIONS.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => { onChange(opt.value); setOpen(false); }}
+              className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-neutral-800 transition-colors ${
+                opt.value === value ? 'text-neutral-100' : 'text-neutral-400'
+              }`}
+            >
+              <span>{opt.label}</span>
+              {opt.value === value && <Check className="w-3 h-3 text-neutral-400" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatAge(isoString: string | null): string {
   if (!isoString) return '';
   const ms = Date.now() - parseTimestamp(isoString).getTime();
@@ -222,28 +271,20 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
 
       {/* Post form */}
       <div className="px-6 py-3 border-b border-neutral-800 shrink-0">
-        <div className="flex gap-2">
-          <select
-            value={newType}
-            onChange={e => setNewType(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 text-neutral-300 rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 shrink-0"
-          >
-            <option value="FEEDBACK">Feedback</option>
-            <option value="BUG_REPORT">Bug Report</option>
-            <option value="NOTE">Note</option>
-          </select>
+        <div className="flex gap-2 items-center">
+          <MessageTypeDropdown value={newType} onChange={setNewType} />
           <input
             type="text"
             value={newContent}
             onChange={e => setNewContent(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
             placeholder="Type a message..."
-            className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+            className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
           />
           <button
             onClick={handleSubmit}
             disabled={submitting || !newContent.trim()}
-            className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded-lg text-sm transition-colors disabled:opacity-40 flex items-center gap-1.5 shrink-0"
+            className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 flex items-center gap-1.5 shrink-0"
           >
             <Send className="w-3.5 h-3.5" />
             Send
