@@ -73,9 +73,9 @@ async def _spawn_pipeline_task(
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
         return None
 
-    # Guard: don't spawn if there's already an ACTIVE same-type task for this PR.
-    # This prevents duplicate concurrent spawns (race window between commit and pipeline spawn)
-    # but allows the intentional review→fix→review cycle to continue.
+    # Guard: don't spawn if there's already an ACTIVE review or fix for this PR.
+    # Same-type check prevents duplicates. Cross-type check prevents spawning a
+    # review while a fix is running (the fix will spawn its own review when done).
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -86,9 +86,10 @@ async def _spawn_pipeline_task(
         if t.id == source_task.id:
             continue
         t_payload = t.first_payload
-        if t_payload.get("pr_number") == pr_number and t_payload.get("type") == task_type:
-            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — already active: {t.id}")
-            source_task.latest_status_message = f"{task_type.title()} already active for PR #{pr_number} → task {str(t.id)[:8]}"
+        t_type = t_payload.get("type")
+        if t_payload.get("pr_number") == pr_number and t_type in ("review", "fix"):
+            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — {t_type} already active: {t.id}")
+            source_task.latest_status_message = f"{task_type.title()} skipped for PR #{pr_number} — {t_type} active → {str(t.id)[:8]}"
             session.add(source_task)
             return t
 
