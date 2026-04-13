@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
@@ -76,6 +76,9 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   debug: { bg: 'bg-rose-500/10 border-rose-500/20', text: 'text-rose-400', icon: AlertTriangle, label: 'Debug' },
   smoketest: { bg: 'bg-lime-500/10 border-lime-500/20', text: 'text-lime-400', icon: Activity, label: 'Smoketest' },
   rollup: { bg: 'bg-violet-500/10 border-violet-500/20', text: 'text-violet-400', icon: Layers, label: 'Rollup' },
+  perf: { bg: 'bg-pink-500/10 border-pink-500/20', text: 'text-pink-400', icon: Gauge, label: 'Perf' },
+  strategic_review: { bg: 'bg-emerald-500/10 border-emerald-500/20', text: 'text-emerald-400', icon: Compass, label: 'Strategic Review' },
+  design_doc_update: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-400', icon: FileText, label: 'Design Doc' },
 };
 
 const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint: string }> = {

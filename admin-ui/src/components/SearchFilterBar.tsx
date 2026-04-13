@@ -15,7 +15,7 @@ interface SearchFilterBarProps {
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
-const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix', 'refactor', 'migrate', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup'] as const;
+const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix', 'refactor', 'migrate', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'] as const;
 const STATUS_OPTIONS = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'COMPLETED', 'FAILED', 'CANCELLED'] as const;
 
 interface MultiSelectDropdownProps {
@@ -155,7 +155,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           type="text"
           value={inputValue}
           onChange={e => setInputValue(e.target.value)}
-          placeholder="Search tasks..."
+          placeholder="Search by title, ID, or status..."
           className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 w-64 outline-none"
         />
       </div>

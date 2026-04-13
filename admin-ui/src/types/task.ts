@@ -1,5 +1,5 @@
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'refactor' | 'docs' | 'security_audit' | 'qa' | 'deps' | 'migrate' | 'investigate';
+export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'refactor' | 'docs' | 'security_audit' | 'qa' | 'deps' | 'migrate' | 'investigate' | 'debug' | 'smoketest' | 'rollup' | 'perf' | 'strategic_review' | 'design_doc_update';
 
 export interface ResearchFinding {
   type?: string;
