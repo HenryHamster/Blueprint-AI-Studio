@@ -1,12 +1,15 @@
 import { Search, ChevronDown, Check } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
+import type { DateRange } from '../hooks/useSearchFilters';
 
 interface SearchFilterBarProps {
   searchQuery: string;
   onSearchChange: (query: string) => void;
   taskTypeFilter: string[];
   onTypeFilterChange: (filter: string[]) => void;
+  dateRange: DateRange;
+  onDateRangeChange: (range: DateRange) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -99,7 +102,15 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
   );
 }
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, inputRef }: SearchFilterBarProps) {
+const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
+  { label: 'All time', value: 'all' },
+  { label: 'Last 1h', value: '1h' },
+  { label: 'Last 6h', value: '6h' },
+  { label: 'Last 24h', value: '24h' },
+  { label: 'Last 7d', value: '7d' },
+];
+
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
 
@@ -117,6 +128,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter.length < typeOptions.length,
+    dateRange !== 'all',
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
@@ -124,6 +136,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   function handleClear() {
     onSearchChange('');
     onTypeFilterChange(typeOptions.map(o => o.value));
+    onDateRangeChange('all');
   }
 
   return (
@@ -146,6 +159,20 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         selected={taskTypeFilter}
         onChange={onTypeFilterChange}
       />
+
+      <select
+        value={dateRange}
+        onChange={e => onDateRangeChange(e.target.value as DateRange)}
+        className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all border ${
+          dateRange !== 'all'
+            ? 'bg-white/5 border-neutral-600 text-neutral-100'
+            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+        }`}
+      >
+        {DATE_RANGE_OPTIONS.map(opt => (
+          <option key={opt.value} value={opt.value}>{opt.label}</option>
+        ))}
+      </select>
 
       {hasActiveFilters && (
         <button

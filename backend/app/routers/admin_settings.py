@@ -44,6 +44,7 @@ class StuckTaskInfo(TypedDict):
     attempt_count: int
     failure_class: Optional[str]
     unresolvable_deps: List[str]
+    remediation_hint: str
 
 
 class CircuitBreakerInfo(TypedDict):
@@ -76,12 +77,25 @@ def _classify_stuck_failure(task: Task) -> Optional[str]:
     return None
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds into a compact human-readable string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s" if s % 60 else f"{s // 60}m"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m" if m else f"{h}h"
+
+
 async def _build_stuck_tasks(
     tasks: List[Task],
     now: datetime,
     session: AsyncSession,
 ) -> List[StuckTaskInfo]:
     """Detect stuck tasks and build the diagnostics list."""
+    from app.compute import get_zone_health  # noqa: PLC0415
     stuck: List[StuckTaskInfo] = []
     provision_timeout_secs = 5 * 60
     no_heartbeat_secs = 5 * 60
@@ -89,7 +103,7 @@ async def _build_stuck_tasks(
     stuck_deps_secs = 10 * 60
     evaluating_timeout_secs = 2 * 3600  # 2 hours
 
-    # Pre-fetch all dependency statuses in a single batch query to avoid N+1
+    # Pre-fetch all dependency statuses and titles in a single batch query to avoid N+1
     all_dep_uuids: set[uuid.UUID] = set()
     for task in tasks:
         if task.status == TaskStatus.QUEUED:
@@ -102,29 +116,53 @@ async def _build_stuck_tasks(
                         pass
 
     dep_status_map: Dict[str, TaskStatus] = {}
+    dep_title_map: Dict[str, str] = {}
     if all_dep_uuids:
         dep_result = await session.execute(
-            select(Task.id, Task.status).where(Task.id.in_(all_dep_uuids))
+            select(Task.id, Task.status, Task.title).where(Task.id.in_(all_dep_uuids))
         )
         for row in dep_result.all():
             dep_status_map[str(row.id)] = row.status
+            dep_title_map[str(row.id)] = row.title or str(row.id)[:8]
+
+    # Count running/queued tasks for capacity hints
+    running_count = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
+    queued_count = sum(1 for t in tasks if t.status == TaskStatus.QUEUED)
+
+    # Fetch zone health once for provision_timeout hints
+    try:
+        zone_health = get_zone_health()
+    except Exception:
+        zone_health = {}
 
     for task in tasks:
         stuck_reason = None
         stuck_for_seconds = 0
         unresolvable_deps: List[str] = []
+        remediation_hint = ""
 
         if task.status == TaskStatus.PROVISIONING and task.last_heartbeat is None and task.started_at is not None:
             age = (now - task.started_at).total_seconds()
             if age > provision_timeout_secs:
                 stuck_reason = "provision_timeout"
                 stuck_for_seconds = int(age - provision_timeout_secs)
+                ctx = task.context or {}
+                zone = ctx.get("provision_zone")
+                if zone:
+                    zh = zone_health.get(zone, {})
+                    if zh.get("cooldown_active"):
+                        remediation_hint = f"VM timed out in {zone} — zone in cooldown, reaper will retry"
+                    else:
+                        remediation_hint = f"VM timed out in {zone} — zone available, reaper will retry"
+                else:
+                    remediation_hint = "VM provision timed out — reaper will detect and retry"
 
         elif task.status == TaskStatus.IN_PROGRESS and task.last_heartbeat is not None:
             heartbeat_age = (now - task.last_heartbeat).total_seconds()
             if heartbeat_age > no_heartbeat_secs:
                 stuck_reason = "no_heartbeat"
                 stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
+                remediation_hint = f"No heartbeat for {_fmt_duration(heartbeat_age)} — VM may have crashed, reaper will clean up"
 
         elif task.status == TaskStatus.QUEUED:
             created_age = (now - task.created_at).total_seconds()
@@ -153,10 +191,18 @@ async def _build_stuck_tasks(
                         stuck_reason = "stuck_deps"
                         stuck_for_seconds = int(created_age - stuck_deps_secs)
                         unresolvable_deps = failed_dep_ids
+                        dep_titles = [dep_title_map.get(d, d[:8]) for d in failed_dep_ids[:2]]
+                        suffix = f" +{len(failed_dep_ids) - 2} more" if len(failed_dep_ids) > 2 else ""
+                        remediation_hint = f"Blocked by {len(failed_dep_ids)} failed task(s): {', '.join(dep_titles)}{suffix}"
 
             elif not dep_ids and created_age > long_queued_secs:
                 stuck_reason = "long_queued"
                 stuck_for_seconds = int(created_age - long_queued_secs)
+                exhausted = [z for z, d in zone_health.items() if d.get("cooldown_active")]
+                if exhausted:
+                    remediation_hint = f"All zones exhausted — {running_count} running, {queued_count}Q waiting"
+                else:
+                    remediation_hint = f"No available slots — {running_count} running, {queued_count}Q waiting"
 
         elif task.status == TaskStatus.EVALUATING:
             # Skip CI-waiting tasks — they have their own timeout
@@ -178,6 +224,7 @@ async def _build_stuck_tasks(
                 if eval_age > evaluating_timeout_secs:
                     stuck_reason = "evaluation_timeout"
                     stuck_for_seconds = int(eval_age - evaluating_timeout_secs)
+                    remediation_hint = f"Evaluating for {_fmt_duration(eval_age)} — may need manual review"
 
         if stuck_reason:
             stuck.append({
@@ -189,6 +236,7 @@ async def _build_stuck_tasks(
                 "attempt_count": task.attempt_count,
                 "failure_class": _classify_stuck_failure(task),
                 "unresolvable_deps": unresolvable_deps,
+                "remediation_hint": remediation_hint,
             })
 
     return stuck

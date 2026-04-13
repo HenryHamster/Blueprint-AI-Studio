@@ -464,6 +464,7 @@ class TestBuildStuckTasks:
         assert set(entry.keys()) == {
             "task_id", "title", "status", "stuck_reason",
             "stuck_for_seconds", "attempt_count", "failure_class", "unresolvable_deps",
+            "remediation_hint",
         }
         assert entry["failure_class"] == "RATE_LIMIT"
         assert entry["unresolvable_deps"] == []

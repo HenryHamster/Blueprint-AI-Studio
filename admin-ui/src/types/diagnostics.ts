@@ -7,6 +7,7 @@ export interface StuckTask {
   attempt_count: number;
   failure_class: string | null;
   unresolvable_deps: string[];
+  remediation_hint?: string;
 }
 
 export interface ProjectDiagnostics {

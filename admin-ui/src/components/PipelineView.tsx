@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, ExternalLink, Archive } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, ExternalLink, Archive } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
 import { parseTimestamp } from '../utils/time';
@@ -117,7 +117,7 @@ function buildForest(tasks: Task[]): TreeNode[] {
   return [...syntheticRoots, ...roots];
 }
 
-function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; activeFilter: FilterType }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter, blockingCount }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
@@ -199,6 +199,14 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter
         ) : null;
       })()}
 
+      {/* Blocking badge */}
+      {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
+        <span className="inline-flex items-center gap-1 text-[9px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded whitespace-nowrap shrink-0">
+          <AlertTriangle className="w-2.5 h-2.5" />
+          Blocking {blockingCount}
+        </span>
+      )}
+
       {/* Title + status message */}
       <div className="flex flex-col min-w-0 flex-1">
         <span className="text-xs text-neutral-200 truncate group-hover:text-neutral-100">
@@ -229,6 +237,7 @@ function TreeBranch({
   isLast,
   depth,
   activeFilter,
+  blockingMap,
 }: {
   node: TreeNode;
   taskMap: Map<string, Task>;
@@ -239,6 +248,7 @@ function TreeBranch({
   isLast: boolean;
   depth: number;
   activeFilter: FilterType;
+  blockingMap: Record<string, number>;
 }) {
   const depIds = node.task.depends_on || [];
   const depTasks = depIds
@@ -331,7 +341,7 @@ function TreeBranch({
             </button>
           )}
           <div className="flex-1 min-w-0">
-            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} activeFilter={activeFilter} />
+            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} />
           </div>
         </div>
 
@@ -350,6 +360,7 @@ function TreeBranch({
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
                 activeFilter={activeFilter}
+                blockingMap={blockingMap}
               />
             ))}
           </div>
@@ -392,6 +403,7 @@ function RootGroup({
   onToggle,
   activeFilter,
   onArchiveGroup,
+  blockingMap,
 }: {
   root: TreeNode;
   taskMap: Map<string, Task>;
@@ -403,6 +415,7 @@ function RootGroup({
   onToggle: () => void;
   activeFilter: FilterType;
   onArchiveGroup?: (taskIds: string[]) => void;
+  blockingMap: Record<string, number>;
 }) {
   const isSynthetic = root.isSyntheticParent;
   const totalInGroup = isSynthetic
@@ -517,6 +530,7 @@ function RootGroup({
                 isLast={i === root.children.length - 1}
                 depth={0}
                 activeFilter={activeFilter}
+                blockingMap={blockingMap}
               />
             ))
           ) : (
@@ -530,6 +544,7 @@ function RootGroup({
               isLast={true}
               depth={0}
               activeFilter={activeFilter}
+              blockingMap={blockingMap}
             />
           )}
         </div>
@@ -543,6 +558,17 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const prChainMap = useMemo(() => buildPrChainMap(tasks), [tasks]);
+  const blockingMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const task of tasks) {
+      if (task.depends_on) {
+        for (const depId of task.depends_on) {
+          map[depId] = (map[depId] ?? 0) + 1;
+        }
+      }
+    }
+    return map;
+  }, [tasks]);
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({});
   const [activeFilter, setActiveFilter] = useState<FilterType>('All');
 
@@ -640,6 +666,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             onToggle={() => toggleGroup(root.task.id)}
             activeFilter={activeFilter}
             onArchiveGroup={onArchiveGroup}
+            blockingMap={blockingMap}
           />
         ))}
       </div>

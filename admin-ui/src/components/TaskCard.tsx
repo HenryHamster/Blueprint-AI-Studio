@@ -3,6 +3,14 @@ import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 
+/** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
+function formatCompact(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
+}
+
 export type { ResearchFinding } from '../types/task';
 import type { ResearchFinding } from '../types/task';
 
@@ -90,6 +98,7 @@ interface TaskCardProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
+  blockingCount?: number;
 }
 
 export function useElapsedTime(startIso: string, endIso?: string): string {
@@ -201,7 +210,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -258,9 +267,26 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       }, 3000);
     }
   };
+  const [now30, setNow30] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow30(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, []);
+
   const isChild = !!task.parent_task_id;
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
+
+  const hbAgeSec = (task.status === 'IN_PROGRESS' || task.status === 'EVALUATING') && task.last_heartbeat
+    ? (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000
+    : null;
+  const hbAgeText = hbAgeSec !== null ? `HB ${formatCompact(hbAgeSec)}` : null;
+  const hbAgeColor = hbAgeSec === null ? '' : hbAgeSec < 60 ? 'text-emerald-400' : hbAgeSec < 300 ? 'text-amber-400' : 'text-red-400';
+
+  const queueWaitSec = task.status === 'QUEUED'
+    ? (now30 - parseTimestamp(task.created_at).getTime()) / 1000
+    : null;
+  const queueWaitText = queueWaitSec !== null ? `Queued ${formatCompact(queueWaitSec)}` : null;
   const isActiveForDuration = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING' || task.status === 'EVALUATING';
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const endTime = isTerminal && task.history && task.history.length > 0
@@ -383,7 +409,10 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           </div>
           <StatusBadge status={task.status} />
           {isActive && task.last_heartbeat && (
-            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
+            <div className="flex items-center gap-0.5" title={heartbeat.text}>
+              <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} />
+              {hbAgeText && <span className={`text-[10px] font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
+            </div>
           )}
         </div>
       </div>
@@ -397,6 +426,12 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         {(task.attempt_count ?? 0) > 0 && (
           <span className="bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded font-mono">
             #{(task.attempt_count ?? 0) + 1}
+          </span>
+        )}
+        {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
+          <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
+            <AlertTriangle className="w-3 h-3" />
+            Blocking {blockingCount} task{blockingCount! > 1 ? 's' : ''}
           </span>
         )}
       </div>
@@ -502,7 +537,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <Clock className="w-3 h-3" />
           {parseTimestamp(task.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           <span className="text-neutral-400 font-mono">
-            {task.status === 'QUEUED' ? 'Waiting' : duration}
+            {queueWaitText ?? duration}
           </span>
         </div>
 
@@ -511,6 +546,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <div className="flex items-center gap-1.5" title={heartbeat.text}>
               <Activity className="w-3 h-3" />
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
+              {hbAgeText && <span className={`text-[10px] font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
             </div>
           ) : null}
 

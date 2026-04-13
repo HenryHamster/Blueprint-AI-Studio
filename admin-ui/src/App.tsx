@@ -243,16 +243,23 @@ export default function App() {
       .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
   }, [effectiveColumnPrefs, s.statusFilter]);
 
-  const filteredTasks = useMemo(() => s.tasks.filter(t => {
-    const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-    const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
-    const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
-    const statusMatch = s.statusFilter.includes(t.status);
-    const query = s.searchQuery.toLowerCase();
-    const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
-    const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
-    return typeMatch && statusMatch && searchMatch && projectMatch;
-  }), [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId]);
+  const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
+  const filteredTasks = useMemo(() => {
+    const now = new Date().getTime();
+    const cutoff = s.dateRange !== 'all' ? now - dateRangeCutoffs[s.dateRange] : null;
+    return s.tasks.filter(t => {
+      const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
+      const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
+      const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
+      const statusMatch = s.statusFilter.includes(t.status);
+      const query = s.searchQuery.toLowerCase();
+      const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
+      const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
+      const dateMatch = cutoff === null || new Date(t.created_at).getTime() >= cutoff;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange]);
 
   const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
@@ -554,6 +561,8 @@ export default function App() {
               onSearchChange={s.setSearchQuery}
               taskTypeFilter={s.taskTypeFilter}
               onTypeFilterChange={s.setTaskTypeFilter}
+              dateRange={s.dateRange}
+              onDateRangeChange={s.setDateRange}
               inputRef={searchInputRef}
             />
             {s.viewMode === 'kanban' && (

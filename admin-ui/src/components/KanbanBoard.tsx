@@ -87,7 +87,7 @@ interface KanbanBoardProps {
   hasActiveFilters?: boolean;
 }
 
-function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate }: {
+function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
@@ -95,6 +95,7 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   compact?: boolean;
+  blockingCount?: number;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
@@ -129,6 +130,7 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
           maxRetries={maxRetries}
           actionLoading={actionLoadingMap[task.id]}
           compact={compact}
+          blockingCount={blockingCount}
           selectionMode={selectionMode}
           onToggleTaskSelection={onToggleTaskSelection}
           colIdx={colIdx}
@@ -158,6 +160,7 @@ interface SortableCardProps {
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
   compact?: boolean;
+  blockingCount?: number;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
   onCancel: (id: string) => void;
@@ -183,6 +186,7 @@ function SortableCard({
   selectedTaskIds,
   onToggleTaskSelection,
   compact,
+  blockingCount,
   onApprove,
   onRequestChanges,
   onCancel,
@@ -244,6 +248,7 @@ function SortableCard({
           maxRetries={maxRetries}
           actionLoading={actionLoadingMap[task.id]}
           compact={compact}
+          blockingCount={blockingCount}
           selectionMode={selectionMode}
           onToggleTaskSelection={onToggleTaskSelection}
           colIdx={colIdx}
@@ -531,6 +536,18 @@ export function KanbanBoard({
     return map;
   }, [projects]);
 
+  const blockingMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const task of tasks) {
+      if (task.depends_on) {
+        for (const depId of task.depends_on) {
+          map[depId] = (map[depId] ?? 0) + 1;
+        }
+      }
+    }
+    return map;
+  }, [tasks]);
+
   const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack };
 
   return (
@@ -602,6 +619,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
@@ -652,6 +670,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
@@ -680,6 +699,7 @@ export function KanbanBoard({
                       selectedTaskIds={selectedTaskIds}
                       onToggleTaskSelection={onToggleTaskSelection}
                       compact={compact}
+                      blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
                       cardIdx={cardIdx}
                       cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}
@@ -784,6 +804,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
@@ -834,6 +855,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
@@ -862,6 +884,7 @@ export function KanbanBoard({
                       selectedTaskIds={selectedTaskIds}
                       onToggleTaskSelection={onToggleTaskSelection}
                       compact={compact}
+                      blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
                       cardIdx={cardIdx}
                       cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}

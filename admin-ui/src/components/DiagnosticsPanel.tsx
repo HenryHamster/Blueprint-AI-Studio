@@ -70,28 +70,35 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
               </span>
             </div>
             {stuckCount > 0 && (
-              <div className="space-y-1.5 ml-4">
+              <div className="space-y-2 ml-4">
                 {diagnostics.stuck_tasks.map((task) => (
-                  <div key={task.task_id} className="flex items-start gap-2">
-                    <button
-                      onClick={() => onViewTask(task.task_id)}
-                      className="text-neutral-300 hover:text-blue-400 transition-colors truncate max-w-[200px] text-left"
-                      title={task.title}
-                    >
-                      {task.title}
-                    </button>
-                    <span className="text-neutral-500 shrink-0">—</span>
-                    <span className="text-amber-400 shrink-0">{STUCK_REASON_LABELS[task.stuck_reason]}</span>
-                    <span className="text-neutral-600 shrink-0 font-mono">
-                      <Clock className="w-3 h-3 inline mr-0.5" />{formatDurationSec(task.stuck_for_seconds)}
-                    </span>
-                    {task.attempt_count > 1 && (
-                      <span className="text-neutral-600 shrink-0">×{task.attempt_count}</span>
-                    )}
-                    {task.stuck_reason === 'stuck_deps' && task.unresolvable_deps?.length > 0 && (
-                      <span className="text-neutral-600 font-mono shrink-0">
-                        deps: {task.unresolvable_deps.map(d => d.slice(0, 8)).join(', ')}
+                  <div key={task.task_id}>
+                    <div className="flex items-start gap-2">
+                      <button
+                        onClick={() => onViewTask(task.task_id)}
+                        className="text-neutral-300 hover:text-blue-400 transition-colors truncate max-w-[200px] text-left"
+                        title={task.title}
+                      >
+                        {task.title}
+                      </button>
+                      <span className="text-neutral-500 shrink-0">—</span>
+                      <span className="text-amber-400 shrink-0">{STUCK_REASON_LABELS[task.stuck_reason]}</span>
+                      <span className="text-neutral-600 shrink-0 font-mono">
+                        <Clock className="w-3 h-3 inline mr-0.5" />{formatDurationSec(task.stuck_for_seconds)}
                       </span>
+                      {task.attempt_count > 1 && (
+                        <span className="text-neutral-600 shrink-0">×{task.attempt_count}</span>
+                      )}
+                      {task.stuck_reason === 'stuck_deps' && task.unresolvable_deps?.length > 0 && (
+                        <span className="text-neutral-600 font-mono shrink-0">
+                          deps: {task.unresolvable_deps.map(d => d.slice(0, 8)).join(', ')}
+                        </span>
+                      )}
+                    </div>
+                    {task.remediation_hint && (
+                      <div className="mt-0.5 ml-0 text-[10px] text-neutral-500 italic">
+                        {task.remediation_hint}
+                      </div>
                     )}
                   </div>
                 ))}

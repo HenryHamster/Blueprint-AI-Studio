@@ -73,7 +73,7 @@ export function useAppState() {
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter } = useSearchFilters();
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange } = useSearchFilters();
 
   const {
     showResearchBrowser, setShowResearchBrowser,
@@ -795,7 +795,7 @@ export function useAppState() {
     // Column preferences
     columnPrefs, setColumnPrefs,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange,
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
     // Log viewer
