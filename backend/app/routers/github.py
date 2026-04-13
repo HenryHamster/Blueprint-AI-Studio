@@ -102,8 +102,18 @@ async def github_oauth_authorize(
     if not GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)")
 
-    # Default to ADMIN_UI_URL if not provided, but allow dynamic override (for localhost/PR previews)
-    admin_url = redirect_uri or os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+    # Default to ADMIN_UI_URL if not provided, but allow dynamic override (for localhost/PR previews).
+    # Validate redirect_uri against allowlist to prevent open redirect.
+    default_admin_url = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+    if redirect_uri:
+        from urllib.parse import urlparse
+        parsed = urlparse(redirect_uri)
+        allowed_hosts = {urlparse(default_admin_url).netloc, "localhost", "127.0.0.1"}
+        if parsed.scheme not in ("http", "https") or parsed.netloc not in allowed_hosts:
+            raise HTTPException(status_code=400, detail="Invalid redirect_uri: host not in allowlist")
+        admin_url = redirect_uri
+    else:
+        admin_url = default_admin_url
 
     # Sign a state token so the callback can verify which user initiated the flow
     import jwt as pyjwt

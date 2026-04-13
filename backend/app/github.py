@@ -152,14 +152,12 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     return await generate_installation_access_token(installation_id, repositories=[repo])
 
 
-async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dict:
+async def exchange_oauth_code(code: str) -> dict:
     """Exchange a GitHub OAuth code for a user access token."""
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
         raise ValueError("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set")
 
     payload = {"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET, "code": code}
-    if redirect_uri:
-        payload["redirect_uri"] = redirect_uri
 
     resp = await _github_request(
         "POST", "https://github.com/login/oauth/access_token",
