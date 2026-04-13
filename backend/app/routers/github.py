@@ -298,7 +298,7 @@ async def github_webhook(
                             logger.info(f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})")
                     if affected_tasks:
                         await session.commit()
-                        from app.task_lifecycle import _check_and_trigger_rollup
+                        from app.rollup_management import _check_and_trigger_rollup
                         for at in affected_tasks:
                             await _check_and_trigger_rollup(at, session)
 

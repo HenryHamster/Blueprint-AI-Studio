@@ -983,9 +983,9 @@ class TestComputeMergeRate:
 
 @pytest.mark.asyncio
 async def test_direction_cap_blocks_excess_active(client: AsyncClient, mocker):
-    """Creating a 6th active direction returns 409 when cap is 5."""
+    """Creating an 11th active direction returns 409 when cap is 10."""
     project_id = await _deploy_project(client, mocker)
-    for i in range(5):
+    for i in range(10):
         resp = await client.post(
             f"/api/admin/projects/{project_id}/directions",
             json={"text": f"Direction {i + 1}", "priority": "medium"},
@@ -994,7 +994,7 @@ async def test_direction_cap_blocks_excess_active(client: AsyncClient, mocker):
 
     resp = await client.post(
         f"/api/admin/projects/{project_id}/directions",
-        json={"text": "Direction 6 - should be blocked", "priority": "medium"},
+        json={"text": "Direction 11 - should be blocked", "priority": "medium"},
     )
     assert resp.status_code == 409
     assert "Direction cap reached" in resp.json()["error"]["message"]
@@ -1028,10 +1028,10 @@ async def test_direction_cap_allows_non_active(client: AsyncClient, mocker):
 
 @pytest.mark.asyncio
 async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
-    """PATCH setting status to 'active' returns 409 when cap is already at 5."""
+    """PATCH setting status to 'active' returns 409 when cap is already at 10."""
     project_id = await _deploy_project(client, mocker)
-    # Create 5 active + 1 paused
-    for i in range(5):
+    # Create 9 active, then one more to reach cap of 10
+    for i in range(9):
         await client.post(
             f"/api/admin/projects/{project_id}/directions",
             json={"text": f"Active {i + 1}", "priority": "medium"},
@@ -1040,23 +1040,22 @@ async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
         f"/api/admin/projects/{project_id}/directions",
         json={"text": "To be paused", "priority": "low"},
     )
-    # We can't create it as active since cap is now hit — create via DB directly
-    # Instead: pause the 5th, create a 6th, then re-activate the paused one
+    # Now at cap (10 active). Pause one to allow creating an 11th, then re-activate to trigger 409.
     resp = await client.get(f"/api/admin/projects/{project_id}/directions")
     directions = resp.json()["directions"]
-    # Pause one to allow creating the 6th
+    # Pause one to allow creating an 11th
     first_id = directions[0]["id"]
     await client.patch(
         f"/api/admin/projects/{project_id}/directions/{first_id}",
         json={"status": "paused"},
     )
-    # Now create 6th active direction (4 active + 1 paused = OK)
-    sixth_resp = await client.post(
+    # Now create 10th active direction (9 active + 1 paused = OK)
+    tenth_resp = await client.post(
         f"/api/admin/projects/{project_id}/directions",
-        json={"text": "Sixth direction", "priority": "medium"},
+        json={"text": "Tenth direction", "priority": "medium"},
     )
-    assert sixth_resp.status_code == 200
-    # Now we have 5 active + 1 paused. Trying to reactivate the paused one should fail
+    assert tenth_resp.status_code == 200
+    # Now we have 10 active + 1 paused. Trying to reactivate the paused one should fail
     resp = await client.patch(
         f"/api/admin/projects/{project_id}/directions/{first_id}",
         json={"status": "active"},

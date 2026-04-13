@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlmodel import SQLModel
 
 from app.services import _check_evaluating_timeouts
-from app.task_lifecycle import _check_and_trigger_rollup
+from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
 
 
@@ -78,7 +78,7 @@ async def test_evaluating_all_children_terminal_triggers_rollup(eval_db, mocker)
     """When all children are terminal but the parent is still EVALUATING, the
     missed-rollup recovery path should call _check_and_trigger_rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_rollup = mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mock_rollup = mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
 
     project = Project(name="Eval Rollup Test", user_id="user1")
     eval_db.add(project)
@@ -169,7 +169,7 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     sweep while under the 90-minute CI backstop threshold — the normal 30-min
     CI timeout in orchestrator.py handles them instead."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_rollup = mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mock_rollup = mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
 
     project = Project(name="CI Waiting Test", user_id="user1")
     eval_db.add(project)
@@ -264,7 +264,7 @@ async def test_rollup_empty_children_after_filter(eval_db, mocker):
     """When every child is a review/fix type (excluded from ROLLUP_TYPES),
     _check_and_trigger_rollup should mark the parent COMPLETED — not CANCELLED."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Rollup Filter Test", user_id="user1")
     eval_db.add(project)
@@ -351,7 +351,7 @@ async def test_evaluating_unmerged_pr_verification(eval_db, mocker):
         return True
 
     mock_verify = AsyncMock(side_effect=_mock_verify)
-    mocker.patch("app.task_lifecycle._verify_pr_merged", new=mock_verify)
+    mocker.patch("app.rollup_management._verify_pr_merged", new=mock_verify)
 
     await _check_evaluating_timeouts()
 

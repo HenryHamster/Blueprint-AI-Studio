@@ -692,6 +692,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "task_id": str(task.id),
                         "tasks_created": len(dir_child_tasks),
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
+                        "finding_titles": titles,
                     }
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
                     new_history = history + [entry]

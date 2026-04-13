@@ -40,7 +40,8 @@ async def reaper_service():
     )
     from app.failure_classification import classify_failure  # noqa: PLC0415
     from app.broadcast import broadcast_to_project  # noqa: PLC0415
-    from app.task_lifecycle import _requeue_parent_task, _check_and_trigger_rollup  # noqa: PLC0415
+    from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
+    from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
 
     while True:
         try:

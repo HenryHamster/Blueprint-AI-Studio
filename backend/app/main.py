@@ -69,9 +69,8 @@ import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
-from app.task_lifecycle import (
-    _process_post_commit, _check_and_trigger_rollup,
-)
+from app.task_lifecycle import _process_post_commit
+from app.rollup_management import _check_and_trigger_rollup
 
 logger = logging.getLogger(__name__)
 

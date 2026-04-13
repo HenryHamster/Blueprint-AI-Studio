@@ -371,7 +371,7 @@ async def _check_evaluating_timeouts():
     - Skips CI-waiting tasks (they have their own 30-min timeout).
     """
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
-    from app.task_lifecycle import _check_and_trigger_rollup  # noqa: PLC0415
+    from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours

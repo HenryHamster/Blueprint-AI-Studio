@@ -22,7 +22,7 @@ from app.main import record_task_result, should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
 from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task
-from app.task_lifecycle import _check_and_trigger_rollup
+from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
 
@@ -729,7 +729,7 @@ async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker
     """When all children are review/fix types (excluded from ROLLUP_TYPES),
     the parent should be marked COMPLETED rather than incorrectly CANCELLED."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Rollup Test", user_id="user1")
     rollup_db.add(project)

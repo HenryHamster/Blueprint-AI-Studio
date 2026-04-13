@@ -393,7 +393,7 @@ async def bulk_action_tasks(
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.shared_state import runtime_config as _runtime_config
-                            from app.task_lifecycle import _cleanup_branches
+                            from app.rollup_management import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment
                             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                             merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
@@ -969,7 +969,7 @@ async def modify_task(
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.shared_state import runtime_config as _runtime_config
-                    from app.task_lifecycle import _cleanup_branches
+                    from app.rollup_management import _cleanup_branches
                     from app.github import merge_pull_request, create_pr_comment
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
@@ -1165,7 +1165,7 @@ async def modify_task(
             await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 
         # Trigger rollup check if child status/context changed
-        from app.task_lifecycle import _check_and_trigger_rollup, _cleanup_branches
+        from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
         should_check_rollup = False
         if "status" in payload and task.parent_task_id:
             new_status = TaskStatus(payload["status"])

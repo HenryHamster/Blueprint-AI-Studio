@@ -166,9 +166,9 @@ class TestAgentRestrictions:
 
 class TestDirectionLifecycleInvariants:
     def test_max_active_directions_default(self):
-        """max_active_directions must remain at 5 — controls direction sprawl."""
+        """max_active_directions must remain at 10 — controls direction sprawl."""
         from app.shared_state import runtime_config
-        assert runtime_config["max_active_directions"] == 5, (
+        assert runtime_config["max_active_directions"] == 10, (
             f"max_active_directions changed to {runtime_config['max_active_directions']} — "
             "this controls direction sprawl and must not change without approval."
         )
@@ -320,8 +320,11 @@ class TestMainPyFreeze:
 TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategic extraction
 TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
 
-TASK_LIFECYCLE_MAX_LINES = 1820      # Bumped: HTTPException import + transient-vs-404 branch check
-TASK_LIFECYCLE_MAX_FUNCTIONS = 10    # Ratcheted down after review_pipeline.py extraction
+TASK_LIFECYCLE_MAX_LINES = 1200      # Ratcheted down after rollup_management.py extraction
+TASK_LIFECYCLE_MAX_FUNCTIONS = 7     # Ratcheted down after rollup_management.py extraction
+
+ROLLUP_MANAGEMENT_MAX_LINES = 700
+ROLLUP_MANAGEMENT_MAX_FUNCTIONS = 4
 
 REVIEW_PIPELINE_MAX_LINES = 350
 REVIEW_PIPELINE_MAX_FUNCTIONS = 4
@@ -344,6 +347,10 @@ def _get_orchestrator_py_path() -> str:
 
 def _get_review_pipeline_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "review_pipeline.py")
+
+
+def _get_rollup_management_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "rollup_management.py")
 
 
 class TestTaskCompletionFreeze:
@@ -475,6 +482,46 @@ class TestReviewPipelineFreeze:
         assert func_count <= REVIEW_PIPELINE_MAX_FUNCTIONS, (
             f"review_pipeline.py has {func_count} functions, exceeding the ceiling of "
             f"{REVIEW_PIPELINE_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestRollupManagementFreeze:
+    """Enforce the rollup_management.py freeze: no new functions, no line growth."""
+
+    def test_rollup_management_line_count(self):
+        """rollup_management.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to rollup_management.py beyond
+        the extracted rollup/PR management logic. Once a line-reducing extraction
+        lands, ratchet the ceiling down.
+        """
+        path = _get_rollup_management_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= ROLLUP_MANAGEMENT_MAX_LINES, (
+            f"rollup_management.py has {count} lines, exceeding the ceiling of "
+            f"{ROLLUP_MANAGEMENT_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_rollup_management_function_count(self):
+        """rollup_management.py must not gain new functions."""
+        import ast
+        path = _get_rollup_management_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= ROLLUP_MANAGEMENT_MAX_FUNCTIONS, (
+            f"rollup_management.py has {func_count} functions, exceeding the ceiling of "
+            f"{ROLLUP_MANAGEMENT_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules. "
             "Once a line-reducing extraction lands, ratchet the ceiling down."
         )
