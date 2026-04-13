@@ -22,7 +22,7 @@ from app.models import (
     Task, Project, TaskHistory, TaskStatus, ProjectMessage,
 )
 from app.database import AsyncSessionLocal
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
@@ -707,6 +707,11 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from sqlalchemy import func
 
+    # Guard: task_type must be a known type
+    if task_type not in ALL_TASK_TYPES:
+        logger.warning(f"[AUTONOMOUS] Unknown task_type '{task_type}' in _spawn_periodic_task, skipping")
+        return
+
     # Guard: circuit breaker must allow spawning
     breaker = _shared_state.get_circuit_breaker(str(project.id))
     if breaker["state"] == "OPEN":
@@ -810,6 +815,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         **({"effort": task_effort} if task_effort else {}),
         **({"prompt_suffix": task_suffix} if task_suffix else {}),
     }
+    payload = validate_internal_payload(payload, "autonomous_research:periodic:" + task_type)
     new_task = Task(
         project_id=project.id,
         title=f"{task_type.upper()} scan: autonomous periodic",
