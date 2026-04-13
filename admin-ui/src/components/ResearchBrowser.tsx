@@ -293,12 +293,24 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                           {isDetailOpen && (
                             <div className="mt-2 ml-5 space-y-1.5" onClick={e => e.stopPropagation()}>
                               <p className="text-[11px] text-neutral-400 leading-relaxed">{ef.finding.description}</p>
-                              <div className="flex items-center gap-3 text-[10px] text-neutral-600">
+                              <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-600">
                                 {outcomeInfo && <span className={outcomeInfo.color}>{outcomeInfo.label}</span>}
                                 {ef.finding.related_files && ef.finding.related_files.length > 0 && (
                                   <span className="font-mono">{ef.finding.related_files.length} file{ef.finding.related_files.length !== 1 ? 's' : ''}</span>
                                 )}
-                                {ef.finding.risk === 'high' && <span className="text-red-400">high risk</span>}
+                                {ef.finding.scope && ef.finding.risk && (
+                                  <span className={`inline-block text-[9px] uppercase px-1 rounded ${
+                                    ef.finding.risk === 'high' ? 'bg-red-900/40 text-red-400' :
+                                    ef.finding.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' :
+                                    'bg-emerald-900/40 text-emerald-400'
+                                  }`}>{ef.finding.scope}/{ef.finding.risk}</span>
+                                )}
+                                {ef.finding.type && (
+                                  <span className="text-[10px] px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
+                                )}
+                                {ef.finding.priority && ef.finding.priority !== 'medium' && (
+                                  <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>
+                                )}
                               </div>
                             </div>
                           )}

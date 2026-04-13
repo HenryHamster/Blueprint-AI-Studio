@@ -78,6 +78,19 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   rollup: { bg: 'bg-violet-500/10 border-violet-500/20', text: 'text-violet-400', icon: Layers, label: 'Rollup' },
 };
 
+function HighlightText({ text, query }: { text: string; query?: string }) {
+  if (!query || !text) return <>{text}</>;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return <>{text}</>;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="bg-amber-500/30 text-amber-200 rounded-sm px-0.5">{text.slice(idx, idx + query.length)}</mark>
+      {text.slice(idx + query.length)}
+    </>
+  );
+}
+
 interface TaskCardProps {
   task: Task;
   maxRetries?: number;
@@ -99,6 +112,7 @@ interface TaskCardProps {
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
   blockingCount?: number;
+  searchQuery?: string;
 }
 
 export function useElapsedTime(startIso: string, endIso?: string): string {
@@ -210,7 +224,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -361,7 +375,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     >
       <div className="flex items-start gap-2 mb-1.5">
         <div className="flex-1 min-w-0">
-          <h3 className={`font-medium text-sm ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`}>{task.title}</h3>
+          <h3 className={`font-medium text-sm ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`}><HighlightText text={task.title} query={searchQuery} /></h3>
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {/* Hover quick-action toolbar */}
@@ -445,7 +459,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
       {!compact && (
         <div className="mb-2">
-          <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-1'}`}>{task.description}</p>
+          <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-1'}`}><HighlightText text={task.description} query={searchQuery} /></p>
           {task.description.length > 80 && (
             <button
               onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}

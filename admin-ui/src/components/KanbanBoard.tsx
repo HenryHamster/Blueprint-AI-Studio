@@ -95,9 +95,10 @@ interface KanbanBoardProps {
   onTrack?: (task: Task) => void;
   trackedTaskIds?: Set<string>;
   hasActiveFilters?: boolean;
+  searchQuery?: string;
 }
 
-function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate }: {
+function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
@@ -120,6 +121,7 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
   cardIdx?: number;
   cardRef?: (el: HTMLDivElement | null) => void;
   onNavigate?: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
+  searchQuery?: string;
 }) {
   return (
     <div className="relative">
@@ -156,6 +158,7 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
           onViewLogs={onViewLogs}
           onTrack={onTrack}
           isTracked={isTracked}
+          searchQuery={searchQuery}
         />
       </div>
     </div>
@@ -186,6 +189,7 @@ interface SortableCardProps {
   cardIdx: number;
   cardRef: (el: HTMLDivElement | null) => void;
   onNavigate: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
+  searchQuery?: string;
 }
 
 function SortableCard({
@@ -212,6 +216,7 @@ function SortableCard({
   cardIdx,
   cardRef,
   onNavigate,
+  searchQuery,
 }: SortableCardProps) {
   const {
     attributes,
@@ -274,6 +279,7 @@ function SortableCard({
           onViewLogs={onViewLogs}
           onTrack={onTrack}
           isTracked={isTracked}
+          searchQuery={searchQuery}
         />
       </div>
     </div>
@@ -345,6 +351,7 @@ export function KanbanBoard({
   onViewLogs,
   onTrack,
   trackedTaskIds,
+  searchQuery,
 }: KanbanBoardProps) {
   // Selection mode and groupBy removed from UI
   const selectionMode = false;
@@ -558,7 +565,7 @@ export function KanbanBoard({
     return map;
   }, [tasks]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
 
   return (
     <DndContext
@@ -724,6 +731,7 @@ export function KanbanBoard({
                       onViewLogs={onViewLogs}
                       onTrack={onTrack}
                       isTracked={trackedTaskIds?.has(task.id)}
+                      searchQuery={searchQuery}
                     />
                   ))}
                 </SortableContext>
@@ -909,6 +917,7 @@ export function KanbanBoard({
                       onViewLogs={onViewLogs}
                       onTrack={onTrack}
                       isTracked={trackedTaskIds?.has(task.id)}
+                      searchQuery={searchQuery}
                     />
                   ))}
                 </SortableContext>
@@ -1045,6 +1054,7 @@ export function KanbanBoard({
             onViewLogs={onViewLogs}
             onTrack={onTrack}
             isTracked={trackedTaskIds?.has(activeTask.id)}
+            searchQuery={searchQuery}
             isOverlay
           />
         )}

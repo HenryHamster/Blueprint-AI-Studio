@@ -632,6 +632,7 @@ export default function App() {
               onViewLogs={s.handleViewLogs}
               onTrack={s.trackTask}
               trackedTaskIds={s.trackedTaskIds}
+              searchQuery={s.searchQuery}
             />
             </ErrorBoundary>
           ) : (
