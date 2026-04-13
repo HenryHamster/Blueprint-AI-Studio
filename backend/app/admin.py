@@ -220,6 +220,7 @@ async def get_all_tasks(
             children_map[parent_key].append(str(t.id))
 
     # Return tasks with artifact data attached
+    from app.failure_classification import classify_failure  # noqa: PLC0415
     result_list = []
     for t in tasks:
         task_type = (t.first_payload).get("type", "create")
@@ -254,6 +255,7 @@ async def get_all_tasks(
             "repo_url": commit_map.get(str(t.id), {}).get("repo_url"),
             "history": history_map.get(str(t.id), []),
             "child_task_ids": children_map.get(str(t.id), []),
+            "failure_class": classify_failure(t) if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
         }
         result_list.append(task_dict)
 

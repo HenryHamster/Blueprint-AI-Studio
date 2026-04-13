@@ -1,7 +1,7 @@
 # Blueprint AI Studio — Cross-Cutting Codebase Analysis
 
-> Generated: 2026-04-11  
-> Branch: research/2b3f540b  
+> Generated: 2026-04-13  
+> Branch: main  
 > Scope: Full repository analysis across frontend, backend, agent, and infrastructure
 
 ---
@@ -351,35 +351,29 @@ Orchestrator assigns `vm_instance_id` to a task *before* the VM boots, then JWT 
 
 ### High priority
 
-1. **Monolithic files** — `backend/app/main.py` (5 000+ LOC) and `agent/src/index.ts` (8 000+ LOC) are hard to navigate, increase merge conflict risk, and limit parallelized development. Breaking them into routers/services/workers modules is the single highest-leverage refactor.
+1. **Monolithic files** — `backend/app/main.py` (~2 400 LOC, ceiling 2 500) and `agent/src/index.ts` are hard to navigate and have hard line/function ceilings enforced by `test_invariants.py`. Substantial decomposition has already occurred (routers extracted, task lifecycle split). Further extraction must respect the ceilings.
 
 2. **Missing payload schema validation** — `Task.payloads` is raw JSONB; handlers assume fields exist without null checks. Adding Pydantic schemas per handler type (`CreatePayload`, `ResearchPayload`, …) would catch malformed tasks at ingestion time.
 
-3. **Dependency DAG has no deadlock detection** — `depends_on` DAG is checked at dispatch but not validated at creation. A cycle (A depends on B depends on A) silently blocks both tasks forever. Pre-validate DAG on task creation.
-
-4. **Error context loss in orchestrator loop** — broad `except Exception` handlers catch all errors; only a string message is stored. Adding structured `error_class` / `reason_code` fields would enable better circuit breaker logic and alerting.
+3. **Error context loss in orchestrator loop** — broad `except Exception` handlers catch all errors; only a string message is stored. Adding structured `error_class` / `reason_code` fields would enable better circuit breaker logic and alerting.
 
 ### Medium priority
 
-5. **Incomplete type coverage** — `app/github.py` suppresses `warn_return_any`; test files disable `DTZ`/`BLE` Ruff rules broadly. Tightening types would surface latent bugs.
+4. **Incomplete type coverage** — `app/github.py` suppresses `warn_return_any`; test files disable `DTZ`/`BLE` Ruff rules broadly. Tightening types would surface latent bugs.
 
-6. **GCS artifact retention** — artifacts are uploaded but no lifecycle policy exists. Add GCS object lifecycle rules (e.g., 30-day auto-delete) or an explicit cleanup endpoint.
+5. **Rate limiter fairness** — per-IP limits penalize shared corporate NAT IPs. A per-authenticated-user override for known internal IPs would improve ergonomics.
 
-7. **Agent VM image token staleness** — Packer bakes Claude OAuth tokens into the VM image; tokens can expire before the image is refreshed. Dynamic token injection at VM startup via Secret Manager lookup is safer.
+6. **Handler registration** — `handlers/index.ts` must be manually updated when adding a new handler. A registry pattern or directory-based auto-discovery would reduce friction.
 
-8. **WebSocket heartbeat missing** — no ping/pong on long-lived WS connections; they may be silently dropped by load balancers. Add client-side heartbeat (30 s) and server-side idle timeout (60 s).
+7. **Alembic migration naming** — files use numeric prefixes only (e.g., `0024_`). Semantic suffixes (e.g., `0024_add_project_members`) would make `git log` diffs more readable.
 
-9. **Logging volume** — orchestrator logs every 10-second loop iteration. Log on state changes only; emit periodic telemetry summaries instead.
+8. **Distributed integration tests** — CI uses SQLite + mocked GCP. A test tier against real PostgreSQL + Redis would catch distributed-semaphore and connection-pool edge cases.
 
-### Lower priority
+### Already addressed (previously listed as debt)
 
-10. **Handler registration** — `handlers/index.ts` must be manually updated when adding a new handler. A registry pattern or directory-based auto-discovery would reduce friction.
-
-11. **Alembic migration naming** — files use numeric prefixes only (e.g., `0024_`). Semantic suffixes (e.g., `0024_add_project_members`) would make `git log` diffs more readable.
-
-12. **Distributed integration tests** — CI uses SQLite + mocked GCP. A test tier against real PostgreSQL + Redis would catch distributed-semaphore and connection-pool edge cases.
-
-13. **Rate limiter fairness** — per-IP limits penalize shared corporate NAT IPs. A per-authenticated-user override for known internal IPs would improve ergonomics.
+- **WebSocket heartbeat** — ping/pong heartbeats implemented; `ws.close(4001)` on pong timeout triggers reconnect.
+- **GCS artifact retention** — 7-day auto-delete lifecycle rule in Terraform (`infra/terraform/iam.tf`).
+- **Dependency DAG cycle detection** — DAG is now validated at creation to prevent silent deadlocks.
 
 ---
 
@@ -388,19 +382,32 @@ Orchestrator assigns `vm_instance_id` to a task *before* the VM boots, then JWT 
 | File | Purpose |
 |---|---|
 | `backend/app/models.py` | SQLModel data models, enums, state machines |
-| `backend/app/main.py` | FastAPI app; all routers, orchestrator integration (monolith) |
-| `backend/app/schemas.py` | Pydantic request/response schemas |
+| `backend/app/main.py` | FastAPI app entry point; mounts all routers (~2 400 LOC, ceiling 2 500) |
 | `backend/app/auth.py` | Firebase auth, agent JWT, WebSocket ticket issuance |
 | `backend/app/orchestrator.py` | Orchestrator worker loop (polling, provisioning, monitoring) |
+| `backend/app/orchestrator_filters.py` | Task eligibility and conflict filtering for the orchestrator |
 | `backend/app/reaper.py` | Orphaned VM detection & recovery |
 | `backend/app/compute.py` | GCP Compute API wrapper; zone-aware scheduling |
 | `backend/app/github.py` | GitHub API client (httpx, retry logic, rate limiting) |
 | `backend/app/security.py` | Prompt injection detection (100+ patterns, fuzzy match, base64) |
 | `backend/app/shared_state.py` | Shared globals (runtime_config, circuit_breakers, metrics) |
 | `backend/app/lifecycle.py` | Startup/shutdown hooks, background task crash monitoring |
+| `backend/app/task_lifecycle.py` | Core task state transitions and post-commit flow (~1 200 LOC, ceiling 1 200) |
+| `backend/app/task_completion.py` | Task completion handling and evaluation |
+| `backend/app/research_completion.py` | Research task completion + ghost-merge dedup filter |
+| `backend/app/strategic_completion.py` | Strategic cycle completion (direction create/retire/vision) |
+| `backend/app/review_pipeline.py` | Review-fix iteration logic; caps per task size |
+| `backend/app/rollup_management.py` | Rollup PR creation and retry (~700 LOC, effectively frozen) |
+| `backend/app/autonomous_research.py` | Autonomous research spawning, strategic cycles, direction health |
+| `backend/app/direction_lifecycle.py` | Direction pruning, auto-pause, auto-recovery |
+| `backend/app/deploy_health.py` | Deployment health monitoring and webhook notifications |
+| `backend/app/failure_classification.py` | On-read failure class computation (no DB storage) |
 | `backend/app/routers/agent.py` | Agent lifecycle endpoints (claim, status, spawn, GitHub proxy) |
 | `backend/app/routers/projects.py` | Deploy, status, WebSocket endpoints |
-| `backend/app/admin.py` | Admin panel endpoints (users, settings, metrics) |
+| `backend/app/routers/directions.py` | Direction CRUD endpoints |
+| `backend/app/routers/admin_analytics.py` | Analytics and digest endpoints |
+| `backend/app/routers/admin_settings.py` | Runtime configuration endpoints |
+| `backend/app/admin.py` | Admin panel endpoints (users, tasks, manual create) |
 | `admin-ui/src/useAppState.ts` | Master state hook (tasks, projects, metrics, WS logs) |
 | `admin-ui/src/hooks/useLogViewer.ts` | WebSocket log streaming |
 | `admin-ui/src/hooks/useDeploymentState.ts` | Deployment monitoring + rollback |

@@ -78,6 +78,14 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   rollup: { bg: 'bg-violet-500/10 border-violet-500/20', text: 'text-violet-400', icon: Layers, label: 'Rollup' },
 };
 
+const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint: string }> = {
+  CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400', hint: 'Application code error — review error logs for root cause' },
+  PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400', hint: 'VM startup failed — check zone health. Auto-retries on different zone' },
+  AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400', hint: 'Agent died or timed out — possible OOM or stuck execution' },
+  EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400', hint: 'External service failure — typically transient, auto-retries' },
+  RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400', hint: 'API quota exhausted — auto-retries with different account' },
+};
+
 function HighlightText({ text, query }: { text: string; query?: string }) {
   if (!query || !text) return <>{text}</>;
   const idx = text.toLowerCase().indexOf(query.toLowerCase());
@@ -511,6 +519,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <ExternalLink className="w-3 h-3" />
           PR #{task.payloads[0].pr_number as number}
         </a>
+      ) : null}
+
+      {task.status === 'FAILED' && task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? (
+        <span
+          className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold mb-2 ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
+          title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
+        >
+          {FAILURE_CLASS_CONFIG[task.failure_class].label}
+        </span>
       ) : null}
 
       {task.status === 'FAILED' && task.error_logs ? (

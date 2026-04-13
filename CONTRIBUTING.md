@@ -68,11 +68,14 @@ Thanks for your interest in contributing to Blueprint! This guide will help you 
 3. Run linting and tests before pushing:
 
    ```bash
-   # Frontend (admin-ui)
-   cd admin-ui && npx eslint .
+   # Frontend (admin-ui) — build check + lint
+   cd admin-ui && npm run build && npx eslint .
 
-   # Backend
-   cd backend && pytest
+   # Backend — runs full test suite in Docker
+   bash scripts/test-backend.sh
+
+   # Agent — TypeScript type check
+   cd agent && npx tsc --noEmit
    ```
 
 4. Push your branch and open a pull request against `main`.
