@@ -1175,6 +1175,88 @@ async def test_starvation_no_gap_no_increment(strategic_db, mocker):
     assert "_strategic_frequency_override" not in project.vision
 
 
+@pytest.mark.asyncio
+async def test_starvation_auto_creates_direction_after_five_cycles(strategic_db, mocker):
+    """After 5 consecutive empty cycles with no product direction, auto-creates a product direction."""
+    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    # Start with starvation_count=4 (simulating 4 previous cycles)
+    project = Project(
+        name="P", user_id="u1",
+        vision={
+            "purpose": "test", "revision": 1,
+            "_direction_starvation_count": 4,
+            "_strategic_frequency_override": 2,
+        },
+        directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    # Counter should be reset to 0 and override cleared
+    assert project.vision.get("_direction_starvation_count") == 0
+    assert "_strategic_frequency_override" not in project.vision
+    # A new direction should have been auto-created
+    assert len(project.directions) == 2
+    new_dir = project.directions[-1]
+    assert new_dir["status"] == "active"
+    assert new_dir["priority"] == "medium"
+    assert new_dir["category"] == "product"
+    assert "Deliver user-visible product improvements" in new_dir["text"]
+    assert len(new_dir["notes"]) == 1
+    assert "starvation handler" in new_dir["notes"][0]["text"]
+    assert new_dir["research_history"] == []
+    # Alert should be fired
+    alert_mock.assert_called_once()
+    alert_msg = alert_mock.call_args[0][2]
+    assert "fallback" in alert_msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocker):
+    """Auto-creation does NOT exceed max_active_directions when cap is reached."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.strategic_completion._runtime_config", {"max_active_directions": 2})
+
+    # Two active directions already at cap
+    project = Project(
+        name="P", user_id="u1",
+        vision={
+            "purpose": "test", "revision": 1,
+            "_direction_starvation_count": 4,
+        },
+        directions=[
+            {"id": "d-aaa", "status": "active", "text": "Dir A"},
+            {"id": "d-bbb", "status": "active", "text": "Dir B"},
+        ],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    # No new direction should be added — cap is at 2, already at 2
+    assert len(project.directions) == 2
+    # Starvation counter increments (no reset since no direction was created)
+    assert project.vision.get("_direction_starvation_count") == 5
+
+
 # ── Structural Refactor Pipeline Relaxations ──────────────────────────────────
 
 

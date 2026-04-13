@@ -146,6 +146,10 @@ async def _check_direction_starvation(
       - Creates a strategic alert describing the gap.
       - Sets vision['_strategic_frequency_override'] = 2 to boost cycle frequency.
 
+    When starvation_count >= 5:
+      - Auto-creates a fallback direction targeting the detected gap.
+      - Resets the starvation counter and clears frequency override.
+
     Resets both counter and override when dirs_created > 0 (starvation resolved).
     """
     from app.main import _create_strategic_alert  # noqa: PLC0415
@@ -166,7 +170,73 @@ async def _check_direction_starvation(
     if dirs_created == 0 and has_gaps:
         starvation_count = vision.get("_direction_starvation_count", 0) + 1
         vision["_direction_starvation_count"] = starvation_count
-        if starvation_count >= 2:
+
+        if starvation_count >= 5:
+            # Auto-create a fallback direction as last resort
+            max_active = _runtime_config.get("max_active_directions", 10)
+            if active_count < max_active:
+                if product_count == 0:
+                    gap_type = "NO_PRODUCT_DIRECTIONS"
+                    fallback_text = "Deliver user-visible product improvements"
+                    fallback_category = "product"
+                elif active_count < 3:
+                    gap_type = "BELOW_MINIMUM"
+                    fallback_text = "Expand system capabilities beyond current directions"
+                    fallback_category = None
+                else:
+                    gap_type = "ALL_SATURATED"
+                    fallback_text = "Explore and improve underserved areas of the system"
+                    fallback_category = None
+
+                fallback_dir: Dict[str, Any] = {
+                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "text": fallback_text,
+                    "status": "active",
+                    "priority": "medium",
+                    "notes": [{
+                        "text": (
+                            f"Auto-created by starvation handler after {starvation_count} "
+                            f"consecutive cycles with no direction creation"
+                        ),
+                        "added_at": _utcnow().isoformat(),
+                    }],
+                    "research_history": [],
+                }
+                if fallback_category:
+                    fallback_dir["category"] = fallback_category
+
+                updated_directions = list(directions) + [fallback_dir]
+                project.directions = updated_directions
+                flag_modified(project, "directions")
+
+                vision["_direction_starvation_count"] = 0
+                vision.pop("_strategic_frequency_override", None)
+                project.vision = vision
+                flag_modified(project, "vision")
+                session.add(project)
+
+                logger.warning(
+                    f"[STRATEGIC] Starvation fallback: auto-created direction for project "
+                    f"{project.id} after {starvation_count} consecutive empty cycles. "
+                    f"gap_type={gap_type}, dir_id={fallback_dir['id']}"
+                )
+                await _create_strategic_alert(
+                    project.id, session,
+                    f"Direction starvation fallback: auto-created direction '{fallback_text}' "
+                    f"after {starvation_count} consecutive cycles with 0 new directions "
+                    f"(gap: {gap_type}).",
+                )
+            else:
+                # Cap reached — cannot auto-create, just log and keep alerting
+                project.vision = vision
+                flag_modified(project, "vision")
+                session.add(project)
+                logger.warning(
+                    f"[STRATEGIC] Direction starvation for project {project.id}: "
+                    f"{starvation_count} cycles, but direction cap ({max_active}) reached — "
+                    f"cannot auto-create fallback."
+                )
+        elif starvation_count >= 2:
             gap_parts = []
             if active_count < 3:
                 gap_parts.append(f"only {active_count} active directions (min 3 needed)")
