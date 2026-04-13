@@ -57,6 +57,10 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
   const [resolvingIds, setResolvingIds] = useState<Set<string>>(new Set());
   const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
 
+  // Batch selection state
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchCreating, setBatchCreating] = useState(false);
+
   // Stable ref for addToast to avoid re-creating fetchMessages on every render
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
@@ -69,6 +73,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setMessages(data.messages ?? []);
+      setSelectedIds(new Set());
     } catch {
       addToastRef.current('Failed to load messages', 'error');
     } finally {
@@ -124,8 +129,8 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
     }
   }
 
-  async function handleCreateDirection(msg: ProjectMessage) {
-    if (!selectedProjectId) return;
+  async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
+    if (!selectedProjectId) return false;
     setCreatingDirectionIds(prev => new Set(prev).add(msg.id));
     try {
       const text = msg.content.slice(0, 2000);
@@ -144,10 +149,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
         body: JSON.stringify({ resolution: `Direction created: ${directionId}` }),
       });
       if (!resolveRes.ok) throw new Error(`HTTP ${resolveRes.status}`);
-      addToast('Direction created', 'success');
+      if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
+      return true;
     } catch {
       addToast('Failed to create direction', 'error');
+      return false;
     } finally {
       setCreatingDirectionIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
@@ -155,6 +162,40 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
 
   const openMessages = messages.filter(m => m.status === 'open');
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
+  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
+  const allFeedbackSelected = openFeedbackMessages.length > 0 && openFeedbackMessages.every(m => selectedIds.has(m.id));
+
+  function toggleSelectAllFeedback() {
+    if (allFeedbackSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(openFeedbackMessages.map(m => m.id)));
+    }
+  }
+
+  function toggleSelect(msgId: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(msgId)) next.delete(msgId);
+      else next.add(msgId);
+      return next;
+    });
+  }
+
+  async function handleBatchCreateDirections() {
+    const ids = Array.from(selectedIds);
+    const msgs = openFeedbackMessages.filter(m => ids.includes(m.id));
+    if (msgs.length === 0) return;
+    setBatchCreating(true);
+    let count = 0;
+    for (const msg of msgs) {
+      const ok = await handleCreateDirection(msg, true);
+      if (ok) count++;
+    }
+    setBatchCreating(false);
+    setSelectedIds(new Set());
+    if (count > 0) addToast(`${count} direction${count > 1 ? 's' : ''} created`, 'success');
+  }
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
@@ -167,6 +208,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
             <span className="bg-blue-500/20 text-blue-400 border border-blue-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
               {openMessages.length} open
             </span>
+          )}
+          {openFeedbackMessages.length > 1 && (
+            <button onClick={toggleSelectAllFeedback} className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors">
+              {allFeedbackSelected ? 'Deselect all' : `Select all ${openFeedbackMessages.length} feedback`}
+            </button>
           )}
         </div>
         <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-1.5 rounded text-xs transition-colors border border-neutral-700">
@@ -226,6 +272,14 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
                 <div key={msg.id} className={`bg-neutral-900 border border-neutral-800 border-l-4 rounded-lg overflow-hidden ${borderColor}`}>
                   <div className="px-4 py-3">
                     <div className="flex items-start gap-3">
+                      {msg.message_type === 'FEEDBACK' && (
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(msg.id)}
+                          onChange={() => toggleSelect(msg.id)}
+                          className="mt-1 shrink-0 accent-purple-500 cursor-pointer"
+                        />
+                      )}
                       <Icon className={`w-4 h-4 shrink-0 mt-0.5 ${config.color.split(' ')[0]}`} />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1.5">
@@ -277,6 +331,26 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
                 </div>
               );
             })}
+
+            {/* Batch action bar */}
+            {selectedIds.size > 0 && (
+              <div className="sticky bottom-0 bg-neutral-800 border-t border-neutral-700 px-4 py-2 flex items-center gap-3 rounded-lg">
+                <span className="text-xs text-neutral-400">{selectedIds.size} selected</span>
+                <button
+                  onClick={handleBatchCreateDirections}
+                  disabled={batchCreating}
+                  className="text-xs bg-purple-600 hover:bg-purple-500 text-white px-3 py-1 rounded disabled:opacity-40 transition-colors"
+                >
+                  {batchCreating ? 'Creating...' : 'Create Directions'}
+                </button>
+                <button
+                  onClick={() => setSelectedIds(new Set())}
+                  className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
 
             {/* Resolved messages */}
             {resolvedMessages.length > 0 && (

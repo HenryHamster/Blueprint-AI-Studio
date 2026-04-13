@@ -245,7 +245,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             })
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
-        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
+        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired"
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
