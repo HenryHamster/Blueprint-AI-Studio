@@ -360,6 +360,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     if len(sid) > STRATEGIC_SYSTEM_ID_MAX:
                         logger.warning(f"[STRATEGIC] Task {task.id}: truncating system_id {len(sid)}→{STRATEGIC_SYSTEM_ID_MAX} chars")
                     new_dir["system_id"] = sid[:STRATEGIC_SYSTEM_ID_MAX]
+                if op_entry.get("category") and op_entry["category"] in ("product", "structural"):
+                    new_dir["category"] = op_entry["category"]
                 current_active = sum(1 for d in directions if d.get('status') == 'active')
                 if current_active >= _runtime_config.get('max_active_directions', 5):
                     logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')

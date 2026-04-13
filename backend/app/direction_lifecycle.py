@@ -97,8 +97,35 @@ async def _process_direction_lifecycle(
             d["paused_reason"] = pause_reason
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
+            d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
+            MAX_AUTO_PAUSE_CYCLES = 3
+            if d.get("auto_pause_count", 0) >= MAX_AUTO_PAUSE_CYCLES:
+                d["status"] = "completed"
+                d["auto_completed"] = True
+                d["auto_completed_reason"] = (
+                    f"Auto-retired: direction was auto-paused {d['auto_pause_count']} times "
+                    f"without producing results. Slot freed for new directions."
+                )
+                d["completed_at"] = _utcnow().isoformat()
+                logger.info(
+                    f"[AUTONOMOUS] Auto-retired direction {did} after "
+                    f"{d['auto_pause_count']} auto-pause cycles: {d.get('text', '')[:60]}"
+                )
+                from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                alert = Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.INFO,
+                    title="Direction auto-retired",
+                    message=(
+                        f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
+                        f"{d['auto_pause_count']} consecutive auto-pause cycles. "
+                        f"Slot freed for strategic agent to create a replacement."
+                    ),
+                )
+                session.add(alert)
+                directions_modified = True
             continue
         # Positive completion detection — mark for user review but don't pause
         completion_suggestion = _check_direction_completion(d)

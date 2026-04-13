@@ -516,6 +516,7 @@ ${hotspotsSection}
           if (d.prs_merged) parts.push(`${d.prs_merged} merged`);
           if (d.tasks_failed) parts.push(`${d.tasks_failed} failed`);
           const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
+          const catNote = d.category ? ` [${strVal(d.category)}]` : '';
           const sysNote = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
 
           // Research context: show established findings count, failed approaches, open questions
@@ -563,7 +564,7 @@ ${hotspotsSection}
             failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
           }
 
-          return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)} (id: ${strVal(d.id)})${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
+          return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
         }).join('\n\n')
       : 'No directions exist yet.';
 
@@ -638,6 +639,24 @@ echo ""
     fs.writeFileSync(`${WORKSPACE}/design-doc`, designDocHelper, { mode: 0o755 });
     excludeAgentHelpers();
 
+    // ── Compute direction health summary for thinker prompt ──
+    const maxActiveDirections = typeof payload.max_active_directions === 'number'
+      ? payload.max_active_directions
+      : 10;
+    const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
+    const activeCount = activeDirections.length;
+    const saturatedCount = activeDirections.filter(d => d.possibly_saturated === true).length;
+    const productCount = activeDirections.filter(d => strVal(d.category) === 'product').length;
+    const availableSlots = maxActiveDirections - activeCount;
+    const gaps: string[] = [];
+    if (productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
+    if (saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
+    if (activeCount < 3) gaps.push('BELOW_MINIMUM');
+    const dirHealthSummary = [
+      `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.`,
+      gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
+    ].join('\n');
+
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
@@ -653,6 +672,9 @@ ${visionJson || 'No vision set yet.'}
 ${outcomeSection}
 ## Current research directions
 ${dirSummaryText}
+
+## Direction Health
+${dirHealthSummary}
 ${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
 ## Codebase
 ${codebaseSummary}${researchPlaybookSection}${fileTreeSection}
@@ -665,12 +687,14 @@ Analyze this project and write a strategic review. Cover:
    Define systems with IDs (sys-xxx), names, descriptions, statuses (planned/in_progress/functional/mature), and dependencies.
    Order priorities — which systems matter most right now?
 
-2. **Directions**: What are the 3-5 most impactful research directions?
-   For each: a clear description, priority (high/medium/low), which system_id it serves, and rationale.
-   If existing directions should be updated or retired, say so with rationale.
-   For FEEDBACK messages: If a user has requested a feature or capability, create a direction for it
-   (unless one already exists that addresses it). Set priority based on urgency implied by the request.
-   After creating the direction, resolve the FEEDBACK message with a note explaining which direction addresses it.
+2. **Directions**: Evaluate and steer the active research portfolio.
+   MANDATORY — you MUST include direction_operations in your Structured Output:
+   - If fewer than 3 active directions exist: create at least one new direction.
+   - If ALL active directions are SATURATED: retire at least one and create a replacement.
+   - If no direction has category="product": create one product-feature direction.
+   - Each new direction MUST include category: "product" (user-visible features, UI, API) or "structural" (infrastructure, refactoring, testing).
+   - For FEEDBACK messages: create a direction unless one already addresses the request. Set priority based on urgency. Resolve the FEEDBACK message afterward.
+   If existing directions are healthy and sufficient, you may skip creates — but you must still output update or retire operations for any saturated or complete directions.
 
 3. **Notes**: Any strategic observations worth preserving for future cycles.
 
@@ -680,7 +704,9 @@ Write your analysis as structured prose — it will be processed by a follow-up 
 IMPORTANT: End your analysis with a section titled '## Structured Output' containing:
 - A JSON block with the complete vision object (purpose, success_criteria, systems, priorities)
 - A list of direction operations (create/update/retire with all required parameters)
-This structured section will be used directly by the executor. Make it complete and self-contained.`;
+This structured section will be used directly by the executor. Make it complete and self-contained.
+
+IMPORTANT: Your Structured Output MUST include direction_operations with concrete create/update/retire entries. If your analysis recommends new directions, they MUST appear as create operations — not just prose descriptions.`;
 
     statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
     const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -707,7 +733,7 @@ Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Jus
 
 # Create research directions (max 5)
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel
-./strategic create-direction '{"text": "...", "priority": "high|medium|low", "system_id": "sys-x", "rationale": "...", "conflicts_with": ["d-xxx"]}'
+./strategic create-direction '{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "...", "conflicts_with": ["d-xxx"]}'
 
 # Update existing directions (can set conflicts_with to control parallel execution)
 ./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "conflicts_with": ["d-yyy"]}, "rationale": "..."}'
@@ -734,6 +760,7 @@ ${analysisText.slice(0, 50_000)}
 # Instructions
 
 1. Run ./strategic set-vision with the vision described in the analysis.
+1.5. If the analysis identifies gaps (BELOW_MINIMUM, NO_PRODUCT_DIRECTIONS, ALL_SATURATED), ENSURE you run ./strategic create-direction for at least one new direction addressing the gap.
 2. Run ./strategic create-direction for each new direction recommended.
 3. Run ./strategic retire-direction for any directions the analysis says to retire.
 4. Run ./design-doc set "notes/strategic-review" with key observations.
@@ -765,6 +792,34 @@ ${analysisText.slice(0, 50_000)}
       }
     } catch (e) {
       sendLog(ws, `[WARNING] Could not verify strategic set-vision call: ${e}\n`);
+    }
+
+    // Post-check: verify direction operations were executed if thinker recommended them
+    try {
+      const directionCreatedInOutput = /"op"\s*:\s*"create_direction"/.test(allOutput);
+      const directionUpdatedInOutput = /"op"\s*:\s*"(update_direction|retire_direction)"/.test(allOutput);
+      const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
+
+      // Check if thinker's structured output contained direction recommendations
+      const structuredSection = rawAnalysis.match(/## Structured Output[\s\S]*$/i)?.[0] || '';
+      const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
+
+      if (exitCode === 0 && thinkerRecommendedCreates && !anyDirectionOp) {
+        sendLog(ws, '\n[WARNING] Strategic executor completed but no direction operations were executed. Retrying...\n');
+        const retryResult = await runClaudeCode(
+          'Your previous attempt did not execute any ./strategic create-direction commands.\n\n' +
+          'The strategic analysis recommended creating new directions. Run the create-direction commands NOW:\n\n' +
+          'For each new direction in the analysis, run:\n' +
+          './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "..."}\' \n\n' +
+          'Extract the directions from the analysis and call the commands. Nothing else.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+        allOutput = allOutput + '\n' + retryResult.allOutput;
+        lastResultText = retryResult.lastResultText || lastResultText;
+      }
+    } catch (e) {
+      sendLog(ws, `[WARNING] Could not verify strategic direction ops: ${e}\n`);
     }
 
     // Legacy: try to read /tmp output file (backward compat)

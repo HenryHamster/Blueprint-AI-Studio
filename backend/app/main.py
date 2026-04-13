@@ -1641,6 +1641,8 @@ async def strategic_operation(
             new_dir["system_id"] = _cap_str(data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings)
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
+        if data.get("category") and data["category"] in ("product", "structural"):
+            new_dir["category"] = data["category"]
         directions.append(new_dir)
         project.directions = directions
         flag_modified(project, "directions")
