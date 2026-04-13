@@ -1,7 +1,6 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, LayoutList, LayoutGrid, ChevronUp, ChevronDown, CheckSquare, X } from 'lucide-react';
-import type { Task } from './types/task';
+import { Activity, AlertCircle, LayoutList, LayoutGrid, ChevronUp, ChevronDown, CheckSquare } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { DirectionsPanel } from './components/DirectionsPanel';
@@ -19,6 +18,7 @@ import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
+import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
@@ -43,12 +43,6 @@ const COLUMNS: KanbanColumn[] = [
 const SORT_KEY = 'blueprint-admin:kanban-sort';
 const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
-
-function buildBulkConfirmMessage(tasks: Task[]): string {
-  const titles = tasks.map(t => t.title || t.id.slice(0, 12));
-  if (titles.length <= 5) return titles.join('\n');
-  return titles.slice(0, 5).join('\n') + `\n...and ${titles.length - 5} more`;
-}
 
 interface ColumnPref { id: string; visible: boolean; }
 
@@ -834,82 +828,18 @@ export default function App() {
       )}
 
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl">
-          <span className="flex items-center gap-1.5 text-xs text-neutral-300 font-medium mr-1">
-            <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
-            {s.selectedTaskIds.size} selected
-          </span>
-          {approvableTasks.length > 0 && (
-            <button
-              onClick={() => s.setConfirmDialog({
-                title: `Approve ${approvableTasks.length} task${approvableTasks.length !== 1 ? 's' : ''}?`,
-                message: buildBulkConfirmMessage(approvableTasks),
-                confirmLabel: `Approve ${approvableTasks.length}`,
-                onConfirm: () => {
-                  s.handleBulkAction('approve', approvableTasks.map(t => t.id));
-                  s.toggleSelectionMode();
-                  s.setConfirmDialog(null);
-                },
-              })}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/40 transition-colors"
-            >
-              Approve {approvableTasks.length}
-            </button>
-          )}
-          {cancellableTasks.length > 0 && (
-            <button
-              onClick={() => s.setConfirmDialog({
-                title: `Cancel ${cancellableTasks.length} task${cancellableTasks.length !== 1 ? 's' : ''}?`,
-                message: buildBulkConfirmMessage(cancellableTasks),
-                confirmLabel: `Cancel ${cancellableTasks.length}`,
-                onConfirm: () => s.handleBulkCancel(cancellableTasks.map(t => t.id)),
-              })}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 transition-colors"
-            >
-              Cancel {cancellableTasks.length}
-            </button>
-          )}
-          {failedTasks.length > 0 && (
-            <button
-              onClick={() => s.setConfirmDialog({
-                title: `Retry ${failedTasks.length} task${failedTasks.length !== 1 ? 's' : ''}?`,
-                message: buildBulkConfirmMessage(failedTasks),
-                confirmLabel: `Retry ${failedTasks.length}`,
-                onConfirm: () => {
-                  s.handleBulkAction('retry', failedTasks.map(t => t.id));
-                  s.toggleSelectionMode();
-                  s.setConfirmDialog(null);
-                },
-              })}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors"
-            >
-              Retry {failedTasks.length}
-            </button>
-          )}
-          {terminalTasks.length > 0 && (
-            <button
-              onClick={() => s.setConfirmDialog({
-                title: `Archive ${terminalTasks.length} task${terminalTasks.length !== 1 ? 's' : ''}?`,
-                message: buildBulkConfirmMessage(terminalTasks),
-                confirmLabel: `Archive ${terminalTasks.length}`,
-                onConfirm: () => {
-                  s.handleBulkArchiveColumn(terminalTasks.map(t => t.id));
-                  s.toggleSelectionMode();
-                },
-              })}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-700 hover:bg-neutral-600 text-neutral-300 border border-neutral-600 transition-colors"
-            >
-              Archive {terminalTasks.length}
-            </button>
-          )}
-          <button
-            onClick={s.toggleSelectionMode}
-            title="Exit selection mode"
-            className="ml-1 p-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
+        <BulkActionBar
+          selectedCount={s.selectedTaskIds.size}
+          approvableTasks={approvableTasks}
+          cancellableTasks={cancellableTasks}
+          failedTasks={failedTasks}
+          terminalTasks={terminalTasks}
+          setConfirmDialog={s.setConfirmDialog}
+          handleBulkAction={s.handleBulkAction}
+          handleBulkCancel={s.handleBulkCancel}
+          handleBulkArchiveColumn={s.handleBulkArchiveColumn}
+          toggleSelectionMode={s.toggleSelectionMode}
+        />
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
