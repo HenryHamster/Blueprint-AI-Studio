@@ -29,6 +29,7 @@ from app.compute import (
 )
 from app.database import AsyncSessionLocal
 from app.models import Project, Task, TaskStatus
+from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -571,130 +572,14 @@ async def orchestrator_worker():
                         )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
-                # Build per-project sets of files being modified by IN_PROGRESS tasks
-                # (tasks in different projects target different repos — no cross-project conflicts)
-                in_progress_files_by_project: dict[uuid.UUID, set[str]] = {}
-                for t in active_tasks_result:
-                    if t.status == TaskStatus.IN_PROGRESS:
-                        files = (t.context or {}).get("related_files", [])
-                        if files:
-                            in_progress_files_by_project.setdefault(t.project_id, set()).update(files)
-
-                # Only apply conflict check if we have file data to work with
-                if in_progress_files_by_project:
-                    non_conflicting = []
-                    for eid in eligible_ids:
-                        candidate = next((t for t in candidate_tasks if t.id == eid), None)
-                        if candidate is None:
-                            non_conflicting.append(eid)
-                            continue
-                        # Only check conflicts within the same project
-                        project_files = in_progress_files_by_project.get(candidate.project_id, set())
-                        if not project_files:
-                            non_conflicting.append(eid)
-                            continue
-                        candidate_files = set((candidate.context or {}).get("related_files", []))
-                        if not candidate_files:
-                            non_conflicting.append(eid)
-                            continue
-                        overlap = candidate_files & project_files
-                        if not overlap:
-                            non_conflicting.append(eid)
-                            continue
-                        # Large scope tasks defer on any overlap; refactors use standard threshold
-                        # (refactors are expected to touch decomposition targets — overlap is intentional)
-                        scope = (candidate.context or {}).get("scope", "small")
-                        task_type = (candidate.first_payload).get("type", "")
-                        is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
-                        # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
-                        should_defer = is_large or (len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5)
-                        if should_defer:
-                            overlapping_files = ', '.join(sorted(overlap))[:120]
-                            blocking_task = next((t for t in active_tasks_result if t.status == TaskStatus.IN_PROGRESS
-                                                  and t.project_id == candidate.project_id
-                                                  and set((t.context or {}).get("related_files", [])) & overlap), None)
-                            blocking_title = f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
-                            defer_msg = f"Waiting: file conflict on {overlapping_files}{blocking_title}"
-                            if candidate.latest_status_message != defer_msg:
-                                candidate.latest_status_message = defer_msg
-                                session.add(candidate)
-                                try:
-                                    await broadcast_to_project(str(candidate.project_id), "task_updated",
-                                        {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
-                                except Exception:
-                                    logger.debug(f"Failed to broadcast deferral for {eid}", exc_info=True)
-                            logger.info(f"[DISPATCH] Deferring task {eid} — file conflict ({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}")
-                        else:
-                            non_conflicting.append(eid)
-                    eligible_ids = non_conflicting
+                eligible_ids = await filter_file_conflicts(
+                    eligible_ids, candidate_tasks, active_tasks_result, session, broadcast_to_project
+                )
 
                 # Step 2.6: Defer tasks that overlap with pending-rollup files
-                # EVALUATING parents = rollups not yet merged to main; their children's files are stale
-                if eligible_ids:
-                    eval_parent_ids = (await session.execute(
-                        select(Task.id).where(Task.status == TaskStatus.EVALUATING)
-                    )).scalars().all()
-                    if eval_parent_ids:
-                        pending_children = (await session.execute(
-                            select(Task).where(
-                                Task.parent_task_id.in_(eval_parent_ids),
-                                Task.status == TaskStatus.COMPLETED,
-                            )
-                        )).scalars().all()
-                        # Build per-project rollup file sets (different repos can't conflict)
-                        pending_rollup_by_project: dict[uuid.UUID, dict[str, str]] = {}
-                        for pc in pending_children:
-                            pc_scope = (pc.context or {}).get("scope", "small")
-                            pc_type = (pc.first_payload).get("type", "")
-                            if pc_scope == "large" or pc_type in ("refactor", "plan"):
-                                rollup_files = pending_rollup_by_project.setdefault(pc.project_id, {})
-                                for f in (pc.context or {}).get("related_files", []):
-                                    rollup_files[f] = pc.title or str(pc.id)
-                        if pending_rollup_by_project:
-                            non_rollup_conflicting = []
-                            for eid in eligible_ids:
-                                candidate = next((t for t in candidate_tasks if t.id == eid), None)
-                                if not candidate:
-                                    non_rollup_conflicting.append(eid)
-                                    continue
-                                # Only check rollup conflicts within the same project
-                                project_rollup_files = pending_rollup_by_project.get(candidate.project_id, {})
-                                if not project_rollup_files:
-                                    non_rollup_conflicting.append(eid)
-                                    continue
-                                cfiles = set((candidate.context or {}).get("related_files", []))
-                                if not cfiles:
-                                    non_rollup_conflicting.append(eid)
-                                    continue
-                                stale_overlap = cfiles & project_rollup_files.keys()
-                                # Only defer on significant overlap: 2+ files AND >= 50% of candidate's files
-                                should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
-                                if should_defer:
-                                    blocking_title = project_rollup_files[next(iter(stale_overlap))]
-                                    logger.warning(
-                                        f"[DISPATCH] Near-miss: deferring task {eid} — overlaps {len(stale_overlap)} file(s) "
-                                        f"with pending-rollup refactor '{blocking_title[:60]}': "
-                                        f"{', '.join(sorted(stale_overlap)[:3])}"
-                                    )
-                                    defer_msg = f"Waiting: overlaps pending rollup '{blocking_title[:60]}'"
-                                    if candidate.latest_status_message != defer_msg:
-                                        candidate.latest_status_message = defer_msg
-                                        session.add(candidate)
-                                        try:
-                                            await broadcast_to_project(str(candidate.project_id), "task_updated",
-                                                {"task_id": str(eid), "status": "QUEUED", "message": defer_msg})
-                                        except Exception:
-                                            logger.debug(f"Failed to broadcast rollup deferral for {eid}", exc_info=True)
-                                else:
-                                    if stale_overlap:
-                                        blocking_title = project_rollup_files[next(iter(stale_overlap))]
-                                        logger.warning(
-                                            f"[DISPATCH] Near-miss: task {eid} overlaps {len(stale_overlap)} file(s) "
-                                            f"with pending-rollup refactor '{blocking_title[:60]}': "
-                                            f"{', '.join(sorted(stale_overlap)[:3])}"
-                                        )
-                                    non_rollup_conflicting.append(eid)
-                            eligible_ids = non_rollup_conflicting
+                eligible_ids = await filter_rollup_conflicts(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
