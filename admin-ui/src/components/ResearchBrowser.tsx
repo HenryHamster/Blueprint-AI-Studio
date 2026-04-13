@@ -58,8 +58,22 @@ function relativeDate(dateStr: string): string {
 
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
 
+type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed';
+
+const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING']);
+const FAILED_OUTCOMES = new Set(['FAILED', 'CANCELLED']);
+
+const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: string }[] = [
+  { value: 'all', label: 'All', color: 'text-neutral-300' },
+  { value: 'shipped', label: 'Shipped', color: 'text-emerald-400' },
+  { value: 'in_progress', label: 'In Progress', color: 'text-cyan-400' },
+  { value: 'proposed', label: 'Proposed', color: 'text-neutral-400' },
+  { value: 'failed', label: 'Failed', color: 'text-red-400' },
+];
+
 export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchBrowserProps) {
   const [search, setSearch] = useState('');
+  const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>('all');
   const [expandedGroups, setExpandedGroups] = useState<Set<string> | null>(null);
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
   const [directions, setDirections] = useState<Direction[]>([]);
@@ -158,21 +172,32 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
     return result;
   }, [tasks, implementedFindings, directionMap]);
 
-  // Filter by search
+  // Filter by search and outcome
   const filteredGroups = useMemo(() => {
-    if (!search.trim()) return groups;
-    const q = search.toLowerCase();
+    const matchesOutcome = (f: EnrichedFinding): boolean => {
+      if (outcomeFilter === 'all') return true;
+      if (outcomeFilter === 'shipped') return f.outcome === 'COMPLETED';
+      if (outcomeFilter === 'in_progress') return !!f.outcome && IN_PROGRESS_OUTCOMES.has(f.outcome);
+      if (outcomeFilter === 'proposed') return !f.outcome;
+      if (outcomeFilter === 'failed') return !!f.outcome && FAILED_OUTCOMES.has(f.outcome);
+      return true;
+    };
+
+    const q = search.trim().toLowerCase();
     return groups
       .map(g => ({
         ...g,
         findings: g.findings.filter(f =>
-          f.finding.title.toLowerCase().includes(q) ||
-          f.finding.description.toLowerCase().includes(q) ||
-          (f.finding.related_files ?? []).some(p => p.toLowerCase().includes(q))
+          matchesOutcome(f) && (
+            !q ||
+            f.finding.title.toLowerCase().includes(q) ||
+            f.finding.description.toLowerCase().includes(q) ||
+            (f.finding.related_files ?? []).some(p => p.toLowerCase().includes(q))
+          )
         ),
       }))
-      .filter(g => g.findings.length > 0 || g.directionText.toLowerCase().includes(q));
-  }, [groups, search]);
+      .filter(g => g.findings.length > 0 || (outcomeFilter === 'all' && q && g.directionText.toLowerCase().includes(q)));
+  }, [groups, search, outcomeFilter]);
 
   const totalFindings = filteredGroups.reduce((sum, g) => sum + g.findings.length, 0);
 
@@ -201,6 +226,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
             </h3>
             <p className="text-[10px] text-neutral-500 mt-0.5">
               {totalFindings} finding{totalFindings !== 1 ? 's' : ''} across {filteredGroups.length} direction{filteredGroups.length !== 1 ? 's' : ''}
+              {outcomeFilter !== 'all' && (
+                <span className="ml-1 text-neutral-600">— filtered by {OUTCOME_FILTER_OPTIONS.find(o => o.value === outcomeFilter)?.label.toLowerCase()}</span>
+              )}
             </p>
           </div>
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
@@ -209,7 +237,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
         </div>
 
         {/* Search */}
-        <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0">
+        <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-neutral-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
             <input
@@ -219,6 +247,21 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
               placeholder="Search findings..."
               className="w-full bg-neutral-900 border border-neutral-800 rounded pl-8 pr-3 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-700"
             />
+          </div>
+          <div className="flex items-center gap-1 flex-wrap">
+            {OUTCOME_FILTER_OPTIONS.map(opt => (
+              <button
+                key={opt.value}
+                onClick={() => setOutcomeFilter(opt.value)}
+                className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                  outcomeFilter === opt.value
+                    ? `bg-neutral-700 ${opt.color}`
+                    : 'bg-neutral-900 text-neutral-600 hover:text-neutral-400'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
         </div>
 

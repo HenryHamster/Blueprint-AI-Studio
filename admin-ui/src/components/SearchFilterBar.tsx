@@ -114,7 +114,10 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, dateRange, onDateRangeChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
-  const statusOptions = STATUS_OPTIONS.map(opt => ({ label: opt.replace('_', ' '), value: opt }));
+  const statusOptions = STATUS_OPTIONS.map(opt => ({
+    label: opt.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    value: opt,
+  }));
 
   useEffect(() => {
     const timer = setTimeout(() => {

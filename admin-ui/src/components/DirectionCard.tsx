@@ -418,6 +418,29 @@ export function DirectionCard({
                 </span>
               );
             })()}
+            {/* Lifetime metrics badges */}
+            {(() => {
+              const history = d.research_history;
+              if (!history || history.length === 0) return null;
+              const totalPrsMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
+              const totalTasksCreated = history.reduce((sum, e) => sum + (e.tasks_created ?? 0), 0);
+              const successRate = totalTasksCreated > 0 ? totalPrsMerged / totalTasksCreated : 0;
+              const totalCycles = history.length;
+              return (
+                <>
+                  {totalPrsMerged > 0 && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
+                      {totalPrsMerged} PRs merged
+                    </span>
+                  )}
+                  {totalCycles >= 2 && (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-950/40 border-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-900/50 text-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-400`}>
+                      {Math.round(successRate * 100)}% success
+                    </span>
+                  )}
+                </>
+              );
+            })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               <button
