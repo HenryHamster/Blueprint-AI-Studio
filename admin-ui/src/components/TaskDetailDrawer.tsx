@@ -128,6 +128,36 @@ function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: str
     </div>
   );
 }
+function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const researchTaskId = ctx?.research_task_id as string | undefined;
+  const findingIndex = ctx?.finding_index as number | undefined;
+  const parentResearchTask = researchTaskId ? tasks?.find(t => t.id === researchTaskId) : undefined;
+  const originFinding = parentResearchTask?.research_findings && findingIndex !== undefined
+    ? parentResearchTask.research_findings[findingIndex]
+    : undefined;
+  if (!researchTaskId) return null;
+  return (
+    <>
+      <SectionHeader>Research Origin</SectionHeader>
+      {originFinding && <div className="text-xs text-neutral-300 mb-1 line-clamp-2">{originFinding.title}</div>}
+      <DetailRow label="Research Task">
+        {onNavigateToTask ? (
+          <button onClick={() => onNavigateToTask(researchTaskId)} className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline">{researchTaskId}</button>
+        ) : (
+          <CopyableId value={researchTaskId} />
+        )}
+      </DetailRow>
+      {findingIndex !== undefined && <DetailRow label="Finding #"><span className="text-sm">#{findingIndex + 1}</span></DetailRow>}
+      {originFinding?.scope && originFinding?.risk && (
+        <DetailRow label="Scope/Risk">
+          <span className={`text-xs px-1.5 py-0.5 rounded ${originFinding.risk === 'high' ? 'bg-red-900/40 text-red-400' : originFinding.risk === 'medium' ? 'bg-amber-900/40 text-amber-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{originFinding.scope}/{originFinding.risk}</span>
+        </DetailRow>
+      )}
+      {originFinding?.direction_id && <DetailRow label="Direction"><span className="font-mono text-xs text-neutral-400">{originFinding.direction_id}</span></DetailRow>}
+    </>
+  );
+}
 function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void; onGoToLogs?: () => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
@@ -137,8 +167,6 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
 
   const provenanceCtx = task.context as Record<string, unknown> | undefined;
   const provenanceDirectionId = provenanceCtx?.direction_id as string | undefined;
-  const provenanceResearchTaskId = provenanceCtx?.research_task_id as string | undefined;
-  const provenanceFindingIndex = provenanceCtx?.finding_index as number | undefined;
 
   useEffect(() => {
     if (!provenanceDirectionId || !task.project_id) return;
@@ -196,6 +224,7 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
           )}
         </DetailRow>
       )}
+      <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && (
         <DetailRow label="VM Instance">
@@ -216,8 +245,8 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         </DetailRow>
       )}
 
-      {(provenanceDirectionId || (provenanceResearchTaskId && provenanceFindingIndex != null)) && (() => {
-        const direction = provenanceDirectionId ? directionsCache.find(d => d.id === provenanceDirectionId) : undefined;
+      {provenanceDirectionId && (() => {
+        const direction = directionsCache.find(d => d.id === provenanceDirectionId);
         const directionText = direction?.text;
         const truncatedText = directionText && directionText.length > 80
           ? directionText.slice(0, 80) + '...'
@@ -225,43 +254,22 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         return (
           <>
             <SectionHeader>Provenance</SectionHeader>
-            {provenanceDirectionId && (
-              <DetailRow label="Direction">
-                <div className="min-w-0">
-                  {truncatedText && (
-                    <span className="text-sm text-neutral-200 break-words block">{truncatedText}</span>
-                  )}
-                  <span className="text-xs text-neutral-500 font-mono">{provenanceDirectionId}</span>
-                </div>
-              </DetailRow>
-            )}
-            {provenanceResearchTaskId && provenanceFindingIndex != null && (
-              <DetailRow label="Research source">
-                <span className="inline-flex items-center gap-2 flex-wrap">
-                  <span className="text-sm">Finding #{provenanceFindingIndex + 1}</span>
-                  {provenanceResearchTaskId !== task.parent_task_id && onNavigateToTask && (
-                    <button
-                      onClick={() => onNavigateToTask(provenanceResearchTaskId)}
-                      className="font-mono text-xs text-blue-400 hover:text-blue-300 hover:underline cursor-pointer"
-                    >
-                      {provenanceResearchTaskId}
-                    </button>
-                  )}
-                </span>
-              </DetailRow>
-            )}
+            <DetailRow label="Direction">
+              <div className="min-w-0">
+                {truncatedText && (
+                  <span className="text-sm text-neutral-200 break-words block">{truncatedText}</span>
+                )}
+                <span className="text-xs text-neutral-500 font-mono">{provenanceDirectionId}</span>
+              </div>
+            </DetailRow>
           </>
         );
       })()}
 
       <SectionHeader>Timing</SectionHeader>
       <DetailRow label="Created at">{formatAbsolute(task.created_at)}</DetailRow>
-      {task.started_at && (
-        <DetailRow label="Started at">{formatAbsolute(task.started_at)}</DetailRow>
-      )}
-      {task.started_at && (
-        <DetailRow label="Duration"><span className="font-mono">{duration}</span></DetailRow>
-      )}
+      {task.started_at && <DetailRow label="Started at">{formatAbsolute(task.started_at)}</DetailRow>}
+      {task.started_at && <DetailRow label="Duration"><span className="font-mono">{duration}</span></DetailRow>}
       <DetailRow label="Heartbeat">
         <span className="inline-flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${heartbeat.color}`} />
@@ -271,9 +279,7 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
           )}
         </span>
       </DetailRow>
-      {task.attempt_count != null && (
-        <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>
-      )}
+      {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
 
       {(() => {
         const metrics = task.context?.last_metrics as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number } | undefined;
@@ -281,29 +287,17 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         return (
           <>
             <SectionHeader>System Metrics</SectionHeader>
-            {metrics.rss_mb != null && (
-              <DetailRow label="RSS Memory"><span className="font-mono text-sm">{metrics.rss_mb} MB</span></DetailRow>
-            )}
-            {metrics.heap_used_mb != null && (
-              <DetailRow label="Heap Used"><span className="font-mono text-sm">{metrics.heap_used_mb} MB</span></DetailRow>
-            )}
-            {metrics.disk_free_mb != null && metrics.disk_total_mb != null && (
-              <DetailRow label="Disk (/tmp)">
-                <span className="font-mono text-sm">{metrics.disk_free_mb} MB free / {metrics.disk_total_mb} MB total</span>
-              </DetailRow>
-            )}
+            {metrics.rss_mb != null && <DetailRow label="RSS Memory"><span className="font-mono text-sm">{metrics.rss_mb} MB</span></DetailRow>}
+            {metrics.heap_used_mb != null && <DetailRow label="Heap Used"><span className="font-mono text-sm">{metrics.heap_used_mb} MB</span></DetailRow>}
+            {metrics.disk_free_mb != null && metrics.disk_total_mb != null && <DetailRow label="Disk (/tmp)"><span className="font-mono text-sm">{metrics.disk_free_mb} MB free / {metrics.disk_total_mb} MB total</span></DetailRow>}
           </>
         );
       })()}
 
-      {task.description && (
-        <>
-          <SectionHeader>Description</SectionHeader>
-          <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">
-            {task.description}
-          </pre>
-        </>
-      )}
+      {task.description && <>
+        <SectionHeader>Description</SectionHeader>
+        <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">{task.description}</pre>
+      </>}
 
       {task.payloads && task.payloads.length > 0 && (() => {
         const directions = task.payloads![0].directions as { text: string; priority?: string; status?: string }[] | undefined;
@@ -322,13 +316,7 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         return (
           <>
             <SectionHeader>Task Config</SectionHeader>
-            {prompt && prompt !== task.description && (
-              <DetailRow label="Prompt">
-                <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">
-                  {prompt}
-                </pre>
-              </DetailRow>
-            )}
+            {prompt && prompt !== task.description && <DetailRow label="Prompt"><pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">{prompt}</pre></DetailRow>}
             {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm">{baseBranch}</span></DetailRow>}
             {prNumber && (
               <DetailRow label="PR Number">
@@ -346,23 +334,15 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         );
       })()}
 
-      {task.plan_output && (
-        <>
-          <SectionHeader>Plan Output</SectionHeader>
-          <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-purple-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-purple-900/30 font-mono">
-            {JSON.stringify(task.plan_output, null, 2)}
-          </pre>
-        </>
-      )}
+      {task.plan_output && <>
+        <SectionHeader>Plan Output</SectionHeader>
+        <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-purple-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-purple-900/30 font-mono">{JSON.stringify(task.plan_output, null, 2)}</pre>
+      </>}
 
-      {task.research_findings && (
-        <>
-          <SectionHeader>Research Findings ({task.research_findings.length})</SectionHeader>
-          <div className="bg-cyan-950/20 rounded-lg p-3 border border-cyan-900/30">
-            <ResearchFindings findings={task.research_findings} />
-          </div>
-        </>
-      )}
+      {task.research_findings && <>
+        <SectionHeader>Research Findings ({task.research_findings.length})</SectionHeader>
+        <div className="bg-cyan-950/20 rounded-lg p-3 border border-cyan-900/30"><ResearchFindings findings={task.research_findings} /></div>
+      </>}
 
       {(task.task_type === 'investigate' && task.plan_output) || investigationArtifacts.length > 0 ? (() => {
         const report = task.plan_output as {

@@ -349,7 +349,6 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       const OutcomeIcon = outcomeInfo?.icon;
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
-                      const prNumber = ef.outcome?.prUrl ? ef.outcome.prUrl.match(/\/pull\/(\d+)/)?.[1] : null;
                       return (
                         <button
                           key={fKey}
@@ -389,18 +388,6 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                   )
                                   : outcomeInfo && <span className={outcomeInfo.color}>{outcomeInfo.label}</span>
                                 }
-                                {prNumber && ef.outcome?.prUrl && isSafeUrl(ef.outcome.prUrl) && (
-                                  <a
-                                    href={ef.outcome.prUrl}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    onClick={e => e.stopPropagation()}
-                                    className="flex items-center gap-0.5 text-blue-400 hover:text-blue-300 transition-colors"
-                                  >
-                                    <ExternalLink className="w-2.5 h-2.5" />
-                                    PR #{prNumber}
-                                  </a>
-                                )}
                                 {ef.finding.related_files && ef.finding.related_files.length > 0 && (
                                   <span className="font-mono">{ef.finding.related_files.length} file{ef.finding.related_files.length !== 1 ? 's' : ''}</span>
                                 )}
@@ -412,7 +399,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                   }`}>{ef.finding.scope}/{ef.finding.risk}</span>
                                 )}
                                 {ef.finding.type && (
-                                  <span className="text-[10px] px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
+                                  <span className="px-1 py-0.5 rounded bg-neutral-800 text-neutral-400">{ef.finding.type}</span>
                                 )}
                                 {ef.finding.priority && ef.finding.priority !== 'medium' && (
                                   <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>

@@ -649,7 +649,7 @@ export default function App() {
           {/* Quick-filter preset buttons */}
           {(() => {
             const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
-            const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
+            const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
             const isFailedToday = s.statusFilter.length === 1 && s.statusFilter[0] === 'FAILED' && s.dateRange === '24h' && !s.requiresApproval && s.searchQuery === '';
             const isStuckHour = s.statusFilter.length === 2 && s.statusFilter.includes('IN_PROGRESS') && s.statusFilter.includes('PROVISIONING') && s.dateRange === '1h' && !s.requiresApproval && s.searchQuery === '';
             const isNeedsReview = s.requiresApproval && s.statusFilter.length === ALL_STATUSES.length && s.dateRange === 'all' && s.searchQuery === '';
