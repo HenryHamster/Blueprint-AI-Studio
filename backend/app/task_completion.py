@@ -752,7 +752,7 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
     the task marked COMPLETED with no follow-up.
     """
     # Deferred imports to avoid circular dependency
-    from app.autonomous_research import _spawn_strategic_review  # noqa: PLC0415
+    from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
     from app.main import _create_strategic_alert  # noqa: PLC0415
 
     result = await session.execute(
