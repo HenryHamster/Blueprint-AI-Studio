@@ -2051,6 +2051,120 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     assert "Improve caching layer (proposed)" not in ctx
 
 
+@pytest.mark.asyncio
+async def test_type_distribution_and_product_ratio(db_session):
+    """type_distribution and product_ratio are correctly populated in the history entry."""
+    direction_id = "d-typedist01"
+    direction = _active_direction(direction_id, "Type distribution test")
+
+    project = Project(
+        name="Type Distribution Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create child tasks: 2 product types (create), 2 structural (fix, refactor)
+    create_task1 = Task(
+        project_id=project.id,
+        title="Add dashboard widget",
+        payloads=[{"type": "create", "prompt": "add widget"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    create_task2 = Task(
+        project_id=project.id,
+        title="Add export feature",
+        payloads=[{"type": "create", "prompt": "add export"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+        created_by="ORCHESTRATOR",
+    )
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix null pointer in parser",
+        payloads=[{"type": "fix", "prompt": "fix null"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    refactor_task = Task(
+        project_id=project.id,
+        title="Refactor database layer",
+        payloads=[{"type": "refactor", "prompt": "refactor db"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Build failed",
+        created_by="ORCHESTRATOR",
+    )
+    for t in (create_task1, create_task2, fix_task, refactor_task):
+        db_session.add(t)
+    await db_session.commit()
+    for t in (create_task1, create_task2, fix_task, refactor_task):
+        await db_session.refresh(t)
+
+    # Create a research task so we have a real UUID for parent_task_id lookup
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Type distribution test",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    # Link child tasks to the research task via parent_task_id
+    for t in (create_task1, create_task2, fix_task, refactor_task):
+        t.parent_task_id = research_task.id
+        db_session.add(t)
+    await db_session.commit()
+
+    # Inject research_history entry using the real research task UUID
+    dirs = list(project.directions or [])
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [{
+                "timestamp": "2026-04-07T00:00:00",
+                "task_id": str(research_task.id),
+                "tasks_created": 4,
+                "finding_titles": [],
+            }]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # type_distribution should count all 4 tasks by type
+    type_dist = entry.get("type_distribution", {})
+    assert type_dist.get("create") == 2, f"Expected 2 create tasks, got {type_dist}"
+    assert type_dist.get("fix") == 1, f"Expected 1 fix task, got {type_dist}"
+    assert type_dist.get("refactor") == 1, f"Expected 1 refactor task, got {type_dist}"
+
+    # product_ratio: 2 product (create) out of 4 total = 0.5
+    product_ratio = entry.get("product_ratio")
+    assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _strategic_failures auto-decay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2108,3 +2222,193 @@ async def test_strategic_failures_no_decay_when_recent(db_session):
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 0, "Expected no task: decay should not apply for recent failure"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dedup hole tests — failed parent and infra failures
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_failed_parent_child_not_blocking_dedup(db_session, mocker):
+    """A COMPLETED child with pr_merged=True whose parent rollup FAILED must NOT block re-proposal."""
+    direction = _active_direction("d-fpdedup01", "Failed parent dedup test")
+    project = Project(
+        name="Failed Parent Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Fix caching layer for session tokens"
+    dup_desc = "Session tokens not cached properly causing re-auth on every request"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Parent rollup task that failed
+    failed_parent = Task(
+        project_id=project.id,
+        title="Rollup PR for batch-7",
+        payloads=[{"type": "create", "prompt": "rollup", "base_branch": "main"}],
+        context={},
+        status=TaskStatus.FAILED,
+        latest_status_message="Rollup PR creation failed: staging branch invalid",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed_parent)
+    await db_session.commit()
+    await db_session.refresh(failed_parent)
+
+    # Child task: COMPLETED+pr_merged but parent failed, so code never reached main
+    ghost_child = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "pr_merged": True},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=failed_parent.id,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(ghost_child)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Fix session token caching",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Ghost child (failed parent) must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_not_blocking_dedup(db_session, mocker):
+    """A FAILED task with AGENT_TIMEOUT classification must NOT block re-proposal."""
+    direction = _active_direction("d-infraded01", "Infra failure dedup test")
+    project = Project(
+        name="Infra Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Add retry logic to payment processor"
+    dup_desc = "Payment processor calls fail with no retry on transient errors"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Infra failure — agent timeout (no heartbeat message triggers AGENT_TIMEOUT)
+    infra_failed = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Reaped: No heartbeat for 320s (last: 2026-04-13T08:10:00)",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(infra_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Add retry logic",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Infra-failed task must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_still_blocks_dedup(db_session, mocker):
+    """A FAILED task with CODE_ERROR classification must still block re-proposal."""
+    direction = _active_direction("d-codedeup01", "Code error dedup test")
+    project = Project(
+        name="Code Error Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Refactor authentication middleware"
+    dup_desc = "Middleware has circular dependency causing startup failures"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Code error failure — should remain in dedup set
+    code_failed = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Tests failed: ImportError in auth module",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Refactor middleware",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "CODE_ERROR failure must still block re-proposal"

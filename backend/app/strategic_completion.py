@@ -348,6 +348,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
                     "research_history": [],
                 }
+                if op_entry.get("source"):
+                    new_dir["source"] = str(op_entry["source"])[:64]
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 if op_entry.get("system_id"):
@@ -570,23 +572,24 @@ def _build_outcome_evaluation(project) -> dict:
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
-        # Aggregate type distribution across window history
-        type_dist: dict[str, int] = {}
-        for h in window_history:
-            for t, c in (h.get("type_distribution") or {}).items():
-                type_dist[t] = type_dist.get(t, 0) + c
-        if type_dist:
-            product_types = {"create", "feature", "improvement"}
-            product_count = sum(type_dist.get(t, 0) for t in product_types)
-            total = sum(type_dist.values())
-            outcome["type_distribution"] = type_dist
-            outcome["product_ratio"] = round(product_count / max(total, 1), 2)
-
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
         if lifetime_cycles > cycles:
             outcome["lifetime"] = {"cycles": lifetime_cycles, "merged": lifetime_merged}
+
+        # Aggregate type distribution across window cycles
+        type_dist: dict = {}
+        product_weighted = 0.0
+        for cycle_entry in window_history:
+            for t, count in cycle_entry.get("type_distribution", {}).items():
+                type_dist[t] = type_dist.get(t, 0) + count
+            tasks_in_cycle = cycle_entry.get("tasks_created", 0)
+            product_weighted += cycle_entry.get("product_ratio", 0.0) * tasks_in_cycle
+        total_typed = sum(type_dist.values())
+        if type_dist:
+            outcome["type_distribution"] = type_dist
+            outcome["product_ratio"] = round(product_weighted / total_typed, 2) if total_typed > 0 else None
 
         direction_outcomes.append(outcome)
 
@@ -641,28 +644,30 @@ def _build_outcome_evaluation(project) -> dict:
                 "failed": sys_failed,
             })
 
-    # Aggregate product_ratio across all directions
-    product_types = {"create", "feature", "improvement"}
-    agg_type_dist: dict[str, int] = {}
-    for d_outcome in direction_outcomes:
-        for t, c in (d_outcome.get("type_distribution") or {}).items():
-            agg_type_dist[t] = agg_type_dist.get(t, 0) + c
-    overall_product_ratio: float | None = None
-    if agg_type_dist:
-        agg_total = sum(agg_type_dist.values())
-        agg_product = sum(agg_type_dist.get(t, 0) for t in product_types)
-        overall_product_ratio = round(agg_product / max(agg_total, 1), 2)
+    # Overall type distribution across all directions
+    overall_type_dist: dict = {}
+    overall_product_weighted = 0.0
+    for d_out in direction_outcomes:
+        for t, count in d_out.get("type_distribution", {}).items():
+            overall_type_dist[t] = overall_type_dist.get(t, 0) + count
+        tasks_count = sum(d_out.get("type_distribution", {}).values())
+        if d_out.get("product_ratio") is not None:
+            overall_product_weighted += d_out["product_ratio"] * tasks_count
+    overall_total_typed = sum(overall_type_dist.values())
+    overall_product_ratio = round(overall_product_weighted / overall_total_typed, 2) if overall_total_typed > 0 else None
 
-    overall_dict: dict = {
+    overall_summary: dict = {
         "cycles": total_cycles, "merged": total_merged, "failed": total_failed,
         "success_rate": success_rate, "trend": trend,
     }
+    if overall_type_dist:
+        overall_summary["type_distribution"] = overall_type_dist
     if overall_product_ratio is not None:
-        overall_dict["product_ratio"] = overall_product_ratio
+        overall_summary["product_ratio"] = overall_product_ratio
 
     result: dict = {
         "window": {"from": window_from or "all_time", "to": now_iso, "vision_revision": vision_rev},
-        "overall": overall_dict,
+        "overall": overall_summary,
     }
     if systems:
         result["systems"] = systems

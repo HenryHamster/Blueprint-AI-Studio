@@ -908,6 +908,7 @@ ${recentlyCompleted.length > 0
 - **Building something new?** Use scope=large. Write the finding prompt as a design brief.
   The plan agent will decompose this into ordered implementation steps.
 - **Improving something existing?** Use scope=small or medium as appropriate.
+- **Adding user-facing features?** Product features, UI improvements, and API enhancements are equally valid findings. Don't deprioritize them in favor of structural work.
 - **Building features on a foundation?** If research context shows a foundation was confirmed
   (e.g., "(confirmed)" entries), output findings that USE it. These are typically scope=medium.
 

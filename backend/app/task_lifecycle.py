@@ -211,14 +211,6 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
             )
-            # Task type distribution for product vs structural tracking
-            type_counts: dict[str, int] = {}
-            for ct in child_tasks_rows:
-                if ct.status == TaskStatus.COMPLETED:
-                    task_type = ct.first_payload.get("type", "create")
-                    type_counts[task_type] = type_counts.get(task_type, 0) + 1
-            if type_counts:
-                entry["type_distribution"] = type_counts
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             for ct in child_tasks_rows:
@@ -226,6 +218,23 @@ async def _update_direction_research_outcomes(
                     reason = (ct.latest_status_message or "")[:120]
                     failed_details.append({"title": ct.title or "", "reason": reason})
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
+
+            # Classify child tasks as product vs structural
+            PRODUCT_TYPES = {"create", "feature", "improvement"}
+            type_counts: dict = {}
+            product_count = 0
+            structural_count = 0
+            for ct in child_tasks_rows:
+                task_type = (ct.first_payload or {}).get("type", "unknown")
+                type_counts[task_type] = type_counts.get(task_type, 0) + 1
+                if task_type in PRODUCT_TYPES:
+                    product_count += 1
+                else:
+                    structural_count += 1
+            entry["type_distribution"] = type_counts
+            total_typed = product_count + structural_count
+            entry["product_ratio"] = round(product_count / total_typed, 2) if total_typed > 0 else 0.0
+            entry["structural_count"] = structural_count
 
             # Maintain research_context: promote proposed findings based on outcomes
             ctx = d.get("research_context", "")
