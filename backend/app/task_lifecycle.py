@@ -572,8 +572,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         staging_branch = parent_ctx.get("plan_branch") or parent_ctx.get("research_branch")
         target_branch = parent_ctx.get("parent_base") or parent_ctx.get("original_base")
 
-        completed_count = len(children) - cancelled_count
         failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+        failed_count = len(failed_children)
+        completed_count = len(children) - cancelled_count - failed_count
         rollup_note = ""
         if cancelled_count > 0:
             rollup_note += f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
