@@ -861,6 +861,270 @@ class TestStrategicAnalysisFreeze:
         )
 
 
+# ── Large Uncapped Backend Module Size Guards ────────────────────────────────
+# Enforces line count and function ceilings on the 5 largest previously-uncapped modules.
+
+ADMIN_SETTINGS_MAX_LINES = 1500
+ADMIN_SETTINGS_MAX_FUNCTIONS = 23
+
+ADMIN_PY_MAX_LINES = 1450
+ADMIN_PY_MAX_FUNCTIONS = 22
+
+COMPUTE_MAX_LINES = 1250
+COMPUTE_MAX_FUNCTIONS = 38
+
+GITHUB_MAX_LINES = 1100
+GITHUB_MAX_FUNCTIONS = 33
+
+AGENT_ROUTER_MAX_LINES = 1000
+AGENT_ROUTER_MAX_FUNCTIONS = 20
+
+
+def _get_admin_settings_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'admin_settings.py')
+
+
+def _get_admin_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'admin.py')
+
+
+def _get_compute_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'compute.py')
+
+
+def _get_github_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'github.py')
+
+
+def _get_agent_router_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'agent.py')
+
+
+class TestAdminSettingsFreeze:
+    """Enforce the admin_settings.py freeze: no new functions, no line growth."""
+
+    def test_admin_settings_line_count(self):
+        """admin_settings.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to routers/admin_settings.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_admin_settings_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= ADMIN_SETTINGS_MAX_LINES, (
+            f"routers/admin_settings.py has {count} lines, exceeding the ceiling of "
+            f"{ADMIN_SETTINGS_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_admin_settings_function_count(self):
+        """admin_settings.py must not gain new functions.
+
+        If this fails: a new function was added to routers/admin_settings.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_admin_settings_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= ADMIN_SETTINGS_MAX_FUNCTIONS, (
+            f"routers/admin_settings.py has {func_count} functions, exceeding the ceiling of "
+            f"{ADMIN_SETTINGS_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestAdminPyFreeze:
+    """Enforce the admin.py freeze: no new functions, no line growth."""
+
+    def test_admin_py_line_count(self):
+        """admin.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to admin.py.
+        New functionality must go in extracted router sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_admin_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= ADMIN_PY_MAX_LINES, (
+            f"admin.py has {count} lines, exceeding the ceiling of "
+            f"{ADMIN_PY_MAX_LINES}. "
+            "New functionality must go in extracted router sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_admin_py_function_count(self):
+        """admin.py must not gain new functions.
+
+        If this fails: a new function was added to admin.py.
+        New functionality must go in extracted router sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_admin_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= ADMIN_PY_MAX_FUNCTIONS, (
+            f"admin.py has {func_count} functions, exceeding the ceiling of "
+            f"{ADMIN_PY_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted router sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestComputeFreeze:
+    """Enforce the compute.py freeze: no new functions, no line growth."""
+
+    def test_compute_line_count(self):
+        """compute.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to compute.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_compute_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= COMPUTE_MAX_LINES, (
+            f"compute.py has {count} lines, exceeding the ceiling of "
+            f"{COMPUTE_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_compute_function_count(self):
+        """compute.py must not gain new functions.
+
+        If this fails: a new function was added to compute.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_compute_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= COMPUTE_MAX_FUNCTIONS, (
+            f"compute.py has {func_count} functions, exceeding the ceiling of "
+            f"{COMPUTE_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestGithubFreeze:
+    """Enforce the github.py freeze: no new functions, no line growth."""
+
+    def test_github_line_count(self):
+        """github.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to github.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_github_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= GITHUB_MAX_LINES, (
+            f"github.py has {count} lines, exceeding the ceiling of "
+            f"{GITHUB_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_github_function_count(self):
+        """github.py must not gain new functions.
+
+        If this fails: a new function was added to github.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_github_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= GITHUB_MAX_FUNCTIONS, (
+            f"github.py has {func_count} functions, exceeding the ceiling of "
+            f"{GITHUB_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestAgentRouterFreeze:
+    """Enforce the routers/agent.py freeze: no new functions, no line growth."""
+
+    def test_agent_router_line_count(self):
+        """routers/agent.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to routers/agent.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_agent_router_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= AGENT_ROUTER_MAX_LINES, (
+            f"routers/agent.py has {count} lines, exceeding the ceiling of "
+            f"{AGENT_ROUTER_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_agent_router_function_count(self):
+        """routers/agent.py must not gain new functions.
+
+        If this fails: a new function was added to routers/agent.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_agent_router_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= AGENT_ROUTER_MAX_FUNCTIONS, (
+            f"routers/agent.py has {func_count} functions, exceeding the ceiling of "
+            f"{AGENT_ROUTER_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
 # ── Frontend File Size Guards ────────────────────────────────────────────────
 # Enforces line count ceilings on the largest frontend files to prevent unbounded growth.
 
