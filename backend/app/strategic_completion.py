@@ -570,6 +570,19 @@ def _build_outcome_evaluation(project) -> dict:
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
+        # Aggregate type distribution across window history
+        type_dist: dict[str, int] = {}
+        for h in window_history:
+            for t, c in (h.get("type_distribution") or {}).items():
+                type_dist[t] = type_dist.get(t, 0) + c
+        if type_dist:
+            product_types = {"create", "feature", "improvement"}
+            structural_types = {"refactor", "perf", "qa", "test", "deps", "docs"}
+            product_count = sum(type_dist.get(t, 0) for t in product_types)
+            total = sum(type_dist.values())
+            outcome["type_distribution"] = type_dist
+            outcome["product_ratio"] = round(product_count / max(total, 1), 2)
+
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)

@@ -475,13 +475,29 @@ ${hotspotsSection}
       }
     }
 
-    const openMessagesText = openMessages.length > 0
-      ? openMessages.map(m => {
-          const age = m.created_at ? (() => {
-            const ms = Date.now() - new Date(String(m.created_at)).getTime();
-            const h = Math.floor(ms / 3600000);
-            return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
-          })() : '?';
+    const calcMessageAge = (m: Record<string, unknown>): string => {
+      if (!m.created_at) return '?';
+      const ms = Date.now() - new Date(String(m.created_at)).getTime();
+      const h = Math.floor(ms / 3600000);
+      return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+    };
+
+    const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
+    const otherMessages = openMessages.filter(m => strVal(m.type) !== 'FEEDBACK');
+
+    const feedbackSection = feedbackMessages.length > 0
+      ? (() => {
+          const feedbackLines = feedbackMessages.map(m => {
+            const age = calcMessageAge(m);
+            return `- (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 300)}`;
+          }).join('\n');
+          return `\n## User Feature Requests\nThese FEEDBACK messages are direct user requests. Strongly consider creating a direction for each unaddressed request:\n${feedbackLines}\n`;
+        })()
+      : '';
+
+    const openMessagesText = otherMessages.length > 0
+      ? otherMessages.map(m => {
+          const age = calcMessageAge(m);
           return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 200)}`;
         }).join('\n')
       : '';
@@ -629,7 +645,7 @@ ${visionJson || 'No vision set yet.'}
 ${outcomeSection}
 ## Current research directions
 ${dirSummaryText}
-${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
+${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
 ## Codebase
 ${codebaseSummary}${researchPlaybookSection}${fileTreeSection}
 
@@ -644,10 +660,13 @@ Analyze this project and write a strategic review. Cover:
 2. **Directions**: What are the 3-5 most impactful research directions?
    For each: a clear description, priority (high/medium/low), which system_id it serves, and rationale.
    If existing directions should be updated or retired, say so with rationale.
+   For FEEDBACK messages: If a user has requested a feature or capability, create a direction for it
+   (unless one already exists that addresses it). Set priority based on urgency implied by the request.
+   After creating the direction, resolve the FEEDBACK message with a note explaining which direction addresses it.
 
 3. **Notes**: Any strategic observations worth preserving for future cycles.
 
-Think big. Focus on fundamental improvements, not incremental fixes.
+Think about what would deliver the most value to users. Balance infrastructure improvements with product features and user-visible outcomes. Don't default to structural work when product features would have more impact.
 Write your analysis as structured prose — it will be processed by a follow-up step.
 
 IMPORTANT: End your analysis with a section titled '## Structured Output' containing:
@@ -699,7 +718,7 @@ Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Jus
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
-${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\n${openMessagesText}\n` : ''}
+${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\n${openMessagesText}\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}
@@ -846,9 +865,9 @@ Quality over quantity — 2 real findings beats 10 incremental ones.
 must come before "add caching to user API"), use depends_on_indices to order them. The pipeline
 respects these — dependent tasks won't start until prerequisites complete.
 
-**Think in layers:** Foundation first, then features. If the last cycle confirmed a foundation
-was built (check research context for "(confirmed)" entries), build features on top of it.
-Don't re-propose the foundation.
+**Sequence wisely.** If foundational infrastructure is genuinely missing (check research context for gaps),
+build it. But if foundations exist, prioritize user-visible features and product improvements over
+additional structural refinement. Don't re-propose foundations that are already confirmed.
 
 # CODEBASE CONTEXT
 

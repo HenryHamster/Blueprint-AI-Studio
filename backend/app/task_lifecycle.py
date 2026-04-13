@@ -209,6 +209,14 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
             )
+            # Task type distribution for product vs structural tracking
+            type_counts: dict[str, int] = {}
+            for ct in child_tasks_rows:
+                if ct.status == TaskStatus.COMPLETED:
+                    task_type = ct.first_payload.get("type", "create")
+                    type_counts[task_type] = type_counts.get(task_type, 0) + 1
+            if type_counts:
+                entry["type_distribution"] = type_counts
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             for ct in child_tasks_rows:

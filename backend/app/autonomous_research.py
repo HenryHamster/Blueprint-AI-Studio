@@ -388,24 +388,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if active_directions:
         import random
         priority_rank = {"high": 0, "medium": 1, "low": 2}
-        never_researched = [d for d in active_directions if not d.get("last_researched_at")]
-        already_researched = [d for d in active_directions if d.get("last_researched_at")]
 
-        # Sort never-researched by priority + vision alignment
-        never_researched.sort(key=lambda d: (
-            priority_rank.get(d.get("priority", "medium"), 1),
-            _vision_rank(d),
-        ))
-        # Sort already-researched by priority, vision, saturation, merge rate, staleness
-        already_researched.sort(key=lambda d: (
-            priority_rank.get(d.get("priority", "medium"), 1),
-            _vision_rank(d),
-            1 if d.get("possibly_saturated") else 0,
-            -(_compute_merge_rate(d) * _compute_momentum_factor(d)),
-            d.get("last_researched_at") or ""
-        ))
-        # Prioritize never-researched, then already-researched
-        sorted_eligible = never_researched + already_researched
+        def _direction_score(d: dict) -> tuple:
+            merge_rate = _compute_merge_rate(d)
+            momentum = _compute_momentum_factor(d)
+            is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
+            return (
+                priority_rank.get(d.get("priority", "medium"), 1),
+                is_new,                                          # novelty bonus within same priority
+                -(merge_rate * momentum),                        # productivity beats vision rank
+                _vision_rank(d),                                 # vision rank as tiebreaker
+                1 if d.get("possibly_saturated") else 0,         # saturated last
+                d.get("last_researched_at") or "",               # staleness
+            )
+
+        active_directions.sort(key=_direction_score)
+        sorted_eligible = active_directions
 
         # Greedy selection: pick non-conflicting directions up to the parallel cap.
         # conflicts_with is a mutual exclusion list — if A lists B, they can't run
