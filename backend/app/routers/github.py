@@ -134,6 +134,10 @@ async def github_oauth_authorize(
         f"&state={state}"
         f"&allow_signup=false"
     )
+    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
+    if orchestrator_url:
+        from urllib.parse import quote
+        url += f"&redirect_uri={quote(orchestrator_url + '/api/github/oauth/callback', safe='')}"
     return {"url": url}
 
 
@@ -171,7 +175,10 @@ async def github_oauth_callback(
 
     try:
         # Exchange code for GitHub user access token
-        token_data = await exchange_oauth_code(code)
+        # redirect_uri must match what was passed in the authorize URL (if any)
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
+        callback_uri = (orchestrator_url + "/api/github/oauth/callback") if orchestrator_url else None
+        token_data = await exchange_oauth_code(code, redirect_uri=callback_uri)
         user_token = token_data["access_token"]
 
         # Get the GitHub user's profile to confirm identity
