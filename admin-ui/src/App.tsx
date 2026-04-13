@@ -18,6 +18,7 @@ import { NewTaskModal } from './components/NewTaskModal';
 import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar } from './components/SearchFilterBar';
+import { DashboardHome } from './components/DashboardHome';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
@@ -586,7 +587,7 @@ export default function App() {
         />
       ) : (
         <>
-          <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
+          {s.viewMode !== 'home' && <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
             <SearchFilterBar
               searchQuery={s.searchQuery}
               onSearchChange={s.setSearchQuery}
@@ -648,10 +649,10 @@ export default function App() {
             <span className="text-xs text-neutral-500">
               {filteredTasks.length} of {s.tasks.length}
             </span>
-          </div>
+          </div>}
 
           {/* Quick-filter preset buttons */}
-          {(() => {
+          {s.viewMode !== 'home' && (() => {
             const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
             const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
             const isFailedToday = s.statusFilter.length === 1 && s.statusFilter[0] === 'FAILED' && s.dateRange === '24h' && !s.requiresApproval && s.searchQuery === '';
@@ -721,7 +722,11 @@ export default function App() {
             );
           })()}
 
-          {s.viewMode === 'kanban' ? (
+          {s.viewMode === 'home' ? (
+            <ErrorBoundary level="panel">
+              <DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} />
+            </ErrorBoundary>
+          ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard
               tasks={filteredTasks}
@@ -778,7 +783,7 @@ export default function App() {
             </ErrorBoundary>
           )}
 
-          <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
+          {s.viewMode !== 'home' && <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />}
         </>
       )}
 

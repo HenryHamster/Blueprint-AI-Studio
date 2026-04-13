@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, MessageSquare } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
@@ -16,8 +16,8 @@ export interface HeaderBarProps {
   maxConcurrentVMs: number;
   lastRefresh: Date | null;
   onRefresh: () => void;
-  viewMode: 'kanban' | 'pipeline';
-  onSetViewMode: (mode: 'kanban' | 'pipeline') => void;
+  viewMode: 'kanban' | 'pipeline' | 'home';
+  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
   showArchive: boolean;
@@ -259,6 +259,13 @@ export function HeaderBar(props: HeaderBarProps) {
         <div className="hidden md:flex items-center gap-1">
           <div className="flex items-center rounded-md overflow-hidden">
             <button
+              onClick={() => onSetViewMode('home')}
+              className={`p-2 text-xs transition-colors ${viewMode === 'home' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
+              title="Dashboard home"
+            >
+              <LayoutDashboard className="w-4 h-4" />
+            </button>
+            <button
               onClick={() => onSetViewMode('kanban')}
               className={`p-2 text-xs transition-colors ${viewMode === 'kanban' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
               title="Kanban view"
@@ -404,6 +411,13 @@ export function HeaderBar(props: HeaderBarProps) {
           </button>
           {showMobileMenu && (
             <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
+              <button
+                onClick={() => { onSetViewMode('home'); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'home' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <LayoutDashboard className="w-4 h-4 shrink-0" />
+                <span>Dashboard</span>
+              </button>
               <button
                 onClick={() => { onSetViewMode('kanban'); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'kanban' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}

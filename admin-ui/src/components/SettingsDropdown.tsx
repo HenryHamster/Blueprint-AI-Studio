@@ -14,8 +14,8 @@ interface SettingsDropdownProps {
   // Defaults
   defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
   onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
-  viewMode: 'kanban' | 'pipeline';
-  onSetViewMode: (mode: 'kanban' | 'pipeline') => void;
+  viewMode: 'kanban' | 'pipeline' | 'home';
+  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;

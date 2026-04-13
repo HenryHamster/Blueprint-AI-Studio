@@ -1,0 +1,454 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  TrendingUp,
+  TrendingDown,
+  AlertTriangle,
+  CheckCircle,
+  Clock,
+  ExternalLink,
+  GitMerge,
+  Minus,
+} from 'lucide-react';
+import { ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { apiFetch } from '../api';
+import { timeAgo, formatDurationSec } from '../utils/time';
+import { isSafeUrl } from './TaskCard';
+import type { Task } from '../types/task';
+import type { ProjectDiagnostics } from '../types/diagnostics';
+
+// ---------- local types ----------
+
+interface DirectionProgress {
+  direction_id: string;
+  direction_text: string;
+  priority: string;
+  cycles_in_window: number;
+  tasks_created: number;
+  prs_merged: number;
+  possibly_saturated: boolean;
+  product_ratio?: number | null;
+}
+
+interface DigestData {
+  failed_count: number;
+  success_rate?: number | null;
+  trend?: 'improving' | 'declining' | 'stable';
+  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number }[];
+  direction_progress?: DirectionProgress[];
+  pending_approval_count: number;
+  overall_product_ratio?: number | null;
+}
+
+interface ActivityEvent {
+  id: string;
+  title: string;
+  timestamp: string;
+  pr_url?: string;
+  task_type?: string;
+  duration_seconds?: number;
+}
+
+interface SparkPoint {
+  active: number;
+  queued: number;
+  failed: number;
+}
+
+// ---------- props ----------
+
+export interface DashboardHomeProps {
+  tasks: Task[];
+  selectedProjectId: string | null;
+  onViewTask: (task: Task) => void;
+}
+
+// ---------- helpers ----------
+
+const TASK_TYPE_COLORS: Record<string, string> = {
+  create: 'bg-emerald-500/20 text-emerald-400',
+  fix: 'bg-red-500/20 text-red-400',
+  review: 'bg-amber-500/20 text-amber-400',
+  research: 'bg-blue-500/20 text-blue-400',
+  plan: 'bg-purple-500/20 text-purple-400',
+  refactor: 'bg-cyan-500/20 text-cyan-400',
+};
+
+function mergeRate(merged: number, created: number): { pct: number; color: string } {
+  if (created === 0) return { pct: 0, color: 'text-neutral-500' };
+  const pct = Math.round((merged / created) * 100);
+  if (pct >= 60) return { pct, color: 'text-emerald-400' };
+  if (pct >= 30) return { pct, color: 'text-amber-400' };
+  return { pct, color: 'text-red-400' };
+}
+
+function priorityBadge(p: string) {
+  switch (p) {
+    case 'high': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
+    case 'medium': return 'bg-amber-500/20 text-amber-400 border-amber-500/30';
+    default: return 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  }
+}
+
+// ---------- skeleton ----------
+
+function Skeleton({ className = '' }: { className?: string }) {
+  return <div className={`animate-pulse bg-neutral-800/60 rounded ${className}`} />;
+}
+
+// ---------- component ----------
+
+export function DashboardHome({ tasks, selectedProjectId, onViewTask }: DashboardHomeProps) {
+  const [digest, setDigest] = useState<DigestData | null>(null);
+  const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAllIssues, setShowAllIssues] = useState(false);
+  const sparkRef = useRef<SparkPoint[]>([]);
+  const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
+
+  // Fetch data
+  const fetchData = useCallback(async () => {
+    const fetches: Promise<void>[] = [];
+
+    // Digest
+    fetches.push(
+      (async () => {
+        try {
+          const url = selectedProjectId
+            ? `/api/admin/digest?hours=24&project_id=${encodeURIComponent(selectedProjectId)}`
+            : '/api/admin/digest?hours=24';
+          const res = await apiFetch(url);
+          if (res.ok) setDigest(await res.json());
+        } catch { /* silent */ }
+      })(),
+    );
+
+    // Diagnostics — only when a project is selected
+    if (selectedProjectId) {
+      fetches.push(
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
+            if (res.ok) setDiagnostics(await res.json());
+          } catch { /* silent */ }
+        })(),
+      );
+    }
+
+    // Activity
+    fetches.push(
+      (async () => {
+        try {
+          const res = await apiFetch('/api/admin/activity?limit=10&event_types=TASK_COMPLETED');
+          if (res.ok) { const data = await res.json(); setActivity(Array.isArray(data) ? data : (data.events ?? [])); }
+        } catch { /* silent */ }
+      })(),
+    );
+
+    await Promise.allSettled(fetches);
+    setLoading(false);
+  }, [selectedProjectId]);
+
+  // Initial + polling
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
+    fetchData();
+    const id = setInterval(fetchData, 30_000);
+    return () => clearInterval(id);
+  }, [fetchData]);
+
+  // Sparkline sampling
+  useEffect(() => {
+    const active = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
+    const queued = tasks.filter(t => t.status === 'QUEUED').length;
+    const failed = digest?.failed_count ?? 0;
+    const next = [...sparkRef.current, { active, queued, failed }].slice(-60);
+    sparkRef.current = next;
+    setSparkData(next);
+  }, [tasks, digest?.failed_count]);
+
+  // Derived counts
+  const activeCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
+  const queuedCount = tasks.filter(t => t.status === 'QUEUED').length;
+  const failedCount = digest?.failed_count ?? 0;
+  const successRate = digest?.success_rate;
+
+  // Build issues list
+  const issues = buildIssues(diagnostics, digest, tasks, onViewTask);
+  const visibleIssues = showAllIssues ? issues : issues.slice(0, 3);
+
+  // Activity events with pr_url
+  const mergeEvents = activity.filter(e => e.pr_url);
+
+  // Direction progress sorted by cycles
+  const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => b.cycles_in_window - a.cycles_in_window);
+  const totalDirPRs = directions.reduce((s, d) => s + d.prs_merged, 0);
+  const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
+
+  return (
+    <div className="flex-1 overflow-auto space-y-4">
+      {/* Main grid: 2-col on large screens */}
+      <div className="lg:grid lg:grid-cols-3 lg:gap-4 space-y-4 lg:space-y-0">
+        <div className="lg:col-span-2 space-y-4">
+          {/* Section 1: Task Status Overview */}
+          <section>
+            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Task Status</h2>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
+              <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
+              <MetricCard label="Failed (24h)" value={failedCount} color="red" spark={sparkData} dataKey="failed" loading={loading} />
+              <SuccessRateCard rate={successRate} trend={digest?.trend} loading={loading} />
+            </div>
+          </section>
+
+          {/* Section 2: Direction Portfolio Health */}
+          <section>
+            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
+            {loading ? (
+              <Skeleton className="h-28 w-full" />
+            ) : directions.length === 0 ? (
+              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No active directions</div>
+            ) : (
+              <>
+                {/* Summary row */}
+                <div className="flex items-center gap-3 text-xs text-neutral-400 mb-2">
+                  <span>{directions.length} direction{directions.length !== 1 ? 's' : ''}</span>
+                  {productPct != null && (
+                    <>
+                      <span className="text-neutral-600">&middot;</span>
+                      <span className="flex items-center gap-1">
+                        {productPct}% product
+                        <div className="w-16 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
+                          <div className="h-full rounded-full bg-emerald-500" style={{ width: `${productPct}%` }} />
+                        </div>
+                      </span>
+                    </>
+                  )}
+                  <span className="text-neutral-600">&middot;</span>
+                  <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
+                </div>
+
+                {/* Scrollable direction cards */}
+                <div className="flex gap-2 overflow-x-auto pb-1">
+                  {directions.map(d => {
+                    const mr = mergeRate(d.prs_merged, d.tasks_created);
+                    return (
+                      <div key={d.direction_id} className="min-w-[200px] max-w-[220px] bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 shrink-0">
+                        <div className="flex items-center gap-1.5 mb-1.5">
+                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
+                          {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
+                        </div>
+                        <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
+                        <div className="flex items-center gap-2 text-[10px] text-neutral-500">
+                          <span className={mr.color}>{mr.pct}% merge</span>
+                          <span>{d.cycles_in_window} cycle{d.cycles_in_window !== 1 ? 's' : ''}</span>
+                          <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </section>
+
+          {/* Section 3: Top Actionable Issues */}
+          <section>
+            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Actionable Issues</h2>
+            {loading ? (
+              <div className="space-y-2"><Skeleton className="h-14 w-full" /><Skeleton className="h-14 w-full" /></div>
+            ) : issues.length === 0 ? (
+              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
+                <CheckCircle className="w-4 h-4" />
+                All systems healthy
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {visibleIssues.map((issue, i) => (
+                  <IssueRow key={i} {...issue} />
+                ))}
+                {issues.length > 3 && (
+                  <button
+                    onClick={() => setShowAllIssues(v => !v)}
+                    className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                  >
+                    {showAllIssues ? 'Show less' : `Show ${issues.length - 3} more`}
+                  </button>
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* Section 4: Recent Merge Timeline */}
+        <div className="lg:col-span-1">
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Recent Merges</h2>
+          {loading ? (
+            <div className="space-y-3"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
+          ) : mergeEvents.length === 0 ? (
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No recent merges</div>
+          ) : (
+            <div className="relative pl-4 space-y-0">
+              {/* vertical line */}
+              <div className="absolute left-1.5 top-1 bottom-1 w-px bg-neutral-800" />
+              {mergeEvents.map(ev => {
+                const dotColor = (ev.task_type === 'fix' || ev.task_type === 'review') ? 'bg-amber-500' : 'bg-emerald-500';
+                const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
+                return (
+                  <div key={ev.id} className="relative pb-3">
+                    <div className={`absolute -left-2.5 top-1.5 w-2 h-2 rounded-full ${dotColor} ring-2 ring-neutral-950`} />
+                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+                      <div className="flex items-start gap-2">
+                        <GitMerge className="w-3.5 h-3.5 text-neutral-500 mt-0.5 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs text-neutral-200 truncate">{ev.title}</p>
+                          <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500">
+                            {ev.task_type && <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{ev.task_type}</span>}
+                            <span>{timeAgo(ev.timestamp)}</span>
+                            {ev.duration_seconds != null && <span>{formatDurationSec(ev.duration_seconds)}</span>}
+                          </div>
+                        </div>
+                        {ev.pr_url && isSafeUrl(ev.pr_url) && (
+                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- sub-components ----------
+
+const SPARK_COLORS: Record<string, string> = { emerald: '#34d399', blue: '#60a5fa', red: '#f87171' };
+
+function MetricCard({ label, value, color, spark, dataKey, loading }: {
+  label: string; value: number; color: string; spark: SparkPoint[]; dataKey: keyof SparkPoint; loading: boolean;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  const fill = SPARK_COLORS[color] ?? '#a3a3a3';
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">{label}</p>
+      <p className={`text-2xl font-bold font-mono text-${color}-400`}>{value}</p>
+      {spark.length >= 3 && (
+        <div className="h-8 mt-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={spark}>
+              <defs>
+                <linearGradient id={`grad-${color}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={fill} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={fill} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <Area type="monotone" dataKey={dataKey} stroke={fill} fill={`url(#grad-${color})`} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuccessRateCard({ rate, trend, loading }: { rate?: number | null; trend?: string; loading: boolean }) {
+  if (loading) return <Skeleton className="h-20" />;
+  const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
+  const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
+      <div className="flex items-center gap-2">
+        <p className="text-2xl font-bold font-mono text-neutral-100">{rate != null ? `${Math.round(rate * 100)}%` : '--'}</p>
+        <TrendIcon className={`w-4 h-4 ${trendColor}`} />
+      </div>
+    </div>
+  );
+}
+
+// ---------- issues ----------
+
+interface IssueItem {
+  severity: 'critical' | 'warning' | 'info';
+  icon: typeof AlertTriangle;
+  title: string;
+  detail?: string;
+  onClick?: () => void;
+}
+
+const SEVERITY_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
+const SEVERITY_ICON_COLOR: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+
+function IssueRow({ severity, icon: Icon, title, detail, onClick }: IssueItem) {
+  const Tag = onClick ? 'button' : 'div';
+  return (
+    <Tag
+      onClick={onClick}
+      className={`w-full text-left bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${SEVERITY_BORDER[severity]} rounded-lg p-3 flex items-start gap-2 ${onClick ? 'cursor-pointer hover:bg-neutral-800/50 transition-colors' : ''}`}
+    >
+      <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${SEVERITY_ICON_COLOR[severity]}`} />
+      <div className="min-w-0">
+        <p className="text-xs text-neutral-200">{title}</p>
+        {detail && <p className="text-[10px] text-neutral-500 mt-0.5 truncate">{detail}</p>}
+      </div>
+    </Tag>
+  );
+}
+
+function buildIssues(
+  diagnostics: ProjectDiagnostics | null,
+  digest: DigestData | null,
+  tasks: Task[],
+  onViewTask: (task: Task) => void,
+): IssueItem[] {
+  const items: IssueItem[] = [];
+
+  // Circuit breaker
+  if (diagnostics?.circuit_breaker && diagnostics.circuit_breaker.state !== 'CLOSED') {
+    items.push({
+      severity: 'critical',
+      icon: AlertTriangle,
+      title: `Circuit breaker ${diagnostics.circuit_breaker.state} (${diagnostics.circuit_breaker.failure_count} failures)`,
+    });
+  }
+
+  // Stuck tasks (top 3)
+  const stuckSorted = [...(diagnostics?.stuck_tasks ?? [])].sort((a, b) => b.stuck_for_seconds - a.stuck_for_seconds);
+  for (const st of stuckSorted.slice(0, 3)) {
+    const matchedTask = tasks.find(t => t.id === st.task_id);
+    items.push({
+      severity: 'warning',
+      icon: AlertTriangle,
+      title: `Stuck: ${st.title}`,
+      detail: st.remediation_hint ?? st.stuck_reason,
+      onClick: matchedTask ? () => onViewTask(matchedTask) : undefined,
+    });
+  }
+
+  // Pending approvals
+  if (digest && digest.pending_approval_count > 0) {
+    items.push({
+      severity: 'info',
+      icon: Clock,
+      title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
+    });
+  }
+
+  // Zone exhaustion
+  if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
+    items.push({
+      severity: 'warning',
+      icon: AlertTriangle,
+      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${diagnostics.zone_health.exhausted.join(', ')}`,
+    });
+  }
+
+  return items;
+}
