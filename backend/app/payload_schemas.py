@@ -11,6 +11,7 @@ Provides:
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from typing import Optional
 
@@ -47,6 +48,10 @@ def _validate_branch_name(v: Optional[str]) -> Optional[str]:
     """Shared branch safety checks — mirrors CreateTaskPayload.validate_branch_name."""
     if v is None:
         return v
+    if not v.strip():
+        raise ValueError("Branch name cannot be empty")
+    if not re.match(r'^[a-zA-Z0-9_./-]+$', v):
+        raise ValueError(f"Branch name contains invalid characters: {v!r}")
     # Reject leading dash (e.g. -bad-branch)
     if v.startswith("-"):
         raise ValueError(f"Branch name cannot start with '-': {v!r}")

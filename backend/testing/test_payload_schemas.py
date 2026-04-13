@@ -48,6 +48,16 @@ def test_all_task_types_frozenset_matches_enum():
     assert isinstance(ALL_TASK_TYPES, frozenset)
 
 
+def test_model_for_type_covers_all_task_types():
+    from app.payload_schemas import _MODEL_FOR_TYPE
+    assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
+
+
+def test_model_for_type_count_is_17():
+    from app.payload_schemas import _MODEL_FOR_TYPE
+    assert len(_MODEL_FOR_TYPE) == 17
+
+
 # ---------------------------------------------------------------------------
 # All 17 types pass with correct required fields
 # ---------------------------------------------------------------------------
@@ -190,6 +200,21 @@ def test_review_branch_with_dotdot_rejected():
 def test_review_branch_leading_dash_rejected():
     msg = _invalid({"type": "review", "pr_number": 1, "branch": "-bad"})
     assert "review" in msg
+
+
+def test_branch_with_spaces_rejected():
+    msg = _invalid({"type": "create", "prompt": "x", "base_branch": "main branch"})
+    assert "create" in msg
+
+
+def test_branch_with_unicode_rejected():
+    msg = _invalid({"type": "create", "prompt": "x", "base_branch": "main/café"})
+    assert "create" in msg
+
+
+def test_branch_empty_rejected():
+    msg = _invalid({"type": "create", "prompt": "x", "base_branch": ""})
+    assert "create" in msg
 
 
 def test_reserved_git_component_rejected():
