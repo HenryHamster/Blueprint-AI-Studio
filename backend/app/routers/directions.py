@@ -488,7 +488,7 @@ async def trigger_strategic_cycle(
         title = f"Architecture review: {project.name}"
     elif phase == "strategic_review":
         # Build direction stats
-        from app.strategic_completion import _build_outcome_evaluation
+        from app.strategic_analysis import _build_outcome_evaluation
         all_active = [d for d in (project.directions or []) if d.get("status") == "active"]
         direction_stats = []
         for d in all_active:

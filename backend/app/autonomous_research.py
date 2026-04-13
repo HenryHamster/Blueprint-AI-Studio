@@ -197,7 +197,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
-    from app.strategic_completion import _build_outcome_evaluation  # noqa: PLC0415
+    from app.strategic_analysis import _build_outcome_evaluation  # noqa: PLC0415
     payload: dict = {
         "type": "strategic_review",
         "research_mode": "strategic",

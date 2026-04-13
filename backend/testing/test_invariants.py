@@ -707,8 +707,10 @@ class TestDeployHealthFreeze:
 
 RESEARCH_COMPLETION_MAX_LINES = 1050
 RESEARCH_COMPLETION_MAX_FUNCTIONS = 17
-STRATEGIC_COMPLETION_MAX_LINES = 920
-STRATEGIC_COMPLETION_MAX_FUNCTIONS = 10
+STRATEGIC_COMPLETION_MAX_LINES = 760
+STRATEGIC_COMPLETION_MAX_FUNCTIONS = 9
+STRATEGIC_ANALYSIS_MAX_LINES = 200
+STRATEGIC_ANALYSIS_MAX_FUNCTIONS = 3
 
 
 def _get_research_completion_py_path() -> str:
@@ -717,6 +719,10 @@ def _get_research_completion_py_path() -> str:
 
 def _get_strategic_completion_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), '..', 'app', 'strategic_completion.py')
+
+
+def _get_strategic_analysis_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'strategic_analysis.py')
 
 
 class TestResearchCompletionFreeze:
@@ -805,6 +811,51 @@ class TestStrategicCompletionFreeze:
         assert func_count <= STRATEGIC_COMPLETION_MAX_FUNCTIONS, (
             f"strategic_completion.py has {func_count} functions, exceeding the ceiling of "
             f"{STRATEGIC_COMPLETION_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestStrategicAnalysisFreeze:
+    """Enforce the strategic_analysis.py freeze: no new functions, no line growth."""
+
+    def test_strategic_analysis_line_count(self):
+        """strategic_analysis.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to strategic_analysis.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_strategic_analysis_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= STRATEGIC_ANALYSIS_MAX_LINES, (
+            f"strategic_analysis.py has {count} lines, exceeding the ceiling of "
+            f"{STRATEGIC_ANALYSIS_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_strategic_analysis_function_count(self):
+        """strategic_analysis.py must not gain new functions.
+
+        If this fails: a new function was added to strategic_analysis.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_strategic_analysis_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= STRATEGIC_ANALYSIS_MAX_FUNCTIONS, (
+            f"strategic_analysis.py has {func_count} functions, exceeding the ceiling of "
+            f"{STRATEGIC_ANALYSIS_MAX_FUNCTIONS}. "
             "New functionality must go in extracted sub-modules. "
             "Once a function-removing extraction lands, ratchet the ceiling down."
         )
