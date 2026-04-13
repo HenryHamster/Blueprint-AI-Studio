@@ -1,4 +1,4 @@
-import { Search, ChevronDown, Check } from 'lucide-react';
+import { Search, ChevronDown, Check, GitFork } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
@@ -12,6 +12,8 @@ interface SearchFilterBarProps {
   onStatusFilterChange: (filter: string[]) => void;
   dateRange: DateRange;
   onDateRangeChange: (range: DateRange) => void;
+  blockedFilter: boolean;
+  onBlockedFilterChange: (v: boolean) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -111,7 +113,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
   { label: 'Last 7d', value: '7d' },
 ];
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, dateRange, onDateRangeChange, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
   const statusOptions = STATUS_OPTIONS.map(opt => ({
@@ -135,6 +137,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     taskTypeFilter.length < typeOptions.length,
     statusFilter.length < statusOptions.length,
     dateRange !== 'all',
+    blockedFilter,
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
@@ -144,6 +147,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
     onTypeFilterChange(typeOptions.map(o => o.value));
     onStatusFilterChange(statusOptions.map(o => o.value));
     onDateRangeChange('all');
+    onBlockedFilterChange(false);
   }
 
   return (
@@ -187,6 +191,18 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           <option key={opt.value} value={opt.value}>{opt.label}</option>
         ))}
       </select>
+
+      <button
+        onClick={() => onBlockedFilterChange(!blockedFilter)}
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all border ${
+          blockedFilter
+            ? 'bg-amber-950/30 border-amber-700/60 text-amber-400'
+            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+        }`}
+      >
+        <GitFork className="w-3 h-3" />
+        <span>Blocked</span>
+      </button>
 
       {hasActiveFilters && (
         <button

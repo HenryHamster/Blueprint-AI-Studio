@@ -219,6 +219,10 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
             }, 10000);
           }
         }, 30000);
+
+        // Refresh task list to catch up on any missed state changes during disconnect
+        setLogLines(prev => [...prev, '[Refreshing task list after reconnect]']);
+        fetchTasksRef.current();
       };
 
       ws.onmessage = handleWsMessage;

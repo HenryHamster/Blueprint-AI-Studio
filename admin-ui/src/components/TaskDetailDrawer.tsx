@@ -5,6 +5,7 @@ import type { LogLevel } from './TaskDetailDrawerLogs';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings } from './TaskCard';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
+import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL } from '../api';
 
 interface TaskDetailDrawerProps {
@@ -658,7 +659,7 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
         <>
           <SectionHeader>Dependencies</SectionHeader>
           <div className="space-y-1">
-            {task.depends_on.map((dep) => { const dt = tasks?.find(t => t.id === dep); return <DependencyItem key={dep} dep={dep} depTask={dt} hasCycle={dt?.depends_on?.includes(task.id)} onNavigateToTask={onNavigateToTask} />; })}
+            {task.depends_on.map((dep) => { const dt = tasks?.find(t => t.id === dep); return <DependencyItem key={dep} dep={dep} depTask={dt} hasCycle={hasTransitiveCycle(task.id, dep, tasks ?? [], 10)} onNavigateToTask={onNavigateToTask} />; })}
           </div>
         </>
       )}
