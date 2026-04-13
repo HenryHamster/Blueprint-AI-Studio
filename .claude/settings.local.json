@@ -6,9 +6,9 @@
     "allow": [
       "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/admin.py''\\).read\\(\\)\\); print\\(''OK: admin.py''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''backend/app/compute.py''\\).read\\(\\)\\); print\\(''OK: compute.py''\\)\")",
-      "Bash(git ls-files:*)",
-      "Bash(export PATH=\"/c/Program Files/Docker/Docker/resources/bin:$PATH\")",
-      "Bash(bash scripts/test-backend.sh)"
+      "Bash(grep -r alloydb.*auth.*proxy /Users/alokthakrar/Projects/blueprint/BlueprintAIStudio --include=*.py --include=*.tf --include=*.md --include=*.yml --include=*.yaml -i)",
+      "Bash(grep -r proxy /Users/alokthakrar/Projects/blueprint/BlueprintAIStudio --include=*.py --include=*.tf --include=*.md --include=*.sh -i)",
+      "Bash(git log:*)"
     ]
   }
 }

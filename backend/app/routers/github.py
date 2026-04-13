@@ -118,16 +118,12 @@ async def github_oauth_authorize(
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
-    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "")
     url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&state={state}"
         f"&allow_signup=false"
     )
-    if orchestrator_url:
-        from urllib.parse import quote
-        url += f"&redirect_uri={quote(orchestrator_url + '/api/github/oauth/callback', safe='')}"
     return {"url": url}
 
 
