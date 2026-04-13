@@ -57,6 +57,17 @@ def _compute_momentum_factor(d: dict) -> float:
     return 1.0  # neutral
 
 
+def _compute_merge_rate(d: dict) -> float:
+    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    if total_cycles == 0:
+        return 0.5  # unknown, neutral
+    return total_merged / total_cycles
+
+
 def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
     """Find a cycle entry by cycle_id in project.vision and apply updates in-place."""
     vision = dict(project.vision or {})
