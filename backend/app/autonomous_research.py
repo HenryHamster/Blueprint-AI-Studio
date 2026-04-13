@@ -439,31 +439,27 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
     now = _utcnow()
 
-    # Build set of direction IDs that already have an active research cycle
-    # (any non-terminal state: QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)
+    # Build set of direction IDs that already have an active research cycle.
+    # Only count tasks where the agent is still working (not EVALUATING, where
+    # the agent is done and we're just waiting for children to merge).
     busy_direction_ids: set = set()
     active_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
             Task.status.in_([
                 TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+                TaskStatus.IN_PROGRESS,
             ]),
         )
     )).scalars().all()
     for t in active_research:
         payload = t.first_payload
         if payload.get("type") == "research":
-            # New-format tasks include all active directions but only one is targeted
+            # current_direction_id identifies the targeted direction; null means
+            # undirected/cross-cutting analysis which doesn't block any direction.
             current_did = payload.get("current_direction_id")
             if current_did:
                 busy_direction_ids.add(current_did)
-            else:
-                # Legacy format: single direction in list
-                for direction in payload.get("directions", []):
-                    did = direction.get("id")
-                    if did:
-                        busy_direction_ids.add(did)
 
     directions_modified = False
     # Prune dead directions (expired/completed/rejected) to prevent JSON bloat

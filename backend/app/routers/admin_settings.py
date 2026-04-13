@@ -967,12 +967,24 @@ async def get_autonomy_debug(
 ):
     """Return a detailed snapshot of why autonomy is or isn't spawning for a project."""
     from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
+    from app.max_plan_pool import _max_plan_pools, _account_available_for_model
     import app.shared_state as _shared_state_mod
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
 
     now = _utcnow()
     blocking_guards = []
+
+    # Guard 0: no available Max Plan accounts
+    user_pool = _max_plan_pools.get(project.user_id, [])
+    research_model = _runtime_config.get("task_type_models", {}).get("research")
+    has_available = any(_account_available_for_model(a, research_model) for a in user_pool) or bool(os.getenv("ANTHROPIC_API_KEY"))
+    if not has_available:
+        blocking_guards.append({
+            "guard": "no_available_accounts",
+            "reason": f"No Max Plan accounts available for research model ({research_model})",
+            "pool_size": len(user_pool),
+        })
 
     # Guard 1: autonomous_disabled
     if not project.autonomous_enabled:
@@ -1060,17 +1072,29 @@ async def get_autonomy_debug(
         )
     )
     active_tasks = active_tasks_result.scalars().all()
-    blocking_research_task_id = None
+    active_research_count = 0
+    busy_direction_ids: list[str] = []
     for t in active_tasks:
-        if (t.first_payload).get("type") == "research":
-            blocking_research_task_id = str(t.id)
-            break
-    if blocking_research_task_id:
+        payload = t.first_payload
+        if payload.get("type") == "research":
+            active_research_count += 1
+            did = payload.get("current_direction_id")
+            if did:
+                busy_direction_ids.append(did)
+    max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
+    if active_research_count >= max_parallel:
         blocking_guards.append({
             "guard": "research_task_active",
-            "reason": "A research task is actively running (QUEUED/PROVISIONING/IN_PROGRESS)",
-            "task_id": blocking_research_task_id,
+            "reason": f"Active research ({active_research_count}) >= max_parallel ({max_parallel})",
+            "active_research_count": active_research_count,
+            "max_parallel": max_parallel,
         })
+    if busy_direction_ids:
+        # Mark busy directions in the directions info for visibility
+        for d in directions_info:
+            if d["id"] in busy_direction_ids:
+                d["is_eligible"] = False
+                d["busy_reason"] = "direction has active research task"
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
