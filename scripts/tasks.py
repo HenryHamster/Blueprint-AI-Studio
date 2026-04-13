@@ -246,12 +246,48 @@ def cmd_cancel(args):
 
 
 def cmd_cancel_all(args):
-    """Cancel all non-terminal tasks, optionally filtered by status."""
-    statuses = [args[0]] if args else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
+    """Cancel all non-terminal tasks, optionally filtered by status or project.
+
+    Usage: cancel-all [--status STATUS] [--project PROJECT_ID_OR_NAME]
+    """
+    from blueprint_api import api
+    status_filter = None
+    project_filter = None
+    i = 0
+    positional_args = list(args)
+    while i < len(positional_args):
+        if positional_args[i] == "--status" and i + 1 < len(positional_args):
+            status_filter = positional_args[i + 1]
+            i += 2
+        elif positional_args[i] == "--project" and i + 1 < len(positional_args):
+            project_filter = positional_args[i + 1]
+            i += 2
+        else:
+            # Legacy: first positional arg is status
+            if not status_filter:
+                status_filter = positional_args[i]
+            i += 1
+
+    # Resolve project filter to ID
+    project_id = None
+    if project_filter:
+        projects = api("GET", "/api/admin/projects")
+        for p in projects:
+            if p["id"].startswith(project_filter) or project_filter.lower() in p.get("name", "").lower():
+                project_id = p["id"]
+                print(f"Filtering to project: {p.get('name', p['id'][:8])}")
+                break
+        if not project_id:
+            print(f"ERROR: No project matching '{project_filter}'")
+            return
+
+    statuses = [status_filter] if status_filter else ["QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"]
     cancelled = 0
     for status in statuses:
-        tasks = list_tasks(status=status, limit=100)
+        tasks = list_tasks(status=status, limit=200)
         for t in tasks:
+            if project_id and t.get("project_id") != project_id:
+                continue
             tid = t["id"]
             title = _safe(t["title"], 50)
             print(f"  Cancelling [{status[:4]}] {tid[:8]} {title}...", end=" ")

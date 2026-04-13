@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import select, delete
 from typing import Optional, Dict, Any, List
 import uuid
 from datetime import timedelta
@@ -149,6 +149,11 @@ async def delete_project_admin(
                 await _ensure_vm_deleted(task, reason="project_force_delete")
         await session.commit()
 
+    # Delete dependent records that lack ON DELETE CASCADE
+    from app.models import Alert
+    await session.execute(
+        delete(Alert).where(Alert.project_id == project_id)
+    )
     await session.delete(project)
     await session.commit()
 
