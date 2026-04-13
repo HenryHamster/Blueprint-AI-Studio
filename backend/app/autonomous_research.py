@@ -393,8 +393,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             merge_rate = _compute_merge_rate(d)
             momentum = _compute_momentum_factor(d)
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
+            category_bonus = -1 if d.get("category") == "product" else 0  # product directions preferred
             return (
                 priority_rank.get(d.get("priority", "medium"), 1),
+                category_bonus,                                  # product category within same priority
                 is_new,                                          # novelty bonus within same priority
                 -(merge_rate * momentum),                        # productivity beats vision rank
                 _vision_rank(d),                                 # vision rank as tiebreaker
@@ -439,7 +441,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 did = d.get("id", "?")
                 merge_rate = _compute_merge_rate(d)
                 momentum = _compute_momentum_factor(d)
-                logger.debug(f"[RESEARCH] Selected direction {did} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
+                category = d.get("category", "unset")
+                logger.debug(f"[RESEARCH] Selected direction {did} category={category} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 
@@ -617,6 +620,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             **({"effort": research_effort} if research_effort else {}),
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
+        if chosen_direction and chosen_direction.get("category") == "product":
+            product_guidance = (
+                "This direction targets a product feature. Prioritize user-visible changes, "
+                "end-user experience improvements, and direct product value. Structural work "
+                "is acceptable only when it directly enables the product feature."
+            )
+            existing = research_payload.get("prompt_suffix", "")
+            research_payload["prompt_suffix"] = f"{existing}\n{product_guidance}".strip() if existing else product_guidance
         # Pre-extract design doc context for the current direction's system_id
         if chosen_direction:
             dir_system_id = chosen_direction.get("system_id")
