@@ -724,6 +724,190 @@ async def test_confirmed_merge_still_blocks_rededup(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ghost_merge_does_not_block_rededup(db_session, mocker):
+    """A COMPLETED+pr_merged task whose parent rollup failed must NOT block re-proposal."""
+    direction = _active_direction("d-ghostmrg", "Ghost merge direction")
+    project = Project(
+        name="Ghost Merge Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Fix authentication token expiry handling"
+    dup_desc = "Auth tokens expire without proper notification"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Parent rollup task that FAILED (e.g. staging branch invalid)
+    parent = Task(
+        project_id=project.id,
+        title="rollup: research batch",
+        payloads=[{"type": "create", "prompt": "rollup", "base_branch": "main"}],
+        context={},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    # Ghost merge: child is COMPLETED+pr_merged=True but its parent rollup failed
+    ghost_merge = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "pr_merged": True},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        parent_task_id=parent.id,
+    )
+    db_session.add(ghost_merge)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Fix auth token expiry",
+            "priority": "high",
+            "scope": "small",
+            "risk": "high",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Ghost merge (failed rollup parent) must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_does_not_block_rededup(db_session, mocker):
+    """A FAILED task due to infrastructure issues must NOT block re-proposal."""
+    direction = _active_direction("d-infrafail", "Infra failure direction")
+    project = Project(
+        name="Infra Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    infra_title = "Add rate limiting to API endpoints"
+    infra_desc = "API endpoints lack rate limiting protection"
+    infra_hash = hashlib.sha256((infra_title + infra_desc).encode()).hexdigest()[:16]
+
+    # FAILED task due to AGENT_TIMEOUT (no heartbeat = transient infra issue)
+    infra_failed = Task(
+        project_id=project.id,
+        title=infra_title,
+        payloads=[{"type": "create", "prompt": "add rate limiting", "base_branch": "main"}],
+        context={"finding_hash": infra_hash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Reaped (attempt 1/3): No heartbeat for 314s",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(infra_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": infra_title,
+            "description": infra_desc,
+            "prompt": "Add rate limiting",
+            "priority": "high",
+            "scope": "small",
+            "risk": "medium",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Infrastructure failure must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_failure_still_blocks_rededup(db_session, mocker):
+    """A FAILED task due to a code error must still block re-proposal."""
+    direction = _active_direction("d-codefail", "Code failure direction")
+    project = Project(
+        name="Code Failure Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    code_title = "Refactor database connection pooling"
+    code_desc = "Connection pool is not properly configured"
+    code_hash = hashlib.sha256((code_title + code_desc).encode()).hexdigest()[:16]
+
+    # FAILED task due to a code error (non-infra failure)
+    code_failed = Task(
+        project_id=project.id,
+        title=code_title,
+        payloads=[{"type": "create", "prompt": "refactor pool", "base_branch": "main"}],
+        context={"finding_hash": code_hash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Tests failed: AssertionError in test_db_pool.py line 42",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": code_title,
+            "description": code_desc,
+            "prompt": "Refactor connection pool",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "medium",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "Code error failure must still block re-proposal"
+
+
+@pytest.mark.asyncio
 async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     """Distinct findings that share fewer than 3 meaningful words each get a child task."""
     direction = _active_direction("d-unique01", "Unique findings direction")
@@ -1804,7 +1988,7 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     await db_session.refresh(fail_task)
     await db_session.refresh(merge_task)
 
-    # Create a research task and manually add a history entry with child_task_ids
+    # Create a research task and manually add a history entry (compact format, no child_task_ids)
     research_task = Task(
         project_id=project.id,
         title="Research: Outcome update test",
@@ -1817,7 +2001,13 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(research_task)
 
-    # Inject research_history entry with child_task_ids
+    # Set parent_task_id on child tasks so they can be found by parent_task_id query
+    fail_task.parent_task_id = research_task.id
+    merge_task.parent_task_id = research_task.id
+    db_session.add(fail_task)
+    db_session.add(merge_task)
+
+    # Inject research_history entry without child_task_ids (compact format)
     dirs = list(project.directions or [])
     for d in dirs:
         if d.get("id") == direction_id:
@@ -1825,7 +2015,6 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
                 "timestamp": "2026-04-07T00:00:00",
                 "task_id": str(research_task.id),
                 "tasks_created": 2,
-                "child_task_ids": [str(fail_task.id), str(merge_task.id)],
                 "finding_titles": ["Add retry logic to API client", "Improve caching layer"],
             }]
             break
@@ -1834,6 +2023,8 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     flag_modified(project, "directions")
     db_session.add(project)
     await db_session.commit()
+    await db_session.refresh(fail_task)
+    await db_session.refresh(merge_task)
 
     # Trigger outcome update
     await _update_direction_research_outcomes(

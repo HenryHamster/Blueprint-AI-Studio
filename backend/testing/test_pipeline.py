@@ -1535,3 +1535,48 @@ async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
 
     assert result is not None
     assert result.priority == 80, f"Expected priority 80 but got {result.priority}"
+
+
+# ── _ensure_vm_deleted VM count decrement ────────────────────────────────────
+
+class TestEnsureVmDeletedCountDecrement:
+    """_ensure_vm_deleted must decrement _last_gcp_vm_count on successful deletion."""
+
+    @pytest.mark.asyncio
+    async def test_decrements_count_on_success(self, mocker):
+        import app.main as main_module
+
+        main_module._last_gcp_vm_count = 3
+        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True)
+
+        from app.main import _ensure_vm_deleted
+        result = await _ensure_vm_deleted("vm-test-123", reason="test")
+
+        assert result is True
+        assert main_module._last_gcp_vm_count == 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_go_below_zero(self, mocker):
+        import app.main as main_module
+
+        main_module._last_gcp_vm_count = 0
+        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True)
+
+        from app.main import _ensure_vm_deleted
+        result = await _ensure_vm_deleted("vm-test-456", reason="test")
+
+        assert result is True
+        assert main_module._last_gcp_vm_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_decrement_on_failure(self, mocker):
+        import app.main as main_module
+
+        main_module._last_gcp_vm_count = 3
+        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=False)
+
+        from app.main import _ensure_vm_deleted
+        result = await _ensure_vm_deleted("vm-test-789", reason="test")
+
+        assert result is False
+        assert main_module._last_gcp_vm_count == 3

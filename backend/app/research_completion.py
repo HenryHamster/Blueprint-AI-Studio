@@ -401,10 +401,43 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             Task.created_at >= ninety_days_ago,
         )
     )).scalars().all()
+    # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
+    # (code merged to staging branch but parent rollup PR to main failed)
+    potential_ghost_parent_ids = {
+        t.parent_task_id for t in recent_tasks_for_dedup
+        if t.parent_task_id
+        and t.status == TaskStatus.COMPLETED
+        and (t.context or {}).get("pr_merged")
+    }
+    failed_parent_ids: set = set()
+    if potential_ghost_parent_ids:
+        parent_tasks_rows = (await session.execute(
+            select(Task).where(Task.id.in_(potential_ghost_parent_ids))
+        )).scalars().all()
+        failed_parent_ids = {
+            p.id for p in parent_tasks_rows
+            if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+        }
+
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+    _infra_classes = frozenset({"PROVISION_FAILURE", "AGENT_TIMEOUT", "RATE_LIMIT"})
+
     recent_finding_hashes = {
         t.context["finding_hash"] for t in recent_tasks_for_dedup
         if t.context and t.context.get("finding_hash")
+        # Exclude COMPLETED without pr_merged (code was never shipped)
         and not (t.status == TaskStatus.COMPLETED and not (t.context or {}).get("pr_merged"))
+        # Exclude ghost merges: pr_merged=True but rollup parent failed (code never reached main)
+        and not (
+            t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged")
+            and t.parent_task_id in failed_parent_ids
+        )
+        # Exclude transient infra failures (task never ran, should be retried)
+        and not (
+            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            and classify_failure(t) in _infra_classes
+        )
     }
     # Build a map of finding_hash -> outcome for failed/cancelled tasks for better logging
     failed_hashes = {

@@ -156,6 +156,8 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
     Retries up to 3 times with exponential backoff.
     Returns True if deletion succeeded or was unnecessary.
     """
+    global _last_gcp_vm_count
+
     if isinstance(task_or_vm_id, Task):
         vm_id = task_or_vm_id.vm_instance_id
         task_id = str(task_or_vm_id.id)
@@ -173,6 +175,9 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
             result = await delete_agent_vm(vm_id)
             if result:
                 logger.info(f"[VM CLEANUP] Deleted VM {vm_id}")
+                if _last_gcp_vm_count > 0:
+                    _last_gcp_vm_count -= 1
+                    logger.info(f"[VM CLEANUP] Decremented cached VM count to {_last_gcp_vm_count}")
                 return True
             else:
                 logger.warning(f"[VM CLEANUP] delete_agent_vm returned False for {vm_id} (attempt {attempt + 1}/3)")

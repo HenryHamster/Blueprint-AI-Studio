@@ -193,18 +193,14 @@ async def _update_direction_research_outcomes(
         for entry in history:
             if entry.get("task_id") != research_task_id:
                 continue
-            child_ids = entry.get("child_task_ids", [])
-            if not child_ids:
+            research_task_uuid = None
+            try:
+                research_task_uuid = uuid.UUID(entry.get("task_id", ""))
+            except (ValueError, AttributeError):
+                pass
+            if not research_task_uuid:
                 break
-            child_uuids = []
-            for cid in child_ids:
-                try:
-                    child_uuids.append(uuid.UUID(cid))
-                except ValueError:
-                    pass
-            if not child_uuids:
-                break
-            child_tasks_stmt = select(Task).where(Task.id.in_(child_uuids))
+            child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
             child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
             entry["tasks_completed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED)
             entry["tasks_failed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED)
