@@ -115,7 +115,8 @@ export function useSettings(addToast: AddToast) {
 
   const connectGitHub = async () => {
     try {
-      const res = await authGet(`${API_BASE_URL}/api/github/oauth/authorize`);
+      const redirectUri = window.location.origin;
+      const res = await authGet(`${API_BASE_URL}/api/github/oauth/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`);
       if (res.ok) {
         const { url } = await res.json();
         window.location.href = url;

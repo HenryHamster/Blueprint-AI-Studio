@@ -8,6 +8,7 @@ import os
 import time
 from collections import OrderedDict
 from datetime import timedelta
+from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -91,6 +92,7 @@ async def register_github_pat(
 @limiter.limit("10/minute")
 async def github_oauth_authorize(
     request: Request,
+    redirect_uri: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -100,11 +102,19 @@ async def github_oauth_authorize(
     if not GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)")
 
+    # Default to ADMIN_UI_URL if not provided, but allow dynamic override (for localhost/PR previews)
+    admin_url = redirect_uri or os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+
     # Sign a state token so the callback can verify which user initiated the flow
     import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     state = pyjwt.encode(
-        {"sub": current_user["user_id"], "exp": _utcnow() + timedelta(minutes=10), "type": "github_oauth"},
+        {
+            "sub": current_user["user_id"],
+            "exp": _utcnow() + timedelta(minutes=10),
+            "type": "github_oauth",
+            "admin_url": admin_url
+        },
         AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
     )
 
@@ -134,20 +144,24 @@ async def github_oauth_callback(
     installations, and auto-registers them. This proves the user actually owns the
     GitHub account — no spoofing possible.
     """
-    admin_url = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
-
     # Verify the state token to identify the Firebase user who started the flow
     import jwt as pyjwt
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
     try:
         state_payload = pyjwt.decode(state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
         if state_payload.get("type") != "github_oauth":
-            return RedirectResponse(url=f"{admin_url}?github_error=invalid_state")
+            # Can't even trust the state for a redirect URL here, use fallback
+            fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+            return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
+        
         firebase_user_id = state_payload["sub"]
+        admin_url = state_payload.get("admin_url") or os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
     except pyjwt.ExpiredSignatureError:
-        return RedirectResponse(url=f"{admin_url}?github_error=state_expired")
+        fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+        return RedirectResponse(url=f"{fallback_admin}?github_error=state_expired")
     except pyjwt.PyJWTError:
-        return RedirectResponse(url=f"{admin_url}?github_error=invalid_state")
+        fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+        return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
 
     try:
         # Exchange code for GitHub user access token
@@ -160,6 +174,21 @@ async def github_oauth_callback(
         # Discover which of this App's installations the user can access
         installations = await get_user_installations(user_token)
         if not installations:
+            # If no installations found, try to help the user install the app
+            try:
+                from app.github import get_app_info
+                app_info = await get_app_info()
+                app_slug = app_info.get("slug")
+                if app_slug:
+                    # Redirect to the app installation page
+                    # We pass the state along so the user might eventually come back? 
+                    # Actually GitHub App installation doesn't support state param in this way,
+                    # but it will redirect back to the "Setup URL" configured in the App settings.
+                    logger.info(f"[GITHUB OAUTH] No installations for user {firebase_user_id}, redirecting to app install: {app_slug}")
+                    return RedirectResponse(url=f"https://github.com/apps/{app_slug}/installations/new")
+            except Exception as app_err:
+                logger.warning(f"Failed to fetch app info for installation redirect: {app_err}")
+            
             return RedirectResponse(url=f"{admin_url}?github_error=no_installations")
 
         # Store the first installation ID; collect all account names for display.

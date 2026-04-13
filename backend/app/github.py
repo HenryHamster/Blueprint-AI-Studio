@@ -152,22 +152,47 @@ async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     return await generate_installation_access_token(installation_id, repositories=[repo])
 
 
-async def exchange_oauth_code(code: str) -> dict:
+async def exchange_oauth_code(code: str, redirect_uri: str | None = None) -> dict:
     """Exchange a GitHub OAuth code for a user access token."""
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
         raise ValueError("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must be set")
 
+    payload = {"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET, "code": code}
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
+
     resp = await _github_request(
         "POST", "https://github.com/login/oauth/access_token",
         {"Accept": "application/json"},
-        json={"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET, "code": code},
+        json=payload,
     )
     if resp.status_code != 200:
+        logger.error(f"[GITHUB OAUTH] Token exchange failed ({resp.status_code}): {resp.text}")
         raise HTTPException(status_code=502, detail="GitHub OAuth exchange failed")
     data = resp.json()
     if "error" in data:
+        logger.error(f"[GITHUB OAUTH] Error in token data: {data}")
         raise HTTPException(status_code=400, detail=f"GitHub OAuth error: {data.get('error_description', data['error'])}")
     return data
+
+
+async def get_app_info() -> dict:
+    """Fetch basic information about this GitHub App."""
+    if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
+        raise ValueError("GITHUB_APP_ID and GITHUB_PRIVATE_KEY must be set")
+
+    app_jwt = generate_github_app_jwt()
+    headers = {
+        "Authorization": f"Bearer {app_jwt}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    resp = await _github_request("GET", "https://api.github.com/app", headers)
+    if resp.status_code != 200:
+        logger.error(f"Failed to fetch app info: {resp.text}")
+        raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
+    return resp.json()
 
 
 async def get_user_installations(user_token: str) -> list[dict]:
