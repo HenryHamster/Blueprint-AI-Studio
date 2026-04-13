@@ -244,6 +244,7 @@ export default function App() {
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
   const failedTasks = useMemo(() => selectedTasks.filter(t => t.status === 'FAILED'), [selectedTasks]);
   const terminalTasks = useMemo(() => selectedTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
+  const approvableTasks = useMemo(() => selectedTasks.filter(t => t.requires_approval && !TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
 
   const effectiveColumnPrefs = useMemo<ColumnPref[]>(() => {
     const base = s.columnPrefs.length > 0 ? s.columnPrefs : COLUMNS.map(c => ({ id: c.id, visible: true }));
@@ -875,6 +876,23 @@ export default function App() {
             <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
             {s.selectedTaskIds.size} selected
           </span>
+          {approvableTasks.length > 0 && (
+            <button
+              onClick={() => s.setConfirmDialog({
+                title: `Approve ${approvableTasks.length} task${approvableTasks.length !== 1 ? 's' : ''}?`,
+                message: buildBulkConfirmMessage(approvableTasks),
+                confirmLabel: `Approve ${approvableTasks.length}`,
+                onConfirm: () => {
+                  s.handleBulkAction('approve', approvableTasks.map(t => t.id));
+                  s.toggleSelectionMode();
+                  s.setConfirmDialog(null);
+                },
+              })}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/40 transition-colors"
+            >
+              Approve {approvableTasks.length}
+            </button>
+          )}
           {cancellableTasks.length > 0 && (
             <button
               onClick={() => s.setConfirmDialog({

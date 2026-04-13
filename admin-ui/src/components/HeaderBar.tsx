@@ -474,6 +474,10 @@ export function HeaderBar(props: HeaderBarProps) {
                       ['A', 'Toggle activity feed'],
                       ['?', 'This help'],
                       ['Esc', 'Close panel/modal'],
+                      ['Del', 'Cancel selected (selection mode)'],
+                      ['R*', 'Retry selected (selection mode)'],
+                      ['Enter', 'Open selected task (selection mode)'],
+                      ['Esc*', 'Clear selection / exit mode'],
                     ].map(([key, desc]) => (
                       <div key={key} className="flex items-center justify-between">
                         <span className="text-neutral-400">{desc}</span>

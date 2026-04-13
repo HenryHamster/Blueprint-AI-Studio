@@ -240,6 +240,10 @@ export function useAppState() {
       if (e.key === 'Escape') {
         if (showNewTaskModal) { setShowNewTaskModal(false); return; }
         if (logTask) { closeLogViewer(); return; }
+        if (selectionMode) {
+          if (selectedTaskIds.size > 0) { setSelectedTaskIds(new Set()); } else { toggleSelectionMode(); }
+          return;
+        }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showMessages) { setShowMessages(false); return; }
@@ -260,8 +264,43 @@ export function useAppState() {
           }
           break;
         case 'r':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
+          if (selectionMode && selectedTaskIds.size > 0) {
+            const failed = tasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'FAILED');
+            if (failed.length > 0) {
+              setConfirmDialog({
+                title: `Retry ${failed.length} task${failed.length !== 1 ? 's' : ''}?`,
+                message: failed.map(t => t.title || t.id).join('\n'),
+                confirmLabel: `Retry ${failed.length}`,
+                onConfirm: () => {
+                  handleBulkAction('retry', failed.map(t => t.id));
+                  toggleSelectionMode();
+                  setConfirmDialog(null);
+                },
+              });
+            }
+          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && !showDirections && !showSettings) {
             fetchTasks();
+          }
+          break;
+        case 'Delete':
+          if (selectionMode && selectedTaskIds.size > 0) {
+            const cancellable = tasks.filter(t => selectedTaskIds.has(t.id) && ['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(t.status));
+            if (cancellable.length > 0) {
+              setConfirmDialog({
+                title: `Cancel ${cancellable.length} task${cancellable.length !== 1 ? 's' : ''}?`,
+                message: cancellable.map(t => t.title || t.id).join('\n'),
+                confirmLabel: `Cancel ${cancellable.length}`,
+                onConfirm: () => handleBulkCancel(cancellable.map(t => t.id)),
+              });
+            }
+          }
+          break;
+        case 'Enter':
+          if (selectionMode && selectedTaskIds.size > 0) {
+            const ids = Array.from(selectedTaskIds);
+            const taskId = ids[ids.length - 1];
+            const task = tasks.find(t => t.id === taskId);
+            if (task) { handleViewLogs(task); }
           }
           break;
         case '1':
@@ -293,7 +332,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Functions ───────────────────────────────────────────────────────────
 
