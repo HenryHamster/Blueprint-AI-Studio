@@ -80,16 +80,27 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const finalPromptWithTree = fileTree + finalPrompt;
 
   statusRef.value = 'Running Claude Code...';
+  // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
+  const baseCommit = git(['rev-parse', 'HEAD']);
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPromptWithTree, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
+  const currentHead = git(['rev-parse', 'HEAD']);
+  // Detect changes from BOTH uncommitted files AND commits Claude may have created
+  const hasChanges = diff.length > 0 || currentHead !== baseCommit;
 
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing changes...\n');
 
-    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+    // Collect changed paths from both uncommitted changes and any commits Claude made
+    const uncommittedPaths = diff.length > 0
+      ? diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
+      : [];
+    const committedPaths = currentHead !== baseCommit
+      ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
+      : [];
+    const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
     if (runLintFix) {
       await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort);
     }
@@ -113,7 +124,12 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     git(['add', '-A']);
     const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
+    // Only create a new commit if there are staged changes — Claude may have
+    // already committed, and lint/test fix loops may not have added new changes.
+    const staged = git(['status', '--porcelain']);
+    if (staged.length > 0) {
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
+    }
 
     let prBody = `## Summary\n\n${lastResultText.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
     if (runTestFix) {

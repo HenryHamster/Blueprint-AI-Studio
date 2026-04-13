@@ -458,11 +458,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   useEffect(() => {
     if (!digest || autoSectionExpandedRef.current) return;
     autoSectionExpandedRef.current = true;
-    const attentionIdSet = new Set(digest.needs_attention.map(i => i.task_id));
-    const extra = digest.recent_failures.filter(f => !attentionIdSet.has(f.task_id));
-    if (digest.needs_attention.length > 0) {
+    const attentionIdSet = new Set((digest.needs_attention ?? []).map(i => i.task_id));
+    const extra = (digest.recent_failures ?? []).filter(f => !attentionIdSet.has(f.task_id));
+    if ((digest.needs_attention ?? []).length > 0) {
       // needs_attention is always visible — nothing to expand
-    } else if (digest.recent_completions.length > 0) {
+    } else if ((digest.recent_completions ?? []).length > 0) {
       setCompletionsExpanded(true);
     } else if (extra.length > 0) {
       setFailuresExpanded(true);
@@ -543,7 +543,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   );
 
   // Failures not already in needs_attention
-  const attentionIds = new Set(digest?.needs_attention.map(i => i.task_id) ?? []);
+  const attentionIds = new Set((digest?.needs_attention ?? []).map(i => i.task_id));
   const extraFailureGroups = (digest?.failure_groups ?? [])
     .map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) }))
     .filter(g => g.tasks.length > 0);
@@ -739,7 +739,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Needs attention */}
-              {digest!.needs_attention.length > 0 && (() => {
+              {(digest!.needs_attention ?? []).length > 0 && (() => {
                 const visibleItems = digest!.needs_attention.filter(item => !isHidden(item.task_id));
                 const hiddenItems = digest!.needs_attention.filter(item => isHidden(item.task_id));
                 const countLabel = hiddenItems.length > 0
@@ -927,7 +927,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   </button>
                   {activeExpanded && (
                     <div className="flex flex-col gap-1.5">
-                      {digest!.active_tasks.map(t => (
+                      {(digest!.active_tasks ?? []).map(t => (
                         <div
                           key={t.task_id}
                           role="button"
@@ -945,9 +945,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           )}
                         </div>
                       ))}
-                      {digest!.active_count > digest!.active_tasks.length && (
+                      {digest!.active_count > (digest!.active_tasks ?? []).length && (
                         <div className="text-[10px] text-neutral-600 px-2">
-                          +{digest!.active_count - digest!.active_tasks.length} more
+                          +{digest!.active_count - (digest!.active_tasks ?? []).length} more
                         </div>
                       )}
                     </div>
@@ -1045,7 +1045,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Recent completions */}
-              {digest!.recent_completions.length > 0 && (() => {
+              {(digest!.recent_completions ?? []).length > 0 && (() => {
                 const completions = digest!.recent_completions;
                 // Group by task_type, preserving insertion order
                 const groups = new Map<string, RecentCompletion[]>();

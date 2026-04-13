@@ -192,17 +192,23 @@ CRITICAL RULES:
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
+  const migrateBaseCommit = git(['rev-parse', 'HEAD']);
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePlaybookSection + migratePrompt + PLAYBOOK_GUIDANCE + migratePromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
-  const hasChanges = diff.length > 0;
+  const currentHead = git(['rev-parse', 'HEAD']);
+  // Detect changes from BOTH uncommitted files AND commits Claude may have created
+  const hasChanges = diff.length > 0 || currentHead !== migrateBaseCommit;
 
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing migration changes...\n');
 
     git(['add', '-A']);
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    const migrateStaged = git(['status', '--porcelain']);
+    if (migrateStaged.length > 0) {
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+    }
 
     // Rebase onto latest base branch before push
     statusRef.value = `Rebasing onto ${baseBranch}...`;

@@ -370,13 +370,22 @@ export async function handleFix(
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
+  const fixBaseCommit = git(['rev-parse', 'HEAD']);
   const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort, disallowedToolsFix);
 
-  // Check for uncommitted changes (from Claude's fixes)
+  // Check for changes — both uncommitted files and commits Claude may have made
   const diff = git(['status', '--porcelain']);
-  if (diff.length > 0 && exitCode === 0) {
-    // Run lint/build checks before committing — retry up to 3 times with Claude fixes
-    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+  const fixCurrentHead = git(['rev-parse', 'HEAD']);
+  const hasFixChanges = diff.length > 0 || fixCurrentHead !== fixBaseCommit;
+  if (hasFixChanges && exitCode === 0) {
+    // Collect changed paths from both uncommitted changes and any commits Claude made
+    const fixUncommittedPaths = diff.length > 0
+      ? diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
+      : [];
+    const fixCommittedPaths = fixCurrentHead !== fixBaseCommit
+      ? git(['diff', '--name-only', `${fixBaseCommit}..HEAD`]).split('\n').filter(Boolean)
+      : [];
+    const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
     await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort);
 
     const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort);
@@ -384,7 +393,11 @@ export async function handleFix(
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
     const testNote = fixTestFailures ? '\n\nNote: test failures detected, manual review recommended' : '';
-    execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`], { encoding: 'utf-8' });
+    // Only create a new commit if there are uncommitted changes (Claude may have already committed)
+    const fixStaged = git(['status', '--porcelain']);
+    if (fixStaged.length > 0) {
+      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`], { encoding: 'utf-8' });
+    }
   }
 
   // Final rebase onto base branch to ensure no conflicts remain before push.
@@ -438,8 +451,11 @@ export async function handleFix(
   }
 
   // Re-run lint after rebase — upstream changes can introduce new errors
-  if (exitCode === 0 && diff.length > 0) {
-    const changedPaths = diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '');
+  if (exitCode === 0 && hasFixChanges) {
+    const postRebaseDiff = git(['status', '--porcelain']);
+    const changedPaths = postRebaseDiff.length > 0
+      ? postRebaseDiff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
+      : git(['diff', '--name-only', `origin/${baseBranch}..HEAD`]).split('\n').filter(Boolean);
     try {
       runProjectLintChecks(changedPaths, ws);
     } catch (postRebaseLintErr: unknown) {
@@ -450,8 +466,11 @@ export async function handleFix(
         ws, statusRef, model, effort
       );
       git(['add', '-A']);
-      const shortId = taskId.replace(/-/g, '').slice(0, 8);
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+      const postLintStaged = git(['status', '--porcelain']);
+      if (postLintStaged.length > 0) {
+        const shortId = taskId.replace(/-/g, '').slice(0, 8);
+        execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+      }
     }
   }
 

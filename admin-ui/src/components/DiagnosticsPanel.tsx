@@ -88,7 +88,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
                     {task.attempt_count > 1 && (
                       <span className="text-neutral-600 shrink-0">×{task.attempt_count}</span>
                     )}
-                    {task.stuck_reason === 'stuck_deps' && task.unresolvable_deps.length > 0 && (
+                    {task.stuck_reason === 'stuck_deps' && task.unresolvable_deps?.length > 0 && (
                       <span className="text-neutral-600 font-mono shrink-0">
                         deps: {task.unresolvable_deps.map(d => d.slice(0, 8)).join(', ')}
                       </span>
