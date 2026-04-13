@@ -32,6 +32,7 @@ export interface Direction {
   priority: 'high' | 'medium' | 'low';
   added_at: string;
   status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  category?: 'product' | 'structural' | 'mixed' | null;
   paths?: string[];
   last_researched_at?: string | null;
   proposed_by?: string;
@@ -96,6 +97,9 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
 
   // Force-research confirmation popover
   const [forceConfirmId, setForceConfirmId] = useState<string | null>(null);
+
+  // Category filter
+  const [categoryFilter, setCategoryFilter] = useState<'all' | 'product' | 'structural' | 'mixed'>('all');
 
   // Form state for add/edit
   const form = useDirectionForm();
@@ -162,9 +166,11 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     setError(null);
     try {
       const h = await authHeaders();
+      const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
+      if (form.newCategory) body.category = form.newCategory;
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST', headers: h,
-        body: JSON.stringify({ text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error('Failed to add direction');
       form.resetAddForm();
@@ -180,7 +186,7 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
       const h = await authHeaders();
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH', headers: h,
-        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);
@@ -393,13 +399,17 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
     setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
   }
 
+  const categoryFilterFn = (d: Direction) =>
+    categoryFilter === 'all' || d.category === categoryFilter;
+
   const grouped = STATUS_GROUPS.map(({ key, label }) => ({
     key,
     label,
     items: key === 'active'
-      ? directions.filter(d => d.status === key)
+      ? directions.filter(d => d.status === key).filter(categoryFilterFn)
       : directions
           .filter(d => d.status === key)
+          .filter(categoryFilterFn)
           .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]),
   }));
 
@@ -536,6 +546,16 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                 <option value="high">High</option>
                 <option value="medium">Medium</option>
                 <option value="low">Low</option>
+              </select>
+              <select
+                value={form.newCategory ?? ''}
+                onChange={e => form.setNewCategory((e.target.value || null) as 'product' | 'structural' | 'mixed' | null)}
+                className="bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              >
+                <option value="">Type…</option>
+                <option value="product">Product</option>
+                <option value="structural">Structural</option>
+                <option value="mixed">Mixed</option>
               </select>
               <button
                 onClick={addDirection}
@@ -684,6 +704,28 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
             );
           })()}
 
+          {/* Category filter */}
+          {!loading && directions.length > 0 && (
+            <div className="flex items-center gap-1 mb-3">
+              {(['all', 'product', 'structural', 'mixed'] as const).map(cat => (
+                <button
+                  key={cat}
+                  onClick={() => setCategoryFilter(cat)}
+                  className={`text-[10px] px-2 py-0.5 rounded border font-medium transition-colors capitalize ${
+                    categoryFilter === cat
+                      ? cat === 'product' ? 'bg-emerald-950/60 border-emerald-900/50 text-emerald-400'
+                        : cat === 'structural' ? 'bg-blue-950/60 border-blue-900/50 text-blue-400'
+                        : cat === 'mixed' ? 'bg-purple-950/60 border-purple-900/50 text-purple-400'
+                        : 'bg-neutral-700/60 border-neutral-600/50 text-neutral-300'
+                      : 'bg-neutral-900/40 border-neutral-700/40 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  {cat}
+                </button>
+              ))}
+            </div>
+          )}
+
           {loading ? (
             <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
           ) : !selectedProjectId ? (
@@ -721,12 +763,14 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                             editText={form.editText}
                             editPriority={form.editPriority}
                             editStatus={form.editStatus}
+                            editCategory={form.editCategory}
                             editPathTags={form.editPathTags}
                             editPathInput={form.editPathInput}
                             setEditingId={form.setEditingId}
                             setEditText={form.setEditText}
                             setEditPriority={form.setEditPriority}
                             setEditStatus={form.setEditStatus}
+                            setEditCategory={form.setEditCategory}
                             setEditPathTags={form.setEditPathTags}
                             setEditPathInput={form.setEditPathInput}
                             startEdit={form.startEdit}

@@ -39,12 +39,16 @@ def _compute_direction_merge_rate(d: dict) -> float:
     return total_merged / total_cycles
 
 
+VALID_CATEGORIES = {"product", "structural", "mixed"}
+
+
 class DirectionPayload(BaseModel):
     text: str = Field(..., min_length=1, max_length=DIRECTION_TEXT_MAX)
     priority: str = Field(default="medium", pattern=r"^(high|medium|low)$")
     paths: Optional[List[str]] = None
     completion_criteria: Optional[str] = Field(default=None, max_length=COMPLETION_CRITERIA_MAX)
     conflicts_with: Optional[List[str]] = Field(default=None, description="Direction IDs that shouldn't run in parallel with this one")
+    category: Optional[str] = Field(default=None, description="Direction category: 'product', 'structural', or 'mixed'")
 
 
 @router.get("/projects/{project_id}/directions")
@@ -70,6 +74,9 @@ async def add_direction(
 ):
     project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
+    if payload.category is not None and payload.category not in VALID_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"category must be one of: {sorted(VALID_CATEGORIES)}")
+
     from app.shared_state import runtime_config as _runtime_config
     max_active = _runtime_config.get("max_active_directions", 5)
     active_count = sum(1 for d in (project.directions or []) if d.get("status") == "active")
@@ -87,6 +94,8 @@ async def add_direction(
         "added_at": _utcnow().isoformat(),
         "status": "active",
     }
+    if payload.category:
+        direction["category"] = payload.category
     if payload.completion_criteria:
         direction["completion_criteria"] = payload.completion_criteria
     else:
@@ -137,6 +146,8 @@ async def replace_directions(
                 raise HTTPException(status_code=400, detail="completion_criteria must be a string or null")
             if cc is not None and len(cc) > COMPLETION_CRITERIA_MAX:
                 raise HTTPException(status_code=400, detail=f"completion_criteria must not exceed {COMPLETION_CRITERIA_MAX} characters")
+        if "category" in entry and entry["category"] is not None and entry["category"] not in VALID_CATEGORIES:
+            raise HTTPException(status_code=400, detail=f"category must be one of: {sorted(VALID_CATEGORIES)}")
         if "status" not in entry:
             entry["status"] = "active"
         normalized.append(entry)
@@ -267,6 +278,8 @@ async def update_direction(
         invalid = [cid for cid in payload["conflicts_with"] if cid not in existing_ids]
         if invalid:
             raise HTTPException(status_code=400, detail=f"Unknown direction IDs in conflicts_with: {invalid}")
+    if "category" in payload and payload["category"] is not None and payload["category"] not in VALID_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"category must be one of: {sorted(VALID_CATEGORIES)}")
 
     # Direction cap check: if reactivating, ensure we won't exceed the cap
     if payload.get("status") == "active":
@@ -327,6 +340,11 @@ async def update_direction(
                     d.pop("conflicts_with", None)
                 elif isinstance(payload["conflicts_with"], list):
                     d["conflicts_with"] = payload["conflicts_with"]
+            if "category" in payload:
+                if payload["category"] is None:
+                    d.pop("category", None)
+                elif payload["category"] in VALID_CATEGORIES:
+                    d["category"] = payload["category"]
             updated = True
             break
 

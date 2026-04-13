@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import type React from 'react';
 import { Check, ChevronDown, ChevronRight, ChevronUp, Pencil, Trash2, X, Zap } from 'lucide-react';
 import type { Direction } from './DirectionsPanel';
+import type { DirectionCategory } from '../hooks/useDirectionForm';
 import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
 
@@ -14,12 +15,14 @@ export interface DirectionCardProps {
   editText: string;
   editPriority: 'high' | 'medium' | 'low';
   editStatus: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
+  editCategory: DirectionCategory;
   editPathTags: string[];
   editPathInput: string;
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
   setEditPriority: React.Dispatch<React.SetStateAction<'high' | 'medium' | 'low'>>;
   setEditStatus: React.Dispatch<React.SetStateAction<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>>;
+  setEditCategory: React.Dispatch<React.SetStateAction<DirectionCategory>>;
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
   startEdit: (d: Direction) => void;
@@ -53,8 +56,8 @@ export function DirectionCard({
   direction: d,
   statusKey: key,
   activeItems,
-  editingId, editText, editPriority, editStatus, editPathTags, editPathInput,
-  setEditingId, setEditText, setEditPriority, setEditStatus, setEditPathTags, setEditPathInput,
+  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput,
+  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
@@ -218,6 +221,16 @@ export function DirectionCard({
               <option value="completed">Completed</option>
               <option value="paused">Paused</option>
             </select>
+            <select
+              value={editCategory ?? ''}
+              onChange={e => setEditCategory((e.target.value || null) as DirectionCategory)}
+              className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            >
+              <option value="">Type…</option>
+              <option value="product">Product</option>
+              <option value="structural">Structural</option>
+              <option value="mixed">Mixed</option>
+            </select>
             <div className="flex-1" />
             <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
               <Check className="w-3.5 h-3.5" />
@@ -362,6 +375,21 @@ export function DirectionCard({
             ) : (
               <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${statusColors[d.status]}`}>
                 {d.status}
+              </span>
+            )}
+            {d.category === 'product' && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 border-emerald-900/50 text-emerald-400">
+                Product
+              </span>
+            )}
+            {d.category === 'structural' && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
+                Structural
+              </span>
+            )}
+            {d.category === 'mixed' && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-purple-950/40 border-purple-900/50 text-purple-400">
+                Mixed
               </span>
             )}
             {/* Reactivate button for auto-paused directions */}

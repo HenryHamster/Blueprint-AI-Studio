@@ -584,6 +584,22 @@ async def get_digest(
                 recent_finding_titles = last_entry.get("finding_titles", []) if last_entry else []
                 latest_research_at = last_entry.get("timestamp") if last_entry else None
 
+                # Compute product_ratio and type_distribution from window entries
+                window_product_ratios = []
+                agg_type_distribution: Dict[str, int] = {}
+                for entry in d.get("research_history") or []:
+                    try:
+                        entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                        if entry_ts >= window_start:
+                            pr = entry.get("product_ratio")
+                            if pr is not None:
+                                window_product_ratios.append(float(pr))
+                            for ttype, cnt in (entry.get("type_distribution") or {}).items():
+                                agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
+                    except (ValueError, TypeError):
+                        pass
+                dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
+
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 direction_progress_list.append({
                     "direction_id": did,
@@ -596,6 +612,8 @@ async def get_digest(
                     "latest_insights": latest_insights,
                     "recent_finding_titles": recent_finding_titles,
                     "latest_research_at": latest_research_at,
+                    "product_ratio": dir_product_ratio,
+                    "type_distribution": agg_type_distribution or None,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -908,6 +926,14 @@ async def get_digest(
         else:
             narrative_summary = f"All quiet — no activity in the last {hours}h."
 
+    # Compute overall product_ratio and type_distribution across all directions
+    all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
+    overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
+    overall_type_distribution: Dict[str, int] = {}
+    for d in direction_progress_list:
+        for ttype, cnt in (d.get("type_distribution") or {}).items():
+            overall_type_distribution[ttype] = overall_type_distribution.get(ttype, 0) + cnt
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -926,6 +952,8 @@ async def get_digest(
         "failure_groups": failure_groups,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
+        "overall_product_ratio": overall_product_ratio,
+        "overall_type_distribution": overall_type_distribution or None,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,

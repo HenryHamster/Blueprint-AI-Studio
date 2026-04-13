@@ -1,10 +1,13 @@
 import { useState } from 'react';
 import type { Direction } from '../components/DirectionsPanel';
 
+export type DirectionCategory = 'product' | 'structural' | 'mixed' | null;
+
 export function useDirectionForm() {
   // Add form state
   const [newText, setNewText] = useState('');
   const [newPriority, setNewPriority] = useState<'high' | 'medium' | 'low'>('medium');
+  const [newCategory, setNewCategory] = useState<DirectionCategory>(null);
   const [newPathTags, setNewPathTags] = useState<string[]>([]);
   const [newPathInput, setNewPathInput] = useState('');
 
@@ -13,6 +16,7 @@ export function useDirectionForm() {
   const [editText, setEditText] = useState('');
   const [editPriority, setEditPriority] = useState<'high' | 'medium' | 'low'>('medium');
   const [editStatus, setEditStatus] = useState<'active' | 'completed' | 'paused' | 'proposed' | 'expired'>('active');
+  const [editCategory, setEditCategory] = useState<DirectionCategory>(null);
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');
 
@@ -21,6 +25,7 @@ export function useDirectionForm() {
     setEditText(d.text);
     setEditPriority(d.priority);
     setEditStatus(d.status);
+    setEditCategory(d.category ?? null);
     setEditPathTags(d.paths ?? []);
     setEditPathInput('');
   }
@@ -28,6 +33,7 @@ export function useDirectionForm() {
   function resetAddForm() {
     setNewText('');
     setNewPriority('medium');
+    setNewCategory(null);
     setNewPathTags([]);
     setNewPathInput('');
   }
@@ -35,12 +41,14 @@ export function useDirectionForm() {
   return {
     newText, setNewText,
     newPriority, setNewPriority,
+    newCategory, setNewCategory,
     newPathTags, setNewPathTags,
     newPathInput, setNewPathInput,
     editingId, setEditingId,
     editText, setEditText,
     editPriority, setEditPriority,
     editStatus, setEditStatus,
+    editCategory, setEditCategory,
     editPathTags, setEditPathTags,
     editPathInput, setEditPathInput,
     startEdit,

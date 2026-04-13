@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, ChevronRight, PlusCircle } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
 
@@ -55,6 +55,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
   // Resolve inputs per message
   const [resolveInputs, setResolveInputs] = useState<Record<string, string>>({});
   const [resolvingIds, setResolvingIds] = useState<Set<string>>(new Set());
+  const [creatingDirectionIds, setCreatingDirectionIds] = useState<Set<string>>(new Set());
 
   // Stable ref for addToast to avoid re-creating fetchMessages on every render
   const addToastRef = useRef(addToast);
@@ -120,6 +121,35 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
       addToast('Failed to resolve message', 'error');
     } finally {
       setResolvingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
+    }
+  }
+
+  async function handleCreateDirection(msg: ProjectMessage) {
+    if (!selectedProjectId) return;
+    setCreatingDirectionIds(prev => new Set(prev).add(msg.id));
+    try {
+      const text = msg.content.slice(0, 2000);
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/directions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, priority: 'medium' }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const directionId: string = data.direction?.id ?? '';
+      // Auto-resolve the message
+      const resolveRes = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolution: `Direction created: ${directionId}` }),
+      });
+      if (!resolveRes.ok) throw new Error(`HTTP ${resolveRes.status}`);
+      addToast('Direction created', 'success');
+      await fetchMessages();
+    } catch {
+      addToast('Failed to create direction', 'error');
+    } finally {
+      setCreatingDirectionIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
   }
 
@@ -224,6 +254,17 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
                       placeholder={msg.message_type === 'QUESTION' ? 'Your answer...' : 'Resolution note (optional)...'}
                       className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-300 rounded-lg px-2.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
                     />
+                    {msg.message_type === 'FEEDBACK' && (
+                      <button
+                        onClick={() => handleCreateDirection(msg)}
+                        disabled={creatingDirectionIds.has(msg.id)}
+                        title="Create Direction from Feedback"
+                        className="bg-purple-700 hover:bg-purple-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 flex items-center gap-1"
+                      >
+                        <PlusCircle className="w-3 h-3" />
+                        Create Direction
+                      </button>
+                    )}
                     <button
                       onClick={() => handleResolve(msg.id)}
                       disabled={resolvingIds.has(msg.id)}

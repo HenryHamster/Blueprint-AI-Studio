@@ -352,6 +352,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     new_dir["source"] = str(op_entry["source"])[:64]
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
+                raw_category = op_entry.get("category")
+                if raw_category in ("product", "structural", "mixed"):
+                    new_dir["category"] = raw_category
                 if op_entry.get("system_id"):
                     sid = str(op_entry["system_id"])
                     if len(sid) > STRATEGIC_SYSTEM_ID_MAX:
@@ -396,6 +399,11 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                                 logger.warning(f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}")
                             else:
                                 d["status"] = changes["status"]
+                        if "category" in changes:
+                            if changes["category"] in ("product", "structural", "mixed"):
+                                d["category"] = changes["category"]
+                            elif changes["category"] is None:
+                                d.pop("category", None)
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])
