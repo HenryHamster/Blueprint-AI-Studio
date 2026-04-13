@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage } from './TaskCard';
 import type { Task } from './TaskCard';
-import { formatAbsolute } from '../utils/time';
+import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 
 interface TaskDetailDrawerProps {
   task: Task;
@@ -108,6 +108,7 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
+  const [rawContextExpanded, setRawContextExpanded] = useState(false);
   const prArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url));
   const commitArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT');
   const investigationArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT');
@@ -351,14 +352,91 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
         );
       })() : null}
 
-      {task.context && Object.keys(task.context).length > 0 && (
-        <>
-          <SectionHeader>Context</SectionHeader>
-          <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
-            {JSON.stringify(task.context, null, 2)}
-          </pre>
-        </>
-      )}
+      {task.context && Object.keys(task.context).length > 0 && (() => {
+        const ctx = task.context as Record<string, unknown>;
+        const diagFields = ['retry_after', 'provision_zone', 'provision_failures', 'last_serial_log', 'blacklisted_accounts', 'max_plan_account_id', '_first_attempt_succeeded'];
+        const hasDiag = diagFields.some(f => f in ctx);
+
+        function formatRetryAfter(val: unknown): string {
+          if (typeof val !== 'string') return String(val);
+          const d = parseTimestamp(val);
+          const ms = d.getTime() - Date.now();
+          if (ms > 0) {
+            const sec = Math.round(ms / 1000);
+            if (sec < 60) return `in ${sec}s`;
+            const min = Math.round(sec / 60);
+            return `in ${min}m`;
+          }
+          return timeAgo(val);
+        }
+
+        return (
+          <>
+            <SectionHeader>Context</SectionHeader>
+            {hasDiag && (
+              <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 p-3 space-y-2 mb-2">
+                <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-1">Diagnostics</p>
+                {'retry_after' in ctx && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">Retry after</span>
+                    <span className="text-neutral-200">{formatRetryAfter(ctx.retry_after)}</span>
+                  </div>
+                )}
+                {'provision_zone' in ctx && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">Provision zone</span>
+                    <span className="text-neutral-200 font-mono">{String(ctx.provision_zone)}</span>
+                  </div>
+                )}
+                {'provision_failures' in ctx && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">Provision attempts</span>
+                    <span className="text-neutral-200">{String(ctx.provision_failures)}</span>
+                  </div>
+                )}
+                {'max_plan_account_id' in ctx && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">Account</span>
+                    <span className="text-neutral-200 font-mono break-all">{String(ctx.max_plan_account_id)}</span>
+                  </div>
+                )}
+                {'blacklisted_accounts' in ctx && Array.isArray(ctx.blacklisted_accounts) && ctx.blacklisted_accounts.length > 0 && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">Blacklisted accts</span>
+                    <span className="text-neutral-200 font-mono break-all">{(ctx.blacklisted_accounts as unknown[]).join(', ')}</span>
+                  </div>
+                )}
+                {'_first_attempt_succeeded' in ctx && (
+                  <div className="flex gap-2 text-xs">
+                    <span className="text-neutral-500 w-36 shrink-0">First attempt</span>
+                    <span className={ctx._first_attempt_succeeded ? 'text-green-400' : 'text-red-400'}>{ctx._first_attempt_succeeded ? 'succeeded' : 'failed'}</span>
+                  </div>
+                )}
+                {'last_serial_log' in ctx && typeof ctx.last_serial_log === 'string' && ctx.last_serial_log.trim() && (
+                  <div className="text-xs">
+                    <p className="text-neutral-500 mb-1">Serial log</p>
+                    <pre className="text-neutral-300 whitespace-pre-wrap break-words bg-neutral-950/60 rounded p-2 max-h-32 overflow-y-auto custom-scrollbar font-mono text-xs border border-neutral-800">{ctx.last_serial_log}</pre>
+                  </div>
+                )}
+              </div>
+            )}
+            <div>
+              <button
+                className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-300 mb-1"
+                onClick={() => setRawContextExpanded(v => !v)}
+              >
+                {rawContextExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                Raw Context
+              </button>
+              {rawContextExpanded && (
+                <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono">
+                  {JSON.stringify(task.context, null, 2)}
+                </pre>
+              )}
+            </div>
+          </>
+        );
+      })()}
 
       {task.error_logs && (
         <>
