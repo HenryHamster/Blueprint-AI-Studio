@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw } from 'lucide-react';
 import { apiFetch } from '../api';
+import { timeAgo } from '../utils/time';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
 import type { TaskType } from './TaskCard';
 
@@ -142,29 +143,31 @@ function formatSnoozeRemaining(until: number): string {
   return `snoozed for ${mins}m more`;
 }
 
-function windowToHours(window: TimeWindow, lastVisitTimestamp: number | null): number {
+const CATCH_UP_VIEWED_KEY = 'blueprint-admin:lastCatchUpViewed';
+
+function getLastCatchUpViewed(): number | null {
+  try {
+    const stored = localStorage.getItem(CATCH_UP_VIEWED_KEY);
+    const ts = stored ? parseInt(stored, 10) : null;
+    return ts && !isNaN(ts) ? ts : null;
+  } catch { return null; }
+}
+
+function markCatchUpViewed() {
+  try { localStorage.setItem(CATCH_UP_VIEWED_KEY, String(Date.now())); } catch { /* */ }
+}
+
+function windowToHours(window: TimeWindow, lastViewed: number | null): number {
   switch (window) {
     case 'last_visit': {
-      if (!lastVisitTimestamp) return 24;
-      const elapsed = (Date.now() - lastVisitTimestamp) / (1000 * 60 * 60);
+      if (!lastViewed) return 24;
+      const elapsed = (Date.now() - lastViewed) / (1000 * 60 * 60);
       return Math.max(1, Math.min(168, Math.ceil(elapsed)));
     }
     case '6h': return 6;
     case '24h': return 24;
     case '7d': return 168;
   }
-}
-
-function formatRelativeTime(isoString: string | null): string {
-  if (!isoString) return '';
-  const date = new Date(isoString);
-  const diffMs = Date.now() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  const diffHrs = Math.floor(diffMins / 60);
-  if (diffHrs < 24) return `${diffHrs}h ago`;
-  return `${Math.floor(diffHrs / 24)}d ago`;
 }
 
 function WaitingBadge({ hours }: { hours: number | undefined }) {
@@ -206,7 +209,7 @@ function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask:
           </a>
         )}
         {c.completed_at && (
-          <span className="text-[10px] text-neutral-600 font-mono">{formatRelativeTime(c.completed_at)}</span>
+          <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(c.completed_at)}</span>
         )}
       </div>
     </div>
@@ -290,7 +293,7 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                   </div>
                 )}
                 {dp.latest_research_at && (
-                  <span className="text-[9px] text-neutral-600">Last researched: {formatRelativeTime(dp.latest_research_at)}</span>
+                  <span className="text-[9px] text-neutral-600">Last researched: {timeAgo(dp.latest_research_at)}</span>
                 )}
               </div>
             )}
@@ -301,7 +304,10 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
   );
 }
 
-export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
+  // Track when the user last viewed the catch-up panel (not page load).
+  // Read once on mount; updated when the user collapses the panel after reading.
+  const [lastCatchUpViewed] = useState(() => getLastCatchUpViewed() ?? _lastVisitTimestamp);
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -347,7 +353,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     if (!silent) setLoading(true);
     else setUpdatingDigest(true);
     try {
-      const hours = windowToHours(activeWindow, lastVisitTimestamp);
+      const hours = windowToHours(activeWindow, lastCatchUpViewed);
       const params = new URLSearchParams({ hours: String(hours) });
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`/api/admin/digest?${params}`);
@@ -366,7 +372,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
       if (!silent) setLoading(false);
       else setUpdatingDigest(false);
     }
-  }, [activeWindow, lastVisitTimestamp, selectedProjectId]);
+  }, [activeWindow, lastCatchUpViewed, selectedProjectId]);
 
   // Load cached digest when project changes
   useEffect(() => {
@@ -510,6 +516,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
 
   const toggle = () => {
     const next = !collapsed;
+    if (next) {
+      // Collapsing → user has read the digest, record the timestamp
+      markCatchUpViewed();
+    }
     setCollapsed(next);
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));
   };
@@ -539,7 +549,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
     .filter(g => g.tasks.length > 0);
 
   const windowLabels: { key: TimeWindow; label: string }[] = [
-    { key: 'last_visit', label: lastVisitTimestamp ? 'Since last visit' : 'Since last visit (24h)' },
+    { key: 'last_visit', label: lastCatchUpViewed ? 'Since last visit' : 'Since last visit (24h)' },
     { key: '6h', label: 'Last 6h' },
     { key: '24h', label: 'Last 24h' },
     { key: '7d', label: 'Last 7d' },
@@ -685,10 +695,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </span>
                 )}
                 {digest!.completed_count > 0 && (
-                  <span
-                    className="flex items-center gap-1 cursor-pointer hover:text-emerald-300 transition-colors"
-                    onClick={() => onOpenActivityFeed?.('TASK_COMPLETED')}
-                  >
+                  <span className="flex items-center gap-1">
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
                     {digest!.completed_count} completed
                     {digest!.completed_delta != null && digest!.completed_delta !== 0 && (
@@ -699,10 +706,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </span>
                 )}
                 {digest!.failed_count > 0 && (
-                  <span
-                    className="flex items-center gap-1 cursor-pointer hover:text-red-300 transition-colors"
-                    onClick={() => onOpenActivityFeed?.('TASK_FAILED')}
-                  >
+                  <span className="flex items-center gap-1">
                     <XCircle className="w-3 h-3 text-red-500" />
                     {digest!.failed_count} failed
                     {digest!.failed_delta != null && digest!.failed_delta !== 0 && (
@@ -937,7 +941,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                             {t.status}
                           </span>
                           {t.started_at && (
-                            <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{formatRelativeTime(t.started_at)}</span>
+                            <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{timeAgo(t.started_at)}</span>
                           )}
                         </div>
                       ))}
@@ -1104,14 +1108,6 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp, refreshInt
                   </div>
                 );
               })()}
-              {onOpenActivityFeed && (
-                <button
-                  onClick={() => onOpenActivityFeed?.()}
-                  className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors mt-1 self-end"
-                >
-                  View full activity ↗
-                </button>
-              )}
             </div>
           )}
         </div>

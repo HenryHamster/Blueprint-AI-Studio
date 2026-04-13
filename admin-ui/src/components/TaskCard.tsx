@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { Square, CheckCircle, AlertTriangle, Clock, SplitSquareHorizontal, Server, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers } from 'lucide-react';
+import { formatDurationMs, parseTimestamp } from '../utils/time';
 
 export type { ResearchFinding } from '../types/task';
 import type { ResearchFinding } from '../types/task';
@@ -52,9 +53,10 @@ export type { Task, TaskStatus, TaskType } from '../types/task';
 import type { Task, TaskStatus, TaskType } from '../types/task';
 
 export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: typeof Search; label: string }> = {
+  create: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Terminal, label: 'Create' },
   plan: { bg: 'bg-purple-500/10 border-purple-500/20', text: 'text-purple-400', icon: GitFork, label: 'Plan' },
   research: { bg: 'bg-cyan-500/10 border-cyan-500/20', text: 'text-cyan-400', icon: Microscope, label: 'Research' },
-  review: { bg: 'bg-amber-500/10 border-amber-500/20', text: 'text-amber-400', icon: Search, label: 'Review' },
+  review: { bg: 'bg-sky-500/10 border-sky-500/20', text: 'text-sky-400', icon: Search, label: 'Review' },
   fix: { bg: 'bg-orange-500/10 border-orange-500/20', text: 'text-orange-400', icon: RotateCcw, label: 'Fix' },
   refactor: { bg: 'bg-teal-500/10 border-teal-500/20', text: 'text-teal-400', icon: Wrench, label: 'Refactor' },
   docs: { bg: 'bg-indigo-500/10 border-indigo-500/20', text: 'text-indigo-400', icon: BookOpen, label: 'Docs' },
@@ -62,6 +64,10 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   qa: { bg: 'bg-green-500/10 border-green-500/20', text: 'text-green-400', icon: TestTube, label: 'QA' },
   deps: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Package, label: 'Deps' },
   migrate: { bg: 'bg-teal-500/10 border-teal-500/20', text: 'text-teal-400', icon: ArrowUpDown, label: 'Migrate' },
+  investigate: { bg: 'bg-yellow-500/10 border-yellow-500/20', text: 'text-yellow-400', icon: Search, label: 'Investigate' },
+  debug: { bg: 'bg-rose-500/10 border-rose-500/20', text: 'text-rose-400', icon: AlertTriangle, label: 'Debug' },
+  smoketest: { bg: 'bg-lime-500/10 border-lime-500/20', text: 'text-lime-400', icon: Activity, label: 'Smoketest' },
+  rollup: { bg: 'bg-violet-500/10 border-violet-500/20', text: 'text-violet-400', icon: Layers, label: 'Rollup' },
 };
 
 interface TaskCardProps {
@@ -86,15 +92,6 @@ interface TaskCardProps {
   isTracked?: boolean;
 }
 
-function formatDuration(ms: number): string {
-  const totalMinutes = Math.floor(ms / 60000);
-  if (totalMinutes < 1) return '<1m';
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  if (hours === 0) return `${minutes}m`;
-  return `${hours}h ${minutes}m`;
-}
-
 export function useElapsedTime(startIso: string, endIso?: string): string {
   const [now, setNow] = useState(() => Date.now());
   const intervalRef = useRef<ReturnType<typeof setInterval>>(undefined);
@@ -106,27 +103,33 @@ export function useElapsedTime(startIso: string, endIso?: string): string {
     return () => clearInterval(intervalRef.current);
   }, [isLive]);
 
-  const start = new Date(startIso).getTime();
-  const end = endIso ? new Date(endIso).getTime() : now;
-  return formatDuration(Math.max(0, end - start));
+  const start = parseTimestamp(startIso).getTime();
+  const end = endIso ? parseTimestamp(endIso).getTime() : now;
+  return formatDurationMs(Math.max(0, end - start));
 }
 
 export function getHeartbeatStatus(lastHeartbeat?: string) {
   if (!lastHeartbeat) return { color: 'bg-neutral-600', text: 'No heartbeat' };
 
-  const diffMinutes = (new Date().getTime() - new Date(lastHeartbeat).getTime()) / 60000;
+  const diffMinutes = (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000;
   if (diffMinutes < 2) return { color: 'bg-emerald-500', text: 'Healthy (< 2m)' };
   if (diffMinutes < 5) return { color: 'bg-amber-500', text: 'Delayed (2-5m)' };
   return { color: 'bg-red-500', text: 'Stale (> 5m)' };
 }
 
-export function TaskTypeBadge({ taskType }: { taskType?: TaskType }) {
+export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; expanded?: boolean }) {
   if (!taskType) return null;
   const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
   const Icon = style.icon;
   return (
-    <span className={`${style.bg} ${style.text} border text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1`}>
-      <Icon className="w-3 h-3" />{style.label}
+    <span
+      className={`group/badge ${style.bg} ${style.text} border text-[10px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-0 hover:gap-1 p-1 hover:px-2 hover:py-0.5 transition-all duration-150 ${expanded ? 'gap-1 px-2 py-0.5' : ''}`}
+      title={style.label}
+    >
+      <Icon className="w-3 h-3 shrink-0" />
+      <span className={`max-w-0 overflow-hidden group-hover/badge:max-w-[80px] transition-all duration-150 ${expanded ? 'max-w-[80px]' : ''}`}>
+        {style.label}
+      </span>
     </span>
   );
 }
@@ -162,28 +165,25 @@ function ResearchFindings({ findings }: { findings: ResearchFinding[] }) {
 }
 
 export function StatusBadge({ status }: { status: TaskStatus }) {
-  if (status === 'PROVISIONING') {
-    return (
-      <span className="inline-flex items-center gap-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
-        <Activity className="w-3 h-3 animate-spin" />Provisioning…
+  const configs: Partial<Record<TaskStatus, { bg: string; text: string; icon: typeof Activity; label: string; spin?: boolean }>> = {
+    PROVISIONING: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Activity, label: 'Provisioning…', spin: true },
+    EVALUATING: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Clock, label: 'Evaluating' },
+    CANCELLED: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-500', icon: X, label: 'Cancelled' },
+  };
+  const cfg = configs[status];
+  if (!cfg) return null;
+  const Icon = cfg.icon;
+  return (
+    <span
+      className={`group/status inline-flex items-center gap-0 hover:gap-1 ${cfg.bg} ${cfg.text} border text-[10px] uppercase tracking-wider p-1 hover:px-2 hover:py-0.5 rounded font-semibold whitespace-nowrap transition-all duration-150`}
+      title={cfg.label}
+    >
+      <Icon className={`w-3 h-3 shrink-0 ${cfg.spin ? 'animate-spin' : ''}`} />
+      <span className="max-w-0 overflow-hidden group-hover/status:max-w-[120px] transition-all duration-150">
+        {cfg.label}
       </span>
-    );
-  }
-  if (status === 'EVALUATING') {
-    return (
-      <span className="inline-flex items-center gap-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
-        <Clock className="w-3 h-3" />Evaluating subtasks
-      </span>
-    );
-  }
-  if (status === 'CANCELLED') {
-    return (
-      <span className="inline-flex items-center gap-1 bg-neutral-500/10 text-neutral-500 border border-neutral-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap">
-        <X className="w-3 h-3" />Cancelled
-      </span>
-    );
-  }
-  return null;
+    </span>
+  );
 }
 
 function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
@@ -201,12 +201,12 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, maxRetries, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
   const [statusExpanded, setStatusExpanded] = useState(false);
-  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [findingsExpanded, setFindingsExpanded] = useState(false);
   const [confirmAction, setConfirmAction] = useState<'cancel' | 'dismiss' | 'archive' | null>(null);
   const [confirmCountdown, setConfirmCountdown] = useState(3);
   const [showChangesForm, setShowChangesForm] = useState(false);
@@ -308,16 +308,20 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
   const taskTypeBorderColor: Record<string, string> = {
     create: 'border-l-amber-500',
-    plan: 'border-l-blue-400',
+    plan: 'border-l-purple-400',
     research: 'border-l-cyan-400',
-    review: 'border-l-purple-400',
-    fix: 'border-l-green-400',
-    refactor: 'border-l-orange-400',
-    docs: 'border-l-gray-400',
+    review: 'border-l-sky-400',
+    fix: 'border-l-orange-400',
+    refactor: 'border-l-teal-400',
+    docs: 'border-l-indigo-400',
     security_audit: 'border-l-red-400',
-    qa: 'border-l-teal-400',
-    deps: 'border-l-yellow-400',
-    migrate: 'border-l-pink-400',
+    qa: 'border-l-green-400',
+    deps: 'border-l-blue-400',
+    migrate: 'border-l-teal-400',
+    investigate: 'border-l-yellow-400',
+    debug: 'border-l-rose-400',
+    smoketest: 'border-l-lime-400',
+    rollup: 'border-l-violet-400',
   };
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
@@ -327,15 +331,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       tabIndex={0}
       role="article"
       onKeyDown={handleRootKeyDown}
-      className={`relative group bg-neutral-900 rounded-xl border border-l-4 ${borderColor} transition-shadow outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 ${compact ? 'p-2.5' : 'p-4'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-neutral-800 shadow-sm hover:shadow-md hover:border-neutral-700'}`}
+      className={`relative group bg-neutral-900 rounded-lg border border-l-4 ${borderColor} transition-shadow outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 ${compact ? 'p-2' : 'px-3 py-2.5'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-y-neutral-800 border-r-neutral-800 shadow-sm hover:shadow-md hover:border-y-neutral-700 hover:border-r-neutral-700'}`}
     >
-      <div className="flex justify-between items-start mb-3">
-        <div className="flex items-center gap-2 pr-2 overflow-hidden">
-          {isChild && <span title="Child Task" className="shrink-0 flex items-center"><SplitSquareHorizontal className="w-4 h-4 text-neutral-500" /></span>}
-          <h3 className={`font-medium text-sm truncate ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`} title={task.title}>{task.title}</h3>
+      <div className="flex items-start gap-2 mb-1.5">
+        <div className="flex-1 min-w-0">
+          <h3 className={`font-medium text-sm ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`}>{task.title}</h3>
         </div>
-        <div className="flex items-center gap-1.5 shrink-0">
-          {/* Hover quick-action toolbar — inline in header to avoid overlapping the badge cluster */}
+        <div className="flex items-center gap-1 shrink-0">
+          {/* Hover quick-action toolbar */}
           <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
             {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') && (
               <button
@@ -382,44 +385,33 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {isActive && task.last_heartbeat && (
             <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${heartbeat.color}`} title={heartbeat.text} />
           )}
-          <TaskTypeBadge taskType={task.task_type} />
-          {task.requires_approval && (
-            <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
-              <Shield className="w-3 h-3" />Approval
-            </span>
-          )}
-          {(task.attempt_count ?? 0) > 0 && (
-            <span className="bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded font-mono">
-              #{(task.attempt_count ?? 0) + 1}
-            </span>
-          )}
         </div>
       </div>
-
-      <div className="flex flex-col gap-1 mb-3 text-[10px] text-neutral-500 font-mono">
-        <div className="flex items-center gap-1.5" title="Task ID">
-          <Hash className="w-3 h-3" />
-          <span className="truncate">{task.id}</span>
-        </div>
-        {task.vm_instance_id ? (
-          <div className="flex items-center gap-1.5" title="VM Instance ID">
-            <Server className="w-3 h-3" />
-            <span className="truncate">{task.vm_instance_id}</span>
-          </div>
-        ) : null}
+      <div className="flex items-center gap-1.5 flex-wrap mb-1.5">
+        <TaskTypeBadge taskType={task.task_type} />
+        {task.requires_approval && (
+          <span className="bg-amber-500/10 text-amber-500 border border-amber-500/20 text-[10px] uppercase tracking-wider px-2 py-0.5 rounded font-semibold whitespace-nowrap flex items-center gap-1">
+            <Shield className="w-3 h-3" />Approval
+          </span>
+        )}
+        {(task.attempt_count ?? 0) > 0 && (
+          <span className="bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded font-mono">
+            #{(task.attempt_count ?? 0) + 1}
+          </span>
+        )}
       </div>
 
       {isActive && heartbeat.text.startsWith('Stale') && (
-        <div className="bg-amber-50 border border-amber-200 text-amber-700 rounded px-2 py-1 text-xs flex items-center gap-1.5 mb-3">
+        <div className="bg-amber-950/40 border border-amber-900/50 text-amber-400 rounded px-2 py-1 text-xs flex items-center gap-1.5 mb-2">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
           No heartbeat for 5+ minutes — task may be stuck
         </div>
       )}
 
       {!compact && (
-        <div className="mb-3">
-          <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-2'}`}>{task.description}</p>
-          {task.description.length > 120 && (
+        <div className="mb-2">
+          <p className={`text-xs text-neutral-400 ${descExpanded ? '' : 'line-clamp-1'}`}>{task.description}</p>
+          {task.description.length > 80 && (
             <button
               onClick={(e) => { e.stopPropagation(); setDescExpanded(!descExpanded); }}
               className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer flex items-center gap-0.5 mt-0.5"
@@ -431,7 +423,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       )}
 
       {!compact && task.latest_status_message ? (
-        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
+        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-2 border border-neutral-800/50 font-mono">
           <button
             onClick={() => setStatusExpanded(!statusExpanded)}
             className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
@@ -455,7 +447,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           href={task.pr_url}
           target="_blank"
           rel="noopener noreferrer"
-          className="flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-2 rounded-lg mb-3 hover:bg-emerald-500/20 transition-colors font-medium"
+          className="flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs px-3 py-1.5 rounded mb-2 hover:bg-emerald-500/20 transition-colors font-medium"
         >
           <ExternalLink className="w-3.5 h-3.5" />
           View Pull Request
@@ -465,7 +457,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           href={`${task.repo_url}/pull/${task.payloads[0].pr_number}`}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-[11px] mb-3 transition-colors"
+          className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-[11px] mb-2 transition-colors"
         >
           <ExternalLink className="w-3 h-3" />
           PR #{task.payloads[0].pr_number as number}
@@ -473,69 +465,42 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.status === 'FAILED' && task.error_logs ? (
-        <div className="bg-red-950/30 text-red-400 text-[11px] p-2.5 rounded-lg mb-3 border border-red-900/30 font-mono max-h-24 overflow-y-auto">
+        <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto">
           <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
           {task.error_logs.slice(0, 500)}
         </div>
       ) : null}
 
       {task.research_findings ? (
-        <div className="bg-cyan-950/20 text-cyan-300 text-[11px] p-2.5 rounded-lg mb-3 border border-cyan-900/30 font-mono max-h-32 overflow-y-auto">
-          <span className="font-semibold block mb-1 text-cyan-400 font-sans">Research Findings:</span>
-          <ResearchFindings findings={task.research_findings} />
+        <div className="bg-cyan-950/20 text-cyan-300 text-[11px] p-2 rounded mb-2 border border-cyan-900/30 font-mono">
+          <span
+            onClick={(e) => { e.stopPropagation(); setFindingsExpanded(!findingsExpanded); }}
+            className="flex items-center gap-1 text-cyan-400 font-sans cursor-pointer mb-1"
+          >
+            <ChevronRight className={`w-3 h-3 shrink-0 transition-transform ${findingsExpanded ? 'rotate-90' : ''}`} />
+            {task.research_findings.length} findings
+          </span>
+          {findingsExpanded && (
+            <div className="max-h-32 overflow-y-auto">
+              <ResearchFindings findings={task.research_findings} />
+            </div>
+          )}
         </div>
       ) : null}
 
       {task.plan_output ? <PlanPreview planOutput={task.plan_output} /> : null}
 
       {task.depends_on && task.depends_on.length > 0 ? (
-        <div className="text-[10px] text-neutral-500 mb-3 font-mono flex items-center gap-1">
+        <div className="text-[10px] text-neutral-500 mb-2 font-mono flex items-center gap-1">
           <GitFork className="w-3 h-3" />
           Waiting on {task.depends_on.length} task{task.depends_on.length > 1 ? 's' : ''}
         </div>
       ) : null}
 
-      {/* History Section */}
-      {((task.attempt_count ?? 0) > 0 || (task.history && task.history.length > 0)) && (
-        <div className="bg-neutral-950 text-neutral-400 text-[11px] rounded-lg mb-3 border border-neutral-800/50 font-mono">
-          <button
-            onClick={() => setHistoryExpanded(!historyExpanded)}
-            className="w-full flex items-center gap-1.5 p-2.5 text-left hover:text-neutral-300 transition-colors"
-          >
-            <ChevronRight className={`w-3 h-3 shrink-0 text-neutral-500 transition-transform ${historyExpanded ? 'rotate-90' : ''}`} />
-            <span className="font-semibold text-neutral-500 font-sans text-[11px]">History</span>
-            {(task.attempt_count ?? 0) > 0 && (
-              <span className="ml-auto text-[10px] text-neutral-500 font-sans">
-                Attempt {(task.attempt_count ?? 0) + 1}{maxRetries != null ? ` of ${maxRetries + 1}` : ''}
-              </span>
-            )}
-          </button>
-          {historyExpanded && (
-            <div className="px-2.5 pb-2.5 space-y-1.5">
-              {task.history && task.history.length > 0 ? (
-                task.history.map((entry, i) => (
-                  <div key={i} className="flex gap-2 text-[10px]">
-                    <span className="text-neutral-600 shrink-0 tabular-nums">
-                      {new Date(entry.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                    </span>
-                    <span className="text-neutral-400 font-semibold shrink-0">{entry.action}</span>
-                    <span className="text-neutral-500 truncate">
-                      {entry.details ? Object.entries(entry.details).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(', ').slice(0, 120) : ''}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <span className="text-neutral-600 text-[10px]">No history entries</span>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between text-[11px] text-neutral-500 mt-auto pt-3 border-t border-neutral-800">
+      <div className="flex items-center justify-between text-[10px] text-neutral-500 mt-auto pt-2 border-t border-neutral-800">
         <div className="flex items-center gap-1.5">
           <Clock className="w-3 h-3" />
-          {new Date(task.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          {parseTimestamp(task.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           <span className="text-neutral-400 font-mono">
             {task.status === 'QUEUED' ? 'Waiting' : duration}
           </span>
@@ -619,61 +584,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
       ) : null}
 
-      {!task.requires_approval && isActive ? (
-        compact ? (
-          <div className="mt-2" ref={overflowMenuRef}>
-            <button
-              onClick={() => setShowOverflowMenu(v => !v)}
-              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
-              title="More actions"
-            >
-              <MoreHorizontal className="w-3.5 h-3.5" />
-            </button>
-            {showOverflowMenu && (
-              <div className="mt-1 flex gap-1.5">
-                <button onClick={() => { handleDestructiveClick('cancel', () => { onCancel(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`flex-1 py-1 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-                  {actionLoading === 'cancel' ? <Activity className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />} {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Cancel'}
-                </button>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="mt-3 flex gap-2">
-            <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`flex-1 py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-              {actionLoading === 'cancel' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />} {confirmAction === 'cancel' ? `Click again to cancel (${confirmCountdown}s)` : 'Cancel'}
-            </button>
-          </div>
-        )
-      ) : null}
-
-      {isTerminal && task.status !== 'FAILED' ? (
-        compact ? (
-          <div className="mt-2" ref={overflowMenuRef}>
-            <button
-              onClick={() => setShowOverflowMenu(v => !v)}
-              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
-              title="More actions"
-            >
-              <MoreHorizontal className="w-3.5 h-3.5" />
-            </button>
-            {showOverflowMenu && (
-              <div className="mt-1 flex gap-1.5">
-                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`flex-1 py-1 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-                  {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}
-                  {confirmAction === 'archive' ? `Confirm (${confirmCountdown}s)` : 'Archive'}
-                </button>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="mt-3">
-            <button onClick={() => handleDestructiveClick('archive', () => onArchive(task.id))} disabled={!!actionLoading} className={`w-full py-1.5 rounded text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1.5 border ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-              {actionLoading === 'archive' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <Archive className="w-3.5 h-3.5" />}
-              {confirmAction === 'archive' ? `Click again to archive (${confirmCountdown}s)` : 'Archive'}
-            </button>
-          </div>
-        )
-      ) : null}
+      {/* Cancel/Archive for active and terminal-non-failed tasks handled via hover toolbar + drawer */}
 
       {task.status === 'FAILED' ? (
         compact ? (

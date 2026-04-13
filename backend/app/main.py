@@ -2035,10 +2035,10 @@ async def update_agent_status(
                         await release_max_plan_account(acct_id)
                         # Mark slot as released so the fallback release (line ~6232) doesn't double-release
                         task.context = {**(task.context or {}), "_slot_released": True}
-                        if failure_class == "RATE_LIMIT":
-                            # Default to sonnet when model is unknown (agent's default model)
-                            rl_model = model or "claude-sonnet-4-6"
-                            # Disable only the specific model on this account
+                        if failure_class == "RATE_LIMIT" and model:
+                            # Only disable a specific model when we know which one hit the limit.
+                            # Previously defaulted to sonnet, causing false rate-limit marks.
+                            rl_model = model
                             async with _max_plan_pool_lock:
                                 acct = _account_by_id.get(acct_id)
                                 if acct:

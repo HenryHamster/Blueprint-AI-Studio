@@ -1,0 +1,79 @@
+/**
+ * Shared timestamp utilities.
+ *
+ * The backend stores naive UTC datetimes and serialises them as ISO-8601
+ * strings *without* a trailing 'Z'.  `new Date("2026-04-12T10:30:00")`
+ * treats that as **local** time, which silently shifts every displayed
+ * timestamp.  `parseTimestamp` normalises the input so all downstream
+ * formatting is correct.
+ */
+
+/** Parse an API timestamp (ISO string, epoch-ms, or Date) into a Date. */
+export function parseTimestamp(v: string | number | Date | null | undefined): Date {
+  if (!v) return new Date(0);
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') return new Date(v);
+  // Append 'Z' to naive ISO strings so they're parsed as UTC.
+  return new Date(v.endsWith('Z') || v.includes('+') ? v : v + 'Z');
+}
+
+/** "5m ago" / "2h 30m ago" / "3d ago" relative time. */
+export function timeAgo(v: string | number | Date): string {
+  const ms = Date.now() - parseTimestamp(v).getTime();
+  const sec = Math.floor(ms / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ${min % 60}m ago`;
+  const days = Math.floor(hr / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+/** Format a duration given in **milliseconds**: "< 1m" / "5m" / "2h 10m". */
+export function formatDurationMs(ms: number): string {
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin < 1) return '<1m';
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m}m`;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+/** Format a duration given in **seconds**: "30s" / "5m 10s" / "2h 10m". */
+export function formatDurationSec(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
+}
+
+/** "Apr 12, 10:30:05 AM" — absolute local-time display. */
+export function formatAbsolute(v: string | number): string {
+  return parseTimestamp(v).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+/** "10:30:05 AM" — time-only display. */
+export function formatTimeOnly(v: string | number): string {
+  return parseTimestamp(v).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+/** Seconds remaining until a future timestamp (0 if past). */
+export function secondsUntil(v: string | number): number {
+  return Math.max(0, Math.floor((parseTimestamp(v).getTime() - Date.now()) / 1000));
+}

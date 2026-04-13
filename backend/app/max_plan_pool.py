@@ -119,10 +119,11 @@ def _account_available_for_model(acct: dict, model: Optional[str]) -> bool:
         return False  # Entirely disabled (legacy path)
     dm = acct.get("disabled_models", {})
     if not model:
-        # No model specified — account is available only if it has no disabled models.
-        # Most tasks don't carry an explicit model, so we must respect per-model disables
-        # even when model is None, otherwise rate-limited accounts get re-selected.
-        return len(dm) == 0
+        # No model specified — allow the account. Per-model disables only block
+        # tasks that explicitly request that model. Previously this blocked the
+        # account entirely when ANY model was disabled, causing false rejections
+        # (e.g., Opus rate-limit blocking all Sonnet/unknown-model tasks).
+        return True
     return model not in dm
 
 

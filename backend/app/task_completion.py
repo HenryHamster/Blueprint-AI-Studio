@@ -779,8 +779,21 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
     cycle_id = (task.context or {}).get("strategic_cycle_id")
     try:
         await session.refresh(project)
-        await _spawn_strategic_review(project, session, cycle_id=cycle_id)
-        task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
+        spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
+        if spawned:
+            task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
+        else:
+            # Spawn silently skipped (active strategic task) — create retry marker
+            logger.warning(f"[DESIGN DOC] Phase 2 spawn skipped for task {task.id} (active strategic task exists)")
+            task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
+            project.vision = {**(project.vision or {}), '_pending_strategic_review': {
+                'design_doc_task_id': str(task.id),
+                'failed_at': _utcnow().isoformat(),
+                'error': 'skipped: active strategic task exists',
+                'cycle_id': cycle_id,
+            }}
+            flag_modified(project, 'vision')
+            session.add(project)
     except Exception as chain_exc:
         logger.error(f"[DESIGN DOC] Failed to chain Phase 2 for task {task.id}: {chain_exc}", exc_info=True)
         task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — FAILED to spawn strategic review: {chain_exc!r}"[:500]

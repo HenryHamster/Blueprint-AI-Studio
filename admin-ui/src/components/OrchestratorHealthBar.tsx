@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Task } from './TaskCard';
+import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
 
 interface OrchestratorHealth {
   last_cycle_seconds_ago: number | null;
@@ -67,19 +68,8 @@ function statusDotTitle(key: string, val: boolean | string): string {
   return `${label}: ${val}`;
 }
 
-function relativeTime(ts: number, now: number): string {
-  if (!ts) return '—';
-  const sec = Math.floor((now - ts) / 1000);
-  if (sec < 10) return 'just now';
-  if (sec < 60) return `${sec}s ago`;
-  return `${Math.floor(sec / 60)}m ago`;
-}
-
-function monitoringDuration(since: string, now: number): string {
-  const sec = Math.floor((now - new Date(since).getTime()) / 1000);
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
-  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+function monitoringDuration(since: string): string {
+  return formatDurationSec(Math.floor((Date.now() - parseTimestamp(since).getTime()) / 1000));
 }
 
 export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
@@ -96,7 +86,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     return tasks.filter(t =>
       t.status === 'IN_PROGRESS' &&
       t.last_heartbeat &&
-      new Date(t.last_heartbeat).getTime() < fiveMinutesAgo
+      parseTimestamp(t.last_heartbeat).getTime() < fiveMinutesAgo
     ).length;
   }, [tasks, now]);
 
@@ -179,8 +169,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
 
             <div className="flex items-center gap-2 text-neutral-400">
-              <span><span className="text-neutral-300 font-medium">{health.queued_tasks}</span> queued</span>
-              <span><span className="text-neutral-300 font-medium">{health.active_tasks}</span> active</span>
+              <span><span className="text-neutral-300 font-medium">{Math.max(0, health.queued_tasks)}</span> queued</span>
+              <span><span className="text-neutral-300 font-medium">{Math.max(0, health.active_tasks)}</span> active</span>
             </div>
 
             {showDeployInfo && (
@@ -192,7 +182,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     (deployState?.rollback_count ?? 0) > 0 ? `${deployState?.rollback_count ?? 0} rollback${(deployState?.rollback_count ?? 0) !== 1 ? 's' : ''}` : null,
                     deployState?.rollback_reason ? `Reason: ${deployState?.rollback_reason}` : null,
                     deployState?.pause_reason ? `Paused: ${deployState?.pause_reason}` : null,
-                    deployState?.monitoring_since ? `Monitoring for ${monitoringDuration(deployState?.monitoring_since, now)}` : null,
+                    deployState?.monitoring_since ? `Monitoring for ${monitoringDuration(deployState?.monitoring_since)}` : null,
                   ].filter(Boolean).join(' · ') || undefined}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
@@ -208,7 +198,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     'text-neutral-400'
                   }`}>
                     {deployState?.status === 'MONITORING' && deployState?.monitoring_since
-                      ? `Monitoring ${monitoringDuration(deployState?.monitoring_since, now)}`
+                      ? `Monitoring ${monitoringDuration(deployState?.monitoring_since)}`
                       : deployState?.status === 'ROLLED_BACK'
                       ? 'Rolled back'
                       : deployState?.status === 'HALTED'
@@ -313,7 +303,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             ⚠ {staleHeartbeatCount} stale
           </span>
         )}
-        <span className="text-neutral-500">Updated {relativeTime(lastFetchTime, now)}</span>
+        <span className="text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
       </div>
     </div>
   );

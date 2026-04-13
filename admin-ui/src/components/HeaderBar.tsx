@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Clock, Plus, LogOut, MoreHorizontal, Settings, Users, Stethoscope, LayoutGrid, MessageSquare } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
@@ -16,17 +16,14 @@ export interface HeaderBarProps {
   maxConcurrentVMs: number;
   lastRefresh: Date | null;
   onRefresh: () => void;
-  viewMode: 'kanban' | 'pipeline' | 'timeline';
-  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'timeline') => void;
+  viewMode: 'kanban' | 'pipeline';
+  onSetViewMode: (mode: 'kanban' | 'pipeline') => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
   showArchive: boolean;
   onToggleArchive: () => void;
-  showActivityFeed: boolean;
-  onToggleActivityFeed: () => void;
   showMessages: boolean;
   onToggleMessages: () => void;
-  newActivityCount: number;
   needsAttentionCount: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
@@ -104,9 +101,6 @@ export interface HeaderBarProps {
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
   userRole: 'admin' | 'user' | null;
-  showDiagnostics: boolean;
-  onToggleDiagnostics: () => void;
-  stuckTaskCount: number;
 }
 
 
@@ -125,20 +119,14 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleResearchBrowser,
     showArchive,
     onToggleArchive,
-    showActivityFeed,
-    onToggleActivityFeed,
     showMessages,
     onToggleMessages,
-    newActivityCount,
     needsAttentionCount,
     onOpenNewTaskModal,
     onShowDirections,
     onSignOut,
     userEmail,
     wsRef,
-    showShortcutHelp,
-    onToggleShortcutHelp,
-    shortcutHelpRef,
     showSettings,
     onToggleSettings,
     settingsRef,
@@ -232,17 +220,17 @@ export function HeaderBar(props: HeaderBarProps) {
   }, [tasks]);
 
   return (
-    <header className="mb-6 flex justify-between items-center shrink-0">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight text-neutral-100 flex items-center gap-2">
-          <Activity className="w-5 h-5 text-neutral-400" />
-          Blueprint Launcher
+    <header className="mb-6 relative flex items-center shrink-0">
+      {/* Left: title */}
+      <div className="shrink-0">
+        <h1 className="text-base font-semibold tracking-tight text-neutral-100 flex items-center gap-2">
+          <Activity className="w-4 h-4 text-neutral-400" />
+          Blueprint
         </h1>
-        <p className="text-xs text-neutral-500 mt-1 font-mono uppercase tracking-wider">Claude Code PVM Orchestrator</p>
       </div>
 
-      {/* MetricsBar — hidden on mobile to save space */}
-      <div className="hidden md:flex">
+      {/* Center: MetricsBar — absolutely positioned so it's truly centered */}
+      <div className="hidden md:flex items-center gap-3 absolute left-1/2 -translate-x-1/2">
         <MetricsBar
           globalActiveCount={globalActiveCount}
           maxConcurrentVMs={maxConcurrentVMs}
@@ -257,70 +245,39 @@ export function HeaderBar(props: HeaderBarProps) {
           metricsHistory={metricsHistory}
           pauseReason={props.deployState?.reason ?? null}
         />
+        {/* API connection problem — only visible when API is unreachable */}
+        {!apiHealthy && (
+          <div className="flex items-center gap-2 text-[10px] px-2 py-1 rounded bg-red-950/30 border border-red-900/30">
+            <div className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-red-400">API down</span>
+            </div>
+          </div>
+        )}
       </div>
 
-      <div className="flex items-center gap-2">
-        {/* Secondary buttons — desktop only, in original order: ? | Network | Compass */}
-        <div className="hidden md:flex items-center gap-2">
-          <div className="relative" ref={shortcutHelpRef}>
-            <button
-              onClick={onToggleShortcutHelp}
-              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-500 hover:text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700 font-mono"
-              title="Keyboard shortcuts"
-            >
-              ?
-            </button>
-            {showShortcutHelp && (
-              <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-3 z-50">
-                <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Keyboard Shortcuts</h3>
-                <div className="space-y-1.5 text-xs">
-                  {[
-                    ['N', 'New task'],
-                    ['R', 'Refresh tasks'],
-                    ['1', 'Kanban view'],
-                    ['2', 'Pipeline view'],
-                    ['D', 'Toggle directions'],
-                    ['S', 'Toggle settings'],
-                    ['M', 'Toggle metrics'],
-                    ['A', 'Toggle activity feed'],
-                    ['?', 'This help'],
-                    ['Esc', 'Close panel/modal'],
-                  ].map(([key, desc]) => (
-                    <div key={key} className="flex items-center justify-between">
-                      <span className="text-neutral-400">{desc}</span>
-                      <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-[10px] font-mono min-w-[24px] text-center">{key}</kbd>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-          <div className="flex items-center rounded border border-neutral-700 overflow-hidden">
+      {/* Right: buttons */}
+      <div className="flex items-center gap-1.5 ml-auto">
+        <div className="hidden md:flex items-center gap-1">
+          <div className="flex items-center rounded-md overflow-hidden">
             <button
               onClick={() => onSetViewMode('kanban')}
-              className={`p-2 text-xs transition-colors border-r border-neutral-700 ${viewMode === 'kanban' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
+              className={`p-2 text-xs transition-colors ${viewMode === 'kanban' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
               title="Kanban view"
             >
               <LayoutGrid className="w-4 h-4" />
             </button>
             <button
               onClick={() => onSetViewMode('pipeline')}
-              className={`p-2 text-xs transition-colors border-r border-neutral-700 ${viewMode === 'pipeline' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
+              className={`p-2 text-xs transition-colors ${viewMode === 'pipeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
               title="Pipeline view"
             >
               <Network className="w-4 h-4" />
             </button>
-            <button
-              onClick={() => onSetViewMode('timeline')}
-              className={`p-2 text-xs transition-colors ${viewMode === 'timeline' ? 'bg-neutral-700 text-neutral-100' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
-              title="Timeline view"
-            >
-              <Clock className="w-4 h-4" />
-            </button>
           </div>
           <button
             onClick={onShowDirections}
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700"
+            className="text-neutral-400 hover:text-neutral-200 p-2 rounded-md text-xs transition-colors hover:bg-neutral-800"
             title="Directions"
           >
             <Compass className="w-4 h-4" />
@@ -396,54 +353,27 @@ export function HeaderBar(props: HeaderBarProps) {
           onRepairState={props.onRepairState}
           zoneHealth={props.zoneHealth}
           userRole={props.userRole}
+          userEmail={userEmail}
+          onSignOut={onSignOut}
+          showUserManagement={props.showUserManagement}
+          onToggleUserManagement={props.onToggleUserManagement}
         />
 
         {/* More secondary buttons — desktop only */}
-        <div className="hidden md:flex items-center gap-2">
-          {props.userRole === 'admin' && (
-          <button
-            onClick={props.onToggleUserManagement}
-            className={`p-2 rounded text-xs transition-colors border ${
-              props.showUserManagement
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-            title="User Management"
-          >
-            <Users className="w-4 h-4" />
-          </button>
-          )}
+        <div className="hidden md:flex items-center gap-1">
           <button
             onClick={onToggleArchive}
-            className={`p-2 rounded text-xs transition-colors border ${
-              showArchive
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            className={`p-2 rounded-md text-xs transition-colors ${
+              showArchive ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
             title="Archive"
           >
             <Archive className="w-4 h-4" />
           </button>
           <button
-            onClick={onToggleActivityFeed}
-            className={`p-2 rounded text-xs transition-colors border relative ${
-              showActivityFeed
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-            title="Toggle activity feed (A)"
-          >
-            <Clock className="w-4 h-4" />
-            {newActivityCount > 0 && !showActivityFeed && (
-              <span className="absolute top-0.5 right-0.5 w-2 h-2 bg-red-500 rounded-full" />
-            )}
-          </button>
-          <button
             onClick={onToggleMessages}
-            className={`p-2 rounded text-xs transition-colors border ${
-              showMessages
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            className={`p-2 rounded-md text-xs transition-colors ${
+              showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
             title="Messages"
           >
@@ -451,33 +381,15 @@ export function HeaderBar(props: HeaderBarProps) {
           </button>
           <button
             onClick={onToggleResearchBrowser}
-            className={`p-2 rounded text-xs transition-colors border relative flex items-center ${
-              showResearchBrowser
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+            className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
+              showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
             title="Research Findings"
           >
             <Microscope className="w-4 h-4" />
             {pendingFindingsCount > 0 && (
-              <span className="ml-1 bg-cyan-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+              <span className="ml-0.5 bg-cyan-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
                 {pendingFindingsCount}
-              </span>
-            )}
-          </button>
-          <button
-            onClick={props.onToggleDiagnostics}
-            className={`p-2 rounded text-xs transition-colors border relative flex items-center ${
-              props.showDiagnostics
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-            title="Pipeline Diagnostics"
-          >
-            <Stethoscope className="w-4 h-4" />
-            {props.stuckTaskCount > 0 && (
-              <span className="ml-1 bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
-                {props.stuckTaskCount}
               </span>
             )}
           </button>
@@ -509,13 +421,6 @@ export function HeaderBar(props: HeaderBarProps) {
                 <span>Pipeline view</span>
               </button>
               <button
-                onClick={() => { onSetViewMode('timeline'); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${viewMode === 'timeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <Clock className="w-4 h-4 shrink-0" />
-                <span>Timeline view</span>
-              </button>
-              <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
@@ -534,30 +439,7 @@ export function HeaderBar(props: HeaderBarProps) {
                 <Archive className="w-4 h-4 shrink-0" />
                 <span>Archive</span>
               </button>
-              <button
-                onClick={() => { onToggleActivityFeed(); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showActivityFeed ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <Clock className="w-4 h-4 shrink-0" />
-                <span>Activity Feed</span>
-                {newActivityCount > 0 && !showActivityFeed && (
-                  <span className="ml-auto bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
-                    {newActivityCount}
-                  </span>
-                )}
-              </button>
-              <button
-                onClick={() => { props.onToggleDiagnostics(); setShowMobileMenu(false); }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${props.showDiagnostics ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-              >
-                <Stethoscope className="w-4 h-4 shrink-0" />
-                <span>Diagnostics</span>
-                {props.stuckTaskCount > 0 && (
-                  <span className="ml-auto bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
-                    {props.stuckTaskCount}
-                  </span>
-                )}
-              </button>
+              {/* Pipeline Diagnostics & Activity Feed removed */}
               <button
                 onClick={() => { onToggleMessages(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors text-left ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
@@ -628,15 +510,6 @@ export function HeaderBar(props: HeaderBarProps) {
         >
           <Plus className="w-3.5 h-3.5" />
           Launch Task
-        </button>
-
-        {/* Sign out — always visible */}
-        <button
-          onClick={onSignOut}
-          className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-3 md:p-2 min-w-[44px] min-h-[44px] md:min-w-0 md:min-h-0 rounded text-xs transition-colors border border-neutral-700 flex items-center justify-center"
-          title={`Sign out (${userEmail})`}
-        >
-          <LogOut className="w-4 h-4" />
         </button>
       </div>
     </header>

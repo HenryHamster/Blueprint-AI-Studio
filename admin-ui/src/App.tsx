@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, Archive, CheckSquare, LayoutList, Layers, LayoutGrid, ChevronUp, ChevronDown, UserPlus } from 'lucide-react';
+import { Activity, AlertCircle, LayoutList, LayoutGrid, ChevronUp, ChevronDown } from 'lucide-react';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { DirectionsPanel } from './components/DirectionsPanel';
@@ -21,13 +21,10 @@ import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
-import ActivityFeed from './components/ActivityFeed';
+// ActivityFeed removed from UI — CatchUpPanel covers this
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
-import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { CatchUpPanel } from './components/CatchUpPanel';
-import { DiagnosticsPanel } from './components/DiagnosticsPanel';
-import { TimelineView } from './components/TimelineView';
 import { MessagesPanel } from './components/MessagesPanel';
 
 const COLUMNS: KanbanColumn[] = [
@@ -150,19 +147,6 @@ export default function App() {
     return () => document.removeEventListener('keydown', handleSearchShortcut);
   }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
 
-  const { showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed } = s;
-  useEffect(() => {
-    function handleActivityFeedShortcut(e: KeyboardEvent) {
-      if (e.key !== 'a' && e.key !== 'A') return;
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (showNewTaskModal || logTask || showResearchBrowser || showSettings) return;
-      setShowActivityFeed(prev => !prev);
-    }
-    document.addEventListener('keydown', handleActivityFeedShortcut);
-    return () => document.removeEventListener('keydown', handleActivityFeedShortcut);
-  }, [showNewTaskModal, logTask, showResearchBrowser, showSettings, setShowActivityFeed]);
-
   // Project members panel
   const [showProjectMembers, setShowProjectMembers] = useState(false);
   const selectedProject = useMemo(
@@ -177,12 +161,6 @@ export default function App() {
     }
   }, [showProjectMembers, s.selectedProjectId, s.fetchProjectMembers]);
 
-  const [activityEvents, setActivityEvents] = useState<import('./components/ActivityFeed').ActivityEvent[]>([]);
-  const [activityFeedFilter, setActivityFeedFilter] = useState<string | undefined>();
-  const newActivityCount = useMemo(() => {
-    if (!s.lastActivityFeedOpen) return 0;
-    return activityEvents.filter(e => new Date(e.timestamp).getTime() > s.lastActivityFeedOpen!).length;
-  }, [activityEvents, s.lastActivityFeedOpen]);
 
   // Backend version mismatch detection
   const [versionMismatch, setVersionMismatch] = useState(false);
@@ -366,11 +344,8 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
-        showActivityFeed={s.showActivityFeed}
-        onToggleActivityFeed={() => s.setShowActivityFeed(prev => !prev)}
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
-        newActivityCount={newActivityCount}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
@@ -436,9 +411,6 @@ export default function App() {
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
         userRole={s.userRole}
-        showDiagnostics={s.showDiagnostics}
-        onToggleDiagnostics={() => s.setShowDiagnostics(prev => !prev)}
-        stuckTaskCount={s.diagnostics?.stuck_tasks.length ?? 0}
       />
 
       <div
@@ -458,6 +430,26 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
+
+      <ProjectDashboard
+        projects={s.projects}
+        tasks={s.tasks}
+        selectedProjectId={s.selectedProjectId}
+        onSelectProject={s.setSelectedProjectId}
+        showMembers={showProjectMembers}
+        onToggleMembers={() => setShowProjectMembers(prev => !prev)}
+      />
+
+      {showProjectMembers && s.selectedProjectId && selectedProject && (
+        <ProjectMembers
+          projectId={s.selectedProjectId}
+          members={s.projectMembers}
+          myRole={selectedProject.my_role || 'viewer'}
+          onAdd={(email, role) => s.addProjectMember(s.selectedProjectId!, email, role)}
+          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(s.selectedProjectId!, memberId, role)}
+          onRemove={(memberId) => s.removeProjectMember(s.selectedProjectId!, memberId)}
+        />
+      )}
 
       {versionMismatch && (
         <div className="mx-4 mb-2 p-3 bg-yellow-900/50 border border-yellow-700 rounded-lg text-yellow-200 text-sm flex items-center gap-2">
@@ -484,7 +476,7 @@ export default function App() {
         }}
       />
 
-      {!s.showArchive && !s.showActivityFeed && !s.showUserManagement && (
+      {!s.showArchive && !s.showUserManagement && (
         <CatchUpPanel
           selectedProjectId={s.selectedProjectId}
           lastVisitTimestamp={s.lastVisitTimestamp}
@@ -495,7 +487,6 @@ export default function App() {
               s.addToast('Could not load task — it may have been deleted', 'error');
             });
           }}
-          onOpenActivityFeed={(filter) => { setActivityFeedFilter(filter); s.setShowActivityFeed(true); }}
           onApprove={(taskId) => s.handleApprove(taskId)}
           onRetry={(taskId) => s.handleRetry(taskId)}
           onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
@@ -504,29 +495,7 @@ export default function App() {
         />
       )}
 
-      <OrchestratorHealthBar
-        health={s.orchestratorHealth}
-        detailedHealth={s.detailedHealth}
-        apiHealthy={s.apiHealthy}
-        wsConnected={s.wsConnected}
-        lastFetchTime={s.lastFetchTime}
-        tasks={s.tasks}
-        pipelineThrottle={s.pipelineThrottle}
-      />
-
-      <div
-        className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
-        style={{ maxHeight: s.showDiagnostics ? '500px' : '0px', opacity: s.showDiagnostics ? 1 : 0 }}
-      >
-        <DiagnosticsPanel
-          diagnostics={s.diagnostics}
-          onViewTask={(taskId) => {
-            fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }}
-        />
-      </div>
+      {/* Health bar + diagnostics panel removed — status dots in HeaderBar */}
 
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
@@ -542,41 +511,6 @@ export default function App() {
         </div>
       )}
 
-      <div className="flex items-start gap-3">
-        <div className="flex-1">
-          <ProjectDashboard
-            projects={s.projects}
-            tasks={s.tasks}
-            selectedProjectId={s.selectedProjectId}
-            onSelectProject={s.setSelectedProjectId}
-          />
-        </div>
-        {s.selectedProjectId && (
-          <button
-            onClick={() => setShowProjectMembers(prev => !prev)}
-            className={`mt-1 p-2 rounded text-xs transition-colors border shrink-0 ${
-              showProjectMembers
-                ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-            }`}
-            title="Project Members"
-          >
-            <UserPlus className="w-4 h-4" />
-          </button>
-        )}
-      </div>
-
-      {showProjectMembers && s.selectedProjectId && selectedProject && (
-        <ProjectMembers
-          projectId={s.selectedProjectId}
-          members={s.projectMembers}
-          myRole={selectedProject.my_role || 'viewer'}
-          onAdd={(email, role) => s.addProjectMember(s.selectedProjectId!, email, role)}
-          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(s.selectedProjectId!, memberId, role)}
-          onRemove={(memberId) => s.removeProjectMember(s.selectedProjectId!, memberId)}
-        />
-      )}
-
       {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
           users={s.allowedUsers}
@@ -585,21 +519,6 @@ export default function App() {
           onUpdateRole={s.updateAllowedUserRole}
           onRemove={s.removeAllowedUser}
           onClose={() => s.setShowUserManagement(false)}
-        />
-      ) : s.showActivityFeed ? (
-        <ActivityFeed
-          selectedProjectId={s.selectedProjectId}
-          refreshInterval={s.refreshInterval}
-          onSelectTask={(task) => {
-            s.setShowActivityFeed(false);
-            fetchTask(task.id).then(s.handleViewLogs).catch(() => {
-              s.addToast('Could not load task — it may have been deleted', 'error');
-            });
-          }}
-          onClose={() => { s.setShowActivityFeed(false); setActivityFeedFilter(undefined); }}
-          lastVisitTimestamp={s.prevLastActivityFeedOpen}
-          onEventsChange={setActivityEvents}
-          initialFilter={activityFeedFilter}
         />
       ) : s.showMessages ? (
         <MessagesPanel
@@ -631,69 +550,14 @@ export default function App() {
         />
       ) : (
         <>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 mb-3 flex-wrap">
             <SearchFilterBar
               searchQuery={s.searchQuery}
               onSearchChange={s.setSearchQuery}
               taskTypeFilter={s.taskTypeFilter}
               onTypeFilterChange={s.setTaskTypeFilter}
-              statusFilter={s.statusFilter}
-              onStatusFilterChange={s.setStatusFilter}
-              filteredCount={filteredTasks.length}
-              totalCount={s.tasks.length}
               inputRef={searchInputRef}
             />
-          </div>
-
-          <div className="flex items-center gap-2 shrink-0 mb-2">
-            {s.viewMode === 'kanban' && (
-            <div className="relative group">
-              <button
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
-              >
-                <Layers className="w-3.5 h-3.5" />
-                Group: {s.groupBy === 'status' ? 'Status' : s.groupBy === 'type' ? 'Type' : 'Project'}
-              </button>
-              <div className="absolute left-0 top-full mt-1 z-20 hidden group-focus-within:flex group-hover:flex flex-col bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden min-w-[120px]">
-                {(['status', 'type', 'project'] as const).map(opt => (
-                  <button
-                    key={opt}
-                    onClick={() => s.setGroupBy(opt)}
-                    className={`px-3 py-2 text-xs text-left hover:bg-neutral-800 transition-colors ${s.groupBy === opt ? 'text-amber-400 font-medium' : 'text-neutral-300'}`}
-                  >
-                    {opt === 'status' ? 'Status' : opt === 'type' ? 'Type' : 'Project'}
-                  </button>
-                ))}
-              </div>
-            </div>
-            )}
-            {s.viewMode === 'kanban' && (
-            <button
-              onClick={s.toggleSelectionMode}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                s.selectionMode
-                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
-              }`}
-            >
-              <CheckSquare className="w-3.5 h-3.5" />
-              {s.selectionMode ? `Select (${s.selectedTaskIds.size} selected)` : 'Select'}
-            </button>
-            )}
-            {s.viewMode === 'kanban' && (
-            <button
-              onClick={() => s.setCompactMode(v => !v)}
-              title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                s.compactMode
-                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
-              }`}
-            >
-              <LayoutList className="w-3.5 h-3.5" />
-              {s.compactMode ? 'Compact' : 'Normal'}
-            </button>
-            )}
             {s.viewMode === 'kanban' && (
               <select
                 value={sortBy}
@@ -710,49 +574,24 @@ export default function App() {
             {s.viewMode === 'kanban' && (
               <ColumnsPicker prefs={effectiveColumnPrefs} onPrefsChange={s.setColumnPrefs} />
             )}
-            {s.selectionMode && s.selectedTaskIds.size > 0 && (
-              <button
-                onClick={() => s.setConfirmDialog({
-                  title: `Archive ${s.selectedTaskIds.size} selected task${s.selectedTaskIds.size !== 1 ? 's' : ''}?`,
-                  message: 'This will archive the selected tasks. They can be viewed and unarchived from the Archive view.',
-                  confirmLabel: 'Archive Selected',
-                  onConfirm: s.handleBulkArchiveSelected,
-                })}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-amber-500/20 border-amber-500/40 text-amber-400 hover:bg-amber-500/30 transition-colors"
-              >
-                <Archive className="w-3.5 h-3.5" />
-                Archive Selected
-              </button>
+            {s.viewMode === 'kanban' && (
+            <button
+              onClick={() => s.setCompactMode(v => !v)}
+              title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                s.compactMode
+                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+              }`}
+            >
+              <LayoutList className="w-3.5 h-3.5" />
+              {s.compactMode ? 'Compact' : 'Normal'}
+            </button>
             )}
             <div className="flex-1" />
-            <button
-              onClick={() => {
-                s.setConfirmDialog({
-                  title: 'Archive all completed tasks?',
-                  message: 'This will archive all completed tasks across all pages. They can be viewed and unarchived from the Archive view.',
-                  confirmLabel: 'Archive All Completed',
-                  onConfirm: () => s.handleBulkArchive('completed'),
-                });
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
-            >
-              <Archive className="w-3.5 h-3.5" />
-              Archive All Completed
-            </button>
-            <button
-              onClick={() => {
-                s.setConfirmDialog({
-                  title: 'Archive all terminal tasks?',
-                  message: 'This will archive all terminal tasks (completed, cancelled, and failed) across all pages. They can be viewed and unarchived from the Archive view.',
-                  confirmLabel: 'Archive All Terminal',
-                  onConfirm: () => s.handleBulkArchive('terminal'),
-                });
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
-            >
-              <Archive className="w-3.5 h-3.5" />
-              Archive All Terminal
-            </button>
+            <span className="text-xs text-neutral-500">
+              {filteredTasks.length} of {s.tasks.length}
+            </span>
           </div>
 
           {s.viewMode === 'kanban' ? (
@@ -763,15 +602,9 @@ export default function App() {
               loading={s.initialLoading}
               maxRetries={s.maxRetries}
               actionLoadingMap={s.actionLoadingMap}
-              selectionMode={s.selectionMode}
-              selectedTaskIds={s.selectedTaskIds}
               compact={s.compactMode}
               sortBy={sortBy}
-              onToggleTaskSelection={s.toggleTaskSelection}
-              groupBy={s.groupBy}
-              projects={s.projects}
               hasActiveFilters={hasActiveFilters}
-              onBulkToggle={s.bulkColumnToggle}
               onArchiveColumn={(taskIds, columnLabel) => {
                 s.setConfirmDialog({
                   title: `Archive all ${columnLabel} tasks?`,
@@ -792,16 +625,6 @@ export default function App() {
               trackedTaskIds={s.trackedTaskIds}
             />
             </ErrorBoundary>
-          ) : s.viewMode === 'timeline' ? (
-            <ErrorBoundary level="panel">
-            <main className="flex-1 overflow-hidden flex flex-col">
-              <TimelineView
-                tasks={filteredTasks}
-                hasActiveFilters={hasActiveFilters}
-                onViewLogs={s.handleViewLogs}
-              />
-            </main>
-            </ErrorBoundary>
           ) : (
             <ErrorBoundary level="panel">
             <main className="flex-1 overflow-hidden flex flex-col">
@@ -817,6 +640,7 @@ export default function App() {
                   });
                 }}
                 onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
+                onArchiveGroup={(taskIds) => s.handleBulkArchiveColumn(taskIds)}
               />
             </main>
             </ErrorBoundary>
@@ -868,14 +692,8 @@ export default function App() {
       {s.showResearchBrowser && (
         <ResearchBrowser
           tasks={s.tasks}
+          selectedProjectId={s.selectedProjectId}
           onClose={() => s.setShowResearchBrowser(false)}
-          onLaunch={(finding) => {
-            s.setShowResearchBrowser(false);
-            s.setNewTaskPrompt(finding.prompt);
-            s.setNewTaskTitle(finding.title);
-            s.setNewTaskType(finding.scope === 'large' ? 'plan' : 'create');
-            s.openNewTaskModal();
-          }}
         />
       )}
 

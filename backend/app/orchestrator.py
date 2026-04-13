@@ -638,12 +638,13 @@ async def orchestrator_worker():
                     if not task_model:
                         task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                         task_model = _runtime_config.get("task_type_models", {}).get(task_type)
-                        # Persist resolved model into payload so rate-limit handler can read it later
-                        if task_model and task.payloads:
-                            task.payloads[0]["model"] = task_model
-                            from sqlalchemy.orm.attributes import flag_modified
-                            flag_modified(task, "payloads")
-                            session.add(task)
+                    # Always persist model to payload so rate-limit handler knows which
+                    # model was used. Claude Code defaults to Sonnet when no --model flag.
+                    if task.payloads and not task.payloads[0].get("model"):
+                        task.payloads[0]["model"] = task_model or "claude-sonnet-4-6"
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(task, "payloads")
+                        session.add(task)
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
                     if _blacklist:

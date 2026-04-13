@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import or_
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -554,11 +555,16 @@ async def _check_evaluating_timeouts():
                 # 2-hour warning
                 if elapsed > EVALUATING_WARN_SECONDS:
                     hours = round(elapsed / 3600, 1)
-                    # Deduplicate: check for existing undismissed alert on this task
+                    # Deduplicate: skip if an undismissed alert exists OR one was
+                    # dismissed within the last 2 hours (prevents re-firing after dismiss).
+                    dismiss_cooldown = _utcnow() - timedelta(hours=2)
                     existing = (await session.execute(
                         select(Alert).where(
                             Alert.task_id == task.id,
-                            Alert.dismissed_at.is_(None),
+                            or_(
+                                Alert.dismissed_at.is_(None),
+                                Alert.dismissed_at >= dismiss_cooldown,
+                            ),
                         )
                     )).scalars().first()
                     if existing is None:

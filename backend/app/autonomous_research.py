@@ -34,17 +34,18 @@ def _utcnow() -> datetime:
 
 
 
-async def _spawn_design_doc_update(project: Project, session: AsyncSession):
+async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
     This runs as a separate task type so it doesn't block tactical research.
     On completion, it chains to _spawn_strategic_review (Phase 2).
+    Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task  # noqa: PLC0415
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
-        logger.debug(f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}")
-        return
+        logger.warning(f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}")
+        return False
 
     doc_model = _runtime_config.get("task_type_models", {}).get("design_doc_update") or \
                 _runtime_config.get("task_type_models", {}).get("research") or None
@@ -114,19 +115,21 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession):
     session.add(project)
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})")
+    return True
 
 
-async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: Optional[str] = None):
+async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: Optional[str] = None) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
+    Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task  # noqa: PLC0415
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
-        logger.debug(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
-        return
+        logger.warning(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
+        return False
 
     # Build direction stats with rich data (same as previous strategic payload)
     all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
@@ -228,6 +231,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         session.add(project)
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
+    return True
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -426,15 +430,16 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     pending_sr = (project.vision or {}).get('_pending_strategic_review')
     if pending_sr:
         try:
-            await _spawn_strategic_review(project, session, cycle_id=pending_sr.get('cycle_id'))
-            project.vision = {**project.vision}
-            project.vision.pop('_pending_strategic_review', None)
-            flag_modified(project, 'vision')
-            session.add(project)
-            logger.info(f'[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get("failed_at")})')
+            if await _spawn_strategic_review(project, session, cycle_id=pending_sr.get('cycle_id')):
+                project.vision = {**project.vision}
+                project.vision.pop('_pending_strategic_review', None)
+                flag_modified(project, 'vision')
+                session.add(project)
+                logger.info(f'[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get("failed_at")})')
+            else:
+                logger.warning(f'[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}')
         except Exception as retry_exc:
             logger.error(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}: {retry_exc}')
-            # Leave the marker — will retry on the next research spawn cycle
         return  # Don't spawn tactical research this cycle
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
@@ -461,12 +466,12 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         or force_strategic
     )
     if is_strategic:
-        await _spawn_design_doc_update(project, session)
-        research_spawn_count += 1
-        project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
-        flag_modified(project, "vision")
-        session.add(project)
-        logger.info(f"[AUTONOMOUS] Spawning design doc update (strategic cycle #{research_spawn_count - 1}, vision rev {(project.vision or {}).get('revision', 0)})")
+        if await _spawn_design_doc_update(project, session):
+            research_spawn_count += 1
+            project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
+            flag_modified(project, "vision")
+            session.add(project)
+            logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{research_spawn_count - 1}, vision rev {(project.vision or {}).get('revision', 0)})")
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
@@ -622,7 +627,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
             direction_text = "Cross-cutting codebase analysis"
             logger.info(f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})")
         else:
-            direction_text = (chosen_direction.get("text") or "general improvement")[:80]
+            direction_text = (chosen_direction.get("text") or "general improvement")[:200]
 
         new_task = Task(
             project_id=project.id,

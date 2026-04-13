@@ -1,4 +1,5 @@
-import { AlertTriangle, X, ExternalLink } from 'lucide-react';
+import { useState } from 'react';
+import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp } from 'lucide-react';
 
 export type { Alert } from '../types/alert';
 import type { Alert } from '../types/alert';
@@ -15,6 +16,9 @@ const iconColors: Record<Alert['severity'], string> = {
   INFO: 'text-blue-500',
 };
 
+/** Max alerts shown before collapsing into a summary bar. */
+const COLLAPSE_THRESHOLD = 2;
+
 interface AlertsBannerProps {
   alerts: Alert[];
   onDismiss: (id: string) => void;
@@ -23,12 +27,26 @@ interface AlertsBannerProps {
 }
 
 export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask }: AlertsBannerProps) {
+  const [expanded, setExpanded] = useState(false);
   if (alerts.length === 0) return null;
+
+  const shouldCollapse = alerts.length > COLLAPSE_THRESHOLD;
+  const visibleAlerts = shouldCollapse && !expanded ? alerts.slice(0, 1) : alerts;
+  const hiddenCount = alerts.length - visibleAlerts.length;
 
   return (
     <div className="mb-4 flex flex-col gap-2 shrink-0">
       {alerts.length > 1 && onDismissAll && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-3">
+          {shouldCollapse && (
+            <button
+              onClick={() => setExpanded(e => !e)}
+              className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors flex items-center gap-1"
+            >
+              {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+              {expanded ? 'Collapse' : `Show all ${alerts.length} alerts`}
+            </button>
+          )}
           <button
             onClick={onDismissAll}
             className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors"
@@ -37,7 +55,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask }: Al
           </button>
         </div>
       )}
-      {alerts.map(alert => (
+      {visibleAlerts.map(alert => (
         <div
           key={alert.id}
           className={`${severityStyles[alert.severity]} border rounded-lg px-4 py-3 text-sm flex items-center gap-3`}
@@ -66,6 +84,14 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask }: Al
           </button>
         </div>
       ))}
+      {hiddenCount > 0 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors text-center py-1"
+        >
+          +{hiddenCount} more alert{hiddenCount > 1 ? 's' : ''}
+        </button>
+      )}
     </div>
   );
 }
