@@ -19,7 +19,7 @@ interface EnrichedFinding {
   taskCreatedAt: string;
   findingIndex: number;
   /** Info about the child task that implemented this finding, if any. */
-  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string };
+  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string };
 }
 
 /** Findings grouped under a direction (or "undirected"). */
@@ -37,6 +37,14 @@ interface ResearchBrowserProps {
   onNavigateToTask?: (taskId: string) => void;
   initialDirectionId?: string;
 }
+
+const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string }> = {
+  CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400' },
+  PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400' },
+  AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400' },
+  EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400' },
+  RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400' },
+};
 
 const OUTCOME_STYLES: Record<string, { icon: typeof CheckCircle; color: string; label: string }> = {
   COMPLETED: { icon: CheckCircle, color: 'text-emerald-500', label: 'Merged' },
@@ -57,6 +65,15 @@ function relativeDate(dateStr: string): string {
   if (diffHr < 24) return `${diffHr}h ago`;
   const diffDay = Math.floor(diffHr / 24);
   return `${diffDay}d ago`;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+function getStaleness(dateStr: string): 'fresh' | 'stale' | 'very_stale' {
+  const ageMs = Date.now() - parseTimestamp(dateStr).getTime();
+  if (ageMs >= 72 * HOUR_MS) return 'very_stale';
+  if (ageMs >= 24 * HOUR_MS) return 'stale';
+  return 'fresh';
 }
 
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
@@ -107,7 +124,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
 
   // Build the map of finding key -> child task info
   const implementedFindings = useMemo(() => {
-    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string }>();
+    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string }>();
     for (const task of tasks) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
@@ -117,6 +134,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           taskType: task.task_type,
           taskId: task.id,
           prUrl: task.pr_url,
+          failureClass: task.failure_class ?? undefined,
         });
       }
     }
@@ -307,6 +325,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
             const mergedCount = group.findings.filter(f => f.outcome?.status === 'COMPLETED').length;
             const activeCount = group.findings.filter(f => f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome.status)).length;
             const prCount = group.findings.filter(f => f.outcome?.prUrl).length;
+            const failedCount = group.findings.filter(f => f.outcome && ['FAILED', 'CANCELLED'].includes(f.outcome.status)).length;
+            const proposedCount = group.findings.filter(f => !f.outcome).length;
+            const staleCount = group.findings.filter(f => !f.outcome && getStaleness(f.taskCreatedAt) !== 'fresh').length;
 
             return (
               <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
@@ -338,6 +359,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       {mergedCount > 0 && <span className="text-emerald-500 ml-1">{mergedCount} merged</span>}
                       {activeCount > 0 && <span className="text-cyan-400 ml-1">{activeCount} active</span>}
                       {prCount > 0 && <span className="text-blue-400 ml-1">{prCount} PRs</span>}
+                      {failedCount > 0 && <span className="text-red-400 ml-1">{failedCount} failed</span>}
+                      {proposedCount > 0 && <span className="text-neutral-500 ml-1">{proposedCount} proposed</span>}
+                      {staleCount > 0 && <span className="text-amber-400 ml-1">{staleCount} stale</span>}
                     </span>
                   </div>
                 </button>
@@ -368,7 +392,16 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               )
                               : outcomeInfo && OutcomeIcon
                                 ? <OutcomeIcon className={`w-3 h-3 shrink-0 ${outcomeInfo.color}`} />
-                                : <span className="w-3 h-3 shrink-0 rounded-full border border-neutral-700" />
+                                : (() => {
+                                  const s = getStaleness(ef.taskCreatedAt);
+                                  return (
+                                    <span className={`w-3 h-3 shrink-0 rounded-full border ${
+                                      s === 'very_stale' ? 'border-red-500 bg-red-500/20' :
+                                      s === 'stale' ? 'border-amber-500 bg-amber-500/20' :
+                                      'border-neutral-700'
+                                    }`} />
+                                  );
+                                })()
                             }
                             <span className="text-xs text-neutral-200 flex-1 truncate">{ef.finding.title}</span>
                             <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
@@ -386,7 +419,15 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                       {outcomeInfo.label}
                                     </button>
                                   )
-                                  : outcomeInfo && <span className={outcomeInfo.color}>{outcomeInfo.label}</span>
+                                  : outcomeInfo
+                                    ? <span className={outcomeInfo.color}>{outcomeInfo.label}</span>
+                                    : (() => {
+                                        const s = getStaleness(ef.taskCreatedAt);
+                                        const age = relativeDate(ef.taskCreatedAt);
+                                        if (s === 'very_stale') return <span className="px-1.5 py-0.5 rounded bg-red-900/30 text-red-400">Stale · {age}</span>;
+                                        if (s === 'stale') return <span className="px-1.5 py-0.5 rounded bg-amber-900/30 text-amber-400">Stale · {age}</span>;
+                                        return <span className="text-neutral-500">Proposed · {age}</span>;
+                                      })()
                                 }
                                 {ef.finding.related_files && ef.finding.related_files.length > 0 && (
                                   <span className="font-mono">{ef.finding.related_files.length} file{ef.finding.related_files.length !== 1 ? 's' : ''}</span>
@@ -410,6 +451,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                 <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">
                                   <span className="text-neutral-600">→</span>
                                   <TaskTypeBadge taskType={ef.outcome.taskType as import('../types/task').TaskType | undefined} />
+                                  {ef.outcome.status === 'FAILED' && ef.outcome.failureClass && FAILURE_CLASS_CONFIG[ef.outcome.failureClass] && (
+                                    <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-medium ${FAILURE_CLASS_CONFIG[ef.outcome.failureClass].color}`}>
+                                      {FAILURE_CLASS_CONFIG[ef.outcome.failureClass].label}
+                                    </span>
+                                  )}
                                   {ef.outcome.prUrl && isSafeUrl(ef.outcome.prUrl) && (
                                     <a
                                       href={ef.outcome.prUrl}
