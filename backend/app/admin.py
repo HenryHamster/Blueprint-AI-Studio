@@ -411,7 +411,7 @@ async def bulk_action_tasks(
                                 await session.commit()
                                 await _cleanup_branches(task, session)
                                 base_branch = (task.first_payload).get("base_branch", "main")
-                                if base_branch == "main":
+                                if base_branch == "main" and _runtime_config.get("smoketest_enabled"):
                                     try:
                                         type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
                                         type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
@@ -1059,7 +1059,7 @@ async def modify_task(
                         # Post-merge cleanup: branches + smoketest (mirrors webhook merge path)
                         await _cleanup_branches(task, session)
                         base_branch = (task.first_payload).get("base_branch", "main")
-                        if base_branch == "main":
+                        if base_branch == "main" and _runtime_config.get("smoketest_enabled"):
                             try:
                                 type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
                                 type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None

@@ -617,7 +617,7 @@ async def _process_post_commit(
                                         # Spawn a smoketest after rollup merges to main
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
-                                        if is_rollup_merge and base_branch == "main":
+                                        if is_rollup_merge and base_branch == "main" and _runtime_config.get("smoketest_enabled"):
                                             try:
                                                 type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
                                                 type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
