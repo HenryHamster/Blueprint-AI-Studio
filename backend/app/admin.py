@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from typing import Optional, Dict, Any, List, TypedDict
@@ -22,6 +22,7 @@ from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
 from app.broadcast import broadcast_to_project
+from app.payload_schemas import TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -687,11 +688,11 @@ class CreateTaskPayload(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1, max_length=50000)
     base_branch: str = Field(default="main", max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
-    task_type: str = Field(default="create", pattern=r"^(create|plan|research|review|fix|security_audit|qa|deps|docs)$")
+    task_type: TaskType = Field(default=TaskType.create)
     pr_number: Optional[int] = None
     branch: Optional[str] = Field(default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
     model: Optional[str] = Field(default=None, min_length=1)
-    effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high)$")
+    effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high|max)$")
 
     @field_validator("base_branch", "branch")
     @classmethod
@@ -706,6 +707,12 @@ class CreateTaskPayload(BaseModel):
             if ".." in part:
                 raise ValueError(f"Branch component cannot contain '..': {part}")
         return v
+
+    @model_validator(mode="after")
+    def validate_pr_required_for_review_fix(self) -> "CreateTaskPayload":
+        if self.task_type in (TaskType.review, TaskType.fix) and self.pr_number is None:
+            raise ValueError(f"pr_number is required for task_type '{self.task_type.value}'")
+        return self
 
 @router.post("/tasks")
 @limiter.limit("60/minute")

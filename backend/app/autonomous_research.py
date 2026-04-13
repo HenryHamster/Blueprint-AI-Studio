@@ -22,6 +22,7 @@ from app.models import (
     Task, Project, TaskHistory, TaskStatus, ProjectMessage,
 )
 from app.database import AsyncSessionLocal
+from app.payload_schemas import validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
@@ -77,7 +78,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         for m in open_msgs_result.scalars().all()
     ]
 
-    payload: dict = {
+    payload: dict = validate_internal_payload({
         "type": "design_doc_update",
         "design_doc": project.design_doc or {},
         "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
@@ -87,7 +88,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "base_branch": "main",
         **({"model": doc_model} if doc_model else {}),
         **({"effort": doc_effort} if doc_effort else {}),
-    }
+    }, "autonomous_research:design_doc_update")
     cycle_id = "sc-" + uuid.uuid4().hex[:8]
     new_task = Task(
         project_id=project.id,
@@ -198,7 +199,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
     from app.strategic_analysis import _build_outcome_evaluation  # noqa: PLC0415
-    payload: dict = {
+    payload: dict = validate_internal_payload({
         "type": "strategic_review",
         "research_mode": "strategic",
         "design_doc": project.design_doc or {},
@@ -210,7 +211,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),
-    }
+    }, "autonomous_research:strategic_review")
     new_task = Task(
         project_id=project.id,
         title=f"Strategic review: {project.name}",
@@ -670,6 +671,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         else:
             direction_text = (chosen_direction.get("text") or "general improvement")[:200]
 
+        research_payload = validate_internal_payload(research_payload, "autonomous_research:research")
         new_task = Task(
             project_id=project.id,
             title=f"Research: {direction_text}",

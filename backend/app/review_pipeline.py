@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import Task, TaskHistory, TaskStatus
+from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.broadcast import broadcast_to_project
 
@@ -274,6 +275,7 @@ async def _spawn_pipeline_task(
                     )
                 return None
 
+    payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}
     propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
     new_task = Task(

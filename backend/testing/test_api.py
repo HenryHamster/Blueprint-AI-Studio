@@ -25,7 +25,7 @@ async def test_deploy_blueprint(client: AsyncClient, mocker):
 
     payload = {
         "name": "Test Project",
-        "payloads": [{"command": "echo hello"}],
+        "payloads": [{"type": "smoketest"}],
         "storage_uris": []
     }
 
@@ -65,7 +65,7 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     # 1. Create project
     payload = {
         "name": "Test Project Tasks",
-        "payloads": [{"command": "echo hello"}],
+        "payloads": [{"type": "smoketest"}],
         "storage_uris": []
     }
     create_resp = await client.post("/api/deploy", json=payload)
@@ -76,10 +76,10 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["tasks"]) == 2
-    # The child task (has a parent_task_id) carries the original payload
+    # The child task (has a parent_task_id) carries the validated payload
     child_tasks = [t for t in data["tasks"] if t["parent_task_id"] is not None]
     assert len(child_tasks) == 1
-    assert child_tasks[0]["payloads"] == [{"command": "echo hello"}]
+    assert child_tasks[0]["payloads"][0]["type"] == "smoketest"
 
 @pytest.mark.asyncio
 async def test_get_project_tasks_not_found(client: AsyncClient):
@@ -128,7 +128,7 @@ async def test_deploy_extra_fields_are_ignored(client: AsyncClient, mocker):
     mocker.patch("app.main.provision_agent_vm", return_value=None)
     payload = {
         "name": "Test Extra Fields",
-        "payloads": [{"command": "echo hello"}],
+        "payloads": [{"type": "smoketest"}],
         "unexpected_field": "should be ignored",
         "another_extra": 42
     }

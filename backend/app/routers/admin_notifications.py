@@ -45,10 +45,7 @@ class AdminPlaybookSet(BaseModel):
 
 _ADMIN_PLAYBOOK_KEY_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$')
 
-_VALID_TASK_TYPES = frozenset({
-    "create", "fix", "refactor", "qa", "migrate", "deps",
-    "smoketest", "research", "review", "plan", "debug",
-})
+from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
 
 _SEED_ENTRIES: Dict[str, dict] = {
     "build-backend": {

@@ -1359,10 +1359,7 @@ async def update_design_doc(
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
 
-_VALID_TASK_TYPES = frozenset({
-    "create", "fix", "refactor", "qa", "migrate", "deps",
-    "smoketest", "research", "review", "plan", "debug",
-})
+from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID

@@ -30,6 +30,7 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
+from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.task_completion import (
     _extract_json_array,
@@ -630,19 +631,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
         # Inherit parent direction_id if the finding doesn't specify one
         parent_direction_id = (task.context or {}).get("direction_id")
+        finding_payload = validate_internal_payload({
+            "type": task_type,
+            "prompt": full_prompt,
+            "base_branch": research_branch,
+            **(({'model': finding_model} if finding_model else {})),
+            **(({'effort': finding_effort} if finding_effort else {})),
+            **({"prompt_suffix": type_suffix} if type_suffix else {}),
+        }, f"research_completion:finding:{task_type}")
         new_task = Task(
             project_id=task.project_id,
             title=title,
             description=finding.get("description", prompt[:200]),
             parent_task_id=task.id,
-            payloads=[{
-                "type": task_type,
-                "prompt": full_prompt,
-                "base_branch": research_branch,
-                **(({'model': finding_model} if finding_model else {})),
-                **(({'effort': finding_effort} if finding_effort else {})),
-                **({"prompt_suffix": type_suffix} if type_suffix else {}),
-            }],
+            payloads=[finding_payload],
             context={
                 "research_task_id": str(task.id),
                 "parent_research_task_id": str(task.id),

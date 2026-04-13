@@ -44,7 +44,7 @@ async def _deploy_project(client: AsyncClient, mocker, name: str = "Test Project
     mocker.patch("app.main.provision_agent_vm", return_value=None)
     resp = await client.post(
         "/api/deploy",
-        json={"name": name, "payloads": [{"command": "setup"}], "storage_uris": []},
+        json={"name": name, "payloads": [{"type": "smoketest"}], "storage_uris": []},
     )
     assert resp.status_code == 200
     return resp.json()["project_id"]

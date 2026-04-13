@@ -21,6 +21,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
 from app.shared_state import limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
@@ -69,6 +70,10 @@ async def deploy_blueprint(
     await session.flush()  # Assign parent_task.id without committing
 
     for p in payload.payloads:
+        try:
+            p = validate_task_payload(p)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
 

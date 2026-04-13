@@ -23,6 +23,7 @@ from app.schemas import (
     GitHubPRReviewCommentRequest, GitHubCreateIssueRequest,
     GitHubGetIssuesRequest, GitHubCreateBranchRequest, GitHubCreatePRRequest,
 )
+from app.payload_schemas import validate_task_payload
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
@@ -662,6 +663,10 @@ async def spawn_subtask(
 
     new_tasks = []
     for payload in req.payloads:
+        try:
+            payload = validate_task_payload(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),
