@@ -329,7 +329,7 @@ ROLLUP_MANAGEMENT_MAX_FUNCTIONS = 4
 REVIEW_PIPELINE_MAX_LINES = 350
 REVIEW_PIPELINE_MAX_FUNCTIONS = 4
 
-ORCHESTRATOR_MAX_LINES = 1340        # Ratcheted after orchestrator_filters.py extraction (was 1450, now 1299)
+ORCHESTRATOR_MAX_LINES = 1400        # Bumped for infra-wide provision failure classification (was 1340)
 ORCHESTRATOR_MAX_FUNCTIONS = 10      # Current 6 + 4 slots
 
 ORCHESTRATOR_FILTERS_MAX_LINES = 200

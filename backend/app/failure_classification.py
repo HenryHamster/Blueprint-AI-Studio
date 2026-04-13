@@ -51,6 +51,7 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
 
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
     if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
+                                      "500 internal server error",
                                       "502 bad gateway", "503 service unavailable",
                                       "github api error", "claude api",
                                       "connection timed out", "name resolution failed",

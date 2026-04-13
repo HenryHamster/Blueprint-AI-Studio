@@ -659,9 +659,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     invalidate_github_token_cache(str(parent.project_id))
                     logger.warning(f"[ROLLUP] Auth failure (401) for parent {parent.id} — invalidated token cache")
                 is_transient = (
-                    isinstance(e, HTTPException) and e.status_code == 401
+                    isinstance(e, HTTPException) and e.status_code in (401, 500, 502, 503, 504)
                 ) or any(kw in err_str for kw in [
-                    "api.github.com", "502", "503", "connection", "timeout",
+                    "api.github.com",
+                    "500 internal server error", "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+                    "internal server error",
+                    "connection", "timeout",
                     "rate limit", "ssl", "name resolution",
                     # Staging branch may have been deleted by a race — retry
                     # to allow recovery or manual intervention
@@ -670,10 +673,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     "unauthorized", "bad credentials", "token expired",
                 ])
                 rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
-                if is_transient and rollup_retries <= 3:
+                if is_transient and rollup_retries <= 5:
                     # Transient GitHub error — leave parent EVALUATING, retry next cycle
                     parent.context = {**(parent.context or {}), "_rollup_retries": rollup_retries}
-                    parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/3), will retry: {type(e).__name__}"
+                    parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/5), will retry: {type(e).__name__}"
                     logger.warning(f"[ROLLUP] Transient error creating rollup PR (attempt {rollup_retries}): {e}")
                 else:
                     logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)

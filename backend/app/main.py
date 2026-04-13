@@ -2130,8 +2130,50 @@ async def update_agent_status(
                         task.last_heartbeat = None
                         task.started_at = None
                         task.latest_status_message = f"{failure_class.replace('_', ' ').title()} — requeued"
-                        # Clear stale state so dispatcher picks it up fresh
-                        if failure_class != "EXTERNAL_API":
+                        # For rate-limited tasks: check if any account is still available.
+                        # If all are exhausted, set retry_after based on earliest recovery
+                        # to prevent rapid cycling through exhausted accounts.
+                        if failure_class == "RATE_LIMIT":
+                            model = _extract_task_model(task)
+                            blacklisted = ctx.get("blacklisted_accounts") or []
+                            # Check this user's accounts to see if any are available.
+                            # Find which user pool the failed account belongs to.
+                            any_available = False
+                            earliest_recovery = None
+                            async with _max_plan_pool_lock:
+                                # Find user pool via the account that just failed
+                                user_pool = []
+                                if acct_id:
+                                    for uid, pool in _max_plan_pools.items():
+                                        if any(a["id"] == acct_id for a in pool):
+                                            user_pool = pool
+                                            break
+                                for a in user_pool:
+                                    if a["id"] in blacklisted:
+                                        continue
+                                    if _account_available_for_model(a, model):
+                                        any_available = True
+                                        break
+                                    # Track earliest model recovery across user's accounts
+                                    dm = a.get("disabled_models", {})
+                                    if model and model in dm:
+                                        info = dm[model]
+                                        disabled_at = info.get("at")
+                                        if disabled_at:
+                                            hits = info.get("hits", 1)
+                                            cooldown_min = min(30 * (2 ** (hits - 1)), 240)
+                                            recovery_dt = disabled_at + timedelta(minutes=cooldown_min)
+                                            if earliest_recovery is None or recovery_dt < earliest_recovery:
+                                                earliest_recovery = recovery_dt
+                            if any_available:
+                                ctx.pop("retry_after", None)
+                            elif earliest_recovery:
+                                ctx["retry_after"] = earliest_recovery.isoformat()
+                                task.latest_status_message = f"Rate Limited — all accounts exhausted, waiting for recovery"
+                            else:
+                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=5)).isoformat()
+                                task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
+                        elif failure_class != "EXTERNAL_API":
                             ctx.pop("retry_after", None)
                         ctx.pop("max_plan_account_id", None)
                         ctx.pop("_slot_released", None)

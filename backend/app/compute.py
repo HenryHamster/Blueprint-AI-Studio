@@ -35,6 +35,16 @@ FALLBACK_ZONES: list[tuple[str, str]] = [
     ("us-west1-a",    "agent-sandbox-subnet-us-west1"),
 ]
 
+# Patterns indicating infrastructure-wide provision failure (not task-specific).
+# Used by orchestrator and reaper to avoid burning retry budgets for transient outages.
+INFRA_PROVISION_PATTERNS = [
+    "all zones in cooldown", "all zones exhausted",
+    "global provision capacity",
+    "zone_resource_pool_exhausted", "quota", "cpus_all_regions",
+    "does not have enough resources", "in_use_addresses",
+    "503 service unavailable",
+]
+
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
 

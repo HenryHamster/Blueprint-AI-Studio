@@ -53,17 +53,29 @@ async def _github_request(
         try:
             client = _get_client()
             response = await client.request(method, url, headers=headers, **kwargs)
-            # 429 rate limit — respect Retry-After header
-            if response.status_code == 429 and attempt < max_retries - 1:
-                retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
-                retry_after = min(retry_after, 60)  # cap at 60s
+            # 429 or 403 rate limit — GitHub uses 403 for primary rate limit
+            # exhaustion (5,000 req/hr) and 429 for secondary/search limits.
+            # Both should be retried with Retry-After / X-RateLimit-Reset.
+            is_rate_limited = response.status_code == 429 or (
+                response.status_code == 403
+                and response.headers.get("X-RateLimit-Remaining") == "0"
+            )
+            if is_rate_limited and attempt < max_retries - 1:
+                retry_after = response.headers.get("Retry-After")
+                reset_ts = response.headers.get("X-RateLimit-Reset")
+                if retry_after:
+                    delay = min(int(retry_after), 120)
+                elif reset_ts:
+                    delay = min(max(0, int(reset_ts) - int(time.time())) + 1, 120)
+                else:
+                    delay = min(2 ** attempt * 10, 120)
                 logger.warning(
-                    f"[GITHUB] {method} {url} rate limited, "
-                    f"retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})"
+                    f"[GITHUB] {method} {url} rate limited ({response.status_code}), "
+                    f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
                 )
-                await asyncio.sleep(retry_after)
+                await asyncio.sleep(delay)
                 continue
-            # Proactive rate limit check — back off before hitting 429
+            # Proactive rate limit check — back off before hitting the limit
             remaining = response.headers.get("X-RateLimit-Remaining")
             if remaining is not None:
                 try:

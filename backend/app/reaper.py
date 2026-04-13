@@ -11,7 +11,7 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
-from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone
+from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
@@ -232,6 +232,15 @@ async def reaper_service():
                         provision_failures += 1
                         prov_zone = (task.context or {}).get("provision_zone")
                         failed_acct = (task.context or {}).get("max_plan_account_id")
+
+                        # Classify: infra-wide (all zones/quota exhausted) vs task-specific
+                        provision_err = get_provision_error(fresh_task.vm_instance_id or "")
+                        err_lower = ((provision_err or "") + " " + (task.latest_status_message or "")).lower()
+                        is_infra = (
+                            any(p in err_lower for p in INFRA_PROVISION_PATTERNS)
+                            or (not prov_zone and not any_zone_available())
+                        )
+
                         if prov_zone:
                             # VM was created (GCP API succeeded) but agent never claimed.
                             # Capture serial logs before the VM is deleted — this is the
@@ -259,20 +268,32 @@ async def reaper_service():
                                 )
                             new_ctx = {
                                 **(task.context or {}),
-                                "provision_failures": provision_failures,
                                 "blacklisted_accounts": blacklisted or None,
                             }
                             if serial_log:
                                 new_ctx["last_serial_log"] = serial_log[-500:]
-                            task.context = new_ctx
                             record_zone_failure(prov_zone, reason="AGENT_STARTUP_FAILURE")
                         else:
                             # No provision_zone — VM may never have been created.
-                            # Record zone failure if we can determine the zone.
-                            task.context = {**(task.context or {}), "provision_failures": provision_failures}
-                        can_retry = provision_failures < max_provision_retries
-                        if not can_retry:
-                            logger.error(f"[REAPER] Task {task.id} provision failed {provision_failures} times — giving up")
+                            new_ctx = dict(task.context or {})
+
+                        if is_infra:
+                            # Infrastructure-wide failure — don't burn task retry budget
+                            provision_failures -= 1  # Undo the increment above
+                            infra_count = new_ctx.get("provision_failures_infra", 0) + 1
+                            new_ctx["provision_failures_infra"] = infra_count
+                            new_ctx["provision_failures"] = provision_failures
+                            new_ctx["_infra_wait"] = True
+                            task.context = new_ctx
+                            can_retry = True
+                            logger.warning(f"[REAPER] Task {task.id} infra-wide provision failure (#{infra_count}) — requeuing without burning retry budget")
+                        else:
+                            new_ctx["provision_failures"] = provision_failures
+                            new_ctx.pop("_infra_wait", None)
+                            task.context = new_ctx
+                            can_retry = provision_failures < max_provision_retries
+                            if not can_retry:
+                                logger.error(f"[REAPER] Task {task.id} provision failed {provision_failures} times — giving up")
                     else:
                         can_retry = task.attempt_count < _runtime_config["max_retries"]
 
@@ -306,7 +327,15 @@ async def reaper_service():
                             # Clear account so dispatcher does fresh selection (respects blacklist)
                             reaper_ctx.pop("max_plan_account_id", None)
                             reaper_ctx.pop("_slot_released", None)
-                            if is_provision_failure:
+                            if is_provision_failure and (task.context or {}).get("_infra_wait"):
+                                # Infra-wide failure: align with zone recovery
+                                recovery = soonest_zone_recovery()
+                                if recovery:
+                                    wait_sec = max(60, (recovery - datetime.now(timezone.utc)).total_seconds() + 60)
+                                    delay_minutes = min(wait_sec / 60, 30)
+                                else:
+                                    delay_minutes = 10 * random.uniform(0.75, 1.25)
+                            elif is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
                             else:
                                 # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
@@ -329,7 +358,7 @@ async def reaper_service():
                             provision_zone = ctx.get("provision_zone", "unknown zone")
                             blacklisted_accounts = ctx.get("blacklisted_accounts", [])
                             acct_id = ctx.get("max_plan_account_id", "no account")
-                            gcp_error = get_provision_error(task.vm_instance_id or "") or "no GCP error captured"
+                            gcp_error = provision_err or "no GCP error captured"
                             gcp_error_short = gcp_error[:200]
                             # Distinguish: VM created but agent died vs. GCP API failure
                             if provision_zone and provision_zone != "unknown zone":

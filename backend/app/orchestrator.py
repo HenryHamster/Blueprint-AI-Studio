@@ -20,6 +20,7 @@ from sqlalchemy import func as _func
 from sqlmodel import select
 
 from app.compute import (
+    INFRA_PROVISION_PATTERNS,
     any_zone_available,
     get_provision_error,
     get_vm_zone,
@@ -401,6 +402,13 @@ async def orchestrator_worker():
                                 continue
                         except (ValueError, TypeError):
                             pass  # Malformed retry_after — let it through
+                    # Clear infra-wait flag when task becomes eligible again
+                    if (task.context or {}).get("_infra_wait"):
+                        ctx = dict(task.context or {})
+                        ctx.pop("_infra_wait", None)
+                        ctx.pop("retry_after", None)
+                        task.context = ctx
+                        session.add(task)
 
                     deps = task.depends_on or []
                     if not deps:
@@ -860,32 +868,63 @@ async def orchestrator_worker():
                                         failed_task = await inner_session.get(Task, t_id)
                                         if failed_task:
                                             ctx = dict(failed_task.context or {})
-                                            prov_failures = ctx.get("provision_failures", 0) + 1
-                                            ctx["provision_failures"] = prov_failures
                                             if prov_zone:
                                                 ctx["provision_zone"] = prov_zone
                                             if serial_log:
                                                 ctx["last_serial_log"] = serial_log[-500:]
-                                            max_prov_retries = _runtime_config["max_provision_retries"]
-                                            if prov_failures >= max_prov_retries:
-                                                # Exhausted retries — permanent failure
-                                                failed_task.status = TaskStatus.FAILED
-                                                failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
-                                                await _maybe_create_failure_alert(
-                                                    failed_task, inner_session,
-                                                    (provision_err or "unknown error")[:200]
-                                                )
-                                                logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
-                                            else:
-                                                # Requeue for retry — zone exhaustion is transient
+
+                                            # Classify: infra-wide (zone/quota exhaustion) vs task-specific
+                                            err_lower = (provision_err or "").lower()
+                                            is_infra = (
+                                                any(p in err_lower for p in INFRA_PROVISION_PATTERNS)
+                                                or not any_zone_available()
+                                            )
+
+                                            if is_infra:
+                                                # Infrastructure-wide failure — don't burn retry budget
+                                                infra_count = ctx.get("provision_failures_infra", 0) + 1
+                                                ctx["provision_failures_infra"] = infra_count
+                                                ctx["_infra_wait"] = True
                                                 failed_task.status = TaskStatus.QUEUED
                                                 failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                                                 failed_task.last_heartbeat = None
                                                 failed_task.started_at = None
-                                                # Back off 2 min per failure to let zones recover
-                                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
-                                                failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
-                                                logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
+                                                # Align retry with zone recovery; cap at 30 min
+                                                recovery = soonest_zone_recovery()
+                                                if recovery:
+                                                    wait_sec = max(60, (recovery - datetime.now(timezone.utc)).total_seconds() + 60)
+                                                    delay_min = min(wait_sec / 60, 30)
+                                                else:
+                                                    delay_min = 10
+                                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_min)).isoformat()
+                                                failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[:500]
+                                                logger.warning(f"[ORCHESTRATOR] Task {t_id} infra provision failure — requeuing without burning retry budget (delay {delay_min:.0f}min)")
+                                            else:
+                                                # Task-specific failure — burn retry budget
+                                                prov_failures = ctx.get("provision_failures", 0) + 1
+                                                ctx["provision_failures"] = prov_failures
+                                                ctx.pop("_infra_wait", None)
+                                                max_prov_retries = _runtime_config["max_provision_retries"]
+                                                if prov_failures >= max_prov_retries:
+                                                    # Exhausted retries — permanent failure
+                                                    failed_task.status = TaskStatus.FAILED
+                                                    failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
+                                                    await _maybe_create_failure_alert(
+                                                        failed_task, inner_session,
+                                                        (provision_err or "unknown error")[:200]
+                                                    )
+                                                    logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
+                                                else:
+                                                    # Requeue for retry
+                                                    failed_task.status = TaskStatus.QUEUED
+                                                    failed_task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                                                    failed_task.last_heartbeat = None
+                                                    failed_task.started_at = None
+                                                    # Back off 2 min per failure to let zones recover
+                                                    ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
+                                                    failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
+                                                    logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
+
                                             failed_task.context = ctx
                                             inner_session.add(failed_task)
                                             await inner_session.commit()
