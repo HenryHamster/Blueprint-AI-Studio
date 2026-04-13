@@ -26,6 +26,38 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> None:
+    """Record a FAILED strategic task in the circuit breaker and cycle history.
+
+    Called from _process_post_commit when a design_doc_update or strategic_review
+    task terminates with FAILED status (VM crash, timeout, etc.).
+    """
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return
+    vision = dict(project.vision or {})
+    failures = vision.get("_strategic_failures", 0) + 1
+    vision["_strategic_failures"] = failures
+    vision["_strategic_failures_at"] = _utcnow().isoformat()
+    project.vision = vision
+    flag_modified(project, "vision")
+    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    if cycle_id:
+        task_type = task.first_payload.get("type", "")
+        failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+        _update_cycle_history(project, cycle_id, {
+            f"{failed_phase}_completed_at": _utcnow().isoformat(),
+            "outcome": "failed",
+            "failed_phase": failed_phase,
+            "error": (task.latest_status_message or "task failed")[:200],
+        })
+    session.add(project)
+    logger.warning(
+        f"[STRATEGIC] {task.first_payload.get('type')} task {task.id} FAILED "
+        f"(failure #{failures}): {(task.latest_status_message or '')[:120]}"
+    )
+
+
 def _check_direction_health(direction: dict) -> Optional[str]:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []

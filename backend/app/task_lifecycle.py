@@ -306,7 +306,7 @@ async def _process_post_commit(
         _handle_security_audit_completion, _handle_perf_completion,
         _handle_investigation_completion,
     )
-    from app.strategic_completion import _handle_strategic_completion  # noqa: PLC0415
+    from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure  # noqa: PLC0415
     from app.research_completion import _handle_research_completion  # noqa: PLC0415
 
     factory = _session_factory or AsyncSessionLocal
@@ -338,6 +338,13 @@ async def _process_post_commit(
                         logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
             except Exception as e:
                 logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
+
+            # Record strategic task failures for the circuit breaker and cycle history
+            if task.first_payload.get("type") in ("design_doc_update", "strategic_review"):
+                try:
+                    await _record_strategic_task_failure(task, session)
+                except Exception as _strat_exc:
+                    logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
