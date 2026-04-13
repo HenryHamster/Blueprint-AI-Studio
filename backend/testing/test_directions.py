@@ -896,8 +896,10 @@ class TestComputeMergeRate:
             "research_history": [{"prs_merged": 1}],
             "history_aggregate": {"total_cycles": 4, "total_prs_merged": 8},
         }
-        # 1 live cycle + 4 aggregated = 5 total; 1 + 8 = 9 merged
-        assert _compute_merge_rate(d) == pytest.approx(9 / 5)
+        # lifetime: 1 live + 4 agg = 5 cycles, 1+8=9 merged → 1.8
+        # recent (last 3 live): [{"prs_merged":1}] → rate=1.0
+        # weighted: (1.0*3 + 1.8) / 4 = 1.2
+        assert _compute_merge_rate(d) == pytest.approx(1.2)
 
     def test_higher_merge_rate_sorted_first(self):
         """Within the same priority tier, higher merge_rate direction is selected first."""

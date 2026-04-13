@@ -58,14 +58,25 @@ def _compute_momentum_factor(d: dict) -> float:
 
 
 def _compute_merge_rate(d: dict) -> float:
-    """Return merged-PRs-per-cycle for a direction. Returns 0.5 (neutral) if never researched."""
+    """Return merged-PRs-per-cycle for a direction, with recency weighting.
+
+    Weights the last 3 cycles 3x relative to the lifetime average for
+    responsiveness to recent changes. Returns 0.5 (neutral) if never researched.
+    """
     history = d.get("research_history", [])
     agg = d.get("history_aggregate", {})
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
     total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
     if total_cycles == 0:
         return 0.5  # unknown, neutral
-    return total_merged / total_cycles
+    lifetime_rate = total_merged / total_cycles
+    # Weight last 3 cycles 3x for responsiveness to recent changes
+    recent = history[-3:]
+    if not recent:
+        return lifetime_rate
+    recent_merged = sum(e.get("prs_merged", 0) for e in recent)
+    recent_rate = recent_merged / len(recent)
+    return (recent_rate * 3 + lifetime_rate) / 4
 
 
 def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
