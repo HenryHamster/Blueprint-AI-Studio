@@ -521,6 +521,10 @@ async def orchestrator_worker():
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = msg
                                         fix_session.add(fix_task)
+                                        await broadcast_to_project(
+                                            str(fix_task.project_id), "task_updated",
+                                            {"task_id": str(task_id), "status": "QUEUED", "message": msg}
+                                        )
                                     eligible_ids.append(task_id)
                                     narrow_broken += 1
                                 await fix_session.commit()
@@ -584,6 +588,10 @@ async def orchestrator_worker():
                                         fix_task.depends_on = []
                                         fix_task.latest_status_message = msg
                                         fix_session.add(fix_task)
+                                        await broadcast_to_project(
+                                            str(fix_task.project_id), "task_updated",
+                                            {"task_id": str(task_id), "status": "QUEUED", "message": msg}
+                                        )
                                         broad_broken += 1
                                 await fix_session.commit()
 
