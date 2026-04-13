@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
-import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink } from 'lucide-react';
 import type { Task, ResearchFinding } from './TaskCard';
+import { TaskTypeBadge, isSafeUrl } from './TaskCard';
 import { API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
 
@@ -17,8 +18,8 @@ interface EnrichedFinding {
   taskId: string;
   taskCreatedAt: string;
   findingIndex: number;
-  /** Status of the child task that implemented this finding, if any. */
-  outcome?: string;
+  /** Info about the child task that implemented this finding, if any. */
+  outcome?: { status: string; taskType?: string; taskId: string; prUrl?: string };
 }
 
 /** Findings grouped under a direction (or "undirected"). */
@@ -101,14 +102,19 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
     return m;
   }, [directions]);
 
-  // Build the map of finding key -> child task status
+  // Build the map of finding key -> child task info
   const implementedFindings = useMemo(() => {
-    const map = new Map<string, string>();
+    const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string }>();
     for (const task of tasks) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
         const key = `${ctx.research_task_id}-${ctx.finding_index}`;
-        map.set(key, task.status);
+        map.set(key, {
+          status: task.status,
+          taskType: task.task_type,
+          taskId: task.id,
+          prUrl: task.pr_url,
+        });
       }
     }
     return map;
@@ -176,10 +182,10 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
   const filteredGroups = useMemo(() => {
     const matchesOutcome = (f: EnrichedFinding): boolean => {
       if (outcomeFilter === 'all') return true;
-      if (outcomeFilter === 'shipped') return f.outcome === 'COMPLETED';
-      if (outcomeFilter === 'in_progress') return !!f.outcome && IN_PROGRESS_OUTCOMES.has(f.outcome);
+      if (outcomeFilter === 'shipped') return f.outcome?.status === 'COMPLETED';
+      if (outcomeFilter === 'in_progress') return !!f.outcome && IN_PROGRESS_OUTCOMES.has(f.outcome.status);
       if (outcomeFilter === 'proposed') return !f.outcome;
-      if (outcomeFilter === 'failed') return !!f.outcome && FAILED_OUTCOMES.has(f.outcome);
+      if (outcomeFilter === 'failed') return !!f.outcome && FAILED_OUTCOMES.has(f.outcome.status);
       return true;
     };
 
@@ -196,7 +202,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
           )
         ),
       }))
-      .filter(g => g.findings.length > 0 || (outcomeFilter === 'all' && q && g.directionText.toLowerCase().includes(q)));
+      .filter(g => g.findings.length > 0 || (outcomeFilter === 'all' && (!q || g.directionText.toLowerCase().includes(q))));
   }, [groups, search, outcomeFilter]);
 
   const totalFindings = filteredGroups.reduce((sum, g) => sum + g.findings.length, 0);
@@ -276,8 +282,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
           {filteredGroups.map(group => {
             const groupKey = group.directionId ?? '_undirected';
             const isExpanded = effectiveExpanded.has(groupKey);
-            const mergedCount = group.findings.filter(f => f.outcome === 'COMPLETED').length;
-            const activeCount = group.findings.filter(f => f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome)).length;
+            const mergedCount = group.findings.filter(f => f.outcome?.status === 'COMPLETED').length;
+            const activeCount = group.findings.filter(f => f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome.status)).length;
+            const prCount = group.findings.filter(f => f.outcome?.prUrl).length;
 
             return (
               <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
@@ -308,6 +315,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                       {group.findings.length}
                       {mergedCount > 0 && <span className="text-emerald-500 ml-1">{mergedCount} merged</span>}
                       {activeCount > 0 && <span className="text-cyan-400 ml-1">{activeCount} active</span>}
+                      {prCount > 0 && <span className="text-blue-400 ml-1">{prCount} PRs</span>}
                     </span>
                   </div>
                 </button>
@@ -315,7 +323,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                 {isExpanded && (
                   <div className="border-t border-neutral-800 divide-y divide-neutral-800/50">
                     {group.findings.map((ef) => {
-                      const outcomeInfo = ef.outcome ? OUTCOME_STYLES[ef.outcome] : null;
+                      const outcomeInfo = ef.outcome ? OUTCOME_STYLES[ef.outcome.status] : null;
                       const OutcomeIcon = outcomeInfo?.icon;
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
@@ -355,6 +363,25 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                                   <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>
                                 )}
                               </div>
+                              {/* Downstream task chain */}
+                              {ef.outcome && (
+                                <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">
+                                  <span className="text-neutral-600">→</span>
+                                  <TaskTypeBadge taskType={ef.outcome.taskType as import('../types/task').TaskType | undefined} />
+                                  {ef.outcome.prUrl && isSafeUrl(ef.outcome.prUrl) && (
+                                    <a
+                                      href={ef.outcome.prUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors"
+                                      onClick={e => e.stopPropagation()}
+                                    >
+                                      <ExternalLink className="w-3 h-3" />
+                                      PR
+                                    </a>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           )}
                         </button>
