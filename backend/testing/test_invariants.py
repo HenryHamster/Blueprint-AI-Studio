@@ -530,8 +530,8 @@ class TestRollupManagementFreeze:
 # ── Autonomous Research Module Size Guards ───────────────────────────────────
 # Direction d-3d050b18: autonomous research spawning extracted from main.py
 
-AUTONOMOUS_RESEARCH_MAX_LINES = 1100   # Ratchet down as extractions land
-AUTONOMOUS_RESEARCH_MAX_FUNCTIONS = 12  # Ratchet down as extractions land
+AUTONOMOUS_RESEARCH_MAX_LINES = 1050   # Ratcheted down after direction_lifecycle extraction (actual: 1018)
+AUTONOMOUS_RESEARCH_MAX_FUNCTIONS = 11  # Ratcheted down after direction_lifecycle extraction (actual: 10)
 
 
 def _get_autonomous_research_py_path() -> str:
@@ -578,6 +578,62 @@ class TestAutonomousResearchFreeze:
         assert func_count <= AUTONOMOUS_RESEARCH_MAX_FUNCTIONS, (
             f"autonomous_research.py has {func_count} functions, exceeding the ceiling of "
             f"{AUTONOMOUS_RESEARCH_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+# ── Direction Lifecycle Module Size Guards ──────────────────────────────────
+# Extracted from autonomous_research.py to create headroom in that module.
+
+DIRECTION_LIFECYCLE_MAX_LINES = 170   # actual: 121 (50 headroom)
+DIRECTION_LIFECYCLE_MAX_FUNCTIONS = 4  # actual: 2 (_utcnow + _process_direction_lifecycle)
+
+
+def _get_direction_lifecycle_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "direction_lifecycle.py")
+
+
+class TestDirectionLifecycleFreeze:
+    """Enforce the direction_lifecycle.py freeze: no new functions, no line growth."""
+
+    def test_direction_lifecycle_line_count(self):
+        """direction_lifecycle.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to direction_lifecycle.py.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_direction_lifecycle_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= DIRECTION_LIFECYCLE_MAX_LINES, (
+            f"direction_lifecycle.py has {count} lines, exceeding the ceiling of "
+            f"{DIRECTION_LIFECYCLE_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_direction_lifecycle_function_count(self):
+        """direction_lifecycle.py must not gain new functions.
+
+        If this fails: a new function was added to direction_lifecycle.py.
+        New functionality must go in an appropriate extracted module instead.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_direction_lifecycle_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= DIRECTION_LIFECYCLE_MAX_FUNCTIONS, (
+            f"direction_lifecycle.py has {func_count} functions, exceeding the ceiling of "
+            f"{DIRECTION_LIFECYCLE_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules. "
             "Once a function-removing extraction lands, ratchet the ceiling down."
         )
