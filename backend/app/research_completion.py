@@ -402,7 +402,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
     )).scalars().all()
     recent_finding_hashes = {
-        t.context["finding_hash"] for t in recent_tasks_for_dedup if t.context and t.context.get("finding_hash")
+        t.context["finding_hash"] for t in recent_tasks_for_dedup
+        if t.context and t.context.get("finding_hash")
+        and not (t.status == TaskStatus.COMPLETED and not (t.context or {}).get("pr_merged"))
     }
     # Build a map of finding_hash -> outcome for failed/cancelled tasks for better logging
     failed_hashes = {

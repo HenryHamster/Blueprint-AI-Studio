@@ -148,7 +148,7 @@ export default function App() {
   }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
 
   // Project members panel
-  const [showProjectMembers, setShowProjectMembers] = useState(false);
+  const [showProjectMembers] = useState(false);
   const selectedProject = useMemo(
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
@@ -436,8 +436,6 @@ export default function App() {
         tasks={s.tasks}
         selectedProjectId={s.selectedProjectId}
         onSelectProject={s.setSelectedProjectId}
-        showMembers={showProjectMembers}
-        onToggleMembers={() => setShowProjectMembers(prev => !prev)}
       />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (
@@ -640,7 +638,6 @@ export default function App() {
                   });
                 }}
                 onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
-                onArchiveGroup={(taskIds) => s.handleBulkArchiveColumn(taskIds)}
               />
             </main>
             </ErrorBoundary>

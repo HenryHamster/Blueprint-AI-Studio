@@ -612,6 +612,118 @@ async def test_all_findings_deduplicated_auto_completes_task(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_ghost_completion_does_not_block_rededup(db_session, mocker):
+    """A COMPLETED task without pr_merged=True (ghost completion) must NOT block re-proposal."""
+    direction = _active_direction("d-ghost01", "Ghost completion direction")
+    project = Project(
+        name="Ghost Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Fix authentication token expiry handling"
+    dup_desc = "Auth tokens expire without proper notification"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Ghost completion: COMPLETED but no pr_merged in context
+    ghost = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(ghost)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Fix auth token expiry",
+            "priority": "high",
+            "scope": "small",
+            "risk": "high",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Ghost completion must NOT block re-proposal — child task should be created"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_merge_still_blocks_rededup(db_session, mocker):
+    """A COMPLETED task WITH pr_merged=True must still block re-proposal."""
+    direction = _active_direction("d-merged01", "Merged completion direction")
+    project = Project(
+        name="Merged Dedup Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Fix authentication token expiry handling"
+    dup_desc = "Auth tokens expire without proper notification"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+
+    # Confirmed merge: COMPLETED with pr_merged=True
+    merged = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "pr_merged": True},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(merged)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Fix auth token expiry",
+            "priority": "high",
+            "scope": "small",
+            "risk": "high",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "Confirmed merge (pr_merged=True) must still block re-proposal"
+
+
+@pytest.mark.asyncio
 async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     """Distinct findings that share fewer than 3 meaningful words each get a child task."""
     direction = _active_direction("d-unique01", "Unique findings direction")

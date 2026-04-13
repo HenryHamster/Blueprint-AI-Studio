@@ -124,8 +124,6 @@ export function HeaderBar(props: HeaderBarProps) {
     needsAttentionCount,
     onOpenNewTaskModal,
     onShowDirections,
-    onSignOut,
-    userEmail,
     wsRef,
     showSettings,
     onToggleSettings,
@@ -353,8 +351,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onRepairState={props.onRepairState}
           zoneHealth={props.zoneHealth}
           userRole={props.userRole}
-          userEmail={userEmail}
-          onSignOut={onSignOut}
+          userEmail={props.userEmail}
+          onSignOut={props.onSignOut}
           showUserManagement={props.showUserManagement}
           onToggleUserManagement={props.onToggleUserManagement}
         />
