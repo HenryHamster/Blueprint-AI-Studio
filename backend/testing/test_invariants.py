@@ -702,6 +702,114 @@ class TestDeployHealthFreeze:
         )
 
 
+# ── Research/Strategic Completion Module Size Guards ──────────────────────────
+# Direction d-8848700b: ceiling enforcement for uncapped completion modules
+
+RESEARCH_COMPLETION_MAX_LINES = 1050
+RESEARCH_COMPLETION_MAX_FUNCTIONS = 17
+STRATEGIC_COMPLETION_MAX_LINES = 920
+STRATEGIC_COMPLETION_MAX_FUNCTIONS = 10
+
+
+def _get_research_completion_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'research_completion.py')
+
+
+def _get_strategic_completion_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'strategic_completion.py')
+
+
+class TestResearchCompletionFreeze:
+    """Enforce the research_completion.py freeze: no new functions, no line growth."""
+
+    def test_research_completion_line_count(self):
+        """research_completion.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to research_completion.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_research_completion_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= RESEARCH_COMPLETION_MAX_LINES, (
+            f"research_completion.py has {count} lines, exceeding the ceiling of "
+            f"{RESEARCH_COMPLETION_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_research_completion_function_count(self):
+        """research_completion.py must not gain new functions.
+
+        If this fails: a new function was added to research_completion.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        Note: ast.walk counts nested functions too (3 nested in _handle_research_completion).
+        """
+        import ast
+        path = _get_research_completion_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= RESEARCH_COMPLETION_MAX_FUNCTIONS, (
+            f"research_completion.py has {func_count} functions (including nested), "
+            f"exceeding the ceiling of {RESEARCH_COMPLETION_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestStrategicCompletionFreeze:
+    """Enforce the strategic_completion.py freeze: no new functions, no line growth."""
+
+    def test_strategic_completion_line_count(self):
+        """strategic_completion.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to strategic_completion.py.
+        New functionality must go in extracted sub-modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_strategic_completion_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= STRATEGIC_COMPLETION_MAX_LINES, (
+            f"strategic_completion.py has {count} lines, exceeding the ceiling of "
+            f"{STRATEGIC_COMPLETION_MAX_LINES}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_strategic_completion_function_count(self):
+        """strategic_completion.py must not gain new functions.
+
+        If this fails: a new function was added to strategic_completion.py.
+        New functionality must go in extracted sub-modules.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_strategic_completion_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= STRATEGIC_COMPLETION_MAX_FUNCTIONS, (
+            f"strategic_completion.py has {func_count} functions, exceeding the ceiling of "
+            f"{STRATEGIC_COMPLETION_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted sub-modules. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
 # ── Frontend File Size Guards ────────────────────────────────────────────────
 # Enforces line count ceilings on the largest frontend files to prevent unbounded growth.
 
