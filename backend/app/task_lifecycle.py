@@ -33,6 +33,7 @@ from app.routers.agent import _has_local_cycle
 from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
+from app.payload_schemas import validate_internal_payload
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         new_payloads = copy.deepcopy(child.payloads or [])
         if parent_staging and new_payloads:
             new_payloads[0]["base_branch"] = parent_staging
+        new_payloads = [validate_internal_payload(p, "task_lifecycle:requeue_child") for p in new_payloads]
         new_child = Task(
             project_id=child.project_id,
             title=child.title,
@@ -744,17 +746,18 @@ async def _process_post_commit(
                                                 type_model = _runtime_config.get("task_type_models", {}).get("smoketest") or None
                                                 type_effort = _runtime_config.get("task_type_efforts", {}).get("smoketest") or None
                                                 health_check_urls = _runtime_config.get("health_check_urls") or []
+                                                _smoketest_payload = validate_internal_payload({
+                                                    "type": "smoketest",
+                                                    "base_branch": base_branch,
+                                                    **({"model": type_model} if type_model else {}),
+                                                    **({"effort": type_effort} if type_effort else {}),
+                                                    **({"health_check_urls": health_check_urls} if health_check_urls else {}),
+                                                }, "task_lifecycle:smoketest")
                                                 smoketest_task = Task(
                                                     project_id=task.project_id,
                                                     title=f"Smoketest after rollup merge to {base_branch}",
                                                     description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                                    payloads=[{
-                                                        "type": "smoketest",
-                                                        "base_branch": base_branch,
-                                                        **({"model": type_model} if type_model else {}),
-                                                        **({"effort": type_effort} if type_effort else {}),
-                                                        **({"health_check_urls": health_check_urls} if health_check_urls else {}),
-                                                    }],
+                                                    payloads=[_smoketest_payload],
                                                     vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                     status=TaskStatus.QUEUED,
                                                     created_by="ORCHESTRATOR",
@@ -798,20 +801,21 @@ async def _process_post_commit(
                                                         audit_title = audit_parent.title
                                                         type_model = _runtime_config.get("task_type_models", {}).get("security_audit") or None
                                                         type_effort = _runtime_config.get("task_type_efforts", {}).get("security_audit") or None
+                                                        _rescan_payload = validate_internal_payload({
+                                                            "type": "security_audit",
+                                                            "prompt": (
+                                                                f"Verify that the security fixes merged in PR #{pr_number} actually addressed "
+                                                                f"the reported vulnerabilities. Focus audit on these files: {changed_files}. "
+                                                                f"Output only PASS or remaining FAIL findings."
+                                                            ),
+                                                            **({"model": type_model} if type_model else {}),
+                                                            **({"effort": type_effort} if type_effort else {}),
+                                                        }, "task_lifecycle:security_audit")
                                                         rescan_task = Task(
                                                             project_id=orig.project_id,
                                                             title=f"Security rescan: verify {audit_title} fixes",
                                                             description=f"Verify that security fixes merged in PR #{pr_number} addressed reported vulnerabilities.",
-                                                            payloads=[{
-                                                                "type": "security_audit",
-                                                                "prompt": (
-                                                                    f"Verify that the security fixes merged in PR #{pr_number} actually addressed "
-                                                                    f"the reported vulnerabilities. Focus audit on these files: {changed_files}. "
-                                                                    f"Output only PASS or remaining FAIL findings."
-                                                                ),
-                                                                **({"model": type_model} if type_model else {}),
-                                                                **({"effort": type_effort} if type_effort else {}),
-                                                            }],
+                                                            payloads=[_rescan_payload],
                                                             parent_task_id=audit_parent.id,
                                                             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                             status=TaskStatus.QUEUED,

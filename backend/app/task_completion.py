@@ -28,6 +28,7 @@ from app.models import (
 )
 from app.routers.agent import get_github_token_for_task
 from app.shared_state import runtime_config as _runtime_config
+from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
@@ -414,14 +415,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
             requires_approval=False,  # review pipeline handles quality; only merge to main gates
-            payloads=[{
+            payloads=[validate_internal_payload({
                 "type": subtask_type,
                 "prompt": full_prompt,
                 "base_branch": plan_branch,
                 **({"model": subtask_model} if subtask_model else {}),
                 **({"effort": subtask_effort} if subtask_effort else {}),
                 **({"prompt_suffix": create_suffix} if create_suffix else {}),
-            }],
+            }, f"task_completion:plan_subtask:{subtask_type}")],
             context={
                 "plan_branch": plan_branch,
                 "parent_base": parent_base,
@@ -541,12 +542,12 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
             title=f"[{severity.upper()}] {title}",
             description=finding.get("description", fix_prompt[:200]),
             parent_task_id=task.id,
-            payloads=[{
+            payloads=[validate_internal_payload({
                 "type": "create",
                 "prompt": fix_prompt,
                 "base_branch": base_branch,
                 **({"prompt_suffix": create_suffix} if create_suffix else {}),
-            }],
+            }, "task_completion:security_finding")],
             context={
                 "security_audit_task_id": str(task.id),
                 "finding_index": i,
@@ -659,11 +660,11 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             title=f"[PERF] {title}",
             description=finding.get("description", fix_prompt[:200]),
             parent_task_id=task.id,
-            payloads=[{
+            payloads=[validate_internal_payload({
                 "type": "create",
                 "prompt": fix_prompt,
                 "base_branch": base_branch,
-            }],
+            }, "task_completion:perf_finding")],
             context={
                 "perf_task_id": str(task.id),
                 "finding_index": i,

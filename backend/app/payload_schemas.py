@@ -113,6 +113,8 @@ class ReviewPayload(BasePayload):
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
     original_prompt: Optional[str] = None
+    original_task_id: Optional[str] = None
+    original_task_type: Optional[str] = None
 
     @field_validator("branch")
     @classmethod
@@ -128,6 +130,8 @@ class FixPayload(BasePayload):
     prompt: str = Field(..., min_length=1)
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
+    original_task_id: Optional[str] = None
+    original_prompt: Optional[str] = None
 
     @field_validator("branch")
     @classmethod
@@ -144,19 +148,35 @@ class _SystemPopulated(BasePayload):
 
 
 class ResearchPayload(_SystemPopulated):
-    pass
+    directions: Optional[list] = None
+    research_mode: Optional[str] = None
+    current_direction_id: Optional[str] = None
+    anomaly_signals: Optional[list] = None
+    project_name: Optional[str] = None
+    design_doc: Optional[dict] = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
-    pass
+    design_doc: Optional[dict] = None
+    vision: Optional[dict] = None
+    directions_summary: Optional[list] = None
+    outcome_evaluation: Optional[dict] = None
+    open_messages: Optional[list] = None
+    project_name: Optional[str] = None
+    research_mode: Optional[str] = None
+    max_active_directions: Optional[int] = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
-    pass
+    design_doc: Optional[dict] = None
+    vision: Optional[dict] = None
+    open_messages: Optional[list] = None
+    project_name: Optional[str] = None
+    proposed_changes: Optional[list] = None
 
 
 class SecurityAuditPayload(_SystemPopulated):
-    pass
+    prompt: Optional[str] = None
 
 
 class QAPayload(_SystemPopulated):
@@ -172,15 +192,19 @@ class DocsPayload(_SystemPopulated):
 
 
 class SmokestestPayload(_SystemPopulated):
-    pass
+    health_check_urls: Optional[list] = None
 
 
 class DebugPayload(_SystemPopulated):
-    pass
+    failed_task_id: Optional[str] = None
+    failed_task_title: Optional[str] = None
+    error_logs: Optional[str] = None
+    failed_task_prompt: Optional[str] = None
+    failed_task_type: Optional[str] = None
 
 
 class PerfPayload(_SystemPopulated):
-    pass
+    prompt: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from app.database import get_session
 from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
+from app.payload_schemas import validate_internal_payload
 
 logger = logging.getLogger(__name__)
 
@@ -391,11 +392,11 @@ async def create_direction_research_task(
         description = f"[cooldown bypassed manually] {direction_text}"
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
-    task_payload = {
+    task_payload = validate_internal_payload({
         "type": "research",
         "directions": [direction],
         "base_branch": "main",
-    }
+    }, "directions:research")
     new_task = Task(
         project_id=project.id,
         title=f"Research: {direction_text[:200]}",
@@ -538,6 +539,8 @@ async def trigger_strategic_cycle(
     else:
         raise HTTPException(status_code=400, detail="Phase must be 'design_doc' or 'strategic_review'")
 
+    task_type = payload.get("type", phase)
+    payload = validate_internal_payload(payload, f"directions:{task_type}")
     new_task = Task(
         project_id=project.id,
         title=title,

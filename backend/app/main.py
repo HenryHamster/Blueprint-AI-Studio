@@ -1359,7 +1359,7 @@ async def update_design_doc(
 # Any agent task type can read/write persistent operational knowledge stored
 # as playbook/* keys in the project's design_doc JSONB column.
 
-from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
+from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES, validate_internal_payload as _validate_internal_payload  # noqa: E402
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
@@ -1927,7 +1927,7 @@ async def update_agent_status(
                             description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
                             parent_task_id=task.id,
                             priority=fix_priority,
-                            payloads=[{
+                            payloads=[_validate_internal_payload({
                                 "type": "plan",
                                 "prompt": (
                                     f"Smoke tests failed after a merge to {base_branch}. "
@@ -1946,7 +1946,7 @@ async def update_agent_status(
                                 "base_branch": base_branch,
                                 **({"model": type_model} if type_model else {}),
                                 **({"effort": type_effort} if type_effort else {}),
-                            }],
+                            }, "main:smoketest_fix_plan")],
                             context={
                                 "smoketest_task_id": str(task.id),
                                 "failed_tests": [t["name"] for t in failed_tests],
@@ -2017,11 +2017,11 @@ async def update_agent_status(
                     title=f"Fix: {fix_title}",
                     description=debug_data["fix_prompt"],
                     parent_task_id=task.parent_task_id or task.id,
-                    payloads=[{
+                    payloads=[_validate_internal_payload({
                         "type": "create",
                         "prompt": debug_data["fix_prompt"],
                         "base_branch": base_branch,
-                    }],
+                    }, "main:debug_auto_fix")],
                     context={
                         "debug_task_id": str(task.id),
                         "failed_task_id": failed_task_id,
@@ -2259,7 +2259,7 @@ async def update_agent_status(
                 title=f"Debug: {task.title}",
                 description=f"Automated root cause analysis for failed task: {task.title}",
                 parent_task_id=task.id,
-                payloads=[{
+                payloads=[_validate_internal_payload({
                     "type": "debug",
                     "failed_task_id": str(task.id),
                     "failed_task_title": task.title,
@@ -2267,7 +2267,7 @@ async def update_agent_status(
                     "base_branch": base_branch,
                     "failed_task_prompt": (failed_task_payload.get("prompt") or task.description or "")[:2000],
                     "failed_task_type": failed_task_type,
-                }],
+                }, "main:auto_debug")],
                 context={
                     "failed_task_id": str(task.id),
                     "parent_base": base_branch,

@@ -155,11 +155,11 @@ def test_extra_fields_preserved_create():
 def test_extra_fields_preserved_research():
     raw = {
         "type": "research",
-        "design_doc": "some doc text",
+        "design_doc": {"summary": "some doc text"},
         "research_context": {"key": "value"},
     }
     result = _valid(raw)
-    assert result["design_doc"] == "some doc text"
+    assert result["design_doc"] == {"summary": "some doc text"}
     assert result["research_context"] == {"key": "value"}
 
 
@@ -315,6 +315,219 @@ def test_internal_payload_does_not_raise_on_bad_input():
     for raw in bad_inputs:
         result = validate_internal_payload(raw, "safety_check")
         assert result is raw
+
+
+# ---------------------------------------------------------------------------
+# New Optional typed fields — correct types accepted
+# ---------------------------------------------------------------------------
+
+def test_research_payload_optional_fields_accepted():
+    raw = {
+        "type": "research",
+        "directions": [{"id": "d1", "title": "Improve X"}],
+        "research_mode": "standard",
+        "current_direction_id": "d-abc123",
+        "anomaly_signals": [{"signal": "high error rate"}],
+        "project_name": "MyProject",
+        "design_doc": {"summary": "Current design"},
+    }
+    result = _valid(raw)
+    assert result["directions"] == [{"id": "d1", "title": "Improve X"}]
+    assert result["research_mode"] == "standard"
+    assert result["current_direction_id"] == "d-abc123"
+    assert result["anomaly_signals"] == [{"signal": "high error rate"}]
+    assert result["project_name"] == "MyProject"
+    assert result["design_doc"] == {"summary": "Current design"}
+
+
+def test_research_payload_omit_optional_fields_passes():
+    result = _valid({"type": "research"})
+    assert result["type"] == "research"
+    assert "directions" not in result
+    assert "research_mode" not in result
+    assert "current_direction_id" not in result
+
+
+def test_research_payload_directions_wrong_type_rejected():
+    msg = _invalid({"type": "research", "directions": "not-a-list"})
+    assert "research" in msg
+
+
+def test_research_payload_design_doc_wrong_type_rejected():
+    msg = _invalid({"type": "research", "design_doc": "not-a-dict"})
+    assert "research" in msg
+
+
+def test_design_doc_update_optional_fields_accepted():
+    raw = {
+        "type": "design_doc_update",
+        "design_doc": {"summary": "Current design"},
+        "vision": {"text": "Our vision"},
+        "open_messages": [{"id": "m1", "body": "Question?"}],
+        "project_name": "MyProject",
+        "proposed_changes": [{"change": "Add feature"}],
+    }
+    result = _valid(raw)
+    assert result["design_doc"] == {"summary": "Current design"}
+    assert result["vision"] == {"text": "Our vision"}
+    assert result["open_messages"] == [{"id": "m1", "body": "Question?"}]
+    assert result["project_name"] == "MyProject"
+    assert result["proposed_changes"] == [{"change": "Add feature"}]
+
+
+def test_design_doc_update_omit_optional_fields_passes():
+    result = _valid({"type": "design_doc_update"})
+    assert result["type"] == "design_doc_update"
+    assert "design_doc" not in result
+    assert "vision" not in result
+
+
+def test_design_doc_update_open_messages_wrong_type_rejected():
+    msg = _invalid({"type": "design_doc_update", "open_messages": "not-a-list"})
+    assert "design_doc_update" in msg
+
+
+def test_strategic_review_optional_fields_accepted():
+    raw = {
+        "type": "strategic_review",
+        "design_doc": {"summary": "doc"},
+        "vision": {"text": "vision"},
+        "directions_summary": [{"id": "d1"}],
+        "outcome_evaluation": {"score": 0.9},
+        "open_messages": [{"id": "m1"}],
+        "project_name": "MyProject",
+        "research_mode": "strategic",
+        "max_active_directions": 10,
+    }
+    result = _valid(raw)
+    assert result["design_doc"] == {"summary": "doc"}
+    assert result["vision"] == {"text": "vision"}
+    assert result["directions_summary"] == [{"id": "d1"}]
+    assert result["outcome_evaluation"] == {"score": 0.9}
+    assert result["open_messages"] == [{"id": "m1"}]
+    assert result["project_name"] == "MyProject"
+    assert result["research_mode"] == "strategic"
+    assert result["max_active_directions"] == 10
+
+
+def test_strategic_review_omit_optional_fields_passes():
+    result = _valid({"type": "strategic_review"})
+    assert result["type"] == "strategic_review"
+    assert "design_doc" not in result
+    assert "max_active_directions" not in result
+
+
+def test_strategic_review_max_active_directions_wrong_type_rejected():
+    msg = _invalid({"type": "strategic_review", "max_active_directions": "ten"})
+    assert "strategic_review" in msg
+
+
+def test_smoketest_health_check_urls_accepted():
+    raw = {"type": "smoketest", "health_check_urls": ["https://example.com/health"]}
+    result = _valid(raw)
+    assert result["health_check_urls"] == ["https://example.com/health"]
+
+
+def test_smoketest_omit_optional_fields_passes():
+    result = _valid({"type": "smoketest"})
+    assert result["type"] == "smoketest"
+    assert "health_check_urls" not in result
+
+
+def test_smoketest_health_check_urls_wrong_type_rejected():
+    msg = _invalid({"type": "smoketest", "health_check_urls": "not-a-list"})
+    assert "smoketest" in msg
+
+
+def test_debug_optional_fields_accepted():
+    raw = {
+        "type": "debug",
+        "failed_task_id": "task-abc",
+        "failed_task_title": "Some failing task",
+        "error_logs": "ERROR: something went wrong",
+        "failed_task_prompt": "Do X",
+        "failed_task_type": "create",
+    }
+    result = _valid(raw)
+    assert result["failed_task_id"] == "task-abc"
+    assert result["failed_task_title"] == "Some failing task"
+    assert result["error_logs"] == "ERROR: something went wrong"
+    assert result["failed_task_prompt"] == "Do X"
+    assert result["failed_task_type"] == "create"
+
+
+def test_debug_omit_optional_fields_passes():
+    result = _valid({"type": "debug"})
+    assert result["type"] == "debug"
+    assert "failed_task_id" not in result
+
+
+def test_debug_failed_task_id_wrong_type_rejected():
+    msg = _invalid({"type": "debug", "failed_task_id": 123})
+    assert "debug" in msg
+
+
+def test_review_optional_task_fields_accepted():
+    raw = {
+        "type": "review",
+        "pr_number": 42,
+        "branch": "feature/x",
+        "original_task_id": "task-123",
+        "original_task_type": "create",
+    }
+    result = _valid(raw)
+    assert result["original_task_id"] == "task-123"
+    assert result["original_task_type"] == "create"
+
+
+def test_review_omit_optional_task_fields_passes():
+    result = _valid({"type": "review", "pr_number": 1, "branch": "main"})
+    assert "original_task_id" not in result
+    assert "original_task_type" not in result
+
+
+def test_fix_optional_fields_accepted():
+    raw = {
+        "type": "fix",
+        "prompt": "Fix it",
+        "pr_number": 7,
+        "branch": "main",
+        "original_task_id": "task-456",
+        "original_prompt": "Original request",
+    }
+    result = _valid(raw)
+    assert result["original_task_id"] == "task-456"
+    assert result["original_prompt"] == "Original request"
+
+
+def test_fix_omit_optional_fields_passes():
+    result = _valid({"type": "fix", "prompt": "Fix it", "pr_number": 1, "branch": "main"})
+    assert "original_task_id" not in result
+    assert "original_prompt" not in result
+
+
+def test_perf_prompt_optional_accepted():
+    raw = {"type": "perf", "prompt": "Profile the hot path"}
+    result = _valid(raw)
+    assert result["prompt"] == "Profile the hot path"
+
+
+def test_perf_omit_prompt_passes():
+    result = _valid({"type": "perf"})
+    assert result["type"] == "perf"
+    assert "prompt" not in result
+
+
+def test_security_audit_prompt_optional_accepted():
+    raw = {"type": "security_audit", "prompt": "Audit auth endpoints"}
+    result = _valid(raw)
+    assert result["prompt"] == "Audit auth endpoints"
+
+
+def test_security_audit_omit_prompt_passes():
+    result = _valid({"type": "security_audit"})
+    assert result["type"] == "security_audit"
+    assert "prompt" not in result
 
 
 # ---------------------------------------------------------------------------

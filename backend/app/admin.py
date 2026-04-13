@@ -22,7 +22,7 @@ from app.auth import get_current_user, require_admin
 
 from app.github import generate_installation_access_token
 from app.broadcast import broadcast_to_project
-from app.payload_schemas import TaskType
+from app.payload_schemas import TaskType, validate_internal_payload, validate_task_payload
 
 logger = logging.getLogger(__name__)
 
@@ -420,13 +420,13 @@ async def bulk_action_tasks(
                                             project_id=task.project_id,
                                             title=f"Smoketest after rollup merge to {base_branch}",
                                             description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                            payloads=[{
+                                            payloads=[validate_internal_payload({
                                                 "type": "smoketest",
                                                 "base_branch": base_branch,
                                                 **({"model": type_model} if type_model else {}),
                                                 **({"effort": type_effort} if type_effort else {}),
                                                 **({"health_check_urls": health_check_urls} if health_check_urls else {}),
-                                            }],
+                                            }, "admin:bulk_rollup_smoketest")],
                                             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                             status=TaskStatus.QUEUED,
                                             created_by="ORCHESTRATOR",
@@ -774,6 +774,11 @@ async def create_task_manually(
         active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
         task_payload["directions"] = active_directions
 
+    try:
+        task_payload = validate_task_payload(task_payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     # Guard: cap active tasks per project to prevent queue explosion
     active_count = (await session.execute(
         select(func.count(Task.id)).where(
@@ -1063,13 +1068,13 @@ async def modify_task(
                                     project_id=task.project_id,
                                     title=f"Smoketest after rollup merge to {base_branch}",
                                     description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                    payloads=[{
+                                    payloads=[validate_internal_payload({
                                         "type": "smoketest",
                                         "base_branch": base_branch,
                                         **({"model": type_model} if type_model else {}),
                                         **({"effort": type_effort} if type_effort else {}),
                                         **({"health_check_urls": health_check_urls} if health_check_urls else {}),
-                                    }],
+                                    }, "admin:rollup_smoketest")],
                                     vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                     status=TaskStatus.QUEUED,
                                     created_by="ORCHESTRATOR",
