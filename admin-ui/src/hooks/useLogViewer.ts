@@ -23,6 +23,9 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
   const wsReconnectAttemptRef = useRef<number>(0);
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastPongRef = useRef<number>(0);
+  const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // --- Task Tracking State ---
   const [trackedTaskIds, setTrackedTaskIds] = useState<Set<string>>(new Set());
@@ -53,11 +56,41 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
         wsRef.current.close();
         wsRef.current = null;
       }
+      if (wsPingIntervalRef.current) {
+        clearInterval(wsPingIntervalRef.current);
+      }
+      if (wsPongTimeoutRef.current) {
+        clearTimeout(wsPongTimeoutRef.current);
+      }
       if (pipelineThrottleTimerRef.current) {
         clearTimeout(pipelineThrottleTimerRef.current);
       }
     };
   }, []);
+
+  // Keep a stable ref to connectWs for the online listener (avoids re-registering on each render)
+  const connectWsRef = useRef<((projectId: string) => Promise<void>) | null>(null);
+
+  // Reconnect immediately when the network comes back online
+  useEffect(() => {
+    const handleOnline = () => {
+      const projectId = trackingProjectIdRef.current;
+      if (!projectId) return;
+      const ws = wsRef.current;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      // Clear any pending backoff timer and reconnect immediately
+      if (wsReconnectTimerRef.current) {
+        clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+      wsReconnectAttemptRef.current = 0;
+      if (connectWsRef.current) {
+        connectWsRef.current(projectId);
+      }
+    };
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, []); // empty deps — we use refs throughout
 
   const appendTrackLog = useCallback((taskId: string, type: TrackLogEntry['type'], msg: string) => {
     const entry: TrackLogEntry = { id: ++_trackLogIdCounter, t: new Date().toISOString(), type, msg };
@@ -75,6 +108,13 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data);
+
+      // Pong response — update last-pong timestamp for heartbeat tracking
+      if (msg.event === 'pong') {
+        lastPongRef.current = Date.now();
+        return;
+      }
+
       const taskId = msg.data?.task_id;
       const currentLogTask = logTaskRef.current;
 
@@ -161,6 +201,24 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
         for (const tid of trackedTaskIdsRef.current) {
           appendTrackLog(tid, 'system', 'Stream connected');
         }
+
+        // Start application-level ping/pong heartbeat (30s interval)
+        let lastPingTime = 0;
+        wsPingIntervalRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            lastPingTime = Date.now();
+            ws.send(JSON.stringify({ type: 'ping' }));
+
+            // Expect a pong within 10 seconds
+            if (wsPongTimeoutRef.current) clearTimeout(wsPongTimeoutRef.current);
+            wsPongTimeoutRef.current = setTimeout(() => {
+              if (lastPongRef.current < lastPingTime && ws.readyState === WebSocket.OPEN) {
+                // No pong received — connection is silently dead, force reconnect
+                ws.close(4001, 'Pong timeout');
+              }
+            }, 10000);
+          }
+        }, 30000);
       };
 
       ws.onmessage = handleWsMessage;
@@ -177,18 +235,29 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
         setWsConnected(false);
         setLogsConnecting(false);
 
+        // Clean up ping heartbeat for this connection
+        if (wsPingIntervalRef.current) {
+          clearInterval(wsPingIntervalRef.current);
+          wsPingIntervalRef.current = null;
+        }
+        if (wsPongTimeoutRef.current) {
+          clearTimeout(wsPongTimeoutRef.current);
+          wsPongTimeoutRef.current = null;
+        }
+
         if (!wasConnected) return;
 
+        // 1000 = normal close, 1008 = auth/policy failure — don't reconnect
         const isIntentional = e.code === 1000 || e.code === 1008;
-        const attemptsExhausted = wsReconnectAttemptRef.current >= 5;
 
-        if (!isIntentional && !attemptsExhausted) {
+        if (!isIntentional) {
           const attempt = wsReconnectAttemptRef.current;
           wsReconnectAttemptRef.current = attempt + 1;
+          // Progressive backoff: 1s, 2s, 4s, 8s, 16s, 30s, then stay at 30s
           const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
           const delaySec = Math.round(delay / 1000);
           setWsDisconnected(true);
-          setWsDisconnectReason(`Connection lost — reconnecting in ${delaySec}s (attempt ${attempt + 1}/5)...`);
+          setWsDisconnectReason(`Connection lost — reconnecting in ${delaySec}s (attempt ${attempt + 1})...`);
           wsReconnectTimerRef.current = setTimeout(() => {
             wsReconnectTimerRef.current = null;
             setLogsConnecting(true);
@@ -196,14 +265,9 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
           }, delay);
         } else {
           setWsDisconnected(true);
-          let reason: string;
-          if (e.code === 1008) {
-            reason = 'Authentication failed — please refresh the page';
-          } else if (attemptsExhausted) {
-            reason = 'Connection failed after 5 attempts — please refresh the page';
-          } else {
-            reason = `Disconnected (code ${e.code})`;
-          }
+          const reason = e.code === 1008
+            ? 'Authentication failed — please refresh the page'
+            : `Disconnected (code ${e.code})`;
           setWsDisconnectReason(reason);
         }
       };
@@ -212,6 +276,9 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
   }, [handleWsMessage, appendTrackLog]);
+
+  // Keep connectWsRef in sync so the online listener can call the latest version
+  useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);
 
   const handleViewLogs = useCallback((task: Task) => {
     // Update drawer state immediately (non-destructive)
@@ -247,6 +314,14 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
     if (wsReconnectTimerRef.current) {
       clearTimeout(wsReconnectTimerRef.current);
       wsReconnectTimerRef.current = null;
+    }
+    if (wsPingIntervalRef.current) {
+      clearInterval(wsPingIntervalRef.current);
+      wsPingIntervalRef.current = null;
+    }
+    if (wsPongTimeoutRef.current) {
+      clearTimeout(wsPongTimeoutRef.current);
+      wsPongTimeoutRef.current = null;
     }
     wsReconnectAttemptRef.current = 0;
     // Only close WS if no tracked tasks need it

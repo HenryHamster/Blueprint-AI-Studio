@@ -698,6 +698,7 @@ export default function App() {
         <ErrorBoundary level="panel">
         <TaskDetailDrawer
           task={s.logTask}
+          tasks={s.tasks}
           logLines={s.logLines}
           logsConnecting={s.logsConnecting}
           wsDisconnected={s.wsDisconnected}

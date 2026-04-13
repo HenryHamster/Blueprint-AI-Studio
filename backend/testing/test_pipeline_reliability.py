@@ -580,6 +580,162 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Test 6b — False-positive: A→B→D(running) must NOT clear A's deps
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_deadlock_no_false_positive_when_dep_has_active_parent(orch_db, mocker):
+    """Tasks blocked on a chain that includes an active (IN_PROGRESS) task
+    must NOT have their depends_on cleared — they are NOT deadlocked.
+
+    Scenario: A depends on B, B depends on D, D is IN_PROGRESS.
+    The old heuristic cleared A because B was in the stuck pool; the DFS-based
+    algorithm must recognise that B is not in a cycle and leave A untouched.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="FP Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    # D: actively running
+    task_d = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "task D"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_at=_naive_utc_ago(minutes=5),
+    )
+    session.add(task_d)
+    await session.commit()
+    await session.refresh(task_d)
+
+    # B: QUEUED, waiting on the running D
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "task B"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task_d.id)],
+        created_at=_naive_utc_ago(minutes=12),
+    )
+    session.add(task_b)
+    await session.commit()
+    await session.refresh(task_b)
+
+    # A: QUEUED, waiting on B (which is stuck but not deadlocked)
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "task A"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(task_b.id)],
+        created_at=_naive_utc_ago(minutes=11),
+    )
+    session.add(task_a)
+    await session.commit()
+    await session.refresh(task_a)
+
+    task_a_id = task_a.id
+    task_b_id = task_b.id
+    original_a_deps = list(task_a.depends_on or [])
+    original_b_deps = list(task_b.depends_on or [])
+
+    _orch_module._last_deadlock_check = 0.0
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+        a_result = await verify_session.execute(_select(Task).where(Task.id == task_a_id))
+        updated_a = a_result.scalars().first()
+        b_result = await verify_session.execute(_select(Task).where(Task.id == task_b_id))
+        updated_b = b_result.scalars().first()
+
+    # Neither A nor B should be touched — D is still running
+    assert updated_a is not None
+    assert (updated_a.depends_on or []) == original_a_deps, (
+        f"False positive: A's depends_on was incorrectly cleared. "
+        f"A depends on B which depends on an IN_PROGRESS task D. "
+        f"Got depends_on={updated_a.depends_on!r}"
+    )
+    assert updated_b is not None
+    assert (updated_b.depends_on or []) == original_b_deps, (
+        f"False positive: B's depends_on was incorrectly cleared. "
+        f"B depends on an IN_PROGRESS task D. "
+        f"Got depends_on={updated_b.depends_on!r}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test 6c — True cycle: A→B→A clears both tasks
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_deadlock_true_cycle_cleared(orch_db, mocker):
+    """True dependency cycles (A→B→A) must have depends_on cleared for all
+    cycle participants so they can be dispatched.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="Cycle Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    # Create A and B with placeholder IDs first, then set mutual deps
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "task A"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[],  # filled in below
+        created_at=_naive_utc_ago(minutes=12),
+    )
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "task B"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[],  # filled in below
+        created_at=_naive_utc_ago(minutes=12),
+    )
+    session.add(task_a)
+    session.add(task_b)
+    await session.commit()
+    await session.refresh(task_a)
+    await session.refresh(task_b)
+
+    # Wire the cycle: A→B, B→A
+    task_a.depends_on = [str(task_b.id)]
+    task_b.depends_on = [str(task_a.id)]
+    session.add(task_a)
+    session.add(task_b)
+    await session.commit()
+
+    task_a_id = task_a.id
+    task_b_id = task_b.id
+
+    _orch_module._last_deadlock_check = 0.0
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+        a_result = await verify_session.execute(_select(Task).where(Task.id == task_a_id))
+        updated_a = a_result.scalars().first()
+        b_result = await verify_session.execute(_select(Task).where(Task.id == task_b_id))
+        updated_b = b_result.scalars().first()
+
+    assert updated_a is not None
+    assert updated_a.depends_on == [] or updated_a.depends_on is None, (
+        f"Expected A's depends_on to be cleared (true cycle A→B→A), "
+        f"got {updated_a.depends_on!r}"
+    )
+    assert updated_b is not None
+    assert updated_b.depends_on == [] or updated_b.depends_on is None, (
+        f"Expected B's depends_on to be cleared (true cycle A→B→A), "
+        f"got {updated_b.depends_on!r}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Test 7 — CI-waiting backstop timeout
 # ══════════════════════════════════════════════════════════════════════════════
 

@@ -73,6 +73,54 @@ ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv('ORCHESTRATOR_THROTTLE_SECONDS', '
 _provision_coroutines: Dict[str, asyncio.Task] = {}
 
 
+# ---------------------------------------------------------------------------
+# Cycle detection for deadlock resolution
+# ---------------------------------------------------------------------------
+
+def _find_cycle_members(adj: Dict[str, list]) -> set:
+    """Return node IDs participating in cycles (DFS white/gray/black coloring)."""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = dict.fromkeys(adj, WHITE)
+    members: set = set()
+    def dfs(n, stack):
+        color[n] = GRAY; stack.append(n)
+        for d in adj.get(n, []):
+            if color.get(d) == GRAY:
+                members.update(stack[stack.index(d):])
+            elif color.get(d) == WHITE:
+                dfs(d, stack)
+        stack.pop(); color[n] = BLACK
+    for n in list(adj):
+        if color[n] == WHITE:
+            dfs(n, [])
+    return members
+
+
+def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
+    """Return [(task_id, reason)] for tasks whose depends_on should be cleared.
+
+    reason is 'cycle' (true dependency cycle) or 'dead_deps' (all deps are
+    FAILED/CANCELLED/deleted with none stuck or active).
+    """
+    adj = {str(t.id): [str(d) for d in dep_map[t.id] if d in stuck_ids] for t in stuck}
+    cycle_m = _find_cycle_members(adj)
+    out = []
+    for t in stuck:
+        deps = dep_map[t.id]
+        if not deps:
+            continue
+        if str(t.id) in cycle_m:
+            out.append((t.id, "cycle"))
+            continue
+        # Dead-dep: no dep is stuck (resolvable) or active
+        if not any(
+            d in stuck_ids or dep_status.get(d) not in (None, TaskStatus.FAILED, TaskStatus.CANCELLED)
+            for d in deps
+        ):
+            out.append((t.id, "dead_deps"))
+    return out
+
+
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
     from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
@@ -450,45 +498,28 @@ async def orchestrator_worker():
                             for dep_task in dep_rows.scalars().all():
                                 dep_status[dep_task.id] = dep_task.status
 
-                        # Verify each dep's actual DB status before clearing
-                        # Only clear if deps are genuinely unresolvable (FAILED/CANCELLED/deleted)
-                        deadlocked_ids: list = []
-                        for stask in stuck_tasks:
-                            dep_uuids = task_dep_uuids[stask.id]
-                            if not dep_uuids:
-                                continue
-                            genuinely_blocked = True
-                            for dep_id in dep_uuids:
-                                if dep_id in stuck_ids:
-                                    continue  # Stuck in this pool — potential cycle
-                                status = dep_status.get(dep_id)
-                                if status is None:
-                                    continue  # Deleted dep — genuinely unresolvable
-                                if status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                    continue  # Terminal — genuinely unresolvable
-                                if status == TaskStatus.QUEUED:
-                                    # QUEUED but outside fetch window — NOT a deadlock, just low priority
-                                    genuinely_blocked = False
-                                    break
-                                if status in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
-                                    # Still running — NOT a deadlock
-                                    genuinely_blocked = False
-                                    break
-                            if genuinely_blocked:
-                                deadlocked_ids.append(stask.id)
-
-                        # Fix all narrow-scan deadlocked tasks in a single session
-                        if deadlocked_ids:
+                        # True cycle detection — avoids false positives where a
+                        # stuck task waits on another that depends on an active task
+                        classified = _classify_stuck_tasks(
+                            stuck_tasks, task_dep_uuids, dep_status, stuck_ids
+                        )
+                        if classified:
                             async with AsyncSessionLocal() as fix_session:
-                                for task_id in deadlocked_ids:
+                                for task_id, reason in classified:
                                     fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
+                                        if reason == "cycle":
+                                            msg = "Dependencies cleared: dependency cycle detected"
+                                            tag = "cycle broken"
+                                        else:
+                                            msg = "Dependencies cleared: all deps failed/cancelled"
+                                            tag = "dead deps cleared"
                                         logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock: clearing depends_on "
-                                            f"for task {task_id} (had {len(task_dep_uuids[task_id])} stuck/failed deps)"
+                                            f"[ORCHESTRATOR] Breaking deadlock ({tag}): "
+                                            f"clearing depends_on for task {task_id}"
                                         )
                                         fix_task.depends_on = []
-                                        fix_task.latest_status_message = "Dependencies cleared: deadlock detected"
+                                        fix_task.latest_status_message = msg
                                         fix_session.add(fix_task)
                                     eligible_ids.append(task_id)
                                     narrow_broken += 1
@@ -532,35 +563,26 @@ async def orchestrator_worker():
                             for dep_task in broad_dep_rows.scalars().all():
                                 broad_dep_status[dep_task.id] = dep_task.status
 
-                        broad_deadlocked_ids: list = []
-                        for stask in broad_stuck:
-                            dep_uuids_b = broad_task_dep_uuids[stask.id]
-                            if not dep_uuids_b:
-                                continue
-                            genuinely_blocked = True
-                            for dep_id in dep_uuids_b:
-                                if dep_id in broad_stuck_ids:
-                                    continue
-                                status = broad_dep_status.get(dep_id)
-                                if status is None or status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-                                    continue
-                                genuinely_blocked = False
-                                break
-                            if genuinely_blocked:
-                                broad_deadlocked_ids.append(stask.id)
-
-                        # Fix all broad-scan deadlocked tasks in a single session
-                        if broad_deadlocked_ids:
+                        broad_classified = _classify_stuck_tasks(
+                            broad_stuck, broad_task_dep_uuids, broad_dep_status, broad_stuck_ids
+                        )
+                        if broad_classified:
                             async with AsyncSessionLocal() as fix_session:
-                                for task_id in broad_deadlocked_ids:
+                                for task_id, reason in broad_classified:
                                     fix_task = await fix_session.get(Task, task_id)
                                     if fix_task:
+                                        if reason == "cycle":
+                                            msg = "Dependencies cleared: dependency cycle detected (broad scan)"
+                                            tag = "cycle broken"
+                                        else:
+                                            msg = "Dependencies cleared: all deps failed/cancelled (broad scan)"
+                                            tag = "dead deps cleared"
                                         logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock (broad scan): clearing depends_on "
-                                            f"for task {task_id} (stuck >{10}min with {len(broad_task_dep_uuids[task_id])} unresolvable deps)"
+                                            f"[ORCHESTRATOR] Breaking deadlock (broad scan, {tag}): "
+                                            f"clearing depends_on for task {task_id}"
                                         )
                                         fix_task.depends_on = []
-                                        fix_task.latest_status_message = "Dependencies cleared: deadlock detected (broad scan)"
+                                        fix_task.latest_status_message = msg
                                         fix_session.add(fix_task)
                                         broad_broken += 1
                                 await fix_session.commit()

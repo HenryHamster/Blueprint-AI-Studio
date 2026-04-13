@@ -11,6 +11,7 @@ import asyncio
 import ipaddress
 import logging
 import re
+import time
 from typing import Dict, List
 
 from fastapi import WebSocket
@@ -47,8 +48,10 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
         self.ip_connections: Dict[str, int] = {}
+        self.last_activity: Dict[WebSocket, float] = {}
         self.MAX_CONNECTIONS_PER_IP = 20
         self._lock = asyncio.Lock()
+        self._last_cleanup: float = 0.0
 
     async def check_and_add_ip(self, websocket: WebSocket) -> bool:
         client_ip = _get_websocket_client_ip(websocket)
@@ -70,6 +73,10 @@ class ConnectionManager:
     def remove_ip(self, websocket: WebSocket):
         self._remove_ip(websocket)
 
+    def update_activity(self, websocket: WebSocket) -> None:
+        """Update the last-activity timestamp for a connection."""
+        self.last_activity[websocket] = time.time()
+
     async def connect(self, websocket: WebSocket, project_id: str) -> bool:
         async with self._lock:
             if not await self.check_and_add_ip(websocket):
@@ -78,6 +85,7 @@ class ConnectionManager:
             if project_id not in self.active_connections:
                 self.active_connections[project_id] = []
             self.active_connections[project_id].append(websocket)
+            self.last_activity[websocket] = time.time()
             return True
 
     async def disconnect(self, websocket: WebSocket, project_id: str):
@@ -89,8 +97,33 @@ class ConnectionManager:
                     del self.active_connections[project_id]
 
             self._remove_ip(websocket)
+            self.last_activity.pop(websocket, None)
+
+    async def cleanup_idle(self, max_idle_seconds: float = 90.0) -> None:
+        """Close connections that have had no activity for longer than max_idle_seconds."""
+        now = time.time()
+        async with self._lock:
+            idle = [
+                (ws, pid)
+                for pid, conns in self.active_connections.items()
+                for ws in list(conns)
+                if now - self.last_activity.get(ws, now) > max_idle_seconds
+            ]
+        for ws, pid in idle:
+            logger.info(f"[WS] Closing idle connection (project={pid}, idle>{max_idle_seconds:.0f}s)")
+            try:
+                await ws.close(code=1001, reason="Idle timeout")
+            except Exception:
+                pass
+            await self.disconnect(ws, pid)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):
+        # Opportunistic idle cleanup — runs at most once every 30 seconds
+        now = time.time()
+        if now - self._last_cleanup >= 30.0:
+            self._last_cleanup = now
+            asyncio.create_task(self.cleanup_idle())
+
         async with self._lock:
             if project_id not in self.active_connections:
                 return

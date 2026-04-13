@@ -295,10 +295,27 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         message_count = 0
         while True:
             # Keep the connection open and listen for any messages from the client
-            data = await websocket.receive_text()
+            # 90-second idle timeout — detects silent drops from load balancers/proxies
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=90.0)
+            except asyncio.TimeoutError:
+                await websocket.close(code=1001, reason="Idle timeout")
+                return
+
+            manager.update_activity(websocket)
+
             if len(data) > 10000: # 10KB limit
                 await websocket.close(code=1009, reason="Message too big")
                 return
+
+            # Handle ping messages — infrastructure keepalive, not counted toward rate limit
+            try:
+                parsed = json.loads(data)
+                if isinstance(parsed, dict) and parsed.get("type") == "ping":
+                    await websocket.send_json({"event": "pong", "data": {}})
+                    continue
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
             # Simple rate limiting: 10 messages per second
             current_time = time.time()

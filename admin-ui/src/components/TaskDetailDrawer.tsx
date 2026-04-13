@@ -6,6 +6,7 @@ import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 
 interface TaskDetailDrawerProps {
   task: Task;
+  tasks?: Task[];
   logLines: string[];
   logsConnecting?: boolean;
   wsDisconnected?: boolean;
@@ -104,7 +105,27 @@ function DirectionsSection({ directions }: { directions: { text: string; priorit
   );
 }
 
-function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task: Task; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void; onGoToLogs?: () => void }) {
+const DEP_STATUS_COLORS: Record<string, string> = { COMPLETED: 'text-emerald-400', IN_PROGRESS: 'text-amber-400', FAILED: 'text-red-400', CANCELLED: 'text-neutral-500', EVALUATING: 'text-blue-400', PROVISIONING: 'text-blue-400', QUEUED: 'text-neutral-400' };
+function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: string; depTask?: Task; hasCycle?: boolean; onNavigateToTask?: (id: string) => void }) {
+  const statusColor = depTask ? (DEP_STATUS_COLORS[depTask.status] ?? 'text-neutral-400') : '';
+  const label = depTask ? (depTask.title.length > 40 ? depTask.title.slice(0, 40) + '…' : depTask.title) : null;
+  return (
+    <div className="font-mono text-sm text-neutral-300 flex items-center gap-1.5 flex-wrap">
+      <ChevronRight className="w-3 h-3 text-neutral-600 shrink-0" />
+      {depTask ? (<>
+        {onNavigateToTask
+          ? <button onClick={() => onNavigateToTask(dep)} className="text-blue-400 hover:text-blue-300 transition-colors text-left">{label}</button>
+          : <span>{label}</span>}
+        <span className={`text-[10px] uppercase font-semibold ${statusColor}`}>{depTask.status}</span>
+        {hasCycle && <span className="text-[10px] font-semibold text-orange-400">Cycle detected</span>}
+      </>) : (<>
+        <span className="text-neutral-500">{dep}</span>
+        <span className="text-[10px] text-neutral-600">(not found)</span>
+      </>)}
+    </div>
+  );
+}
+function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void; onGoToLogs?: () => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
@@ -594,12 +615,7 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
         <>
           <SectionHeader>Dependencies</SectionHeader>
           <div className="space-y-1">
-            {task.depends_on.map((dep) => (
-              <div key={dep} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5">
-                <ChevronRight className="w-3 h-3 text-neutral-600" />
-                {dep}
-              </div>
-            ))}
+            {task.depends_on.map((dep) => { const dt = tasks?.find(t => t.id === dep); return <DependencyItem key={dep} dep={dep} depTask={dt} hasCycle={dt?.depends_on?.includes(task.id)} onNavigateToTask={onNavigateToTask} />; })}
           </div>
         </>
       )}
@@ -803,6 +819,7 @@ function LogsTab({
 
 export function TaskDetailDrawer({
   task,
+  tasks,
   logLines,
   logsConnecting = false,
   wsDisconnected = false,
@@ -1021,7 +1038,7 @@ export function TaskDetailDrawer({
           </div>
         )}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} onGoToLogs={() => setActiveTab('logs')} />
+          <DetailsTab task={task} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} onGoToLogs={() => setActiveTab('logs')} />
         ) : (
           <>
             {wsDisconnected && (
