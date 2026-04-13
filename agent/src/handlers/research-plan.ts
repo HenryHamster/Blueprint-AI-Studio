@@ -809,8 +809,10 @@ ${analysisText.slice(0, 50_000)}
 
     // Post-check: verify direction operations were executed if thinker recommended them
     try {
-      const directionCreatedInOutput = /"op"\s*:\s*"create_direction"/.test(allOutput);
-      const directionUpdatedInOutput = /"op"\s*:\s*"(update_direction|retire_direction)"/.test(allOutput);
+      const directionCreatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"create_direction"/.test(allOutput)
+        || /"op"\s*:\s*"create_direction"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
+      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction)"/.test(allOutput)
+        || /"op"\s*:\s*"(update_direction|retire_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
       const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
 
       // Detect constraint rejections (cap/dedup) so we don't retry wastefully
