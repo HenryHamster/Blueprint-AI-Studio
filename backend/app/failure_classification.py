@@ -68,6 +68,11 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
     # "non-zero exit code" and "process exited" are code errors, not timeouts.
     # Only use specific forms: "execution timed out", "node process killed", "oom killer".
+    # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors)
+    if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
+                                      "review-fix cap reached", "review-fix cycle limit"]):
+        return "AGENT_TIMEOUT"
+
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
                                       "execution timed out", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",

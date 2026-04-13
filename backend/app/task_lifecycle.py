@@ -202,6 +202,8 @@ async def _update_direction_research_outcomes(
                 break
             child_tasks_stmt = select(Task).where(Task.parent_task_id == research_task_uuid)
             child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
+            if not child_tasks_rows:
+                break
             entry["tasks_completed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED)
             entry["tasks_failed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED)
             entry["tasks_cancelled"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED)

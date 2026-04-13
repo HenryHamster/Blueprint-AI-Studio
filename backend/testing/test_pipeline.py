@@ -547,6 +547,35 @@ class TestIterationCap:
         """Tripwire: MAX_REVIEW_FIX_ITERATIONS must not be raised without review."""
         assert MAX_REVIEW_FIX_ITERATIONS == 16
 
+    def _make_task(self, msg: str):
+        t = MagicMock(spec=Task)
+        t.latest_status_message = msg
+        return t
+
+    def test_iteration_cap_message_classified_as_agent_timeout(self):
+        """'Review-fix cap reached' status messages must be AGENT_TIMEOUT not CODE_ERROR."""
+        assert classify_failure(self._make_task(
+            "Review-fix cap reached for PR #123 (12 total iterations)"
+        )) == "AGENT_TIMEOUT"
+
+    def test_iteration_cap_keyword_classified_as_agent_timeout(self):
+        """'iteration cap' in status message must be AGENT_TIMEOUT."""
+        assert classify_failure(self._make_task(
+            "Rollup PR #100 created but review not spawned (iteration cap)"
+        )) == "AGENT_TIMEOUT"
+
+    def test_fix_not_spawned_classified_as_agent_timeout(self):
+        """'fix not spawned' in status message must be AGENT_TIMEOUT."""
+        assert classify_failure(self._make_task(
+            "Rollup PR #200 merge blocked, fix not spawned (iteration cap)"
+        )) == "AGENT_TIMEOUT"
+
+    def test_review_fix_cycle_limit_classified_as_agent_timeout(self):
+        """'review-fix cycle limit' message must be AGENT_TIMEOUT not CODE_ERROR."""
+        assert classify_failure(self._make_task(
+            "Review-fix cycle limit reached for PR #55 after 16 iterations"
+        )) == "AGENT_TIMEOUT"
+
 
 # ── Security Scan Coverage ─────────────────────────────────────────────────
 

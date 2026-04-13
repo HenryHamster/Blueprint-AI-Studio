@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
 from app.auth import create_agent_token
+from app.review_pipeline import _spawn_pipeline_task, MAX_REVIEW_FIX_ITERATIONS
 
 
 # ---------------------------------------------------------------------------
@@ -1253,4 +1254,204 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     assert review_task.requires_approval is True, (
         "Without explicit original_task_id, resolved_original_id falls back to "
         "source_task.id — that task must still be flagged requires_approval=True"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rollup iteration cap bypass tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rollup_bypasses_global_cap_via_status_message(
+    db_session, mocker
+):
+    """
+    When source_task.latest_status_message contains 'rollup', _spawn_pipeline_task
+    must use MAX_REVIEW_FIX_ITERATIONS (16) as the global cap instead of the
+    scope-based cap, allowing rollup reviews to proceed even after many retries.
+
+    Setup: medium scope task → normal global cap = 12.
+    Pre-populate 12 completed review/fix tasks for PR #200 (would hit normal cap).
+    Set latest_status_message to contain 'rollup'.
+    Expect: _spawn_pipeline_task returns a task (not None).
+    """
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Rollup Cap Bypass via Status Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Parent research/rollup task — medium scope, 'rollup' in latest_status_message
+    parent_task = Task(
+        project_id=project.id,
+        title="Research task (rollup parent)",
+        payloads=[{"type": "research", "prompt": "Research improvements", "base_branch": "main"}],
+        vm_instance_id="agent-vm-rollup-parent-001",
+        status=TaskStatus.EVALUATING,
+        context={"scope": "medium"},
+        latest_status_message="All 3 subtasks merged, rollup PR #200 awaiting review",
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    # 12 completed review+fix tasks for PR #200 — this equals the medium scope cap
+    # Without rollup bypass, global cap (12) would block the next spawn.
+    for i in range(12):
+        t = Task(
+            project_id=project.id,
+            title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #200 (prior attempt {i})",
+            payloads=[{
+                "type": "review" if i % 2 == 0 else "fix",
+                "pr_number": 200,
+                "branch": "blueprint/rollup-test",
+                "base_branch": "main",
+            }],
+            vm_instance_id=f"agent-vm-rollup-prior-{i:03d}",
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    # Call _spawn_pipeline_task directly — should succeed because is_rollup=True
+    result = await _spawn_pipeline_task(
+        source_task=parent_task,
+        task_type="review",
+        session=db_session,
+        pr_number=200,
+        branch="blueprint/rollup-test",
+        base_branch="main",
+    )
+
+    assert result is not None, (
+        "Rollup task (latest_status_message contains 'rollup') should bypass the "
+        f"medium-scope global cap (12) and use MAX_REVIEW_FIX_ITERATIONS ({MAX_REVIEW_FIX_ITERATIONS})"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
+    db_session, mocker
+):
+    """
+    When source_task.context contains '_rollup_retries', _spawn_pipeline_task
+    must use MAX_REVIEW_FIX_ITERATIONS (16) as the global cap.
+
+    This covers the transient PR creation failure path where rollup_management
+    writes _rollup_retries into context before retrying.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Rollup Cap Bypass via Context Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Parent task with _rollup_retries in context (set by rollup_management on transient failure)
+    parent_task = Task(
+        project_id=project.id,
+        title="Research task (rollup with retries)",
+        payloads=[{"type": "research", "prompt": "Research improvements", "base_branch": "main"}],
+        vm_instance_id="agent-vm-rollup-retry-001",
+        status=TaskStatus.EVALUATING,
+        context={"scope": "small", "_rollup_retries": 2},
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    # 10 completed tasks — equals small scope cap (10)
+    for i in range(10):
+        t = Task(
+            project_id=project.id,
+            title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #201 (prior {i})",
+            payloads=[{
+                "type": "review" if i % 2 == 0 else "fix",
+                "pr_number": 201,
+                "branch": "blueprint/rollup-retry-test",
+                "base_branch": "main",
+            }],
+            vm_instance_id=f"agent-vm-rollup-retry-prior-{i:03d}",
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await _spawn_pipeline_task(
+        source_task=parent_task,
+        task_type="review",
+        session=db_session,
+        pr_number=201,
+        branch="blueprint/rollup-retry-test",
+        base_branch="main",
+    )
+
+    assert result is not None, (
+        "Rollup task with _rollup_retries in context should bypass the "
+        f"small-scope global cap (10) and use MAX_REVIEW_FIX_ITERATIONS ({MAX_REVIEW_FIX_ITERATIONS})"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_non_rollup_task_respects_global_cap(
+    db_session, mocker
+):
+    """
+    Regression: a normal (non-rollup) task must still be blocked when the
+    global cap is reached. Verifies the rollup bypass does not accidentally
+    apply to non-rollup tasks.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Non-Rollup Cap Enforcement Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Normal task — no rollup markers
+    normal_task = Task(
+        project_id=project.id,
+        title="Normal create task",
+        payloads=[{"type": "create", "prompt": "Build feature", "base_branch": "main"}],
+        vm_instance_id="agent-vm-normal-cap-001",
+        status=TaskStatus.EVALUATING,
+        context={"scope": "small"},
+        latest_status_message="Processing feature task",
+    )
+    db_session.add(normal_task)
+    await db_session.commit()
+    await db_session.refresh(normal_task)
+
+    # 10 completed tasks — equals small scope cap (10)
+    for i in range(10):
+        t = Task(
+            project_id=project.id,
+            title=f"{'Review' if i % 2 == 0 else 'Fix'} PR #202 (prior {i})",
+            payloads=[{
+                "type": "review" if i % 2 == 0 else "fix",
+                "pr_number": 202,
+                "branch": "blueprint/normal-cap-test",
+                "base_branch": "main",
+            }],
+            vm_instance_id=f"agent-vm-normal-prior-{i:03d}",
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    result = await _spawn_pipeline_task(
+        source_task=normal_task,
+        task_type="review",
+        session=db_session,
+        pr_number=202,
+        branch="blueprint/normal-cap-test",
+        base_branch="main",
+    )
+
+    assert result is None, (
+        "Non-rollup task at small-scope global cap (10) must be blocked — "
+        "rollup bypass should not apply"
     )

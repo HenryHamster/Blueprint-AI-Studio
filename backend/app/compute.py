@@ -86,12 +86,12 @@ async def _release_provision_slot(vm_id: str):
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
-ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '300'))  # 5 minutes — base for exponential backoff
+ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '180'))  # 3 minutes — base for exponential backoff
 
 
 def _zone_cooldown_seconds(consecutive_failures: int) -> int:
-    """Exponential backoff: 5min → 10min → 20min → ... capped at 2 hours."""
-    return min(ZONE_COOLDOWN_SECONDS * (2 ** consecutive_failures), 7200)
+    """Exponential backoff: 3min → 6min → 12min → 24min → 30min cap."""
+    return min(ZONE_COOLDOWN_SECONDS * (2 ** consecutive_failures), 1800)
 
 # Zone health tracking: populated by provisioning attempts
 _zone_health: dict[str, dict] = {}
