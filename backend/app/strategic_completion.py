@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -167,6 +168,24 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             session.add(project)
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
         session.add(task)
+        # Audit: check for unaddressed FEEDBACK messages
+        remaining_feedback_result = await session.execute(
+            select(func.count()).select_from(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.status == "open",
+                ProjectMessage.message_type == MessageType.FEEDBACK,
+            )
+        )
+        open_feedback_count = remaining_feedback_result.scalar() or 0
+        if open_feedback_count > 0:
+            logger.warning(
+                f"[STRATEGIC] Task {task.id}: {open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review"
+            )
+            await _create_strategic_alert(
+                task.project_id,
+                session,
+                f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
+            )
         await session.commit()
         logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
         return
@@ -509,6 +528,25 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 msgs_resolved += 1
         except (ValueError, TypeError):
             pass
+
+    # Audit: check for unaddressed FEEDBACK messages
+    remaining_feedback_result = await session.execute(
+        select(func.count()).select_from(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "open",
+            ProjectMessage.message_type == MessageType.FEEDBACK,
+        )
+    )
+    open_feedback_count = remaining_feedback_result.scalar() or 0
+    if open_feedback_count > 0:
+        logger.warning(
+            f"[STRATEGIC] Task {task.id}: {open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review"
+        )
+        await _create_strategic_alert(
+            task.project_id,
+            session,
+            f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
+        )
 
     vision_rev = (project.vision or {}).get("revision", "?")
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"

@@ -24,6 +24,8 @@ export interface ResearchHistoryEntry {
   tasks_completed?: number;
   tasks_failed?: number;
   cycle_insights?: string[];
+  product_ratio?: number | null;
+  type_distribution?: Record<string, number> | null;
 }
 
 export interface Direction {

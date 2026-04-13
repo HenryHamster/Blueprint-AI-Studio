@@ -593,6 +593,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 summary["conflicts_with"] = d["conflicts_with"]
             if d.get("completion_criteria"):
                 summary["completion_criteria"] = d["completion_criteria"]
+            if d.get("category"):
+                summary["category"] = d["category"]
             # Include compact research context (truncated) — not full history
             ctx = d.get("research_context")
             if ctx:

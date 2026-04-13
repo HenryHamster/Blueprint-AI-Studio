@@ -392,6 +392,20 @@ export function DirectionCard({
                 Mixed
               </span>
             )}
+            {/* Aggregate product ratio badge from latest research history entry */}
+            {(() => {
+              const entries = d.research_history?.filter(e => e.product_ratio != null);
+              if (!entries || entries.length === 0) return null;
+              const latest = [...entries].reverse()[0];
+              const ratio = latest.product_ratio as number;
+              const pct = Math.round(ratio * 100);
+              const color = ratio > 0.3 ? 'emerald' : ratio >= 0.1 ? 'amber' : 'red';
+              return (
+                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                  {pct}% product
+                </span>
+              );
+            })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               <button
@@ -522,6 +536,24 @@ export function DirectionCard({
                               {desc.length > 100 ? desc.slice(0, 100) + '…' : desc}
                             </p>
                           ))}
+                        </div>
+                      )}
+                      {(entry.product_ratio != null || entry.type_distribution) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5 border-t border-neutral-800/60 pt-1">
+                          {entry.product_ratio != null && (() => {
+                            const pct = Math.round((entry.product_ratio as number) * 100);
+                            const color = (entry.product_ratio as number) > 0.3 ? 'emerald' : (entry.product_ratio as number) >= 0.1 ? 'amber' : 'red';
+                            return (
+                              <span className={`text-[10px] px-1 py-0.5 rounded border bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                                {pct}% product
+                              </span>
+                            );
+                          })()}
+                          {entry.type_distribution && Object.keys(entry.type_distribution).length > 0 && (
+                            <span className="text-[10px] text-neutral-600">
+                              {Object.entries(entry.type_distribution).map(([k, v]) => `${k}:${v}`).join(' ')}
+                            </span>
+                          )}
                         </div>
                       )}
                       {entry.cycle_insights && entry.cycle_insights.length > 0 && (
