@@ -17,6 +17,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 
+from fastapi import HTTPException
 from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
@@ -596,18 +597,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     return
 
                 # Verify target branch exists before creating PR.
-                # Primary protection is in _cleanup_branches (won't delete branches
-                # referenced by active rollups). This catches external deletions.
-                # If the branch is missing, FAIL loudly so we can catch remaining
-                # causes of bad branch deletion ordering.
+                # Distinguish 404 (actually deleted) from transient GitHub errors
+                # (5xx, rate-limit) — only fail on confirmed 404.
                 try:
                     await get_branch_sha(gh_token, owner, repo, target_branch)
-                except Exception as branch_err:
-                    raise Exception(
-                        f"Target branch '{target_branch}' does not exist — "
-                        f"cannot create rollup PR. This indicates a branch was "
-                        f"deleted out of order. Error: {branch_err}"
+                except HTTPException as branch_err:
+                    if branch_err.status_code == 404:
+                        raise Exception(
+                            f"Target branch '{target_branch}' does not exist — "
+                            f"cannot create rollup PR. This indicates a branch was "
+                            f"deleted out of order."
+                        )
+                    # Transient GitHub error — defer to next evaluation cycle
+                    logger.warning(
+                        f"[ROLLUP] Transient GitHub error checking target branch "
+                        f"'{target_branch}': {branch_err.detail} — will retry"
                     )
+                    return
 
                 # Verify staging (head) branch exists — if it was deleted
                 # (e.g., by a child rollup that found an empty diff and cleaned

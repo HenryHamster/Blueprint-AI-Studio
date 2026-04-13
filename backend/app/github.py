@@ -524,10 +524,10 @@ async def create_branch(
             pass  # fall through to error below
 
     if response.status_code != 201:
-        logger.error(f"Failed to create branch: {response.text}")
+        logger.error(f"Failed to create branch: {response.status_code} {response.text}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create branch '{branch_name}' on GitHub."
+            detail=f"Failed to create branch '{branch_name}' on GitHub (GitHub {response.status_code})."
         )
 
     return response.json()
@@ -546,11 +546,17 @@ async def get_branch_sha(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
         headers
     )
-    if response.status_code != 200:
-        logger.error(f"Failed to get SHA for branch {branch}: {response.text}")
+    if response.status_code == 404:
+        logger.warning(f"Branch '{branch}' not found (404)")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get branch '{branch}' SHA."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch '{branch}' not found (GitHub 404)."
+        )
+    if response.status_code != 200:
+        logger.error(f"Failed to get SHA for branch {branch}: {response.status_code} {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub API error getting branch '{branch}' SHA (HTTP {response.status_code})."
         )
     return response.json()["object"]["sha"]
 

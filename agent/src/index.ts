@@ -839,7 +839,12 @@ echo ""
       claudeEnv.TASK_ID = process.env.TASK_ID;
     }
 
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+    // Write prompt to a temp file and pipe via stdin to avoid E2BIG when
+    // the prompt (design doc + project context + directions) exceeds ARG_MAX (~128KB).
+    const promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
+    fs.writeFileSync(promptFile, prompt);
+
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
     if (model) args.push('--model', model);
     if (effort) args.push('--effort', effort);
     if (disallowedTools && disallowedTools.length > 0) {
@@ -847,7 +852,9 @@ echo ""
         args.push('--disallowedTools', tool);
       }
     }
-    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true });
+    const promptFd = fs.openSync(promptFile, 'r');
+    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true, stdio: [promptFd, 'pipe', 'pipe'] });
+    fs.closeSync(promptFd);
 
     // Kill Claude if it exceeds 45 minutes — kill entire process group (negative PID)
     // so child processes (npm, pytest, etc.) are also terminated
@@ -859,7 +866,7 @@ echo ""
       setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
     }, CLAUDE_TIMEOUT_MS);
 
-    claude.stdout.on('data', (data: Buffer) => {
+    claude.stdout!.on('data', (data: Buffer) => {
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       for (const line of text.split('\n').filter(Boolean)) {
@@ -883,7 +890,7 @@ echo ""
       }
     });
 
-    claude.stderr.on('data', (data: Buffer) => {
+    claude.stderr!.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (stderrBuffer.length < 50_000) stderrBuffer += text;
@@ -1041,6 +1048,7 @@ async function main() {
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     // Clean up /tmp files written by Claude Code handlers (task-specific paths)
+    try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
     for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
