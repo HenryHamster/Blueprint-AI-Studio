@@ -589,16 +589,29 @@ DATA="\$1"
 _call() {
   local attempt=0
   while [ \$attempt -lt 3 ]; do
-    if printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
-      curl -f -sS --max-time 30 --connect-timeout 10 \\
+    local response
+    response=\$(printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
+      curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "\$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
         -H "X-Agent-Token: \$TOKEN" \\
-        --data-binary @-; then
+        --data-binary @- \\
+        -w '\n%{http_code}')
+    local http_code
+    http_code=\$(printf '%s' "\$response" | tail -n1)
+    local body
+    body=\$(printf '%s' "\$response" | head -n -1)
+    if [ "\$http_code" -ge 200 ] && [ "\$http_code" -lt 300 ]; then
+      printf '%s' "\$body"
+      return 0
+    fi
+    if [ "\$http_code" -eq 409 ]; then
+      printf '%s' "\$body"
+      echo "[CONSTRAINT] \$1 rejected (HTTP 409)" >&2
       return 0
     fi
     attempt=\$((attempt + 1))
-    [ \$attempt -lt 3 ] && echo "[RETRY \$attempt/3] \$1 failed, retrying in 5s..." >&2 && sleep 5
+    [ \$attempt -lt 3 ] && echo "[RETRY \$attempt/3] \$1 failed (HTTP \$http_code), retrying in 5s..." >&2 && sleep 5
   done
   echo "[ERROR] \$1 failed after 3 attempts" >&2
   return 1
@@ -800,11 +813,16 @@ ${analysisText.slice(0, 50_000)}
       const directionUpdatedInOutput = /"op"\s*:\s*"(update_direction|retire_direction)"/.test(allOutput);
       const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
 
+      // Detect constraint rejections (cap/dedup) so we don't retry wastefully
+      const directionRejectedInOutput = /\[CONSTRAINT\].*create_direction/.test(allOutput) || /"status"\s*:\s*"skipped"/.test(allOutput);
+
       // Check if thinker's structured output contained direction recommendations
       const structuredSection = rawAnalysis.match(/## Structured Output[\s\S]*$/i)?.[0] || '';
       const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
 
-      if (exitCode === 0 && thinkerRecommendedCreates && !anyDirectionOp) {
+      if (directionRejectedInOutput && !anyDirectionOp) {
+        sendLog(ws, '\n[INFO] Direction creation was attempted but rejected by constraints (cap/duplicate). Not retrying.\n');
+      } else if (exitCode === 0 && thinkerRecommendedCreates && !anyDirectionOp) {
         sendLog(ws, '\n[WARNING] Strategic executor completed but no direction operations were executed. Retrying...\n');
         const retryResult = await runClaudeCode(
           'Your previous attempt did not execute any ./strategic create-direction commands.\n\n' +

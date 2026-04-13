@@ -396,6 +396,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     MAX_DIRECTION_OPS = 10
     MAX_DIRECTION_CREATES = 5
     ops_applied = 0
+    retires_applied = 0
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(f"[STRATEGIC] Task {task.id}: truncating {len(direction_ops)} direction ops to {MAX_DIRECTION_OPS}")
@@ -529,6 +530,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                                 logger.warning(f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}")
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
+                        retires_applied += 1
                         logger.info(f"[STRATEGIC] Retired direction {dir_id} for project {project.id}")
                         break
 
@@ -538,9 +540,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
 
     # Update cycle history with final outcome
     cycle_id = (task.context or {}).get("strategic_cycle_id")
-    dirs_created = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "create")
+    dirs_created = creates_count if direction_ops and isinstance(direction_ops, list) else 0
     if cycle_id:
-        dirs_retired = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "retire")
+        dirs_retired = retires_applied
         vision_produced = bool(new_vision and isinstance(new_vision, dict))
         _update_cycle_history(project, cycle_id, {
             "phase2_completed_at": _utcnow().isoformat(),
