@@ -428,7 +428,8 @@ ${hotspotsSection}
       }
       if (overall) {
         const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
-        lines.push(`Overall: ${overall.cycles || 0} cycles, ${overall.merged || 0} merged, ${overall.failed || 0} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')})`);
+        const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio as number) * 100)}%` : '';
+        lines.push(`Overall: ${overall.cycles || 0} cycles, ${overall.merged || 0} merged, ${overall.failed || 0} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
       }
 
       if (systems.length > 0) {
@@ -449,6 +450,13 @@ ${hotspotsSection}
           const sysTag = d.system_id ? ` (system: ${strVal(d.system_id as string)})` : '';
           lines.push(`\n### ${strVal(d.text as string)} (${strVal(d.id as string)})${sysTag} [${strVal(d.status as string)}]`);
           lines.push(`Stats: ${d.cycles || 0} cycles, ${d.merged || 0} merged, ${d.failed || 0} failed`);
+
+          const typeDist = d.type_distribution as Record<string, number> | undefined;
+          if (typeDist && Object.keys(typeDist).length > 0) {
+            const typeParts = Object.entries(typeDist).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c} ${t}`);
+            const productRatio = typeof d.product_ratio === 'number' ? ` (${Math.round((d.product_ratio as number) * 100)}% product)` : '';
+            lines.push(`Type mix: ${typeParts.join(', ')}${productRatio}`);
+          }
 
           const lifetime = d.lifetime as Record<string, number> | undefined;
           if (lifetime) {

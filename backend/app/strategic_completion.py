@@ -642,12 +642,28 @@ def _build_outcome_evaluation(project) -> dict:
                 "failed": sys_failed,
             })
 
+    # Aggregate product_ratio across all directions
+    product_types = {"create", "feature", "improvement"}
+    agg_type_dist: dict[str, int] = {}
+    for d_outcome in direction_outcomes:
+        for t, c in (d_outcome.get("type_distribution") or {}).items():
+            agg_type_dist[t] = agg_type_dist.get(t, 0) + c
+    overall_product_ratio: float | None = None
+    if agg_type_dist:
+        agg_total = sum(agg_type_dist.values())
+        agg_product = sum(agg_type_dist.get(t, 0) for t in product_types)
+        overall_product_ratio = round(agg_product / max(agg_total, 1), 2)
+
+    overall_dict: dict = {
+        "cycles": total_cycles, "merged": total_merged, "failed": total_failed,
+        "success_rate": success_rate, "trend": trend,
+    }
+    if overall_product_ratio is not None:
+        overall_dict["product_ratio"] = overall_product_ratio
+
     result: dict = {
         "window": {"from": window_from or "all_time", "to": now_iso, "vision_revision": vision_rev},
-        "overall": {
-            "cycles": total_cycles, "merged": total_merged, "failed": total_failed,
-            "success_rate": success_rate, "trend": trend,
-        },
+        "overall": overall_dict,
     }
     if systems:
         result["systems"] = systems
