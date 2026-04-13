@@ -68,7 +68,7 @@ async def _spawn_pipeline_task(
                 session.add(source_task)
                 return None
         except Exception:
-            pass
+            logger.debug(f"[PIPELINE] Could not verify pr_merged for original task {orig_id[:8]}: skipping check")
     # Also check the source task itself
     if (source_task.context or {}).get("pr_merged"):
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
@@ -113,7 +113,8 @@ async def _spawn_pipeline_task(
     # Two detection paths: (1) _rollup_retries set when PR creation fails transiently,
     # (2) 'rollup' in status_message set by rollup_management before calling _spawn_pipeline_task.
     is_rollup = (
-        (source_task.context or {}).get("_rollup_retries") is not None
+        (source_task.context or {}).get("_is_rollup_review") is True
+        or (source_task.context or {}).get("_rollup_retries") is not None
         or 'rollup' in (source_task.latest_status_message or '').lower()
     )
     if is_rollup:
@@ -162,7 +163,7 @@ async def _spawn_pipeline_task(
         if orig:
             inherited_priority = orig.priority
     except Exception:
-        pass
+        logger.debug(f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}")
 
     # Apply per-task-type model/effort defaults from settings
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None

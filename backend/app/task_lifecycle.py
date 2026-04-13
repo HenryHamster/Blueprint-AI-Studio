@@ -405,7 +405,7 @@ async def _process_post_commit(
                             await session.commit()
                             return {"status": "accepted"}
 
-                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
@@ -637,7 +637,7 @@ async def _process_post_commit(
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         # Validate PR head branch matches before merging
-                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                        pr_data = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
                         pr_head = pr_data.get("head", {}).get("ref", "")
                         if pr_head and pr_head != branch:
                             logger.info(f"[REVIEW PIPELINE] Branch mismatch: reviewed '{branch}' but PR #{pr_number} head is '{pr_head}' — skipping merge")
@@ -651,7 +651,7 @@ async def _process_post_commit(
                         # Check CI status before merging (only for PRs targeting main)
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         is_main_merge = base_branch == "main"
-                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha) if (head_sha and is_main_merge) else None
+                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha, project_id=str(task.project_id)) if (head_sha and is_main_merge) else None
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
@@ -716,7 +716,7 @@ async def _process_post_commit(
                             except Exception as e:
                                 logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
 
-                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
 
                         if merge_result.get("merged"):
                             await create_pr_comment(gh_token, owner, repo, pr_number,

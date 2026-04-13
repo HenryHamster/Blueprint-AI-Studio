@@ -789,7 +789,7 @@ STATICENV
                         health["last_failure"] = now_fail
                         health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
-                        cooldown_secs = _zone_cooldown_seconds(old_cf)
+                        cooldown_secs = _zone_cooldown_seconds(new_failure_count)
                         health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
 
                     if entering_cooldown:
@@ -1155,7 +1155,7 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
         health["last_failure"] = now_fail
         health["consecutive_failures"] = new_failure_count
         health["last_failure_reason"] = reason
-        cooldown_secs = _zone_cooldown_seconds(old_cf)
+        cooldown_secs = _zone_cooldown_seconds(new_failure_count)
         health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
 
     if entering_cooldown:

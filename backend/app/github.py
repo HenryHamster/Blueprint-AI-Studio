@@ -44,6 +44,7 @@ async def _github_request(
     url: str,
     headers: dict,
     max_retries: int = 3,
+    project_id: str | None = None,
     **kwargs,
 ) -> httpx.Response:
     """Make a GitHub API request with retry on 5xx/network/rate-limit errors."""
@@ -79,6 +80,10 @@ async def _github_request(
                     f"[GITHUB] {method} {url} returned 401 Unauthorized — "
                     f"token may be expired or revoked"
                 )
+                if project_id:
+                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                    invalidate_github_token_cache(project_id)
+                    logger.info(f"[GITHUB] Invalidated token cache for project {project_id} after 401")
             if response.status_code < 500 or attempt == max_retries - 1:
                 if attempt > 0 and response.status_code >= 500:
                     logger.error(
@@ -684,7 +689,8 @@ async def create_pull_request(
     title: str,
     head: str,
     base: str,
-    body: str = ""
+    body: str = "",
+    project_id: str | None = None,
 ) -> dict:
     """
     Creates a new pull request in the specified repository.
@@ -704,7 +710,7 @@ async def create_pull_request(
 
     response = await _github_request(
         "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers, json=payload
+        headers, json=payload, project_id=project_id,
     )
 
     if response.status_code == 201:
@@ -722,7 +728,7 @@ async def create_pull_request(
                 list_resp = await _github_request(
                     "GET",
                     f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{head}&base={base}&state=open",
-                    headers
+                    headers, project_id=project_id,
                 )
                 if list_resp.status_code == 200 and list_resp.json():
                     return list_resp.json()[0]
@@ -746,7 +752,8 @@ async def create_pull_request(
 
 
 async def get_pull_request(
-    token: str, owner: str, repo: str, pr_number: int
+    token: str, owner: str, repo: str, pr_number: int,
+    project_id: str | None = None,
 ) -> dict:
     """Fetches PR details."""
     headers = {
@@ -756,7 +763,7 @@ async def get_pull_request(
     }
     response = await _github_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers
+        headers, project_id=project_id,
     )
     if response.status_code == 401:
         raise HTTPException(status_code=401, detail=f"GitHub authentication failed (401 Unauthorized) — token may be expired or revoked")
@@ -830,7 +837,8 @@ async def get_pull_request_commits(
 
 
 async def merge_pull_request(
-    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash"
+    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "squash",
+    project_id: str | None = None,
 ) -> dict:
     """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict."""
     headers = {
@@ -840,7 +848,7 @@ async def merge_pull_request(
     }
     response = await _github_request(
         "PUT", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
-        headers, json={"merge_method": merge_method}
+        headers, json={"merge_method": merge_method}, project_id=project_id,
     )
     data = response.json()
     if response.status_code == 200:
@@ -855,7 +863,8 @@ async def merge_pull_request(
 
 
 async def get_pr_files(
-    token: str, owner: str, repo: str, pr_number: int
+    token: str, owner: str, repo: str, pr_number: int,
+    project_id: str | None = None,
 ) -> list[dict]:
     """Fetches the list of files changed in a PR with their status (added/modified/removed)."""
     headers = {
@@ -865,7 +874,7 @@ async def get_pr_files(
     }
     response = await _github_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
-        headers
+        headers, project_id=project_id,
     )
     if response.status_code == 401:
         raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
@@ -887,7 +896,8 @@ def _unique(*values: int | None) -> list[int]:
 
 
 async def get_check_runs(
-    token: str, owner: str, repo: str, ref: str
+    token: str, owner: str, repo: str, ref: str,
+    project_id: str | None = None,
 ) -> dict:
     """Get CI check run results for a commit SHA.
 
@@ -904,7 +914,7 @@ async def get_check_runs(
     }
     response = await _github_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
-        headers
+        headers, project_id=project_id,
     )
     if response.status_code != 200:
         logger.error(f"Failed to get check runs for {ref}: {response.text}")

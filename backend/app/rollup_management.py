@@ -473,7 +473,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
 
                     pr_result = await create_pull_request(gh_token, owner, repo,
-                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body)
+                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=str(parent.project_id))
 
                     # Empty diff — branches are identical, nothing to merge
                     if pr_result.get("empty_diff"):
@@ -541,7 +541,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Auto-merge small rollups on intermediate branches; review large ones
                 # Measure by total lines changed (additions + deletions)
                 try:
-                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number)
+                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
                     lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
                 except Exception as e:
                     logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent.id}: {e}")
@@ -573,7 +573,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         await session.commit()
                         return
 
-                    merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+                    merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
                     if merge_result.get("merged"):
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
@@ -600,7 +600,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 )
                         except Exception as e:
                             logger.warning(f"[ROLLUP] Failed to query concurrent rollup count for PR #{rollup_pr_number} (task {parent.id}): {e}")
-                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number, "_is_rollup_review": True}
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked: {merge_msg} — spawning fix task"
                         try:
                             pr_files = await get_pr_files(gh_token, owner, repo, rollup_pr_number)
@@ -637,7 +637,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # all merged child work and requeueing should be possible.
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
-                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number, "_is_rollup_review": True}
                     review_task = await _spawn_pipeline_task(
                         parent, "review", session, rollup_pr_number, staging_branch, target_branch,
                         original_prompt=parent.description or parent.title,
