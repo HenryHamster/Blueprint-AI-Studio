@@ -368,7 +368,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # already landed on the target branch and we can complete.
                 try:
                     await get_branch_sha(gh_token, owner, repo, staging_branch)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found for task {parent.id}: {e}")
                     # Check if all children completed — if so, work already landed
                     all_children_ok = completed_count > 0 and failed_count == 0
                     if all_children_ok:
@@ -462,8 +463,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.latest_status_message = f"✓ All {completed_count} subtasks completed — no new changes to merge (fixes already on {target_branch})"
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent.id}: {e}")
                         session.add(parent)
                         await session.commit()
                         await _cleanup_branches(parent, session)
@@ -523,7 +524,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 try:
                     pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number)
                     lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent.id}: {e}")
                     lines_changed = 999  # assume large if we can't check
                 is_small_rollup = lines_changed <= 100
                 logger.info(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
@@ -577,14 +579,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     f"[ROLLUP] Conflict on PR #{rollup_pr_number} may be stale-window: "
                                     f"{recent_rollups} other rollup(s) merged to {target_branch} in the last hour"
                                 )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"[ROLLUP] Failed to query concurrent rollup count for PR #{rollup_pr_number} (task {parent.id}): {e}")
                         parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked: {merge_msg} — spawning fix task"
                         try:
                             pr_files = await get_pr_files(gh_token, owner, repo, rollup_pr_number)
                             files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} file list for task {parent.id}: {e}")
                             files_list = "  (could not fetch file list)"
                         parent_goal = (parent.description or parent.title or "")[:500]
                         fix_prompt = (

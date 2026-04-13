@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Dict
 
 from sqlalchemy import func as _func
@@ -18,10 +19,9 @@ from app.models import AllowedUser, Alert, AlertSeverity, Project
 logger = logging.getLogger("blueprint")
 
 
-def _utcnow():
-    """Return a timezone-naive UTC timestamp (matches DB convention)."""
-    from datetime import datetime
-    return datetime.utcnow()
+def _utcnow() -> datetime:
+    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _seed_initial_admin():

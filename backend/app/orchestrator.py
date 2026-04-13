@@ -25,6 +25,7 @@ from app.compute import (
     get_vm_zone,
     prepare_and_store_agent_secret,
     provision_agent_vm,
+    record_zone_failure,
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
@@ -38,8 +39,8 @@ logger = logging.getLogger("blueprint")
 
 
 def _utcnow() -> datetime:
-    """Return a timezone-naive UTC timestamp (matches DB convention)."""
-    return datetime.utcnow()
+    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -811,10 +812,11 @@ async def orchestrator_worker():
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}")
                             try:
                                 record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
+                                # Hoist zone lookup so it can be saved to context and used for zone failure recording
+                                prov_zone = get_vm_zone(vm_id)
                                 # Capture serial port logs before VM deletion (best-effort)
                                 serial_log = None
                                 try:
-                                    prov_zone = get_vm_zone(vm_id)
                                     if prov_zone and prov_zone != "unknown":
                                         from app.compute import _capture_serial_for_vm
                                         serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
@@ -830,6 +832,8 @@ async def orchestrator_worker():
                                             ctx = dict(failed_task.context or {})
                                             prov_failures = ctx.get("provision_failures", 0) + 1
                                             ctx["provision_failures"] = prov_failures
+                                            if prov_zone:
+                                                ctx["provision_zone"] = prov_zone
                                             if serial_log:
                                                 ctx["last_serial_log"] = serial_log[-500:]
                                             max_prov_retries = _runtime_config["max_provision_retries"]
@@ -860,6 +864,9 @@ async def orchestrator_worker():
                                                 "task_updated",
                                                 {"task_id": str(t_id), "status": failed_task.status}
                                             )
+                                            # Record zone failure so the zone health system avoids this zone
+                                            if prov_zone and prov_zone != "unknown":
+                                                record_zone_failure(prov_zone, reason="PROVISION_INLINE_FAILURE")
                                 except Exception as e:
                                     logger.error(f"[ORCHESTRATOR] Error handling provision failure for task {t_id}: {e}", exc_info=True)
                             finally:

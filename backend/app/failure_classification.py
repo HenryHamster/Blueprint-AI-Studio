@@ -60,7 +60,9 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
                                       "network unreachable",
                                       "failed to create pull request",
                                       "rollup pr creation failed",
-                                      "staging branch"]):
+                                      "staging branch",
+                                      "401", "unauthorized", "bad credentials",
+                                      "token expired", "token invalid", "token revoked"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
@@ -82,6 +84,10 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
                                       "node process killed",
                                       "oom killer", "killed by", "cgroup",
                                       "[fatal:", "fatal error", "process crashed"]):
+        return "AGENT_TIMEOUT"
+
+    # Orchestration constraints — dependency waits are not code defects
+    if any(kw in combined for kw in ["waiting on", "dependencies cleared"]):
         return "AGENT_TIMEOUT"
 
     # Default: code error
