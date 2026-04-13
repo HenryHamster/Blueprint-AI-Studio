@@ -299,7 +299,12 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
-    api_was_used = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
+    api_was_used = (
+        (task.context or {}).get("_strategic_vision_set", False)
+        or vision_rev > spawned_vision_rev
+        or (task.context or {}).get("_strategic_dirs_created", 0) > 0
+        or (task.context or {}).get("_strategic_dirs_retired", 0) > 0
+    )
 
     if api_was_used:
         cycle_id = (task.context or {}).get("strategic_cycle_id")

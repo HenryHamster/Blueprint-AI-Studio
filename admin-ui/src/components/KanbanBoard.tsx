@@ -21,7 +21,7 @@ import type { Task, TaskStatus } from './TaskCard';
 import { parseTimestamp } from '../utils/time';
 import type { Project } from './ProjectDashboard';
 
-export type SortBy = 'newest' | 'oldest' | 'type' | 'title';
+export type SortBy = 'newest' | 'oldest' | 'type' | 'title' | 'duration' | 'attempts';
 
 const COLLAPSED_COLUMNS_KEY = 'kanban_collapsed_columns';
 
@@ -48,6 +48,8 @@ const SORT_LABELS: Record<SortBy, string> = {
   oldest: 'Oldest first',
   type: 'Type',
   title: 'Title',
+  duration: 'Longest running',
+  attempts: 'Most retried',
 };
 
 function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
@@ -61,6 +63,14 @@ function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
         return (a.task_type ?? '').localeCompare(b.task_type ?? '');
       case 'title':
         return (a.title ?? '').localeCompare(b.title ?? '');
+      case 'duration': {
+        const now = Date.now();
+        const aDur = now - parseTimestamp(a.created_at).getTime();
+        const bDur = now - parseTimestamp(b.created_at).getTime();
+        return bDur - aDur;
+      }
+      case 'attempts':
+        return (b.attempt_count ?? 0) - (a.attempt_count ?? 0);
     }
   });
 }

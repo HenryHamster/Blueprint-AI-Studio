@@ -249,7 +249,7 @@ export default function App() {
     const cutoff = s.dateRange !== 'all' ? now - dateRangeCutoffs[s.dateRange] : null;
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-      const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
+      const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup'];
       const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
       const statusMatch = s.statusFilter.includes(t.status);
       const query = s.searchQuery.toLowerCase();
@@ -561,6 +561,8 @@ export default function App() {
               onSearchChange={s.setSearchQuery}
               taskTypeFilter={s.taskTypeFilter}
               onTypeFilterChange={s.setTaskTypeFilter}
+              statusFilter={s.statusFilter}
+              onStatusFilterChange={s.setStatusFilter}
               dateRange={s.dateRange}
               onDateRangeChange={s.setDateRange}
               inputRef={searchInputRef}

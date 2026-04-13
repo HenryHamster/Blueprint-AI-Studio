@@ -6,6 +6,7 @@ export function useSearchFilters() {
   const [searchQuery, setSearchQuery] = useState('');
   const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>([
     'create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor',
+    'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup',
   ]);
   const [statusFilter, setStatusFilter] = useState<string[]>([
     'QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED',

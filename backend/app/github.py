@@ -639,8 +639,7 @@ async def list_branches(
     while url and len(branches) < max_branches:
         response = await _github_request("GET", url, headers)
         if response.status_code == 401:
-            logger.warning(f"[GITHUB] Unauthorized listing branches for {owner}/{repo}")
-            return []
+            raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
         if response.status_code != 200:
             logger.error(f"[GITHUB] Failed to list branches for {owner}/{repo}: {response.status_code}")
             return []
@@ -782,6 +781,8 @@ async def get_open_pull_requests(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls",
         headers, params={"state": "open", "base": base, "per_page": 100}
     )
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
     if response.status_code != 200:
         logger.error(f"Failed to list PRs for base={base}: {response.text}")
         return []
@@ -820,6 +821,8 @@ async def get_pull_request_commits(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100",
         headers
     )
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
     if response.status_code != 200:
         logger.error(f"Failed to get PR commits #{pr_number}: {response.text}")
         return []
@@ -864,6 +867,8 @@ async def get_pr_files(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
         headers
     )
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
     if response.status_code != 200:
         logger.error(f"Failed to get PR files #{pr_number}: {response.text}")
         return []

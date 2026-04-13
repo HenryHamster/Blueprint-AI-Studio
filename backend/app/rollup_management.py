@@ -343,7 +343,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                 # Verify all PRs targeting the staging branch are resolved before rolling up
                 from app.github import get_open_pull_requests
-                open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                try:
+                    open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                except HTTPException as auth_err:
+                    if auth_err.status_code != 401:
+                        raise
+                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                    invalidate_github_token_cache(str(parent.project_id))
+                    logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
+                    gh_token, owner, repo = await get_github_token_for_task(parent.id, session, force_refresh=True)
+                    open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                 if open_prs:
                     pr_nums = [f"#{p['number']}" for p in open_prs]
                     parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"

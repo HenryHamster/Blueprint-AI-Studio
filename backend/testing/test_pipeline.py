@@ -968,6 +968,44 @@ async def test_strategic_completion_vision_rev_increase_is_success(strategic_db,
 
 
 @pytest.mark.asyncio
+async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db, mocker):
+    """Strategic task with _strategic_dirs_created>0 but no _strategic_vision_set should use API path."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    import uuid
+    cycle_id = str(uuid.uuid4())
+    project = Project(name="P", user_id="u1", vision={
+        "purpose": "test", "revision": 1,
+        "_strategic_cycle_history": [{"cycle_id": cycle_id, "phase1_completed_at": "2026-01-01T00:00:00"}],
+    })
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    # _strategic_dirs_created=2, but _strategic_vision_set is absent and vision_rev unchanged
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={
+            "_strategic_dirs_created": 2,
+            "strategic_cycle_id": cycle_id,
+        },
+        vision_rev=1,
+    )
+
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    # Should be treated as success (API path), no failure increment
+    assert project.vision.get("_strategic_failures", 0) == 0
+
+    # Cycle history should record directions_created=2
+    history = (project.vision or {}).get("_strategic_cycle_history", [])
+    matching = [h for h in history if h.get("cycle_id") == cycle_id]
+    assert matching, "Expected cycle history entry for this cycle_id"
+    assert matching[0].get("directions_created") == 2
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_no_api_no_logs_increments_failures(strategic_db, mocker):
     """No API calls and unparseable logs should increment _strategic_failures."""
     alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)

@@ -8,14 +8,15 @@ interface SearchFilterBarProps {
   onSearchChange: (query: string) => void;
   taskTypeFilter: string[];
   onTypeFilterChange: (filter: string[]) => void;
+  statusFilter: string[];
+  onStatusFilterChange: (filter: string[]) => void;
   dateRange: DateRange;
   onDateRangeChange: (range: DateRange) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
 const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix', 'refactor', 'migrate', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup'] as const;
-
-
+const STATUS_OPTIONS = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'COMPLETED', 'FAILED', 'CANCELLED'] as const;
 
 interface MultiSelectDropdownProps {
   label: string;
@@ -110,9 +111,10 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
   { label: 'Last 7d', value: '7d' },
 ];
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, dateRange, onDateRangeChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
+  const statusOptions = STATUS_OPTIONS.map(opt => ({ label: opt.replace('_', ' '), value: opt }));
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -128,6 +130,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter.length < typeOptions.length,
+    statusFilter.length < statusOptions.length,
     dateRange !== 'all',
   ].filter(Boolean).length;
 
@@ -136,6 +139,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   function handleClear() {
     onSearchChange('');
     onTypeFilterChange(typeOptions.map(o => o.value));
+    onStatusFilterChange(statusOptions.map(o => o.value));
     onDateRangeChange('all');
   }
 
@@ -158,6 +162,13 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         options={typeOptions}
         selected={taskTypeFilter}
         onChange={onTypeFilterChange}
+      />
+
+      <MultiSelectDropdown
+        label="Status"
+        options={statusOptions}
+        selected={statusFilter}
+        onChange={onStatusFilterChange}
       />
 
       <select

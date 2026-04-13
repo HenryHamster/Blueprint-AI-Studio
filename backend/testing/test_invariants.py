@@ -323,7 +323,7 @@ TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategi
 TASK_LIFECYCLE_MAX_LINES = 1200      # Ratcheted down after rollup_management.py extraction
 TASK_LIFECYCLE_MAX_FUNCTIONS = 7     # Ratcheted down after rollup_management.py extraction
 
-ROLLUP_MANAGEMENT_MAX_LINES = 700
+ROLLUP_MANAGEMENT_MAX_LINES = 710
 ROLLUP_MANAGEMENT_MAX_FUNCTIONS = 4
 
 REVIEW_PIPELINE_MAX_LINES = 350
