@@ -2224,6 +2224,59 @@ async def test_strategic_failures_no_decay_when_recent(db_session):
     assert len(tasks) == 0, "Expected no task: decay should not apply for recent failure"
 
 
+@pytest.mark.asyncio
+async def test_all_saturated_directions_triggers_force_strategic(db_session):
+    """When all active directions are saturated, force_strategic fires regardless of spawn count."""
+    project = Project(
+        name="All Saturated Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-111", "status": "active", "possibly_saturated": True, "title": "Dir 1"},
+            {"id": "d-222", "status": "active", "possibly_saturated": True, "title": "Dir 2"},
+            {"id": "d-333", "status": "active", "possibly_saturated": True, "title": "Dir 3"},
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    task_types = [t.payloads[0].get("type") for t in tasks]
+    assert "design_doc_update" in task_types, "Expected a strategic (design_doc_update) task when all directions are saturated"
+    assert "research" not in task_types, "Expected no research tasks when all directions are saturated"
+
+
+@pytest.mark.asyncio
+async def test_partially_saturated_directions_no_force_strategic(db_session):
+    """When only some active directions are saturated, force_strategic does NOT fire."""
+    project = Project(
+        name="Partial Saturated Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-111", "status": "active", "possibly_saturated": True, "title": "Dir 1"},
+            {"id": "d-222", "status": "active", "possibly_saturated": False, "title": "Dir 2"},
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    # A research task for the non-saturated direction should spawn, not a strategic task
+    strategic_tasks = [t for t in tasks if t.payloads[0].get("type") == "design_doc_update"]
+    assert len(strategic_tasks) == 0, "Expected no strategic task when only some directions are saturated"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dedup hole tests — failed parent and infra failures
 # ─────────────────────────────────────────────────────────────────────────────

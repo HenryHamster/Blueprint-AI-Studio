@@ -20,7 +20,7 @@ from app.task_completion import _validate_plan_dependencies
 from app.failure_classification import classify_failure
 from app.main import record_task_result, should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
-from app.strategic_completion import _handle_strategic_completion
+from app.strategic_completion import _handle_strategic_completion, _check_direction_starvation
 from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task
 from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, DeploymentStatus
@@ -885,6 +885,43 @@ async def test_strategic_completion_vision_set_flag_is_success(strategic_db, moc
 
 
 @pytest.mark.asyncio
+async def test_strategic_completion_api_path_records_directions_created(strategic_db, mocker):
+    """API path should record directions_created/retired in cycle history from task context."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    cycle_id = "cycle-test-001"
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1,
+                "_strategic_cycle_history": [{"cycle_id": cycle_id, "phase1_completed_at": "2026-01-01T00:00:00"}]},
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={
+            "_strategic_vision_set": True,
+            "_strategic_dirs_created": 2,
+            "_strategic_dirs_retired": 1,
+            "strategic_cycle_id": cycle_id,
+        },
+        vision_rev=1,
+    )
+
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    history = (project.vision or {}).get("_strategic_cycle_history", [])
+    cycle_entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
+    assert cycle_entry is not None, "Cycle entry not found in history"
+    assert cycle_entry.get("directions_created") == 2
+    assert cycle_entry.get("directions_retired") == 1
+    assert cycle_entry.get("outcome") == "completed"
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_create_direction_only_is_not_success(strategic_db, mocker):
     """A task that called create_direction but NOT set_vision should NOT be treated as success."""
     alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
@@ -1015,6 +1052,127 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
     # Failure fields should NOT carry over (reset on success)
     assert "_strategic_failures" not in vision
     assert "_strategic_failures_at" not in vision
+
+
+# ── Direction Starvation Detection ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker):
+    """First cycle with 0 dirs_created and active_count < 3 increments starvation counter to 1."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    # Counter increments but no alert and no override yet (threshold is 2)
+    assert project.vision.get("_direction_starvation_count") == 1
+    assert "_strategic_frequency_override" not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_starvation_triggers_alert_and_override_after_two_cycles(strategic_db, mocker):
+    """Two consecutive cycles with 0 dirs and active_count < 3 triggers alert and sets override."""
+    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    # Start with starvation_count=1 (simulating previous cycle)
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1, "_direction_starvation_count": 1},
+        directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    assert project.vision.get("_direction_starvation_count") == 2
+    assert project.vision.get("_strategic_frequency_override") == 2
+    alert_mock.assert_called_once()
+    # Alert message should mention starvation
+    alert_msg = alert_mock.call_args[0][2]
+    assert "starvation" in alert_msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_starvation_counter_resets_on_direction_creation(strategic_db, mocker):
+    """When dirs_created > 0, starvation counter and frequency override are cleared."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={
+            "purpose": "test", "revision": 1,
+            "_direction_starvation_count": 2,
+            "_strategic_frequency_override": 2,
+        },
+        directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 1},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    assert project.vision.get("_direction_starvation_count") == 0
+    assert "_strategic_frequency_override" not in project.vision
+
+
+@pytest.mark.asyncio
+async def test_starvation_no_gap_no_increment(strategic_db, mocker):
+    """With 3+ active directions including a product one, no gap exists — counter not incremented."""
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-aaa", "status": "active", "text": "Dir A", "category": "product"},
+            {"id": "d-bbb", "status": "active", "text": "Dir B"},
+            {"id": "d-ccc", "status": "active", "text": "Dir C"},
+        ],
+    )
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = await _make_strategic_task(
+        strategic_db, project,
+        context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
+        vision_rev=1,
+    )
+    await _handle_strategic_completion(task, "", strategic_db)
+
+    await strategic_db.refresh(project)
+    assert project.vision.get("_direction_starvation_count", 0) == 0
+    assert "_strategic_frequency_override" not in project.vision
 
 
 # ── Structural Refactor Pipeline Relaxations ──────────────────────────────────

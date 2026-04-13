@@ -361,8 +361,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.
     any_active_in_project = any(d.get("status") == "active" for d in (project.directions or []))
+    all_dirs_saturated = any_active_in_project and all(
+        d.get("possibly_saturated") for d in (project.directions or []) if d.get("status") == "active"
+    )
     force_strategic = strategic_failures < 3 and (
-        not vision_data.get("purpose") or not any_active_in_project
+        not vision_data.get("purpose") or not any_active_in_project or all_dirs_saturated
     )
     if not active_directions and not force_strategic:
         return
@@ -446,6 +449,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 
+    # When all active directions are saturated, skip tactical research — a strategic
+    # cycle will create fresh directions; spawning more saturated research is wasteful.
+    if all_dirs_saturated:
+        chosen_directions = []
+        active_directions = []
+
     # Check for a pending strategic review from a previously failed chain.
     # If the design_doc → strategic_review spawn failed last cycle, retry it now
     # rather than waiting up to 6 more research spawns (~3+ hours).
@@ -482,7 +491,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         flag_modified(project, "vision")
         session.add(project)
         logger.info(f"[RESEARCH] Seeded _research_spawn_count={research_spawn_count} from research_history")
-    strategic_frequency = _runtime_config.get("strategic_research_frequency", 6)
+    strategic_frequency = (project.vision or {}).get("_strategic_frequency_override") or _runtime_config.get("strategic_research_frequency", 6)
     is_strategic = (
         (strategic_frequency > 0 and research_spawn_count > 0 and research_spawn_count % strategic_frequency == 0)
         or force_strategic

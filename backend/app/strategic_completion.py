@@ -134,6 +134,80 @@ def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejec
     return False
 
 
+async def _check_direction_starvation(
+    project: Any, dirs_created: int, session: AsyncSession
+) -> None:
+    """Detect consecutive strategic cycles with no direction creation despite active gaps.
+
+    Increments vision['_direction_starvation_count'] each cycle where dirs_created == 0
+    and at least one gap exists (active_count < 3, no product directions, or all saturated).
+
+    When starvation_count >= 2:
+      - Creates a strategic alert describing the gap.
+      - Sets vision['_strategic_frequency_override'] = 2 to boost cycle frequency.
+
+    Resets both counter and override when dirs_created > 0 (starvation resolved).
+    """
+    from app.main import _create_strategic_alert  # noqa: PLC0415
+
+    directions = project.directions or []
+    active_count = sum(1 for d in directions if d.get("status") == "active")
+    product_count = sum(
+        1 for d in directions
+        if d.get("status") == "active" and d.get("category") == "product"
+    )
+    all_saturated = (
+        active_count > 0
+        and all(d.get("possibly_saturated") for d in directions if d.get("status") == "active")
+    )
+    has_gaps = active_count < 3 or product_count == 0 or all_saturated
+
+    vision = dict(project.vision or {})
+    if dirs_created == 0 and has_gaps:
+        starvation_count = vision.get("_direction_starvation_count", 0) + 1
+        vision["_direction_starvation_count"] = starvation_count
+        if starvation_count >= 2:
+            gap_parts = []
+            if active_count < 3:
+                gap_parts.append(f"only {active_count} active directions (min 3 needed)")
+            if product_count == 0:
+                gap_parts.append("no product-category directions")
+            if all_saturated:
+                gap_parts.append("all active directions are saturated")
+            gap_desc = "; ".join(gap_parts) or "unspecified gap"
+            vision["_strategic_frequency_override"] = 2
+            project.vision = vision
+            flag_modified(project, "vision")
+            await _create_strategic_alert(
+                project.id, session,
+                f"Direction starvation: {starvation_count} consecutive cycles with 0 new "
+                f"directions ({gap_desc}). Boosting strategic frequency.",
+            )
+            logger.warning(
+                f"[STRATEGIC] Direction starvation for project {project.id}: "
+                f"{starvation_count} cycles, gap: {gap_desc}. Frequency override → 2."
+            )
+        else:
+            project.vision = vision
+            flag_modified(project, "vision")
+            logger.info(
+                f"[STRATEGIC] Direction starvation cycle {starvation_count}/2 "
+                f"for project {project.id} (has_gaps=True, dirs_created=0)"
+            )
+    else:
+        starvation_count = vision.get("_direction_starvation_count", 0)
+        has_override = "_strategic_frequency_override" in vision
+        if starvation_count > 0 or has_override:
+            vision["_direction_starvation_count"] = 0
+            vision.pop("_strategic_frequency_override", None)
+            project.vision = vision
+            flag_modified(project, "vision")
+            logger.info(
+                f"[STRATEGIC] Direction starvation resolved for project {project.id}: "
+                f"{dirs_created} direction(s) created. Counter and override cleared."
+            )
+
+
 async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSession):
     """Handle strategic review completion.
 
@@ -159,13 +233,18 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
 
     if api_was_used:
         cycle_id = (task.context or {}).get("strategic_cycle_id")
+        dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)
+        dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         if cycle_id:
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
                 "vision_updated": True,
+                "directions_created": dirs_created,
+                "directions_retired": dirs_retired,
                 "outcome": "completed",
             })
-            session.add(project)
+        await _check_direction_starvation(project, dirs_created, session)
+        session.add(project)
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions"
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
@@ -459,8 +538,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
 
     # Update cycle history with final outcome
     cycle_id = (task.context or {}).get("strategic_cycle_id")
+    dirs_created = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "create")
     if cycle_id:
-        dirs_created = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "create")
         dirs_retired = sum(1 for op in (direction_ops or []) if isinstance(op, dict) and op.get("op") == "retire")
         vision_produced = bool(new_vision and isinstance(new_vision, dict))
         _update_cycle_history(project, cycle_id, {
@@ -471,6 +550,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             "outcome": "completed" if vision_produced else "failed",
         })
 
+    await _check_direction_starvation(project, dirs_created, session)
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace

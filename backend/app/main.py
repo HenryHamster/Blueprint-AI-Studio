@@ -1647,6 +1647,10 @@ async def strategic_operation(
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_dirs_created": ctx.get("_strategic_dirs_created", 0) + 1}
+        flag_modified(task, "context")
+        session.add(task)
         await session.commit()
         logger.info(f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}")
         return _resp({"status": "ok", "op": "create_direction", "direction_id": new_dir["id"]})
@@ -1706,6 +1710,10 @@ async def strategic_operation(
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1}
+        flag_modified(task, "context")
+        session.add(task)
         await session.commit()
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
