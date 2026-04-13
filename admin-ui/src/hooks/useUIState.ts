@@ -57,13 +57,16 @@ export function useUIState() {
   // Selection mode
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
+  const lastSelectedTaskIdRef = useRef<string | null>(null);
 
   const toggleSelectionMode = () => {
     setSelectionMode(prev => !prev);
     setSelectedTaskIds(new Set());
+    lastSelectedTaskIdRef.current = null;
   };
 
   const toggleTaskSelection = (taskId: string) => {
+    lastSelectedTaskIdRef.current = taskId;
     setSelectedTaskIds(prev => {
       const next = new Set(prev);
       if (next.has(taskId)) {
@@ -73,6 +76,30 @@ export function useUIState() {
       }
       return next;
     });
+  };
+
+  const shiftSelectRange = (taskId: string, orderedTaskIds: string[]) => {
+    const lastId = lastSelectedTaskIdRef.current;
+    if (!lastId || !orderedTaskIds.includes(lastId)) {
+      toggleTaskSelection(taskId);
+      return;
+    }
+    const lastIdx = orderedTaskIds.indexOf(lastId);
+    const currIdx = orderedTaskIds.indexOf(taskId);
+    if (currIdx === -1) {
+      toggleTaskSelection(taskId);
+      return;
+    }
+    const [from, to] = lastIdx <= currIdx ? [lastIdx, currIdx] : [currIdx, lastIdx];
+    const rangeIds = orderedTaskIds.slice(from, to + 1);
+    setSelectedTaskIds(prev => {
+      const next = new Set(prev);
+      for (const id of rangeIds) {
+        next.add(id);
+      }
+      return next;
+    });
+    lastSelectedTaskIdRef.current = taskId;
   };
 
   const bulkColumnToggle = (taskIds: string[], selected: boolean) => {
@@ -109,7 +136,7 @@ export function useUIState() {
     showUserManagement, setShowUserManagement,
     settingsRef, shortcutHelpRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
-    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
+    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
   };
 }

@@ -402,3 +402,46 @@ async def test_bulk_action_partial_errors(client: AsyncClient, db_session, mocke
     statuses = {r["task_id"]: r["status"] for r in data["results"]}
     assert statuses[str(valid_task.id)] == "ok"
     assert statuses["not-a-uuid"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_cancel_sets_cancelled(client: AsyncClient, db_session, mocker):
+    """Bulk cancel sets status=CANCELLED and creates TaskHistory."""
+    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", return_value=None)
+
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_task(db_session, project, TaskStatus.IN_PROGRESS)
+    task2 = await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "cancel", "task_ids": [str(task1.id), str(task2.id)]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success_count"] == 2
+    assert data["error_count"] == 0
+
+    get_resp = await client.get(f"/api/admin/tasks/{task1.id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["status"] == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_bulk_action_cancel_skips_terminal_tasks(client: AsyncClient, db_session, mocker):
+    """Bulk cancel returns error for already-terminal tasks."""
+    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_task(db_session, project, TaskStatus.COMPLETED)
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "cancel", "task_ids": [str(task.id)]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success_count"] == 0
+    assert data["error_count"] == 1
+    assert "terminal" in data["results"][0]["error"]

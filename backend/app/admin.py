@@ -328,8 +328,8 @@ async def bulk_action_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    if body.action not in ('approve', 'retry'):
-        raise HTTPException(status_code=400, detail="action must be 'approve' or 'retry'")
+    if body.action not in ('approve', 'retry', 'cancel'):
+        raise HTTPException(status_code=400, detail="action must be 'approve', 'retry', or 'cancel'")
 
     results = []
 
@@ -510,6 +510,65 @@ async def bulk_action_tasks(
                 session.add(task)
                 session.add(history)
                 await session.commit()
+
+            elif body.action == 'cancel':
+                terminal_statuses = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                if task.status in terminal_statuses:
+                    results.append({"task_id": raw_id, "status": "error", "error": f"Task already in terminal state {task.status}"})
+                    continue
+
+                task.status = TaskStatus.CANCELLED
+                task.requires_approval = False
+
+                # Suppress low-priority tasks with finding_hash for 180 days
+                if task.context and task.context.get("finding_hash"):
+                    task_priority = task.priority if task.priority is not None else 50
+                    if task_priority == 0:
+                        suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
+                        task.context = {**task.context, "suppress_until": suppress_until}
+                        flag_modified(task, "context")
+
+                history = TaskHistory(
+                    task_id=task.id,
+                    action="MODIFIED",
+                    details={"changes": {"status": "CANCELLED"}, "modified_by": "BULK_ACTION"}
+                )
+                session.add(task)
+                session.add(history)
+                # Commit terminal status first so agents detect cancellation
+                await session.commit()
+
+                # Delete VM immediately (no graceful sleep for bulk operations)
+                if task.vm_instance_id:
+                    from app.main import _ensure_vm_deleted
+                    await _ensure_vm_deleted(task, reason="admin_bulk_cancel")
+                    acct_id = (task.context or {}).get("max_plan_account_id")
+                    if acct_id:
+                        from app.max_plan_pool import release_max_plan_account
+                        await release_max_plan_account(acct_id)
+
+                # Cascade cancellation to active children
+                from app.main import _ensure_vm_deleted as _cancel_vm
+                from app.max_plan_pool import release_max_plan_account as _cancel_release
+                active_children = (await session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == task.id,
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+                    )
+                )).scalars().all()
+                for child in active_children:
+                    child.status = TaskStatus.CANCELLED
+                    child.requires_approval = False
+                    session.add(child)
+                await session.commit()
+                for child in active_children:
+                    if child.vm_instance_id:
+                        await _cancel_vm(child, reason="parent_bulk_cancelled")
+                    child_acct = (child.context or {}).get("max_plan_account_id")
+                    if child_acct:
+                        await _cancel_release(child_acct)
+                if active_children:
+                    logger.info(f"[ADMIN] Bulk cancel cascaded to {len(active_children)} children of task {task.id}")
 
             results.append({"task_id": raw_id, "status": "ok"})
         except HTTPException as e:
@@ -858,7 +917,7 @@ async def modify_task(
             # Only block nonsensical transitions like FAILED → IN_PROGRESS.
             admin_allowed = {TaskStatus.QUEUED, TaskStatus.CANCELLED}
             if new_status not in admin_allowed and task.status in _TERMINAL_STATUSES:
-                raise HTTPException(status_code=400, detail=f"Cannot transition from terminal state {task.status.value} to {new_status.value} (only requeue or cancel is allowed)")
+                raise HTTPException(status_code=400, detail=f"Cannot transition from terminal state {task.status} to {new_status} (only requeue or cancel is allowed)")
 
             task.status = new_status
             changes["status"] = new_status.value

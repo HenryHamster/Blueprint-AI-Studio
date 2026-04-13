@@ -1,6 +1,7 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, LayoutList, LayoutGrid, ChevronUp, ChevronDown } from 'lucide-react';
+import { Activity, AlertCircle, LayoutList, LayoutGrid, ChevronUp, ChevronDown, CheckSquare, X } from 'lucide-react';
+import type { Task } from './types/task';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { DirectionsPanel } from './components/DirectionsPanel';
@@ -37,6 +38,14 @@ const COLUMNS: KanbanColumn[] = [
 ];
 
 const SORT_KEY = 'blueprint-admin:kanban-sort';
+const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
+
+function buildBulkConfirmMessage(tasks: Task[]): string {
+  const titles = tasks.map(t => t.title || t.id.slice(0, 12));
+  if (titles.length <= 5) return titles.join('\n');
+  return titles.slice(0, 5).join('\n') + `\n...and ${titles.length - 5} more`;
+}
 
 interface ColumnPref { id: string; visible: boolean; }
 
@@ -227,6 +236,14 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
 
+  const selectedTasks = useMemo(
+    () => s.tasks.filter(t => s.selectedTaskIds.has(t.id)),
+    [s.tasks, s.selectedTaskIds],
+  );
+  const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
+  const failedTasks = useMemo(() => selectedTasks.filter(t => t.status === 'FAILED'), [selectedTasks]);
+  const terminalTasks = useMemo(() => selectedTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
+
   const effectiveColumnPrefs = useMemo<ColumnPref[]>(() => {
     const base = s.columnPrefs.length > 0 ? s.columnPrefs : COLUMNS.map(c => ({ id: c.id, visible: true }));
     // Add any COLUMNS entry not yet in prefs (e.g. newly added columns)
@@ -256,10 +273,11 @@ export default function App() {
       const searchMatch = !query || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query));
       const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
       const dateMatch = cutoff === null || new Date(t.created_at).getTime() >= cutoff;
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch;
+      const approvalMatch = !s.requiresApproval || t.requires_approval;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && approvalMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.requiresApproval]);
 
   const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
@@ -555,7 +573,7 @@ export default function App() {
         />
       ) : (
         <>
-          <div className="flex items-center gap-2 shrink-0 mb-3 flex-wrap">
+          <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
             <SearchFilterBar
               searchQuery={s.searchQuery}
               onSearchChange={s.setSearchQuery}
@@ -597,11 +615,96 @@ export default function App() {
               {s.compactMode ? 'Compact' : 'Normal'}
             </button>
             )}
+            {s.viewMode === 'kanban' && (
+            <button
+              onClick={s.toggleSelectionMode}
+              title={s.selectionMode ? 'Exit selection mode' : 'Select tasks for bulk actions'}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                s.selectionMode
+                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+              }`}
+            >
+              <CheckSquare className="w-3.5 h-3.5" />
+              {s.selectionMode ? 'Selecting' : 'Select'}
+            </button>
+            )}
             <div className="flex-1" />
             <span className="text-xs text-neutral-500">
               {filteredTasks.length} of {s.tasks.length}
             </span>
           </div>
+
+          {/* Quick-filter preset buttons */}
+          {(() => {
+            const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
+            const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'];
+            const isFailedToday = s.statusFilter.length === 1 && s.statusFilter[0] === 'FAILED' && s.dateRange === '24h' && !s.requiresApproval && s.searchQuery === '';
+            const isStuckHour = s.statusFilter.length === 2 && s.statusFilter.includes('IN_PROGRESS') && s.statusFilter.includes('PROVISIONING') && s.dateRange === '1h' && !s.requiresApproval && s.searchQuery === '';
+            const isNeedsReview = s.requiresApproval && s.statusFilter.length === ALL_STATUSES.length && s.dateRange === 'all' && s.searchQuery === '';
+
+            const clearAll = () => {
+              s.setStatusFilter(ALL_STATUSES);
+              s.setTaskTypeFilter(ALL_TYPES);
+              s.setDateRange('all');
+              s.setRequiresApproval(false);
+              s.setSearchQuery('');
+            };
+
+            const presets = [
+              {
+                label: 'Failed today',
+                active: isFailedToday,
+                apply: () => {
+                  if (isFailedToday) { clearAll(); return; }
+                  s.setStatusFilter(['FAILED']);
+                  s.setDateRange('24h');
+                  s.setRequiresApproval(false);
+                  s.setSearchQuery('');
+                },
+              },
+              {
+                label: 'Active last hour',
+                active: isStuckHour,
+                apply: () => {
+                  if (isStuckHour) { clearAll(); return; }
+                  s.setStatusFilter(['IN_PROGRESS', 'PROVISIONING']);
+                  s.setDateRange('1h');
+                  s.setRequiresApproval(false);
+                  s.setSearchQuery('');
+                },
+              },
+              {
+                label: 'Needs review',
+                active: isNeedsReview,
+                apply: () => {
+                  if (isNeedsReview) { clearAll(); return; }
+                  s.setRequiresApproval(true);
+                  s.setStatusFilter(ALL_STATUSES);
+                  s.setDateRange('all');
+                  s.setSearchQuery('');
+                },
+              },
+            ];
+
+            return (
+              <div className="flex items-center gap-1.5 mb-3">
+                {presets.map(p => (
+                  <button
+                    key={p.label}
+                    onClick={p.apply}
+                    className={`px-2.5 py-0.5 rounded-full text-xs border transition-colors ${
+                      p.active
+                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+                        : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            );
+          })()}
 
           {s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
@@ -613,6 +716,11 @@ export default function App() {
               actionLoadingMap={s.actionLoadingMap}
               compact={s.compactMode}
               sortBy={sortBy}
+              selectionMode={s.selectionMode}
+              selectedTaskIds={s.selectedTaskIds}
+              onToggleTaskSelection={s.toggleTaskSelection}
+              onBulkToggle={s.bulkColumnToggle}
+              onShiftSelect={s.shiftSelectRange}
               hasActiveFilters={hasActiveFilters}
               onArchiveColumn={(taskIds, columnLabel) => {
                 s.setConfirmDialog({
@@ -751,6 +859,69 @@ export default function App() {
       )}
 
       {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} addToast={s.addToast} />}
+
+      {s.selectionMode && s.selectedTaskIds.size > 0 && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl">
+          <span className="flex items-center gap-1.5 text-xs text-neutral-300 font-medium mr-1">
+            <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
+            {s.selectedTaskIds.size} selected
+          </span>
+          {cancellableTasks.length > 0 && (
+            <button
+              onClick={() => s.setConfirmDialog({
+                title: `Cancel ${cancellableTasks.length} task${cancellableTasks.length !== 1 ? 's' : ''}?`,
+                message: buildBulkConfirmMessage(cancellableTasks),
+                confirmLabel: `Cancel ${cancellableTasks.length}`,
+                onConfirm: () => s.handleBulkCancel(cancellableTasks.map(t => t.id)),
+              })}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 transition-colors"
+            >
+              Cancel {cancellableTasks.length}
+            </button>
+          )}
+          {failedTasks.length > 0 && (
+            <button
+              onClick={() => s.setConfirmDialog({
+                title: `Retry ${failedTasks.length} task${failedTasks.length !== 1 ? 's' : ''}?`,
+                message: buildBulkConfirmMessage(failedTasks),
+                confirmLabel: `Retry ${failedTasks.length}`,
+                onConfirm: () => {
+                  s.handleBulkAction('retry', failedTasks.map(t => t.id));
+                  s.toggleSelectionMode();
+                  s.setConfirmDialog(null);
+                },
+              })}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 border border-amber-500/40 transition-colors"
+            >
+              Retry {failedTasks.length}
+            </button>
+          )}
+          {terminalTasks.length > 0 && (
+            <button
+              onClick={() => s.setConfirmDialog({
+                title: `Archive ${terminalTasks.length} task${terminalTasks.length !== 1 ? 's' : ''}?`,
+                message: buildBulkConfirmMessage(terminalTasks),
+                confirmLabel: `Archive ${terminalTasks.length}`,
+                onConfirm: () => {
+                  s.handleBulkArchiveColumn(terminalTasks.map(t => t.id));
+                  s.toggleSelectionMode();
+                },
+              })}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-700 hover:bg-neutral-600 text-neutral-300 border border-neutral-600 transition-colors"
+            >
+              Archive {terminalTasks.length}
+            </button>
+          )}
+          <button
+            onClick={s.toggleSelectionMode}
+            title="Exit selection mode"
+            className="ml-1 p-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 hover:bg-neutral-700 transition-colors"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
       {s.confirmDialog && (

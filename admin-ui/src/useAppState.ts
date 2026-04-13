@@ -73,7 +73,7 @@ export function useAppState() {
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange } = useSearchFilters();
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, requiresApproval, setRequiresApproval } = useSearchFilters();
 
   const {
     showResearchBrowser, setShowResearchBrowser,
@@ -87,7 +87,7 @@ export function useAppState() {
     showUserManagement, setShowUserManagement,
     settingsRef, shortcutHelpRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
-    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
+    toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
   } = useUIState();
 
@@ -759,6 +759,31 @@ export function useAppState() {
     setConfirmDialog(null);
   };
 
+  const handleBulkCancel = async (taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'cancel', task_ids: taskIds }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      setSelectedTaskIds(new Set());
+      setSelectionMode(false);
+      fetchTasks();
+      if (data.error_count === 0) {
+        addToast(`Cancelled ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
+      } else {
+        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
+      }
+    } catch (error) {
+      console.error('Failed to bulk cancel tasks:', error);
+      addToast('Failed to cancel tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
   const handleToggleSettings = () => {
     setShowSettings(prev => {
       if (!prev) fetchSettings();
@@ -781,8 +806,8 @@ export function useAppState() {
     needsAttentionCount,
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
-    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn, handleBulkAction,
-    selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle,
+    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn, handleBulkAction, handleBulkCancel,
+    selectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
     // Toasts
     toasts, addToast, dismissToast,
@@ -795,7 +820,7 @@ export function useAppState() {
     // Column preferences
     columnPrefs, setColumnPrefs,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, requiresApproval, setRequiresApproval,
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous,
     // Log viewer

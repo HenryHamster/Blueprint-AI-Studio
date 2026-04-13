@@ -12,6 +12,7 @@ export function useSearchFilters() {
     'QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED',
   ]);
   const [dateRange, setDateRange] = useState<DateRange>('all');
+  const [requiresApproval, setRequiresApproval] = useState(false);
 
-  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange };
+  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, requiresApproval, setRequiresApproval };
 }

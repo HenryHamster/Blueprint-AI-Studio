@@ -83,6 +83,11 @@ interface KanbanBoardProps {
   actionLoadingMap: Record<string, string>;
   compact?: boolean;
   sortBy: SortBy;
+  selectionMode: boolean;
+  selectedTaskIds: Set<string>;
+  onToggleTaskSelection: (id: string) => void;
+  onBulkToggle: (taskIds: string[], selected: boolean) => void;
+  onShiftSelect?: (taskId: string, orderedTaskIds: string[]) => void;
   onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
@@ -98,11 +103,12 @@ interface KanbanBoardProps {
   searchQuery?: string;
 }
 
-function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
+function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
+  onShiftClick?: (id: string) => void;
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   compact?: boolean;
@@ -130,7 +136,14 @@ function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection,
           <input
             type="checkbox"
             checked={selectedTaskIds.has(task.id)}
-            onChange={() => onToggleTaskSelection(task.id)}
+            onChange={(e) => {
+              const shiftHeld = !!(e.nativeEvent as MouseEvent).shiftKey;
+              if (shiftHeld && onShiftClick) {
+                onShiftClick(task.id);
+              } else {
+                onToggleTaskSelection(task.id);
+              }
+            }}
             className="w-4 h-4 accent-amber-400 cursor-pointer"
           />
         </div>
@@ -172,6 +185,7 @@ interface SortableCardProps {
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
+  onShiftClick?: (id: string) => void;
   compact?: boolean;
   blockingCount?: number;
   onApprove: (id: string) => void;
@@ -199,6 +213,7 @@ function SortableCard({
   selectionMode,
   selectedTaskIds,
   onToggleTaskSelection,
+  onShiftClick,
   compact,
   blockingCount,
   onApprove,
@@ -244,7 +259,14 @@ function SortableCard({
           <input
             type="checkbox"
             checked={selectedTaskIds.has(task.id)}
-            onChange={() => onToggleTaskSelection(task.id)}
+            onChange={(e) => {
+              const shiftHeld = !!(e.nativeEvent as MouseEvent).shiftKey;
+              if (shiftHeld && onShiftClick) {
+                onShiftClick(task.id);
+              } else {
+                onToggleTaskSelection(task.id);
+              }
+            }}
             className="w-4 h-4 accent-amber-400 cursor-pointer"
           />
         </div>
@@ -340,6 +362,11 @@ export function KanbanBoard({
   actionLoadingMap,
   compact,
   sortBy,
+  selectionMode,
+  selectedTaskIds,
+  onToggleTaskSelection,
+  onBulkToggle,
+  onShiftSelect,
   onArchiveColumn,
   onApprove,
   onRequestChanges,
@@ -353,13 +380,6 @@ export function KanbanBoard({
   trackedTaskIds,
   searchQuery,
 }: KanbanBoardProps) {
-  // Selection mode and groupBy removed from UI
-  const selectionMode = false;
-  const selectedTaskIds = new Set<string>();
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const onToggleTaskSelection = (..._args: unknown[]) => {};
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const onBulkToggle = (..._args: unknown[]) => {};
   const groupBy = 'status' as 'status' | 'type' | 'project';
   const projects: Project[] = [];
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
@@ -603,6 +623,10 @@ export function KanbanBoard({
           const columnTasks = tasksByColumn[col.id] ?? [];
           const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
           const taskIds = columnTasks.map(t => t.id);
+          const columnTaskIds = taskIds;
+          const shiftClickHandler = onShiftSelect
+            ? (taskId: string) => onShiftSelect(taskId, columnTaskIds)
+            : undefined;
 
           let mobileContent: React.ReactNode;
           if (groupBy === 'type') {
@@ -636,6 +660,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              onShiftClick={shiftClickHandler}
                               blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
@@ -687,6 +712,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              onShiftClick={shiftClickHandler}
                               blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
@@ -715,6 +741,7 @@ export function KanbanBoard({
                       selectionMode={selectionMode}
                       selectedTaskIds={selectedTaskIds}
                       onToggleTaskSelection={onToggleTaskSelection}
+                      onShiftClick={shiftClickHandler}
                       compact={compact}
                       blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
@@ -788,6 +815,10 @@ export function KanbanBoard({
           if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
           const isCollapsed = collapsedColumns.has(col.id);
           const taskIds = columnTasks.map(t => t.id);
+          const columnTaskIds = taskIds;
+          const shiftClickHandler = onShiftSelect
+            ? (taskId: string) => onShiftSelect(taskId, columnTaskIds)
+            : undefined;
 
           let content: React.ReactNode;
 
@@ -822,6 +853,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              onShiftClick={shiftClickHandler}
                               blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
@@ -873,6 +905,7 @@ export function KanbanBoard({
                               key={task.id}
                               task={task}
                               {...taskProps}
+                              onShiftClick={shiftClickHandler}
                               blockingCount={blockingMap[task.id]}
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
@@ -901,6 +934,7 @@ export function KanbanBoard({
                       selectionMode={selectionMode}
                       selectedTaskIds={selectedTaskIds}
                       onToggleTaskSelection={onToggleTaskSelection}
+                      onShiftClick={shiftClickHandler}
                       compact={compact}
                       blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
