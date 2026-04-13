@@ -1724,7 +1724,7 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
                     json={"op": "create_direction", "task_id": task_id,
                           "data": {"text": "Overcap direction", "priority": "medium"}},
                 )
-            assert resp.status_code == 200, resp.text
+            assert resp.status_code == 409, resp.text
             body = resp.json()
             assert body["status"] == "skipped"
             assert "cap" in body.get("reason", "").lower()
@@ -1741,3 +1741,66 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
             _runtime_config.pop("max_active_directions", None)
         else:
             _runtime_config["max_active_directions"] = original_cap
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker):
+    """POST /api/agent/strategic with op=create_direction returns 409 for duplicate text."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    existing_dirs = [
+        {"id": "d-dup001", "text": "Improve test coverage", "status": "active", "priority": "medium",
+         "notes": [], "research_history": []}
+    ]
+    project = Project(
+        name="P-strategic-dup",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "create_direction", "task_id": task_id,
+                      "data": {"text": "Improve test coverage", "priority": "high"}},
+            )
+        assert resp.status_code == 409, resp.text
+        body = resp.json()
+        assert body["status"] == "skipped"
+        assert "duplicate" in body.get("reason", "").lower()
+
+        await db_session.refresh(task)
+        assert task.context is not None
+        assert task.context.get("_strategic_api_called") is True
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)

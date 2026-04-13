@@ -1624,11 +1624,21 @@ async def strategic_operation(
         directions = list(project.directions or [])
         # Dedup: skip if same text exists
         if any(d.get("text", "").strip().lower() == text.lower() for d in directions if d.get("status") in ("active", "proposed")):
-            return _resp({"status": "skipped", "reason": "duplicate"})
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(content=_resp({"status": "skipped", "reason": "duplicate"}), status_code=409)
         active_count = sum(1 for d in directions if d.get('status') == 'active')
         max_active = _runtime_config.get('max_active_directions', 5)
         if active_count >= max_active:
-            return _resp({'status': 'skipped', 'reason': f'Direction cap reached: {active_count}/{max_active} active'})
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(content=_resp({'status': 'skipped', 'reason': f'Direction cap reached: {active_count}/{max_active} active'}), status_code=409)
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,

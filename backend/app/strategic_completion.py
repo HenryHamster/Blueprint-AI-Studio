@@ -304,6 +304,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         or vision_rev > spawned_vision_rev
         or (task.context or {}).get("_strategic_dirs_created", 0) > 0
         or (task.context or {}).get("_strategic_dirs_retired", 0) > 0
+        or (task.context or {}).get("_strategic_api_called", False)
     )
 
     if api_was_used:
