@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type React from 'react';
 import { Check, ChevronDown, ChevronRight, ChevronUp, Pencil, Trash2, X, Zap } from 'lucide-react';
+import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
 import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
@@ -539,6 +540,27 @@ export function DirectionCard({
             const latestTitle = latestShipped?.finding_titles[0];
             const truncatedTitle = latestTitle && latestTitle.length > 60 ? latestTitle.slice(0, 60) + '…' : latestTitle;
 
+            // Sparkline data and label
+            const sparkData = d.research_history.map((e, i) => ({
+              cycle: i,
+              prs: e.prs_merged ?? 0,
+              timestamp: e.timestamp,
+              findings: e.finding_titles,
+            }));
+            const lastEntry = d.research_history[d.research_history.length - 1];
+            const lastPrs = lastEntry.prs_merged ?? 0;
+            const recentNoMergeCount = (() => {
+              let count = 0;
+              for (let i = d.research_history.length - 1; i >= 0; i--) {
+                if ((d.research_history[i].prs_merged ?? 0) > 0) break;
+                count++;
+              }
+              return count;
+            })();
+            const lastCycleLabel = lastPrs > 0
+              ? `Last cycle: ${lastPrs} PR${lastPrs !== 1 ? 's' : ''}`
+              : `No merges in last ${recentNoMergeCount} cycle${recentNoMergeCount !== 1 ? 's' : ''}`;
+
             return (
               <div className="mt-1.5 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -566,6 +588,39 @@ export function DirectionCard({
                   <p className="text-[10px] text-neutral-600 italic leading-relaxed">
                     Latest shipped: {truncatedTitle} <span className="not-italic">({formatRelativeTime(latestShipped.timestamp)})</span>
                   </p>
+                )}
+                {sparkData.length >= 3 && (
+                  <div className="mt-1">
+                    <ResponsiveContainer width="100%" height={30}>
+                      <BarChart data={sparkData} barCategoryGap="15%" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                        <Bar dataKey="prs" isAnimationActive={false}>
+                          {sparkData.map((entry, index) => (
+                            <Cell
+                              key={`cell-${index}`}
+                              fill={entry.prs > 0 ? '#10b981' : '#404040'}
+                            />
+                          ))}
+                        </Bar>
+                        <RechartsTooltip
+                          cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                          content={({ active, payload }) => {
+                            if (!active || !payload?.length) return null;
+                            const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
+                            return (
+                              <div className="text-[10px] bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
+                                <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
+                                <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
+                                {pt.findings.slice(0, 2).map((f, fi) => (
+                                  <div key={fi} className="text-neutral-500 truncate">• {f.slice(0, 45)}</div>
+                                ))}
+                              </div>
+                            );
+                          }}
+                        />
+                      </BarChart>
+                    </ResponsiveContainer>
+                    <p className="text-[10px] text-neutral-600 mt-0.5">{lastCycleLabel}</p>
+                  </div>
                 )}
               </div>
             );
