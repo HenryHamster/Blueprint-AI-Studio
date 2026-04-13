@@ -65,8 +65,8 @@ function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
         return (a.title ?? '').localeCompare(b.title ?? '');
       case 'duration': {
         const now = Date.now();
-        const aDur = now - parseTimestamp(a.created_at).getTime();
-        const bDur = now - parseTimestamp(b.created_at).getTime();
+        const aDur = now - parseTimestamp(a.started_at ?? a.created_at).getTime();
+        const bDur = now - parseTimestamp(b.started_at ?? b.created_at).getTime();
         return bDur - aDur;
       }
       case 'attempts':
