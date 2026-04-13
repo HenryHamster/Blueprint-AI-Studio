@@ -1683,6 +1683,11 @@ async def strategic_operation(
                     d["system_id"] = _cap_str(changes["system_id"], STRATEGIC_SYSTEM_ID_MAX, "changes.system_id", warnings) if changes["system_id"] else None
                 if "status" in changes and changes["status"] in ("active", "paused", "expired"):
                     if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
+                        ctx = task.context or {}
+                        task.context = {**ctx, "_strategic_api_called": True}
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
                         return _resp({"status": "blocked", "reason": "Cannot reactivate user-paused direction"})
                     d["status"] = changes["status"]
                 if rationale:
@@ -1696,6 +1701,10 @@ async def strategic_operation(
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
         await session.commit()
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
         return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})

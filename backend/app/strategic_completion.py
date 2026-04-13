@@ -314,7 +314,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         if cycle_id:
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
-                "vision_updated": True,
+                "vision_updated": (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev,
                 "directions_created": dirs_created,
                 "directions_retired": dirs_retired,
                 "outcome": "completed",
