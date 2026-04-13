@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Pencil, ChevronDown, ChevronRight, Zap } from 'lucide-react';
 import { API_BASE_URL, authHeaders } from '../api';
+import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { VisionEditorModal } from './VisionEditorModal';
 
@@ -15,16 +16,6 @@ interface VisionViewerProps {
   selectedProjectId: string;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onVisionUpdated: (v: Record<string, unknown>) => void;
-}
-
-function formatRelativeTime(isoString: string): string {
-  const diffMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  const diffHrs = Math.floor(diffMins / 60);
-  if (diffHrs < 24) return `${diffHrs}h ${diffMins % 60}m ago`;
-  return `${Math.floor(diffHrs / 24)}d ago`;
 }
 
 const statusColors: Record<string, string> = {
@@ -51,7 +42,11 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
   const purpose = typeof vision.purpose === 'string' ? vision.purpose : '';
   const criteria = Array.isArray(vision.success_criteria) ? vision.success_criteria as string[] : [];
   const context = typeof vision.context === 'string' ? vision.context : '';
-  const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
+  const systems = Array.isArray(vision.systems) ? (vision.systems as unknown[]).map((s, i) => {
+    if (typeof s === 'string') return { id: `sys-${i}`, name: s, status: 'planned', description: '' };
+    if (typeof s === 'object' && s !== null) return s as Record<string, unknown>;
+    return null;
+  }).filter((s): s is Record<string, unknown> => s !== null) : [];
   const priorities = Array.isArray(vision.priorities) ? vision.priorities as string[] : [];
   const revision = typeof vision.revision === 'number' ? vision.revision : 0;
   const lastUpdated = typeof vision.last_updated === 'string' ? vision.last_updated : '';
@@ -142,10 +137,10 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <h3 className="text-sm font-semibold text-neutral-200">Product Vision</h3>
+          <h3 className="text-base font-bold text-neutral-100 tracking-tight">Product Vision</h3>
           <div className="flex items-center gap-2 text-xs text-neutral-500">
-            {revision > 0 && <span>rev {revision}</span>}
-            {lastUpdated && <span>updated {formatRelativeTime(lastUpdated)}</span>}
+            {revision > 0 && <span className="bg-neutral-800 px-1.5 py-0.5 rounded text-neutral-400 font-mono">v{revision}</span>}
+            {lastUpdated && <span>updated {timeAgo(lastUpdated)}</span>}
             {spawnCount > 0 && (
               <span className="text-neutral-600" title={`Research cycle ${spawnCount}. Strategic in ${nextStrategic}, crosscutting in ${nextUndirected}`}>
                 cycle {spawnCount} (arch {nextStrategic === strategicFreq ? 'now' : `in ${nextStrategic}`})
@@ -164,8 +159,8 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
 
       {/* Purpose — hero section */}
       {purpose && (
-        <div className="border-l-3 border-cyan-500/40 pl-4 py-1">
-          <div className="text-base text-neutral-200 leading-relaxed">
+        <div className="bg-gradient-to-r from-cyan-950/30 to-transparent border-l-4 border-cyan-500/60 pl-5 py-3 rounded-r-lg">
+          <div className="text-base text-neutral-100 leading-relaxed font-medium">
             <MarkdownContent content={purpose} />
           </div>
         </div>
@@ -175,8 +170,8 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
       {systems.length > 0 && (
         <div>
           <div className="flex items-center gap-2 mb-3">
-            <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Systems</span>
-            <span className="text-xs text-neutral-600">{systems.length}</span>
+            <span className="text-sm font-bold text-neutral-300 uppercase tracking-wider">Systems</span>
+            <span className="text-xs text-neutral-500 bg-neutral-800 px-1.5 py-0.5 rounded font-mono">{systems.length}</span>
           </div>
 
           {/* Health bar */}
@@ -209,7 +204,7 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
                   </span>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-neutral-200 font-medium">{String(sys.name)}</span>
+                      <span className="text-sm text-neutral-200 font-medium">{String(sys.name || sys.id || `System ${i + 1}`)}</span>
                       {priorityIdx >= 0 && <span className="text-[9px] text-neutral-600">#{priorityIdx + 1}</span>}
                     </div>
                     {desc && <p className="text-xs text-neutral-500 mt-0.5 leading-relaxed">{desc}</p>}

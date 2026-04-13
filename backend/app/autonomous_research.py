@@ -7,6 +7,7 @@ This module handles all aspects of autonomous research task spawning:
 - Post-merge and idle research triggers
 - Direction health, auto-pause, and auto-recovery
 """
+import asyncio
 import logging
 import os
 import uuid
@@ -26,6 +27,16 @@ from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 
 logger = logging.getLogger(__name__)
+
+# Per-project lock to prevent concurrent _spawn_research_task calls
+# (post-merge hook and idle check can race on the same project)
+_spawn_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_spawn_lock(project_id: str) -> asyncio.Lock:
+    if project_id not in _spawn_locks:
+        _spawn_locks[project_id] = asyncio.Lock()
+    return _spawn_locks[project_id]
 
 
 def _utcnow() -> datetime:
@@ -235,7 +246,17 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
-    """Spawn a research task for a project if conditions are met."""
+    """Spawn a research task for a project if conditions are met.
+
+    Uses a per-project lock to prevent races between the post-merge hook
+    and the idle-check loop, which run concurrently with separate sessions.
+    """
+    async with _get_spawn_lock(str(project.id)):
+        return await _spawn_research_task_inner(project, session)
+
+
+async def _spawn_research_task_inner(project: Project, session: AsyncSession):
+    """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
     from app.research_completion import _compute_momentum_factor, _compute_merge_rate  # noqa: PLC0415
@@ -297,15 +318,15 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     now = _utcnow()
 
     # Build set of direction IDs that already have an active research cycle.
-    # Only count tasks where the agent is still working (not EVALUATING, where
-    # the agent is done and we're just waiting for children to merge).
+    # Include EVALUATING — the agent is done but children are still merging,
+    # so the direction is still being worked on and shouldn't be re-spawned.
     busy_direction_ids: set = set()
     active_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
             Task.status.in_([
                 TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
             ]),
         )
     )).scalars().all()

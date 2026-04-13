@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap } from 'lucide-react';
 import type { ProjectDiagnostics, StuckTask } from '../types/diagnostics';
+import { formatDurationSec } from '../utils/time';
 
 const STUCK_REASON_LABELS: Record<StuckTask['stuck_reason'], string> = {
   provision_timeout: 'VM provision timed out',
@@ -9,13 +10,6 @@ const STUCK_REASON_LABELS: Record<StuckTask['stuck_reason'], string> = {
   stuck_deps: 'Dependencies failed',
   evaluation_timeout: 'Evaluation timed out (2h+)',
 };
-
-function formatDuration(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
-}
 
 interface DiagnosticsPanelProps {
   diagnostics: ProjectDiagnostics | null;
@@ -89,7 +83,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
                     <span className="text-neutral-500 shrink-0">—</span>
                     <span className="text-amber-400 shrink-0">{STUCK_REASON_LABELS[task.stuck_reason]}</span>
                     <span className="text-neutral-600 shrink-0 font-mono">
-                      <Clock className="w-3 h-3 inline mr-0.5" />{formatDuration(task.stuck_for_seconds)}
+                      <Clock className="w-3 h-3 inline mr-0.5" />{formatDurationSec(task.stuck_for_seconds)}
                     </span>
                     {task.attempt_count > 1 && (
                       <span className="text-neutral-600 shrink-0">×{task.attempt_count}</span>

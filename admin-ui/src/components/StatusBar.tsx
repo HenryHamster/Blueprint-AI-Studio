@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Task } from './TaskCard';
+import { timeAgo, parseTimestamp } from '../utils/time';
 
 interface StatusBarProps {
   apiHealthy: boolean;
@@ -8,13 +9,6 @@ interface StatusBarProps {
   tasks: Task[];
 }
 
-function relativeTime(ts: number, now: number): string {
-  if (!ts) return '—';
-  const sec = Math.floor((now - ts) / 1000);
-  if (sec < 10) return 'just now';
-  if (sec < 60) return `${sec}s ago`;
-  return `${Math.floor(sec / 60)}m ago`;
-}
 
 export function StatusBar({ apiHealthy, wsConnected, lastFetchTime, tasks }: StatusBarProps) {
   const [now, setNow] = useState(() => Date.now());
@@ -29,7 +23,7 @@ export function StatusBar({ apiHealthy, wsConnected, lastFetchTime, tasks }: Sta
     return tasks.filter(t =>
       t.status === 'IN_PROGRESS' &&
       t.last_heartbeat &&
-      new Date(t.last_heartbeat).getTime() < fiveMinutesAgo
+      parseTimestamp(t.last_heartbeat).getTime() < fiveMinutesAgo
     ).length;
   }, [tasks, now]);
 
@@ -54,7 +48,7 @@ export function StatusBar({ apiHealthy, wsConnected, lastFetchTime, tasks }: Sta
           </span>
         </div>
       </div>
-      <span className="text-neutral-500">Updated {relativeTime(lastFetchTime, now)}</span>
+      <span className="text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
     </div>
   );
 }

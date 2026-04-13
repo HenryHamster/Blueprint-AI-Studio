@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { X, Shield, User, Trash2, Plus, Loader2 } from 'lucide-react';
+import { parseTimestamp } from '../utils/time';
 
 interface AllowedUserEntry {
   id: string;
@@ -68,7 +69,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
 
   const formatDate = (iso: string | null) => {
     if (!iso) return 'Never';
-    const d = new Date(iso);
+    const d = parseTimestamp(iso);
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
   };
 

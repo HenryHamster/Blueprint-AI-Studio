@@ -1,6 +1,7 @@
 import { X, Search, ExternalLink, Eye, Loader2, Archive, ArchiveRestore, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
+import { timeAgo } from '../utils/time';
 
 interface ArchiveViewProps {
   archiveTasks: Task[];
@@ -50,21 +51,6 @@ const DATE_RANGES: { value: string; label: string }[] = [
   { value: '30d', label: '30d' },
   { value: 'all', label: 'All Time' },
 ];
-
-function formatRelativeTime(dateStr: string): string {
-  const date = new Date(dateStr);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  const diffHr = Math.floor(diffMin / 60);
-  const diffDays = Math.floor(diffHr / 24);
-
-  if (diffMin < 1) return 'just now';
-  if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffHr < 24) return `${diffHr}h ago`;
-  if (diffDays < 30) return `${diffDays}d ago`;
-  return date.toLocaleDateString();
-}
 
 export default function ArchiveView({
   archiveTasks,
@@ -237,7 +223,7 @@ export default function ArchiveView({
 
                   {/* Timestamp */}
                   <span className="text-xs text-neutral-600 shrink-0 w-16 text-right">
-                    {formatRelativeTime(task.created_at)}
+                    {timeAgo(task.created_at)}
                   </span>
 
                   {/* PR link */}

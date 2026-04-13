@@ -1,19 +1,10 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronRight, FileText, FolderOpen } from 'lucide-react';
 import { MarkdownContent } from './MarkdownContent';
+import { timeAgo } from '../utils/time';
 
 interface DesignDocViewerProps {
   designDoc: Record<string, unknown>;
-}
-
-function formatRelativeTime(isoString: string): string {
-  const diffMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  const diffHrs = Math.floor(diffMins / 60);
-  if (diffHrs < 24) return `${diffHrs}h ${diffMins % 60}m ago`;
-  return `${Math.floor(diffHrs / 24)}d ago`;
 }
 
 const statusColors: Record<string, string> = {
@@ -266,11 +257,11 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
           /* Overview / dashboard */
           <div className="space-y-4">
             <div>
-              <h3 className="text-sm font-semibold text-neutral-200 mb-1">Design Document</h3>
+              <h3 className="text-base font-bold text-neutral-100 tracking-tight mb-1">Design Document</h3>
               <div className="flex items-center gap-3 text-xs text-neutral-500">
-                <span>{pageCount} pages</span>
-                {typeof meta.revision === 'number' && <span>rev {meta.revision}</span>}
-                {typeof meta.last_updated === 'string' && <span>updated {formatRelativeTime(meta.last_updated as string)}</span>}
+                <span className="bg-neutral-800 px-1.5 py-0.5 rounded text-neutral-400 font-mono">{pageCount} pages</span>
+                {typeof meta.revision === 'number' && <span className="bg-neutral-800 px-1.5 py-0.5 rounded text-neutral-400 font-mono">v{meta.revision}</span>}
+                {typeof meta.last_updated === 'string' && <span>updated {timeAgo(meta.last_updated as string)}</span>}
               </div>
             </div>
 

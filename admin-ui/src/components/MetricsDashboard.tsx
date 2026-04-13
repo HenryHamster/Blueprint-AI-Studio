@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { parseTimestamp } from '../utils/time';
 import type { Task } from './TaskCard';
 import {
   ResponsiveContainer,
@@ -123,8 +124,8 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
   const cumPoints = filtered.reduce<{ timestamp: number; cumCompleted: number; cumFailed: number }[]>(
     (acc, p) => {
       const prev = acc[acc.length - 1];
-      const cumCompleted = (prev?.cumCompleted ?? offsetCompleted) + p.completedCount;
-      const cumFailed = (prev?.cumFailed ?? offsetFailed) + p.failedCount;
+      const cumCompleted = Math.max(0, (prev?.cumCompleted ?? offsetCompleted) + p.completedCount);
+      const cumFailed = Math.max(0, (prev?.cumFailed ?? offsetFailed) + p.failedCount);
       return [...acc, { timestamp: p.timestamp, cumCompleted, cumFailed }];
     },
     [],
@@ -180,10 +181,10 @@ function getTaskCompletedTime(task: Task): number | null {
   if (task.status !== 'COMPLETED') return null;
   if (task.history && task.history.length > 0) {
     const last = task.history[task.history.length - 1];
-    const ts = new Date(last.timestamp).getTime();
+    const ts = parseTimestamp(last.timestamp).getTime();
     if (!isNaN(ts)) return ts;
   }
-  const ts = new Date(task.created_at).getTime();
+  const ts = parseTimestamp(task.created_at).getTime();
   return isNaN(ts) ? null : ts;
 }
 
@@ -213,10 +214,10 @@ export default function MetricsDashboard({
     if (task.status !== 'FAILED') return null;
     if (task.history && task.history.length > 0) {
       const last = task.history[task.history.length - 1];
-      const ts = new Date(last.timestamp).getTime();
+      const ts = parseTimestamp(last.timestamp).getTime();
       if (!isNaN(ts)) return ts;
     }
-    const ts = new Date(task.created_at).getTime();
+    const ts = parseTimestamp(task.created_at).getTime();
     return isNaN(ts) ? null : ts;
   }
 

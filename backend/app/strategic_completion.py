@@ -221,6 +221,31 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         # Preserve internal tracking fields not produced by the agent
         if "_strategic_cycle_history" in current_vision:
             new_vision["_strategic_cycle_history"] = current_vision["_strategic_cycle_history"]
+        # Auto-derive system statuses from direction outcomes
+        # Agents often leave everything as "planned" — infer from actual merge/direction data
+        vision_systems = new_vision.get("systems")
+        if isinstance(vision_systems, list):
+            directions_list = project.directions or []
+            for sys in vision_systems:
+                if not isinstance(sys, dict) or not sys.get("id"):
+                    continue
+                sys_id = sys["id"]
+                # Count directions mapped to this system and their merged PRs
+                mapped_dirs = [d for d in directions_list if d.get("system_id") == sys_id]
+                total_merged = 0
+                for d in mapped_dirs:
+                    for h in d.get("research_history", []):
+                        total_merged += h.get("prs_merged", 0)
+                    agg = d.get("history_aggregate", {})
+                    total_merged += agg.get("total_prs_merged", 0)
+                # Only upgrade status, never downgrade what the agent set
+                agent_status = sys.get("status", "planned")
+                STATUS_RANK = {"planned": 0, "in_progress": 1, "functional": 2, "mature": 3}
+                agent_rank = STATUS_RANK.get(agent_status, 0)
+                if total_merged >= 5 and agent_rank < 2:
+                    sys["status"] = "functional"
+                elif (total_merged > 0 or len(mapped_dirs) > 0) and agent_rank < 1:
+                    sys["status"] = "in_progress"
         project.vision = new_vision
         flag_modified(project, "vision")
         logger.info(f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}")

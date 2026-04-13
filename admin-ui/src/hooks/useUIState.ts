@@ -42,18 +42,6 @@ export function useUIState() {
   const settingsRef = useRef<HTMLDivElement>(null);
   const shortcutHelpRef = useRef<HTMLDivElement>(null);
 
-  // Close settings dropdown on outside click
-  useEffect(() => {
-    if (!showSettings) return;
-    const handleClick = (e: MouseEvent) => {
-      if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) {
-        setShowSettings(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [showSettings]);
-
   // Close shortcut help on outside click
   useEffect(() => {
     if (!showShortcutHelp) return;

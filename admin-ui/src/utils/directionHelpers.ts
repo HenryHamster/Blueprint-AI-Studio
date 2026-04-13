@@ -1,17 +1,10 @@
 import type { Direction } from '../components/DirectionsPanel';
+import { timeAgo, parseTimestamp } from './time';
 
-export function formatRelativeTime(isoString: string): string {
-  const diffMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  const diffHrs = Math.floor(diffMins / 60);
-  if (diffHrs < 24) return `${diffHrs}h ${diffMins % 60}m ago`;
-  return `${Math.floor(diffHrs / 24)}d ago`;
-}
+export { timeAgo as formatRelativeTime };
 
 export function formatTimeRemaining(isoString: string, cooldownMinutes: number): string {
-  const elapsedMs = Date.now() - new Date(isoString.endsWith('Z') ? isoString : isoString + 'Z').getTime();
+  const elapsedMs = Date.now() - parseTimestamp(isoString).getTime();
   const remainingMs = cooldownMinutes * 60 * 1000 - elapsedMs;
   if (remainingMs <= 0) return '';
   const remainingMins = Math.ceil(remainingMs / 60000);
@@ -23,8 +16,7 @@ export function formatTimeRemaining(isoString: string, cooldownMinutes: number):
 
 export function getCooldownStatus(d: Direction, cooldownMinutes: number): 'ready' | 'cooling' | 'never' {
   if (!d.last_researched_at) return 'never';
-  const ts = d.last_researched_at;
-  const elapsedMs = Date.now() - new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime();
+  const elapsedMs = Date.now() - parseTimestamp(d.last_researched_at).getTime();
   return elapsedMs < cooldownMinutes * 60 * 1000 ? 'cooling' : 'ready';
 }
 

@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink, Archive } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard';
+import { parseTimestamp } from '../utils/time';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 
@@ -48,6 +49,7 @@ interface PipelineViewProps {
   onViewLogs: (task: Task) => void;
   onNavigateToParent?: (parentTaskId: string) => void;
   onClearWaveDeps?: () => void;
+  onArchiveGroup?: (taskIds: string[]) => void;
 }
 
 function buildForest(tasks: Task[]): TreeNode[] {
@@ -108,8 +110,8 @@ function buildForest(tasks: Task[]): TreeNode[] {
   syntheticRoots.forEach(sortChildren);
 
   // Sort roots by creation time (newest first)
-  roots.sort((a, b) => new Date(b.task.created_at).getTime() - new Date(a.task.created_at).getTime());
-  syntheticRoots.sort((a, b) => new Date(b.task.created_at).getTime() - new Date(a.task.created_at).getTime());
+  roots.sort((a, b) => parseTimestamp(b.task.created_at).getTime() - parseTimestamp(a.task.created_at).getTime());
+  syntheticRoots.sort((a, b) => parseTimestamp(b.task.created_at).getTime() - parseTimestamp(a.task.created_at).getTime());
 
   // Synthetic groups appear first so users see incomplete groups at the top
   return [...syntheticRoots, ...roots];
@@ -375,6 +377,10 @@ function buildPrChainMap(tasks: Task[]): Map<number, Task> {
   return map;
 }
 
+function collectAllIds(node: TreeNode): string[] {
+  return [node.task.id, ...node.children.flatMap(c => collectAllIds(c))];
+}
+
 function RootGroup({
   root,
   taskMap,
@@ -385,6 +391,7 @@ function RootGroup({
   expanded,
   onToggle,
   activeFilter,
+  onArchiveGroup,
 }: {
   root: TreeNode;
   taskMap: Map<string, Task>;
@@ -395,6 +402,7 @@ function RootGroup({
   expanded: boolean;
   onToggle: () => void;
   activeFilter: FilterType;
+  onArchiveGroup?: (taskIds: string[]) => void;
 }) {
   const isSynthetic = root.isSyntheticParent;
   const totalInGroup = isSynthetic
@@ -416,7 +424,7 @@ function RootGroup({
         ? 'bg-neutral-900/30 border border-dashed border-neutral-700/60 rounded-xl p-4'
         : 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4'}
     >
-      {/* Group header */}
+      {/* Group header — double-click to archive */}
       <div className="flex items-center justify-between w-full mb-0 px-1 group">
         <div className="flex items-center gap-2 truncate pr-4">
           <div
@@ -444,6 +452,15 @@ function RootGroup({
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {onArchiveGroup && runningInGroup === 0 && !isSynthetic && (
+            <button
+              onClick={e => { e.stopPropagation(); onArchiveGroup(collectAllIds(root).filter(id => !id.startsWith('synthetic-'))); }}
+              className="opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-neutral-500 hover:text-neutral-300 flex items-center gap-1 px-2 py-0.5 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
+              title="Archive this group"
+            >
+              <Archive className="w-3 h-3" />
+            </button>
+          )}
           {runningInGroup > 0 && (
             <span className="flex items-center gap-1 text-[10px] bg-yellow-500/10 text-yellow-400 px-2 py-0.5 rounded-full font-medium border border-yellow-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0" />
@@ -521,7 +538,7 @@ function RootGroup({
   );
 }
 
-export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps }: PipelineViewProps) {
+export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps, onArchiveGroup }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -622,6 +639,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             expanded={getExpanded(root.task.id)}
             onToggle={() => toggleGroup(root.task.id)}
             activeFilter={activeFilter}
+            onArchiveGroup={onArchiveGroup}
           />
         ))}
       </div>

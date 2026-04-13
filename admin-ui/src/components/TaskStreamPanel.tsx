@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { X, Radio, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 import type { Task, TrackLogEntry, TrackLogType } from '../types/task';
+import { formatTimeOnly } from '../utils/time';
 
 interface TaskStreamPanelProps {
   trackedTaskIds: Set<string>;
@@ -18,11 +19,6 @@ const LOG_TYPE_COLORS: Record<TrackLogType, string> = {
   error: 'text-red-400',
   system: 'text-neutral-500 italic',
 };
-
-function formatTime(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
 
 function statusDotColor(status?: string): string {
   switch (status) {
@@ -131,7 +127,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
             )}
             {activeEntries.map(entry => (
               <div key={entry.id} className="flex gap-2 py-0.5">
-                <span className="text-neutral-600 shrink-0 select-none">{formatTime(entry.t)}</span>
+                <span className="text-neutral-600 shrink-0 select-none">{formatTimeOnly(entry.t)}</span>
                 <span className={`${LOG_TYPE_COLORS[entry.type]} break-words min-w-0`}>{entry.msg}</span>
               </div>
             ))}

@@ -3,6 +3,7 @@ import type React from 'react';
 import { Check, ChevronDown, ChevronRight, ChevronUp, Pencil, Trash2, X, Zap } from 'lucide-react';
 import type { Direction } from './DirectionsPanel';
 import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
+import { parseTimestamp } from '../utils/time';
 
 export interface DirectionCardProps {
   direction: Direction;
@@ -398,7 +399,7 @@ export function DirectionCard({
               );
             })()}
             <span className="text-[10px] text-neutral-600 ml-auto">
-              {new Date(d.added_at).toLocaleDateString()}
+              {d.added_at ? parseTimestamp(d.added_at).toLocaleDateString() : ''}
             </span>
             {(taskCounts[d.id] ?? 0) > 0 && (
               <span className="text-[10px] text-neutral-500">

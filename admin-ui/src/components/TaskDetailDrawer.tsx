@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage } from './TaskCard';
 import type { Task } from './TaskCard';
+import { formatAbsolute } from '../utils/time';
 
 interface TaskDetailDrawerProps {
   task: Task;
@@ -59,17 +60,6 @@ function DetailRow({ label, children }: { label: string; children: ReactNode }) 
       <div className="text-sm text-neutral-200 min-w-0">{children}</div>
     </div>
   );
-}
-
-function formatTimestamp(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
 }
 
 function formatCreatedBy(value: string): string {
@@ -180,9 +170,9 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
       )}
 
       <SectionHeader>Timing</SectionHeader>
-      <DetailRow label="Created at">{formatTimestamp(task.created_at)}</DetailRow>
+      <DetailRow label="Created at">{formatAbsolute(task.created_at)}</DetailRow>
       {task.started_at && (
-        <DetailRow label="Started at">{formatTimestamp(task.started_at)}</DetailRow>
+        <DetailRow label="Started at">{formatAbsolute(task.started_at)}</DetailRow>
       )}
       {task.started_at && (
         <DetailRow label="Duration"><span className="font-mono">{duration}</span></DetailRow>
@@ -192,7 +182,7 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
           <span className={`w-2 h-2 rounded-full ${heartbeat.color}`} />
           <span className="text-sm">{heartbeat.text}</span>
           {task.last_heartbeat && (
-            <span className="text-xs text-neutral-500">{formatTimestamp(task.last_heartbeat)}</span>
+            <span className="text-xs text-neutral-500">{formatAbsolute(task.last_heartbeat)}</span>
           )}
         </span>
       </DetailRow>
@@ -396,7 +386,7 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
               const isStatusTransition = entry.msg.startsWith('Status changed:');
               return (
                 <div key={i} className={`flex items-start gap-2 text-xs${isStatusTransition ? ' pl-2 border-l-2 border-blue-600/50' : ''}`}>
-                  <span className="text-neutral-600 shrink-0 font-mono">{formatTimestamp(entry.t)}</span>
+                  <span className="text-neutral-600 shrink-0 font-mono">{formatAbsolute(entry.t)}</span>
                   <span className={`${getLogEntryColor(entry.msg)} break-words min-w-0`}>{linkifyStatusMessage(entry.msg, task.pr_url)}</span>
                 </div>
               );
@@ -413,7 +403,7 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
               <div key={i} className="flex items-start gap-2 text-sm">
                 <div className="w-1.5 h-1.5 rounded-full bg-neutral-600 mt-1.5 shrink-0" />
                 <div className="min-w-0">
-                  <span className="text-neutral-500 text-xs">{formatTimestamp(entry.timestamp)}</span>
+                  <span className="text-neutral-500 text-xs">{formatAbsolute(entry.timestamp)}</span>
                   <span className="text-neutral-300 ml-2 font-medium">{entry.action}</span>
                   {entry.details && Object.keys(entry.details).length > 0 && (
                     <div className="text-xs text-neutral-500 mt-0.5 font-mono">
@@ -494,18 +484,31 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
                 <CopyableId value={task.commit_hash} />
               </div>
             )}
-            {task.repo_url && isSafeUrl(task.repo_url) && (
+            {task.repo_url && isSafeUrl(task.repo_url) && !task.pr_url && (
               <a
-                href={task.repo_url}
+                href={`${task.repo_url}/pulls`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
               >
-                {task.repo_url}
+                View Pull Requests
                 <ExternalLink className="w-3.5 h-3.5" />
               </a>
             )}
           </div>
+        </>
+      ) : (task.task_type === 'research' || task.task_type === 'plan') && task.repo_url && isSafeUrl(task.repo_url) ? (
+        <>
+          <SectionHeader>Repository</SectionHeader>
+          <a
+            href={`${task.repo_url}/pulls`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+          >
+            View Pull Requests
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
         </>
       ) : null}
 

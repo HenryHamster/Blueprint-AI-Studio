@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import type { Task, TaskStatus } from '../types/task';
 import { ChevronDown, ChevronRight } from 'lucide-react';
+import { formatDurationSec, parseTimestamp } from '../utils/time';
 
 interface TimelineViewProps {
   tasks: Task[];
@@ -25,31 +26,19 @@ const MAX_VISIBLE_ROWS = 100;
 const ROW_HEIGHT = 36;
 const SIDEBAR_WIDTH = 200;
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rs = s % 60;
-  if (m < 60) return `${m}m ${rs}s`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  return `${h}h ${rm}m`;
-}
-
 function getTaskEnd(task: Task, now: number): number {
   if (TERMINAL_STATUSES.includes(task.status)) {
     // Use last status_log entry as completion time, then last_heartbeat, then created_at
     if (task.status_log?.length) {
       try {
         const lastEntry = task.status_log[task.status_log.length - 1];
-        const ts = new Date(lastEntry.t).getTime();
+        const ts = parseTimestamp(lastEntry.t).getTime();
         if (!isNaN(ts)) return ts;
       } catch { /* fall through */ }
     }
-    return task.last_heartbeat ? new Date(task.last_heartbeat).getTime() : new Date(task.created_at).getTime();
+    return task.last_heartbeat ? parseTimestamp(task.last_heartbeat).getTime() : parseTimestamp(task.created_at).getTime();
   }
-  if (task.last_heartbeat) return Math.max(new Date(task.last_heartbeat).getTime(), now);
+  if (task.last_heartbeat) return Math.max(parseTimestamp(task.last_heartbeat).getTime(), now);
   return now;
 }
 
@@ -78,7 +67,7 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
   // Filter tasks to those within (or overlapping) the visible window
   const visibleTasks = useMemo(() => {
     return tasks.filter((task) => {
-      const taskStart = new Date(task.created_at).getTime();
+      const taskStart = parseTimestamp(task.created_at).getTime();
       const taskEnd = getTaskEnd(task, now);
       return taskEnd >= windowStart && taskStart <= windowEnd;
     });
@@ -91,7 +80,7 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
     // Find top-level tasks: no parent, or parent not in current visible list
     const topLevel = visibleTasks
       .filter((t) => !t.parent_task_id || !inList.has(t.parent_task_id))
-      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      .sort((a, b) => parseTimestamp(a.created_at).getTime() - parseTimestamp(b.created_at).getTime());
 
     const childMap = new Map<string, Task[]>();
     for (const t of visibleTasks) {
@@ -105,7 +94,7 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
     return topLevel.map((parent) => ({
       parent,
       children: (childMap.get(parent.id) ?? []).sort(
-        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        (a, b) => parseTimestamp(a.created_at).getTime() - parseTimestamp(b.created_at).getTime()
       ),
     }));
   }, [visibleTasks]);
@@ -113,8 +102,8 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
   // Flatten rows for rendering, respecting collapse state, and precompute bar segments
   const rows = useMemo(() => {
     function computeBarSegments(task: Task): Array<{ left: number; width: number; color: string; key: string }> {
-      const createdMs = new Date(task.created_at).getTime();
-      const startedMs = task.started_at ? new Date(task.started_at).getTime() : null;
+      const createdMs = parseTimestamp(task.created_at).getTime();
+      const startedMs = task.started_at ? parseTimestamp(task.started_at).getTime() : null;
       const taskEndMs = getTaskEnd(task, now);
 
       const segments: Array<{ left: number; width: number; color: string; key: string }> = [];
@@ -221,9 +210,9 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
 
   // Duration for tooltip
   function getTaskDuration(task: Task): string {
-    const start = task.started_at ? new Date(task.started_at).getTime() : new Date(task.created_at).getTime();
+    const start = task.started_at ? parseTimestamp(task.started_at).getTime() : parseTimestamp(task.created_at).getTime();
     const end = getTaskEnd(task, now);
-    return formatDuration(end - start);
+    return formatDurationSec((end - start) / 1000);
   }
 
   const totalHeight = visibleRows.length * ROW_HEIGHT;

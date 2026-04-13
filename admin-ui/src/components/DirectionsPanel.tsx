@@ -407,9 +407,9 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
   const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
 
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div className="fixed inset-0 z-[60] flex">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/80" onClick={onClose} />
 
       {/* Panel */}
       <div className={`relative ml-auto w-full ${activeTab === 'directions' ? 'sm:max-w-lg' : 'sm:max-w-3xl'} h-full bg-neutral-950 border-l border-neutral-800 flex flex-col overflow-hidden transition-[max-width] duration-200`}>

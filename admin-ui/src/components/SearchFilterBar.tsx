@@ -1,17 +1,12 @@
 import { Search, ChevronDown, Check } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
-import { STATUS_OPTIONS } from '../constants';
 
 interface SearchFilterBarProps {
   searchQuery: string;
   onSearchChange: (query: string) => void;
   taskTypeFilter: string[];
   onTypeFilterChange: (filter: string[]) => void;
-  statusFilter: string[];
-  onStatusFilterChange: (status: string[]) => void;
-  filteredCount: number;
-  totalCount: number;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -104,7 +99,7 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
   );
 }
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, statusFilter, onStatusFilterChange, filteredCount, totalCount, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
 
@@ -122,7 +117,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter.length < typeOptions.length,
-    statusFilter.length < STATUS_OPTIONS.length,
   ].filter(Boolean).length;
 
   const hasActiveFilters = activeFilterCount > 0;
@@ -130,11 +124,10 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   function handleClear() {
     onSearchChange('');
     onTypeFilterChange(typeOptions.map(o => o.value));
-    onStatusFilterChange(STATUS_OPTIONS.map(o => o.value));
   }
 
   return (
-    <div className="flex items-center gap-2 mb-4 shrink-0 flex-wrap">
+    <>
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500" />
         <input
@@ -154,22 +147,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         onChange={onTypeFilterChange}
       />
 
-      <MultiSelectDropdown
-        label="Status"
-        options={STATUS_OPTIONS}
-        selected={statusFilter}
-        onChange={onStatusFilterChange}
-      />
-
-      <span className="text-xs text-neutral-500">
-        {filteredCount} of {totalCount}
-        {hasActiveFilters && (
-          <span className="ml-1.5 px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 text-xs font-medium">
-            {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
-          </span>
-        )}
-      </span>
-
       {hasActiveFilters && (
         <button
           onClick={handleClear}
@@ -178,6 +155,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           Clear
         </button>
       )}
-    </div>
+    </>
   );
 }

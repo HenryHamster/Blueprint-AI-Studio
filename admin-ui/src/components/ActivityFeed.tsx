@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, type ReactElement } from 'react';
 import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
+import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import type { Task } from './TaskCard';
 
@@ -36,32 +37,8 @@ interface ActivityFeedProps {
   initialFilter?: string;
 }
 
-function formatRelativeTime(dateStr: string): string {
-  const date = new Date(dateStr);
-  const diffMs = Date.now() - date.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  const diffHr = Math.floor(diffMin / 60);
-  const diffDays = Math.floor(diffHr / 24);
-
-  if (diffMin < 1) return 'just now';
-  if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffHr < 24) return `${diffHr}h ago`;
-  if (diffDays < 30) return `${diffDays}d ago`;
-  return date.toLocaleDateString();
-}
-
 function formatFullDatetime(dateStr: string): string {
-  return new Date(dateStr).toLocaleString();
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const rem = m % 60;
-  return rem > 0 ? `${h}h ${rem}m` : `${h}h`;
+  return parseTimestamp(dateStr).toLocaleString();
 }
 
 const EVENT_ICON: Record<ActivityEventType, ReactElement> = {
@@ -335,7 +312,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           ];
 
           for (const event of filteredEvents) {
-            const d = new Date(event.timestamp);
+            const d = parseTimestamp(event.timestamp);
             if (d >= startOfToday) groups[0].events.push(event);
             else if (d >= startOfYesterday) groups[1].events.push(event);
             else if (d >= startOfWeek) groups[2].events.push(event);
@@ -344,8 +321,8 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
           // Determine if we need a last-visit divider and track whether it's been inserted
           const hasNewAndOld = lastVisitTimestamp != null &&
-            filteredEvents.some(e => new Date(e.timestamp).getTime() > lastVisitTimestamp) &&
-            filteredEvents.some(e => new Date(e.timestamp).getTime() <= lastVisitTimestamp);
+            filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() > lastVisitTimestamp) &&
+            filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() <= lastVisitTimestamp);
           let dividerInserted = false;
 
           return groups.flatMap(({ label, events: groupEvents }) => {
@@ -355,7 +332,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
                 <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{label}</span>
               </div>,
               ...groupEvents.flatMap(event => {
-              const isOld = lastVisitTimestamp != null && new Date(event.timestamp).getTime() <= lastVisitTimestamp;
+              const isOld = lastVisitTimestamp != null && parseTimestamp(event.timestamp).getTime() <= lastVisitTimestamp;
               const showDivider = hasNewAndOld && isOld && !dividerInserted;
               if (showDivider) dividerInserted = true;
               return [
@@ -480,14 +457,14 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
                   {/* Duration label for completed/failed tasks */}
                   {(event.type === 'TASK_COMPLETED' || event.type === 'TASK_FAILED') && event.duration_seconds != null && (
-                    <span className="text-[10px] text-neutral-600 font-mono">ran {formatDuration(event.duration_seconds)}</span>
+                    <span className="text-[10px] text-neutral-600 font-mono">ran {formatDurationSec(event.duration_seconds)}</span>
                   )}
                   {/* Relative timestamp */}
                   <span
                     className="text-xs text-neutral-500 font-mono whitespace-nowrap"
                     title={formatFullDatetime(event.timestamp)}
                   >
-                    {formatRelativeTime(event.timestamp)}
+                    {timeAgo(event.timestamp)}
                   </span>
                 </div>
               </div>

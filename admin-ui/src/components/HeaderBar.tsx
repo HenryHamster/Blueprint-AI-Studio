@@ -230,7 +230,7 @@ export function HeaderBar(props: HeaderBarProps) {
       </div>
 
       {/* Center: MetricsBar — absolutely positioned so it's truly centered */}
-      <div className="hidden md:flex items-center gap-3 absolute left-1/2 -translate-x-1/2">
+      <div className="hidden md:flex items-center gap-3 absolute left-1/2 -translate-x-1/2 z-30">
         <MetricsBar
           globalActiveCount={globalActiveCount}
           maxConcurrentVMs={maxConcurrentVMs}

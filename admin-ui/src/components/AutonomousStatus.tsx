@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
 import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
+import { secondsUntil, parseTimestamp } from '../utils/time';
 
 interface ProjectAutonomousStatus {
   project_id: string;
@@ -85,9 +86,6 @@ function formatSeconds(s: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-function secondsUntil(iso: string): number {
-  return Math.max(0, Math.floor((new Date(iso).getTime() - Date.now()) / 1000));
-}
 
 function CircuitBreakerPill({ state }: { state: string }) {
   const styles: Record<string, string> = {
@@ -382,7 +380,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   const anyCircuitBreaker = projects.some(p => p.consecutive_failures >= 2);
 
   const formatTimeAgo = (iso: string) => {
-    const diff = Date.now() - new Date(iso).getTime();
+    const diff = Date.now() - parseTimestamp(iso).getTime();
     const mins = Math.floor(diff / 60000);
     if (mins < 1) return 'just now';
     if (mins < 60) return `${mins}m ago`;

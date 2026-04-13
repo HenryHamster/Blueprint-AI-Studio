@@ -85,17 +85,21 @@ async def list_project_members(
     """List members of a project. Any member/viewer can see."""
     await _get_user_project(project_id, current_user["user_id"], session)
     result = await session.execute(
-        select(ProjectMember).where(ProjectMember.project_id == project_id).order_by(ProjectMember.created_at.asc())
+        select(ProjectMember, AllowedUser.email)
+        .outerjoin(AllowedUser, AllowedUser.firebase_uid == ProjectMember.user_id)
+        .where(ProjectMember.project_id == project_id)
+        .order_by(ProjectMember.created_at.asc())
     )
-    members = result.scalars().all()
+    rows = result.all()
     return [
         {
             "id": str(m.id),
             "user_id": m.user_id,
+            "email": email,
             "role": m.role,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        for m in members
+        for m, email in rows
     ]
 
 

@@ -380,7 +380,7 @@ async def create_direction_research_task(
     }
     new_task = Task(
         project_id=project.id,
-        title=f"Research: {direction_text[:60]}",
+        title=f"Research: {direction_text[:200]}",
         description=description,
         payloads=[task_payload],
         vm_instance_id=vm_name,

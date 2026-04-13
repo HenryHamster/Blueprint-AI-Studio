@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
+import { parseTimestamp } from '../utils/time';
 
 interface ProjectMessage {
   id: string;
@@ -32,7 +33,7 @@ const TYPE_CONFIG: Record<string, { icon: typeof MessageSquare; color: string; l
 
 function formatAge(isoString: string | null): string {
   if (!isoString) return '';
-  const ms = Date.now() - new Date(isoString).getTime();
+  const ms = Date.now() - parseTimestamp(isoString).getTime();
   const mins = Math.floor(ms / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
@@ -145,32 +146,31 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
 
       {/* Post form */}
       <div className="px-6 py-3 border-b border-neutral-800 shrink-0">
-        <div className="flex items-center gap-2 mb-2">
+        <div className="flex gap-2">
           <select
             value={newType}
             onChange={e => setNewType(e.target.value)}
-            className="bg-neutral-900 border border-neutral-700 text-neutral-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="bg-neutral-900 border border-neutral-700 text-neutral-300 rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 shrink-0"
           >
             <option value="FEEDBACK">Feedback</option>
             <option value="BUG_REPORT">Bug Report</option>
             <option value="NOTE">Note</option>
           </select>
-        </div>
-        <div className="flex gap-2">
           <input
             type="text"
             value={newContent}
             onChange={e => setNewContent(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
             placeholder="Type a message..."
-            className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+            className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
           />
           <button
             onClick={handleSubmit}
             disabled={submitting || !newContent.trim()}
-            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 px-3 py-1.5 rounded text-sm transition-colors border border-neutral-700 disabled:opacity-40"
+            className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded-lg text-sm transition-colors disabled:opacity-40 flex items-center gap-1.5 shrink-0"
           >
-            <Send className="w-4 h-4" />
+            <Send className="w-3.5 h-3.5" />
+            Send
           </button>
         </div>
       </div>
@@ -191,39 +191,47 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast }: Messages
             {openMessages.map(msg => {
               const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
               const Icon = config.icon;
+              const borderColor = msg.message_type === 'BUG_REPORT' ? 'border-l-red-500' : msg.message_type === 'QUESTION' ? 'border-l-blue-500' : msg.message_type === 'BLOCKER' ? 'border-l-amber-500' : msg.message_type === 'FEEDBACK' ? 'border-l-purple-500' : 'border-l-neutral-600';
               return (
-                <div key={msg.id} className={`bg-neutral-900 border border-neutral-800 border-l-2 rounded-lg px-4 py-3 ${msg.message_type === 'BUG_REPORT' ? 'border-l-red-500' : msg.message_type === 'QUESTION' ? 'border-l-blue-500' : msg.message_type === 'BLOCKER' ? 'border-l-amber-500' : 'border-l-neutral-600'}`}>
-                  <div className="flex items-start gap-3">
-                    <Icon className={`w-4 h-4 shrink-0 mt-0.5 ${config.color.split(' ')[0]}`} />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${config.color}`}>
-                          {config.label}
-                        </span>
-                        <span className="text-[10px] text-neutral-600">
-                          from {msg.from_type} {formatAge(msg.created_at)}
-                        </span>
-                      </div>
-                      <p className="text-sm text-neutral-200">{msg.content}</p>
-                      {/* Resolve input */}
-                      <div className="flex gap-2 mt-2">
-                        <input
-                          type="text"
-                          value={resolveInputs[msg.id] || ''}
-                          onChange={e => setResolveInputs(prev => ({ ...prev, [msg.id]: e.target.value }))}
-                          onKeyDown={e => { if (e.key === 'Enter') handleResolve(msg.id); }}
-                          placeholder={msg.message_type === 'QUESTION' ? 'Your answer...' : 'Resolution note (optional)...'}
-                          className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
-                        />
-                        <button
-                          onClick={() => handleResolve(msg.id)}
-                          disabled={resolvingIds.has(msg.id)}
-                          className="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded text-xs transition-colors disabled:opacity-40"
-                        >
-                          <Check className="w-3 h-3" />
-                        </button>
+                <div key={msg.id} className={`bg-neutral-900 border border-neutral-800 border-l-4 rounded-lg overflow-hidden ${borderColor}`}>
+                  <div className="px-4 py-3">
+                    <div className="flex items-start gap-3">
+                      <Icon className={`w-4 h-4 shrink-0 mt-0.5 ${config.color.split(' ')[0]}`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${config.color}`}>
+                            {config.label}
+                          </span>
+                          <span className="text-[10px] text-neutral-600">
+                            {msg.from_type === 'AGENT' ? 'Agent' : 'User'} · {formatAge(msg.created_at)}
+                          </span>
+                          {msg.from_task_id && (
+                            <span className="text-[10px] text-neutral-600 font-mono">
+                              task {msg.from_task_id.slice(0, 8)}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-sm text-neutral-200 leading-relaxed">{msg.content}</p>
                       </div>
                     </div>
+                  </div>
+                  <div className="flex gap-2 px-4 py-2.5 bg-neutral-950/50 border-t border-neutral-800/50">
+                    <input
+                      type="text"
+                      value={resolveInputs[msg.id] || ''}
+                      onChange={e => setResolveInputs(prev => ({ ...prev, [msg.id]: e.target.value }))}
+                      onKeyDown={e => { if (e.key === 'Enter') handleResolve(msg.id); }}
+                      placeholder={msg.message_type === 'QUESTION' ? 'Your answer...' : 'Resolution note (optional)...'}
+                      className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-300 rounded-lg px-2.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                    />
+                    <button
+                      onClick={() => handleResolve(msg.id)}
+                      disabled={resolvingIds.has(msg.id)}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 flex items-center gap-1"
+                    >
+                      <Check className="w-3 h-3" />
+                      Resolve
+                    </button>
                   </div>
                 </div>
               );

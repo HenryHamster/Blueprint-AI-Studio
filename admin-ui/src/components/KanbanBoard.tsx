@@ -1,4 +1,4 @@
-import { useMemo, useState, useRef, useCallback, useEffect } from 'react';
+import React, { useMemo, useState, useRef, useCallback, useEffect } from 'react';
 import { Archive, ArrowDownUp, GripVertical, ChevronLeft, ChevronRight } from 'lucide-react';
 import {
   DndContext,
@@ -18,6 +18,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { TaskCard, TASK_TYPE_STYLES } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
+import { parseTimestamp } from '../utils/time';
 import type { Project } from './ProjectDashboard';
 
 export type SortBy = 'newest' | 'oldest' | 'type' | 'title';
@@ -53,9 +54,9 @@ function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
   return [...tasks].sort((a, b) => {
     switch (sortBy) {
       case 'newest':
-        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        return parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime();
       case 'oldest':
-        return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+        return parseTimestamp(a.created_at).getTime() - parseTimestamp(b.created_at).getTime();
       case 'type':
         return (a.task_type ?? '').localeCompare(b.task_type ?? '');
       case 'title':
@@ -70,12 +71,8 @@ interface KanbanBoardProps {
   loading: boolean; // true only on first load before data is available
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
-  selectionMode: boolean;
-  selectedTaskIds: Set<string>;
   compact?: boolean;
   sortBy: SortBy;
-  onToggleTaskSelection: (id: string) => void;
-  onBulkToggle: (taskIds: string[], selected: boolean) => void;
   onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
   onApprove: (id: string) => void;
   onRequestChanges: (id: string, feedback: string, action: 'fix' | 'review') => void;
@@ -87,8 +84,6 @@ interface KanbanBoardProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   trackedTaskIds?: Set<string>;
-  groupBy?: 'status' | 'type' | 'project';
-  projects?: Project[];
   hasActiveFilters?: boolean;
 }
 
@@ -236,11 +231,11 @@ function SortableCard({
         </div>
       )}
       <div
-        className="absolute top-2 right-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing touch-none"
+        className="absolute top-1/2 -translate-y-1/2 -left-0.5 z-10 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing touch-none p-0.5"
         {...attributes}
         {...listeners}
       >
-        <GripVertical className="w-4 h-4 text-neutral-500 hover:text-neutral-300" />
+        <GripVertical className="w-3.5 h-3.5 text-neutral-600 hover:text-neutral-400" />
       </div>
       <div className={selectionMode ? 'pl-6' : ''}>
         <TaskCard
@@ -322,12 +317,8 @@ export function KanbanBoard({
   loading,
   maxRetries,
   actionLoadingMap,
-  selectionMode,
-  selectedTaskIds,
   compact,
   sortBy,
-  onToggleTaskSelection,
-  onBulkToggle,
   onArchiveColumn,
   onApprove,
   onRequestChanges,
@@ -339,9 +330,16 @@ export function KanbanBoard({
   onViewLogs,
   onTrack,
   trackedTaskIds,
-  groupBy = 'status',
-  projects = [],
 }: KanbanBoardProps) {
+  // Selection mode and groupBy removed from UI
+  const selectionMode = false;
+  const selectedTaskIds = new Set<string>();
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const onToggleTaskSelection = (..._args: unknown[]) => {};
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const onBulkToggle = (..._args: unknown[]) => {};
+  const groupBy = 'status' as 'status' | 'type' | 'project';
+  const projects: Project[] = [];
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
@@ -364,6 +362,35 @@ export function KanbanBoard({
   useEffect(() => {
     localStorage.setItem(COLLAPSED_COLUMNS_KEY, JSON.stringify([...collapsedColumns]));
   }, [collapsedColumns]);
+
+  // Column resize state: colId -> width in px (null = flex default)
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+  const resizingRef = useRef<{ colId: string; startX: number; startWidth: number } | null>(null);
+
+  const handleResizeStart = useCallback((colId: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    const colEl = document.getElementById(`kanban-col-${colId}`);
+    if (!colEl) return;
+    resizingRef.current = { colId, startX: e.clientX, startWidth: colEl.getBoundingClientRect().width };
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!resizingRef.current) return;
+      const delta = ev.clientX - resizingRef.current.startX;
+      const newWidth = Math.max(220, Math.min(700, resizingRef.current.startWidth + delta));
+      setColumnWidths(prev => ({ ...prev, [resizingRef.current!.colId]: newWidth }));
+    };
+    const onMouseUp = () => {
+      resizingRef.current = null;
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
 
   const toggleCollapse = (colId: string) => {
     setCollapsedColumns(prev => {
@@ -567,7 +594,7 @@ export function KanbanBoard({
                         <span>{label}</span>
                         <span className="opacity-60">({typeTasks.length})</span>
                       </div>
-                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                         {typeTasks.map(task => {
                           const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                           return (
@@ -617,7 +644,7 @@ export function KanbanBoard({
                         <span className="truncate max-w-[200px]" title={name}>{name}</span>
                         <span className="opacity-60 shrink-0">({projectTasks.length})</span>
                       </div>
-                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                         {projectTasks.map(task => {
                           const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                           return (
@@ -641,7 +668,7 @@ export function KanbanBoard({
             );
           } else {
             mobileContent = (
-              <div className={compact ? 'space-y-2' : 'space-y-3'}>
+              <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
                   {columnTasks.map((task, cardIdx) => (
                     <SortableCard
@@ -749,7 +776,7 @@ export function KanbanBoard({
                         <span>{label}</span>
                         <span className="opacity-60">({typeTasks.length})</span>
                       </div>
-                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                         {typeTasks.map(task => {
                           const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                           return (
@@ -799,7 +826,7 @@ export function KanbanBoard({
                         <span className="truncate max-w-[200px]" title={name}>{name}</span>
                         <span className="opacity-60 shrink-0">({projectTasks.length})</span>
                       </div>
-                      <div className={compact ? 'space-y-2' : 'space-y-3'}>
+                      <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                         {projectTasks.map(task => {
                           const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                           return (
@@ -823,7 +850,7 @@ export function KanbanBoard({
             );
           } else {
             content = (
-              <div className={compact ? 'space-y-2' : 'space-y-3'}>
+              <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
                   {columnTasks.map((task, cardIdx) => (
                     <SortableCard
@@ -861,12 +888,25 @@ export function KanbanBoard({
             );
           }
 
+          const colWidth = columnWidths[col.id];
+
           return (
+            <React.Fragment key={col.id}>
+            {colIdx > 0 && !collapsedColumns.has(columns[colIdx - 1].id) && !isCollapsed && (
+              <div
+                onMouseDown={(e) => handleResizeStart(columns[colIdx - 1].id, e)}
+                className="w-1 shrink-0 cursor-col-resize group/resize flex items-center justify-center hover:bg-neutral-700/50 rounded transition-colors self-stretch"
+                title="Drag to resize"
+              >
+                <div className="w-0.5 h-8 bg-neutral-700 group-hover/resize:bg-neutral-500 rounded-full transition-colors" />
+              </div>
+            )}
             <div
-              key={col.id}
-              className={`flex-shrink-0 flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 overflow-hidden transition-all duration-200 ${
-                isCollapsed ? 'w-10' : 'flex-1 min-w-[300px] max-w-[400px] p-3'
+              id={`kanban-col-${col.id}`}
+              className={`flex-shrink-0 flex flex-col bg-neutral-900/50 rounded-xl border border-neutral-800/50 overflow-hidden ${
+                isCollapsed ? 'w-10' : colWidth ? 'p-3' : 'flex-1 min-w-[280px] max-w-[520px] p-3'
               }`}
+              style={!isCollapsed && colWidth ? { width: colWidth } : undefined}
             >
               {/* Collapsed strip */}
               <div className={`flex flex-col items-center py-3 gap-2 ${isCollapsed ? '' : 'hidden'}`}>
@@ -939,11 +979,12 @@ export function KanbanBoard({
                   </div>
                 </div>
 
-                <div className={`overflow-y-auto flex-1 pr-1 custom-scrollbar ${compact ? 'space-y-2' : 'space-y-3'}`}>
+                <div className={`overflow-y-auto flex-1 pr-1 custom-scrollbar ${compact ? 'space-y-1.5' : 'space-y-2'}`}>
                   {content}
                 </div>
               </div>
             </div>
+            </React.Fragment>
           );
         })}
       </main>
