@@ -27,6 +27,7 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
 import { MessagesPanel } from './components/MessagesPanel';
+import { HealthOverviewCard } from './components/HealthOverviewCard';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -518,7 +519,15 @@ export default function App() {
         />
       )}
 
-      {/* Health bar + diagnostics panel removed — status dots in HeaderBar */}
+      <HealthOverviewCard
+        selectedProjectId={s.selectedProjectId}
+        onViewTask={(taskId) => {
+          const task = s.tasks.find(t => t.id === taskId);
+          if (task) s.handleViewLogs(task);
+          else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
+        }}
+        addToast={s.addToast}
+      />
 
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
