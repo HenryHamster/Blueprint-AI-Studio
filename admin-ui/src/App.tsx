@@ -188,6 +188,7 @@ export default function App() {
   }, []);
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
+  const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
 
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
@@ -820,7 +821,20 @@ export default function App() {
         <ResearchBrowser
           tasks={s.tasks}
           selectedProjectId={s.selectedProjectId}
-          onClose={() => s.setShowResearchBrowser(false)}
+          initialDirectionId={researchBrowserDirectionId ?? undefined}
+          onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}
+          onNavigateToTask={(taskId) => {
+            s.setShowResearchBrowser(false);
+            setResearchBrowserDirectionId(null);
+            const target = s.tasks.find(t => t.id === taskId);
+            if (target) {
+              s.handleViewLogs(target);
+            } else {
+              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+                s.addToast('Could not load task — it may have been deleted', 'error');
+              });
+            }
+          }}
         />
       )}
 
@@ -868,7 +882,23 @@ export default function App() {
         />
       )}
 
-      {s.showDirections && <DirectionsPanel onClose={() => s.setShowDirections(false)} addToast={s.addToast} />}
+      {s.showDirections && (
+        <DirectionsPanel
+          onClose={() => s.setShowDirections(false)}
+          addToast={s.addToast}
+          onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+          onNavigateToTask={(taskId) => {
+            const target = s.tasks.find(t => t.id === taskId);
+            if (target) {
+              s.handleViewLogs(target);
+            } else {
+              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
+                s.addToast('Could not load task — it may have been deleted', 'error');
+              });
+            }
+          }}
+        />
+      )}
 
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl">
@@ -948,6 +978,7 @@ export default function App() {
           </button>
         </div>
       )}
+
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 

@@ -34,6 +34,8 @@ interface ResearchBrowserProps {
   tasks: Task[];
   selectedProjectId: string | null;
   onClose: () => void;
+  onNavigateToTask?: (taskId: string) => void;
+  initialDirectionId?: string;
 }
 
 const OUTCOME_STYLES: Record<string, { icon: typeof CheckCircle; color: string; label: string }> = {
@@ -72,12 +74,13 @@ const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: stri
   { value: 'failed', label: 'Failed', color: 'text-red-400' },
 ];
 
-export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchBrowserProps) {
+export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateToTask, initialDirectionId }: ResearchBrowserProps) {
   const [search, setSearch] = useState('');
   const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>('all');
   const [expandedGroups, setExpandedGroups] = useState<Set<string> | null>(null);
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
   const [directions, setDirections] = useState<Direction[]>([]);
+  const [directionFilter, setDirectionFilter] = useState<string | null>(initialDirectionId ?? null);
 
   // Fetch directions for the selected project
   useEffect(() => {
@@ -178,6 +181,13 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
     return result;
   }, [tasks, implementedFindings, directionMap]);
 
+  // Resolve direction name for the active filter chip
+  const directionFilterText = useMemo(() => {
+    if (!directionFilter) return null;
+    const dir = directionMap.get(directionFilter);
+    return dir?.text ?? `Direction ${directionFilter.slice(0, 8)}`;
+  }, [directionFilter, directionMap]);
+
   // Filter by search and outcome
   const filteredGroups = useMemo(() => {
     const matchesOutcome = (f: EnrichedFinding): boolean => {
@@ -191,6 +201,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
 
     const q = search.trim().toLowerCase();
     return groups
+      .filter(g => !directionFilter || g.directionId === directionFilter)
       .map(g => ({
         ...g,
         findings: g.findings.filter(f =>
@@ -203,7 +214,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
         ),
       }))
       .filter(g => g.findings.length > 0 || (outcomeFilter === 'all' && (!q || g.directionText.toLowerCase().includes(q))));
-  }, [groups, search, outcomeFilter]);
+  }, [groups, search, outcomeFilter, directionFilter]);
 
   const totalFindings = filteredGroups.reduce((sum, g) => sum + g.findings.length, 0);
 
@@ -244,6 +255,17 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
 
         {/* Search */}
         <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
+          {directionFilterText && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-neutral-500">Filtered:</span>
+              <span className="flex items-center gap-1 text-[10px] bg-cyan-950/40 border border-cyan-900/50 text-cyan-400 px-2 py-0.5 rounded max-w-[400px] truncate">
+                <span className="truncate">{directionFilterText.length > 60 ? directionFilterText.slice(0, 60) + '…' : directionFilterText}</span>
+                <button onClick={() => setDirectionFilter(null)} className="ml-0.5 text-cyan-600 hover:text-cyan-300 transition-colors shrink-0">
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </span>
+            </div>
+          )}
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-neutral-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
             <input
@@ -327,6 +349,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                       const OutcomeIcon = outcomeInfo?.icon;
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
+                      const prNumber = ef.outcome?.prUrl ? ef.outcome.prUrl.match(/\/pull\/(\d+)/)?.[1] : null;
                       return (
                         <button
                           key={fKey}
@@ -334,9 +357,19 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                           className="w-full text-left px-4 py-2 hover:bg-neutral-800/20 transition-colors"
                         >
                           <div className="flex items-center gap-2">
-                            {outcomeInfo && OutcomeIcon
-                              ? <OutcomeIcon className={`w-3 h-3 shrink-0 ${outcomeInfo.color}`} />
-                              : <span className="w-3 h-3 shrink-0 rounded-full border border-neutral-700" />
+                            {outcomeInfo && OutcomeIcon && ef.outcome?.taskId && onNavigateToTask
+                              ? (
+                                <button
+                                  onClick={e => { e.stopPropagation(); onNavigateToTask(ef.outcome!.taskId); }}
+                                  className={`w-3 h-3 shrink-0 ${outcomeInfo.color} hover:opacity-70 transition-opacity`}
+                                  title={`View task (${outcomeInfo.label})`}
+                                >
+                                  <OutcomeIcon className="w-3 h-3" />
+                                </button>
+                              )
+                              : outcomeInfo && OutcomeIcon
+                                ? <OutcomeIcon className={`w-3 h-3 shrink-0 ${outcomeInfo.color}`} />
+                                : <span className="w-3 h-3 shrink-0 rounded-full border border-neutral-700" />
                             }
                             <span className="text-xs text-neutral-200 flex-1 truncate">{ef.finding.title}</span>
                             <span className="text-[10px] text-neutral-600 shrink-0">{relativeDate(ef.taskCreatedAt)}</span>
@@ -345,7 +378,29 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose }: ResearchB
                             <div className="mt-2 ml-5 space-y-1.5" onClick={e => e.stopPropagation()}>
                               <p className="text-[11px] text-neutral-400 leading-relaxed">{ef.finding.description}</p>
                               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-600">
-                                {outcomeInfo && <span className={outcomeInfo.color}>{outcomeInfo.label}</span>}
+                                {outcomeInfo && ef.outcome?.taskId && onNavigateToTask
+                                  ? (
+                                    <button
+                                      onClick={e => { e.stopPropagation(); onNavigateToTask(ef.outcome!.taskId); }}
+                                      className={`${outcomeInfo.color} hover:underline`}
+                                    >
+                                      {outcomeInfo.label}
+                                    </button>
+                                  )
+                                  : outcomeInfo && <span className={outcomeInfo.color}>{outcomeInfo.label}</span>
+                                }
+                                {prNumber && ef.outcome?.prUrl && isSafeUrl(ef.outcome.prUrl) && (
+                                  <a
+                                    href={ef.outcome.prUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="flex items-center gap-0.5 text-blue-400 hover:text-blue-300 transition-colors"
+                                  >
+                                    <ExternalLink className="w-2.5 h-2.5" />
+                                    PR #{prNumber}
+                                  </a>
+                                )}
                                 {ef.finding.related_files && ef.finding.related_files.length > 0 && (
                                   <span className="font-mono">{ef.finding.related_files.length} file{ef.finding.related_files.length !== 1 ? 's' : ''}</span>
                                 )}

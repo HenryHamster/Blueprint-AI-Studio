@@ -50,6 +50,9 @@ export interface DirectionCardProps {
   // Research history
   historyOpenIds: Record<string, boolean>;
   setHistoryOpenIds: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  // Navigation callbacks
+  onViewFindings?: (directionId: string) => void;
+  onNavigateToTask?: (taskId: string) => void;
 }
 
 export function DirectionCard({
@@ -65,6 +68,7 @@ export function DirectionCard({
   taskCounts, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
   historyOpenIds, setHistoryOpenIds,
+  onViewFindings, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
 
@@ -549,6 +553,14 @@ export function DirectionCard({
                       </span>
                     );
                   })()}
+                  {onViewFindings && (
+                    <button
+                      onClick={() => onViewFindings(d.id)}
+                      className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
+                    >
+                      View findings →
+                    </button>
+                  )}
                 </div>
                 {latestShipped && truncatedTitle && (
                   <p className="text-[10px] text-neutral-600 italic leading-relaxed">
@@ -587,7 +599,18 @@ export function DirectionCard({
                   {[...d.research_history].reverse().slice(0, 5).map((entry, i) => (
                     <div key={entry.task_id ?? i} className="p-2 bg-neutral-900/60 border border-neutral-800/60 rounded text-[10px]">
                       <div className="flex items-center justify-between mb-1">
-                        <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-neutral-400 font-medium">{formatRelativeTime(entry.timestamp)}</span>
+                          {entry.task_id && onNavigateToTask && (
+                            <button
+                              onClick={() => onNavigateToTask(entry.task_id)}
+                              className="font-mono text-[9px] text-blue-400 hover:text-blue-300 transition-colors"
+                              title="Navigate to research task"
+                            >
+                              {entry.task_id.slice(0, 8)}
+                            </button>
+                          )}
+                        </div>
                         <div className="flex items-center gap-1.5 text-neutral-600">
                           <span>{entry.tasks_created} created</span>
                           {entry.tasks_completed != null && (

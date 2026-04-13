@@ -80,7 +80,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void }) {
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [directions, setDirections] = useState<Direction[]>([]);
@@ -803,6 +803,8 @@ export function DirectionsPanel({ onClose, addToast }: { onClose: () => void; ad
                             setForceConfirmId={setForceConfirmId}
                             historyOpenIds={historyOpenIds}
                             setHistoryOpenIds={setHistoryOpenIds}
+                            onViewFindings={onViewFindings}
+                            onNavigateToTask={onNavigateToTask}
                           />
                         ))}
                       </div>
