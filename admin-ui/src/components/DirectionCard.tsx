@@ -406,6 +406,18 @@ export function DirectionCard({
                 </span>
               );
             })()}
+            {/* Merge rate badge */}
+            {(() => {
+              const hasHistory = d.research_history && d.research_history.length >= 3;
+              if (!hasHistory || d.merge_rate == null) return null;
+              const rate = d.merge_rate as number;
+              const color = rate >= 0.5 ? 'emerald' : rate >= 0.2 ? 'amber' : 'red';
+              return (
+                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                  {rate.toFixed(2)} PRs/cycle
+                </span>
+              );
+            })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               <button
@@ -521,6 +533,9 @@ export function DirectionCard({
                           )}
                           {entry.tasks_failed != null && entry.tasks_failed > 0 && (
                             <span className="text-red-600">{entry.tasks_failed} failed</span>
+                          )}
+                          {entry.prs_merged != null && (
+                            <span className="text-blue-500">{entry.prs_merged} merged</span>
                           )}
                         </div>
                       </div>

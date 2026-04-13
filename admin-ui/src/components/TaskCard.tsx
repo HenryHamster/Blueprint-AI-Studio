@@ -134,7 +134,7 @@ export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; exp
   );
 }
 
-function ResearchFindings({ findings }: { findings: ResearchFinding[] }) {
+export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) {
   const [expanded, setExpanded] = useState(false);
 
   if (!Array.isArray(findings)) return null;

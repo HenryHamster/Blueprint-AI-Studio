@@ -26,6 +26,7 @@ export interface ResearchHistoryEntry {
   cycle_insights?: string[];
   product_ratio?: number | null;
   type_distribution?: Record<string, number> | null;
+  prs_merged?: number | null;
 }
 
 export interface Direction {
@@ -60,6 +61,7 @@ export interface Direction {
   paused_reason?: string;
   paused_at?: string;
   auto_paused?: boolean;
+  merge_rate?: number | null;
 }
 
 

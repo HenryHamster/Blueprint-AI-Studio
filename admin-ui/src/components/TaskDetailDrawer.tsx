@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Search, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
-import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage } from './TaskCard';
+import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings } from './TaskCard';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 
@@ -273,10 +273,10 @@ function DetailsTab({ task, gcpProjectId, onNavigateToTask, onGoToLogs }: { task
 
       {task.research_findings && (
         <>
-          <SectionHeader>Research Findings</SectionHeader>
-          <pre className="text-sm text-neutral-300 whitespace-pre-wrap break-words bg-cyan-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-cyan-900/30">
-            {JSON.stringify(task.research_findings, null, 2)}
-          </pre>
+          <SectionHeader>Research Findings ({task.research_findings.length})</SectionHeader>
+          <div className="bg-cyan-950/20 rounded-lg p-3 border border-cyan-900/30">
+            <ResearchFindings findings={task.research_findings} />
+          </div>
         </>
       )}
 
