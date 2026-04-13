@@ -577,7 +577,6 @@ def _build_outcome_evaluation(project) -> dict:
                 type_dist[t] = type_dist.get(t, 0) + c
         if type_dist:
             product_types = {"create", "feature", "improvement"}
-            structural_types = {"refactor", "perf", "qa", "test", "deps", "docs"}
             product_count = sum(type_dist.get(t, 0) for t in product_types)
             total = sum(type_dist.values())
             outcome["type_distribution"] = type_dist

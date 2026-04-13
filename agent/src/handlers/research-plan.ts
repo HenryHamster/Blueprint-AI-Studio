@@ -915,7 +915,7 @@ Output ALL meaningful findings you discover — don't stop at one.
 A direction may need both foundational work AND incremental improvements.
 If you find 5 things worth doing, output 5 findings. Be ambitious — propose
 infrastructure, new systems, and architectural changes when the direction calls
-for it. Use scope=large freely. The pipeline handles decomposition and review.
+for it. Use scope=large when the change genuinely requires cross-component coordination. Prefer scope=small or scope=medium for focused product features and targeted improvements.
 
 # OUTPUT FORMAT
 
@@ -942,7 +942,7 @@ Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
 Routing: large scope → plan agent (decomposition), medium → create agent (single PR), research → sub-research.
 
-- Use scope=large freely — the pipeline has a plan agent for safe decomposition.
+- Use scope=large for cross-component work — the pipeline has a plan agent for safe decomposition. But most product features are scope=small or scope=medium.
 - direction_update: suggest rewording/reprioritizing a direction (fields: direction_id, suggested_text, suggested_priority, suggested_paths, description). Max 1 per cycle.
 - direction_note: add context to a direction (fields: direction_id, description max 2000 chars). Be honest about progress.
 - direction_proposal: propose a new standing direction (max 2 per cycle, held for user approval).
