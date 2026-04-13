@@ -56,7 +56,17 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         try:
             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-            pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            try:
+                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            except HTTPException as auth_err:
+                if auth_err.status_code != 401:
+                    raise
+                # Token expired — invalidate cache and retry once with a fresh token
+                from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                invalidate_github_token_cache(str(task.project_id))
+                logger.warning(f"[PR_VERIFY] Auth failure for task {task.id} PR #{pr_number} — retrying with fresh token")
+                gh_token, owner, repo = await get_github_token_for_task(task.id, session, force_refresh=True)
+                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
                 # Update in-memory first so caller sees the change even if DB write fails
                 task.context = {**(task.context or {}), "pr_merged": True}
@@ -634,12 +644,21 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # all merged child work and requeueing should be possible.
             except Exception as e:
                 err_str = str(e).lower()
-                is_transient = any(kw in err_str for kw in [
+                # Auth failures: invalidate the cached token so the next retry uses a fresh one
+                if isinstance(e, HTTPException) and e.status_code == 401:
+                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                    invalidate_github_token_cache(str(parent.project_id))
+                    logger.warning(f"[ROLLUP] Auth failure (401) for parent {parent.id} — invalidated token cache")
+                is_transient = (
+                    isinstance(e, HTTPException) and e.status_code == 401
+                ) or any(kw in err_str for kw in [
                     "api.github.com", "502", "503", "connection", "timeout",
                     "rate limit", "ssl", "name resolution",
                     # Staging branch may have been deleted by a race — retry
                     # to allow recovery or manual intervention
                     "staging branch", "validation failed",
+                    # Auth failures — token expired/revoked; cache is invalidated above
+                    "unauthorized", "bad credentials", "token expired",
                 ])
                 rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
                 if is_transient and rollup_retries <= 3:

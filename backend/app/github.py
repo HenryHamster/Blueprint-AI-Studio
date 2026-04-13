@@ -733,6 +733,12 @@ async def create_pull_request(
                 logger.info(f"[PR] No commits between {head} and {base} — empty diff")
                 return {"empty_diff": True, "merged": True, "html_url": "", "number": 0}
 
+    if response.status_code == 401:
+        logger.error(f"Failed to create pull request (401 Unauthorized): {response.text}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"GitHub authentication failed (401 Unauthorized) — token may be expired or revoked"
+        )
     logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -753,6 +759,8 @@ async def get_pull_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
         headers
     )
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail=f"GitHub authentication failed (401 Unauthorized) — token may be expired or revoked")
     if response.status_code in (404, 410):
         raise HTTPException(status_code=response.status_code, detail=f"PR #{pr_number} not found or repo gone")
     if response.status_code != 200:

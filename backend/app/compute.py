@@ -87,6 +87,7 @@ async def _release_provision_slot(vm_id: str):
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
 ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '180'))  # 3 minutes — base for exponential backoff
+ZONE_RECOVERY_WAIT_CAP_SECONDS = int(os.getenv('ZONE_RECOVERY_WAIT_CAP_SECONDS', '300'))  # Max wait when all zones in cooldown
 
 
 def _zone_cooldown_seconds(consecutive_failures: int) -> int:
@@ -686,13 +687,13 @@ STATICENV
     def _insert_instance():
         instance_client = compute_v1.InstancesClient()
         last_error = None
-        now = datetime.now(timezone.utc)
         skipped_cooldown = []
 
         for zone, subnet_name in FALLBACK_ZONES:
             if _cancel_event.is_set():
                 logger.info(f"[PROVISION] {vm_instance_id} cancelled — skipping remaining zones")
                 return None
+            now = datetime.now(timezone.utc)  # Refresh each iteration — zone attempts can take up to 300s
             # Skip zones in cooldown (recently failed) — use per-zone exponential backoff expiry
             zone_cooldown_expires = _zone_health.get(zone, {}).get("cooldown_expires_at")
             if zone_cooldown_expires and now < zone_cooldown_expires:
@@ -770,9 +771,22 @@ STATICENV
                         entering_cooldown = zone not in _zone_failures
                         _zone_failures[zone] = now_fail
                         health = _zone_health.setdefault(zone, {})
-                        health["last_failure"] = now_fail
                         old_cf = health.get("consecutive_failures", 0)
-                        new_failure_count = old_cf + 1
+                        last_fail_time = health.get("last_failure")
+                        # Debounce parallel failures: with N concurrent slots, a single zone
+                        # hiccup can trigger N simultaneous failures, jumping consecutive_failures
+                        # from 0→N and causing exponential cooldown escalation. If the last
+                        # failure was within the base cooldown window, treat this as part of the
+                        # same failure event — update the timestamp but don't increment the counter.
+                        within_debounce = (
+                            last_fail_time is not None
+                            and (now_fail - last_fail_time).total_seconds() < ZONE_COOLDOWN_SECONDS
+                        )
+                        if within_debounce:
+                            new_failure_count = old_cf  # Parallel failure of same event — no escalation
+                        else:
+                            new_failure_count = old_cf + 1
+                        health["last_failure"] = now_fail
                         health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
                         cooldown_secs = _zone_cooldown_seconds(old_cf)
@@ -802,7 +816,7 @@ STATICENV
                     if remaining < soonest_wait:
                         soonest_wait = remaining
                         soonest_zone = (z, sn)
-            if soonest_zone and soonest_wait <= 120:
+            if soonest_zone and soonest_wait <= ZONE_RECOVERY_WAIT_CAP_SECONDS:
                 wait_zone, wait_subnet = soonest_zone
                 logger.warning(
                     f"All zones in cooldown — waiting {soonest_wait:.0f}s for {wait_zone} to exit cooldown"
@@ -830,8 +844,8 @@ STATICENV
                     raise
             else:
                 logger.critical(
-                    f"ALL {len(FALLBACK_ZONES)} zones in cooldown, soonest expires in {soonest_wait:.0f}s (>120s cap) — "
-                    f"failing this provision attempt"
+                    f"ALL {len(FALLBACK_ZONES)} zones in cooldown, soonest expires in {soonest_wait:.0f}s "
+                    f"(>{ZONE_RECOVERY_WAIT_CAP_SECONDS}s cap) — failing this provision attempt"
                 )
                 raise Exception(f"All zones in cooldown — soonest: {soonest_wait:.0f}s")
         raise last_error or Exception("All zones exhausted")
@@ -1127,9 +1141,18 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
         entering_cooldown = zone not in _zone_failures
         _zone_failures[zone] = now_fail
         health = _zone_health.setdefault(zone, {})
-        health["last_failure"] = now_fail
         old_cf = health.get("consecutive_failures", 0)
-        new_failure_count = old_cf + 1
+        last_fail_time = health.get("last_failure")
+        # Debounce parallel failures (same logic as inline provisioning handler)
+        within_debounce = (
+            last_fail_time is not None
+            and (now_fail - last_fail_time).total_seconds() < ZONE_COOLDOWN_SECONDS
+        )
+        if within_debounce:
+            new_failure_count = old_cf
+        else:
+            new_failure_count = old_cf + 1
+        health["last_failure"] = now_fail
         health["consecutive_failures"] = new_failure_count
         health["last_failure_reason"] = reason
         cooldown_secs = _zone_cooldown_seconds(old_cf)
