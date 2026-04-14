@@ -692,44 +692,30 @@ ${dirSummaryText}
 ## Direction Health
 ${dirHealthSummary}
 ${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
-## Codebase
-${codebaseSummary}${researchPlaybookSection}${fileTreeSection}
-
 # Your task
 
-Analyze this project and write a strategic review. Cover:
+You are a product advisor. Think about where this project should go.
 
-1. **Vision**: What should this project's purpose, success criteria, and key systems be?
-   Define systems with IDs (sys-xxx), names, descriptions, statuses (planned/in_progress/functional/mature), and dependencies.
-   Order priorities — which systems matter most right now?
+You have everything you need above: the design document (what exists), the vision (what we're aiming for), outcome data (what's actually been shipping), current directions (what we're working on), and user feedback. Do NOT explore the codebase — the architecture agent handles that.
 
-2. **Directions**: Evaluate and steer the active research portfolio.
-   MANDATORY — you MUST include direction_operations in your Structured Output:
-   - If fewer than 3 active directions exist: create at least one new direction.
-   - If ALL active directions are SATURATED: retire at least one and create a replacement.
-   - If no direction has category="product": create one product-feature direction.
-   - Each new direction MUST include category: "product" (user-visible features, UI, API) or "structural" (infrastructure, refactoring, testing).
-   - For FEEDBACK messages: create a direction unless one already addresses the request. Set priority based on urgency. Resolve the FEEDBACK message afterward.
-   If existing directions are healthy and sufficient, you may skip creates — but you must still output update or retire operations for any saturated or complete directions.
+Write a strategic analysis. Think freely. Some questions to consider:
 
-3. **Notes**: Any strategic observations worth preserving for future cycles.
+- What should this project BECOME? Not incrementally — what's the most ambitious, transformative thing it could achieve?
+- Are we stuck in a local optimum? Lots of small improvements instead of one big leap?
+- Is the current vision ambitious enough, or does it just describe what already exists?
+- Look at the outcome data honestly — are directions producing real value, or just easy-to-merge busywork?
+- What high-impact work is nobody doing? What would make a user say "I can't work without this"?
+- Are we defaulting to structural/infrastructure work when product features would matter more?
+- What should we STOP doing?
 
-Think about what would deliver the most value to users. Balance infrastructure improvements with product features and user-visible outcomes. Don't default to structural work when product features would have more impact.
-Write your analysis as structured prose — it will be processed by a follow-up step.
+If you're unsure about what the user wants or values — ASK. Use \`./messages send 'your question' QUESTION\`. One good question is worth more than a wrong guess. If there are open messages, respond to them.
 
-IMPORTANT: End your analysis with a section titled '## Structured Output' containing:
-- A JSON block with the complete vision object (purpose, success_criteria, systems, priorities)
-- A list of direction operations (create/update/retire with all required parameters)
-This structured section will be used directly by the executor. Make it complete and self-contained.
-
-IMPORTANT: Your Structured Output MUST include direction_operations with concrete create/update/retire entries. If your analysis recommends new directions, they MUST appear as create operations — not just prose descriptions.`;
+Don't worry about formatting, JSON, or direction operations. Just think and write. A follow-up step will translate your analysis into concrete actions.`;
 
     statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
     const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
     const rawAnalysis = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
-    // Prefer the structured output section if present — it's compact and complete for the executor
-    const structuredMatch = rawAnalysis.match(/## Structured Output[\s\S]*$/i);
-    const analysisText = structuredMatch ? structuredMatch[0] + '\n\n---\nFull analysis:\n' + rawAnalysis.slice(0, 20_000) : rawAnalysis;
+    const analysisText = rawAnalysis;
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.
@@ -775,13 +761,15 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. Run ./strategic set-vision with the vision described in the analysis.
-1.5. If the analysis identifies gaps (BELOW_MINIMUM, NO_PRODUCT_DIRECTIONS, ALL_SATURATED), ENSURE you run ./strategic create-direction for at least one new direction addressing the gap.
-2. Run ./strategic create-direction for each new direction recommended.
-3. Run ./strategic retire-direction for any directions the analysis says to retire.
-4. Run ./design-doc set "notes/strategic-review" with key observations.
-5. Review open messages — resolve any that have been addressed, respond to user questions.
-6. Done. Do not write anything else.`;
+1. Read the analysis carefully. Extract the vision and direction recommendations.
+2. Run ./strategic set-vision with the vision from the analysis (update purpose, success_criteria, systems, priorities).
+3. Run ./strategic create-direction for each new direction the analysis recommends. Use category "product" or "structural".
+4. Run ./strategic retire-direction for any directions the analysis says to retire or stop.
+5. Run ./strategic update-direction for any priority or scope changes.
+6. Run ./design-doc set "notes/strategic-review" with key observations.
+7. Review open messages — resolve addressed ones, respond to questions.
+8. Guardrails: ensure at least 3 active directions remain and at least one has category="product". If the analysis doesn't cover this, add a direction to fill the gap.
+9. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);

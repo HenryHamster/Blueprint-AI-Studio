@@ -960,7 +960,7 @@ async def orchestrator_worker():
                     await session.commit()
 
                 # Check tasks waiting on CI (review approved, CI pending)
-                CI_WAIT_TIMEOUT_MINUTES = 30
+                CI_WAIT_TIMEOUT_MINUTES = 60
                 ci_waiting_tasks = (await session.execute(
                     select(Task).where(Task.status == TaskStatus.EVALUATING)
                 )).scalars().all()
@@ -994,18 +994,20 @@ async def orchestrator_worker():
                             try:
                                 started = datetime.fromisoformat(ci_wait_started)
                                 if (_utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
-                                    logger.error(f"[CI] PR #{ci_pr_number} CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min")
-                                    ci_task.status = TaskStatus.FAILED
-                                    ci_task.latest_status_message = f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — manual inspection required"
-                                    session.add(ci_task)
-                                    await _maybe_create_failure_alert(
-                                        ci_task, session,
-                                        f"CI wait timed out after {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number}"
-                                    )
-                                    await session.commit()
-                                    await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                               {"task_id": str(ci_task.id), "status": ci_task.status})
-                                    await _ensure_vm_deleted(ci_task, reason="ci_timeout")
+                                    # Escalate: alert the user but keep retrying.
+                                    # The 6-hour hard timeout in services.py is the true backstop.
+                                    if not ci_loop.get("escalated"):
+                                        ci_loop["escalated"] = True
+                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                        ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
+                                        session.add(ci_task)
+                                        await _maybe_create_failure_alert(
+                                            ci_task, session,
+                                            f"Rollup PR #{ci_pr_number} stuck in CI-wait for >{CI_WAIT_TIMEOUT_MINUTES}min — still retrying"
+                                        )
+                                        await session.commit()
+                                        await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                                   {"task_id": str(ci_task.id), "status": ci_task.status})
                                     continue
                             except (ValueError, TypeError) as e:
                                 logger.error(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})", exc_info=True)
@@ -1027,7 +1029,26 @@ async def orchestrator_worker():
                                 await broadcast_to_project(str(ci_task.project_id), "task_updated",
                                                            {"task_id": str(ci_task.id), "status": ci_task.status})
                                 continue
-                            raise
+                            # Transient GitHub API error (500, 502, 503, etc.) — backoff and retry
+                            _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
+                            ci_loop["pr_fetch_failures"] = _fetch_failures
+                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                            ci_loop["ci_poll_interval"] = min((ci_loop.get("ci_poll_interval", 10)) * 2, 60)
+                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                            logger.warning(f"[CI] Transient error fetching PR #{ci_pr_number} for task {ci_task.id} "
+                                           f"(attempt {_fetch_failures}): {exc.detail}")
+                            session.add(ci_task)
+                            await session.commit()
+                            if _fetch_failures >= 10:
+                                # Escalate after 10 consecutive failures but keep retrying
+                                if not ci_loop.get("fetch_escalated"):
+                                    ci_loop["fetch_escalated"] = True
+                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    await _maybe_create_failure_alert(ci_task, session,
+                                        f"PR #{ci_pr_number} GitHub API failures ({_fetch_failures}x) — still retrying")
+                                    session.add(ci_task)
+                                    await session.commit()
+                            continue
 
                         if not pr_data:
                             _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
@@ -1217,13 +1238,39 @@ async def orchestrator_worker():
                                     if 'in progress' in merge_msg.lower() or 'status check' in merge_msg.lower():
                                         ci_loop["ci_poll_interval"] = 10  # Reset polling interval
                                         ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                        ci_loop["ci_wait_started"] = _utcnow().isoformat()  # Reset timeout — new CI cycle
                                         ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
                                         ci_task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
                                         logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait")
                                     else:
-                                        ci_task.status = TaskStatus.FAILED
-                                        ci_task.latest_status_message = f"CI passed but merge blocked after 4 attempts: {merge_msg}"
-                                        logger.error(f"[CI] PR #{ci_pr_number} merge blocked after retries: {merge_result}")
+                                        # Check if PR was merged by a sibling task
+                                        try:
+                                            _recheck_pr = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                                            if _recheck_pr and (_recheck_pr.get("merged") or _recheck_pr.get("state") == "closed"):
+                                                ci_task.status = TaskStatus.COMPLETED
+                                                ci_task.latest_status_message = f"PR #{ci_pr_number} already merged by another task"
+                                                logger.info(f"[CI] PR #{ci_pr_number} was already merged — marking task complete")
+                                            else:
+                                                # Retry instead of failing — backoff and try again next cycle
+                                                _merge_failures = ci_loop.get("merge_failures", 0) + 1
+                                                ci_loop["merge_failures"] = _merge_failures
+                                                ci_loop["ci_poll_interval"] = min(30 * _merge_failures, 120)
+                                                ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                                ci_task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
+                                                logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry")
+                                                if _merge_failures >= 10 and not ci_loop.get("merge_escalated"):
+                                                    ci_loop["merge_escalated"] = True
+                                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                                    await _maybe_create_failure_alert(ci_task, session,
+                                                        f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
+                                        except Exception:
+                                            # GitHub API error on recheck — retry next cycle
+                                            ci_loop["ci_poll_interval"] = 30
+                                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                            ci_task.latest_status_message = f"Merge check failed on PR #{ci_pr_number} — retrying"
+                                            logger.warning(f"[CI] PR #{ci_pr_number} merge recheck failed — will retry")
                         else:
                             # CI failed — check for existing active fix before spawning
                             active_tasks = (await session.execute(

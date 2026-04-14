@@ -298,11 +298,16 @@ async def _process_post_commit(
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
                             if not review_task:
-                                task.latest_status_message = f"Auto-merge failed and review not spawned for PR #{pr_number} — iteration cap"
-                                task.requires_approval = True
+                                logger.error(f"[PIPELINE] Auto-merge failed and review spawn returned None for PR #{pr_number} — parking in CI-wait")
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number}, review cap hit — CI monitor will retry merge"
+                                task.context = {**(task.context or {}), "review_loop": {
+                                    "ci_waiting": True, "pr_number": pr_number,
+                                    "branch": branch, "base_branch": base_branch,
+                                    "original_task_id": str(task.id),
+                                    "ci_wait_started": _utcnow().isoformat()}}
                                 session.add(task)
                                 await session.commit()
-                                logger.error(f"[PIPELINE] WARNING: Auto-merge failed and review spawn returned None for PR #{pr_number}")
                     except Exception as e:
                         logger.error(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}", exc_info=True)
                         # Fallback: spawn review so the pipeline doesn't die
@@ -312,14 +317,25 @@ async def _process_post_commit(
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
                             if not fallback_review:
-                                task.latest_status_message = f"Pipeline stalled: auto-merge failed and review not spawned (iteration cap) for PR #{pr_number}"
-                                task.requires_approval = True
+                                logger.warning(f"[PIPELINE] Fallback review spawn returned None for PR #{pr_number} — parking in CI-wait")
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = f"Auto-merge error for PR #{pr_number}, review cap hit — CI monitor will retry merge"
+                                task.context = {**(task.context or {}), "review_loop": {
+                                    "ci_waiting": True, "pr_number": pr_number,
+                                    "branch": branch, "base_branch": base_branch,
+                                    "original_task_id": str(task.id),
+                                    "ci_wait_started": _utcnow().isoformat()}}
                                 session.add(task)
                                 await session.commit()
-                                logger.warning(f"[PIPELINE] WARNING: Fallback review spawn returned None for PR #{pr_number}")
-                        except Exception as e:
-                            logger.error(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {e}", exc_info=True)
-                            task.latest_status_message = f"Pipeline stalled: auto-merge and review spawn both failed — {type(e).__name__}: {e!r}"[:500]
+                        except Exception as inner_e:
+                            logger.error(f"[PIPELINE] Fallback review spawn failed for PR #{pr_number}: {inner_e}", exc_info=True)
+                            task.status = TaskStatus.EVALUATING
+                            task.latest_status_message = f"Pipeline recovery: merge and review spawn failed for PR #{pr_number} — CI monitor will retry"
+                            task.context = {**(task.context or {}), "review_loop": {
+                                "ci_waiting": True, "pr_number": pr_number,
+                                "branch": branch, "base_branch": base_branch,
+                                "original_task_id": str(task.id),
+                                "ci_wait_started": _utcnow().isoformat()}}
                             session.add(task)
                             await session.commit()
                 else:

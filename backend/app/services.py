@@ -533,6 +533,19 @@ async def _check_evaluating_timeouts():
                             f"children of timed-out task {str(task.id)[:8]}"
                         )
 
+                    # Close orphaned rollup PRs from CI-waiting children
+                    from app.github import close_pull_request  # noqa: PLC0415
+                    for child in children:
+                        child_pr = (child.context or {}).get("review_loop", {}).get("pr_number")
+                        if child_pr and not (child.context or {}).get("pr_merged"):
+                            try:
+                                from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                                _gh, _owner, _repo = await get_github_token_for_task(child.id, session)
+                                await close_pull_request(_gh, _owner, _repo, child_pr)
+                                logger.info(f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}")
+                            except Exception as pr_err:
+                                logger.warning(f"[EVAL TIMEOUT] Failed to close PR #{child_pr}: {pr_err}")
+
                     # Create ERROR alert (deduplicated by _maybe_create_failure_alert)
                     await _maybe_create_failure_alert(
                         task, session,

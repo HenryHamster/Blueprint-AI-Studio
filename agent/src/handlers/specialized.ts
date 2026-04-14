@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  apiPost, persistAndPostStatus, apiGet, git, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
+  apiPost, persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -228,9 +228,10 @@ CRITICAL RULES:
     const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
     const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
     execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    git(['push', 'origin', workBranch]);
+    await gitAsync(['push', 'origin', workBranch]);
     sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
+    sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`);
     statusRef.value = 'Creating pull request...';
     let prUrl = '';
     try {

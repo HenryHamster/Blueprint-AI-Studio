@@ -298,13 +298,35 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         or force_strategic
     )
     if is_strategic:
-        from app.strategic_spawning import _spawn_design_doc_update  # noqa: PLC0415
-        if await _spawn_design_doc_update(project, session):
+        # Determine if this strategic cycle should also include architecture review.
+        # Architecture stabilizes faster than strategy, so it runs less frequently.
+        strategic_cycle_count = (project.vision or {}).get("_strategic_cycle_count", 0) + 1
+        arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
+        is_architecture_cycle = arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
+
+        spawned = False
+        if is_architecture_cycle:
+            # Full pipeline: Phase 1 (architecture) → Phase 2 (strategic) via completion handler
+            from app.strategic_spawning import _spawn_design_doc_update
+            spawned = await _spawn_design_doc_update(project, session)
+            if spawned:
+                logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
+                            f"vision rev {(project.vision or {}).get('revision', 0)})")
+        else:
+            # Strategy-only: skip architecture, go straight to strategic review
+            from app.strategic_spawning import _spawn_strategic_review
+            spawned = await _spawn_strategic_review(project, session)
+            if spawned:
+                logger.info(f"[AUTONOMOUS] Spawned strategic review without architecture "
+                            f"(cycle #{strategic_cycle_count}, arch runs every {arch_frequency})")
+
+        if spawned:
             research_spawn_count += 1
-            project.vision = {**(project.vision or {}), "_research_spawn_count": research_spawn_count}
+            project.vision = {**(project.vision or {}),
+                              "_research_spawn_count": research_spawn_count,
+                              "_strategic_cycle_count": strategic_cycle_count}
             flag_modified(project, "vision")
             session.add(project)
-            logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{research_spawn_count - 1}, vision rev {(project.vision or {}).get('revision', 0)})")
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.

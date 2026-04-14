@@ -53,6 +53,7 @@ runtime_config: Dict = {
     "direction_auto_recovery_hours": 48,
     "autonomous_research_wave_size": 3,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
+    "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,

@@ -3,8 +3,9 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, apiGet, git, cloneWithRetry,
+  persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
+  sendHeartbeatSync,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -483,10 +484,11 @@ export async function handleFix(
     try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch { /* ignore */ }
 
     if (localHead !== remoteHead) {
+      sendHeartbeatSync(taskId, `Pushing fixes to ${branch}...`);
       const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
       const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
       execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-      git(['push', '--force-with-lease', 'origin', branch]);
+      await gitAsync(['push', '--force-with-lease', 'origin', branch]);
       sendLog(ws, `Pushed fixes to ${branch}\n`);
 
       await persistAndPostStatus(taskId, {

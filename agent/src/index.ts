@@ -415,6 +415,25 @@ export function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+/** Async git that doesn't block the event loop — use for long operations (push, clone)
+ *  so the setInterval heartbeat can keep firing. */
+export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    const proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    proc.stdout!.on('data', (d: Buffer) => chunks.push(d));
+    proc.stderr!.on('data', (d: Buffer) => errChunks.push(d));
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error(`git ${args[0]} timed out after ${timeoutMs}ms`)); }, timeoutMs);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(Buffer.concat(chunks).toString('utf-8').trim());
+      else reject(new Error(`git ${args.join(' ')} failed (exit ${code}): ${Buffer.concat(errChunks).toString('utf-8').trim()}`));
+    });
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 /** Clone with retry — transient network failures get 3 attempts with exponential backoff. */
 export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
@@ -503,15 +522,17 @@ export async function pushAndCreatePR(
     } catch { /* no markers found */ }
   }
 
-  // Heartbeat before push — sync git operations block the event loop and starve
-  // the setInterval heartbeat, which can cause the reaper to kill us mid-push.
+  // Use async push so the event loop isn't blocked — the setInterval heartbeat
+  // keeps firing during the push, preventing the reaper from killing us mid-push.
   sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
   const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
   const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
   execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-  git(['push', 'origin', workBranch]);
+  await gitAsync(['push', 'origin', workBranch]);
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
+  // Heartbeat after push, before PR creation — ensures the reaper sees fresh activity
+  sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`);
   statusRef.value = 'Creating pull request...';
   let prUrl = '';
   try {

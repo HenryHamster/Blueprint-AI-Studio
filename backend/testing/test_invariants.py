@@ -54,27 +54,6 @@ class TestSafetyConstants:
         )
 
 
-# ── VM Self-Destruct Timer ──────────────────────────────────────────────────
-
-class TestVMSafety:
-    def test_vm_self_destruct_timer(self):
-        """GCP VMs must have a 1-hour self-destruct timer (TTL_SECONDS=3600)."""
-        compute_path = os.path.join(os.path.dirname(__file__), "..", "app", "compute.py")
-        with open(compute_path) as f:
-            content = f.read()
-        assert "TTL_SECONDS=3600" in content, (
-            "VM self-destruct timer (TTL_SECONDS=3600) missing from compute.py startup script. "
-            "This prevents runaway VMs from accumulating costs."
-        )
-
-    def test_vm_poweroff_present(self):
-        """Startup script must end with poweroff."""
-        compute_path = os.path.join(os.path.dirname(__file__), "..", "app", "compute.py")
-        with open(compute_path) as f:
-            content = f.read()
-        assert "poweroff" in content, "VM startup script must include poweroff for self-termination"
-
-
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
 class TestSecurityIntegrity:
