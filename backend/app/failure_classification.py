@@ -71,12 +71,14 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # (iteration cap)" is correctly classified as AGENT_TIMEOUT rather than EXTERNAL_API.
     if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
                                       "review-fix cap reached", "review-fix cycle limit",
-                                      "ci wait exceeded", "ci wait timed out", "stuck in ci-wait"]):
+                                      "ci wait exceeded", "ci wait timed out", "ci in progress",
+                                      "stuck in ci-wait"]):
         return "AGENT_TIMEOUT"
 
     # Merge-blocking GitHub responses — branch protection, rule violations, not-mergeable states.
     # These are GitHub operation blocks, not agent code defects.
-    if any(kw in combined for kw in ["merge blocked", "merge attempt", "not mergeable",
+    if any(kw in combined for kw in ["merge blocked", "merge attempt", "merge conflicts",
+                                      "merge check failed", "not mergeable",
                                       "repository rule", "rule violations",
                                       "required status check", "branch protection"]):
         return "EXTERNAL_API"
