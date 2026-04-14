@@ -612,6 +612,22 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
     }, 0);
   };
 
+  // Pipelines where the root + all descendants are terminal (done)
+  const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
+  const donePipelineIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const root of forest) {
+      if (root.isSyntheticParent) continue;
+      const allIds = collectAllIds(root).filter(id => !id.startsWith('synthetic-'));
+      const allTerminal = allIds.every(id => {
+        const t = taskMap.get(id);
+        return t && TERMINAL.includes(t.status);
+      });
+      if (allTerminal && allIds.length > 0) ids.push(...allIds);
+    }
+    return ids;
+  }, [forest, taskMap]);
+
   const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
   const chipBase = 'px-2.5 py-1 text-xs rounded-full border transition-colors font-medium';
   const chipActive = 'bg-neutral-700 border-neutral-500 text-neutral-100';
@@ -649,6 +665,15 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
                 onClick={jumpToActive}
               >
                 Jump to active
+              </button>
+            )}
+            {onArchiveGroup && donePipelineIds.length > 0 && (
+              <button
+                className="px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors flex items-center gap-1"
+                onClick={() => onArchiveGroup(donePipelineIds)}
+              >
+                <Archive className="w-3 h-3" />
+                Archive done ({donePipelineIds.length})
               </button>
             )}
           </div>

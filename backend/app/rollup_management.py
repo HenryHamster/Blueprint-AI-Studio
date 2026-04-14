@@ -281,10 +281,52 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                            if c.status == TaskStatus.COMPLETED and (c.context or {}).get("pr_merged")]
 
         if unmerged:
-            # Some completed but PRs not yet merged — wait for merge verification
+            # Some completed but PRs not yet merged.
+            # Check if any are stale (>10min) with no active review — respawn pipeline.
+            now = _utcnow()
+            stale_threshold = timedelta(minutes=10)
+            respawned = 0
+            for c in unmerged:
+                age = (now - c.updated_at).total_seconds() if c.updated_at else 0
+                if age < stale_threshold.total_seconds():
+                    continue  # Too recent — normal pipeline may still be working
+                # Look up PR artifact to get pr_number and branch
+                pr_art = (await session.execute(
+                    select(Artifact).where(
+                        Artifact.task_id == c.id,
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    ).limit(1)
+                )).scalars().first()
+                if not pr_art or not pr_art.pr_url:
+                    # No PR artifact — _verify_pr_merged should have handled this.
+                    # Force-set pr_merged so next cycle picks it up.
+                    c.context = {**(c.context or {}), "pr_merged": True}
+                    session.add(c)
+                    logger.info(f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged")
+                    continue
+                try:
+                    pr_number = int(pr_art.pr_url.rstrip("/").split("/")[-1])
+                except (ValueError, IndexError):
+                    logger.warning(f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}")
+                    continue
+                c_payload = c.first_payload
+                branch = (c.context or {}).get("branch") or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
+                base_branch = c_payload.get("base_branch", "main")
+                original_prompt = c_payload.get("prompt", c.description or "")
+                review_task = await _spawn_pipeline_task(
+                    c, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(c.id),
+                )
+                if review_task and review_task.id != c.id:
+                    respawned += 1
+                    logger.warning(f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} PR #{pr_number} → review {str(review_task.id)[:8]}")
+
             titles = [c.title[:40] for c in unmerged]
-            parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
-            logger.error(f"[ROLLUP] Parent {parent.id} blocked — {len(unmerged)} children completed but unmerged")
+            if respawned:
+                parent.latest_status_message = f"Recovering: respawned {respawned} review(s) for unmerged PR(s) — {', '.join(titles)}"
+            else:
+                parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
+            logger.info(f"[ROLLUP] Parent {parent.id} — {len(unmerged)} unmerged, {respawned} reviews respawned")
             session.add(parent)
             await session.commit()
             return

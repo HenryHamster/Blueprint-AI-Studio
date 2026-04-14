@@ -20,6 +20,7 @@ Usage:
     python scripts/tasks.py requeue-ci
     python scripts/tasks.py trigger-rollup [<parent_id>]
     python scripts/tasks.py archive [--completed]          — archive old terminal tasks
+    python scripts/tasks.py archive --pipelines            — archive fully-terminal pipelines (parent+all children done)
     python scripts/tasks.py research [--limit N] [-v]     — recent research results + findings
     python scripts/tasks.py research <id> [-v]            — detailed view of one research task
 """
@@ -1151,7 +1152,39 @@ def cmd_autonomy_debug(args):
 
 def cmd_archive(args):
     """Archive old completed/failed tasks."""
-    from blueprint_api import api
+    from blueprint_api import api, all_tasks_by_status
+    if '--pipelines' in args:
+        # Archive fully-terminal pipelines: parent + all children in COMPLETED/CANCELLED
+        TERMINAL = {'COMPLETED', 'FAILED', 'CANCELLED'}
+        all_tasks = all_tasks_by_status(None, limit=1000)
+        non_archived = [t for t in all_tasks if not t.get('archived')]
+
+        # Build parent → children map
+        children_by_parent = {}
+        for t in non_archived:
+            pid = t.get('parent_task_id')
+            if pid:
+                children_by_parent.setdefault(pid, []).append(t)
+
+        # Find top-level parents (no parent themselves) that are terminal
+        top_parents = [t for t in non_archived if not t.get('parent_task_id') and t['status'] in TERMINAL]
+
+        to_archive = []
+        for parent in top_parents:
+            children = children_by_parent.get(parent['id'], [])
+            all_terminal = all(c['status'] in TERMINAL for c in children)
+            if all_terminal:
+                to_archive.append(parent['id'])
+                to_archive.extend(c['id'] for c in children)
+
+        if not to_archive:
+            print("No fully-terminal pipelines to archive.")
+            return
+        pipeline_count = sum(1 for p in top_parents if p['id'] in to_archive)
+        result = api("POST", "/api/admin/tasks/bulk-archive", {"task_ids": to_archive})
+        print(f"Archived {result.get('archived_count', '?')} tasks across {pipeline_count} pipelines.")
+        return
+
     filter_type = 'terminal'  # default: archive all terminal tasks
     for i, a in enumerate(args):
         if a == '--completed':
