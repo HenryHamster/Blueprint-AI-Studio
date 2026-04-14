@@ -56,6 +56,7 @@ runtime_config: Dict = {
     "max_active_directions": 10,
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,
+    "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
 }
 
 # --- Autonomous Loop State ---

@@ -19,6 +19,9 @@ from app.admin import _user_project_ids
 
 logger = logging.getLogger(__name__)
 
+ON_DEMAND_RATE = 0.067 / 3600  # $/sec
+SPOT_RATE = 0.020 / 3600  # $/sec
+
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-analytics"],
@@ -601,6 +604,8 @@ async def get_digest(
                         pass
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
+                dir_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
+
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 direction_progress_list.append({
                     "direction_id": did,
@@ -615,6 +620,7 @@ async def get_digest(
                     "latest_research_at": latest_research_at,
                     "product_ratio": dir_product_ratio,
                     "type_distribution": agg_type_distribution or None,
+                    "estimated_cost_usd": round(dir_cost, 2),
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -835,12 +841,14 @@ async def get_digest(
             _cls = _classify_failure(_ft)
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
         _p_total = _p_completed + _p_failed
+        _p_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
         trend_history.append({
             "period_end": _p_end.isoformat(),
             "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
             "completed": _p_completed,
             "failed": _p_failed,
             "failed_by_class": _p_by_class,
+            "period_cost_usd": round(_p_cost, 4),
         })
 
     # Action-first narrative: executives want "what do I need to do?" before "how did things go?"
@@ -937,6 +945,11 @@ async def get_digest(
         else:
             narrative_summary = f"All quiet — no activity in the last {hours}h."
 
+    # Compute total estimated cost (directed + undirected tasks)
+    directed_task_ids = {t.id for t in all_tasks if (t.context or {}).get("direction_id")}
+    undirected_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
+    total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
+
     # Compute overall product_ratio and type_distribution across all directions
     all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
     overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
@@ -985,6 +998,7 @@ async def get_digest(
         "direction_progress": direction_progress_list,
         "overall_product_ratio": overall_product_ratio,
         "overall_type_distribution": overall_type_distribution or None,
+        "total_estimated_cost_usd": total_estimated_cost_usd,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,

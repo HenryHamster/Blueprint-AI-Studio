@@ -27,6 +27,7 @@ interface DirectionProgress {
   prs_merged: number;
   possibly_saturated: boolean;
   product_ratio?: number | null;
+  estimated_cost_usd?: number | null;
 }
 
 interface FailureGroupTask {
@@ -69,7 +70,8 @@ interface DigestData {
   failed_count: number;
   success_rate?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number> }[];
+  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number>; period_cost_usd?: number | null }[];
+  total_estimated_cost_usd?: number | null;
   direction_progress?: DirectionProgress[];
   pending_approval_count: number;
   overall_product_ratio?: number | null;
@@ -293,6 +295,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
               <MetricCard label="Completed" value={digest?.completed_count ?? 0} color="violet" spark={[]} dataKey="active" loading={loading} />
               <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
+              <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
             </div>
           </section>
 
@@ -351,6 +354,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
                           <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
                           {d.product_ratio != null && (
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
+                          )}
+                          {d.estimated_cost_usd != null && (
+                            <span>${d.estimated_cost_usd < 10 ? d.estimated_cost_usd.toFixed(2) : Math.round(d.estimated_cost_usd).toString()}</span>
                           )}
                         </div>
                       </div>
@@ -590,6 +596,38 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
                 </linearGradient>
               </defs>
               <Area type="monotone" dataKey="v" stroke="#e5e5e5" fill="url(#grad-success)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CostCard({ totalCost, trendHistory, loading }: {
+  totalCost?: number | null;
+  trendHistory?: { period_cost_usd?: number | null }[];
+  loading: boolean;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  const fill = SPARK_COLORS['blue'];
+  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 }));
+  const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Cost (24h)</p>
+      <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
+      {sparkPoints.length >= 3 && (
+        <div className="h-8 mt-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={sparkPoints}>
+              <defs>
+                <linearGradient id="grad-cost" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={fill} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={fill} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <Area type="monotone" dataKey="v" stroke={fill} fill="url(#grad-cost)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </div>

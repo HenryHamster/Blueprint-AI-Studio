@@ -40,6 +40,7 @@ from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
+from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,76 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
+
+
+async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
+    """Create a WARNING alert if the daily VM cost total exceeds the configured ceiling.
+
+    Runs at most once per task completion. The alert is deduplicated — only one
+    undismissed 'Daily cost ceiling exceeded' alert per project is created.
+    """
+    ceiling = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
+    if ceiling <= 0:
+        return
+
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+    )
+    # Exclude current task from DB query to avoid double-counting (its vm_stopped_at
+    # was just set in-memory and may be flushed before the query runs).
+    rows = (await session.execute(
+        select(Task.vm_provisioned_at, Task.vm_stopped_at, Task.vm_spot).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.vm_stopped_at >= today_start,
+            Task.vm_provisioned_at.is_not(None),
+        )
+    )).all()
+
+    daily_total = 0.0
+    for prov_at, stop_at, is_spot in rows:
+        if prov_at and stop_at:
+            secs = (stop_at - prov_at).total_seconds()
+            rate = SPOT_RATE if is_spot else ON_DEMAND_RATE
+            daily_total += secs * rate
+
+    # Always include the current task's cost explicitly (it is in-memory, not yet committed).
+    if task.vm_provisioned_at and task.vm_stopped_at and task.vm_stopped_at >= today_start:
+        secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+        daily_total += secs * (SPOT_RATE if task.vm_spot else ON_DEMAND_RATE)
+
+    if daily_total <= ceiling:
+        return
+
+    alert_title = "Daily cost ceiling exceeded"
+    existing = (await session.execute(
+        select(Alert).where(
+            Alert.project_id == task.project_id,
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.WARNING,
+            Alert.dismissed_at.is_(None),
+            Alert.title == alert_title,
+        )
+    )).scalars().first()
+    if existing is not None:
+        return
+
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=alert_title,
+        message=f"Daily VM cost ${daily_total:.2f} exceeds ceiling ${ceiling:.2f}.",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert_title},
+    )
+    logger.warning(
+        f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
+        f"${daily_total:.2f} > ${ceiling:.2f}"
+    )
 
 
 @router.post("/api/agent/status")
@@ -497,6 +568,13 @@ async def update_agent_status(
             task.context = {**(task.context or {}), "_slot_released": True}
 
         task.vm_stopped_at = _utcnow()
+        if task.vm_provisioned_at:
+            _runtime_secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+            _rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
+            ctx = dict(task.context or {})
+            ctx['estimated_cost_usd'] = round(_runtime_secs * _rate, 4)
+            task.context = ctx
+            await _check_daily_cost_ceiling(task, session)
         old_vm_id = task.vm_instance_id
         await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
 

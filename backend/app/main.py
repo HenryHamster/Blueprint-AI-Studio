@@ -315,6 +315,8 @@ async def _init_deployment_state():
                     _runtime_config["strategic_research_frequency"] = int(config_json["strategic_research_frequency"])
                 if "require_approval_gates" in config_json:
                     _runtime_config["require_approval_gates"] = bool(config_json["require_approval_gates"])
+                if "daily_cost_ceiling_usd" in config_json:
+                    _runtime_config["daily_cost_ceiling_usd"] = float(config_json["daily_cost_ceiling_usd"])
                 logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)
