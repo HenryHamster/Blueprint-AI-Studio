@@ -27,6 +27,58 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+async def _post_cycle_summary_message(
+    project: Project,
+    task: Task,
+    session: AsyncSession,
+    cycle_id: Optional[str],
+    vision_rev: Any,
+    active_dirs: int,
+    dirs_created: int,
+    dirs_retired: int,
+) -> None:
+    """Post a ProjectMessage summarising the completed strategic cycle."""
+    content = (
+        f"Strategic cycle completed: vision updated (rev {vision_rev}), "
+        f"{dirs_created} direction(s) created, {dirs_retired} retired, "
+        f"{active_dirs} active total."
+    )
+    # Append brief direction titles for context (cap at 800 chars total)
+    if dirs_created > 0 or dirs_retired > 0:
+        lines = []
+        for d in (project.directions or []):
+            title = (d.get("text") or "")[:80]
+            if d.get("status") == "active" and dirs_created > 0:
+                notes = d.get("notes") or []
+                if any(cycle_id and cycle_id in (n.get("text") or "") for n in notes):
+                    lines.append(f"  + {title}")
+            elif d.get("status") == "expired" and dirs_retired > 0:
+                notes = d.get("notes") or []
+                if any("Retired by strategic review" in (n.get("text") or "") for n in notes):
+                    lines.append(f"  - {title}")
+        if lines:
+            detail = "\n" + "\n".join(lines[:10])
+            if len(content) + len(detail) <= 800:
+                content += detail
+
+    summary_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=task.id,
+        content=content[:800],
+        context={
+            "event_type": "cycle_summary",
+            "cycle_id": cycle_id,
+            "dirs_created": dirs_created,
+            "dirs_retired": dirs_retired,
+            "vision_revision": vision_rev,
+            "active_direction_count": active_dirs,
+        },
+    )
+    session.add(summary_msg)
+
+
 async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> None:
     """Record a FAILED strategic task in the circuit breaker and cycle history.
 
@@ -344,6 +396,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
+        await _post_cycle_summary_message(
+            project, task, session, cycle_id, vision_rev, active_dirs, dirs_created, dirs_retired
+        )
         await session.commit()
         logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
         return
@@ -714,6 +769,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         )
 
     vision_rev = (project.vision or {}).get("revision", "?")
+    _active_dirs_end = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+    await _post_cycle_summary_message(
+        project, task, session, cycle_id, vision_rev, _active_dirs_end, dirs_created, retires_applied
+    )
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
     await session.commit()  # Single commit: vision + directions + messages + task status

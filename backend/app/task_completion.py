@@ -21,7 +21,9 @@ from sqlmodel import select
 
 from app.github import create_branch, create_pr_comment, get_branch_sha, get_open_pull_requests
 from app.models import (
+    MessageType,
     Project,
+    ProjectMessage,
     Task,
     TaskHistory,
     TaskStatus,
@@ -815,6 +817,21 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
             })
         flag_modified(project, 'vision')
         session.add(project)
+    if spawned:
+        phase1_msg = ProjectMessage(
+            project_id=task.project_id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            from_task_id=task.id,
+            content=f"Architecture analysis completed ({page_count} pages, rev {rev}). Strategic review starting.",
+            context={
+                "event_type": "cycle_phase1_complete",
+                "cycle_id": cycle_id,
+                "page_count": page_count,
+                "revision": rev,
+            },
+        )
+        session.add(phase1_msg)
     session.add(task)
     await session.commit()
 
