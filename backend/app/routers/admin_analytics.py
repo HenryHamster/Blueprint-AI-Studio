@@ -961,6 +961,7 @@ async def get_digest(
                     "directions_created": last.get("directions_created", 0),
                     "directions_retired": last.get("directions_retired", 0),
                     "vision_updated": last.get("vision_updated", False),
+                    "summary_text": last.get("summary_text"),
                 }
 
     return {

@@ -312,12 +312,15 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         if cycle_id:
+            _vision_updated = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
+            _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired"
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
-                "vision_updated": (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev,
+                "vision_updated": _vision_updated,
                 "directions_created": dirs_created,
                 "directions_retired": dirs_retired,
                 "outcome": "completed",
+                "summary_text": _summary,
             })
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
@@ -620,12 +623,16 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     if cycle_id:
         dirs_retired = retires_applied
         vision_produced = bool(new_vision and isinstance(new_vision, dict))
+        _active_dirs_fb = sum(1 for d in (project.directions or []) if d.get("status") == "active")
+        _vision_rev_fb = (project.vision or {}).get("revision", 0)
+        _summary_fb = f"rev {_vision_rev_fb}, {_active_dirs_fb} active, {dirs_created} created, {dirs_retired} retired"
         _update_cycle_history(project, cycle_id, {
             "phase2_completed_at": _utcnow().isoformat(),
             "vision_updated": vision_produced,
             "directions_created": dirs_created,
             "directions_retired": dirs_retired,
             "outcome": "completed" if vision_produced else "failed",
+            "summary_text": _summary_fb,
         })
 
     await _check_direction_starvation(project, dirs_created, session)

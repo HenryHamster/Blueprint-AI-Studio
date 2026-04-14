@@ -62,6 +62,7 @@ interface LatestCycle {
   directions_created: number;
   directions_retired: number;
   vision_updated: boolean;
+  summary_text?: string | null;
 }
 
 interface DigestData {
@@ -432,17 +433,22 @@ function SystemStatusCard({ digest, loading }: { digest: DigestData | null; load
               <p className="text-sm text-neutral-300 leading-relaxed">{digest.narrative_summary}</p>
             )}
             {cycle && (
-              <div className="text-[10px] text-neutral-500 mt-2 flex items-center gap-2">
-                {cycle.outcome === 'completed' ? (
-                  <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />
-                ) : (
-                  <AlertTriangle className="w-3 h-3 text-red-400 shrink-0" />
+              <>
+                <div className="text-[10px] text-neutral-500 mt-2 flex items-center gap-2">
+                  {cycle.outcome === 'completed' ? (
+                    <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="w-3 h-3 text-red-400 shrink-0" />
+                  )}
+                  <span>
+                    Last cycle: {timeAgo(cycle.completed_at ?? cycle.started_at)} &mdash;{' '}
+                    {cycle.directions_created} created, {cycle.directions_retired} retired
+                  </span>
+                </div>
+                {cycle.summary_text && (
+                  <p className="text-[10px] text-neutral-500 mt-1">{cycle.summary_text}</p>
                 )}
-                <span>
-                  Last cycle: {timeAgo(cycle.completed_at ?? cycle.started_at)} &mdash;{' '}
-                  {cycle.directions_created} created, {cycle.directions_retired} retired
-                </span>
-              </div>
+              </>
             )}
           </>
         )}
