@@ -172,6 +172,21 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         for m in open_msgs_result.scalars().all()
     ]
 
+    # Fetch recent resolved messages for context continuity
+    resolved_msgs_result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.status == "resolved",
+        ).order_by(ProjectMessage.resolved_at.desc()).limit(10)
+    )
+    recent_resolved = [
+        {"id": str(m.id), "type": m.message_type, "content": m.content,
+         "from": m.from_type, "resolution": m.resolution,
+         "created_at": m.created_at.isoformat() if m.created_at else None,
+         "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None}
+        for m in resolved_msgs_result.scalars().all()
+    ]
+
     review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
                    _runtime_config.get("task_type_models", {}).get("research") or None
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
@@ -187,6 +202,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "outcome_evaluation": _build_outcome_evaluation(project),
         "project_name": project.name,
         "open_messages": open_msgs,
+        "recent_resolved_messages": recent_resolved,
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),

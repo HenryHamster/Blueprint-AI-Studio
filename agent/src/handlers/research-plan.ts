@@ -524,6 +524,17 @@ ${hotspotsSection}
         }).join('\n')
       : '';
 
+    // Recent resolved messages for context continuity
+    const recentResolved = Array.isArray(payload.recent_resolved_messages)
+      ? payload.recent_resolved_messages as Array<Record<string, unknown>>
+      : [];
+    const resolvedSection = recentResolved.length > 0
+      ? '\n## Recent Conversation History\nPreviously resolved messages (for context — no action needed):\n' +
+        recentResolved.map(m =>
+          `- [${strVal(m.type)}] (from: ${strVal(m.from)}, ${strVal(m.resolved_at)}) ${strVal(m.content).slice(0, 200)}${m.resolution ? `\n  → Resolved: ${strVal(m.resolution).slice(0, 200)}` : ''}`
+        ).join('\n') + '\n'
+      : '';
+
     const dirSummaryText = directionsSummary.length > 0
       ? directionsSummary.map((d, i) => {
           const parts = [`${d.total_cycles || 0} cycles`];
@@ -691,7 +702,7 @@ ${dirSummaryText}
 
 ## Direction Health
 ${dirHealthSummary}
-${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
+${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}${resolvedSection}
 # Your task
 
 You are a product advisor. Think about where this project should go.

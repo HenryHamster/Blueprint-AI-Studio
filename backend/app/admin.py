@@ -289,22 +289,26 @@ async def bulk_archive_tasks(
 ):
     user_project_ids = _user_project_ids(current_user["user_id"])
     if request.task_ids is not None:
-        archived = []
+        valid_uuids = []
         for raw_id in request.task_ids:
             try:
-                task = await session.get(Task, uuid.UUID(raw_id))
+                valid_uuids.append(uuid.UUID(raw_id))
             except (ValueError, AttributeError):
                 continue
-            if task and task.status in TERMINAL_STATUSES and not task.archived:
-                # Verify task belongs to user's project (via membership)
-                member = (await session.execute(
-                    select(ProjectMember).where(ProjectMember.project_id == task.project_id, ProjectMember.user_id == current_user["user_id"])
-                )).scalar_one_or_none()
-                if not member:
-                    continue
+        if valid_uuids:
+            query = select(Task).where(
+                Task.id.in_(valid_uuids),
+                Task.status.in_(TERMINAL_STATUSES),
+                Task.archived.is_(False),
+                Task.project_id.in_(user_project_ids),
+            )
+            result = await session.execute(query)
+            archived = result.scalars().all()
+            for task in archived:
                 task.archived = True
                 session.add(task)
-                archived.append(task)
+        else:
+            archived = []
     elif request.filter in ('completed', 'terminal'):
         statuses = [TaskStatus.COMPLETED] if request.filter == 'completed' else TERMINAL_STATUSES
         query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses), Task.project_id.in_(user_project_ids))
@@ -336,17 +340,30 @@ async def bulk_action_tasks(
 
     results = []
 
+    # Pre-fetch all tasks in a single query (with membership/role check)
+    valid_map: dict[str, uuid.UUID] = {}  # raw_id -> parsed UUID
     for raw_id in body.task_ids:
         try:
-            task_uuid = uuid.UUID(raw_id)
+            valid_map[raw_id] = uuid.UUID(raw_id)
         except (ValueError, AttributeError):
             results.append({"task_id": raw_id, "status": "error", "error": "Invalid task ID"})
-            continue
+    if valid_map:
+        member_project_ids = select(ProjectMember.project_id).where(
+            ProjectMember.user_id == current_user["user_id"],
+            ProjectMember.role.in_(["member", "owner"]),
+        )
+        fetched = {task.id: task for task in (await session.execute(
+            select(Task).where(Task.id.in_(valid_map.values()), Task.project_id.in_(member_project_ids))
+        )).scalars().all()}
+    else:
+        fetched = {}
 
-        try:
-            task = await _get_user_task_with_role(task_uuid, current_user["user_id"], session, "member")
-        except HTTPException as e:
-            results.append({"task_id": raw_id, "status": "error", "error": e.detail})
+    for raw_id in body.task_ids:
+        if raw_id not in valid_map:
+            continue  # already reported as invalid
+        task = fetched.get(valid_map[raw_id])
+        if not task:
+            results.append({"task_id": raw_id, "status": "error", "error": "Task not found"})
             continue
 
         try:
