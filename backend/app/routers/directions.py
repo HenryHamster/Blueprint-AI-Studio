@@ -505,6 +505,8 @@ async def trigger_strategic_cycle(
             }
             if d.get("completion_criteria"):
                 stat["completion_criteria"] = d["completion_criteria"]
+            if d.get("category"):
+                stat["category"] = d["category"]
             direction_stats.append(stat)
         open_msgs_result = await session.execute(
             select(ProjectMessage).where(
