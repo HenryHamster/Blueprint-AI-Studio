@@ -106,6 +106,14 @@ const FAILURE_CLASS_COLORS: Record<string, string> = {
   EXTERNAL_API: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
 };
 
+const FAILURE_CLASS_STROKE: Record<string, string> = {
+  CODE_ERROR: '#f87171',
+  PROVISION_FAILURE: '#fb923c',
+  AGENT_TIMEOUT: '#fbbf24',
+  RATE_LIMIT: '#facc15',
+  EXTERNAL_API: '#c084fc',
+};
+
 const TASK_TYPE_COLORS: Record<string, string> = {
   create: 'bg-emerald-500/20 text-emerald-400',
   fix: 'bg-red-500/20 text-red-400',
@@ -133,11 +141,13 @@ function priorityBadge(p: string) {
 
 // ---------- failure class pill ----------
 
-function FailureClassPill({ group }: { group: FailureGroup }) {
+function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData?: { v: number }[] }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const stroke = FAILURE_CLASS_STROKE[group.failure_class] ?? '#a3a3a3';
   const topTasks = group.tasks.slice(0, 3);
+  const hasSpark = sparkData && sparkData.length >= 3;
 
   useEffect(() => {
     if (!open) return;
@@ -151,12 +161,27 @@ function FailureClassPill({ group }: { group: FailureGroup }) {
   return (
     <div ref={ref} className="relative">
       <button
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
+        className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
         onClick={() => setOpen(v => !v)}
         title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
       >
         {group.label}
         <span className="font-bold">{group.count}</span>
+        {hasSpark && (
+          <span className="w-16 h-3 inline-block">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={sparkData}>
+                <defs>
+                  <linearGradient id={`fsp-${group.failure_class}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={stroke} stopOpacity={0.4} />
+                    <stop offset="100%" stopColor={stroke} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <Area type="monotone" dataKey="v" stroke={stroke} fill={`url(#fsp-${group.failure_class})`} strokeWidth={1} dot={false} isAnimationActive={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </span>
+        )}
       </button>
       {open && topTasks.length > 0 && (
         <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
@@ -303,9 +328,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
           {!loading && digest?.failure_groups && digest.failure_groups.length > 0 && (
             <section>
               <div className="flex flex-wrap gap-1.5">
-                {digest.failure_groups.map(g => (
-                  <FailureClassPill key={g.failure_class} group={g} />
-                ))}
+                {digest.failure_groups.map(g => {
+                  const classSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 }));
+                  return <FailureClassPill key={g.failure_class} group={g} sparkData={classSpark} />;
+                })}
               </div>
             </section>
           )}
