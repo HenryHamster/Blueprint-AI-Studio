@@ -5,12 +5,12 @@ import {
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop,
 } from '../index.js';
-import type { BuildConfig } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
 } from '../prompt.js';
+import { resolveBuildConfig } from '../build-config.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 export interface StandardHandlerOpts {
@@ -48,7 +48,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     includeTaskTypeHints = true,
   } = opts;
 
-  const buildConfig = (task.build_config || {}) as BuildConfig;
+  const buildConfig = resolveBuildConfig(task);
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
   const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
@@ -191,7 +191,7 @@ export async function handleCreate(
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-  const createBuildConfig = (task.build_config || {}) as BuildConfig;
+  const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
 
   await runStandardHandler({

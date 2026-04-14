@@ -38,6 +38,10 @@ vi.mock('../prompt.js', () => ({
   formatPlaybook: vi.fn().mockReturnValue(''),
 }));
 
+vi.mock('../build-config.js', () => ({
+  resolveBuildConfig: vi.fn().mockReturnValue(undefined),
+}));
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),

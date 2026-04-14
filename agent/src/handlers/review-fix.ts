@@ -13,6 +13,31 @@ import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
+import type { BuildConfig } from '../index.js';
+import { resolveBuildConfig } from '../build-config.js';
+
+// ── Build instruction generator for review prompts ───────────────────────────
+function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
+  if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
+    return `**Build & Type Safety (MUST run these — do not skip):**
+- For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
+- For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
+- For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
+- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.`;
+  }
+  const checks = buildConfig.directories
+    .filter(d => d.build_cmd || d.lint_cmd)
+    .map(d => {
+      const cmd = d.build_cmd || d.lint_cmd;
+      return `- For changes in \`${d.path}/\`: run \`${cmd}\` — report any errors`;
+    });
+  if (checks.length === 0) {
+    return '**Build & Type Safety:** No build commands configured — review code manually for type correctness.';
+  }
+  return `**Build & Type Safety (MUST run these — do not skip):**
+${checks.join('\n')}
+- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.`;
+}
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
 export async function handleReview(
@@ -44,6 +69,7 @@ export async function handleReview(
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
+  const reviewBuildConfig = resolveBuildConfig(task);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';
@@ -126,11 +152,7 @@ ${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Co
 - Are there tests for the new/changed behavior?
 - Do existing tests still pass given these changes?
 
-**Build & Type Safety (MUST run these — do not skip):**
-- For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
-- For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
-- For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
-- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.
+${buildTypeCheckInstructions(reviewBuildConfig)}
 
 After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
 
@@ -210,9 +232,10 @@ export async function handleFix(
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
+  const fixBuildConfig = resolveBuildConfig(task);
 
-  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
-  git(['config', 'user.name', 'Blueprint Agent']);
+  git(['config', 'user.email', fixBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', fixBuildConfig?.git_user_name || 'Blueprint Agent']);
 
   // Always rebase onto target branch to resolve merge conflicts
   statusRef.value = `Rebasing onto ${baseBranch}...`;
@@ -395,7 +418,7 @@ export async function handleFix(
       ? git(['diff', '--name-only', `${fixBaseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
-    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort);
+    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
 
     const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort, buildConfig);
 
@@ -466,7 +489,7 @@ export async function handleFix(
       ? postRebaseDiff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
       : git(['diff', '--name-only', `origin/${baseBranch}..HEAD`]).split('\n').filter(Boolean);
     try {
-      runProjectLintChecks(changedPaths, ws);
+      runProjectLintChecks(changedPaths, ws, fixBuildConfig);
     } catch (postRebaseLintErr: unknown) {
       const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
       sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);

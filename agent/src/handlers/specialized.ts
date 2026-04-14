@@ -11,6 +11,7 @@ import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
+import { resolveBuildConfig } from '../build-config.js';
 
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
 export async function handleSecurityAudit(
@@ -80,8 +81,8 @@ Rules:
 - IMPORTANT: Write your findings JSON array to /tmp/security_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
 
+  const secBuildConfig = resolveBuildConfig(task);
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
-  const secBuildConfig = (task.build_config ?? {}) as BuildConfig;
   const secTypeHints = getTaskTypeHints(secBuildConfig);
   const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
   statusRef.value = 'Running security audit...';
@@ -131,9 +132,10 @@ export async function handleMigrate(
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('migrate');
+  const migrateBuildConfig = resolveBuildConfig(task);
 
-  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
-  git(['config', 'user.name', 'Blueprint Agent']);
+  git(['config', 'user.email', migrateBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/migrate-${shortId}`;
@@ -153,8 +155,7 @@ export async function handleMigrate(
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
 
-  const migrateBuildConfig = (task.build_config ?? {}) as BuildConfig;
-  const migratePythonDirs = (migrateBuildConfig.directories ?? []).filter(d => d.type === 'python');
+  const migratePythonDirs = (migrateBuildConfig?.directories ?? []).filter(d => d.type === 'python');
   const migratePyDir = migratePythonDirs.length > 0 ? migratePythonDirs[0].path.replace(/\/$/, '') : 'backend';
   const alembicVersionsPath = `${migratePyDir}/alembic/versions/`;
   const migrateModelsPath = `${migratePyDir}/app/models/`;
@@ -513,8 +514,8 @@ export async function handlePerf(
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('perf');
 
-  const perfBuildConfig = (task.build_config ?? {}) as BuildConfig;
-  const perfDirs = perfBuildConfig.directories ?? [];
+  const perfBuildConfig = resolveBuildConfig(task);
+  const perfDirs = perfBuildConfig?.directories ?? [];
   const perfPythonDirs = perfDirs.filter(d => d.type === 'python');
   const perfNodeDirs = perfDirs.filter(d => d.type === 'node');
   const perfPyDir = perfPythonDirs.length > 0 ? perfPythonDirs[0].path.replace(/\/$/, '') : 'backend';

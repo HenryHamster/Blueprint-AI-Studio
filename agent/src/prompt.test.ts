@@ -41,6 +41,9 @@ import {
   buildContextPrefix,
   formatProjectContext,
   configureAgentPermissions,
+  discoverRelatedTests,
+  getTaskTypeHints,
+  TASK_TYPE_HINTS,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -286,5 +289,87 @@ describe('configureAgentPermissions', () => {
 
   it('returns [] for an unknown task type', () => {
     expect(configureAgentPermissions('unknown_type')).toEqual([]);
+  });
+});
+
+// ── getTaskTypeHints ──────────────────────────────────────────────────────────
+describe('getTaskTypeHints', () => {
+  it('returns static hint from TASK_TYPE_HINTS when buildConfig is undefined', () => {
+    const result = getTaskTypeHints(undefined)['create'];
+    expect(result).toBe(TASK_TYPE_HINTS['create']);
+    expect(result).toContain('Run the relevant lint');
+  });
+
+  it('returns undefined for unknown task type when buildConfig is undefined', () => {
+    const result = getTaskTypeHints(undefined)['unknown_type'];
+    expect(result).toBeUndefined();
+  });
+
+  it('returns static hint when buildConfig has empty directories array', () => {
+    const result = getTaskTypeHints({ directories: [] })['create'];
+    expect(result).toBe(TASK_TYPE_HINTS['create']);
+  });
+
+  it('generates dynamic hint referencing test commands when buildConfig has directories', () => {
+    const result = getTaskTypeHints({
+      directories: [
+        { path: 'web', type: 'node', lint_cmd: 'npm run lint', build_cmd: 'npm run build', test_cmd: 'npm test' },
+      ],
+    })['create'];
+    expect(result).toContain('npm test');
+  });
+
+  it('includes only present commands in dynamic hint (skips missing ones)', () => {
+    const result = getTaskTypeHints({
+      directories: [
+        { path: 'api', type: 'python', test_cmd: 'pytest' },
+      ],
+    })['create'];
+    expect(result).toContain('pytest');
+    // No npm commands configured for this python-only directory
+    expect(result).not.toContain('npm run lint');
+  });
+});
+
+// ── discoverRelatedTests ──────────────────────────────────────────────────────
+describe('discoverRelatedTests', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns empty string when relatedFiles is empty', () => {
+    const result = discoverRelatedTests(null, []);
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when relatedFiles is empty with buildConfig', () => {
+    const result = discoverRelatedTests(null, [], {
+      directories: [{ path: 'web', type: 'node' }],
+    });
+    expect(result).toBe('');
+  });
+
+  it('falls back to hardcoded discovery when buildConfig is undefined', () => {
+    // With no matching test files (fs mocked to not find them), returns empty string
+    const result = discoverRelatedTests(null, ['backend/app/main.py'], undefined);
+    // The function tries to find test files via fs; since existsSync returns false, it returns ''
+    expect(typeof result).toBe('string');
+  });
+
+  it('uses buildConfig directory config to discover tests for a matching directory', () => {
+    // With buildConfig pointing to a directory, the function looks for tests
+    // Since existsSync is mocked to false, no test files are found but no error thrown
+    const result = discoverRelatedTests(null, ['myapp/src/utils.ts'], {
+      directories: [{ path: 'myapp', type: 'node' }],
+    });
+    expect(typeof result).toBe('string');
+  });
+
+  it('skips files not matching any buildConfig directory', () => {
+    const result = discoverRelatedTests(null, ['other/file.ts'], {
+      directories: [{ path: 'myapp', type: 'node' }],
+    });
+    // No directory matches 'other/' so no test entries are added
+    expect(result).toBe('');
   });
 });

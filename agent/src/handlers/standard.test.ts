@@ -38,6 +38,10 @@ vi.mock('../prompt.js', () => ({
   formatPlaybook: vi.fn().mockReturnValue(''),
 }));
 
+vi.mock('../build-config.js', () => ({
+  resolveBuildConfig: vi.fn().mockReturnValue(undefined),
+}));
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -209,7 +213,7 @@ describe('handleCreate configuration', () => {
     const task = { title: 'Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
-      OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), expect.any(Object),
+      OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), undefined,
     );
   });
 
@@ -230,7 +234,7 @@ describe('handleRefactor configuration', () => {
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
-      OWNER, REPO, GH_TOKEN, 'main', 'refactor', TASK_ID, WS, expect.any(Object), expect.any(Object),
+      OWNER, REPO, GH_TOKEN, 'main', 'refactor', TASK_ID, WS, expect.any(Object), undefined,
     );
   });
 
@@ -250,7 +254,7 @@ describe('handleDocs configuration', () => {
     const task = { title: 'Docs task', description: '' };
     await handleDocs(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
-      OWNER, REPO, GH_TOKEN, 'main', 'docs', TASK_ID, WS, expect.any(Object), expect.any(Object),
+      OWNER, REPO, GH_TOKEN, 'main', 'docs', TASK_ID, WS, expect.any(Object), undefined,
     );
   });
 
@@ -270,7 +274,7 @@ describe('handleQA configuration', () => {
     const task = { title: 'QA task', description: '' };
     await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
-      OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), expect.any(Object),
+      OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), undefined,
     );
   });
 
@@ -290,7 +294,7 @@ describe('handleDeps configuration', () => {
     const task = { title: 'Deps task', description: '' };
     await handleDeps(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
-      OWNER, REPO, GH_TOKEN, 'main', 'deps', TASK_ID, WS, expect.any(Object), expect.any(Object),
+      OWNER, REPO, GH_TOKEN, 'main', 'deps', TASK_ID, WS, expect.any(Object), undefined,
     );
   });
 

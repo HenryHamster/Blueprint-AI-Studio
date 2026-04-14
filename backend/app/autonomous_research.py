@@ -496,6 +496,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         else:
             direction_text = (chosen_direction.get("text") or "general improvement")[:200]
 
+        if project.build_config:
+            research_payload["build_config"] = project.build_config
         research_payload = validate_internal_payload(research_payload, "autonomous_research:research")
         new_task = Task(
             project_id=project.id,

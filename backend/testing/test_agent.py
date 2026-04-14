@@ -229,6 +229,70 @@ async def test_agent_status_complete_with_artifacts_creates_artifact_record(clie
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_session):
+    """
+    Tests that the claim response includes project_metadata with build_config.
+    Agents need this to adapt lint/build/test behavior to different project structures.
+    """
+    project = Project(
+        name="Build Config Test",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myapp",
+        build_config={"directories": [{"path": "frontend", "type": "node"}], "test_command": "pytest"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{"type": "create", "prompt": "do something"}], vm_instance_id="agent-vm-meta-1")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-meta-1")
+    headers = {"x-agent-token": token}
+    resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "project_metadata" in data
+    pm = data["project_metadata"]
+    assert pm["project_id"] == str(project.id)
+    assert pm["project_name"] == "Build Config Test"
+    assert pm["github_owner"] == "acme"
+    assert pm["github_repo"] == "myapp"
+    assert pm["is_self_repo"] is False
+    assert pm["build_config"]["test_command"] == "pytest"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_project_metadata_empty_build_config(client: AsyncClient, db_session):
+    """
+    Tests that agents get an empty build_config dict (not an error) when the project
+    has no build_config configured.
+    """
+    project = Project(name="No Build Config Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{"type": "create", "prompt": "do something"}], vm_instance_id="agent-vm-meta-2")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-meta-2")
+    headers = {"x-agent-token": token}
+    resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "project_metadata" in data
+    assert data["project_metadata"]["build_config"] == {}
+
+
+@pytest.mark.asyncio
 async def test_agent_status_already_completed_returns_200_idempotent(client: AsyncClient, db_session, mocker):
     """
     Tests that completing a task that is already in a terminal state (COMPLETED)

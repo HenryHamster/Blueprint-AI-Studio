@@ -393,8 +393,11 @@ export function readHandlerOutput<T = unknown>(
   } catch (err: unknown) {
     sendLog(ws, `[WARNING] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
     // Try extracting a JSON array (research findings, plans)
+    // Only accept non-empty arrays; empty arrays (e.g. `[]` embedded inside an
+    // object like `"direction_operations": []`) would otherwise shadow the
+    // subsequent object extraction.
     const arrayResult = extractJsonArray<T>(raw);
-    if (arrayResult) return arrayResult;
+    if (arrayResult && Array.isArray(arrayResult) && (arrayResult as unknown[]).length > 0) return arrayResult;
     // Try extracting a JSON object (strategic output)
     const objResult = extractJsonObject<T>(raw, 'vision', 'direction_operations');
     if (objResult) return objResult;
@@ -1073,6 +1076,10 @@ async function main() {
   const taskType = strVal(payload.type, 'create');
   const model = payload.model ? strVal(payload.model) : undefined;
   const effort = payload.effort ? strVal(payload.effort) : undefined;
+  const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
+  const buildConfig = (projectMetadata?.build_config ?? {}) as Record<string, unknown>;
+  // Attach buildConfig to the task object so handlers can access it via task.build_config
+  (task as Record<string, unknown>).build_config = buildConfig;
   log(`Claimed task ${taskId} (type: ${taskType}): "${strVal(task.title)}"`);
 
   // Start heartbeat & log stream

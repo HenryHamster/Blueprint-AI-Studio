@@ -326,6 +326,7 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
     // Build a lookup from directory prefix → directory type using buildConfig if provided
     const dirConfigs = buildConfig?.directories ?? [];
 
+
     for (const relFile of relatedFiles) {
       // Convention-based discovery: use buildConfig.directories if available, else hardcoded Blueprint paths
       let discoveredByConvention = false;

@@ -59,8 +59,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
 
     # Detect Node/TypeScript project (root-level)
     if "package.json" in root_names:
-        lang = "typescript" if "tsconfig.json" in root_names else "typescript"
-        languages.append(lang)
+        languages.append("typescript")
         directories.append({
             "path": "./",
             "type": "node",
@@ -134,13 +133,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         language = languages[0]
     else:
         language = "mixed"
-
-    # Try to read CLAUDE.md for additional instructions
-    claude_md_resp = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/contents/CLAUDE.md",
-        headers, max_retries=1,
-    )
-    # We don't parse CLAUDE.md into build_config, but its presence is noted
 
     config: Dict[str, Any] = {
         "language": language,

@@ -297,6 +297,18 @@ async def claim_task(
         "context": safe_context
     }
 
+    # Add project metadata so agents can adapt to different project structures
+    project = await session.get(Project, task.project_id)
+    if project:
+        response["project_metadata"] = {
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "github_owner": project.github_owner,
+            "github_repo": project.github_repo,
+            "is_self_repo": project.is_self_repo,
+            "build_config": project.build_config or {},
+        }
+
     task_type = task.first_payload.get("type", "")
     if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project
