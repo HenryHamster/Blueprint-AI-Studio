@@ -22,18 +22,23 @@ export function calcMessageAge(m: Record<string, unknown>): string {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
-export function parseResearchContext(rawCtx: string): { established: string[]; failed: string[]; open: string[] } {
-  const sections: { established: string[]; failed: string[]; open: string[] } = { established: [], failed: [], open: [] };
-  let currentSection: keyof typeof sections | '' = '';
+export function parseResearchContext(rawCtx: string): { established: string[]; failed: string[]; open: string[]; eviction: string } {
+  const sections: { established: string[]; failed: string[]; open: string[]; eviction: string } = { established: [], failed: [], open: [], eviction: '' };
+  let currentSection: 'established' | 'failed' | 'open' | 'eviction' | '' = '';
+  const evictionLines: string[] = [];
   for (const line of rawCtx.split('\n')) {
     const trimmed = line.trim();
     if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
     if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
     if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
-    if (trimmed.startsWith('- ') && currentSection) {
+    if (trimmed.startsWith('## Eviction Summary')) { currentSection = 'eviction'; continue; }
+    if (currentSection === 'eviction' && trimmed.length > 0) {
+      evictionLines.push(trimmed);
+    } else if (trimmed.startsWith('- ') && currentSection && currentSection !== 'eviction') {
       sections[currentSection].push(trimmed);
     }
   }
+  sections.eviction = evictionLines.join(' ');
   return sections;
 }
 
@@ -342,6 +347,9 @@ ${hotspotsSection}
           if (sections.open.length > 0) {
             ctxParts.push(`  Open questions:\n${sections.open.join('\n')}`);
           }
+          if (sections.eviction) {
+            ctxParts.push(`  \u26a0 Context trimmed: ${sections.eviction}. Earlier findings were evicted — check git history if you suspect overlap with prior work.`);
+          }
           if (ctxParts.length > 0) {
             researchCtx = `\n  Context:\n${ctxParts.join('\n')}`;
           }
@@ -560,6 +568,9 @@ ${hotspotsSection}
             }
             if (sections.open.length > 0) {
               ctxParts.push(`   Open questions: ${sections.open.slice(0, 3).join('; ')}`);
+            }
+            if (sections.eviction) {
+              ctxParts.push(`   \u26a0 Context trimmed: ${sections.eviction}. Earlier findings were evicted — check git history if you suspect overlap with prior work.`);
             }
             if (ctxParts.length > 0) ctxSection = '\n' + ctxParts.join('\n');
           }

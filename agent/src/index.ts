@@ -684,7 +684,7 @@ export async function lintFixLoop(
  */
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
-  model?: string, effort?: string
+  model?: string, effort?: string, buildConfig?: BuildConfig
 ): Promise<{ passed: boolean; testFailuresDetected: boolean }> {
   const { existsSync, readFileSync } = fs;
 
@@ -697,69 +697,82 @@ export async function testFixLoop(
 
   const runners: TestRunner[] = [];
 
-  // --- Root-level detection (existing logic) ---
-  const pkgPath = `${WORKSPACE}/package.json`;
-  const pytestIniPath = `${WORKSPACE}/pytest.ini`;
-  const pyprojectPath = `${WORKSPACE}/pyproject.toml`;
-  const cargoPath = `${WORKSPACE}/Cargo.toml`;
-
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { scripts?: { test?: string } };
-      if (pkg.scripts?.test) {
-        runners.push({ cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' });
+  // --- BuildConfig-based detection (takes precedence over auto-detection) ---
+  if (buildConfig?.directories) {
+    for (const dir of buildConfig.directories) {
+      if (dir.test_cmd) {
+        const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+        const parts = dir.test_cmd.split(/\s+/);
+        runners.push({ cmd: parts[0], args: parts.slice(1), cwd, label: `${dir.test_cmd} (${dir.path || 'root'})` });
       }
-    } catch { /* malformed package.json — skip */ }
-  }
-
-  if (runners.length === 0) {
-    if (existsSync(pytestIniPath)) {
-      runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
-    } else if (existsSync(pyprojectPath)) {
-      try {
-        if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
-          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
-        }
-      } catch { /* unreadable — skip */ }
     }
   }
 
-  if (runners.length === 0 && existsSync(cargoPath)) {
-    runners.push({ cmd: 'cargo', args: ['test'], cwd: WORKSPACE, label: 'cargo test (root)' });
-  }
-
-  // --- Subdirectory detection (only if no root-level runner found) ---
+  // --- Auto-detection (only if buildConfig produced no runners) ---
   if (runners.length === 0) {
-    const backendPytestIni = `${WORKSPACE}/backend/pytest.ini`;
-    const backendPyproject = `${WORKSPACE}/backend/pyproject.toml`;
-    const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
-    const agentPkg = `${WORKSPACE}/agent/package.json`;
+    const pkgPath = `${WORKSPACE}/package.json`;
+    const pytestIniPath = `${WORKSPACE}/pytest.ini`;
+    const pyprojectPath = `${WORKSPACE}/pyproject.toml`;
+    const cargoPath = `${WORKSPACE}/Cargo.toml`;
 
-    if (existsSync(backendPytestIni)) {
-      if (existsSync(backendTestScript)) {
-        runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend)' });
-      } else {
-        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
-      }
-    } else if (existsSync(backendPyproject)) {
+    if (existsSync(pkgPath)) {
       try {
-        if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
-          if (existsSync(backendTestScript)) {
-            runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
-          } else {
-            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
-          }
-        }
-      } catch { /* unreadable — skip */ }
-    }
-
-    if (existsSync(agentPkg)) {
-      try {
-        const pkg = JSON.parse(readFileSync(agentPkg, 'utf-8')) as { scripts?: { test?: string } };
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { scripts?: { test?: string } };
         if (pkg.scripts?.test) {
-          runners.push({ cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)' });
+          runners.push({ cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' });
         }
       } catch { /* malformed package.json — skip */ }
+    }
+
+    if (runners.length === 0) {
+      if (existsSync(pytestIniPath)) {
+        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
+      } else if (existsSync(pyprojectPath)) {
+        try {
+          if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
+          }
+        } catch { /* unreadable — skip */ }
+      }
+    }
+
+    if (runners.length === 0 && existsSync(cargoPath)) {
+      runners.push({ cmd: 'cargo', args: ['test'], cwd: WORKSPACE, label: 'cargo test (root)' });
+    }
+
+    // --- Subdirectory detection (only if no root-level runner found) ---
+    if (runners.length === 0) {
+      const backendPytestIni = `${WORKSPACE}/backend/pytest.ini`;
+      const backendPyproject = `${WORKSPACE}/backend/pyproject.toml`;
+      const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
+      const agentPkg = `${WORKSPACE}/agent/package.json`;
+
+      if (existsSync(backendPytestIni)) {
+        if (existsSync(backendTestScript)) {
+          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend)' });
+        } else {
+          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
+        }
+      } else if (existsSync(backendPyproject)) {
+        try {
+          if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
+            if (existsSync(backendTestScript)) {
+              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
+            } else {
+              runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
+            }
+          }
+        } catch { /* unreadable — skip */ }
+      }
+
+      if (existsSync(agentPkg)) {
+        try {
+          const pkg = JSON.parse(readFileSync(agentPkg, 'utf-8')) as { scripts?: { test?: string } };
+          if (pkg.scripts?.test) {
+            runners.push({ cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)' });
+          }
+        } catch { /* malformed package.json — skip */ }
+      }
     }
   }
 

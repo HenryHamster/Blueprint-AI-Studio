@@ -108,6 +108,13 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         failure_class = classify_failure(child)
         original_status_message = child.latest_status_message
 
+        # Auto-generate playbook entry if this failure pattern is recurring
+        try:
+            from app.playbook_learning import _maybe_auto_playbook  # noqa: PLC0415
+            await _maybe_auto_playbook(child, failure_class, original_status_message, session)
+        except Exception:
+            logger.exception("[AUTO_PLAYBOOK] Failed to process playbook for task %s", child.id)
+
         # Cancel the failed child so rollup skips it
         child.status = TaskStatus.CANCELLED
         child.latest_status_message = "Parent requeued — replaced by retry"

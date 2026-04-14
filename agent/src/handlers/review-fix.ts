@@ -7,6 +7,7 @@ import {
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
   sendHeartbeatSync,
 } from '../index.js';
+import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
@@ -195,6 +196,7 @@ export async function handleFix(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
+  const buildConfig = (task.build_config || {}) as BuildConfig;
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -395,7 +397,7 @@ export async function handleFix(
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
     await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort);
 
-    const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort);
+    const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort, buildConfig);
 
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);

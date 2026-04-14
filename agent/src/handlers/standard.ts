@@ -112,7 +112,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testFailuresDetected = false;
     let testsPassed = true;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
     }

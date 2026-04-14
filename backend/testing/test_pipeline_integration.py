@@ -9,6 +9,7 @@ All external calls (VM provisioning/deletion, GitHub API, WebSocket
 broadcasts) are mocked so no real infrastructure is required.
 """
 import json
+import uuid
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -1544,4 +1545,181 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     )
     assert "manual intervention" in (task.latest_status_message or ""), (
         "Status message must indicate manual intervention is required"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auto-playbook generation tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auto_playbook_generation(db_session, mocker):
+    """_maybe_auto_playbook creates a playbook entry after 3 tasks share the
+    same failure signature.  First two calls store the signature but return
+    None; the third call returns a key and the entry appears in project.design_doc.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Auto Playbook Test", user_id="test-user-autopb")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    error_msg = "ModuleNotFoundError: No module named 'requests'"
+    failure_class = "CODE_ERROR"
+
+    from app.playbook_learning import _maybe_auto_playbook
+
+    # --- First and second failures: signature stored, threshold not yet reached ---
+    for i in range(2):
+        t = Task(
+            project_id=project.id,
+            title=f"failing task {i}",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.FAILED,
+            latest_status_message=error_msg,
+        )
+        db_session.add(t)
+        await db_session.commit()
+        await db_session.refresh(t)
+
+        key = await _maybe_auto_playbook(t, failure_class, error_msg, db_session)
+        await db_session.commit()
+
+        assert key is None, f"Expected None on occurrence {i + 1}, got '{key}'"
+        assert (t.context or {}).get("_failure_signature"), (
+            f"Signature should be stored on task after call {i + 1}"
+        )
+
+    # --- Third failure: should trigger playbook creation ---
+    t3 = Task(
+        project_id=project.id,
+        title="failing task 2",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.FAILED,
+        latest_status_message=error_msg,
+    )
+    db_session.add(t3)
+    await db_session.commit()
+    await db_session.refresh(t3)
+
+    key = await _maybe_auto_playbook(t3, failure_class, error_msg, db_session)
+    await db_session.commit()
+
+    assert key is not None, "Expected a playbook key to be returned on the 3rd failure"
+
+    # Verify the entry was persisted on the project
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    playbook_full_key = f"playbook/{key}"
+    assert playbook_full_key in doc, (
+        f"Expected '{playbook_full_key}' in design_doc; got keys: {list(doc.keys())}"
+    )
+    entry = doc[playbook_full_key]
+    assert entry.get("source") == "auto-generated"
+    assert "3" in entry.get("content", ""), (
+        "Content should mention 3 occurrences"
+    )
+    assert str(t3.id) in entry.get("content", ""), (
+        "Content should reference the triggering task ID"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_no_duplicate(db_session, mocker):
+    """_maybe_auto_playbook skips creation if an entry with the same key
+    already exists in the project's design_doc."""
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    from app.playbook_learning import _extract_failure_signature, _signature_to_key, _maybe_auto_playbook
+
+    error_msg = "ModuleNotFoundError: No module named 'requests'"
+    failure_class = "CODE_ERROR"
+
+    # Pre-compute the key the auto-playbook would generate
+    sig = _extract_failure_signature(failure_class, error_msg, "create", "medium")
+    existing_key = _signature_to_key(sig)
+
+    project = Project(name="No Duplicate Playbook Test", user_id="test-user-nodup")
+    project.design_doc = {
+        f"playbook/{existing_key}": {
+            "content": "pre-existing entry",
+            "source_task_id": None,
+            "updated_at": "2024-01-01T00:00:00",
+            "confirmed_count": 0,
+            "source": "manual",
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 3 tasks with matching signature so threshold is reached
+    for i in range(3):
+        t = Task(
+            project_id=project.id,
+            title=f"failing task {i}",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.FAILED,
+            latest_status_message=error_msg,
+        )
+        db_session.add(t)
+        await db_session.commit()
+        await db_session.refresh(t)
+
+        result = await _maybe_auto_playbook(t, failure_class, error_msg, db_session)
+        await db_session.commit()
+
+    # The pre-existing entry must not have been overwritten
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    assert doc.get(f"playbook/{existing_key}", {}).get("source") == "manual", (
+        "Auto-playbook must not overwrite a pre-existing entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_timeout_signature(db_session, mocker):
+    """AGENT_TIMEOUT failures use (task_type, scope) as the signature,
+    not the error message text."""
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    from app.playbook_learning import _maybe_auto_playbook, _extract_failure_signature
+
+    sig = _extract_failure_signature("AGENT_TIMEOUT", "execution timed out", "create", "large")
+    assert sig == "timeout-create-large"
+
+    project = Project(name="Timeout Signature Test", user_id="test-user-timeout")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        t = Task(
+            project_id=project.id,
+            title=f"timeout task {i}",
+            payloads=[{"type": "create", "prompt": "big job"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.FAILED,
+            latest_status_message="execution timed out",
+            context={"scope": "large"},
+        )
+        db_session.add(t)
+        await db_session.commit()
+        await db_session.refresh(t)
+
+        key = await _maybe_auto_playbook(t, "AGENT_TIMEOUT", "execution timed out", db_session)
+        await db_session.commit()
+
+    assert key is not None, "Expected playbook entry for repeated AGENT_TIMEOUT"
+
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    assert any(k.startswith("playbook/auto-timeout") for k in doc), (
+        "Expected a playbook key starting with 'auto-timeout'"
     )

@@ -47,7 +47,7 @@ describe('calcMessageAge', () => {
 
 describe('parseResearchContext', () => {
   it('returns empty arrays for empty string', () => {
-    expect(parseResearchContext('')).toEqual({ established: [], failed: [], open: [] });
+    expect(parseResearchContext('')).toEqual({ established: [], failed: [], open: [], eviction: '' });
   });
 
   it('parses only established items', () => {
@@ -81,7 +81,7 @@ describe('parseResearchContext', () => {
 
   it('ignores lines before any section header', () => {
     const ctx = 'This is a line without a section header\n- bullet without section';
-    expect(parseResearchContext(ctx)).toEqual({ established: [], failed: [], open: [] });
+    expect(parseResearchContext(ctx)).toEqual({ established: [], failed: [], open: [], eviction: '' });
   });
 
   it('ignores non-bullet lines within sections', () => {
@@ -90,6 +90,38 @@ not a bullet
 - real bullet`;
     const result = parseResearchContext(ctx);
     expect(result.established).toEqual(['- real bullet']);
+  });
+
+  it('returns empty eviction when no eviction summary section', () => {
+    const ctx = '## Established Findings\n- item 1\n';
+    const result = parseResearchContext(ctx);
+    expect(result.eviction).toBe('');
+  });
+
+  it('parses eviction summary into eviction field', () => {
+    const ctx = `## Established Findings
+- item 1
+## Eviction Summary
+5 established, 2 failed evicted`;
+    const result = parseResearchContext(ctx);
+    expect(result.established).toEqual(['- item 1']);
+    expect(result.eviction).toBe('5 established, 2 failed evicted');
+  });
+
+  it('parses eviction summary alongside all other sections', () => {
+    const ctx = `## Established Findings
+- finding 1
+## Failed Approaches
+- failed 1
+## Open Questions
+- question 1
+## Eviction Summary
+3 established evicted`;
+    const result = parseResearchContext(ctx);
+    expect(result.established).toEqual(['- finding 1']);
+    expect(result.failed).toEqual(['- failed 1']);
+    expect(result.open).toEqual(['- question 1']);
+    expect(result.eviction).toBe('3 established evicted');
   });
 });
 

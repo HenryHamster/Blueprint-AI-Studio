@@ -72,7 +72,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode } from '../index.js';
+import { setupWorkspace, runClaudeCode, testFixLoop, git } from '../index.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -298,5 +298,52 @@ describe('handleDeps configuration', () => {
     const task = { title: 'Deps task', description: '' };
     await handleDeps(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('dependency update agent');
+  });
+});
+
+// ── testFixLoop receives buildConfig from task.build_config ───────────────────
+describe('testFixLoop buildConfig propagation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Make git('status --porcelain') return a non-empty string so hasChanges=true
+    // and the test fix branch is entered. Call order: rev-parse (baseCommit),
+    // status --porcelain (diff), rev-parse (currentHead), diff --name-only,
+    // add -A, status --porcelain (staged), rev-parse (commitHash).
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+  });
+
+  it('passes build_config from task to testFixLoop when running test fix', async () => {
+    const buildConfig = {
+      directories: [
+        { path: 'backend', type: 'python', test_cmd: 'pytest -x -q' },
+      ],
+    };
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+      build_config: buildConfig,
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // testFixLoop should be called with the buildConfig from task.build_config
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, buildConfig,
+    );
+  });
+
+  it('passes empty buildConfig to testFixLoop when task has no build_config', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, {},
+    );
   });
 });
