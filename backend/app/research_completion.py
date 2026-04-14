@@ -814,6 +814,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                                 ),
                             )
                             session.add(alert)
+                            try:
+                                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                                _ac_reason = (
+                                    f"Saturated with {total_merged} PRs merged across {total_cycles} cycles"
+                                )
+                                await post_direction_milestone_message(
+                                    session, task.project_id, d.get("text", did),
+                                    "auto-completed", _ac_reason, task.id,
+                                )
+                            except Exception as _e:
+                                logger.warning(f"[NOTIFY] Failed to post auto-completed message: {_e}")
 
             project.directions = directions
             flag_modified(project, "directions")

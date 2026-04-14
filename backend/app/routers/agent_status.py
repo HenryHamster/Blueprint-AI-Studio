@@ -743,10 +743,16 @@ async def update_agent_status(
                 await broadcast_to_project(project_key, "autonomous_paused",
                                            {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
                 logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
+                _cb_alert_text = f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
                 await _maybe_create_circuit_breaker_alert(
                     task.project_id, session,
-                    f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
+                    _cb_alert_text,
                 )
+                try:
+                    from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
+                    await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
+                except Exception as _e:
+                    logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
             # Persist breaker state on any transition
             if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
                 await _orch._persist_circuit_breakers()

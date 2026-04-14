@@ -378,6 +378,14 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         session.add(project)
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired"
         session.add(task)
+        try:
+            from app.notification_dispatch import post_cycle_summary_message  # noqa: PLC0415
+            await post_cycle_summary_message(
+                session, project.id, vision_rev, dirs_created, dirs_retired,
+                ops_applied=0, msgs_created=0, task_id=task.id,
+            )
+        except Exception as _e:
+            logger.warning(f"[NOTIFY] Failed to post cycle summary message: {_e}")
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
             select(func.count()).select_from(ProjectMessage).where(
@@ -746,6 +754,16 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 msg.resolved_at = _utcnow()
                 session.add(msg)
                 msgs_resolved += 1
+                if msg.message_type == MessageType.FEEDBACK:
+                    try:
+                        from app.notification_dispatch import post_feedback_acknowledgment  # noqa: PLC0415
+                        await post_feedback_acknowledgment(
+                            session, project.id, msg.id,
+                            msg.resolution or "Addressed by strategic review",
+                            task.id,
+                        )
+                    except Exception as _e:
+                        logger.warning(f"[NOTIFY] Failed to post feedback acknowledgment: {_e}")
         except (ValueError, TypeError):
             pass
 
@@ -775,5 +793,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     )
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
+    try:
+        from app.notification_dispatch import post_cycle_summary_message  # noqa: PLC0415
+        await post_cycle_summary_message(
+            session, project.id, vision_rev, dirs_created, retires_applied,
+            ops_applied=ops_applied, msgs_created=msgs_created, task_id=task.id,
+        )
+    except Exception as _e:
+        logger.warning(f"[NOTIFY] Failed to post cycle summary message: {_e}")
     await session.commit()  # Single commit: vision + directions + messages + task status
     logger.info(f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved")

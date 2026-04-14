@@ -100,6 +100,13 @@ async def _process_direction_lifecycle(
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
+            try:
+                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                await post_direction_milestone_message(
+                    session, project.id, d.get("text", did), "auto-paused", pause_reason
+                )
+            except Exception as _e:
+                logger.warning(f"[NOTIFY] Failed to post auto-paused message: {_e}")
             MAX_AUTO_PAUSE_CYCLES = 3
             if d.get("auto_pause_count", 0) >= MAX_AUTO_PAUSE_CYCLES:
                 d["status"] = "completed"
@@ -125,6 +132,17 @@ async def _process_direction_lifecycle(
                     ),
                 )
                 session.add(alert)
+                try:
+                    from app.notification_dispatch import post_direction_milestone_message as _post_milestone  # noqa: PLC0415
+                    _retire_reason = (
+                        f"Auto-retired after {d['auto_pause_count']} consecutive auto-pause cycles. "
+                        f"Slot freed for strategic agent to create a replacement."
+                    )
+                    await _post_milestone(
+                        session, project.id, d.get("text", did), "auto-retired", _retire_reason
+                    )
+                except Exception as _e:
+                    logger.warning(f"[NOTIFY] Failed to post auto-retired message: {_e}")
                 directions_modified = True
             continue
         # Positive completion detection — mark for user review but don't pause

@@ -622,6 +622,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
                         await delete_branch(gh_token, owner, repo, staging_branch)
                         logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
+                        try:
+                            from app.notification_dispatch import post_pr_merged_message  # noqa: PLC0415
+                            _direction_id = (parent.context or {}).get("direction_id")
+                            _direction_text = "unknown direction"
+                            if _direction_id:
+                                _proj = await session.get(Project, parent.project_id)
+                                if _proj:
+                                    for _d in (_proj.directions or []):
+                                        if str(_d.get("id", "")) == str(_direction_id):
+                                            _direction_text = _d.get("text", "unknown direction")
+                                            break
+                            await post_pr_merged_message(
+                                session, parent.project_id, rollup_pr_number,
+                                _direction_text, completed_count, parent.id,
+                            )
+                        except Exception as _e:
+                            logger.warning(f"[NOTIFY] Failed to post PR merged message: {_e}")
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")
