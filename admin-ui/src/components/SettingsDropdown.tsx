@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { SettingsAdvancedSection } from './SettingsAdvancedSection';
-import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users } from 'lucide-react';
+import { SettingsNotificationsSection } from './SettingsNotificationsSection';
+import type { NotificationConfig } from './SettingsNotificationsSection';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
 import type { DeployState, MaxPlanAccount } from '../types/settings';
@@ -76,6 +78,9 @@ interface SettingsDropdownProps {
   onRepairState: () => Promise<void>;
   // Zone health
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
+  // Notification config
+  notificationConfig: NotificationConfig;
+  onUpdateNotificationConfig: (config: Partial<NotificationConfig>) => void;
   // Optional class name for the trigger button (e.g. to hide it on mobile)
   triggerClassName?: string;
   userRole?: 'admin' | 'user' | null;
@@ -106,7 +111,7 @@ const ALL_PROMPT_SUFFIX_TYPES = [
   'investigate', 'rollup', 'strategic_review', 'design_doc_update',
 ] as const;
 
-type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'advanced';
+type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -114,6 +119,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
   { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
   { id: 'accounts', label: 'Accounts', icon: User },
+  { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -192,6 +198,8 @@ export function SettingsDropdown({
   onMarkStable,
   onRepairState,
   zoneHealth,
+  notificationConfig,
+  onUpdateNotificationConfig,
   triggerClassName,
   userRole,
   userEmail,
@@ -467,6 +475,15 @@ export function SettingsDropdown({
               <span className="text-xs text-neutral-400">Play sound on task completion</span>
               <Toggle enabled={soundOnComplete} onChange={onUpdateSoundOnComplete} />
             </div>
+            <p className="text-[11px] text-neutral-600 pt-1">
+              These are browser-only notifications. For external webhooks (Slack, PagerDuty, etc.), see the{' '}
+              <button
+                onClick={() => setActiveSection('notifications')}
+                className="text-neutral-400 underline hover:text-neutral-200 transition-colors"
+              >
+                Notifications tab
+              </button>.
+            </p>
           </div>
         </div>
       </div>
@@ -867,6 +884,20 @@ export function SettingsDropdown({
     );
   }
 
+  function renderNotifications() {
+    return (
+      <SettingsNotificationsSection
+        webhookUrl={notificationConfig.webhook_url}
+        onUpdateWebhookUrl={url => onUpdateNotificationConfig({ webhook_url: url })}
+        enabledEvents={notificationConfig.enabled_events}
+        onUpdateEnabledEvents={events => onUpdateNotificationConfig({ enabled_events: events })}
+        throttleSeconds={notificationConfig.throttle_seconds}
+        onUpdateThrottleSeconds={secs => onUpdateNotificationConfig({ throttle_seconds: secs })}
+        isAdmin={isAdmin}
+      />
+    );
+  }
+
   function renderAdvanced() {
     return (
       <SettingsAdvancedSection
@@ -884,6 +915,7 @@ export function SettingsDropdown({
       case 'orchestrator': return renderOrchestrator();
       case 'deploy': return renderDeploy();
       case 'accounts': return renderAccounts();
+      case 'notifications': return renderNotifications();
       case 'advanced': return renderAdvanced();
     }
   }

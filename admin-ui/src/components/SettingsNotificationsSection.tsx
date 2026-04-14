@@ -1,0 +1,207 @@
+import { useState } from 'react';
+import { Bell, Send } from 'lucide-react';
+import { API_BASE_URL, authHeaders } from '../api';
+
+export interface NotificationConfig {
+  webhook_url: string;
+  enabled_events: string[];
+  throttle_seconds: number;
+}
+
+const EVENT_OPTIONS: { key: string; label: string; description: string; defaultOn: boolean }[] = [
+  { key: 'TASK_FAILED', label: 'Task Failed', description: 'When a task fails after retries exhausted', defaultOn: true },
+  { key: 'TASK_COMPLETED', label: 'Task Completed', description: 'When a task completes successfully', defaultOn: false },
+  { key: 'APPROVAL_NEEDED', label: 'Approval Needed', description: 'When a task requires manual approval', defaultOn: true },
+  { key: 'PR_MERGED', label: 'PR Merged', description: 'When a pull request is merged', defaultOn: false },
+  { key: 'DEPLOY_HEALTH_ALERT', label: 'Deploy Health Alert', description: 'Deployment state changes and health alerts', defaultOn: true },
+  { key: 'BUDGET_EXCEEDED', label: 'Budget Exceeded', description: 'When projected cost exceeds budget ceiling', defaultOn: false },
+];
+
+interface SettingsNotificationsSectionProps {
+  webhookUrl: string;
+  onUpdateWebhookUrl: (url: string) => void;
+  enabledEvents: string[];
+  onUpdateEnabledEvents: (events: string[]) => void;
+  throttleSeconds: number;
+  onUpdateThrottleSeconds: (seconds: number) => void;
+  isAdmin: boolean;
+}
+
+function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={() => onChange(!enabled)}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+    >
+      <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
+    </button>
+  );
+}
+
+export function SettingsNotificationsSection({
+  webhookUrl,
+  onUpdateWebhookUrl,
+  enabledEvents,
+  onUpdateEnabledEvents,
+  throttleSeconds,
+  onUpdateThrottleSeconds,
+  isAdmin,
+}: SettingsNotificationsSectionProps) {
+  const [urlDraft, setUrlDraft] = useState(webhookUrl);
+  const [testStatus, setTestStatus] = useState<'idle' | 'sending' | 'success' | 'error'>('idle');
+  const [testError, setTestError] = useState<string>('');
+
+  const urlIsValid = urlDraft === '' || urlDraft.startsWith('https://') || urlDraft.startsWith('http://');
+
+  const handleUrlBlur = () => {
+    if (urlIsValid) {
+      onUpdateWebhookUrl(urlDraft);
+    }
+  };
+
+  const toggleEvent = (key: string, enabled: boolean) => {
+    if (enabled) {
+      onUpdateEnabledEvents([...enabledEvents, key]);
+    } else {
+      onUpdateEnabledEvents(enabledEvents.filter(e => e !== key));
+    }
+  };
+
+  const handleSendTest = async () => {
+    setTestStatus('sending');
+    setTestError('');
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ test_notification: true }),
+      });
+      if (res.ok) {
+        setTestStatus('success');
+        setTimeout(() => setTestStatus('idle'), 3000);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setTestError(data?.error?.message ?? `HTTP ${res.status}`);
+        setTestStatus('error');
+        setTimeout(() => setTestStatus('idle'), 5000);
+      }
+    } catch (e) {
+      setTestError(e instanceof Error ? e.message : 'Request failed');
+      setTestStatus('error');
+      setTimeout(() => setTestStatus('idle'), 5000);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Section header */}
+      <div className="flex items-center gap-2">
+        <Bell className="w-4 h-4 text-neutral-400" />
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">External Notifications</h3>
+      </div>
+
+      {/* Webhook URL */}
+      <div>
+        <label className="block text-xs font-medium text-neutral-400 mb-1.5">Webhook URL</label>
+        {isAdmin ? (
+          <>
+            <input
+              type="url"
+              value={urlDraft}
+              onChange={e => setUrlDraft(e.target.value)}
+              onBlur={handleUrlBlur}
+              placeholder="https://hooks.slack.com/services/..."
+              className={`w-full bg-neutral-950 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 ${
+                !urlIsValid ? 'border-red-600 text-red-400' : 'border-neutral-700 text-neutral-100'
+              }`}
+            />
+            {!urlIsValid && (
+              <p className="text-[11px] text-red-400 mt-1">URL must start with http:// or https://</p>
+            )}
+            <p className="text-[11px] text-neutral-600 mt-1">POST requests with JSON payloads will be sent to this URL</p>
+          </>
+        ) : (
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-500">
+            {webhookUrl ? (
+              <span className="font-mono text-neutral-400">{webhookUrl.replace(/^(https?:\/\/[^/]+).*/, '$1/...')}</span>
+            ) : (
+              'Not configured'
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Event toggles */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Notification Events</h3>
+        <div className="space-y-3">
+          {EVENT_OPTIONS.map(opt => (
+            <div key={opt.key} className="flex items-center justify-between">
+              <div className="min-w-0 mr-4">
+                <div className="text-xs text-neutral-300">{opt.label}</div>
+                <div className="text-[11px] text-neutral-600">{opt.description}</div>
+              </div>
+              {isAdmin ? (
+                <Toggle
+                  enabled={enabledEvents.includes(opt.key)}
+                  onChange={v => toggleEvent(opt.key, v)}
+                />
+              ) : (
+                <span className={`text-xs ${enabledEvents.includes(opt.key) ? 'text-emerald-400' : 'text-neutral-600'}`}>
+                  {enabledEvents.includes(opt.key) ? 'On' : 'Off'}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Throttle setting */}
+      <div>
+        <label className="block text-xs font-medium text-neutral-400 mb-1.5">
+          Minimum seconds between notifications of the same type
+        </label>
+        {isAdmin ? (
+          <input
+            type="number"
+            min={0}
+            max={3600}
+            value={throttleSeconds}
+            onChange={e => {
+              const v = parseInt(e.target.value);
+              if (!isNaN(v) && v >= 0 && v <= 3600) onUpdateThrottleSeconds(v);
+            }}
+            className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          />
+        ) : (
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
+            {throttleSeconds}s
+          </div>
+        )}
+      </div>
+
+      {/* Send test notification */}
+      {isAdmin && (
+        <div>
+          <button
+            disabled={!webhookUrl || testStatus === 'sending'}
+            onClick={handleSendTest}
+            className="flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
+          >
+            <Send className="w-3.5 h-3.5" />
+            {testStatus === 'sending' ? 'Sending...' : 'Send Test Notification'}
+          </button>
+          {testStatus === 'success' && (
+            <p className="text-xs text-emerald-400 mt-2">Test notification sent successfully.</p>
+          )}
+          {testStatus === 'error' && (
+            <p className="text-xs text-red-400 mt-2">Failed: {testError}</p>
+          )}
+          {!webhookUrl && (
+            <p className="text-[11px] text-neutral-600 mt-1">Configure a webhook URL above to enable test notifications.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

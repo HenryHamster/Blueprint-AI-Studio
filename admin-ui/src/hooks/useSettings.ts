@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { MaxPlanAccount } from '../types/settings';
+import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 
 type AddToast = (message: string, type: 'success' | 'error' | 'info') => void;
@@ -20,6 +21,11 @@ export function useSettings(addToast: AddToast) {
   const [newAccountToken, setNewAccountToken] = useState('');
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
   const [requireApprovalGates, setRequireApprovalGates] = useState(true);
+  const [notificationConfig, setNotificationConfig] = useState<NotificationConfig>({
+    webhook_url: '',
+    enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
+    throttle_seconds: 30,
+  });
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -40,6 +46,13 @@ export function useSettings(addToast: AddToast) {
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
         setRequireApprovalGates(data.require_approval_gates ?? true);
+        if (data.notification_config) {
+          setNotificationConfig({
+            webhook_url: data.notification_config.webhook_url ?? '',
+            enabled_events: data.notification_config.enabled_events ?? ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
+            throttle_seconds: data.notification_config.throttle_seconds ?? 30,
+          });
+        }
         // Seed localStorage with server-authoritative task type defaults
         const serverModels = (data.task_type_models ?? {}) as Record<string, string>;
         const serverEfforts = (data.task_type_efforts ?? {}) as Record<string, string>;
@@ -293,6 +306,22 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateNotificationConfig = async (config: Partial<NotificationConfig>) => {
+    const prev = notificationConfig;
+    const next = { ...notificationConfig, ...config };
+    setNotificationConfig(next);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ notification_config: next }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setNotificationConfig(prev);
+      addToast('Failed to save notification settings', 'error');
+    }
+  };
+
   return {
     // State
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
@@ -301,6 +330,7 @@ export function useSettings(addToast: AddToast) {
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     githubAccount, setGithubAccount,
     requireApprovalGates,
+    notificationConfig,
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
@@ -311,5 +341,6 @@ export function useSettings(addToast: AddToast) {
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     updateHealthCheckUrls, updateRequireApprovalGates,
+    updateNotificationConfig,
   };
 }

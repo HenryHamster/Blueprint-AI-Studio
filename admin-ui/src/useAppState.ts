@@ -109,6 +109,7 @@ export function useAppState() {
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     githubAccount, setGithubAccount,
     requireApprovalGates,
+    notificationConfig,
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     connectGitHub,
@@ -117,7 +118,7 @@ export function useAppState() {
     updateMaxVMs, updateMaxRetries, updateRequireApprovalGates,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
-    updateHealthCheckUrls,
+    updateHealthCheckUrls, updateNotificationConfig,
   } = useSettings(addToast);
 
   const {
@@ -894,6 +895,7 @@ export function useAppState() {
     agentPromptSuffixes, updateAgentPromptSuffixes,
     handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     healthCheckUrls, updateHealthCheckUrls,
+    notificationConfig, updateNotificationConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
