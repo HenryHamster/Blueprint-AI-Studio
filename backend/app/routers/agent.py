@@ -110,7 +110,9 @@ async def verify_agent_token(
     _agent_active_cache[task_id] = now + _AGENT_CACHE_TTL
     # Evict expired entries to prevent unbounded growth
     if len(_agent_active_cache) > _AGENT_CACHE_MAX:
-        _agent_active_cache.clear()
+        stale = [k for k, v in _agent_active_cache.items() if v <= now]
+        for k in stale:
+            _agent_active_cache.pop(k, None)
     # Evict stale terminated entries (JWT expired, entry is redundant)
     if len(_terminated_task_ids) > _AGENT_CACHE_MAX:
         cutoff = now - _TERMINATED_TTL
