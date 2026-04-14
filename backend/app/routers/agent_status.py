@@ -7,6 +7,7 @@ _recorded_task_ids.
 All deferred imports from app.main are intentional — they avoid circular imports
 (agent_status is imported BY main) and preserve test-patchability.
 """
+import asyncio
 import json
 import logging
 import random
@@ -142,6 +143,19 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         f"[COST] Daily cost ceiling exceeded for project {task.project_id}: "
         f"${daily_total:.2f} > ${ceiling:.2f}"
     )
+    try:
+        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        asyncio.ensure_future(dispatch_external_notification(
+            task.project_id,
+            "BUDGET_EXCEEDED",
+            {
+                "task_id": str(task.id),
+                "daily_total_usd": round(daily_total, 2),
+                "ceiling_usd": round(ceiling, 2),
+            },
+        ))
+    except Exception as _ne:
+        logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
 
 
 @router.post("/api/agent/status")
@@ -798,6 +812,21 @@ async def update_agent_status(
             # Persist on state transition back to CLOSED
             if breaker["state"] == "CLOSED" and breaker["failure_count"] == 0:
                 await _orch._persist_circuit_breakers()
+
+        if payload.status == TaskStatus.COMPLETED:
+            try:
+                from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                asyncio.ensure_future(dispatch_external_notification(
+                    task.project_id,
+                    "TASK_COMPLETED",
+                    {
+                        "task_id": str(task.id),
+                        "task_title": task.title or str(task.id)[:8],
+                        "task_type": task.first_payload.get("type", ""),
+                    },
+                ))
+            except Exception as _ne:
+                logger.warning(f"[NOTIFY] TASK_COMPLETED dispatch setup failed: {_ne}")
 
         # ── EARLY COMMIT ──
         # Release the FOR UPDATE lock NOW, before downstream processing.

@@ -280,6 +280,20 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
     await _send_webhook_notification("AUTO_PAUSED", title, msg)
+    try:
+        import asyncio as _asyncio  # noqa: PLC0415
+        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        for project in projects:
+            _asyncio.ensure_future(dispatch_external_notification(
+                project.id,
+                "DEPLOY_HEALTH_ALERT",
+                {
+                    "failed_deps": failed_deps,
+                    "title": title,
+                },
+            ))
+    except Exception as _ne:
+        logger.warning(f"[NOTIFY] DEPLOY_HEALTH_ALERT dispatch setup failed: {_ne}")
 
 
 async def _create_auto_resume_alerts(session: AsyncSession) -> None:

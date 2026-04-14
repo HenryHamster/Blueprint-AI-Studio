@@ -130,6 +130,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         agg = d.get("history_aggregate", {})
         total_cycles = len(history) + (agg.get("total_cycles") or 0)
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
         recent_history = history[-5:]
         recent_findings = []
@@ -141,12 +142,18 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             for fd in (h.get("failed_task_details") or []):
                 if fd:
                     recent_failures.append(fd)
+        total_prs = total_merged + total_rejected
+        operator_rejection_rate = round(total_rejected / total_prs, 2) if total_prs > 0 else None
         stat_entry: dict = {
             "id": d.get("id"), "text": d.get("text"), "priority": d.get("priority"),
             "status": d.get("status"), "total_cycles": total_cycles,
             "prs_merged": total_merged, "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
+        if total_rejected > 0:
+            stat_entry["prs_rejected"] = total_rejected
+        if operator_rejection_rate is not None and total_rejected > 0:
+            stat_entry["operator_rejection_rate"] = operator_rejection_rate
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]

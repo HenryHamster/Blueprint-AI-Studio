@@ -42,6 +42,7 @@ def _build_outcome_evaluation(project) -> dict:
 
         cycles = len(window_history)
         merged = sum(h.get("prs_merged", 0) for h in window_history)
+        rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
 
         # Extract confirmed vs proposed findings from research_context
@@ -69,6 +70,10 @@ def _build_outcome_evaluation(project) -> dict:
             "merged": merged,
             "failed": failed,
         }
+        if rejected > 0:
+            outcome["prs_rejected"] = rejected
+            total_prs = merged + rejected
+            outcome["operator_rejection_rate"] = round(rejected / total_prs, 2) if total_prs > 0 else None
         if confirmed:
             outcome["confirmed"] = confirmed[:15]
         if proposed:
@@ -78,8 +83,12 @@ def _build_outcome_evaluation(project) -> dict:
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        lifetime_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         if lifetime_cycles > cycles:
-            outcome["lifetime"] = {"cycles": lifetime_cycles, "merged": lifetime_merged}
+            lifetime_entry: dict = {"cycles": lifetime_cycles, "merged": lifetime_merged}
+            if lifetime_rejected > 0:
+                lifetime_entry["rejected"] = lifetime_rejected
+            outcome["lifetime"] = lifetime_entry
 
         # Aggregate type distribution across window cycles
         type_dist: dict = {}

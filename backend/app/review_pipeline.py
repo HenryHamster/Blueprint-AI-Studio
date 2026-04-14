@@ -269,6 +269,22 @@ async def _spawn_pipeline_task(
                         )
                         session.add(stuck_orig)
                         await session.commit()
+                        try:
+                            import asyncio as _asyncio  # noqa: PLC0415
+                            from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                            _asyncio.ensure_future(dispatch_external_notification(
+                                stuck_orig.project_id,
+                                "APPROVAL_NEEDED",
+                                {
+                                    "task_id": str(stuck_orig.id),
+                                    "task_title": stuck_orig.title or str(stuck_orig.id)[:8],
+                                    "pr_number": pr_number,
+                                    "iteration": iteration,
+                                    "reason": "Review-fix cycle stuck — manual review required",
+                                },
+                            ))
+                        except Exception as _ne:
+                            logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
                 except Exception as e:
                     logger.warning(
                         f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",

@@ -528,6 +528,7 @@ async def _process_post_commit(
 
                 action_taken = False
                 if verdict == "APPROVE":
+                    head_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         # Validate PR head branch matches before merging

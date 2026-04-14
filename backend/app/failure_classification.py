@@ -66,6 +66,21 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in RATE_LIMIT_KEYWORDS):
         return "RATE_LIMIT"
 
+    # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors).
+    # Checked before merge-blocking EXTERNAL_API so a message like "merge blocked, fix not spawned
+    # (iteration cap)" is correctly classified as AGENT_TIMEOUT rather than EXTERNAL_API.
+    if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
+                                      "review-fix cap reached", "review-fix cycle limit",
+                                      "ci wait exceeded", "ci wait timed out", "stuck in ci-wait"]):
+        return "AGENT_TIMEOUT"
+
+    # Merge-blocking GitHub responses — branch protection, rule violations, not-mergeable states.
+    # These are GitHub operation blocks, not agent code defects.
+    if any(kw in combined for kw in ["merge blocked", "merge attempt", "not mergeable",
+                                      "repository rule", "rule violations",
+                                      "required status check", "branch protection"]):
+        return "EXTERNAL_API"
+
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
     if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "500 internal server error",
@@ -86,13 +101,7 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.
     # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
     # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
-    # "non-zero exit code" and "process exited" are code errors, not timeouts.
     # Only use specific forms: "execution timed out", "node process killed", "oom killer".
-    # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors)
-    if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
-                                      "review-fix cap reached", "review-fix cycle limit"]):
-        return "AGENT_TIMEOUT"
-
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
                                       "execution timed out", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",

@@ -1228,3 +1228,151 @@ class TestNotificationConfigSettings:
             _app.dependency_overrides.pop(_ra, None)
             # Restore runtime_config
             runtime_config.pop("notification_config", None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# dispatch_external_notification — webhook dispatch logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDispatchExternalNotification:
+    """Tests for dispatch_external_notification in notification_dispatch.py."""
+
+    @pytest.mark.asyncio
+    async def test_dispatches_when_event_enabled(self, mocker):
+        """POSTs to webhook_url when event_type is in enabled_events."""
+        from app import shared_state
+        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+
+        # Clear throttle state
+        _last_dispatch_time.clear()
+
+        shared_state.runtime_config["notification_config"] = {
+            "webhook_url": "https://hooks.example.com/test",
+            "enabled_events": ["TASK_FAILED"],
+            "throttle_seconds": 0,
+        }
+
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 200
+
+        mock_client = mocker.AsyncMock()
+        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
+        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+
+        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+
+        project_id = uuid.uuid4()
+        await dispatch_external_notification(
+            project_id, "TASK_FAILED", {"task_id": "abc", "task_title": "Test Task"}
+        )
+
+        mock_client.post.assert_awaited_once()
+        call_args = mock_client.post.call_args
+        body = call_args.kwargs.get("json") or call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["json"]
+        assert body["event_type"] == "TASK_FAILED"
+        assert body["project_id"] == str(project_id)
+        assert "timestamp" in body
+        assert body["payload"]["task_id"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_skips_when_event_not_enabled(self, mocker):
+        """Does NOT POST when event_type is not in enabled_events."""
+        from app import shared_state
+        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+
+        _last_dispatch_time.clear()
+
+        shared_state.runtime_config["notification_config"] = {
+            "webhook_url": "https://hooks.example.com/test",
+            "enabled_events": ["APPROVAL_NEEDED"],
+            "throttle_seconds": 0,
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
+        mock_client.post = mocker.AsyncMock()
+        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+
+        await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})
+
+        mock_client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_webhook_url(self, mocker):
+        """Does NOT POST when webhook_url is empty."""
+        from app import shared_state
+        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+
+        _last_dispatch_time.clear()
+
+        shared_state.runtime_config["notification_config"] = {
+            "webhook_url": "",
+            "enabled_events": ["TASK_FAILED"],
+            "throttle_seconds": 0,
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
+        mock_client.post = mocker.AsyncMock()
+        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+
+        await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})
+
+        mock_client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_respects_throttle_seconds(self, mocker):
+        """Second call within throttle window is silently dropped."""
+        import time
+        from app import shared_state
+        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+
+        _last_dispatch_time.clear()
+
+        shared_state.runtime_config["notification_config"] = {
+            "webhook_url": "https://hooks.example.com/test",
+            "enabled_events": ["TASK_FAILED"],
+            "throttle_seconds": 60,
+        }
+
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 200
+
+        mock_client = mocker.AsyncMock()
+        mock_client.__aenter__ = mocker.AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = mocker.AsyncMock(return_value=False)
+        mock_client.post = mocker.AsyncMock(return_value=mock_response)
+        mocker.patch("app.notification_dispatch.httpx.AsyncClient", return_value=mock_client)
+
+        project_id = uuid.uuid4()
+        await dispatch_external_notification(project_id, "TASK_FAILED", {"n": 1})
+        # Second call within throttle window
+        await dispatch_external_notification(project_id, "TASK_FAILED", {"n": 2})
+
+        assert mock_client.post.await_count == 1, "throttle should drop the second call"
+
+    @pytest.mark.asyncio
+    async def test_never_raises_on_http_error(self, mocker):
+        """dispatch_external_notification swallows all exceptions without propagating."""
+        from app import shared_state
+        from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
+
+        _last_dispatch_time.clear()
+
+        shared_state.runtime_config["notification_config"] = {
+            "webhook_url": "https://hooks.example.com/test",
+            "enabled_events": ["TASK_FAILED"],
+            "throttle_seconds": 0,
+        }
+
+        import httpx as _httpx
+        mocker.patch(
+            "app.notification_dispatch.httpx.AsyncClient",
+            side_effect=_httpx.RequestError("network down"),
+        )
+
+        # Must not raise
+        await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})

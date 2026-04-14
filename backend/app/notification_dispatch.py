@@ -3,15 +3,78 @@ notification_dispatch.py — helpers to create system ProjectMessages for signif
 
 Each function creates a ProjectMessage and adds it to the session but does NOT commit.
 Callers own the transaction.
+
+Also provides dispatch_external_notification() for fire-and-forget external webhook delivery.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MessageType, ProjectMessage, _utcnow
+
+logger = logging.getLogger(__name__)
+
+# Module-level throttle tracking: event_type -> last dispatch monotonic time (seconds)
+_last_dispatch_time: dict[str, float] = {}
+
+
+async def dispatch_external_notification(
+    project_id: Any,
+    event_type: str,
+    payload: dict,
+    session: Optional[AsyncSession] = None,  # kept for call-site uniformity; not used
+) -> None:
+    """Fire-and-forget external webhook dispatch.
+
+    Reads notification_config from runtime_config and POSTs a structured JSON
+    body to the configured webhook_url when event_type is in enabled_events.
+
+    Never raises — callers must not fail because notification dispatch failed.
+    Use asyncio.ensure_future() / asyncio.create_task() at call sites to make
+    this truly non-blocking.
+    """
+    try:
+        from app.shared_state import runtime_config  # noqa: PLC0415
+        nc = runtime_config.get("notification_config", {})
+        webhook_url = nc.get("webhook_url", "")
+        enabled_events = nc.get("enabled_events", [])
+        throttle_seconds = float(nc.get("throttle_seconds", 30))
+
+        if not webhook_url:
+            return
+        if event_type not in enabled_events:
+            return
+
+        # Per-event throttle: drop if last dispatch was too recent
+        now = time.monotonic()
+        last = _last_dispatch_time.get(event_type, 0.0)
+        if throttle_seconds > 0 and (now - last) < throttle_seconds:
+            return
+
+        _last_dispatch_time[event_type] = now
+
+        body = {
+            "event_type": event_type,
+            "project_id": str(project_id),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+        }
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(webhook_url, json=body)
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[NOTIFY] External webhook {event_type} returned {resp.status_code}"
+                )
+    except Exception as e:
+        logger.warning(f"[NOTIFY] External webhook dispatch failed for {event_type}: {e}")
 
 
 async def post_event_message(

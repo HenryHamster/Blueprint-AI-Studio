@@ -54,6 +54,10 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
             )
+            entry["prs_rejected"] = sum(
+                1 for ct in child_tasks_rows
+                if (ct.context or {}).get("pr_rejected")
+            )
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             for ct in child_tasks_rows:

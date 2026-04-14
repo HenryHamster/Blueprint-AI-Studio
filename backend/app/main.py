@@ -641,6 +641,22 @@ async def _maybe_create_failure_alert(
         "alert_created",
         {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
     )
+    try:
+        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        import asyncio as _asyncio
+        _asyncio.ensure_future(dispatch_external_notification(
+            task.project_id,
+            "TASK_FAILED",
+            {
+                "task_id": str(task.id),
+                "task_title": task.title or str(task.id)[:8],
+                "task_type": task_type,
+                "error_snippet": error_snippet or "",
+            },
+        ))
+    except Exception as _ne:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
