@@ -81,6 +81,15 @@ class GitHubPRReviewCommentRequest(BaseModel):
     line: int
     body: str = Field(..., min_length=1)
 
+class GitHubSubmitPRReviewRequest(BaseModel):
+    task_id: uuid.UUID
+    owner: str = Field(..., min_length=1)
+    repo: str = Field(..., min_length=1)
+    pr_number: int
+    event: str = Field(..., pattern="^(APPROVE|REQUEST_CHANGES|COMMENT)$")
+    body: str = Field(..., min_length=1)
+    comments: list[dict] = Field(default_factory=list)
+
 class GitHubCreateIssueRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)

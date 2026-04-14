@@ -20,7 +20,7 @@ from app.models import (
 from app.schemas import (
     UploadUrlRequest, HeartbeatRequest, SpawnTaskRequest,
     GitHubCommitStatusRequest, GitHubPRCommentRequest,
-    GitHubPRReviewCommentRequest, GitHubCreateIssueRequest,
+    GitHubPRReviewCommentRequest, GitHubSubmitPRReviewRequest, GitHubCreateIssueRequest,
     GitHubGetIssuesRequest, GitHubCreateBranchRequest, GitHubCreatePRRequest,
 )
 from app.payload_schemas import validate_task_payload
@@ -33,6 +33,7 @@ from app.github import (
     update_commit_status,
     create_pr_comment,
     create_pr_review_comment,
+    submit_pr_review,
     create_issue,
     get_issues,
     create_branch,
@@ -894,6 +895,33 @@ async def agent_github_pr_review_comment(
         path=req.path,
         line=req.line,
         body=req.body
+    )
+    return {"status": "success", "data": result}
+
+@router.post("/github/pr-review")
+@limiter.limit("30/minute")
+async def agent_github_submit_pr_review(
+    request: Request,
+    req: GitHubSubmitPRReviewRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token)
+):
+    """
+    Agent endpoint to submit a full PR review (APPROVE/REQUEST_CHANGES/COMMENT) via
+    the GitHub Pull Request Reviews API.
+    """
+    if str(req.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
+    result = await submit_pr_review(
+        token=gh_token,
+        owner=owner,
+        repo=repo,
+        pr_number=req.pr_number,
+        event=req.event,
+        body=req.body,
+        comments=req.comments,
     )
     return {"status": "success", "data": result}
 

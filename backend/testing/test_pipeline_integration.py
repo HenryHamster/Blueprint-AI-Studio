@@ -1460,3 +1460,88 @@ async def test_non_rollup_task_respects_global_cap(
         "Non-rollup task at small-scope global cap (10) must be blocked — "
         "rollup bypass should not apply"
     )
+
+
+# ---------------------------------------------------------------------------
+# CI completion: non-transient merge block escalation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
+    """
+    When merge_pull_request returns a rule-violation message, handle_ci_completion
+    must immediately set requires_approval=True and flag merge_rule_blocked instead
+    of entering the retry loop.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Rule Block Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="CI rule block test",
+        payloads=[{
+            "type": "review",
+            "pr_number": 99,
+            "branch": "blueprint/rule-block-test",
+            "base_branch": "main",
+        }],
+        context={
+            "review_loop": {
+                "pr_number": 99,
+                "branch": "blueprint/rule-block-test",
+                "base_branch": "main",
+                "iteration": 1,
+            },
+        },
+        vm_instance_id="agent-vm-rule-block-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Mock merge_pull_request to return a rule-violation failure
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Repository rule violations: Required approving review not satisfied"},
+    )
+    # Mock get_pull_request to indicate PR is still open (not already merged/closed)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+
+    ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="test-owner",
+        repo="test-repo",
+        session=db_session,
+        source="webhook",
+    )
+
+    # Flush so in-memory mutations are visible; assert directly (don't refresh from DB
+    # as the handler doesn't commit — per filter-test-session-refresh-pattern)
+    await db_session.flush()
+    assert task.requires_approval is True, (
+        "Rule-violation merge block must set requires_approval=True immediately"
+    )
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_rule_blocked") is True, (
+        "merge_rule_blocked flag must be set in review_loop context"
+    )
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "merge_failures must NOT be incremented for a rule-violation block"
+    )
+    assert "manual intervention" in (task.latest_status_message or ""), (
+        "Status message must indicate manual intervention is required"
+    )

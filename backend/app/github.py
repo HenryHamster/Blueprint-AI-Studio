@@ -466,6 +466,67 @@ async def create_pr_review_comment(
 
     return response.json()
 
+
+async def submit_pr_review(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    event: str,
+    body: str,
+    comments: list[dict]
+) -> dict | None:
+    """
+    Submits a PR review via the GitHub Pull Request Reviews API.
+
+    Fetches the HEAD commit SHA first, then POSTs the review.
+    If inline comments cause a 422, retries without them so a review is always posted.
+    Returns None on 404.
+    """
+    pr_data = await get_pull_request(token, owner, repo, pr_number)
+    sha = pr_data["head"]["sha"]
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    payload: dict = {
+        "commit_id": sha,
+        "event": event,
+        "body": body,
+        "comments": comments,
+    }
+
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        headers, json=payload
+    )
+
+    if response.status_code == 422:
+        logger.warning(
+            f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — retrying without inline comments: {response.text[:300]}"
+        )
+        payload["comments"] = []
+        response = await _github_request(
+            "POST", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            headers, json=payload
+        )
+
+    if response.status_code == 404:
+        logger.warning(f"[GITHUB] submit_pr_review 404 for PR #{pr_number} in {owner}/{repo}")
+        return None
+
+    if response.status_code not in (200, 201):
+        logger.error(f"[GITHUB] Failed to submit PR review #{pr_number}: {response.status_code} {response.text[:300]}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to submit PR review on GitHub: {response.text[:200]}"
+        )
+
+    return response.json()
+
 async def create_issue(
     token: str,
     owner: str,

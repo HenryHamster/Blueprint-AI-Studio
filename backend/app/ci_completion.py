@@ -98,18 +98,46 @@ async def handle_ci_completion(
                         task.latest_status_message = f"PR #{ci_pr_number} already merged by another task"
                         logger.info(f"[CI] PR #{ci_pr_number} was already merged — marking complete ({source})")
                     else:
-                        _merge_failures = ci_loop.get("merge_failures", 0) + 1
-                        ci_loop["merge_failures"] = _merge_failures
-                        ci_loop["ci_poll_interval"] = min(30 * _merge_failures, 120)
-                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
-                        task.context = {**(task.context or {}), "review_loop": ci_loop}
-                        task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
-                        logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
-                        if _merge_failures >= 10 and not ci_loop.get("merge_escalated"):
-                            ci_loop["merge_escalated"] = True
+                        # Detect non-transient merge blocks — escalate immediately instead of retrying
+                        _merge_msg_lower = merge_msg.lower()
+                        _is_rule_block = any(kw in _merge_msg_lower for kw in [
+                            "rule violation", "branch protection", "required review",
+                            "required status", "merge restrictions", "not allowed to merge",
+                            "at least", "approving review",
+                        ])
+                        if _is_rule_block:
+                            task.latest_status_message = (
+                                f"CI passed but merge blocked on PR #{ci_pr_number}: "
+                                f"{merge_msg[:200]} — requires manual intervention"
+                            )
+                            task.requires_approval = True
+                            ci_loop["merge_rule_blocked"] = True
                             task.context = {**(task.context or {}), "review_loop": ci_loop}
+                            session.add(task)
+                            if ci_orig_id:
+                                try:
+                                    orig = await session.get(Task, uuid.UUID(ci_orig_id))
+                                    if orig:
+                                        orig.requires_approval = True
+                                        session.add(orig)
+                                except Exception as e:
+                                    logger.warning(f"[CI] Failed to set requires_approval on {ci_orig_id}: {e}", exc_info=True)
                             await _maybe_create_failure_alert(task, session,
-                                f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
+                                f"PR #{ci_pr_number} merge blocked by repository rules — needs manual action")
+                            logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by repo rules — escalated ({source})")
+                        else:
+                            _merge_failures = ci_loop.get("merge_failures", 0) + 1
+                            ci_loop["merge_failures"] = _merge_failures
+                            ci_loop["ci_poll_interval"] = min(30 * _merge_failures, 120)
+                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                            task.context = {**(task.context or {}), "review_loop": ci_loop}
+                            task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
+                            logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
+                            if _merge_failures >= 10 and not ci_loop.get("merge_escalated"):
+                                ci_loop["merge_escalated"] = True
+                                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                                await _maybe_create_failure_alert(task, session,
+                                    f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
                 except Exception:
                     ci_loop["ci_poll_interval"] = 30
                     ci_loop["ci_last_polled"] = _utcnow().isoformat()

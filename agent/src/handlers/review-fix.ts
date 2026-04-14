@@ -137,7 +137,12 @@ If the changes look good and should be merged:
 {"verdict": "APPROVE", "feedback": "Brief summary of why it's approved"}
 
 If changes are needed before merging:
-{"verdict": "REQUEST_CHANGES", "feedback": "...", "issues": [{"severity": "critical|major|minor", "description": "..."}]}
+{"verdict": "REQUEST_CHANGES", "feedback": "...", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
+
+For each issue in the \`issues\` array:
+- \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)
+- \`line\`: line number in the file (optional — omit if not applicable)
+- Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
 
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 

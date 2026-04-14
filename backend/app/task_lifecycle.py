@@ -236,7 +236,7 @@ async def _process_post_commit(
     from app.security import scan_pr_for_injection  # noqa: PLC0415
     from app.github import (  # noqa: PLC0415
         create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs,
+        get_pr_files, get_check_runs, submit_pr_review,
     )
     from app.task_completion import (  # noqa: PLC0415
         _handle_plan_completion, _handle_design_doc_completion,
@@ -598,13 +598,42 @@ async def _process_post_commit(
                         except Exception as e:
                             logger.warning(f"[REVIEW PIPELINE] Failed to mark requires_approval on {original_task_id}: {e}", exc_info=True)
 
-                # Post the review to the PR as a comment
+                # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    review_comment = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
-                    await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
+                    event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
+                    inline_comments = []
+                    body_issues = []
+                    for issue in issues:
+                        if issue.get("file") and issue.get("line"):
+                            sev = issue.get("severity", "minor").upper()
+                            inline_comments.append({
+                                "path": issue["file"],
+                                "line": issue["line"],
+                                "body": f"[{sev}] {issue.get('description', '')}",
+                            })
+                        else:
+                            body_issues.append(issue)
+                    review_body = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
+                    if body_issues:
+                        issues_text = "\n".join(
+                            f"- [{i.get('severity', '?').upper()}] {i.get('description', '')}"
+                            for i in body_issues
+                        )
+                        review_body += f"\n\n**Issues:**\n{issues_text}"
+                    result = await submit_pr_review(
+                        gh_token, owner, repo, pr_number, event, review_body, inline_comments
+                    )
+                    if result is None:
+                        raise ValueError("PR not found")
                 except Exception as e:
-                    logger.warning(f"[REVIEW PIPELINE] Failed to post review comment: {e}", exc_info=True)
+                    logger.warning(f"[REVIEW PIPELINE] submit_pr_review failed, falling back: {e}")
+                    try:
+                        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                        review_comment = f"**Blueprint Code Review** ({verdict})\n\n{feedback[:3000]}"
+                        await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
+                    except Exception as e2:
+                        logger.warning(f"[REVIEW PIPELINE] Fallback comment also failed: {e2}", exc_info=True)
 
                 action_taken = False
                 head_sha = ""
