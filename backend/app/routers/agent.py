@@ -525,6 +525,63 @@ async def claim_task(
         if playbook_entries:
             response["playbook"] = playbook_entries
 
+    # Inject direction quality signal when acceptance rate is low (reuse project already loaded above)
+    direction_id = (task.context or {}).get("direction_id")
+    if direction_id and project_for_playbook:
+        direction = next(
+            (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
+            None,
+        )
+        if direction:
+            history = direction.get("research_history", [])
+            agg = direction.get("history_aggregate", {})
+            total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+            total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+            total_prs = total_merged + total_rejected
+            if total_prs >= 3:
+                acceptance_rate = total_merged / total_prs
+                if acceptance_rate < 0.6:
+                    merge_time_values = [
+                        h["avg_time_to_merge_hours"]
+                        for h in history
+                        if h.get("avg_time_to_merge_hours") is not None
+                    ]
+                    avg_ttm = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
+                    # Fetch last 3 tasks rejected by operator for this direction
+                    rejected_stmt = (
+                        select(Task)
+                        .where(
+                            Task.project_id == task.project_id,
+                            Task.context["direction_id"].as_string() == str(direction_id),
+                            Task.context["pr_rejected"].as_string() == "true",
+                        )
+                        .order_by(Task.created_at.desc())
+                        .limit(3)
+                    )
+                    rejected_rows = (await session.execute(rejected_stmt)).scalars().all()
+                    rejection_context = [
+                        {
+                            "title": rt.title,
+                            "reason": (
+                                (rt.context or {}).get("pr_rejection_note")
+                                or rt.latest_status_message
+                                or ""
+                            )[:200],
+                        }
+                        for rt in rejected_rows
+                    ]
+                    direction_quality = {
+                        "direction_id": direction_id,
+                        "acceptance_rate": round(acceptance_rate, 3),
+                        "prs_merged": total_merged,
+                        "prs_rejected": total_rejected,
+                        "avg_time_to_merge_hours": avg_ttm,
+                        "rejection_context": rejection_context,
+                    }
+                    if "project_context" not in response:
+                        response["project_context"] = {}
+                    response["project_context"]["direction_quality"] = direction_quality
+
     return response
 
 @router.post("/artifacts/upload-url")
