@@ -259,7 +259,7 @@ async def _process_post_commit(
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
         task = (await session.execute(
-            select(Task).where(Task.id == task_id)
+            select(Task).where(Task.id == task_id).with_for_update()
         )).scalars().first()
         if not task:
             return {"status": "accepted"}

@@ -189,11 +189,19 @@ async def onboard_project(
     except Exception as e:
         logger.error(f"[ONBOARD] Build config detection failed for {payload.github_owner}/{payload.github_repo}: {e}", exc_info=True)
 
-    # Merge override on top of detected config
+    # Merge override on top of detected config (validate shape)
     if payload.build_config_override:
         build_config.update(payload.build_config_override)
 
-    project.build_config = build_config
+    # Validate final build_config structure
+    from app.schemas import BuildConfig as BuildConfigSchema  # noqa: PLC0415
+    try:
+        validated = BuildConfigSchema(**build_config) if build_config else BuildConfigSchema()
+        project.build_config = validated.model_dump(exclude_none=True)
+    except Exception:
+        # Detection + override produced invalid shape — store raw but log warning
+        logger.warning(f"[ONBOARD] build_config failed schema validation, storing raw")
+        project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)
 

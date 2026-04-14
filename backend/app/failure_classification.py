@@ -14,6 +14,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'claude_code_failed': 'CODE_ERROR',
     'parse_failed': 'CODE_ERROR',
     'fatal': 'CODE_ERROR',
+    'rate_limited': 'RATE_LIMIT',
 }
 
 

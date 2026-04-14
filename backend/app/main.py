@@ -318,6 +318,11 @@ async def _init_deployment_state():
                     _runtime_config["require_approval_gates"] = bool(config_json["require_approval_gates"])
                 if "daily_cost_ceiling_usd" in config_json:
                     _runtime_config["daily_cost_ceiling_usd"] = float(config_json["daily_cost_ceiling_usd"])
+                for int_key in ("max_provision_retries", "max_rollup_retries",
+                                "architecture_review_frequency", "max_active_directions",
+                                "max_parallel_research_per_project"):
+                    if int_key in config_json:
+                        _runtime_config[int_key] = int(config_json[int_key])
                 logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)
@@ -1754,6 +1759,11 @@ async def strategic_operation(
         )
         session.add(new_msg)
         await session.commit()
+        # Broadcast so the UI can update immediately instead of waiting for poll
+        await broadcast_to_project(
+            str(project.id), "message_created",
+            {"message_id": str(new_msg.id), "type": msg_type.value, "from": "strategic"},
+        )
         return _resp({"status": "ok", "op": "create_message", "message_id": str(new_msg.id)})
 
     elif payload.op == "resolve_message":

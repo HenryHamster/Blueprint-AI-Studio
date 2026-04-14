@@ -148,6 +148,7 @@ async def handle_ci_completion(
         # CI failed — spawn fix task
         active_tasks = (await session.execute(
             select(Task).where(
+                Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
             )
         )).scalars().all()
@@ -179,7 +180,7 @@ async def handle_ci_completion(
             f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
             f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
             f"to confirm which checks are still failing on the latest head.\n\n"
-            f"CI errors captured at spawn time:\n{ci_errors}\n\n"
+            f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
             f"Focus: fix the build/lint/test errors — the code review is already approved, "
             f"don't re-architect unrelated code.\n\n"
             f"Before declaring done: ensure (a) `git rebase origin/{ci_base}` succeeds cleanly with no "

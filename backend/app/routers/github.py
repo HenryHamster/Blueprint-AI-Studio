@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 from collections import OrderedDict
 from datetime import timedelta
 from typing import Optional
@@ -230,7 +231,7 @@ async def github_oauth_callback(
         session.add(integration)
         await session.commit()
 
-        display_name = all_account_names[0]
+        display_name = urllib.parse.quote(all_account_names[0])
         return RedirectResponse(url=f"{admin_url}?github_connected={display_name}")
 
     except Exception as e:
@@ -238,6 +239,7 @@ async def github_oauth_callback(
         return RedirectResponse(url=f"{admin_url}?github_error=failed")
 
 @router.post("/webhook")
+@limiter.limit("120/minute")
 async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -263,6 +265,8 @@ async def github_webhook(
     # Dedup by GitHub delivery ID — prevents duplicate processing on webhook retries
     # Uses Redis for cross-instance dedup when available, else per-instance in-memory
     delivery_id = request.headers.get("x-github-delivery")
+    if not delivery_id:
+        raise HTTPException(status_code=400, detail="Missing X-GitHub-Delivery header")
     if delivery_id:
         from app.redis_client import get_redis as _get_redis
         _r = await _get_redis()
@@ -322,7 +326,8 @@ async def github_webhook(
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
-                        select(Artifact).where(
+                        select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+                            Task.project_id == project.id,
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
                         )
@@ -371,14 +376,16 @@ async def github_webhook(
                         Project.github_repo == repo,
                     )
                 )
-                if not project_check.scalars().first():
+                closed_project = project_check.scalars().first()
+                if not closed_project:
                     logger.info(f"[WEBHOOK] Ignoring PR close event for unregistered repo {repo_full}")
                     return {"status": "ignored"}
                 pr_number = data["pull_request"].get("number")
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
-                        select(Artifact).where(
+                        select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+                            Task.project_id == closed_project.id,
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
                         )
@@ -432,6 +439,13 @@ async def github_webhook(
             conclusion = check_run.get('conclusion')
             head_branch = (check_run.get('check_suite') or {}).get('head_branch')
             if conclusion == 'failure' and head_branch:
+                # Validate branch name from webhook before passing downstream
+                from app.payload_schemas import _validate_branch_name  # noqa: PLC0415
+                try:
+                    _validate_branch_name(head_branch)
+                except Exception:
+                    logger.warning(f"[WEBHOOK] Rejecting invalid head_branch: {head_branch!r}")
+                    return {'status': 'ignored_invalid_branch'}
                 # Read auto-remediation config from project
                 auto_remediation_config = (project.design_doc or {}).get('_auto_remediation', {})
                 enabled = auto_remediation_config.get('enabled', False)

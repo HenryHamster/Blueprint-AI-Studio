@@ -69,12 +69,18 @@ async def _update_direction_research_outcomes(
             ]
             entry["avg_time_to_merge_hours"] = round(sum(merge_durations) / len(merge_durations), 2) if merge_durations else None
             # Capture failed task details so research agents can see WHY tasks failed
+            INFRA_CATEGORIES = {"PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"}
             failed_details = []
+            infra_failures = 0
             for ct in child_tasks_rows:
                 if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                     reason = (ct.latest_status_message or "")[:120]
-                    failed_details.append({"title": ct.title or "", "reason": reason})
+                    category = (ct.context or {}).get("failure_category", "")
+                    failed_details.append({"title": ct.title or "", "reason": reason, "category": category})
+                    if category in INFRA_CATEGORIES:
+                        infra_failures += 1
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
+            entry["tasks_failed_infra"] = infra_failures
 
             # Classify child tasks as product vs structural
             PRODUCT_TYPES = {"create", "feature", "improvement"}

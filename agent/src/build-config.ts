@@ -30,6 +30,8 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     const dir = d as Record<string, unknown>;
     const path = typeof dir.path === 'string' ? dir.path : '';
     if (!path) continue;
+    // Reject path traversal: no .., no absolute paths, no null bytes
+    if (path.includes('..') || path.startsWith('/') || path.includes('\0')) continue;
     // Accept 'type' directly, or fall back to 'language' for backwards compat
     const rawType = dir.type ?? dir.language;
     const type = VALID_TYPES.has(rawType as string) ? (rawType as string) : 'python';

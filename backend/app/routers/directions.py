@@ -508,18 +508,22 @@ async def trigger_strategic_cycle(
             if d.get("category"):
                 stat["category"] = d["category"]
             direction_stats.append(stat)
-        open_msgs_result = await session.execute(
+        # Unified conversation thread — last 30 messages chronologically
+        thread_result = await session.execute(
             select(ProjectMessage).where(
                 ProjectMessage.project_id == project.id,
-                ProjectMessage.status == "open",
-            ).order_by(ProjectMessage.created_at.asc()).limit(50)
+            ).order_by(ProjectMessage.created_at.desc()).limit(30)
         )
-        open_msgs = [
+        all_thread_msgs = list(reversed(thread_result.scalars().all()))
+        conversation_thread = [
             {"id": str(m.id), "type": m.message_type, "content": m.content,
-             "context": m.context, "from": m.from_type,
-             "created_at": m.created_at.isoformat() if m.created_at else None}
-            for m in open_msgs_result.scalars().all()
+             "context": m.context, "from": m.from_type, "status": m.status,
+             "resolution": m.resolution,
+             "created_at": m.created_at.isoformat() if m.created_at else None,
+             "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None}
+            for m in all_thread_msgs
         ]
+        open_msgs = [msg for msg in conversation_thread if msg["status"] == "open"]
         review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
                        _runtime_config.get("task_type_models", {}).get("research") or None
         review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
@@ -533,6 +537,7 @@ async def trigger_strategic_cycle(
             "outcome_evaluation": _build_outcome_evaluation(project),
             "project_name": project.name,
             "open_messages": open_msgs,
+            "conversation_thread": conversation_thread,
             "base_branch": "main",
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),

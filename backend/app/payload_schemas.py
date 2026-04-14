@@ -167,6 +167,7 @@ class StrategicReviewPayload(_SystemPopulated):
     directions_summary: Optional[list[dict[str, Any]]] = None
     outcome_evaluation: Optional[dict[str, Any]] = None
     open_messages: Optional[list[dict[str, Any]]] = None
+    conversation_thread: Optional[list[dict[str, Any]]] = None
     project_name: Optional[str] = None
     research_mode: Optional[str] = None
     max_active_directions: Optional[int] = None

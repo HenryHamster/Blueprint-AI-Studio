@@ -21,6 +21,10 @@ const STATUS_OPTIONS = ['planned', 'in_progress', 'functional', 'mature'] as con
 
 export function VisionEditorModal({ projectId, initialVision, onSave, onClose }: VisionEditorModalProps) {
   const [purpose, setPurpose] = useState(typeof initialVision.purpose === 'string' ? initialVision.purpose : '');
+  const [focus, setFocus] = useState<string[]>(
+    Array.isArray(initialVision.focus) ? (initialVision.focus as string[]).map(String) : []
+  );
+  const [newFocus, setNewFocus] = useState('');
   const [criteria, setCriteria] = useState<string[]>(
     Array.isArray(initialVision.success_criteria) ? (initialVision.success_criteria as string[]).map(String) : []
   );
@@ -38,6 +42,17 @@ export function VisionEditorModal({ projectId, initialVision, onSave, onClose }:
   const [context, setContext] = useState(typeof initialVision.context === 'string' ? initialVision.context : '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  function addFocus() {
+    const trimmed = newFocus.trim();
+    if (!trimmed) return;
+    setFocus(prev => [...prev, trimmed]);
+    setNewFocus('');
+  }
+
+  function removeFocus(index: number) {
+    setFocus(prev => prev.filter((_, i) => i !== index));
+  }
 
   function addCriterion() {
     const trimmed = newCriterion.trim();
@@ -80,6 +95,7 @@ export function VisionEditorModal({ projectId, initialVision, onSave, onClose }:
     const visionPayload: Record<string, unknown> = {
       ...cleanVision,
       purpose: purpose.trim(),
+      focus: focus.filter(f => f.trim()),
       success_criteria: criteria,
       systems: systems.filter(s => s.name.trim()).map(s => ({
         id: s.id,
@@ -130,6 +146,40 @@ export function VisionEditorModal({ projectId, initialVision, onSave, onClose }:
               placeholder="What this product is and who it's for"
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-cyan-600 resize-y"
             />
+          </div>
+
+          {/* Focus */}
+          <div>
+            <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Focus</label>
+            <p className="text-[10px] text-neutral-600 mb-1.5">Near-term priorities that guide autonomous research and task planning.</p>
+            <div className="space-y-1">
+              {focus.map((f, i) => (
+                <div key={i} className="flex items-start gap-2 group">
+                  <span className="text-xs text-neutral-300 flex-1">- {f}</span>
+                  <button
+                    onClick={() => removeFocus(i)}
+                    className="text-neutral-700 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 mt-0.5"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center gap-2 mt-1.5">
+              <input
+                value={newFocus}
+                onChange={e => setNewFocus(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addFocus(); } }}
+                placeholder="Add focus area..."
+                className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2.5 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-cyan-600"
+              />
+              <button
+                onClick={addFocus}
+                className="text-neutral-500 hover:text-cyan-400 transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Success Criteria */}

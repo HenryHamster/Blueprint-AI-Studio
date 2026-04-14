@@ -40,6 +40,7 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
   const [loadingStrategic, setLoadingStrategic] = useState(false);
 
   const purpose = typeof vision.purpose === 'string' ? vision.purpose : '';
+  const focus = Array.isArray(vision.focus) ? vision.focus as string[] : [];
   const criteria = Array.isArray(vision.success_criteria) ? vision.success_criteria as string[] : [];
   const context = typeof vision.context === 'string' ? vision.context : '';
   const systems = Array.isArray(vision.systems) ? (vision.systems as unknown[]).map((s, i) => {
@@ -162,6 +163,21 @@ export default function VisionViewer({ vision, directions, selectedProjectId, ad
         <div className="bg-gradient-to-r from-cyan-950/30 to-transparent border-l-4 border-cyan-500/60 pl-5 py-3 rounded-r-lg">
           <div className="text-base text-neutral-100 leading-relaxed font-medium">
             <MarkdownContent content={purpose} />
+          </div>
+        </div>
+      )}
+
+      {/* Focus — near-term priorities */}
+      {focus.length > 0 && (
+        <div>
+          <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Focus</span>
+          <div className="mt-2 space-y-1.5">
+            {focus.map((f, i) => (
+              <div key={i} className="flex items-start gap-2 text-sm">
+                <span className="text-amber-500/50 mt-0.5 shrink-0">-</span>
+                <span className="text-neutral-200">{String(f)}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}

@@ -34,9 +34,11 @@ _max_plan_pool_lock = asyncio.Lock()
 _pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
 
 # Rate-limit keyword patterns — shared between classify_failure() and reaper
-RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "429", "credit", "billing",
+RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "rate-limit", "429", "credit", "billing",
                        "usage limit", "usage exhausted", "too many requests",
-                       "resource_exhausted", "daily limit", "tokens per minute"]
+                       "resource_exhausted", "daily limit", "tokens per minute",
+                       "quota exceeded", "exceeded your", "plan limit",
+                       "requests per minute", "overloaded"]
 
 
 # Backward compat: flat view for code that needs all accounts

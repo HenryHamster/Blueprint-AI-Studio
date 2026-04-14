@@ -205,23 +205,35 @@ async def reaper_service():
                     can_retry = False
 
                     # Rate-limited tasks: requeue without burning retry budget
-                    # Check both status message and error_logs for rate-limit indicators
+                    # Check status message, error_logs, error_logs artifact, AND failure_category
                     from app.max_plan_pool import RATE_LIMIT_KEYWORDS  # noqa: PLC0415 — deferred to avoid circular import
                     msg_lower = (task.latest_status_message or "").lower()
                     error_lower = ((task.context or {}).get("last_error") or "").lower()
-                    is_rate_limited = any(kw in msg_lower + " " + error_lower
-                                         for kw in RATE_LIMIT_KEYWORDS)
+                    error_logs_lower = ((task.error_logs or "") if hasattr(task, 'error_logs') else "").lower()
+                    is_rate_limited = (
+                        (task.context or {}).get("failure_category") == "rate_limited"
+                        or any(kw in msg_lower + " " + error_lower + " " + error_logs_lower
+                               for kw in RATE_LIMIT_KEYWORDS)
+                    )
                     if is_rate_limited:
-                        logger.info(f"[REAPER] Task {task.id} rate-limited — requeuing without burning retry")
+                        rl_acct_id = (task.context or {}).get("max_plan_account_id")
+                        logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing without burning retry")
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
                         task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
-                        # Clear account so dispatcher picks a different one
+                        # Blacklist the exhausted account and add cooldown
                         rl_ctx = dict(task.context or {})
+                        if rl_acct_id:
+                            blacklisted = list(rl_ctx.get("blacklisted_accounts") or [])
+                            if rl_acct_id not in blacklisted:
+                                blacklisted.append(rl_acct_id)
+                            rl_ctx["blacklisted_accounts"] = blacklisted
                         rl_ctx.pop("max_plan_account_id", None)
                         rl_ctx.pop("_slot_released", None)
+                        # Wait 30 min before retrying — usage limits reset on longer windows
+                        rl_ctx["retry_after"] = (_utcnow() + timedelta(minutes=30)).isoformat()
                         task.context = rl_ctx
                         session.add(task)
                         await broadcast_to_project(str(task.project_id), "task_updated",

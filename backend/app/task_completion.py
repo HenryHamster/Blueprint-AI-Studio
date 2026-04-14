@@ -214,9 +214,10 @@ async def _ensure_branch(
     # Deferred import to avoid circular dependency
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
 
+    max_retries = 5
     gh_token = owner = repo = None
     last_err = None
-    for _attempt in range(3):
+    for _attempt in range(max_retries):
         try:
             gh_token, owner, repo = await get_github_token_for_task(
                 task.id, session, force_refresh=(_attempt > 0))
@@ -233,12 +234,13 @@ async def _ensure_branch(
                     return True
                 except Exception:
                     pass
-            if _attempt < 2:
-                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {5 * (2 ** _attempt)}s: {e!r}")
-                await asyncio.sleep(5 * (2 ** _attempt))
+            if _attempt < max_retries - 1:
+                backoff = 10 * (2 ** _attempt)  # 10, 20, 40, 80s
+                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff}s: {e!r}")
+                await asyncio.sleep(backoff)
             else:
                 if gh_token:
-                    logger.error(f"[{label}] Branch {branch_name} creation failed after 3 attempts: {last_err!r}")
+                    logger.error(f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts: {last_err!r}")
                 else:
                     logger.error(f"[{label}] Cannot create branch — GitHub token unavailable: {last_err!r}")
     e = last_err
@@ -697,6 +699,7 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
     cycle_id = (task.context or {}).get("strategic_cycle_id")
+    spawned = None
     try:
         await session.refresh(project)
         spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
@@ -727,6 +730,7 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
             'cycle_id': cycle_id,
         }}
         if cycle_id:
+            from app.research_completion import _update_cycle_history  # noqa: PLC0415
             _update_cycle_history(project, cycle_id, {
                 "phase1_completed_at": _utcnow().isoformat(),
                 "outcome": "failed_phase2_spawn",

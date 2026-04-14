@@ -369,14 +369,14 @@ async def _check_evaluating_timeouts():
     - If all children are terminal but parent is still EVALUATING → trigger missed rollup.
     - If evaluating >2h with non-terminal children → WARNING alert.
     - If evaluating >6h → FAIL with ERROR alert.
-    - Skips CI-waiting tasks (they have their own 30-min timeout).
+    - Skips CI-waiting tasks (they have their own 20-min escalation timeout).
     """
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
     from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
-    CI_BACKSTOP_SECONDS = 90 * 60         # 90 minutes — 3x the normal 30-min CI wait timeout
+    CI_BACKSTOP_SECONDS = 30 * 60         # 30 minutes — hard kill for CI-waiting tasks (CI takes 5-10 min)
     TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
     try:
@@ -396,9 +396,8 @@ async def _check_evaluating_timeouts():
                     or ctx.get("review_loop", {}).get("ci_waiting") is True
                 )
                 if ci_waiting:
-                    # CI-waiting tasks have their own 30-min timeout in orchestrator.py,
-                    # but if ci_wait_started is missing/corrupt that timeout is silently
-                    # skipped. Apply a 90-minute absolute backstop so tasks can never
+                    # CI-waiting tasks have their own 20-min escalation in orchestrator.py.
+                    # Apply a 30-minute absolute backstop so tasks can never
                     # hang forever regardless of field state.
                     evaluating_since = None
                     for entry in reversed(task.status_log or []):
@@ -416,17 +415,26 @@ async def _check_evaluating_timeouts():
                     if elapsed <= CI_BACKSTOP_SECONDS:
                         # Under backstop threshold — let normal CI timeout handle it
                         continue
-                    # Over backstop threshold — fall through to hard timeout logic
+                    # Over backstop threshold — diagnose why and hard-kill
                     hours = round(elapsed / 3600, 1)
+                    rl = ctx.get("review_loop", {})
+                    ci_ws_val = rl.get("ci_wait_started")
+                    was_escalated = rl.get("escalated", False)
+                    if ci_ws_val is None:
+                        reason = "ci_wait_started missing from review_loop"
+                    else:
+                        try:
+                            datetime.fromisoformat(ci_ws_val)
+                            reason = "CI polling stalled after escalation" if was_escalated else "CI did not complete within backstop window"
+                        except (ValueError, TypeError):
+                            reason = f"ci_wait_started corrupt: {ci_ws_val!r}"
                     logger.error(
                         f"[EVAL TIMEOUT] CI-waiting task {str(task.id)[:8]} has been "
-                        f"EVALUATING for {hours}h — backstop timeout (ci_wait_started "
-                        f"missing or corrupt), marking FAILED"
+                        f"EVALUATING for {hours}h — backstop timeout ({reason}), marking FAILED"
                     )
                     task.status = TaskStatus.FAILED
                     task.latest_status_message = (
-                        f"CI wait backstop timeout after {hours}h "
-                        "(ci_wait_started missing or corrupt — no timeout was applied)"
+                        f"CI wait backstop timeout after {hours}h ({reason})"
                     )
                     session.add(task)
                     children = (await session.execute(
@@ -447,7 +455,7 @@ async def _check_evaluating_timeouts():
                         session.add(child)
                     await _maybe_create_failure_alert(
                         task, session,
-                        f"CI wait backstop timeout after {hours}h — ci_wait_started missing or corrupt",
+                        f"CI wait backstop timeout after {hours}h — {reason}",
                     )
                     await session.commit()
                     await broadcast_to_project(

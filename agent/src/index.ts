@@ -311,8 +311,8 @@ export function sendHeartbeatSync(taskId: string, statusMessage: string) {
       '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
       '-d', payload,
     ], { timeout: 10_000, stdio: 'ignore' });
-  } catch {
-    log('Sync heartbeat failed (non-fatal)');
+  } catch (e) {
+    log(`Sync heartbeat failed: ${e instanceof Error ? e.message : String(e)} (non-fatal)`);
   }
 }
 
@@ -449,8 +449,10 @@ export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): 
 
 /** Clone with retry — transient network failures get 3 attempts with exponential backoff. */
 export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
+  const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
     try {
+      if (attempt > 0 && taskId) sendHeartbeatSync(taskId, `Git clone retry ${attempt + 1}/${CLONE_MAX_RETRIES}...`);
       execFileSync('git', args, { encoding: 'utf-8', timeout: timeoutMs });
       return;
     } catch (e) {
@@ -472,9 +474,11 @@ export async function setupWorkspace(
 ): Promise<{ workBranch: string; shortId: string }> {
   statusRef.value = `Cloning ${owner}/${repo}...`;
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
+  sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -1111,6 +1115,10 @@ async function main() {
     const safeErr = sanitize(errMsg);
     log(`Fatal error: ${safeErr}`);
     sendLog(ws, `\nFatal error: ${safeErr}\n`);
+    // Classify the failure — rate limit / usage exhaustion should NOT burn retry budget
+    const errLower = errMsg.toLowerCase();
+    const isRateLimit = /usage.*exhaust|usage.*limit|rate.*limit|quota.*exceeded|credit|billing|exceeded.*plan|max.*usage|token.*limit|out of.*credit/i.test(errLower);
+    const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' as FailureCategory : 'fatal' as FailureCategory;
     // Surface the error through the heartbeat so it's visible even if the
     // status POST fails — the heartbeat updates latest_status_message on the
     // backend, giving us forensic evidence instead of silent death.
@@ -1123,7 +1131,7 @@ async function main() {
         await persistAndPostStatus(taskId, {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: sanitize(`Fatal error: ${errMsg}`),
-          failure_category: 'fatal' as FailureCategory,
+          failure_category: failureCategory,
         });
         break; // Success — stop retrying
       } catch (e) {

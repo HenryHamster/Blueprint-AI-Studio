@@ -493,6 +493,46 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (0 <= val <= 100000):
             raise HTTPException(status_code=400, detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)")
         _runtime_config["daily_cost_ceiling_usd"] = val
+    if "max_provision_retries" in payload:
+        try:
+            val = int(payload["max_provision_retries"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_provision_retries must be a number")
+        if not (1 <= val <= 10):
+            raise HTTPException(status_code=400, detail="max_provision_retries must be between 1 and 10")
+        _runtime_config["max_provision_retries"] = val
+    if "max_rollup_retries" in payload:
+        try:
+            val = int(payload["max_rollup_retries"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_rollup_retries must be a number")
+        if not (1 <= val <= 20):
+            raise HTTPException(status_code=400, detail="max_rollup_retries must be between 1 and 20")
+        _runtime_config["max_rollup_retries"] = val
+    if "architecture_review_frequency" in payload:
+        try:
+            val = int(payload["architecture_review_frequency"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="architecture_review_frequency must be a number")
+        if not (0 <= val <= 100):
+            raise HTTPException(status_code=400, detail="architecture_review_frequency must be between 0 and 100 (0 = disabled)")
+        _runtime_config["architecture_review_frequency"] = val
+    if "max_active_directions" in payload:
+        try:
+            val = int(payload["max_active_directions"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_active_directions must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="max_active_directions must be between 1 and 50")
+        _runtime_config["max_active_directions"] = val
+    if "max_parallel_research_per_project" in payload:
+        try:
+            val = int(payload["max_parallel_research_per_project"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_parallel_research_per_project must be a number")
+        if not (1 <= val <= 20):
+            raise HTTPException(status_code=400, detail="max_parallel_research_per_project must be between 1 and 20")
+        _runtime_config["max_parallel_research_per_project"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -577,6 +617,11 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
                     "require_approval_gates": _runtime_config.get("require_approval_gates", True),
                     "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+                    "max_provision_retries": _runtime_config.get("max_provision_retries", 3),
+                    "max_rollup_retries": _runtime_config.get("max_rollup_retries", 5),
+                    "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
+                    "max_active_directions": _runtime_config.get("max_active_directions", 10),
+                    "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"],

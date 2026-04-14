@@ -132,6 +132,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
+        total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history)
         recent_history = history[-5:]
         recent_findings = []
         recent_failures = []
@@ -150,6 +151,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             "prs_merged": total_merged, "tasks_failed": total_failed,
             "possibly_saturated": d.get("possibly_saturated", False),
         }
+        if total_failed_infra > 0:
+            stat_entry["tasks_failed_infra"] = total_failed_infra
         if total_rejected > 0:
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:
@@ -165,34 +168,25 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["system_id"] = d["system_id"]
         direction_stats.append(stat_entry)
 
-    # Fetch open messages
-    open_msgs_result = await session.execute(
+    # Fetch unified conversation thread — last 30 messages chronologically,
+    # regardless of status.  Gives the strategic agent a coherent back-and-forth
+    # instead of flat, separated open/resolved lists.
+    thread_result = await session.execute(
         select(ProjectMessage).where(
             ProjectMessage.project_id == project.id,
-            ProjectMessage.status == "open",
-        ).order_by(ProjectMessage.created_at.asc()).limit(50)
+        ).order_by(ProjectMessage.created_at.desc()).limit(30)
     )
-    open_msgs = [
+    all_thread_msgs = list(reversed(thread_result.scalars().all()))  # chronological
+    conversation_thread = [
         {"id": str(m.id), "type": m.message_type, "content": m.content,
-         "context": m.context, "from": m.from_type,
-         "created_at": m.created_at.isoformat() if m.created_at else None}
-        for m in open_msgs_result.scalars().all()
-    ]
-
-    # Fetch recent resolved messages for context continuity
-    resolved_msgs_result = await session.execute(
-        select(ProjectMessage).where(
-            ProjectMessage.project_id == project.id,
-            ProjectMessage.status == "resolved",
-        ).order_by(ProjectMessage.resolved_at.desc()).limit(10)
-    )
-    recent_resolved = [
-        {"id": str(m.id), "type": m.message_type, "content": m.content,
-         "from": m.from_type, "resolution": m.resolution,
+         "context": m.context, "from": m.from_type, "status": m.status,
+         "resolution": m.resolution,
          "created_at": m.created_at.isoformat() if m.created_at else None,
          "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None}
-        for m in resolved_msgs_result.scalars().all()
+        for m in all_thread_msgs
     ]
+    # Executor still needs a flat list of open messages for resolve operations
+    open_msgs = [msg for msg in conversation_thread if msg["status"] == "open"]
 
     review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
                    _runtime_config.get("task_type_models", {}).get("research") or None
@@ -209,7 +203,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "outcome_evaluation": _build_outcome_evaluation(project),
         "project_name": project.name,
         "open_messages": open_msgs,
-        "recent_resolved_messages": recent_resolved,
+        "conversation_thread": conversation_thread,
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),

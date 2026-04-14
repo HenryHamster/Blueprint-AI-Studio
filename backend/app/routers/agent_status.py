@@ -739,10 +739,13 @@ async def update_agent_status(
 
         # Release Max plan account slot (idempotent — skip if already released by reaper)
         # Runs regardless of whether result recording above succeeded or threw.
+        # Flush immediately so _slot_released persists even if downstream processing fails.
         acct_id = (task.context or {}).get("max_plan_account_id")
         if acct_id and not (task.context or {}).get("_slot_released"):
             await release_max_plan_account(acct_id)
             task.context = {**(task.context or {}), "_slot_released": True}
+            session.add(task)
+            await session.flush()
 
         task.vm_stopped_at = _utcnow()
         if task.vm_provisioned_at:

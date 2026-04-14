@@ -742,11 +742,10 @@ async def test_deadlock_true_cycle_cleared(orch_db, mocker):
 @pytest.mark.asyncio
 async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     """A CI-waiting EVALUATING task with missing ci_wait_started should be failed
-    by the 90-minute backstop in _check_evaluating_timeouts().
+    by the 30-minute backstop in _check_evaluating_timeouts().
 
     Scenario: task has ci_waiting=True in context but no ci_wait_started field,
-    and has been EVALUATING for >90 minutes.  The orchestrator's normal CI timeout
-    is silently skipped (it can't parse the field).  The backstop must catch it.
+    and has been EVALUATING for >30 minutes.  The backstop must catch it.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
@@ -768,8 +767,8 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    # Set task to appear 100 minutes into EVALUATING (> 90-min backstop)
-    evaluating_since = _naive_utc_ago(minutes=100)
+    # Set task to appear 35 minutes into EVALUATING (> 30-min backstop)
+    evaluating_since = _naive_utc_ago(minutes=35)
     task.status_log = [
         {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
     ]
@@ -782,16 +781,19 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     await eval_db.refresh(task)
     assert task.status == TaskStatus.FAILED, (
         f"Expected CI-waiting task with missing ci_wait_started to be FAILED after "
-        f"90-min backstop, got {task.status}"
+        f"30-min backstop, got {task.status}"
     )
     assert "backstop" in (task.latest_status_message or "").lower(), (
         f"Expected 'backstop' in status message, got: {task.latest_status_message!r}"
+    )
+    assert "missing" in (task.latest_status_message or "").lower(), (
+        f"Expected 'missing' in status message when ci_wait_started is absent, got: {task.latest_status_message!r}"
     )
 
 
 @pytest.mark.asyncio
 async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
-    """A CI-waiting task that is UNDER the 90-minute backstop threshold must NOT
+    """A CI-waiting task that is UNDER the 30-minute backstop threshold must NOT
     be failed by _check_evaluating_timeouts() — normal CI timeout handles it.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
@@ -813,7 +815,7 @@ async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    # Only 20 minutes into EVALUATING — well under the 90-min backstop
+    # Only 20 minutes into EVALUATING — well under the 30-min backstop
     evaluating_since = _naive_utc_ago(minutes=20)
     task.status_log = [
         {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
@@ -826,6 +828,60 @@ async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
 
     await eval_db.refresh(task)
     assert task.status == TaskStatus.EVALUATING, (
-        f"Expected CI-waiting task under 90-min threshold to remain EVALUATING, "
+        f"Expected CI-waiting task under 30-min threshold to remain EVALUATING, "
         f"got {task.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, mocker):
+    """When ci_wait_started IS present and valid in review_loop, the backstop
+    message must NOT say 'missing or corrupt' — it should diagnose the actual
+    reason (e.g. 'CI did not complete within backstop window').
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Backstop Message Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # CI-waiting task with VALID ci_wait_started in review_loop
+    ci_started = _naive_utc_ago(minutes=35).isoformat()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "backstop message test"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_started,
+            "pr_number": 999,
+        }},
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    # 35 minutes into EVALUATING (> 30-min backstop)
+    evaluating_since = _naive_utc_ago(minutes=35)
+    task.status_log = [
+        {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
+    ]
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        f"Expected task to be FAILED after backstop, got {task.status}"
+    )
+    msg = (task.latest_status_message or "").lower()
+    assert "backstop" in msg, f"Expected 'backstop' in message, got: {task.latest_status_message!r}"
+    assert "missing" not in msg and "corrupt" not in msg, (
+        f"Message should NOT say 'missing or corrupt' when ci_wait_started is valid, "
+        f"got: {task.latest_status_message!r}"
     )

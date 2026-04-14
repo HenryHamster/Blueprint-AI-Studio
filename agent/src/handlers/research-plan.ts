@@ -192,6 +192,7 @@ Rules:
   }
 
   // Try to parse plan JSON and spawn subtasks directly from the agent
+  let spawnFailed = false;
   if (exitCode === 0 && logs) {
     try {
       let planData: Record<string, unknown> | null = null;
@@ -216,27 +217,33 @@ Rules:
         }) as Record<string, unknown>;
 
         const spawnedIds = Array.isArray(spawnResult.task_ids) ? spawnResult.task_ids as string[] : [];
-        sendLog(ws, `Spawned ${spawnedIds.length} subtasks: ${spawnedIds.join(', ')}\n`);
-
-        // Include full plan data with spawn info for backend enrichment
-        logs = JSON.stringify({
-          ...planData,
-          agent_spawned: true,
-          spawned_task_ids: spawnedIds,
-        });
+        if (spawnedIds.length === 0) {
+          spawnFailed = true;
+          sendLog(ws, `Spawn returned no task IDs — reporting FAILED\n`);
+        } else {
+          sendLog(ws, `Spawned ${spawnedIds.length} subtasks: ${spawnedIds.join(', ')}\n`);
+          // Include full plan data with spawn info for backend enrichment
+          logs = JSON.stringify({
+            ...planData,
+            agent_spawned: true,
+            spawned_task_ids: spawnedIds,
+          });
+        }
       }
     } catch (err) {
-      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : String(err)}, falling back to backend processing\n`);
+      spawnFailed = true;
+      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 
+  const finalStatus = spawnFailed ? 'FAILED' : (exitCode === 0 ? 'COMPLETED' : 'FAILED');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
-      status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-      ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
-      logs,
-      ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
+      status: finalStatus,
+      ...(finalStatus === 'FAILED' ? { artifact_type: 'ERROR_LOG' } : {}),
+      logs: spawnFailed ? `Spawn failed — subtasks not created. Plan output: ${logs}` : logs,
+      ...(finalStatus === 'FAILED' ? { failure_category: 'claude_code_failed' } : {}),
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post plan completion status: ${e}\n`);
@@ -513,9 +520,30 @@ ${hotspotsSection}
       }
     }
 
-    const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
-    const otherMessages = openMessages.filter(m => strVal(m.type) !== 'FEEDBACK');
+    // Unified conversation thread — chronological, shows back-and-forth
+    const conversationThread = Array.isArray(payload.conversation_thread)
+      ? payload.conversation_thread as Array<Record<string, unknown>>
+      : [];
+    const threadSection = conversationThread.length > 0
+      ? '\n## Conversation History\n' +
+        conversationThread.map(m => {
+          const age = calcMessageAge(m);
+          const status = strVal(m.status);
+          const from = strVal(m.from);
+          const tag = status === 'resolved' ? `${from}, ${age}, RESOLVED` : `${from}, ${age}, OPEN`;
+          let line = `[${tag}] [${strVal(m.type)}] ${strVal(m.content).slice(0, 300)}`;
+          if (status === 'resolved' && m.resolution) {
+            line += `\n  -> ${strVal(m.resolution).slice(0, 200)}`;
+          }
+          if (status === 'open') {
+            line += ` (id: ${strVal(m.id)})`;
+          }
+          return line;
+        }).join('\n') + '\n'
+      : '';
 
+    // Extract open FEEDBACK messages — these are direct user requests
+    const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
     const feedbackSection = feedbackMessages.length > 0
       ? (() => {
           const feedbackLines = feedbackMessages.map(m => {
@@ -526,29 +554,22 @@ ${hotspotsSection}
         })()
       : '';
 
-    const openMessagesText = otherMessages.length > 0
-      ? otherMessages.map(m => {
+    // Flat open messages list for executor resolve operations
+    const openMessagesText = openMessages.length > 0
+      ? openMessages.map(m => {
           const age = calcMessageAge(m);
           return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 200)}`;
         }).join('\n')
-      : '';
-
-    // Recent resolved messages for context continuity
-    const recentResolved = Array.isArray(payload.recent_resolved_messages)
-      ? payload.recent_resolved_messages as Array<Record<string, unknown>>
-      : [];
-    const resolvedSection = recentResolved.length > 0
-      ? '\n## Recent Conversation History\nPreviously resolved messages (for context — no action needed):\n' +
-        recentResolved.map(m =>
-          `- [${strVal(m.type)}] (from: ${strVal(m.from)}, ${strVal(m.resolved_at)}) ${strVal(m.content).slice(0, 200)}${m.resolution ? `\n  → Resolved: ${strVal(m.resolution).slice(0, 200)}` : ''}`
-        ).join('\n') + '\n'
       : '';
 
     const dirSummaryText = directionsSummary.length > 0
       ? directionsSummary.map((d, i) => {
           const parts = [`${d.total_cycles || 0} cycles`];
           if (d.prs_merged) parts.push(`${d.prs_merged} merged`);
-          if (d.tasks_failed) parts.push(`${d.tasks_failed} failed`);
+          if (d.tasks_failed) {
+            const infraFailed = (d.tasks_failed_infra as number) || 0;
+            parts.push(infraFailed > 0 ? `${d.tasks_failed} failed (${infraFailed} infra)` : `${d.tasks_failed} failed`);
+          }
           const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
           const catNote = d.category ? ` [${strVal(d.category)}]` : '';
           const sysNote = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
@@ -582,11 +603,14 @@ ${hotspotsSection}
             findingsSection = `\n   Recent work: ${findings.slice(0, 5).join('; ')}`;
           }
 
-          // Recent failures: why things failed
+          // Recent failures: why things failed (with category for infra vs code distinction)
           let failuresSection = '';
           const failures = Array.isArray(d.recent_failures) ? d.recent_failures as Array<Record<string, string>> : [];
           if (failures.length > 0) {
-            const failLines = failures.slice(0, 3).map(f => `${f.title || '?'}: ${f.reason || 'unknown'}`);
+            const failLines = failures.slice(0, 3).map(f => {
+              const cat = f.category ? ` [${f.category}]` : '';
+              return `${f.title || '?'}${cat}: ${f.reason || 'unknown'}`;
+            });
             failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
           }
 
@@ -696,13 +720,18 @@ echo ""
       gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
     ].join('\n');
 
+    // ── Running context from prior cycles (design doc notes/strategic-context) ──
+    const strategicContext = designDoc
+      ? strVal((designDoc as Record<string, unknown>)['notes/strategic-context'])
+      : '';
+
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
-    const thinkerPrompt = `${contextPrefix}You are a strategic product architect reviewing this project.
+    const thinkerPrompt = `${contextPrefix}You own this project's strategic direction.
 
 # Project: ${projectName}
-
+${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
 ## Architecture (design document — current state)
 ${designDocJson || 'No design document yet.'}
 
@@ -714,27 +743,32 @@ ${dirSummaryText}
 
 ## Direction Health
 ${dirHealthSummary}
-${feedbackSection}${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}${resolvedSection}
+${feedbackSection}${threadSection}
 # Your task
 
-You are a product advisor. Think about where this project should go.
+Read the vision's purpose and context carefully. They tell you what kind of project this is and what the user values. Calibrate every recommendation to what the user actually needs, not to a generic "best practices" standard. Different projects have radically different priorities — don't assume yours.
 
-You have everything you need above: the design document (what exists), the vision (what we're aiming for), outcome data (what's actually been shipping), current directions (what we're working on), and user feedback. Do NOT explore the codebase — the architecture agent handles that.
+If the vision doesn't make the project's priorities clear (speed vs correctness, features vs polish, etc.), ask the user once and save their answer in the vision context so you don't need to ask again.
 
-Write a strategic analysis. Think freely. Cover the FULL landscape — don't laser-focus on one area. Some questions to consider:
+You have everything above: what exists (design doc), where we're going (vision), what's actually shipping (outcomes), what we're working on (directions), and user feedback. Do NOT explore the codebase — the architecture agent handles that.
 
-- Is the purpose (product identity) still accurate? It should describe what the product IS, not what you're building next. Only change it if the product's fundamental nature has shifted.
-- Are the focus items (current strategic bets) still the right bets? What should we be actively building NOW? Which goals have been achieved and should rotate out? What new goals deserve a slot?
-- Are we stuck in a local optimum? Lots of small improvements instead of one big leap?
-- Look at the outcome data honestly — are directions producing real value, or just easy-to-merge busywork?
-- What high-impact work is nobody doing? What would make a user say "I can't work without this"?
-- Are we defaulting to structural/infrastructure work when product features would matter more?
-- What should we STOP doing? Which directions overlap or should be merged?
-- Are there directions that can't meaningfully start until other work finishes? Those should be paused, not active.
+Start from the end state. What is this project meant to become? Read the vision's purpose — that's the destination. Now look at where we actually are (outcomes, directions, design doc). What's the gap?
+
+Think about what bold moves close that gap:
+- What would make a user say "I can't work without this"? Is anyone building it?
+- Are we stuck in a local optimum — lots of small improvements instead of one big leap?
+- Look at the outcome data honestly — are directions producing real value, or busywork?
+- Are we defaulting to infrastructure when product features would matter more?
+- What should we STOP doing? Which directions are dead weight?
+- What are we avoiding that we shouldn't be?
+
+Think big. If a direction would fundamentally change the product's trajectory, it's worth more than five safe incremental ones. Don't optimize the current plan — question whether it's the right plan.
+
+Some task failures are caused by the pipeline itself — marked [PROVISION_FAILURE], [RATE_LIMIT], [AGENT_TIMEOUT], or [EXTERNAL_API] in the failure details. These say nothing about the direction's quality. If you see a pattern of infra failures, flag it to the user as a pipeline issue (\`./messages send 'observation' NOTE\`) rather than penalizing the direction.
 
 Think about the WHAT, not the HOW. Direction text should describe outcomes ("users can X", "the system handles Y"), not implementation steps. Leave the implementation planning to research agents.
 
-If you're unsure about what the user wants or values — ASK. Use \`./messages send 'your question' QUESTION\`. One good question is worth more than a wrong guess. If there are open messages, respond to them.
+If you have questions for the user — about priorities, intent, or things you can't resolve from the data — ask them now using \`./messages send 'question' QUESTION\`. Better to ask during analysis than to guess wrong during execution. If there are open messages, respond to them.
 
 Don't worry about formatting, JSON, or direction operations. Just think and write. A follow-up step will translate your analysis into concrete actions.`;
 
@@ -750,6 +784,16 @@ Don't worry about formatting, JSON, or direction operations. Just think and writ
     );
 
     const executorPrompt = `You are a strategic executor. Your job is to translate the analysis below into direction operations, but with JUDGMENT — not blind execution. You decide how the analysis maps to directions.
+
+## Ownership
+You own this project's strategic direction. The analysis above is your reasoning — now execute it. If the data clearly supports a change, make it. Don't hedge, don't soften, don't ask permission for things the outcome data already answers.
+
+Only escalate (\`./messages send 'question' QUESTION\`) when you literally cannot proceed without the user:
+- Missing credentials, API keys, deploy targets, or external access
+- Ambiguous user intent where the wrong call wastes cycles
+- External blockers outside the system's control
+
+If a direction is dead, retire it. If there's an obvious gap, fill it. If a user asked for something, create a direction for it.
 
 Do NOT analyze code. Do NOT explore the codebase. Think briefly about each operation, then run the commands.
 
@@ -813,11 +857,18 @@ ${analysisText.slice(0, 50_000)}
    - "Research agents are ignoring the dependency ordering"
    This persists in the design doc and will be visible to the thinker on the next strategic cycle.
 
-7. Review open messages — resolve addressed ones, respond to questions.
+7. Review open messages — resolve addressed ones, respond to questions. Check the conversation history for your own prior QUESTION messages — if a user message answers one, resolve it: \`./messages resolve <id> 'Answered — [summary]'\`.
 
-8. Guardrails: ensure at least 3 active directions remain and at least one has category="product".
+8. **Update running context.** Save a concise summary of this cycle's key takeaways:
+   ./design-doc set "notes/strategic-context" '"Decisions: [what changed and why] | User preferences: [anything expressed in messages] | Pending questions: [open questions awaiting user input] | Blockers: [external constraints]"'
+   This carries forward to future cycles. Overwrite the previous version — this is a living summary, not a log.
 
-9. Done. Do not write anything else.`;
+9. Guardrails: ensure at least 3 active directions remain and at least one has category="product".
+
+10. **Post ONE summary message** explaining what changed and why:
+    ./messages send 'Strategic review complete: [1-2 sentence summary]. Key changes: [list major direction/vision changes].' NOTE
+
+11. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -1013,10 +1064,13 @@ ${recentlyCompleted.length > 0
 2. For each direction, ask: "what would it take for this to be DONE?" Work backward from the goal.
 3. Check the design document — if the direction targets something missing, look for a spec on that system entry first. If a spec exists, use it as your design foundation. If no spec, design from scratch. If the direction targets something existing, improve it.
 4. Before writing findings, verify you explored all major directories.
-5. Finding prompts should describe the PROBLEM and desired outcome — not exact line numbers.
+5. Finding prompts must describe the PROBLEM and desired outcome — NOT the implementation.
+   Do not write line numbers, specific function signatures, or step-by-step code changes.
+   The implementing agent reads the full codebase and decides how to build it. Over-specified
+   prompts waste time and anchor the agent on a suboptimal approach.
    For foundational findings (scope=large), include: what the system needs and why, recommended
    approach and technology choices, key architectural decisions, and how it fits with existing systems.
-   Let implementing agents handle the code, but give them the design.
+   For smaller findings, state what's wrong and what "done" looks like — nothing more.
 
 # SCOPE GUIDANCE
 
@@ -1065,7 +1119,7 @@ implementation findings. Add metadata alongside them when relevant.
   "type": "<see finding types above>",
   "title": "feat: short title (under 60 chars, conventional commit style)",
   "description": "1-3 sentences: what and why",
-  "prompt": "Self-contained prompt for the implementing agent. Describe the problem and desired outcome.",
+  "prompt": "Self-contained prompt for the implementing agent. Describe the problem and desired outcome — NOT the implementation. No line numbers, no function signatures, no step-by-step instructions.",
   "scope": "small|medium|large",
   "risk": "low|medium|high",
   "priority": "high|medium|low",

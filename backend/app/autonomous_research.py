@@ -198,13 +198,18 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             acceptance_rate = _compute_acceptance_rate(d)
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
             category_bonus = -1 if d.get("category") == "product" else 0  # product directions preferred
+            # Vision rank matters: top vision priority = 0, unlisted = N.
+            # Placed after priority+category but BEFORE productivity so the
+            # strategic agent's vision.priorities actually steer selection
+            # instead of being a dead tiebreaker.
+            v_rank = _vision_rank(d)
             return (
                 priority_rank.get(d.get("priority", "medium"), 1),
                 category_bonus,                                  # product category within same priority
                 is_new,                                          # novelty bonus within same priority
-                -(merge_rate * momentum),                        # productivity beats vision rank
+                v_rank,                                          # vision priority drives selection
+                -(merge_rate * momentum),                        # productivity within same vision rank
                 acceptance_rate if acceptance_rate is not None else 0.5,  # low acceptance = deprioritized
-                _vision_rank(d),                                 # vision rank as tiebreaker
                 1 if d.get("possibly_saturated") else 0,         # saturated last
                 d.get("last_researched_at") or "",               # staleness
             )

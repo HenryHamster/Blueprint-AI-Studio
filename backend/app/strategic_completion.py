@@ -135,13 +135,17 @@ def _check_direction_health(direction: dict) -> Optional[str]:
                 total_created = sum(entry.get("tasks_created", 0) for entry in history)
                 return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
 
-    # Rule 3: High failure rate — last 3 cycles have >70% tasks failed
+    # Rule 3: High CODE failure rate — last 3 cycles have >70% tasks failed
+    # for direction-attributable reasons (not infra failures like rate limits,
+    # provision failures, or timeouts which are uncorrelated with direction quality).
     if len(history) >= 3:
         recent3 = history[-3:]
         total_created_3 = sum(entry.get("tasks_created", 0) for entry in recent3)
         total_failed_3 = sum(entry.get("tasks_failed", 0) for entry in recent3)
-        if total_created_3 > 0 and total_failed_3 / total_created_3 > 0.7:
-            return "High failure rate: >70% of spawned tasks failed in last 3 cycles"
+        infra_failed_3 = sum(entry.get("tasks_failed_infra", 0) for entry in recent3)
+        code_failed_3 = total_failed_3 - infra_failed_3
+        if total_created_3 > 0 and code_failed_3 / total_created_3 > 0.7:
+            return f"High code failure rate: >70% of spawned tasks failed for code reasons in last 3 cycles ({code_failed_3}/{total_created_3}, {infra_failed_3} infra failures excluded)"
 
     return None
 

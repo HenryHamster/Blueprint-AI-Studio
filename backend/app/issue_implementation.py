@@ -139,6 +139,21 @@ async def _handle_issue_implementation_inner(
 
     issue_context = await _extract_issue_context(token, owner, repo, issue_number)
 
+    # ── Scan issue content for prompt injection ──
+    requires_approval = False
+    try:
+        from app.security import _scan_text  # noqa: PLC0415
+        scan_targets = [issue_title, issue_context.get("body", "")]
+        for text in scan_targets:
+            if text:
+                findings = _scan_text(text)
+                if any(f.get("severity") == "high" for f in findings):
+                    requires_approval = True
+                    logger.warning(f"[ISSUE-IMPL] Prompt injection detected in issue #{issue_number}: {findings}")
+                    break
+    except Exception as scan_exc:
+        logger.warning(f"[ISSUE-IMPL] Security scan failed for issue #{issue_number}: {scan_exc}")
+
     # ── Build agent prompt ──
     prompt = _build_issue_prompt(issue_context, issue_number, issue_title)
 
@@ -161,6 +176,7 @@ async def _handle_issue_implementation_inner(
         },
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_ISSUE_IMPLEMENTATION",
+        requires_approval=requires_approval,
     )
     session.add(task)
     await session.flush()  # assign task.id

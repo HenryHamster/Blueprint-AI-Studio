@@ -391,14 +391,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 from app.github import get_open_pull_requests
                 try:
                     open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
-                except HTTPException as auth_err:
-                    if auth_err.status_code != 401:
+                except HTTPException as api_err:
+                    if api_err.status_code == 401:
+                        from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                        invalidate_github_token_cache(str(parent.project_id))
+                        logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
+                        gh_token, owner, repo = await get_github_token_for_task(parent.id, session, force_refresh=True)
+                        open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
+                    elif api_err.status_code in (403, 500, 502, 503):
+                        logger.warning(f"[ROLLUP] GitHub error {api_err.status_code} listing open PRs — deferring to next cycle")
+                        return
+                    else:
                         raise
-                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
-                    invalidate_github_token_cache(str(parent.project_id))
-                    logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
-                    gh_token, owner, repo = await get_github_token_for_task(parent.id, session, force_refresh=True)
-                    open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                 if open_prs:
                     pr_nums = [f"#{p['number']}" for p in open_prs]
                     parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"
@@ -431,10 +435,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # up, or by GitHub auto-delete after a prior PR merge), check
                 # whether all children completed successfully. If so, the work
                 # already landed on the target branch and we can complete.
+                staging_branch_missing = False
                 try:
                     await get_branch_sha(gh_token, owner, repo, staging_branch)
+                except HTTPException as http_err:
+                    if http_err.status_code == 404:
+                        logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent.id}")
+                        staging_branch_missing = True
+                    elif http_err.status_code in (401, 403):
+                        logger.error(f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring")
+                        return
+                    else:
+                        logger.warning(f"[ROLLUP] GitHub {http_err.status_code} checking staging branch — deferring")
+                        return
                 except Exception as e:
-                    logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found for task {parent.id}: {e}")
+                    logger.warning(f"[ROLLUP] Error checking staging branch '{staging_branch}': {e} — deferring")
+                    return
+                if staging_branch_missing:
                     # Check if all children completed — if so, work already landed
                     all_children_ok = completed_count > 0 and failed_count == 0
                     if all_children_ok:
@@ -624,8 +641,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {**parent_ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
                         parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
-                        await delete_branch(gh_token, owner, repo, staging_branch)
-                        logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}, deleted {staging_branch}")
+                        try:
+                            await delete_branch(gh_token, owner, repo, staging_branch)
+                        except Exception as del_err:
+                            logger.warning(f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}")
+                        logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
                         try:
                             from app.notification_dispatch import post_pr_merged_message  # noqa: PLC0415
                             _direction_id = (parent.context or {}).get("direction_id")

@@ -52,6 +52,16 @@ async def dispatch_external_notification(
             return
         if event_type not in enabled_events:
             return
+        # SSRF guard: only allow http(s) and block internal/metadata IPs
+        from urllib.parse import urlparse
+        parsed_url = urlparse(webhook_url)
+        if parsed_url.scheme not in ("http", "https"):
+            logger.warning(f"[NOTIFY] Rejecting non-http(s) webhook URL: {parsed_url.scheme}")
+            return
+        _host = parsed_url.hostname or ""
+        if _host in ("169.254.169.254", "metadata.google.internal", "localhost", "127.0.0.1"):
+            logger.warning(f"[NOTIFY] Rejecting internal webhook URL host: {_host}")
+            return
 
         # Per-event throttle: drop if last dispatch was too recent
         now = time.monotonic()

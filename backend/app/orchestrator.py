@@ -261,7 +261,7 @@ async def orchestrator_worker():
                             continue  # Reaper already handled it
                         # Check provision failure limit before requeueing
                         provision_failures = (fresh_t.context or {}).get("provision_failures", 0) + 1
-                        if provision_failures >= _runtime_config["max_provision_retries"]:
+                        if provision_failures >= _runtime_config.get("max_provision_retries", 3):
                             fresh_t.status = TaskStatus.FAILED
                             fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
@@ -452,7 +452,27 @@ async def orchestrator_worker():
                             if cancel_task:
                                 cancel_task.status = TaskStatus.CANCELLED
                                 cancel_task.latest_status_message = "Cancelled: dependency task failed"
+                                # Release account slot if held
+                                cancel_acct = (cancel_task.context or {}).get("max_plan_account_id")
+                                if cancel_acct and not (cancel_task.context or {}).get("_slot_released"):
+                                    await release_max_plan_account(cancel_acct)
+                                    cancel_task.context = {**(cancel_task.context or {}), "_slot_released": True}
                                 cancel_session.add(cancel_task)
+                                # Cascade cancel to children in non-terminal states
+                                children = (await cancel_session.execute(
+                                    select(Task).where(
+                                        Task.parent_task_id == task.id,
+                                        Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+                                    )
+                                )).scalars().all()
+                                for child in children:
+                                    child.status = TaskStatus.CANCELLED
+                                    child.latest_status_message = "Cancelled: parent dependency failed"
+                                    child_acct = (child.context or {}).get("max_plan_account_id")
+                                    if child_acct and not (child.context or {}).get("_slot_released"):
+                                        await release_max_plan_account(child_acct)
+                                        child.context = {**(child.context or {}), "_slot_released": True}
+                                    cancel_session.add(child)
                                 await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
@@ -906,7 +926,7 @@ async def orchestrator_worker():
                                                 prov_failures = ctx.get("provision_failures", 0) + 1
                                                 ctx["provision_failures"] = prov_failures
                                                 ctx.pop("_infra_wait", None)
-                                                max_prov_retries = _runtime_config["max_provision_retries"]
+                                                max_prov_retries = _runtime_config.get("max_provision_retries", 3)
                                                 if prov_failures >= max_prov_retries:
                                                     # Exhausted retries — permanent failure
                                                     failed_task.status = TaskStatus.FAILED
@@ -962,7 +982,7 @@ async def orchestrator_worker():
                     await session.commit()
 
                 # Check tasks waiting on CI (review approved, CI pending)
-                CI_WAIT_TIMEOUT_MINUTES = 60
+                CI_WAIT_TIMEOUT_MINUTES = 20
                 ci_waiting_tasks = (await session.execute(
                     select(Task).where(Task.status == TaskStatus.EVALUATING).limit(200)
                 )).scalars().all()
@@ -974,9 +994,18 @@ async def orchestrator_worker():
                         continue  # Already handled — fix task spawned for merge conflicts
                     if ci_loop.get("ci_fix_spawned"):
                         continue  # Already handled — fix task spawned for CI failure
+                    if ci_loop.get("merge_rule_blocked"):
+                        continue  # Merge blocked by branch protection — requires manual intervention
                     ci_pr_number = ci_loop.get("pr_number")
                     if not ci_pr_number:
                         continue
+
+                    # Ensure ci_wait_started is always set — some paths set ci_waiting=True
+                    # without setting ci_wait_started, which silently disables the timeout.
+                    if not ci_loop.get("ci_wait_started"):
+                        ci_loop["ci_wait_started"] = _utcnow().isoformat()
+                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                        session.add(ci_task)
 
                     # Exponential backoff: skip if not enough time has elapsed since last poll.
                     # Webhooks handle the fast path — polling is a fallback.
@@ -992,28 +1021,30 @@ async def orchestrator_worker():
 
                     try:
                         # Timeout: if CI has been pending too long, proceed to merge anyway
+                        # Use ci_wait_started if available, otherwise fall back to started_at/created_at
                         ci_wait_started = ci_loop.get("ci_wait_started")
-                        if ci_wait_started:
-                            try:
-                                started = datetime.fromisoformat(ci_wait_started)
-                                if (_utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
-                                    # Escalate: alert the user but keep retrying.
-                                    # The 6-hour hard timeout in services.py is the true backstop.
-                                    if not ci_loop.get("escalated"):
-                                        ci_loop["escalated"] = True
-                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                        ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
-                                        session.add(ci_task)
-                                        await _maybe_create_failure_alert(
-                                            ci_task, session,
-                                            f"Rollup PR #{ci_pr_number} stuck in CI-wait for >{CI_WAIT_TIMEOUT_MINUTES}min — still retrying"
-                                        )
-                                        await session.commit()
-                                        await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                                   {"task_id": str(ci_task.id), "status": ci_task.status})
-                                    continue
-                            except (ValueError, TypeError) as e:
-                                logger.error(f"[CI] Malformed ci_wait_started for task {ci_task.id}: {ci_wait_started} ({e})", exc_info=True)
+                        try:
+                            started = datetime.fromisoformat(ci_wait_started) if ci_wait_started else None
+                        except (ValueError, TypeError):
+                            started = None
+                        if started is None:
+                            started = ci_task.started_at or ci_task.created_at
+                        if started and (_utcnow() - started).total_seconds() > CI_WAIT_TIMEOUT_MINUTES * 60:
+                            # Escalate: alert the user but keep retrying.
+                            # The 30-min backstop in services.py is the true hard-kill.
+                            if not ci_loop.get("escalated"):
+                                ci_loop["escalated"] = True
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(
+                                    ci_task, session,
+                                    f"Rollup PR #{ci_pr_number} stuck in CI-wait for >{CI_WAIT_TIMEOUT_MINUTES}min — still retrying"
+                                )
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                            # Fall through — continue polling CI even after escalation
 
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
 
@@ -1168,10 +1199,46 @@ async def orchestrator_worker():
                             continue
 
                         ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=str(ci_task.project_id))
+
+                        # Track whether CI checks have ever been observed for this PR
+                        ci_details = ci_result.get("details", [])
+                        if ci_details and not ci_loop.get("ci_checks_seen"):
+                            ci_loop["ci_checks_seen"] = True
+                            ci_loop["ci_first_check_seen_at"] = _utcnow().isoformat()
+
+                        # Detect stalled CI: no checks appeared after reasonable wait
+                        if not ci_loop.get("ci_checks_seen") and not ci_details:
+                            _cws = ci_loop.get("ci_wait_started")
+                            if _cws:
+                                try:
+                                    _no_checks_elapsed = (_utcnow() - datetime.fromisoformat(_cws)).total_seconds()
+                                    if _no_checks_elapsed > 600 and not ci_loop.get("no_checks_escalated"):
+                                        ci_loop["no_checks_escalated"] = True
+                                        ci_task.latest_status_message = (
+                                            f"No CI checks appeared on PR #{ci_pr_number} after "
+                                            f"{int(_no_checks_elapsed / 60)}min — may need manual trigger"
+                                        )
+                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                        session.add(ci_task)
+                                        await _maybe_create_failure_alert(
+                                            ci_task, session,
+                                            f"PR #{ci_pr_number}: no CI checks after {int(_no_checks_elapsed / 60)}min"
+                                        )
+                                        await session.commit()
+                                except (ValueError, TypeError):
+                                    pass
+
                         if ci_result["status"] != "completed":
-                            details = [d["name"] for d in ci_result.get("details", []) if d.get("status") in ("queued", "in_progress")]
+                            details = [d["name"] for d in ci_details if d.get("status") in ("queued", "in_progress")]
                             ci_task.latest_status_message = f"CI in progress on PR #{ci_pr_number}: {', '.join(details) or 'waiting for checks'}..."
-                            ci_loop["ci_poll_interval"] = min(ci_poll_interval * 2, 300)
+                            # Smarter backoff: faster when CI is actively running
+                            if ci_loop.get("escalated"):
+                                max_interval = 60   # Post-escalation: poll frequently
+                            elif ci_loop.get("ci_checks_seen"):
+                                max_interval = 90   # Checks running: moderate backoff
+                            else:
+                                max_interval = 120  # No checks yet: cautious backoff
+                            ci_loop["ci_poll_interval"] = min(ci_poll_interval * 2, max_interval)
                             ci_loop["ci_last_polled"] = _utcnow().isoformat()
                             ci_loop["head_sha"] = ci_head_sha
                             ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
@@ -1277,3 +1344,5 @@ async def orchestrator_worker():
         except asyncio.CancelledError:
             logger.info("[ORCHESTRATOR] Worker shutting down.")
             break
+        except Exception as e:
+            logger.error(f"[ORCHESTRATOR] Sleep/idle check error: {e}", exc_info=True)

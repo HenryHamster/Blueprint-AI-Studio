@@ -131,9 +131,13 @@ export function ProjectBuildConfigSection({
               Detect Build Config
             </button>
           ) : (
-            <p className="text-[11px] text-neutral-600">
-              Auto-detection endpoint is not yet available. Build config will be configurable after the next update.
-            </p>
+            <button
+              onClick={addDir}
+              className="inline-flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg px-4 py-2 text-xs transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add manually
+            </button>
           )}
         </div>
       )}

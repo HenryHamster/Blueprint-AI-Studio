@@ -102,7 +102,7 @@ Rules:
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'SECURITY_REPORT' }),
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'SECURITY_REPORT' }),
     logs,
   });
 }
@@ -347,9 +347,21 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
     const healthCheckUrls: string[] = Array.isArray(payload.health_check_urls)
       ? (payload.health_check_urls as string[])
       : [];
-    if (healthCheckUrls.length > 0) {
+    // Filter URLs: only allow http(s), block metadata endpoints and internal IPs
+    const safeUrls = healthCheckUrls.filter(u => {
+      try {
+        const parsed = new URL(u);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+        const host = parsed.hostname;
+        if (host === '169.254.169.254' || host === 'metadata.google.internal') return false;
+        if (host.startsWith('10.') || host.startsWith('192.168.') || host === 'localhost' || host === '127.0.0.1') return false;
+        if (host.startsWith('172.') && parseInt(host.split('.')[1]) >= 16 && parseInt(host.split('.')[1]) <= 31) return false;
+        return true;
+      } catch { return false; }
+    });
+    if (safeUrls.length > 0) {
       sendLog(ws, '\nLive endpoint checks:\n');
-      for (const url of healthCheckUrls) {
+      for (const url of safeUrls) {
         let curlStatus: string;
         let curlMessage: string;
         try {
@@ -379,6 +391,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
       artifact_type: 'SMOKETEST_RESULT',
       logs: JSON.stringify(smoketestResult),
       repo_url: `https://github.com/${owner}/${repo}`,
+      ...(!passed ? { failure_category: 'claude_code_failed' } : {}),
     });
   } else {
     await persistAndPostStatus(taskId, {
@@ -581,7 +594,7 @@ Rules:
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'PERF_REPORT' }),
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'PERF_REPORT' }),
     logs,
   });
 }
@@ -651,7 +664,7 @@ IMPORTANT:
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'INVESTIGATION_REPORT' }),
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'INVESTIGATION_REPORT' }),
     logs,
   });
 }

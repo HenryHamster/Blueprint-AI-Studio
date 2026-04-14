@@ -22,7 +22,9 @@ router = APIRouter(
 
 
 @router.get("/projects")
+@limiter.limit("30/minute")
 async def get_all_projects(
+    request: Request,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -111,7 +113,12 @@ async def update_project(
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
-        project.build_config = payload.build_config
+        from app.schemas import BuildConfig as BuildConfigSchema  # noqa: PLC0415
+        try:
+            validated = BuildConfigSchema(**payload.build_config) if payload.build_config else BuildConfigSchema()
+            project.build_config = validated.model_dump(exclude_none=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid build_config structure")
         flag_modified(project, "build_config")
 
     session.add(project)
@@ -121,7 +128,9 @@ async def update_project(
 
 
 @router.delete("/projects/{project_id}")
+@limiter.limit("10/minute")
 async def delete_project_admin(
+    request: Request,
     project_id: uuid.UUID,
     force: bool = Query(False),
     session: AsyncSession = Depends(get_session),
@@ -170,7 +179,9 @@ async def delete_project_admin(
 
 
 @router.post("/autonomous/pause-all")
+@limiter.limit("10/minute")
 async def pause_all_autonomous(
+    request: Request,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -185,7 +196,9 @@ async def pause_all_autonomous(
 
 
 @router.get("/projects/{project_id}/directions/task-counts")
+@limiter.limit("30/minute")
 async def get_direction_task_counts(
+    request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
@@ -196,7 +209,7 @@ async def get_direction_task_counts(
         select(Task).where(
             Task.project_id == project_id,
             Task.status.not_in([TaskStatus.CANCELLED, TaskStatus.FAILED]),
-        )
+        ).limit(5000)
     )
     tasks = result.scalars().all()
 
@@ -220,7 +233,9 @@ async def get_direction_task_counts(
 
 
 @router.patch("/projects/{project_id}/autonomous")
+@limiter.limit("30/minute")
 async def toggle_autonomous(
+    request: Request,
     project_id: uuid.UUID,
     payload: Dict[str, Any],
     session: AsyncSession = Depends(get_session),
@@ -242,7 +257,9 @@ async def toggle_autonomous(
 
 
 @router.get("/autonomous-status")
+@limiter.limit("30/minute")
 async def get_autonomous_status(
+    request: Request,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -255,8 +272,10 @@ async def get_autonomous_status(
     one_hour_ago = _utcnow() - timedelta(hours=1)
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
+    user_pids = _user_project_ids(current_user["user_id"])
     auto_tasks = (await session.execute(
         select(Task).where(
+            Task.project_id.in_(user_pids),
             Task.created_by == "ORCHESTRATOR",
             Task.created_at >= one_hour_ago,
         )
