@@ -378,6 +378,8 @@ export default function App() {
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
         userRole={s.userRole}
+        notificationConfig={s.notificationConfig}
+        onUpdateNotificationConfig={s.updateNotificationConfig}
       />
 
       <div

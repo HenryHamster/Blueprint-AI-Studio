@@ -293,6 +293,11 @@ async def get_settings(
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
+        "notification_config": _runtime_config.get("notification_config", {
+            "webhook_url": "",
+            "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"],
+            "throttle_seconds": 30,
+        }),
         "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
@@ -477,6 +482,44 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if any(not u.startswith(("http://", "https://")) for u in val if u):
             raise HTTPException(status_code=400, detail="health_check_urls entries must start with http:// or https://")
         _runtime_config["health_check_urls"] = [u for u in val if u]
+    if "notification_config" in payload:
+        val = payload["notification_config"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="notification_config must be an object")
+        webhook_url = val.get("webhook_url", "")
+        if not isinstance(webhook_url, str):
+            raise HTTPException(status_code=400, detail="notification_config.webhook_url must be a string")
+        if webhook_url and not webhook_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="notification_config.webhook_url must start with http:// or https://")
+        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"])
+        if not isinstance(enabled_events, list):
+            raise HTTPException(status_code=400, detail="notification_config.enabled_events must be a list")
+        throttle_seconds = val.get("throttle_seconds", 30)
+        try:
+            throttle_seconds = int(throttle_seconds)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="notification_config.throttle_seconds must be a number")
+        if not (0 <= throttle_seconds <= 3600):
+            raise HTTPException(status_code=400, detail="notification_config.throttle_seconds must be between 0 and 3600")
+        _runtime_config["notification_config"] = {
+            "webhook_url": webhook_url,
+            "enabled_events": enabled_events,
+            "throttle_seconds": throttle_seconds,
+        }
+    if "test_notification" in payload and payload["test_notification"] is True:
+        nc = _runtime_config.get("notification_config", {})
+        webhook_url = nc.get("webhook_url", "")
+        if not webhook_url:
+            raise HTTPException(status_code=400, detail="No webhook URL configured")
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(webhook_url, json={"type": "TEST", "message": "Blueprint test notification"})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"Webhook returned {resp.status_code}")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
+        return {"ok": True, "test_notification_sent": True}
 
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
@@ -504,6 +547,11 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
                     "require_approval_gates": _runtime_config.get("require_approval_gates", True),
                     "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+                    "notification_config": _runtime_config.get("notification_config", {
+                        "webhook_url": "",
+                        "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"],
+                        "throttle_seconds": 30,
+                    }),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)

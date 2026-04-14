@@ -102,6 +102,8 @@ export interface HeaderBarProps {
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
   userRole: 'admin' | 'user' | null;
+  notificationConfig: import('./SettingsNotificationsSection').NotificationConfig;
+  onUpdateNotificationConfig: (config: Partial<import('./SettingsNotificationsSection').NotificationConfig>) => void;
 }
 
 
@@ -362,6 +364,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onSignOut={props.onSignOut}
           showUserManagement={props.showUserManagement}
           onToggleUserManagement={props.onToggleUserManagement}
+          notificationConfig={props.notificationConfig}
+          onUpdateNotificationConfig={props.onUpdateNotificationConfig}
         />
 
         {/* More secondary buttons — desktop only */}
