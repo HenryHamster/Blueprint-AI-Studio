@@ -16,6 +16,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _user_project_ids
+from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -950,6 +951,14 @@ async def get_digest(
     undirected_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
     total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
 
+    # Compute today's cost for cost ceiling warning
+    today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_cost_usd = round(sum(
+        (t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= today_start
+    ), 2)
+    daily_cost_ceiling_usd = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
+
     # Compute overall product_ratio and type_distribution across all directions
     all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
     overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
@@ -999,6 +1008,8 @@ async def get_digest(
         "overall_product_ratio": overall_product_ratio,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
+        "daily_cost_usd": daily_cost_usd,
+        "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,
         "prev_completed_count": prev_completed_count,
         "prev_failed_count": prev_failed_count,
