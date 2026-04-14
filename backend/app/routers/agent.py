@@ -582,6 +582,12 @@ async def claim_task(
                         response["project_context"] = {}
                     response["project_context"]["direction_quality"] = direction_quality
 
+    # Inject build_config so the agent knows how to lint/test/build
+    if project_for_playbook and project_for_playbook.build_config:
+        response["build_config"] = project_for_playbook.build_config
+    else:
+        response["build_config"] = {}
+
     return response
 
 @router.post("/artifacts/upload-url")

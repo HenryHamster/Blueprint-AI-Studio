@@ -343,6 +343,60 @@ async def github_webhook(
                         from app.rollup_management import _check_and_trigger_rollup
                         for at in affected_tasks:
                             await _check_and_trigger_rollup(at, session)
+                        try:
+                            from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                            for at in affected_tasks:
+                                asyncio.ensure_future(dispatch_external_notification(
+                                    at.project_id,
+                                    "PR_MERGED",
+                                    {
+                                        "task_id": str(at.id),
+                                        "task_title": at.title or str(at.id)[:8],
+                                        "pr_number": pr_number,
+                                        "repo": f"{owner}/{repo}",
+                                    },
+                                ))
+                        except Exception as _ne:
+                            logger.warning(f"[NOTIFY] PR_MERGED dispatch setup failed: {_ne}")
+
+        elif action == "closed" and not merged:
+            # PR closed without merge — record as operator rejection signal
+            repo_full = data.get("repository", {}).get("full_name", "")
+            if "/" in repo_full:
+                owner, repo = repo_full.split("/", 1)
+                # Verify repo belongs to a registered project (same guard as merged branch)
+                project_check = await session.execute(
+                    select(Project).where(
+                        Project.github_owner == owner,
+                        Project.github_repo == repo,
+                    )
+                )
+                if not project_check.scalars().first():
+                    logger.info(f"[WEBHOOK] Ignoring PR close event for unregistered repo {repo_full}")
+                    return {"status": "ignored"}
+                pr_number = data["pull_request"].get("number")
+                if pr_number:
+                    pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
+                    art_result = await session.execute(
+                        select(Artifact).where(
+                            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                            Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
+                        )
+                    )
+                    pr_artifacts = art_result.scalars().all()
+                    if pr_artifacts:
+                        pr_body = data.get("pull_request", {}).get("body") or ""
+                        rejection_note = pr_body[:500] if pr_body else None
+                        for art in pr_artifacts:
+                            pr_task = await session.get(Task, art.task_id)
+                            if pr_task and not (pr_task.context or {}).get("pr_rejected"):
+                                update: dict = {"pr_rejected": True}
+                                if rejection_note:
+                                    update["pr_rejection_note"] = rejection_note
+                                pr_task.context = {**(pr_task.context or {}), **update}
+                                session.add(pr_task)
+                                logger.info(f"[WEBHOOK] Set pr_rejected on task {pr_task.id} (PR #{pr_number})")
+                        await session.commit()
 
     elif event_type == 'check_run':
         action = data.get('action')
@@ -374,6 +428,30 @@ async def github_webhook(
                     and (t.context or {}).get('review_loop', {}).get('head_sha') == head_sha]
 
         if not matching:
+            # No EVALUATING tasks match — check if this is a protected-branch CI failure
+            conclusion = check_run.get('conclusion')
+            head_branch = (check_run.get('check_suite') or {}).get('head_branch')
+            if conclusion == 'failure' and head_branch:
+                # Read auto-remediation config from project
+                auto_remediation_config = (project.design_doc or {}).get('_auto_remediation', {})
+                enabled = auto_remediation_config.get('enabled', False)
+                branch_whitelist = auto_remediation_config.get('branch_whitelist', ['main', 'master'])
+
+                if not enabled or head_branch not in branch_whitelist:
+                    return {'status': 'ignored_auto_remediation_disabled'}
+
+                from app.auto_remediation import _handle_main_branch_ci_failure
+                background_tasks.add_task(
+                    _handle_main_branch_ci_failure,
+                    owner=owner,
+                    repo=repo,
+                    head_sha=head_sha,
+                    head_branch=head_branch,
+                    project_id=project.id,
+                    config=auto_remediation_config,
+                )
+                return {'status': 'auto_remediation_triggered'}
+
             return {'status': 'no_match'}
 
         # Fetch full check status for this SHA (1 API call covers all check runs)

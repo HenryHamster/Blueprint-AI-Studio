@@ -91,11 +91,15 @@ class Project(SQLModel, table=True):
     vision: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     # Living architectural description maintained by design doc update agent
     design_doc: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
+    # Build configuration for agent lint/test/build commands (auto-detected or user-provided)
+    build_config: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
+    # Build configuration: directories, commands, git identity for the agent
+    build_config: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
 
     tasks: List["Task"] = Relationship(
         back_populates="project",

@@ -513,7 +513,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             raise HTTPException(status_code=400, detail="notification_config.webhook_url must start with http:// or https://")
         _VALID_NOTIFICATION_EVENTS = frozenset([
             "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
-            "PR_MERGED", "BUDGET_EXCEEDED",
+            "PR_MERGED", "BUDGET_EXCEEDED", "AUTO_FIX_SPAWNED", "AUTO_FIX_MERGED",
         ])
         enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"])
         if not isinstance(enabled_events, list):
@@ -1492,3 +1492,80 @@ async def cost_summary(
         'by_task_type': dict(by_type),
         'total_estimated_cost': sum(v['estimated_cost'] for v in by_type.values()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Auto-remediation config endpoints
+# ---------------------------------------------------------------------------
+
+_AUTO_REMEDIATION_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "branch_whitelist": ["main", "master"],
+    "max_per_hour": 2,
+    "max_concurrent": 2,
+    "require_review": True,
+}
+
+
+@router.get("/projects/{project_id}/auto-remediation")
+async def get_auto_remediation_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the current auto-remediation config for a project, merged with defaults."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    stored = (project.design_doc or {}).get("_auto_remediation", {})
+    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    return {"project_id": str(project_id), "config": config}
+
+
+@router.patch("/projects/{project_id}/auto-remediation")
+async def update_auto_remediation_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update auto-remediation config fields (partial update)."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+
+    # Validate incoming fields
+    allowed = set(_AUTO_REMEDIATION_DEFAULTS.keys())
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown config fields: {sorted(unknown)}")
+
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        raise HTTPException(status_code=422, detail="'enabled' must be a boolean")
+
+    if "branch_whitelist" in body:
+        bw = body["branch_whitelist"]
+        if not isinstance(bw, list) or not all(isinstance(b, str) and b for b in bw):
+            raise HTTPException(status_code=422, detail="'branch_whitelist' must be a list of non-empty strings")
+
+    if "max_per_hour" in body:
+        v = body["max_per_hour"]
+        if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 10):
+            raise HTTPException(status_code=422, detail="'max_per_hour' must be an integer between 1 and 10")
+
+    if "max_concurrent" in body:
+        v = body["max_concurrent"]
+        if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
+            raise HTTPException(status_code=422, detail="'max_concurrent' must be an integer between 1 and 5")
+
+    if "require_review" in body and not isinstance(body["require_review"], bool):
+        raise HTTPException(status_code=422, detail="'require_review' must be a boolean")
+
+    # Merge into existing stored config
+    design_doc = dict(project.design_doc or {})
+    stored = dict(design_doc.get("_auto_remediation", {}))
+    stored.update(body)
+    design_doc["_auto_remediation"] = stored
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    return {"project_id": str(project_id), "config": config}

@@ -2,6 +2,7 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import { sendLog, WORKSPACE } from './index.js';
+import type { BuildConfig } from './index.js';
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
 // Write .claude/settings.json in the workspace to restrict what the inner
@@ -60,6 +61,51 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'refactor': 'Run the full test suite BEFORE and AFTER changes. Zero test regressions allowed. Do not change external behavior. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',
   'investigate': 'This is a read-only investigation. Do NOT modify any files. Write your findings to the output JSON only.',
 };
+
+// ── Dynamic Task Type Hints (based on project build configuration) ───────────
+export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, string> {
+  const dirs = buildConfig?.directories ?? [];
+  if (dirs.length === 0) return TASK_TYPE_HINTS;
+
+  const pythonDirs = dirs.filter(d => d.type === 'python');
+  const nodeDirs = dirs.filter(d => d.type === 'node');
+  const hints: Record<string, string> = { ...TASK_TYPE_HINTS };
+
+  // 'migrate' hint: detect migration framework from directory types
+  const pyDir = pythonDirs.length > 0 ? pythonDirs[0].path.replace(/\/$/, '') : null;
+  const nodeDir = nodeDirs.length > 0 ? nodeDirs[0].path.replace(/\/$/, '') : null;
+  if (pyDir) {
+    hints['migrate'] = `This is a database migration task. Check existing Alembic migrations in ${pyDir}/alembic/versions/ for naming conventions. Use \`alembic revision --autogenerate\` as a starting point only — always review and clean up generated migrations.`;
+  } else if (nodeDir) {
+    hints['migrate'] = `This is a database migration task. Check existing migration files in ${nodeDir}/ for naming conventions. For Prisma: use \`prisma migrate dev\` to generate migrations — always review generated output.`;
+  }
+
+  // 'create'/'refactor' hints: reference actual build/test commands
+  const testCmds: string[] = [];
+  for (const dir of dirs) {
+    if (dir.test_cmd) testCmds.push(`${dir.path}: \`${dir.test_cmd}\``);
+    else if (dir.build_cmd) testCmds.push(`${dir.path}: \`${dir.build_cmd}\``);
+  }
+  if (testCmds.length > 0) {
+    const cmdsText = testCmds.join(', ');
+    hints['create'] = `Before finishing: Run the relevant lint, build, and test commands for every area you modified (${cmdsText}). Fix any failures. Do not leave broken tests, lint errors, build failures, or conflict markers. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.`;
+    hints['refactor'] = `Run the full test suite BEFORE and AFTER changes (${cmdsText}). Zero test regressions allowed. Do not change external behavior. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.`;
+  }
+
+  // 'deps' hint: list actual package managers detected
+  const pkgManagers: string[] = [];
+  for (const dir of dirs) {
+    if (dir.type === 'python') pkgManagers.push('pip/poetry');
+    else if (dir.type === 'node') pkgManagers.push('npm/yarn');
+    else if (dir.type === 'go') pkgManagers.push('go mod');
+    else if (dir.type === 'rust') pkgManagers.push('cargo');
+  }
+  if (pkgManagers.length > 0) {
+    hints['deps'] = `Check for breaking changes in major version bumps. This project uses ${pkgManagers.join(', ')}. Run the full test suite after updating to verify compatibility.`;
+  }
+
+  return hints;
+}
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
@@ -246,7 +292,7 @@ export function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
-export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[]): string {
+export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[], buildConfig?: BuildConfig): string {
   if (relatedFiles.length === 0) return '';
 
   try {
@@ -277,27 +323,67 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
       } catch { /* skip unreadable */ }
     };
 
+    // Build a lookup from directory prefix → directory type using buildConfig if provided
+    const dirConfigs = buildConfig?.directories ?? [];
+
     for (const relFile of relatedFiles) {
-      // Convention-based discovery
-      if (relFile.startsWith('backend/') && relFile.endsWith('.py')) {
-        const base = relFile.replace(/^backend\/app\//, '').replace(/\.py$/, '');
-        const candidate = `backend/testing/test_${base.split('/').pop()}.py`;
-        processTestFile(candidate);
-      } else if (relFile.match(/^admin-ui\/.*\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
-        const testPath = relFile.replace(/\.(tsx?|jsx?)$/, '.test.$1');
-        processTestFile(testPath);
-      } else if (relFile.startsWith('agent/')) {
-        // Search for any test files in agent/
-        try {
-          const agentTestFiles = execFileSync('git', ['ls-files', 'agent/'],
-            { cwd: WORKSPACE, encoding: 'utf-8' })
-            .split('\n')
-            .filter(f => f.includes('.test.') || f.includes('test_') || f.includes('/tests/'));
-          for (const tf of agentTestFiles) processTestFile(tf);
-        } catch { /* skip */ }
+      // Convention-based discovery: use buildConfig.directories if available, else hardcoded Blueprint paths
+      let discoveredByConvention = false;
+
+      if (dirConfigs.length > 0) {
+        for (const dir of dirConfigs) {
+          const dirPrefix = dir.path.replace(/\/$/, '');
+          if (!relFile.startsWith(dirPrefix + '/')) continue;
+          discoveredByConvention = true;
+
+          if (dir.type === 'python' && relFile.endsWith('.py')) {
+            // Look for test_<module>.py in common test directories
+            const base = relFile.replace(new RegExp(`^${dirPrefix}/`), '').replace(/\.py$/, '');
+            const moduleName = base.split('/').pop() || base;
+            for (const testDir of [`${dirPrefix}/testing`, `${dirPrefix}/tests`, `${dirPrefix}/test`]) {
+              processTestFile(`${testDir}/test_${moduleName}.py`);
+            }
+          } else if ((dir.type === 'node') && relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+            const testPath = relFile.replace(/\.(tsx?|jsx?)$/, (ext) => `.test${ext}`);
+            processTestFile(testPath);
+            // Also search for any test files in this directory
+            try {
+              const nodeTestFiles = execFileSync('git', ['ls-files', dirPrefix + '/'],
+                { cwd: WORKSPACE, encoding: 'utf-8' })
+                .split('\n')
+                .filter(f => f.includes('.test.') || f.includes('.spec.'));
+              for (const tf of nodeTestFiles) processTestFile(tf);
+            } catch { /* skip */ }
+          } else {
+            // Unknown type: fall through to grep-based discovery
+            discoveredByConvention = false;
+          }
+        }
+      } else {
+        // Hardcoded Blueprint conventions
+        if (relFile.startsWith('backend/') && relFile.endsWith('.py')) {
+          const base = relFile.replace(/^backend\/app\//, '').replace(/\.py$/, '');
+          const candidate = `backend/testing/test_${base.split('/').pop()}.py`;
+          processTestFile(candidate);
+          discoveredByConvention = true;
+        } else if (relFile.match(/^admin-ui\/.*\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+          const testPath = relFile.replace(/\.(tsx?|jsx?)$/, (ext) => `.test${ext}`);
+          processTestFile(testPath);
+          discoveredByConvention = true;
+        } else if (relFile.startsWith('agent/')) {
+          // Search for any test files in agent/
+          try {
+            const agentTestFiles = execFileSync('git', ['ls-files', 'agent/'],
+              { cwd: WORKSPACE, encoding: 'utf-8' })
+              .split('\n')
+              .filter(f => f.includes('.test.') || f.includes('test_') || f.includes('/tests/'));
+            for (const tf of agentTestFiles) processTestFile(tf);
+          } catch { /* skip */ }
+          discoveredByConvention = true;
+        }
       }
 
-      // Grep-based discovery: find test files importing from this module
+      // Grep-based discovery: find test files importing from this module (always run)
       try {
         const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
         if (moduleName) {
@@ -308,6 +394,8 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
           }
         }
       } catch { /* no matches */ }
+
+      void discoveredByConvention; // used for control flow, not needed after loop
     }
 
     if (testEntries.length === 0) return '';

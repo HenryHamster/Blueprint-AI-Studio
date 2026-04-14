@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus } from 'lucide-react';
+import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus } from 'lucide-react';
 import type { Task } from './TaskCard';
 
 export type { Project } from '../types/project';
@@ -12,6 +12,8 @@ interface ProjectDashboardProps {
   onSelectProject: (projectId: string | null) => void;
   showMembers?: boolean;
   onToggleMembers?: () => void;
+  userRole?: 'admin' | 'user' | null;
+  onNewProject?: () => void;
 }
 
 
@@ -27,7 +29,7 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -37,23 +39,35 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
 
   return (
     <div className="mb-4 shrink-0">
-      <button
-        onClick={() => {
-          const next = !collapsed;
-          setCollapsed(next);
-          localStorage.setItem('projectDashboardCollapsed', String(next));
-        }}
-        className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-300 transition-colors"
-      >
-        <FolderKanban className="w-3.5 h-3.5" />
-        Projects
-        {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
-        {selectedProjectId && (
-          <span className="text-[10px] normal-case tracking-normal font-medium text-blue-400 ml-1">
-            (filtered)
-          </span>
+      <div className="flex items-center justify-between mb-2">
+        <button
+          onClick={() => {
+            const next = !collapsed;
+            setCollapsed(next);
+            localStorage.setItem('projectDashboardCollapsed', String(next));
+          }}
+          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+        >
+          <FolderKanban className="w-3.5 h-3.5" />
+          Projects
+          {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+          {selectedProjectId && (
+            <span className="text-[10px] normal-case tracking-normal font-medium text-blue-400 ml-1">
+              (filtered)
+            </span>
+          )}
+        </button>
+        {userRole === 'admin' && onNewProject && (
+          <button
+            onClick={onNewProject}
+            className="flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 rounded px-1.5 py-0.5 transition-colors"
+            title="Add new project"
+          >
+            <Plus className="w-3 h-3" />
+            New
+          </button>
         )}
-      </button>
+      </div>
 
       {!collapsed && (
         <div className="flex gap-4 px-1 pb-2">

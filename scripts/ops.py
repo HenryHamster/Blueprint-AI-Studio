@@ -14,6 +14,8 @@ Usage:
     python scripts/ops.py accounts                  — manage accounts (--disable/--enable/--remove ID)
     python scripts/ops.py zones                     — show zone health
     python scripts/ops.py autonomy                  — show autonomous research state
+    python scripts/ops.py directions                — show project directions, notes, and history
+    python scripts/ops.py vision                    — show product vision and design document
     python scripts/ops.py diagnostics               — pipeline diagnostics (stuck tasks, circuit breakers)
     python scripts/ops.py alerts [--dismiss ID]     — show/dismiss system alerts
     python scripts/ops.py digest [--hours N]        — catch-up digest (default 24h)
@@ -542,6 +544,213 @@ def cmd_messages(args):
         print(f"  [{icon}] ({src}, {age}) {m['content'][:120]}")
 
 
+def cmd_directions(args):
+    """Show project directions with status, notes, and research history.
+
+    Usage:
+        ops.py directions                   — show all active/proposed directions
+        ops.py directions --all             — include paused/completed/expired
+        ops.py directions --id d-xxxx       — show single direction in detail
+    """
+    pid = get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+    directions = data.get('directions', [])
+
+    if not directions:
+        print("No directions configured.")
+        return
+
+    # Single direction detail view
+    if args and args[0] == '--id' and len(args) > 1:
+        target = args[1]
+        match = [d for d in directions if d.get('id', '').startswith(target)]
+        if not match:
+            print(f"Direction not found: {target}")
+            return
+        d = match[0]
+        print(f"=== DIRECTION: {d.get('id', '?')} ===")
+        print(f"  Text:       {d.get('text', '?')}")
+        print(f"  Status:     {d.get('status', '?')}")
+        print(f"  Priority:   {d.get('priority', '?')}")
+        print(f"  Category:   {d.get('category', '-')}")
+        print(f"  Merge rate: {d.get('merge_rate', 0):.2f}")
+        print(f"  Added:      {(d.get('added_at') or '?')[:19]}")
+        if d.get('paths'):
+            print(f"  Paths:      {', '.join(d['paths'])}")
+        if d.get('completion_criteria'):
+            print(f"  Criteria:   {d['completion_criteria']}")
+        if d.get('possibly_complete'):
+            print(f"  ** Possibly complete: {d.get('completion_suggestion', '(no suggestion)')}")
+        if d.get('possibly_saturated'):
+            print(f"  ** Possibly saturated")
+        if d.get('conflicts_with'):
+            print(f"  Conflicts:  {', '.join(d['conflicts_with'])}")
+        if d.get('pending_update'):
+            pu = d['pending_update']
+            print(f"\n  --- Pending Update ---")
+            if pu.get('suggested_text'):
+                print(f"    Text:     {pu['suggested_text'][:150]}")
+            if pu.get('suggested_priority'):
+                print(f"    Priority: {pu['suggested_priority']}")
+            if pu.get('rationale'):
+                print(f"    Reason:   {pu['rationale'][:200]}")
+
+        notes = d.get('notes', [])
+        if notes:
+            print(f"\n  --- Notes ({len(notes)}) ---")
+            for n in notes:
+                ts = (n.get('added_at') or n.get('timestamp') or '?')[:16]
+                text = n.get('text', '?')
+                print(f"    [{ts}] {text[:200]}")
+
+        history = d.get('research_history', [])
+        agg = d.get('history_aggregate', {})
+        if history or agg:
+            total_cycles = len(history) + (agg.get('total_cycles') or 0)
+            total_merged = sum(e.get('prs_merged', 0) for e in history) + (agg.get('total_prs_merged') or 0)
+            total_tasks = sum(e.get('tasks_created', 0) for e in history) + (agg.get('total_tasks_created') or 0)
+            print(f"\n  --- Research History ({total_cycles} cycles, {total_tasks} tasks, {total_merged} merged) ---")
+            for i, h in enumerate(history[-5:]):  # last 5 cycles
+                ts = (h.get('researched_at') or '?')[:16]
+                tc = h.get('tasks_created', 0)
+                pm = h.get('prs_merged', 0)
+                print(f"    {ts}  tasks={tc}  merged={pm}")
+
+        ctx = d.get('research_context', '')
+        if ctx:
+            print(f"\n  --- Research Context ---")
+            for line in ctx.strip().split('\n')[:20]:
+                print(f"    {line}")
+            lines = ctx.strip().split('\n')
+            if len(lines) > 20:
+                print(f"    ... ({len(lines) - 20} more lines)")
+        return
+
+    # List view
+    show_all = args and args[0] == '--all'
+    visible_statuses = {'active', 'proposed'} if not show_all else None
+
+    # Group by status
+    grouped: dict[str, list] = {}
+    for d in directions:
+        status = d.get('status', 'active')
+        if visible_statuses and status not in visible_statuses:
+            continue
+        grouped.setdefault(status, []).append(d)
+
+    status_order = ['proposed', 'active', 'paused', 'completed', 'expired']
+    status_icons = {'proposed': '?', 'active': '*', 'paused': '|', 'completed': '+', 'expired': 'x'}
+
+    print(f"=== DIRECTIONS ({sum(len(v) for v in grouped.values())} shown) ===")
+    for status in status_order:
+        dirs_in_status = grouped.get(status, [])
+        if not dirs_in_status:
+            continue
+        print(f"\n  [{status.upper()}]")
+        for d in dirs_in_status:
+            did = d.get('id', '?')
+            pri = d.get('priority', 'med')[:3]
+            cat = (d.get('category') or '-')[:5]
+            text = d.get('text', '?')[:80]
+            mr = d.get('merge_rate', 0)
+            icon = status_icons.get(status, ' ')
+            notes_ct = len(d.get('notes', []))
+            notes_str = f"  [{notes_ct} notes]" if notes_ct else ""
+            flags = []
+            if d.get('possibly_complete'):
+                flags.append('COMPLETE?')
+            if d.get('possibly_saturated'):
+                flags.append('SATURATED?')
+            if d.get('pending_update'):
+                flags.append('UPDATE?')
+            flag_str = f"  !! {', '.join(flags)}" if flags else ""
+            print(f"    {icon} {did}  [{pri:3}] [{cat:5}]  mr={mr:.1f}  {text}{notes_str}{flag_str}")
+
+    if not show_all:
+        hidden = len(directions) - sum(len(v) for v in grouped.values())
+        if hidden > 0:
+            print(f"\n  ({hidden} paused/completed/expired hidden — use --all to show)")
+
+
+def cmd_vision(args):
+    """Show the product vision and design document.
+
+    Usage:
+        ops.py vision                       — show the strategic vision
+        ops.py vision --design-doc          — show the design document (architecture wiki)
+        ops.py vision --design-doc KEY      — show a single design doc page
+    """
+    import io, os
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    pid = get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+
+    if args and args[0] == '--design-doc':
+        doc = data.get('design_doc', {})
+        if not doc:
+            print("No design document yet.")
+            return
+        if len(args) > 1:
+            key = args[1]
+            page = doc.get(key)
+            if page is None:
+                print(f"Page not found: {key}")
+                print(f"Available pages: {', '.join(sorted(doc.keys()))}")
+                return
+            print(f"=== DESIGN DOC: {key} ===")
+            print(json.dumps(page, indent=2))
+        else:
+            print(f"=== DESIGN DOCUMENT ({len(doc)} pages) ===")
+            for key in sorted(doc.keys()):
+                page = doc[key]
+                if isinstance(page, dict):
+                    summary = page.get('summary', page.get('description', str(page)[:120]))
+                    status = page.get('status', '')
+                    status_str = f" [{status}]" if status else ''
+                    print(f"  {key}{status_str} — {str(summary)[:100]}")
+                else:
+                    print(f"  {key} — {str(page)[:100]}")
+        return
+
+    vision = data.get('vision', {})
+    if not vision:
+        print("No vision set yet.")
+        return
+
+    print("=== PRODUCT VISION ===")
+    print(f"  Purpose:  {vision.get('purpose', '(not set)')}")
+    focus = vision.get('focus')
+    if focus:
+        if isinstance(focus, list):
+            print(f"  Focus ({len(focus)} active):")
+            for f in focus:
+                print(f"    - {f}")
+        else:
+            print(f"  Focus:    {focus}")
+    print(f"  Revision: {vision.get('revision', '?')}")
+    print(f"  Updated:  {(vision.get('last_updated') or '?')[:19]}")
+    criteria = vision.get('success_criteria', [])
+    if criteria:
+        print(f"\n  Success criteria ({len(criteria)}):")
+        for c in criteria:
+            print(f"    - {c}")
+    systems = vision.get('systems', [])
+    if systems:
+        print(f"\n  Systems ({len(systems)}):")
+        for s in systems:
+            sid = s.get('id', '?')
+            name = s.get('name', '?')
+            status = s.get('status', '?')
+            print(f"    {sid} [{status}] {name}")
+    context = vision.get('context', '')
+    if context:
+        print(f"\n  Context:\n    {context[:500]}")
+    cycles = vision.get('_strategic_cycle_count', 0)
+    spawns = vision.get('_research_spawn_count', 0)
+    if cycles or spawns:
+        print(f"\n  Stats: {spawns} research spawns, {cycles} strategic cycles")
+
+
 COMMANDS = {
     'status': cmd_status,
     'resume': cmd_resume,
@@ -555,6 +764,8 @@ COMMANDS = {
     'accounts': cmd_accounts,
     'zones': cmd_zones,
     'autonomy': cmd_autonomy,
+    'directions': cmd_directions,
+    'vision': cmd_vision,
     'diagnostics': cmd_diagnostics,
     'alerts': cmd_alerts,
     'digest': cmd_digest,

@@ -2190,12 +2190,13 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
 
     await _spawn_research_task(project, db_session)
 
-    # force_strategic should have fired — a design_doc_update task should be created
-    # (design_doc_update is Phase 1 of the strategic cycle, chaining to strategic_review)
+    # force_strategic should have fired — a strategic task should be created.
+    # Depending on the cycle count, this is either design_doc_update (architecture
+    # cycle) or strategic_review (strategy-only cycle).
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, "Expected one strategic task to be spawned after decay"
-    assert tasks[0].payloads[0].get("type") == "design_doc_update"
+    assert tasks[0].payloads[0].get("type") in ("design_doc_update", "strategic_review")
 
 
 @pytest.mark.asyncio
@@ -2247,7 +2248,8 @@ async def test_all_saturated_directions_triggers_force_strategic(db_session):
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     task_types = [t.payloads[0].get("type") for t in tasks]
-    assert "design_doc_update" in task_types, "Expected a strategic (design_doc_update) task when all directions are saturated"
+    strategic_types = {"design_doc_update", "strategic_review"}
+    assert any(t in strategic_types for t in task_types), "Expected a strategic task when all directions are saturated"
     assert "research" not in task_types, "Expected no research tasks when all directions are saturated"
 
 

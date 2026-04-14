@@ -5,6 +5,7 @@ import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
 import type { Task } from '../types/task';
+import type { BuildConfig } from '../types/project';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -104,6 +105,13 @@ export interface HeaderBarProps {
   userRole: 'admin' | 'user' | null;
   notificationConfig: import('./SettingsNotificationsSection').NotificationConfig;
   onUpdateNotificationConfig: (config: Partial<import('./SettingsNotificationsSection').NotificationConfig>) => void;
+  // Build config (project-scoped)
+  selectedProjectId: string | null;
+  selectedProjectOwner: string | null;
+  selectedProjectRepo: string | null;
+  buildConfig: BuildConfig | null;
+  onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
+  onDetectBuildConfig: () => Promise<void>;
 }
 
 
@@ -366,6 +374,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onToggleUserManagement={props.onToggleUserManagement}
           notificationConfig={props.notificationConfig}
           onUpdateNotificationConfig={props.onUpdateNotificationConfig}
+          selectedProjectId={props.selectedProjectId}
+          selectedProjectOwner={props.selectedProjectOwner}
+          selectedProjectRepo={props.selectedProjectRepo}
+          buildConfig={props.buildConfig}
+          onUpdateBuildConfig={props.onUpdateBuildConfig}
+          onDetectBuildConfig={props.onDetectBuildConfig}
         />
 
         {/* More secondary buttons — desktop only */}

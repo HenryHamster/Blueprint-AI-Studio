@@ -222,6 +222,96 @@ def test_classify_failure_genuine_code_error_no_fatal_prefix():
     assert classify_failure(task) == "CODE_ERROR"
 
 
+def test_classify_failure_merge_attempt_is_external_api():
+    """'Merge attempt N failed' messages from ci_completion.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="Merge attempt 3 failed on PR #42: Repository rule violations",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_merge_blocked_is_external_api():
+    """'merge blocked' messages from rollup_management.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="merge blocked: branch protection rules require passing CI",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_repository_rule_violations_is_external_api():
+    """'repository rule' violations → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="GitHub merge rejected: repository rule violations",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_not_mergeable_is_external_api():
+    """'not mergeable' state → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="PR is not mergeable: required status checks pending",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_merge_conflicts_is_external_api():
+    """'merge conflicts' from orchestrator.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="merge conflicts — fix iterations exhausted on PR #88",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_merge_check_failed_is_external_api():
+    """'merge check failed' from ci_completion.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="Merge check failed on PR #17: required checks pending",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_ci_wait_exceeded_is_agent_timeout():
+    """'ci wait exceeded' messages from orchestrator.py → AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="CI wait exceeded for PR #55 after 2 hours",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_ci_wait_timed_out_is_agent_timeout():
+    """'ci wait timed out' → AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="ci wait timed out waiting for checks to complete",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_ci_in_progress_is_agent_timeout():
+    """'CI in progress' on timed-out tasks from orchestrator.py → AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="CI in progress on PR #42 (task timed out waiting)",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_stuck_in_ci_wait_is_agent_timeout():
+    """'stuck in ci-wait' → AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="task stuck in ci-wait state for PR #99",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Declining merge rates
 # ─────────────────────────────────────────────────────────────────────────────
