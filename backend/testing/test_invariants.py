@@ -344,6 +344,11 @@ FRONTEND_SIZE_LIMITS = {
     "components/KanbanBoard.tsx": 1500,
     "components/KanbanColumn.tsx": 1500,
     "App.tsx": 2000,
+    "components/TaskCard.tsx": 1500,
+    "components/DirectionCard.tsx": 1200,
+    "components/PipelineView.tsx": 1200,
+    "components/DashboardHome.tsx": 1200,
+    "components/MessagesPanel.tsx": 1000,
 }
 
 
@@ -394,3 +399,18 @@ class TestFrontendSizeGuardrails:
 
     def test_app_tsx(self):
         self._check_frontend("App.tsx")
+
+    def test_task_card(self):
+        self._check_frontend("components/TaskCard.tsx")
+
+    def test_direction_card(self):
+        self._check_frontend("components/DirectionCard.tsx")
+
+    def test_pipeline_view(self):
+        self._check_frontend("components/PipelineView.tsx")
+
+    def test_dashboard_home(self):
+        self._check_frontend("components/DashboardHome.tsx")
+
+    def test_messages_panel(self):
+        self._check_frontend("components/MessagesPanel.tsx")
