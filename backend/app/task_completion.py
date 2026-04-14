@@ -330,7 +330,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             raw_type = child_payload.get('type', 'create')
             child_payload['type'] = raw_type if raw_type in _allowed_types else 'create'
 
-            child.payloads = [child_payload]
+            child.payloads = [validate_internal_payload(child_payload, f"plan_enrichment:child_{i}")]
             child.requires_approval = False  # high-risk children execute freely; approval gates the final rollup merge
             child_approval_reason = child_payload.get('approval_reason') if child_risk == 'high' else None
             existing_ctx = child.context or {}
