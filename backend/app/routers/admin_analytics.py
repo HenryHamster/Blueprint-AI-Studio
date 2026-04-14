@@ -2,6 +2,7 @@
 import uuid
 import json
 import logging
+from collections import defaultdict
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
@@ -1292,3 +1293,27 @@ async def get_health_overview(
         "direction_portfolio": direction_portfolio,
         "queue_depth": queue_depth,
     }
+
+@router.get("/task-duration-stats")
+async def get_task_duration_stats(
+    project_id: Optional[uuid.UUID] = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """p50 duration per task type from COMPLETED tasks in last 7 days."""
+    filters = [Task.status == TaskStatus.COMPLETED, Task.started_at.is_not(None), Task.created_at >= _utcnow() - timedelta(days=7)]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+    completed = (await session.execute(select(Task).where(*filters))).scalars().all()
+    type_durations: dict = defaultdict(list)
+    for t in completed:
+        try: cat = datetime.fromisoformat(t.status_log[-1]["t"]) if t.status_log else t.created_at
+        except Exception: cat = t.created_at
+        dur = (cat - t.started_at).total_seconds()
+        if dur > 0: type_durations[(t.first_payload).get("type", "create")].append(dur)
+    stats: dict = {}
+    for tt, durs in type_durations.items():
+        if len(durs) >= 3:
+            sd = sorted(durs); mid = len(sd) // 2
+            stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
+    return {"stats": stats}

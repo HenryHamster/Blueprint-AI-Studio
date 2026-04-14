@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
+import { authGet, API_BASE_URL } from '../api';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
 function formatCompact(seconds: number): string {
@@ -160,6 +161,38 @@ export function useElapsedTime(startIso: string, endIso?: string): string {
   const start = parseTimestamp(startIso).getTime();
   const end = endIso ? parseTimestamp(endIso).getTime() : now;
   return formatDurationMs(Math.max(0, end - start));
+}
+
+type DurationStats = Record<string, { p50_seconds: number; sample_count: number }>;
+const _durationStatsCache: Record<string, { data: DurationStats; fetchedAt: number }> = {};
+const DURATION_STATS_TTL_MS = 5 * 60 * 1000;
+
+export function useDurationStats(projectId?: string): DurationStats {
+  const cacheKey = projectId ?? 'global';
+  const [stats, setStats] = useState<DurationStats>(() => {
+    const cached = _durationStatsCache[cacheKey];
+    return (cached && Date.now() - cached.fetchedAt < DURATION_STATS_TTL_MS) ? cached.data : {};
+  });
+  useEffect(() => {
+    const cached = _durationStatsCache[cacheKey];
+    if (cached && Date.now() - cached.fetchedAt < DURATION_STATS_TTL_MS) {
+      setStats(cached.data);
+      return;
+    }
+    const url = projectId
+      ? `${API_BASE_URL}/api/admin/task-duration-stats?project_id=${projectId}`
+      : `${API_BASE_URL}/api/admin/task-duration-stats`;
+    authGet(url)
+      .then(r => r.json())
+      .then(data => {
+        const d = (data?.stats ?? {}) as DurationStats;
+        _durationStatsCache[cacheKey] = { data: d, fetchedAt: Date.now() };
+        setStats(d);
+      })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheKey]);
+  return stats;
 }
 
 export function getHeartbeatStatus(lastHeartbeat?: string) {
@@ -338,6 +371,19 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     ? task.history[task.history.length - 1].timestamp
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
+
+  const durationStats = useDurationStats(task.project_id);
+  const taskType = task.task_type ?? ((task.payloads?.[0] as Record<string, unknown>)?.type as string) ?? 'create';
+  const etaLabel = (() => {
+    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return null;
+    if (!task.started_at) return null;
+    const typeStat = durationStats[taskType];
+    if (!typeStat || typeStat.sample_count < 3) return null;
+    const elapsedSec = (now30 - parseTimestamp(task.started_at).getTime()) / 1000;
+    const remaining = typeStat.p50_seconds - elapsedSec;
+    if (remaining > 0) return `~${Math.ceil(remaining / 60)}m left`;
+    return 'longer than usual';
+  })();
 
   const handleRootKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.target !== e.currentTarget) return;
@@ -627,6 +673,11 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <span className="text-neutral-400 font-mono">
             {queueWaitText ?? duration}
           </span>
+          {etaLabel && (
+            <span className={`font-mono ${etaLabel === 'longer than usual' ? 'text-amber-400' : 'text-neutral-400'}`}>
+              · {etaLabel}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">

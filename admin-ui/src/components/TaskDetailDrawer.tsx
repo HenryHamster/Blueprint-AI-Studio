@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, ExternalLink, ChevronRight, ChevronDown, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
 import { LogsTab } from './TaskDetailDrawerLogs';
 import type { LogLevel } from './TaskDetailDrawerLogs';
-import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, FAILURE_CLASS_CONFIG } from './TaskCard';
+import { StatusBadge, TaskTypeBadge, getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, FAILURE_CLASS_CONFIG, useDurationStats } from './TaskCard';
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
@@ -194,6 +194,12 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
+  const durationStats = useDurationStats(task.project_id);
+  const [now30, setNow30] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow30(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, []);
   const [rawContextExpanded, setRawContextExpanded] = useState(false);
   const [directionsCache, setDirectionsCache] = useState<Array<{ id: string; text: string }>>([]);
 
@@ -302,6 +308,22 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
       <DetailRow label="Created at">{formatAbsolute(task.created_at)}</DetailRow>
       {task.started_at && <DetailRow label="Started at">{formatAbsolute(task.started_at)}</DetailRow>}
       {task.started_at && <DetailRow label="Duration"><span className="font-mono">{duration}</span></DetailRow>}
+      {task.started_at && (task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING') && (() => {
+        const taskType = task.task_type ?? ((task.payloads?.[0] as Record<string, unknown>)?.type as string) ?? 'create';
+        const typeStat = durationStats[taskType];
+        if (!typeStat || typeStat.sample_count < 3) return null;
+        const elapsedSec = (now30 - parseTimestamp(task.started_at).getTime()) / 1000;
+        const remaining = typeStat.p50_seconds - elapsedSec;
+        const label = remaining > 0 ? `~${Math.ceil(remaining / 60)}m left` : 'longer than usual';
+        const isOver = remaining <= 0;
+        return (
+          <DetailRow label="Est. remaining">
+            <span className={`font-mono text-sm ${isOver ? 'text-amber-400' : 'text-neutral-200'}`} title={`Based on ${typeStat.sample_count} recent ${taskType} tasks`}>
+              {label}
+            </span>
+          </DetailRow>
+        );
+      })()}
       <DetailRow label="Heartbeat">
         <span className="inline-flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${heartbeat.color}`} />
