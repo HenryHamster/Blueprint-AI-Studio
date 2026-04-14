@@ -637,7 +637,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # all merged child work and requeueing should be possible.
                 else:
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
-                    parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number, "_is_rollup_review": True}
+                    parent.context = {**parent_ctx,
+                                      "rollup_pr_url": rollup_pr_url,
+                                      "rollup_pr_number": rollup_pr_number,
+                                      "_is_rollup_review": True,
+                                      "review_loop": {
+                                          "ci_waiting": True,
+                                          "pr_number": rollup_pr_number,
+                                          "branch": staging_branch,
+                                          "base_branch": target_branch,
+                                          "original_task_id": str(parent.id),
+                                          "ci_wait_started": _utcnow().isoformat(),
+                                      }}
                     review_task = await _spawn_pipeline_task(
                         parent, "review", session, rollup_pr_number, staging_branch, target_branch,
                         original_prompt=parent.description or parent.title,
