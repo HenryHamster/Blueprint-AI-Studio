@@ -1210,9 +1210,20 @@ async def orchestrator_worker():
                                             logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
                                     logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged after retry")
                                 else:
-                                    ci_task.status = TaskStatus.FAILED
-                                    ci_task.latest_status_message = f"CI passed but merge blocked after 4 attempts: {merge_result.get('message', 'unknown')}"
-                                    logger.error(f"[CI] PR #{ci_pr_number} merge blocked after retries: {merge_result}")
+                                    # Check if merge was blocked because checks are still in progress
+                                    # (race: new CI run triggered after our check but before merge).
+                                    # If so, go back to CI-waiting instead of permanently failing.
+                                    merge_msg = merge_result.get('message', '')
+                                    if 'in progress' in merge_msg.lower() or 'status check' in merge_msg.lower():
+                                        ci_loop["ci_poll_interval"] = 10  # Reset polling interval
+                                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                        ci_task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
+                                        logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait")
+                                    else:
+                                        ci_task.status = TaskStatus.FAILED
+                                        ci_task.latest_status_message = f"CI passed but merge blocked after 4 attempts: {merge_msg}"
+                                        logger.error(f"[CI] PR #{ci_pr_number} merge blocked after retries: {merge_result}")
                         else:
                             # CI failed — check for existing active fix before spawning
                             active_tasks = (await session.execute(

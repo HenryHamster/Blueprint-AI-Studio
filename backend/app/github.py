@@ -76,9 +76,11 @@ async def _github_request(
                 )
                 await asyncio.sleep(delay)
                 continue
-            # Proactive rate limit check — back off before hitting the limit
+            # Proactive rate limit check — back off before hitting the limit.
+            # Only delay on non-success responses (retries); never block a
+            # successful response — the caller may have a short timeout.
             remaining = response.headers.get("X-RateLimit-Remaining")
-            if remaining is not None:
+            if remaining is not None and response.status_code >= 400:
                 try:
                     if int(remaining) < 10:
                         reset_ts = response.headers.get("X-RateLimit-Reset")
