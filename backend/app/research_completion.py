@@ -58,6 +58,34 @@ def _compute_momentum_factor(d: dict) -> float:
     return 1.0  # neutral
 
 
+def _compute_acceptance_rate(d: dict) -> float | None:
+    """Return operator acceptance rate (merged / (merged + rejected)) with recency weighting.
+
+    Weights the last 3 cycles 3x relative to the lifetime average, matching
+    _compute_merge_rate's recency scheme. Returns None when no PRs exist (merged
+    or rejected) so callers can distinguish "unknown" from a low rate.
+    """
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+    total_prs = total_merged + total_rejected
+    if total_prs == 0:
+        return None  # no data yet
+    lifetime_rate = total_merged / total_prs
+    # Weight last 3 cycles 3x for responsiveness to recent changes
+    recent = history[-3:]
+    if not recent:
+        return lifetime_rate
+    recent_merged = sum(e.get("prs_merged", 0) for e in recent)
+    recent_rejected = sum(e.get("prs_rejected", 0) for e in recent)
+    recent_prs = recent_merged + recent_rejected
+    if recent_prs == 0:
+        return lifetime_rate
+    recent_rate = recent_merged / recent_prs
+    return (recent_rate * 3 + lifetime_rate) / 4
+
+
 def _compute_merge_rate(d: dict) -> float:
     """Return merged-PRs-per-cycle for a direction, with recency weighting.
 
@@ -761,13 +789,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         evicted = new_history[:-10]
                         prev_agg = d.get("history_aggregate", {
                             "total_cycles": 0, "total_tasks_created": 0,
-                            "total_prs_merged": 0, "total_tasks_failed": 0,
+                            "total_prs_merged": 0, "total_prs_rejected": 0,
+                            "total_tasks_failed": 0,
                             "total_tasks_cancelled": 0, "first_cycle_at": None,
                         })
                         for ev in evicted:
                             prev_agg["total_cycles"] += 1
                             prev_agg["total_tasks_created"] += ev.get("tasks_created", 0)
                             prev_agg["total_prs_merged"] += ev.get("prs_merged", 0)
+                            prev_agg["total_prs_rejected"] = prev_agg.get("total_prs_rejected", 0) + ev.get("prs_rejected", 0)
                             prev_agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
                             prev_agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
                             if not prev_agg["first_cycle_at"] and ev.get("timestamp"):
