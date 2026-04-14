@@ -746,12 +746,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
+                    descriptions = finding_descriptions_by_dir.get(did, [])[:3]
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
                         "tasks_created": len(dir_child_tasks),
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
                         "finding_titles": titles,
+                        "key_finding_descriptions": descriptions,
                     }
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
                     new_history = history + [entry]
