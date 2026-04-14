@@ -258,6 +258,24 @@ def test_classify_failure_not_mergeable_is_external_api():
     assert classify_failure(task) == "EXTERNAL_API"
 
 
+def test_classify_failure_merge_conflicts_is_external_api():
+    """'merge conflicts' from orchestrator.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="merge conflicts — fix iterations exhausted on PR #88",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
+def test_classify_failure_merge_check_failed_is_external_api():
+    """'merge check failed' from ci_completion.py → EXTERNAL_API."""
+    task = make_task(
+        latest_status_message="Merge check failed on PR #17: required checks pending",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "EXTERNAL_API"
+
+
 def test_classify_failure_ci_wait_exceeded_is_agent_timeout():
     """'ci wait exceeded' messages from orchestrator.py → AGENT_TIMEOUT."""
     task = make_task(
@@ -271,6 +289,15 @@ def test_classify_failure_ci_wait_timed_out_is_agent_timeout():
     """'ci wait timed out' → AGENT_TIMEOUT."""
     task = make_task(
         latest_status_message="ci wait timed out waiting for checks to complete",
+        status=TaskStatus.FAILED,
+    )
+    assert classify_failure(task) == "AGENT_TIMEOUT"
+
+
+def test_classify_failure_ci_in_progress_is_agent_timeout():
+    """'CI in progress' on timed-out tasks from orchestrator.py → AGENT_TIMEOUT."""
+    task = make_task(
+        latest_status_message="CI in progress on PR #42 (task timed out waiting)",
         status=TaskStatus.FAILED,
     )
     assert classify_failure(task) == "AGENT_TIMEOUT"

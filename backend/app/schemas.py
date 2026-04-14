@@ -119,3 +119,33 @@ class GitHubCreatePRRequest(BaseModel):
     head: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
     base: str = Field(..., pattern="^[a-zA-Z0-9_./:-]+$")
     body: str = ""
+
+
+# --- Build Config & Onboarding ---
+
+class BuildConfigDirectoryEntry(BaseModel):
+    """A single directory entry within a project's build configuration."""
+    path: str = Field(..., min_length=1)
+    type: str = Field(..., pattern="^(python|node|go|rust|other)$")
+    lint_cmd: Optional[str] = None
+    build_cmd: Optional[str] = None
+    test_cmd: Optional[str] = None
+    install_cmd: Optional[str] = None
+
+
+class BuildConfig(BaseModel):
+    """Schema for project build configuration."""
+    language: Optional[str] = Field(None, pattern="^(python|typescript|go|rust|mixed)$")
+    directories: List[BuildConfigDirectoryEntry] = Field(default_factory=list)
+    env_vars: Dict[str, str] = Field(default_factory=dict)
+    git_user_name: str = "Blueprint Agent"
+    git_user_email: str = "blueprint-agent@automated.dev"
+    detected_at: Optional[str] = None
+
+
+class OnboardPayload(BaseModel):
+    """Payload for the project onboarding endpoint."""
+    github_owner: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
+    github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
+    name: Optional[str] = None
+    build_config_override: Optional[Dict[str, Any]] = None

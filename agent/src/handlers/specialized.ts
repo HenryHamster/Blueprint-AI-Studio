@@ -4,9 +4,10 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   apiPost, persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
 } from '../index.js';
+import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
 
@@ -79,7 +80,9 @@ Rules:
 - Also output the same JSON array as the final output in your logs.`;
 
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
-  const secTypeHint = TASK_TYPE_HINTS['security_audit'] ? '\n\n' + TASK_TYPE_HINTS['security_audit'] : '';
+  const secBuildConfig = (task.build_config ?? {}) as BuildConfig;
+  const secTypeHints = getTaskTypeHints(secBuildConfig);
+  const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
   statusRef.value = 'Running security audit...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort, disallowedTools);
 
@@ -149,15 +152,21 @@ export async function handleMigrate(
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
 
+  const migrateBuildConfig = (task.build_config ?? {}) as BuildConfig;
+  const migratePythonDirs = (migrateBuildConfig.directories ?? []).filter(d => d.type === 'python');
+  const migratePyDir = migratePythonDirs.length > 0 ? migratePythonDirs[0].path.replace(/\/$/, '') : 'backend';
+  const alembicVersionsPath = `${migratePyDir}/alembic/versions/`;
+  const migrateModelsPath = `${migratePyDir}/app/models/`;
+
   const migratePrompt = `You are a database migration agent specializing in Alembic and SQLAlchemy/SQLModel workflows.
 
 Your task: ${prompt}
 
 Follow these steps precisely:
 
-1. **Examine existing migrations**: Look at \`backend/alembic/versions/\` to understand naming conventions, import patterns, and how previous migrations are structured. Note the revision ID format, how dependencies are chained, and any project-specific patterns.
+1. **Examine existing migrations**: Look at \`${alembicVersionsPath}\` to understand naming conventions, import patterns, and how previous migrations are structured. Note the revision ID format, how dependencies are chained, and any project-specific patterns.
 
-2. **Make model changes**: Apply the requested SQLModel/SQLAlchemy model changes in the appropriate files (typically under \`backend/app/models/\` or similar). Do NOT manually write migration files — autogenerate will handle that.
+2. **Make model changes**: Apply the requested SQLModel/SQLAlchemy model changes in the appropriate files (typically under \`${migrateModelsPath}\` or similar). Do NOT manually write migration files — autogenerate will handle that.
 
 3. **Generate migration**: Run \`alembic revision --autogenerate -m "description"\` from the backend directory (where alembic.ini lives). Use a concise, snake_case description that matches existing naming conventions.
 
@@ -182,7 +191,7 @@ Follow these steps precisely:
 7. Once migration applies cleanly, the files should be modified. Do NOT commit — the agent harness will handle the commit.
 
 CRITICAL RULES:
-- Never delete or modify existing migration files in \`backend/alembic/versions/\` (except the one you just generated)
+- Never delete or modify existing migration files in \`${alembicVersionsPath}\` (except the one you just generated)
 - Never run \`alembic stamp\` or \`alembic downgrade base\` — these can corrupt production databases
 - If autogenerate produces an empty migration with no changes, verify that your model changes were saved and the alembic env.py is configured to detect them
 - Document any data loss risks prominently using inline comments in the migration file`;
@@ -262,7 +271,7 @@ CRITICAL RULES:
 
 // ── Handler: Smoketest (post-merge end-to-end health checks) ─────────────────
 export async function handleSmoketest(
-  taskId: string, payload: Record<string, unknown>, _task: Record<string, unknown>,
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
@@ -279,24 +288,29 @@ export async function handleSmoketest(
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('smoketest');
 
+  const smoketestBuildConfig = (task.build_config ?? {}) as BuildConfig;
+  const smoketestPythonDirs = (smoketestBuildConfig.directories ?? []).filter(d => d.type === 'python');
+  const smoketestPyDir = smoketestPythonDirs.length > 0 ? smoketestPythonDirs[0].path.replace(/\/$/, '') : 'backend';
+  const smoketestConfigPath = `${smoketestPyDir}/testing/smoketest.yaml`;
+
   const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
-1. Read backend/testing/smoketest.yaml to understand the test suites and guardrails.
+1. Read ${smoketestConfigPath} to understand the test suites and guardrails.
 
 2. Run each suite IN ORDER from the config (startup, curated, regression):
 
-   a. STARTUP: Run each command listed in suites.startup.commands from the backend/ directory.
+   a. STARTUP: Run each command listed in suites.startup.commands from the ${smoketestPyDir}/ directory.
       Record pass/fail for each command.
 
    b. CURATED: Run pytest with the args from suites.curated.pytest_args.
-      Working directory: backend/
+      Working directory: ${smoketestPyDir}/
       Command: python3 -m pytest <pytest_args from config>
       Record individual test results (name, pass/fail, error message if any).
 
    c. REGRESSION: Run pytest with the args from suites.regression.pytest_args.
-      Working directory: backend/
+      Working directory: ${smoketestPyDir}/
       Command: python3 -m pytest <pytest_args from config>
       Record individual test results.
 
@@ -482,7 +496,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
 
 // ── Handler: Perf (analyze codebase for performance bottlenecks, output findings) ──
 export async function handlePerf(
-  taskId: string, payload: Record<string, unknown>, _task: Record<string, unknown>,
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
@@ -498,19 +512,26 @@ export async function handlePerf(
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('perf');
 
+  const perfBuildConfig = (task.build_config ?? {}) as BuildConfig;
+  const perfDirs = perfBuildConfig.directories ?? [];
+  const perfPythonDirs = perfDirs.filter(d => d.type === 'python');
+  const perfNodeDirs = perfDirs.filter(d => d.type === 'node');
+  const perfPyDir = perfPythonDirs.length > 0 ? perfPythonDirs[0].path.replace(/\/$/, '') : 'backend';
+  const perfNodeDir = perfNodeDirs.length > 0 ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
+
   const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
-1. **N+1 database queries**: ORM relationships loaded inside loops (e.g. accessing \`obj.related\` inside a for loop without eager loading). Check backend/app/main.py for SQLAlchemy patterns.
-2. **Missing database indexes**: Columns used in WHERE clauses, JOIN conditions, or ORDER BY that lack an index. Check backend/app/models.py for table definitions and compare against query patterns in main.py.
+1. **N+1 database queries**: ORM relationships loaded inside loops (e.g. accessing \`obj.related\` inside a for loop without eager loading). Check ${perfPyDir}/ for SQLAlchemy patterns.
+2. **Missing database indexes**: Columns used in WHERE clauses, JOIN conditions, or ORDER BY that lack an index. Check ${perfPyDir}/ for table definitions and compare against query patterns.
 3. **Synchronous blocking operations**: Network calls, file I/O, or CPU-heavy work done synchronously inside async request handlers.
 4. **Unpaginated large payload returns**: API endpoints that return full table scans or unbounded lists without LIMIT/offset or cursor pagination.
-5. **Frontend large bundle imports**: Direct imports of entire libraries where only a small subset is used (e.g. \`import _ from 'lodash'\` instead of \`import debounce from 'lodash/debounce'\`). Check admin-ui/src.
-6. **Unnecessary React re-renders**: Components with expensive computations or callbacks not wrapped in useMemo/useCallback, causing re-renders on every parent update. Check admin-ui/src for patterns.
+5. **Frontend large bundle imports**: Direct imports of entire libraries where only a small subset is used (e.g. \`import _ from 'lodash'\` instead of \`import debounce from 'lodash/debounce'\`). Check ${perfNodeDir}/src.
+6. **Unnecessary React re-renders**: Components with expensive computations or callbacks not wrapped in useMemo/useCallback, causing re-renders on every parent update. Check ${perfNodeDir}/src for patterns.
 
 Instructions:
-1. Read key files: backend/app/models.py (table/index definitions), backend/app/main.py (query patterns, endpoint handlers), and admin-ui/src (React components, imports).
+1. Read key files in ${perfPyDir}/ (table/index definitions, query patterns, endpoint handlers) and ${perfNodeDir}/src (React components, imports).
 2. For each finding, identify the specific file, function, and line range where the problem is observable.
 3. Only report findings that are demonstrably present — cite the exact code pattern that shows the problem.
 4. Produce your findings as a JSON array written to /tmp/perf_report_${taskId}.json:
@@ -539,7 +560,8 @@ Rules:
 - Also output the same JSON array as the final output in your logs.`;
 
   const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
-  const perfTypeHint = TASK_TYPE_HINTS['perf'] ? '\n\n' + TASK_TYPE_HINTS['perf'] : '';
+  const perfTypeHints = getTaskTypeHints(perfBuildConfig);
+  const perfTypeHint = perfTypeHints['perf'] ? '\n\n' + perfTypeHints['perf'] : '';
   statusRef.value = 'Running performance analysis...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort, disallowedTools);
 

@@ -1,3 +1,7 @@
+import hashlib
+import hmac
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -373,3 +377,207 @@ async def test_github_request_raises_network_error_after_max_retries(mocker):
 
     with pytest.raises(httpx_mod.ConnectError):
         await _github_request("GET", "https://api.github.com/test", {}, max_retries=3)
+
+
+# ---------------------------------------------------------------------------
+# Webhook tests: PR closed-without-merge sets pr_rejected on matching task
+# ---------------------------------------------------------------------------
+
+_TEST_WEBHOOK_SECRET = "test-webhook-secret-for-pytest"
+
+
+def _make_webhook_sig(payload_bytes: bytes) -> str:
+    """Compute the x-hub-signature-256 header value for a given payload."""
+    return "sha256=" + hmac.new(
+        _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+
+
+def _pr_close_payload(owner: str, repo: str, pr_number: int, *, merged: bool, body: str = "") -> bytes:
+    """Build a minimal pull_request closed webhook payload."""
+    return json.dumps({
+        "action": "closed",
+        "pull_request": {
+            "number": pr_number,
+            "merged": merged,
+            "body": body,
+        },
+        "repository": {
+            "full_name": f"{owner}/{repo}",
+        },
+    }).encode()
+
+
+@pytest.mark.asyncio
+async def test_pr_close_without_merge_sets_pr_rejected(client, db_session, mocker):
+    """
+    A pull_request webhook with action=closed and merged=false marks the
+    matching task as pr_rejected=True.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    # Prevent Redis dedup from being called (no delivery-id header used)
+
+    project = Project(
+        name="Rejection Test",
+        user_id="user1",
+        github_owner="testorg",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Fix bug",
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/testorg/testrepo/pull/42",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _pr_close_payload("testorg", "testrepo", 42, merged=False, body="Not a good fit")
+    resp = await client.post(
+        "/api/github/webhook",
+        content=payload_bytes,
+        headers={
+            "content-type": "application/json",
+            "x-github-event": "pull_request",
+            "x-hub-signature-256": _make_webhook_sig(payload_bytes),
+        },
+    )
+
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.context.get("pr_rejected") is True
+    assert task.context.get("pr_rejection_note") == "Not a good fit"
+
+
+@pytest.mark.asyncio
+async def test_pr_close_without_merge_is_idempotent(client, db_session, mocker):
+    """
+    A second close-without-merge webhook for a task that is already
+    pr_rejected=True does NOT overwrite existing context values.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    project = Project(
+        name="Idempotent Test",
+        user_id="user1",
+        github_owner="testorg",
+        github_repo="idempotentrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already rejected",
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_rejected": True, "pr_rejection_note": "original note"},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/testorg/idempotentrepo/pull/7",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _pr_close_payload("testorg", "idempotentrepo", 7, merged=False, body="second close")
+    resp = await client.post(
+        "/api/github/webhook",
+        content=payload_bytes,
+        headers={
+            "content-type": "application/json",
+            "x-github-event": "pull_request",
+            "x-hub-signature-256": _make_webhook_sig(payload_bytes),
+        },
+    )
+
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Already-rejected task must not be re-processed
+    assert task.context.get("pr_rejection_note") == "original note"
+
+
+@pytest.mark.asyncio
+async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, mocker):
+    """
+    A close-without-merge webhook for a PR number that has no matching
+    artifact is a no-op — no tasks are modified.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    project = Project(
+        name="Noop Test",
+        user_id="user1",
+        github_owner="testorg",
+        github_repo="nooprepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Unrelated task",
+        payloads=[{"type": "create", "prompt": "something"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Artifact references PR #10; webhook is for PR #99
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/testorg/nooprepo/pull/10",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _pr_close_payload("testorg", "nooprepo", 99, merged=False)
+    resp = await client.post(
+        "/api/github/webhook",
+        content=payload_bytes,
+        headers={
+            "content-type": "application/json",
+            "x-github-event": "pull_request",
+            "x-hub-signature-256": _make_webhook_sig(payload_bytes),
+        },
+    )
+
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.context.get("pr_rejected") is None

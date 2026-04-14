@@ -25,6 +25,7 @@ vi.mock('../index.js', () => ({
 
 vi.mock('../prompt.js', () => ({
   TASK_TYPE_HINTS: {},
+  getTaskTypeHints: vi.fn().mockReturnValue({}),
   DEFAULT_TOOL_GUIDANCE: '',
   PLAYBOOK_GUIDANCE: '',
   readClaudeMd: vi.fn().mockReturnValue(''),

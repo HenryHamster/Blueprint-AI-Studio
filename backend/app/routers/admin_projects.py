@@ -48,9 +48,9 @@ async def get_all_projects(
             "directions": project.directions,
             "vision": project.vision or {},
             "design_doc": project.design_doc or {},
+            "build_config": project.build_config or {},
             "autonomous_enabled": project.autonomous_enabled,
             "is_self_repo": project.is_self_repo,
-            "build_config": project.build_config or {},
             "my_role": role,
         }
         result.append(data)
@@ -62,8 +62,8 @@ class ProjectUpdate(BaseModel):
     directions: Optional[List[Dict[str, Any]]] = None
     vision: Optional[Dict[str, Any]] = None
     design_doc: Optional[Dict[str, Any]] = None
-    autonomous_enabled: Optional[bool] = None
     build_config: Optional[Dict[str, Any]] = None
+    autonomous_enabled: Optional[bool] = None
 
 
 @router.patch("/projects/{project_id}")
@@ -111,7 +111,7 @@ async def update_project(
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
-        project.build_config = dict(payload.build_config)
+        project.build_config = payload.build_config
         flag_modified(project, "build_config")
 
     session.add(project)

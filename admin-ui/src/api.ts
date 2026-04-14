@@ -71,3 +71,21 @@ export async function fetchAutonomyDebug(projectId: string): Promise<unknown> {
   if (!res.ok) throw new Error(`Failed to fetch autonomy debug: ${res.status}`);
   return res.json();
 }
+
+export async function onboardProject(
+  owner: string,
+  repo: string,
+  name?: string,
+  buildConfigOverride?: Record<string, unknown>
+): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
+  const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
+  if (name) body.name = name;
+  if (buildConfigOverride) body.build_config_override = buildConfigOverride;
+  const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}

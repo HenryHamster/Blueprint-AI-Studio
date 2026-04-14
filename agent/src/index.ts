@@ -18,6 +18,23 @@ import {
 // ── Failure categories ───────────────────────────────────────────────────────
 export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal';
 
+// ── Build configuration (from project settings, passed via claim response) ───
+export interface DirectoryConfig {
+  path: string;
+  type: string; // 'python' | 'node' | 'go' | 'rust'
+  install_cmd?: string;
+  lint_cmd?: string;
+  build_cmd?: string;
+  test_cmd?: string;
+}
+export interface BuildConfig {
+  language?: string;
+  directories?: DirectoryConfig[];
+  env_vars?: Record<string, string>;
+  git_user_name?: string;
+  git_user_email?: string;
+}
+
 // ── Environment ─────────────────────────────────────────────────────────────
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
 let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
@@ -454,15 +471,16 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
 export async function setupWorkspace(
   owner: string, repo: string, ghToken: string, baseBranch: string,
   branchPrefix: string, taskId: string,
-  ws: WebSocket | null, statusRef: { value: string }
+  ws: WebSocket | null, statusRef: { value: string },
+  buildConfig?: BuildConfig
 ): Promise<{ workBranch: string; shortId: string }> {
   statusRef.value = `Cloning ${owner}/${repo}...`;
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
-  git(['config', 'user.email', 'blueprint-agent@automated.dev']);
-  git(['config', 'user.name', 'Blueprint Agent']);
+  git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
+  git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario)
@@ -555,8 +573,42 @@ export async function pushAndCreatePR(
  *  Each blocking execFileSync starves the event loop (and heartbeat setInterval),
  *  so we inject sendHeartbeatSync between operations to prevent the reaper from
  *  killing us mid-check.  The taskId is read from process.env (set after claim). */
-export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null) {
+export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null, buildConfig?: BuildConfig) {
   const taskId = process.env.TASK_ID || '';
+
+  // If project provides explicit directory configuration, use it instead of hardcoded paths
+  if (buildConfig?.directories && buildConfig.directories.length > 0) {
+    const extraEnv = buildConfig.env_vars ? { ...process.env, ...buildConfig.env_vars } : process.env;
+    for (const dir of buildConfig.directories) {
+      const dirPrefix = dir.path.replace(/\/$/, '');
+      const touchesDir = changedPaths.some(p => p === dirPrefix || p.startsWith(dirPrefix + '/'));
+      if (!touchesDir) continue;
+
+      const cwd = `${WORKSPACE}/${dirPrefix}`;
+      if (dir.install_cmd) {
+        sendLog(ws, `Running install in ${dirPrefix}...\n`);
+        sendHeartbeatSync(taskId, `${dir.install_cmd} (${dirPrefix})...`);
+        const [cmd, ...args] = dir.install_cmd.split(' ');
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+      }
+      if (dir.lint_cmd) {
+        sendLog(ws, `Running lint in ${dirPrefix}...\n`);
+        sendHeartbeatSync(taskId, `${dir.lint_cmd} (${dirPrefix})...`);
+        const [cmd, ...args] = dir.lint_cmd.split(' ');
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+      }
+      if (dir.build_cmd) {
+        sendLog(ws, `Running build in ${dirPrefix}...\n`);
+        sendHeartbeatSync(taskId, `${dir.build_cmd} (${dirPrefix})...`);
+        const [cmd, ...args] = dir.build_cmd.split(' ');
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+      }
+      sendLog(ws, `Checks passed for ${dirPrefix}.\n`);
+    }
+    return;
+  }
+
+  // Fallback: hardcoded Blueprint project structure
   const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
   const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
   const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
@@ -611,12 +663,13 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
 /** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
 export async function lintFixLoop(
   changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
-  context: string = 'the code you just wrote', model?: string, effort?: string
+  context: string = 'the code you just wrote', model?: string, effort?: string,
+  buildConfig?: BuildConfig
 ): Promise<boolean> {
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
     try {
       statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
-      runProjectLintChecks(changedPaths, ws);
+      runProjectLintChecks(changedPaths, ws, buildConfig);
       return true;
     } catch (lintErr: unknown) {
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);

@@ -21,17 +21,20 @@ export interface Direction {
 
 export interface BuildConfigDirectory {
   path: string;
-  language: string;
-  lint_command: string;
-  test_command: string;
-  build_command: string;
+  type: string;
+  install_cmd?: string;
+  lint_cmd?: string;
+  build_cmd?: string;
+  test_cmd?: string;
 }
 
 export interface BuildConfig {
-  directories: BuildConfigDirectory[];
-  commit_email: string;
-  commit_name: string;
-  languages?: string[];
+  language?: string | null;
+  directories?: BuildConfigDirectory[];
+  git_user_name?: string;
+  git_user_email?: string;
+  env_vars?: Record<string, string>;
+  detected_at?: string;
 }
 
 export interface Project {

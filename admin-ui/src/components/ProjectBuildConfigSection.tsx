@@ -1,20 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Plus, Trash2, RefreshCw } from 'lucide-react';
-
-export interface BuildConfigDirectory {
-  path: string;
-  language: string;
-  lint_command: string;
-  test_command: string;
-  build_command: string;
-}
-
-export interface BuildConfig {
-  directories: BuildConfigDirectory[];
-  commit_email: string;
-  commit_name: string;
-  languages?: string[];
-}
+import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;
@@ -27,10 +13,10 @@ interface ProjectBuildConfigSectionProps {
 
 const EMPTY_DIR: BuildConfigDirectory = {
   path: '',
-  language: '',
-  lint_command: '',
-  test_command: '',
-  build_command: '',
+  type: '',
+  lint_cmd: '',
+  test_cmd: '',
+  build_cmd: '',
 };
 
 function newDir(): BuildConfigDirectory {
@@ -47,18 +33,18 @@ export function ProjectBuildConfigSection({
 }: ProjectBuildConfigSectionProps) {
   const hasConfig = buildConfig && (
     (buildConfig.directories?.length ?? 0) > 0 ||
-    buildConfig.commit_email ||
-    buildConfig.commit_name
+    buildConfig.git_user_email ||
+    buildConfig.git_user_name
   );
 
   const [dirs, setDirs] = useState<BuildConfigDirectory[]>(() =>
     buildConfig?.directories?.length ? buildConfig.directories : []
   );
-  const [commitEmail, setCommitEmail] = useState(
-    buildConfig?.commit_email ?? 'blueprint-agent@automated.dev'
+  const [gitEmail, setGitEmail] = useState(
+    buildConfig?.git_user_email ?? 'blueprint-agent@automated.dev'
   );
-  const [commitName, setCommitName] = useState(
-    buildConfig?.commit_name ?? 'Blueprint Agent'
+  const [gitName, setGitName] = useState(
+    buildConfig?.git_user_name ?? 'Blueprint Agent'
   );
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -66,18 +52,18 @@ export function ProjectBuildConfigSection({
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
   useEffect(() => {
     setDirs(buildConfig?.directories?.length ? buildConfig.directories : []);
-    setCommitEmail(buildConfig?.commit_email ?? 'blueprint-agent@automated.dev');
-    setCommitName(buildConfig?.commit_name ?? 'Blueprint Agent');
+    setGitEmail(buildConfig?.git_user_email ?? 'blueprint-agent@automated.dev');
+    setGitName(buildConfig?.git_user_name ?? 'Blueprint Agent');
   }, [buildConfig]);
 
   const handleSave = async () => {
     setSaving(true);
     try {
       await onSave({
+        ...buildConfig,
         directories: dirs,
-        commit_email: commitEmail,
-        commit_name: commitName,
-        languages: buildConfig?.languages,
+        git_user_email: gitEmail,
+        git_user_name: gitName,
       });
     } finally {
       setSaving(false);
@@ -116,16 +102,11 @@ export function ProjectBuildConfigSection({
             {githubOwner && githubRepo ? `${githubOwner}/${githubRepo}` : '—'}
           </span>
         </div>
-        {buildConfig?.languages?.length ? (
+        {buildConfig?.language ? (
           <div className="mt-2 flex flex-wrap gap-1.5">
-            {buildConfig.languages.map(lang => (
-              <span
-                key={lang}
-                className="text-[11px] bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full"
-              >
-                {lang}
-              </span>
-            ))}
+            <span className="text-[11px] bg-neutral-800 border border-neutral-700 text-neutral-300 px-2 py-0.5 rounded-full">
+              {buildConfig.language}
+            </span>
           </div>
         ) : null}
       </div>
@@ -193,11 +174,11 @@ export function ProjectBuildConfigSection({
                     />
                   </div>
                   <div className="flex-1">
-                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Language</label>
+                    <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Type</label>
                     <input
                       type="text"
-                      value={dir.language}
-                      onChange={e => updateDir(i, 'language', e.target.value)}
+                      value={dir.type}
+                      onChange={e => updateDir(i, 'type', e.target.value)}
                       placeholder="python"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
@@ -215,8 +196,8 @@ export function ProjectBuildConfigSection({
                     <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Lint</label>
                     <input
                       type="text"
-                      value={dir.lint_command}
-                      onChange={e => updateDir(i, 'lint_command', e.target.value)}
+                      value={dir.lint_cmd ?? ''}
+                      onChange={e => updateDir(i, 'lint_cmd', e.target.value)}
                       placeholder="ruff check ."
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
@@ -225,8 +206,8 @@ export function ProjectBuildConfigSection({
                     <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Test</label>
                     <input
                       type="text"
-                      value={dir.test_command}
-                      onChange={e => updateDir(i, 'test_command', e.target.value)}
+                      value={dir.test_cmd ?? ''}
+                      onChange={e => updateDir(i, 'test_cmd', e.target.value)}
                       placeholder="pytest"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
@@ -235,8 +216,8 @@ export function ProjectBuildConfigSection({
                     <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Build</label>
                     <input
                       type="text"
-                      value={dir.build_command}
-                      onChange={e => updateDir(i, 'build_command', e.target.value)}
+                      value={dir.build_cmd ?? ''}
+                      onChange={e => updateDir(i, 'build_cmd', e.target.value)}
                       placeholder="npm run build"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
@@ -267,8 +248,8 @@ export function ProjectBuildConfigSection({
               <label className="block text-xs text-neutral-400 mb-1">Commit Email</label>
               <input
                 type="email"
-                value={commitEmail}
-                onChange={e => setCommitEmail(e.target.value)}
+                value={gitEmail}
+                onChange={e => setGitEmail(e.target.value)}
                 placeholder="blueprint-agent@automated.dev"
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
@@ -277,8 +258,8 @@ export function ProjectBuildConfigSection({
               <label className="block text-xs text-neutral-400 mb-1">Commit Name</label>
               <input
                 type="text"
-                value={commitName}
-                onChange={e => setCommitName(e.target.value)}
+                value={gitName}
+                onChange={e => setGitName(e.target.value)}
                 placeholder="Blueprint Agent"
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />

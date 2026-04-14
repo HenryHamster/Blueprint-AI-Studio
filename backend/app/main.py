@@ -45,6 +45,7 @@ from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.admin_analytics import router as admin_analytics_router
 from app.routers.agent_status import router as agent_status_router
+from app.routers.admin_onboard import router as admin_onboard_router
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -115,7 +116,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0031"
+EXPECTED_SCHEMA_REVISION = "0032"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -655,8 +656,7 @@ async def _maybe_create_failure_alert(
             },
         ))
     except Exception as _ne:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
+        logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
@@ -741,6 +741,7 @@ app.include_router(admin_users_router)
 app.include_router(admin_notifications_router)
 app.include_router(admin_analytics_router)
 app.include_router(agent_status_router)
+app.include_router(admin_onboard_router)
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""
