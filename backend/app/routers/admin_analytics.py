@@ -570,13 +570,19 @@ async def get_digest(
                     if t.created_at >= window_start
                 )
 
-                # prs_merged: sum from research_history entries within window
+                # prs_merged / prs_rejected: sum from research_history entries within window
                 prs_merged = 0
+                prs_rejected = 0
+                merge_time_values: List[float] = []
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
                         if entry_ts >= window_start:
                             prs_merged += entry.get("prs_merged") or 0
+                            prs_rejected += entry.get("prs_rejected") or 0
+                            atm = entry.get("avg_time_to_merge_hours")
+                            if atm is not None:
+                                merge_time_values.append(float(atm))
                     except (ValueError, TypeError):
                         pass
 
@@ -607,6 +613,9 @@ async def get_digest(
                 dir_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
+                total_prs = prs_merged + prs_rejected
+                acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
+                avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -614,6 +623,9 @@ async def get_digest(
                     "cycles_in_window": cycles_in_window,
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
+                    "prs_rejected": prs_rejected,
+                    "acceptance_rate": acceptance_rate,
+                    "avg_time_to_merge_hours": avg_time_to_merge_hours,
                     "possibly_saturated": bool(d.get("possibly_saturated", False)),
                     "latest_insights": latest_insights,
                     "recent_finding_titles": recent_finding_titles,

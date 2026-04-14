@@ -54,6 +54,20 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
             )
+            entry["prs_rejected"] = sum(
+                1 for ct in child_tasks_rows
+                if (ct.context or {}).get("pr_rejected")
+            )
+            # avg_time_to_merge_hours: mean of (vm_stopped_at - created_at) for merged tasks
+            merge_durations = [
+                (ct.vm_stopped_at - ct.created_at).total_seconds() / 3600
+                for ct in child_tasks_rows
+                if ct.status == TaskStatus.COMPLETED
+                and (ct.context or {}).get("pr_merged")
+                and ct.vm_stopped_at is not None
+                and ct.created_at is not None
+            ]
+            entry["avg_time_to_merge_hours"] = round(sum(merge_durations) / len(merge_durations), 2) if merge_durations else None
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             for ct in child_tasks_rows:

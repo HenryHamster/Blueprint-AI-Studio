@@ -42,6 +42,7 @@ def _build_outcome_evaluation(project) -> dict:
 
         cycles = len(window_history)
         merged = sum(h.get("prs_merged", 0) for h in window_history)
+        rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
 
         # Extract confirmed vs proposed findings from research_context
@@ -60,6 +61,16 @@ def _build_outcome_evaluation(project) -> dict:
                     confirmed.append(item)  # Unmarked items are treated as confirmed
             failed_approaches = parsed.get("failed", [])
 
+        total_prs = merged + rejected
+        acceptance_rate = round(merged / total_prs, 3) if total_prs > 0 else None
+        # avg_time_to_merge_hours: average of per-cycle values where present
+        merge_time_values = [
+            h["avg_time_to_merge_hours"]
+            for h in window_history
+            if h.get("avg_time_to_merge_hours") is not None
+        ]
+        avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
+
         outcome: dict = {
             "id": d.get("id"),
             "text": (d.get("text") or "")[:200],
@@ -68,7 +79,12 @@ def _build_outcome_evaluation(project) -> dict:
             "cycles": cycles,
             "merged": merged,
             "failed": failed,
+            "prs_rejected": rejected,
         }
+        if acceptance_rate is not None:
+            outcome["acceptance_rate"] = acceptance_rate
+        if avg_time_to_merge_hours is not None:
+            outcome["avg_time_to_merge_hours"] = avg_time_to_merge_hours
         if confirmed:
             outcome["confirmed"] = confirmed[:15]
         if proposed:
