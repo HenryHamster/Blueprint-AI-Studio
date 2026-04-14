@@ -513,6 +513,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             raise HTTPException(status_code=400, detail="notification_config.webhook_url must start with http:// or https://")
         _VALID_NOTIFICATION_EVENTS = frozenset([
             "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
+            "PR_MERGED", "BUDGET_EXCEEDED",
         ])
         enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"])
         if not isinstance(enabled_events, list):
