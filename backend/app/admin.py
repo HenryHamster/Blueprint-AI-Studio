@@ -132,7 +132,9 @@ async def get_all_tasks(
         escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         search_pattern = f"%{escaped}%"
         filters.append(
-            (Task.title.ilike(search_pattern, escape="\\")) | (Task.description.ilike(search_pattern, escape="\\"))
+            (Task.title.ilike(search_pattern, escape="\\"))
+            | (Task.description.ilike(search_pattern, escape="\\"))
+            | (Task.latest_status_message.ilike(search_pattern, escape="\\"))
         )
     if created_after:
         filters.append(Task.created_at >= created_after)
