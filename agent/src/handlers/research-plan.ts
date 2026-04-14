@@ -144,6 +144,7 @@ Risk guidance:
 When risk=high for a subtask, the task will require human approval before executing. Set this judiciously — only when a mistake would be hard to roll back. When risk=high, also set "approval_reason" to a brief explanation of why this needs approval.
 
 Rules:
+- Every subtask must describe a concrete change to implement — code, config, migrations, tests. Investigation and research are how YOU prepare the plan; they are not subtasks. If you need to understand the codebase, do that now before writing the plan.
 - depends_on_indices uses 0-based array positions (e.g., [0, 1] means this subtask depends on the first and second subtasks)
 - related_files: list the key files each subtask will create or modify
 - Each subtask prompt must be self-contained — don't reference other subtasks by index
@@ -996,13 +997,36 @@ If you find 5 things worth doing, output 5 findings. Be ambitious — propose
 infrastructure, new systems, and architectural changes when the direction calls
 for it. Use scope=large when the change genuinely requires cross-component coordination. Prefer scope=small or scope=medium for focused product features and targeted improvements.
 
+# BEFORE YOU WRITE FINDINGS — dedup check
+
+Review the DEDUP list and Project Context above. For each finding you're about to propose,
+ask: "is this genuinely new work, or does an active/completed/queued task already cover it?"
+Different approaches to the same area ARE valid (e.g. "add rate limiting to webhooks" vs
+"add error handling to webhooks"). Only skip a finding if a prior task solves the same problem.
+When in doubt, keep the finding — false negatives (missing good work) are worse than duplicates.
+
 # OUTPUT FORMAT
 
 Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array as the last thing in your response.
 
+## Finding types
+
+**Implementation findings** — these are your primary output. Each one spawns an agent that writes code:
+  feature, improvement, bug, refactor, perf, security_audit, qa, deps, docs, migrate, test
+
+**Sub-research** — spawns another research cycle (use sparingly):
+  research
+
+**Metadata** — these update the system's knowledge but do not produce code changes:
+  direction_note, direction_update, direction_proposal, design_doc_observation
+
+Metadata is useful context for the system, but it is not work product. A research cycle that
+outputs only metadata has not found anything to build — keep looking. Your goal is to produce
+implementation findings. Add metadata alongside them when relevant.
+
 \`\`\`json
 [{
-  "type": "feature|improvement|bug|refactor|perf|research|security_audit|qa|deps|docs|migrate|test|direction_proposal|direction_update|direction_note|design_doc_observation",
+  "type": "<see finding types above>",
   "title": "feat: short title (under 60 chars, conventional commit style)",
   "description": "1-3 sentences: what and why",
   "prompt": "Self-contained prompt for the implementing agent. Describe the problem and desired outcome.",

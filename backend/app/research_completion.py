@@ -391,15 +391,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in findings:
             f.pop("depends_on_indices", None)
 
-    # Query active/queued tasks for deduplication
-    existing_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == task.project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.PROVISIONING])
-        )
-    )).scalars().all()
-    existing_titles = [t.title.lower() for t in existing_tasks]
-
     # Query recent tasks (last 90 days) for hash-based deduplication across research cycles
     ninety_days_ago = _utcnow() - timedelta(days=90)
     recent_tasks_for_dedup = (await session.execute(
@@ -484,14 +475,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _finding_hash(title: str, description: str) -> str:
         return hashlib.sha256((title + description).encode()).hexdigest()[:16]
 
-    def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
-        words = set(finding_title.lower().split()) - {'the', 'a', 'an', 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
-        for title in existing:
-            overlap = words & set(title.split())
-            if len(overlap) >= 3:  # 3+ meaningful words in common
-                return True
-        return False
-
     # Sort findings by priority: high → medium → low (preserve original order within each tier).
     # The orchestrator dispatches by (status, priority, created_at), so higher-priority
     # tasks naturally run first without needing artificial wave dependencies.
@@ -509,10 +492,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if fhash in recent_finding_hashes:
             outcome = failed_hashes.get(fhash, "prior")
             logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {outcome} task")
-            skipped_duplicates += 1
-            continue
-        if _is_duplicate(title, existing_titles):
-            logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
             continue
         # Skip if all related_files for this finding are already covered by open PRs
