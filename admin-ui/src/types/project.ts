@@ -19,6 +19,21 @@ export interface Direction {
   };
 }
 
+export interface BuildConfigDirectory {
+  path: string;
+  language: string;
+  lint_command: string;
+  test_command: string;
+  build_command: string;
+}
+
+export interface BuildConfig {
+  directories: BuildConfigDirectory[];
+  commit_email: string;
+  commit_name: string;
+  languages?: string[];
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -29,6 +44,7 @@ export interface Project {
   directions: Direction[];
   created_at: string;
   my_role?: 'owner' | 'member' | 'viewer';
+  build_config?: BuildConfig | null;
 }
 
 export interface ProjectMemberEntry {

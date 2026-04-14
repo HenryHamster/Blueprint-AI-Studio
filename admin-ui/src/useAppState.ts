@@ -110,6 +110,7 @@ export function useAppState() {
     githubAccount, setGithubAccount,
     requireApprovalGates,
     notificationConfig,
+    buildConfig, setBuildConfig,
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     connectGitHub,
@@ -118,7 +119,7 @@ export function useAppState() {
     updateMaxVMs, updateMaxRetries, updateRequireApprovalGates,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
-    updateHealthCheckUrls, updateNotificationConfig,
+    updateHealthCheckUrls, updateNotificationConfig, updateBuildConfig,
   } = useSettings(addToast);
 
   const {
@@ -214,6 +215,12 @@ export function useAppState() {
     fetchAlerts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, limit, user, statusFilter, selectedProjectId]);
+
+  // Sync buildConfig from selected project whenever selection or project list changes
+  useEffect(() => {
+    const project = projects.find(p => p.id === selectedProjectId) ?? null;
+    setBuildConfig(project?.build_config ?? null);
+  }, [selectedProjectId, projects]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Polling interval — only restarts when refreshInterval or user changes
   useEffect(() => {
@@ -838,6 +845,41 @@ export function useAppState() {
     ).length;
   }, [tasks]);
 
+  const handleUpdateBuildConfig = async (config: import('./types/project').BuildConfig) => {
+    if (!selectedProjectId) return;
+    try {
+      await updateBuildConfig(selectedProjectId, config);
+      addToast('Build config saved', 'success');
+      fetchProjects(true);
+    } catch {
+      addToast('Failed to save build config', 'error');
+    }
+  };
+
+  const handleDetectBuildConfig = async () => {
+    if (!selectedProjectId) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/detect-build-config`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      if (!res.ok) {
+        if (res.status === 404) {
+          addToast('Auto-detection not yet available', 'info');
+        } else {
+          addToast('Detection failed', 'error');
+        }
+        return;
+      }
+      const data = await res.json();
+      setBuildConfig(data.build_config ?? null);
+      addToast('Build config detected', 'success');
+      fetchProjects(true);
+    } catch {
+      addToast('Auto-detection not yet available', 'info');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -896,6 +938,7 @@ export function useAppState() {
     handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     healthCheckUrls, updateHealthCheckUrls,
     notificationConfig, updateNotificationConfig,
+    buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
