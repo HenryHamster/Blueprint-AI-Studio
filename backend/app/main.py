@@ -656,8 +656,7 @@ async def _maybe_create_failure_alert(
             },
         ))
     except Exception as _ne:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
+        logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",

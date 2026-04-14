@@ -364,6 +364,16 @@ async def github_webhook(
             repo_full = data.get("repository", {}).get("full_name", "")
             if "/" in repo_full:
                 owner, repo = repo_full.split("/", 1)
+                # Verify repo belongs to a registered project (same guard as merged branch)
+                project_check = await session.execute(
+                    select(Project).where(
+                        Project.github_owner == owner,
+                        Project.github_repo == repo,
+                    )
+                )
+                if not project_check.scalars().first():
+                    logger.info(f"[WEBHOOK] Ignoring PR close event for unregistered repo {repo_full}")
+                    return {"status": "ignored"}
                 pr_number = data["pull_request"].get("number")
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"

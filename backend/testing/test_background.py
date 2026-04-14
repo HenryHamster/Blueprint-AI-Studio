@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 from app.models import Project, Task, TaskStatus
 from app.reaper import reaper_service
 from app.broadcast import broadcast_to_project, manager
 from app.services import _run_stale_branch_cleanup
+from app.task_lifecycle import _requeue_parent_task
 
 
 # The reaper creates its own DB sessions via AsyncSessionLocal. Tests must
@@ -385,3 +386,196 @@ async def test_broadcast_to_project():
         assert sent_messages[0]["data"]["foo"] == "bar"
     finally:
         manager.active_connections.pop(project_id, None)
+
+
+# ── _requeue_parent_task retry guidance ────────────────────────────────────
+
+@pytest_asyncio.fixture()
+async def requeue_db(mocker):
+    """Isolated in-memory DB for _requeue_parent_task tests."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    Session = sessionmaker(
+        bind=engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+
+    async with Session() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
+async def _make_parent_child(session, child_payloads, child_context=None, child_status_message=None):
+    """Helper: create a parent+child pair, commit, return (parent, child)."""
+    project = Project(name="Requeue Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        attempt_count=0,
+    )
+    session.add(parent)
+    await session.commit()
+    await session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        payloads=child_payloads,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context=child_context or {},
+        latest_status_message=child_status_message,
+    )
+    session.add(child)
+    await session.commit()
+    await session.refresh(child)
+
+    return parent, child
+
+
+@pytest.mark.asyncio
+async def test_requeue_agent_timeout_injects_scope_guidance(requeue_db, mocker):
+    """AGENT_TIMEOUT retries receive scope reduction guidance in prompt_suffix."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "do the thing"}],
+        child_status_message="reaped after no heartbeat for 30 minutes",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
+    assert "TIMED OUT" in suffix
+    assert "reduce scope" in suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_code_error_test_failure_injects_test_guidance(requeue_db, mocker):
+    """CODE_ERROR with test keywords in status message injects test-fixing guidance."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "add feature"}],
+        child_status_message="pytest test_foo failed with AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
+    assert "RETRY GUIDANCE" in suffix
+    assert "failing tests" in suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_code_error_lint_failure_injects_lint_guidance(requeue_db, mocker):
+    """CODE_ERROR with lint keywords injects lint-fixing guidance."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "refactor module"}],
+        child_status_message="ruff lint error: E501 line too long",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix", "")
+    assert "RETRY GUIDANCE" in suffix
+    assert "lint" in suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_large_scope_second_timeout_downgrades_scope(requeue_db, mocker):
+    """Large-scope task on 2nd+ AGENT_TIMEOUT attempt gets scope downgraded to medium."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "big task"}],
+        child_context={"scope": "large", "_attempt_number": 2},
+        child_status_message="execution timed out after 60 minutes",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    assert clone_ctx.get("scope") == "medium"
+    assert clone_ctx.get("_scope_reduced") is True
+
+
+@pytest.mark.asyncio
+async def test_requeue_large_scope_first_timeout_no_scope_downgrade(requeue_db, mocker):
+    """Large-scope task on 1st AGENT_TIMEOUT does NOT get scope downgraded."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "big task first try"}],
+        child_context={"scope": "large", "_attempt_number": 1},
+        child_status_message="execution timed out after 60 minutes",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    # scope should not be changed to medium on first timeout
+    assert clone_ctx.get("scope") == "large"
+    assert "_scope_reduced" not in clone_ctx
+
+
+@pytest.mark.asyncio
+async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
+    """Non-timeout, non-code-error failures (e.g. RATE_LIMIT) do not inject scope guidance."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "some task"}],
+        child_status_message="usage limit exceeded — billing quota exhausted",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    # RATE_LIMIT → no guidance injected; prompt_suffix absent or empty
+    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix")
+    assert not suffix
