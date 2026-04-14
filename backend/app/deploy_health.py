@@ -11,7 +11,6 @@ Extracted from app.main to reduce module size. Contains:
 """
 
 import logging
-import os
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,11 +18,14 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project, manager
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity, DeploymentState, DeploymentStatus, Project, Task
-from app.max_plan_pool import (
-    _account_by_id,
-    _account_available_for_model,
-    recheck_disabled_accounts,
+from app.models import Alert, AlertSeverity, DeploymentState, DeploymentStatus, Project
+from app.max_plan_pool import recheck_disabled_accounts
+from app.health_check_primitives import (
+    check_db_health,
+    check_github_health,
+    check_claude_api_health,
+    check_gcp_health,
+    log_zone_health_transitions,
 )
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -213,105 +215,21 @@ async def _check_external_health():
     ext["last_check"] = now
     failed = []
 
-    # DB check — if we can run this function, DB is likely fine, but verify explicitly
-    try:
-        async with AsyncSessionLocal() as session:
-            await session.execute(select(Task).limit(1))
-        ext["db"] = True
-        ext["errors"].pop("db", None)
-    except Exception as e:
-        logger.warning(f"[HEALTH] DB health check failed: {e}", exc_info=True)
-        ext["db"] = False
-        ext["errors"]["db"] = f"{type(e).__name__}: {str(e)[:200]}"
-        failed.append("db")
+    result = await check_db_health(ext)
+    if result:
+        failed.append(result)
 
-    # GitHub API check — passive first, active fallback.
-    # Primary: check if recent agent operations succeeded (avoids connection pool
-    # contention that caused false auto-pause under load).
-    # Fallback: if no recent operations, make a dedicated active check.
-    github_stale_threshold = 60  # 1 minute — detect outages faster during idle
-    github_age = (now - _shared_state.last_github_success).total_seconds() if _shared_state.last_github_success else None
+    result = await check_github_health(ext, now)
+    if result:
+        failed.append(result)
 
-    if github_age is not None and github_age < github_stale_threshold:
-        # Recent success — GitHub is healthy, no active check needed
-        ext["github_api"] = True
-        ext["errors"].pop("github_api", None)
-    else:
-        # No recent success — either idle or actually down. Make a dedicated active check
-        # using a separate short-lived client to avoid connection pool contention.
-        check_method = "passive" if github_age is not None else "active (cold start)"
-        try:
-            import httpx
-            from app.github import generate_github_app_jwt
-            jwt_token = generate_github_app_jwt()
-            async with httpx.AsyncClient(timeout=10.0) as health_client:
-                resp = await health_client.get("https://api.github.com/app",
-                                               headers={"Authorization": f"Bearer {jwt_token}"})
-            ext["github_api"] = resp.status_code == 200
-            if ext["github_api"]:
-                _shared_state.last_github_success = now
-                ext["errors"].pop("github_api", None)
-            else:
-                logger.warning(f"[HEALTH] GitHub API returned {resp.status_code}")
-                ext["errors"]["github_api"] = f"HTTP {resp.status_code} (check: {check_method})"
-                failed.append("github_api")
-        except Exception as e:
-            logger.warning(f"[HEALTH] GitHub API health check failed: {type(e).__name__}: {e!r}")
-            ext["github_api"] = False
-            ext["errors"]["github_api"] = f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
-            failed.append("github_api")
+    result = check_claude_api_health(ext)
+    if result:
+        failed.append(result)
 
-    # Claude API — check credentials + account availability
-    has_credentials = bool(_account_by_id) or bool(os.getenv("ANTHROPIC_API_KEY"))
-    if not has_credentials:
-        ext["claude_api"] = False
-        failed.append("claude_api")
-    else:
-        # For Max plan account pools: only mark unhealthy if ALL accounts are disabled.
-        # Individual account rate limits are handled by per-account cooldowns —
-        # the pipeline can continue with remaining enabled accounts.
-        all_accounts = list(_account_by_id.values())
-        if all_accounts:
-            # Use _account_available_for_model to check: has token, enabled, not all models disabled
-            available_accounts = [a for a in all_accounts if _account_available_for_model(a, None)]
-            if not available_accounts:
-                ext["claude_api"] = False
-                failed.append("claude_api")
-                disabled_names = [a["name"] for a in all_accounts]
-                logger.warning(f"[HEALTH] All Claude API accounts unavailable: {', '.join(disabled_names)}")
-            else:
-                ext["claude_api"] = True
-                # Log partial degradation for visibility (not a pipeline pause)
-                unavailable_accounts = [a for a in all_accounts if not _account_available_for_model(a, None)]
-                if unavailable_accounts:
-                    logger.info(f"[HEALTH] Claude API degraded — {len(unavailable_accounts)}/{len(all_accounts)} accounts unavailable, {len(available_accounts)} still available")
-        else:
-            # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
-            # since there's no per-account cooldown mechanism for a single key.
-            recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-            rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
-            if rate_limit_count >= 3:
-                ext["claude_api"] = False
-                failed.append("claude_api")
-                logger.warning(f"[HEALTH] Claude API rate limited (single key) — {rate_limit_count}/5 recent tasks hit limits")
-            else:
-                ext["claude_api"] = True
-
-    # GCP — check is implicit via provisioning success/failure tracking
-    # Mark unhealthy only if recent provisions all failed
-    recent_provisions = [r for r in _shared_state.deploy_monitoring["task_results"]
-                         if r[2] == "PROVISION_FAILURE"]
-    if len(recent_provisions) >= 3:
-        # Check if ALL recent failures are provision failures (guard against empty filter)
-        recent_all = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-        recent_failures = [r for r in recent_all if r[1] == "failure"]
-        if recent_failures and all(r[2] == "PROVISION_FAILURE" for r in recent_failures):
-            ext["gcp"] = False
-            failed.append("gcp")
-        else:
-            ext["gcp"] = True
-    else:
-        ext["gcp"] = True
+    result = check_gcp_health(ext)
+    if result:
+        failed.append(result)
 
     ext["failed_deps"] = failed
 
@@ -321,20 +239,7 @@ async def _check_external_health():
     # Log zone health transitions (available ↔ exhausted)
     zone_summary = _get_zone_health_summary()
     current_exhausted = set(zone_summary.get("exhausted", []))
-    available_zones = zone_summary.get("available", 0)
-    total_zones = zone_summary.get("total_zones", 0)
-    for zone in current_exhausted - _last_exhausted_zones:
-        logger.warning('zone_health_exhausted', extra={
-            'zone': zone,
-            'available_zones': available_zones,
-            'total_zones': total_zones,
-        })
-    for zone in _last_exhausted_zones - current_exhausted:
-        logger.info('zone_health_recovered', extra={
-            'zone': zone,
-            'available_zones': available_zones,
-            'total_zones': total_zones,
-        })
+    log_zone_health_transitions(current_exhausted, _last_exhausted_zones, zone_summary)
     _last_exhausted_zones = current_exhausted
 
     if failed:

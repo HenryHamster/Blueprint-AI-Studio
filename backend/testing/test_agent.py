@@ -657,7 +657,7 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
-    mocker.patch("app.main.broadcast_to_project", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Backoff Test", user_id="test-user-backoff")
     db_session.add(project)

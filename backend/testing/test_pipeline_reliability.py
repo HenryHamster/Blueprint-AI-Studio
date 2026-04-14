@@ -107,7 +107,7 @@ async def orch_db(mocker):
     mocker.patch("app.main.select_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.release_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
-    mocker.patch("app.main.record_task_result", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
