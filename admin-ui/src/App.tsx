@@ -28,6 +28,7 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
 import { MessagesPanel } from './components/MessagesPanel';
+import { QuickFilterPresets } from './components/QuickFilterPresets';
 // StatusBar removed — redundant connection info
 // HealthOverviewCard removed — redundant with CatchUp panel
 
@@ -258,6 +259,8 @@ export default function App() {
       .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
   }, [effectiveColumnPrefs, s.statusFilter]);
 
+  const stuckTaskIds = useMemo(() => new Set(s.diagnostics?.stuck_tasks?.map((st: { task_id: string }) => st.task_id) ?? []), [s.diagnostics]);
+
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
   const filteredTasks = useMemo(() => {
     const now = new Date().getTime();
@@ -273,10 +276,11 @@ export default function App() {
       const dateMatch = cutoff === null || new Date(t.created_at).getTime() >= cutoff;
       const blockedMatch = !s.blockedFilter || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
       const approvalMatch = !s.requiresApproval || t.requires_approval;
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch;
+      const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, stuckTaskIds]);
 
   const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
@@ -631,6 +635,24 @@ export default function App() {
               {filteredTasks.length} of {s.tasks.length}
             </span>
           </div>}
+
+          {/* Quick-filter preset buttons */}
+          <QuickFilterPresets
+            statusFilter={s.statusFilter}
+            dateRange={s.dateRange}
+            requiresApproval={s.requiresApproval}
+            blockedFilter={s.blockedFilter}
+            stuckFilter={s.stuckFilter}
+            stuckCount={stuckTaskIds.size}
+            searchQuery={s.searchQuery}
+            setStatusFilter={s.setStatusFilter}
+            setTaskTypeFilter={s.setTaskTypeFilter}
+            setDateRange={s.setDateRange}
+            setRequiresApproval={s.setRequiresApproval}
+            setBlockedFilter={s.setBlockedFilter}
+            setStuckFilter={s.setStuckFilter}
+            setSearchQuery={s.setSearchQuery}
+          />
 
           {s.viewMode === 'home' ? (
             <ErrorBoundary level="panel">
