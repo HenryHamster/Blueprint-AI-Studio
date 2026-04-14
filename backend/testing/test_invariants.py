@@ -31,6 +31,12 @@ class TestSafetyConstants:
         from app.shared_state import runtime_config
         assert runtime_config["max_autonomous_tasks_per_hour"] == 5
 
+    def test_max_rollup_retries_default(self):
+        """Default max_rollup_retries must be 5 — controls rollup PR creation retry ceiling."""
+        import os
+        from app.shared_state import runtime_config
+        assert runtime_config["max_rollup_retries"] == int(os.getenv("MAX_ROLLUP_RETRIES", "5"))
+
     def test_provision_slots_geq_concurrent_vms(self):
         """MAX_PROVISION_SLOTS must be >= MAX_CONCURRENT_VMS default.
 

@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import time
+import random
 import logging
 import asyncio
 import subprocess
@@ -699,7 +700,13 @@ STATICENV
         last_error = None
         skipped_cooldown = []
 
-        for zone, subnet_name in FALLBACK_ZONES:
+        now_pre = datetime.now(timezone.utc)
+        healthy_zones = [(z, s) for z, s in FALLBACK_ZONES if not (_zone_health.get(z, {}).get("cooldown_expires_at") and now_pre < _zone_health[z]["cooldown_expires_at"])]
+        cooled_zones = [(z, s) for z, s in FALLBACK_ZONES if (z, s) not in healthy_zones]
+        random.shuffle(healthy_zones)
+        zones_to_try = healthy_zones + cooled_zones
+
+        for zone, subnet_name in zones_to_try:
             if _cancel_event.is_set():
                 logger.info(f"[PROVISION] {vm_instance_id} cancelled — skipping remaining zones")
                 return None

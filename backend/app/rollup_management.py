@@ -684,10 +684,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     "unauthorized", "bad credentials", "token expired",
                 ])
                 rollup_retries = (parent.context or {}).get("_rollup_retries", 0) + 1
-                if is_transient and rollup_retries <= 5:
+                if is_transient and rollup_retries <= (max_rollup := _runtime_config.get("max_rollup_retries", 5)):
                     # Transient GitHub error — leave parent EVALUATING, retry next cycle
                     parent.context = {**(parent.context or {}), "_rollup_retries": rollup_retries}
-                    parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/5), will retry: {type(e).__name__}"
+                    parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/{max_rollup}), will retry: {type(e).__name__}"
                     logger.warning(f"[ROLLUP] Transient error creating rollup PR (attempt {rollup_retries}): {e}")
                 else:
                     logger.warning(f"[ROLLUP] Failed to create rollup PR: {e}", exc_info=True)

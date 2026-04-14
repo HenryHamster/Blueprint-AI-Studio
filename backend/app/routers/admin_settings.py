@@ -64,17 +64,14 @@ class ProjectSummary(TypedDict):
 
 
 def _classify_stuck_failure(task: Task) -> Optional[str]:
-    """Lightweight failure classifier for stuck tasks based on status message."""
-    msg = (task.latest_status_message or "").lower()
-    if any(kw in msg for kw in ["provision", "quota", "vm failed", "connection refused", "ssh", "startup script"]):
-        return "PROVISION_FAILURE"
-    if any(kw in msg for kw in ["rate limit", "rate_limit", "429", "overloaded", "credit", "too many requests"]):
-        return "RATE_LIMIT"
-    if any(kw in msg for kw in ["api.github.com", "api.anthropic.com", "502", "503", "ssl", "certificate"]):
-        return "EXTERNAL_API"
-    if any(kw in msg for kw in ["no heartbeat", "reaped", "execution timed out", "node process killed", "oom kill", "oom killer", "killed by oom", "sigterm", "exit code 137", "exit code 143"]):
-        return "AGENT_TIMEOUT"
-    return None
+    """Classify stuck tasks using the canonical classifier, returning None for CODE_ERROR.
+
+    Stuck tasks have not actually failed yet, so CODE_ERROR (the default fallback) is
+    misleading. We suppress it and return None so the UI shows 'unclassified' instead.
+    """
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+    result = classify_failure(task)
+    return result if result != "CODE_ERROR" else None
 
 
 def _fmt_duration(seconds: float) -> str:

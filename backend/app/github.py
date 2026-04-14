@@ -1,4 +1,5 @@
 import asyncio
+import random
 from typing import Any, Dict
 
 import httpx
@@ -103,19 +104,19 @@ async def _github_request(
                         f"after {max_retries} attempts"
                     )
                 return response
-            delay = 2 ** attempt  # 1s, 2s, 4s
+            delay = 2 ** attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
             logger.warning(
                 f"[GITHUB] {method} {url} returned {response.status_code}, "
-                f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
             )
             await asyncio.sleep(delay)
         except httpx.HTTPError as exc:
             if attempt == max_retries - 1:
                 raise
-            delay = 2 ** attempt
+            delay = 2 ** attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
             logger.warning(
                 f"[GITHUB] {method} {url} network error: {exc}, "
-                f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
+                f"retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})"
             )
             await asyncio.sleep(delay)
     assert response is not None  # loop always runs at least once (max_retries >= 1)

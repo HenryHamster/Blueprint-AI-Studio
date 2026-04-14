@@ -61,25 +61,40 @@ class TestClassifyStuckFailure:
         return t
 
     def test_provision_keywords(self):
-        for kw in ["provision error", "quota exceeded", "vm failed", "connection refused", "ssh timeout", "startup script failed"]:
+        for kw in ["provision error", "quota exceeded", "vm failed to start", "connection refused", "sshd failed", "startup script failed"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "PROVISION_FAILURE", kw
 
+    def test_provision_keywords_previously_missing(self):
+        # cpus_all_regions was missing from old lightweight classifier
+        assert _classify_stuck_failure(self._task_with_message("cpus_all_regions quota exceeded")) == "PROVISION_FAILURE"
+
     def test_rate_limit_keywords(self):
-        for kw in ["rate limit hit", "rate_limit exceeded", "429 too many", "overloaded server", "credit exhausted", "too many requests"]:
+        # "overloaded" without billing context → EXTERNAL_API per canonical classifier (not RATE_LIMIT)
+        for kw in ["rate limit hit", "rate_limit exceeded", "429 too many", "credit exhausted", "too many requests"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "RATE_LIMIT", kw
 
     def test_external_api_keywords(self):
-        for kw in ["api.github.com error", "api.anthropic.com down", "502 bad gateway", "503 unavailable", "ssl handshake", "certificate expired"]:
+        for kw in ["api.github.com error", "api.anthropic.com down", "502 bad gateway", "503 service unavailable", "ssl handshake", "certificate expired"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API", kw
 
+    def test_overloaded_without_billing_is_external_api(self):
+        # canonical classifier: "overloaded" without billing/usage keywords → EXTERNAL_API (not RATE_LIMIT)
+        assert _classify_stuck_failure(self._task_with_message("overloaded server")) == "EXTERNAL_API"
+
     def test_agent_timeout_keywords(self):
-        for kw in ["no heartbeat received", "reaped by watchdog", "execution timed out", "node process killed", "oom kill", "killed by oom", "sigterm received", "exit code 137", "exit code 143"]:
+        for kw in ["no heartbeat received", "reaped by watchdog", "execution timed out", "node process killed", "oom-kill", "killed by oom", "sigterm received", "exit code 137", "exit code 143"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "AGENT_TIMEOUT", kw
+
+    def test_agent_timeout_keywords_previously_missing(self):
+        # exit code 124 (timeout) and exit code 139 (segfault) were missing from old classifier
+        assert _classify_stuck_failure(self._task_with_message("exit code 124")) == "AGENT_TIMEOUT"
+        assert _classify_stuck_failure(self._task_with_message("exit code 139")) == "AGENT_TIMEOUT"
 
     def test_empty_message_returns_none(self):
         assert _classify_stuck_failure(self._task_with_message("")) is None
 
     def test_unrelated_message_returns_none(self):
+        # CODE_ERROR is suppressed → returns None for stuck tasks
         assert _classify_stuck_failure(self._task_with_message("task completed successfully")) is None
 
     def test_none_message_returns_none(self):
