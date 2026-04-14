@@ -324,6 +324,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
                           <span className={mr.color}>{mr.pct}% merge</span>
                           <span>{d.cycles_in_window} cycle{d.cycles_in_window !== 1 ? 's' : ''}</span>
                           <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
+                          {d.product_ratio != null && (
+                            <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
+                          )}
                         </div>
                       </div>
                     );
