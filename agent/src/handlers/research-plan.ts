@@ -11,6 +11,63 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers,
 } from '../prompt.js';
 
+// ── Pure data transformation helpers (exported for testing) ─────────────────
+
+export function calcMessageAge(m: Record<string, unknown>): string {
+  if (!m.created_at) return '?';
+  const ms = Date.now() - new Date(String(m.created_at)).getTime();
+  if (isNaN(ms)) return '?';
+  const h = Math.floor(ms / 3600000);
+  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+}
+
+export function parseResearchContext(rawCtx: string): { established: string[]; failed: string[]; open: string[] } {
+  const sections: { established: string[]; failed: string[]; open: string[] } = { established: [], failed: [], open: [] };
+  let currentSection: keyof typeof sections | '' = '';
+  for (const line of rawCtx.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
+    if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
+    if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
+    if (trimmed.startsWith('- ') && currentSection) {
+      sections[currentSection].push(trimmed);
+    }
+  }
+  return sections;
+}
+
+export function aggregateDirectionStats(
+  history: Array<Record<string, unknown>>,
+  aggregate: Record<string, number | string | null>
+): string {
+  const totalCycles = history.length + ((aggregate.total_cycles as number) || 0);
+  if (totalCycles === 0) return '';
+  const totalTasks = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0) + ((aggregate.total_tasks_created as number) || 0);
+  const totalMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0) + ((aggregate.total_prs_merged as number) || 0);
+  const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0) + ((aggregate.total_tasks_failed as number) || 0);
+  const parts = [`${totalCycles} cycles`, `${totalTasks} tasks`];
+  if (totalMerged > 0) parts.push(`${totalMerged} merged`);
+  if (totalFailed > 0) parts.push(`${totalFailed} failed`);
+  return `Stats: ${parts.join(', ')}`;
+}
+
+export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {
+  return {
+    title: strVal(st.title, 'Untitled subtask'),
+    description: strVal(st.prompt),
+    prompt: strVal(st.prompt),
+    type: strVal(st.type, 'create'),
+    scope: strVal(st.scope, 'small'),
+    risk: strVal(st.risk, 'low'),
+    base_branch: baseBranch,
+    depends_on_indices: st.depends_on_indices ?? [],
+    related_files: st.related_files ?? [],
+    ...(st.model ? { model: strVal(st.model) } : {}),
+    ...(st.effort ? { effort: strVal(st.effort) } : {}),
+    ...(st.approval_reason ? { approval_reason: strVal(st.approval_reason) } : {}),
+  };
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -143,20 +200,7 @@ Rules:
       if (Array.isArray(subtasks) && subtasks.length > 0 && subtasks.length <= 10) {
         sendLog(ws, `Parsed ${subtasks.length} subtasks from plan output\n`);
 
-        const spawnPayloads = (subtasks as Record<string, unknown>[]).map((st) => ({
-          title: strVal(st.title, 'Untitled subtask'),
-          description: strVal(st.prompt),
-          prompt: strVal(st.prompt),
-          type: strVal(st.type, 'create'),
-          scope: strVal(st.scope, 'small'),
-          risk: strVal(st.risk, 'low'),
-          base_branch: baseBranch,
-          depends_on_indices: st.depends_on_indices ?? [],
-          related_files: st.related_files ?? [],
-          ...(st.model ? { model: strVal(st.model) } : {}),
-          ...(st.effort ? { effort: strVal(st.effort) } : {}),
-          ...(st.approval_reason ? { approval_reason: strVal(st.approval_reason) } : {}),
-        }));
+        const spawnPayloads = (subtasks as Record<string, unknown>[]).map((st) => mapSubtaskToSpawnPayload(st, baseBranch));
 
         statusRef.value = 'Spawning subtasks...';
         const spawnResult = await apiPost('/api/agent/spawn', {
@@ -278,38 +322,15 @@ ${hotspotsSection}
           : '';
         const history = Array.isArray(d.research_history) ? d.research_history as Array<Record<string, unknown>> : [];
         const agg = (d.history_aggregate || {}) as Record<string, number | string | null>;
-        const totalCycles = history.length + ((agg.total_cycles as number) || 0);
-
-        // One-line stats summary
-        let statsLine = '';
-        if (totalCycles > 0) {
-          const totalTasks = history.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0) + ((agg.total_tasks_created as number) || 0);
-          const totalMerged = history.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0) + ((agg.total_prs_merged as number) || 0);
-          const totalFailed = history.reduce((s, h) => s + ((h.tasks_failed as number) || 0), 0) + ((agg.total_tasks_failed as number) || 0);
-          const parts = [`${totalCycles} cycles`, `${totalTasks} tasks`];
-          if (totalMerged > 0) parts.push(`${totalMerged} merged`);
-          if (totalFailed > 0) parts.push(`${totalFailed} failed`);
-          statsLine = `\n  Stats: ${parts.join(', ')}`;
-        }
+        const statsResult = aggregateDirectionStats(history, agg);
+        const statsLine = statsResult ? `\n  ${statsResult}` : '';
 
         // Research context — restructure to avoid anchoring on small past findings.
         // Show failed approaches and open questions in full (high-signal steering).
         // Summarize established findings as a count to inform without anchoring scope.
         let researchCtx = '';
         if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
-          const rawCtx = d.research_context as string;
-          const sections: Record<string, string[]> = { established: [], failed: [], open: [] };
-          let currentSection = '';
-          for (const line of rawCtx.split('\n')) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
-            if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
-            if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
-            if (trimmed.startsWith('- ') && currentSection) {
-              sections[currentSection].push(trimmed);
-            }
-          }
-
+          const sections = parseResearchContext(d.research_context as string);
           const ctxParts: string[] = [];
           if (sections.established.length > 0) {
             ctxParts.push(`  ${sections.established.length} findings already completed for this direction (do not re-propose similar scope work).`);
@@ -483,13 +504,6 @@ ${hotspotsSection}
       }
     }
 
-    const calcMessageAge = (m: Record<string, unknown>): string => {
-      if (!m.created_at) return '?';
-      const ms = Date.now() - new Date(String(m.created_at)).getTime();
-      const h = Math.floor(ms / 3600000);
-      return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
-    };
-
     const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
     const otherMessages = openMessages.filter(m => strVal(m.type) !== 'FEEDBACK');
 
@@ -522,18 +536,7 @@ ${hotspotsSection}
           // Research context: show established findings count, failed approaches, open questions
           let ctxSection = '';
           if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
-            const rawCtx = d.research_context as string;
-            const sections: Record<string, string[]> = { established: [], failed: [], open: [] };
-            let currentSection = '';
-            for (const line of rawCtx.split('\n')) {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('## Established')) { currentSection = 'established'; continue; }
-              if (trimmed.startsWith('## Failed')) { currentSection = 'failed'; continue; }
-              if (trimmed.startsWith('## Open')) { currentSection = 'open'; continue; }
-              if (trimmed.startsWith('- ') && currentSection) {
-                sections[currentSection].push(trimmed);
-              }
-            }
+            const sections = parseResearchContext(d.research_context as string);
             const ctxParts: string[] = [];
             if (sections.established.length > 0) {
               const confirmed = sections.established.filter(s => s.includes('(confirmed)'));
