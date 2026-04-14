@@ -976,8 +976,9 @@ async def orchestrator_worker():
                     if not ci_pr_number:
                         continue
 
-                    # Exponential backoff: skip if not enough time has elapsed since last poll
-                    ci_poll_interval = ci_loop.get("ci_poll_interval", 10)
+                    # Exponential backoff: skip if not enough time has elapsed since last poll.
+                    # Webhooks handle the fast path — polling is a fallback.
+                    ci_poll_interval = ci_loop.get("ci_poll_interval", 30)
                     ci_last_polled = ci_loop.get("ci_last_polled")
                     if ci_last_polled:
                         try:
@@ -1014,62 +1015,58 @@ async def orchestrator_worker():
 
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
 
-                        # Re-fetch current PR head to handle force-pushes
-                        try:
-                            pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
-                        except HTTPException as exc:
-                            if exc.status_code in (404, 410):
-                                _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
-                                logger.error(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = _pr_gone_msg
+                        # Use cached head SHA when available to skip the PR fetch (saves 1 API call per poll).
+                        # Re-fetch PR every 5th poll to detect force-pushes and merge state changes.
+                        cached_head_sha = ci_loop.get("head_sha", "")
+                        polls_since_fetch = ci_loop.get("polls_since_pr_fetch", 5) + 1  # default 5 to force first fetch
+                        need_pr_fetch = not cached_head_sha or polls_since_fetch >= 5
+                        pr_data = None
+
+                        if not need_pr_fetch:
+                            # Fast path: skip PR fetch, use cached SHA, just check CI
+                            pr_data = {"state": "open", "head": {"sha": cached_head_sha}, "mergeable": True}
+                            ci_loop["polls_since_pr_fetch"] = polls_since_fetch
+
+                        if need_pr_fetch:
+                            ci_loop["polls_since_pr_fetch"] = 0
+                            try:
+                                pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
+                            except HTTPException as exc:
+                                if exc.status_code in (404, 410):
+                                    _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
+                                    logger.error(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
+                                    ci_task.status = TaskStatus.FAILED
+                                    ci_task.latest_status_message = _pr_gone_msg
+                                    session.add(ci_task)
+                                    await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
+                                    await session.commit()
+                                    await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                               {"task_id": str(ci_task.id), "status": ci_task.status})
+                                    continue
+                                # Transient GitHub API error — backoff and retry
+                                _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
+                                ci_loop["pr_fetch_failures"] = _fetch_failures
+                                ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                ci_loop["ci_poll_interval"] = min((ci_loop.get("ci_poll_interval", 30)) * 2, 300)
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                logger.warning(f"[CI] Transient error fetching PR #{ci_pr_number} for task {ci_task.id} "
+                                               f"(attempt {_fetch_failures}): {exc.detail}")
                                 session.add(ci_task)
-                                await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
                                 await session.commit()
-                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
-                                continue
-                            # Transient GitHub API error (500, 502, 503, etc.) — backoff and retry
-                            _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
-                            ci_loop["pr_fetch_failures"] = _fetch_failures
-                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
-                            ci_loop["ci_poll_interval"] = min((ci_loop.get("ci_poll_interval", 10)) * 2, 60)
-                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                            logger.warning(f"[CI] Transient error fetching PR #{ci_pr_number} for task {ci_task.id} "
-                                           f"(attempt {_fetch_failures}): {exc.detail}")
-                            session.add(ci_task)
-                            await session.commit()
-                            if _fetch_failures >= 10:
-                                # Escalate after 10 consecutive failures but keep retrying
-                                if not ci_loop.get("fetch_escalated"):
+                                if _fetch_failures >= 10 and not ci_loop.get("fetch_escalated"):
                                     ci_loop["fetch_escalated"] = True
                                     ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
                                     await _maybe_create_failure_alert(ci_task, session,
                                         f"PR #{ci_pr_number} GitHub API failures ({_fetch_failures}x) — still retrying")
                                     session.add(ci_task)
                                     await session.commit()
-                            continue
+                                continue
 
-                        if not pr_data:
-                            _fetch_failures = ci_loop.get("pr_fetch_failures", 0) + 1
-                            ci_loop["pr_fetch_failures"] = _fetch_failures
-                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                            session.add(ci_task)
-                            await session.commit()
-                            if _fetch_failures >= 5:
-                                _empty_msg = f"PR #{ci_pr_number} returned empty response {_fetch_failures} times consecutively"
-                                logger.error(f"[CI] {_empty_msg} for task {ci_task.id}")
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = _empty_msg
-                                session.add(ci_task)
-                                await _maybe_create_failure_alert(ci_task, session, _empty_msg)
-                                await session.commit()
-                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
-                            continue
+                            if not pr_data:
+                                continue
 
-                        if ci_loop.get("pr_fetch_failures"):
-                            ci_loop["pr_fetch_failures"] = 0
+                            if ci_loop.get("pr_fetch_failures"):
+                                ci_loop["pr_fetch_failures"] = 0
 
                         pr_state = pr_data.get("state", "open")
 
@@ -1168,11 +1165,11 @@ async def orchestrator_worker():
                             logger.info(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
-                        ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha)
+                        ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=str(ci_task.project_id))
                         if ci_result["status"] != "completed":
                             details = [d["name"] for d in ci_result.get("details", []) if d.get("status") in ("queued", "in_progress")]
                             ci_task.latest_status_message = f"CI in progress on PR #{ci_pr_number}: {', '.join(details) or 'waiting for checks'}..."
-                            ci_loop["ci_poll_interval"] = min(ci_poll_interval * 2, 60)
+                            ci_loop["ci_poll_interval"] = min(ci_poll_interval * 2, 300)
                             ci_loop["ci_last_polled"] = _utcnow().isoformat()
                             ci_loop["head_sha"] = ci_head_sha
                             ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
@@ -1182,164 +1179,10 @@ async def orchestrator_worker():
                                                        {"task_id": str(ci_task.id), "status": ci_task.status})
                             continue
 
-                        ci_payload = ci_task.first_payload
-                        ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
-                        ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
-                        ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
-
-                        if ci_result["conclusion"] == "success":
-                            # CI passed — merge
-                            merge_result = await merge_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
-                            if merge_result.get("merged"):
-                                await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
-                                    "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
-                                ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"CI passed, PR #{ci_pr_number} merged"
-                                if ci_orig_id:
-                                    try:
-                                        orig = await session.get(Task, uuid.UUID(ci_orig_id))
-                                        if orig:
-                                            orig.context = {**(orig.context or {}), "pr_merged": True}
-                                            if orig.status == TaskStatus.EVALUATING and not (orig.context or {}).get("review_loop", {}).get("ci_waiting"):
-                                                orig.status = TaskStatus.COMPLETED
-                                                orig.latest_status_message = "Rollup PR merged"
-                                            session.add(orig)
-                                    except Exception as e:
-                                        logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
-                                logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged")
-                            else:
-                                for attempt in range(3):
-                                    await asyncio.sleep(5 * (3 ** attempt))  # 5s, 15s, 45s
-                                    merge_result = await merge_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
-                                    if merge_result.get('merged'):
-                                        break
-                                if merge_result.get('merged'):
-                                    await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
-                                        "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
-                                    ci_task.status = TaskStatus.COMPLETED
-                                    ci_task.latest_status_message = f"CI passed, PR #{ci_pr_number} merged (after retry)"
-                                    if ci_orig_id:
-                                        try:
-                                            orig = await session.get(Task, uuid.UUID(ci_orig_id))
-                                            if orig:
-                                                orig.context = {**(orig.context or {}), "pr_merged": True}
-                                                if orig.status == TaskStatus.EVALUATING and not (orig.context or {}).get("review_loop", {}).get("ci_waiting"):
-                                                    orig.status = TaskStatus.COMPLETED
-                                                    orig.latest_status_message = "Rollup PR merged"
-                                                session.add(orig)
-                                        except Exception as e:
-                                            logger.warning(f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True)
-                                    logger.info(f"[CI] PR #{ci_pr_number} CI passed, merged after retry")
-                                else:
-                                    # Check if merge was blocked because checks are still in progress
-                                    # (race: new CI run triggered after our check but before merge).
-                                    # If so, go back to CI-waiting instead of permanently failing.
-                                    merge_msg = merge_result.get('message', '')
-                                    if 'in progress' in merge_msg.lower() or 'status check' in merge_msg.lower():
-                                        ci_loop["ci_poll_interval"] = 10  # Reset polling interval
-                                        ci_loop["ci_last_polled"] = _utcnow().isoformat()
-                                        ci_loop["ci_wait_started"] = _utcnow().isoformat()  # Reset timeout — new CI cycle
-                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                        ci_task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
-                                        logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait")
-                                    else:
-                                        # Check if PR was merged by a sibling task
-                                        try:
-                                            _recheck_pr = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
-                                            if _recheck_pr and (_recheck_pr.get("merged") or _recheck_pr.get("state") == "closed"):
-                                                ci_task.status = TaskStatus.COMPLETED
-                                                ci_task.latest_status_message = f"PR #{ci_pr_number} already merged by another task"
-                                                logger.info(f"[CI] PR #{ci_pr_number} was already merged — marking task complete")
-                                            else:
-                                                # Retry instead of failing — backoff and try again next cycle
-                                                _merge_failures = ci_loop.get("merge_failures", 0) + 1
-                                                ci_loop["merge_failures"] = _merge_failures
-                                                ci_loop["ci_poll_interval"] = min(30 * _merge_failures, 120)
-                                                ci_loop["ci_last_polled"] = _utcnow().isoformat()
-                                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                                ci_task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
-                                                logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry")
-                                                if _merge_failures >= 10 and not ci_loop.get("merge_escalated"):
-                                                    ci_loop["merge_escalated"] = True
-                                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                                    await _maybe_create_failure_alert(ci_task, session,
-                                                        f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
-                                        except Exception:
-                                            # GitHub API error on recheck — retry next cycle
-                                            ci_loop["ci_poll_interval"] = 30
-                                            ci_loop["ci_last_polled"] = _utcnow().isoformat()
-                                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                            ci_task.latest_status_message = f"Merge check failed on PR #{ci_pr_number} — retrying"
-                                            logger.warning(f"[CI] PR #{ci_pr_number} merge recheck failed — will retry")
-                        else:
-                            # CI failed — check for existing active fix before spawning
-                            active_tasks = (await session.execute(
-                                select(Task).where(
-                                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
-                                )
-                            )).scalars().all()
-                            existing_fix = next(
-                                (t for t in active_tasks
-                                 if t.first_payload.get("type") == "fix"
-                                 and t.first_payload.get("pr_number") == ci_pr_number),
-                                None
-                            )
-                            if existing_fix:
-                                ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix already active → {existing_fix.id}"
-                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id}")
-                                session.add(ci_task)
-                                await session.commit()
-                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
-                                continue
-                            ci_errors = ci_result.get("failed_logs", "CI checks failed")
-                            await create_pr_comment(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
-                                f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```")
-                            ci_fix_prompt = (
-                                f"PR #{ci_pr_number} is blocked by failing CI checks (code review already approved).\n\n"
-                                f"IMPORTANT — verify current state before acting. Between when this task was spawned and "
-                                f"when you run, the PR's mergeable state or check-run results may have changed. After cloning:\n"
-                                f"  1. Attempt `git rebase origin/{ci_base}` — if conflicts appear, resolve them first.\n"
-                                f"  2. Inspect the failing checks via the GitHub API "
-                                f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
-                                f"https://api.github.com/repos/{ci_owner}/{ci_repo}/commits/$(git rev-parse HEAD)/check-runs`) "
-                                f"to confirm which checks are still failing on the latest head.\n\n"
-                                f"CI errors captured at spawn time:\n{ci_errors}\n\n"
-                                f"Focus: fix the build/lint/test errors — the code review is already approved, "
-                                f"don't re-architect unrelated code.\n\n"
-                                f"Before declaring done: ensure (a) `git rebase origin/{ci_base}` succeeds cleanly with no "
-                                f"remaining conflict markers, (b) local lint/type/test suites pass on the changed files, "
-                                f"and (c) every fix is committed."
-                            )
-                            fix_task = await _spawn_pipeline_task(
-                                ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
-                                fix_prompt=ci_fix_prompt,
-                                original_task_id=ci_orig_id,
-                                fix_reason="ci_failure"
-                            )
-                            if fix_task:
-                                ci_loop_ctx = dict(ci_loop)
-                                ci_loop_ctx["ci_waiting"] = False
-                                ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
-                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop_ctx}
-                                ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
-                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id}")
-                            else:
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
-                                logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None")
-
-                        if ci_task.status == TaskStatus.FAILED:
-                            await _maybe_create_failure_alert(
-                                ci_task, session,
-                                f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
-                            )
-                        session.add(ci_task)
-                        await session.commit()
-                        await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                   {"task_id": str(ci_task.id), "status": ci_task.status})
+                        # CI completed — delegate to shared handler
+                        from app.ci_completion import handle_ci_completion  # noqa: PLC0415
+                        logger.info(f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing")
+                        await handle_ci_completion(ci_task, ci_result, ci_gh_token, ci_owner, ci_repo, session, source="poll")
                     except Exception as e:
                         logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
                         try:

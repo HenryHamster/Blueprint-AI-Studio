@@ -56,10 +56,12 @@ async def _github_request(
             response = await client.request(method, url, headers=headers, **kwargs)
             # 429 or 403 rate limit — GitHub uses 403 for primary rate limit
             # exhaustion (5,000 req/hr) and 429 for secondary/search limits.
-            # Both should be retried with Retry-After / X-RateLimit-Reset.
+            # Secondary abuse limits return 403 + Retry-After WITHOUT
+            # X-RateLimit-Remaining: 0, so also treat 403 + Retry-After as retriable.
             is_rate_limited = response.status_code == 429 or (
                 response.status_code == 403
-                and response.headers.get("X-RateLimit-Remaining") == "0"
+                and (response.headers.get("X-RateLimit-Remaining") == "0"
+                     or response.headers.get("Retry-After") is not None)
             )
             if is_rate_limited and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After")

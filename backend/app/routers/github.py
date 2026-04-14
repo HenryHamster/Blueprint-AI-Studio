@@ -357,24 +357,50 @@ async def github_webhook(
 
         owner, repo = repo_full.split('/', 1)
 
-        # Find ci_waiting tasks matching this commit SHA
+        # Find ci_waiting tasks matching this commit SHA, scoped to this repo's project
+        project_result = await session.execute(
+            select(Project).where(Project.github_owner == owner, Project.github_repo == repo)
+        )
+        project = project_result.scalars().first()
+        if not project:
+            return {'status': 'ignored', 'reason': 'unregistered_repo'}
+
         ci_tasks = (await session.execute(
-            select(Task).where(Task.status == TaskStatus.EVALUATING)
+            select(Task).where(Task.status == TaskStatus.EVALUATING, Task.project_id == project.id)
         )).scalars().all()
 
-        for task in ci_tasks:
-            loop = (task.context or {}).get('review_loop', {})
-            if not loop.get('ci_waiting'):
-                continue
-            task_sha = loop.get('head_sha')
-            if task_sha == head_sha:
-                # Reset the polling interval to trigger immediate check on next cycle
-                loop['ci_poll_interval'] = 0
+        matching = [t for t in ci_tasks
+                    if (t.context or {}).get('review_loop', {}).get('ci_waiting')
+                    and (t.context or {}).get('review_loop', {}).get('head_sha') == head_sha]
+
+        if not matching:
+            return {'status': 'no_match'}
+
+        # Fetch full check status for this SHA (1 API call covers all check runs)
+        from app.github import get_check_runs as _get_check_runs
+        from app.routers.agent import get_github_token_for_task
+        from app.ci_completion import handle_ci_completion
+
+        for task in matching:
+            try:
+                gh_token, gh_owner, gh_repo = await get_github_token_for_task(task.id, session)
+                ci_result = await _get_check_runs(gh_token, gh_owner, gh_repo, head_sha, project_id=str(task.project_id))
+
+                if ci_result['status'] != 'completed':
+                    # Some checks still pending — more webhooks will come
+                    logger.info(f'[WEBHOOK] check_run for {head_sha[:8]}: some checks still pending, waiting')
+                    continue
+
+                await handle_ci_completion(task, ci_result, gh_token, gh_owner, gh_repo, session, source='webhook')
+                logger.info(f'[WEBHOOK] CI completed for {head_sha[:8]} — handled task {task.id} via webhook')
+            except Exception as e:
+                # Fallback: reduce polling interval so orchestrator picks it up soon
+                logger.error(f'[WEBHOOK] Error handling CI completion for task {task.id}: {e}', exc_info=True)
+                loop = (task.context or {}).get('review_loop', {})
+                loop['ci_poll_interval'] = 15
                 loop['ci_last_polled'] = None
                 task.context = {**(task.context or {}), 'review_loop': loop}
                 session.add(task)
-
-        await session.commit()
-        logger.info(f'[WEBHOOK] check_run completed for {head_sha[:8]} — reset polling for matching tasks')
+                await session.commit()
 
     return {"status": "received"}

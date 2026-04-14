@@ -47,7 +47,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     includeTaskTypeHints = true,
   } = opts;
 
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const ctx = (task.context as Record<string, unknown> | undefined) || {};
+  const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');

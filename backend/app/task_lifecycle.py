@@ -789,7 +789,7 @@ async def _process_post_commit(
                         task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
                         task.context = {**(task.context or {}), "review_loop": {
                             **review_loop, "ci_waiting": True, "verdict": "APPROVE",
-                            "pr_number": pr_number,
+                            "head_sha": head_sha, "pr_number": pr_number,
                             "branch": branch, "base_branch": base_branch,
                             "original_task_id": original_task_id,
                             "ci_wait_started": _utcnow().isoformat()}}
