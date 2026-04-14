@@ -1,9 +1,14 @@
-import { useState } from 'react';
-import { X, GitBranch, Loader2, CheckCircle, Plus } from 'lucide-react';
-import { onboardProject } from '../api';
+import { useState, useEffect } from 'react';
+import { X, GitBranch, Loader2, CheckCircle, Plus, Search } from 'lucide-react';
+import { onboardProject, authGet, API_BASE_URL } from '../api';
 import type { BuildConfig } from '../types/project';
 
 type Step = 'repo' | 'config' | 'submitting' | 'success';
+
+interface RepoOption {
+  full_name: string;
+  default_branch: string;
+}
 
 interface NewProjectModalProps {
   onClose: () => void;
@@ -29,6 +34,46 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
   const [submitError, setSubmitError] = useState('');
   const [createdProjectId, setCreatedProjectId] = useState('');
   const [detectedConfig, setDetectedConfig] = useState<BuildConfig | null>(null);
+
+  // Repo picker state
+  const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
+  const [repoLoading, setRepoLoading] = useState(false);
+  const [repoFetchError, setRepoFetchError] = useState<string | null>(null);
+  const [useManualRepo, setUseManualRepo] = useState(false);
+  const [repoFilter, setRepoFilter] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRepoLoading(true);
+    setRepoFetchError(null);
+    authGet(`${API_BASE_URL}/api/admin/github/repos`)
+      .then(async res => {
+        if (cancelled) return;
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          setRepoFetchError(errData?.detail || 'Failed to load repositories');
+          setUseManualRepo(true);
+          return;
+        }
+        const data = await res.json();
+        const repos: RepoOption[] = data.repositories || [];
+        setRepoOptions(repos);
+        if (repos.length === 0) {
+          setRepoFetchError('No repositories found for this GitHub installation');
+          setUseManualRepo(true);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRepoFetchError('Failed to connect to server');
+        setUseManualRepo(true);
+      })
+      .finally(() => {
+        if (!cancelled) setRepoLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const parsed = parseRepoInput(repoInput);
 
@@ -63,6 +108,10 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
 
   const stepKeys = ['repo', 'config', 'success'] as const;
   const currentStepIndex = step === 'submitting' ? 1 : stepKeys.indexOf(step as typeof stepKeys[number]);
+
+  const filteredRepos = repoOptions.filter(r =>
+    r.full_name.toLowerCase().includes(repoFilter.toLowerCase())
+  );
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
@@ -110,19 +159,95 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
                 <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   GitHub Repository
                 </label>
-                <input
-                  type="text"
-                  autoFocus
-                  value={repoInput}
-                  onChange={e => { setRepoInput(e.target.value); setRepoError(''); }}
-                  onKeyDown={e => e.key === 'Enter' && handleRepoNext()}
-                  placeholder="owner/repo or https://github.com/owner/repo"
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
-                    repoError ? 'border-red-500' : 'border-neutral-800'
-                  }`}
-                />
+
+                {repoLoading ? (
+                  <div className="flex items-center gap-2 py-3 text-neutral-500 text-xs">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Loading repositories…
+                  </div>
+                ) : !useManualRepo && repoOptions.length > 0 ? (
+                  <div>
+                    {/* Searchable repo list */}
+                    <div className="relative mb-1">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500 pointer-events-none" />
+                      <input
+                        type="text"
+                        autoFocus
+                        value={repoFilter}
+                        onChange={e => setRepoFilter(e.target.value)}
+                        placeholder="Filter repositories…"
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg pl-8 pr-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      />
+                    </div>
+                    <div className="max-h-48 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950 mb-1">
+                      {filteredRepos.length === 0 ? (
+                        <div className="px-3 py-2 text-xs text-neutral-500">No repositories match</div>
+                      ) : (
+                        filteredRepos.map(r => (
+                          <button
+                            key={r.full_name}
+                            type="button"
+                            onClick={() => {
+                              setRepoInput(r.full_name);
+                              setRepoError('');
+                            }}
+                            className={`w-full flex items-center justify-between px-3 py-2 text-left hover:bg-neutral-800 transition-colors border-b border-neutral-800/50 last:border-b-0 ${
+                              repoInput === r.full_name ? 'bg-neutral-800' : ''
+                            }`}
+                          >
+                            <span className="text-xs font-mono text-neutral-200">{r.full_name}</span>
+                            <span className="text-[10px] text-neutral-500 ml-2 shrink-0 flex items-center gap-1">
+                              <GitBranch className="w-3 h-3" />
+                              {r.default_branch}
+                            </span>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                    {repoInput && parsed && !repoError && (
+                      <p className="text-[10px] text-emerald-500 mb-1 flex items-center gap-1">
+                        <CheckCircle className="w-3 h-3" />
+                        Selected: {parsed.owner}/{parsed.repo}
+                      </p>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => { setUseManualRepo(true); setRepoInput(''); setRepoFilter(''); }}
+                      className="text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
+                    >
+                      Enter manually
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    {repoFetchError && !useManualRepo && (
+                      <p className="text-[10px] text-amber-500 mb-1">{repoFetchError}</p>
+                    )}
+                    <input
+                      type="text"
+                      autoFocus
+                      value={repoInput}
+                      onChange={e => { setRepoInput(e.target.value); setRepoError(''); }}
+                      onKeyDown={e => e.key === 'Enter' && handleRepoNext()}
+                      placeholder="owner/repo or https://github.com/owner/repo"
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
+                        repoError ? 'border-red-500' : 'border-neutral-800'
+                      }`}
+                    />
+                    {repoOptions.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => { setUseManualRepo(false); setRepoInput(''); }}
+                        className="text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors mt-1 block"
+                      >
+                        Pick from list
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {repoError && <p className="text-[10px] text-red-500 mt-1">{repoError}</p>}
-                {parsed && !repoError && (
+                {!repoLoading && useManualRepo && parsed && !repoError && (
                   <p className="text-[10px] text-emerald-500 mt-1 flex items-center gap-1">
                     <GitBranch className="w-3 h-3" />
                     {parsed.owner}/{parsed.repo}
