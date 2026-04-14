@@ -58,6 +58,34 @@ def _compute_momentum_factor(d: dict) -> float:
     return 1.0  # neutral
 
 
+def _compute_acceptance_rate(d: dict) -> float | None:
+    """Return operator acceptance rate (merged / (merged + rejected)) with recency weighting.
+
+    Weights the last 3 cycles 3x relative to the lifetime average, matching
+    _compute_merge_rate's recency scheme. Returns None when no PRs exist (merged
+    or rejected) so callers can distinguish "unknown" from a low rate.
+    """
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+    total_prs = total_merged + total_rejected
+    if total_prs == 0:
+        return None  # no data yet
+    lifetime_rate = total_merged / total_prs
+    # Weight last 3 cycles 3x for responsiveness to recent changes
+    recent = history[-3:]
+    if not recent:
+        return lifetime_rate
+    recent_merged = sum(e.get("prs_merged", 0) for e in recent)
+    recent_rejected = sum(e.get("prs_rejected", 0) for e in recent)
+    recent_prs = recent_merged + recent_rejected
+    if recent_prs == 0:
+        return lifetime_rate
+    recent_rate = recent_merged / recent_prs
+    return (recent_rate * 3 + lifetime_rate) / 4
+
+
 def _compute_merge_rate(d: dict) -> float:
     """Return net productivity score for a direction, with recency weighting.
 
@@ -391,6 +419,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in findings:
             f.pop("depends_on_indices", None)
 
+    # Query active/queued tasks for word-overlap deduplication
+    existing_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == task.project_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.PROVISIONING])
+        )
+    )).scalars().all()
+    existing_titles = [t.title.lower() for t in existing_tasks]
+
     # Query recent tasks (last 90 days) for hash-based deduplication across research cycles
     ninety_days_ago = _utcnow() - timedelta(days=90)
     recent_tasks_for_dedup = (await session.execute(
@@ -475,6 +512,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _finding_hash(title: str, description: str) -> str:
         return hashlib.sha256((title + description).encode()).hexdigest()[:16]
 
+    def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
+        words = set(finding_title.lower().split()) - {'the', 'a', 'an', 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
+        for title in existing:
+            overlap = words & set(title.split())
+            if len(overlap) >= 3:  # 3+ meaningful words in common
+                return True
+        return False
+
     # Sort findings by priority: high → medium → low (preserve original order within each tier).
     # The orchestrator dispatches by (status, priority, created_at), so higher-priority
     # tasks naturally run first without needing artificial wave dependencies.
@@ -492,6 +537,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if fhash in recent_finding_hashes:
             outcome = failed_hashes.get(fhash, "prior")
             logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {outcome} task")
+            skipped_duplicates += 1
+            continue
+        if _is_duplicate(title, existing_titles):
+            logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
             skipped_duplicates += 1
             continue
         # Skip if all related_files for this finding are already covered by open PRs

@@ -59,7 +59,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
-    from app.research_completion import _compute_momentum_factor, _compute_merge_rate  # noqa: PLC0415
+    from app.research_completion import _compute_momentum_factor, _compute_merge_rate, _compute_acceptance_rate  # noqa: PLC0415
     from app.anomaly_detection import _compute_research_anomalies  # noqa: PLC0415
     from app.direction_lifecycle import _process_direction_lifecycle  # noqa: PLC0415
     # Guard: autonomous must be enabled
@@ -195,6 +195,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         def _direction_score(d: dict) -> tuple:
             merge_rate = _compute_merge_rate(d)
             momentum = _compute_momentum_factor(d)
+            acceptance_rate = _compute_acceptance_rate(d)
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
             category_bonus = -1 if d.get("category") == "product" else 0  # product directions preferred
             return (
@@ -202,6 +203,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 category_bonus,                                  # product category within same priority
                 is_new,                                          # novelty bonus within same priority
                 -(merge_rate * momentum),                        # productivity beats vision rank
+                acceptance_rate if acceptance_rate is not None else 0.5,  # low acceptance = deprioritized
                 _vision_rank(d),                                 # vision rank as tiebreaker
                 1 if d.get("possibly_saturated") else 0,         # saturated last
                 d.get("last_researched_at") or "",               # staleness

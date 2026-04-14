@@ -598,7 +598,40 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
       if (candidate.length <= 400 && candidate.length <= budget) {
         healthLines = ['### Pipeline Health (last 24h)', body, ''];
+        budget -= candidate.length;
       }
+    }
+  }
+
+  // Build direction quality warning — only if budget allows, placed after Pipeline Health
+  const directionQuality = ctx.direction_quality as Record<string, unknown> | null | undefined;
+  let dirQualityLines: string[] = [];
+  if (directionQuality) {
+    const rate = directionQuality.acceptance_rate as number;
+    const merged = directionQuality.prs_merged as number;
+    const rejected = directionQuality.prs_rejected as number;
+    const avgTtm = directionQuality.avg_time_to_merge_hours as number | null | undefined;
+    const rejCtx = directionQuality.rejection_context as Array<Record<string, unknown>> | undefined;
+
+    const qualityParts: string[] = [
+      `Operator acceptance rate for this direction: ${Math.round(rate * 100)}% (${merged} merged, ${rejected} rejected)`,
+    ];
+    if (avgTtm !== null && avgTtm !== undefined) {
+      qualityParts.push(`Average time for operators to merge PRs in this direction: ${avgTtm}h`);
+    }
+    if (rejCtx && rejCtx.length > 0) {
+      qualityParts.push('Recent rejections:');
+      for (const r of rejCtx) {
+        qualityParts.push(`- "${strVal(r.title)}" — ${strVal(r.reason)}`);
+      }
+    }
+    qualityParts.push('Pay extra attention to code quality, test coverage, and alignment with project conventions.');
+
+    const candidateLines = ['### Direction Quality Warning', ...qualityParts, ''];
+    const candidate = candidateLines.join('\n');
+    if (candidate.length <= budget) {
+      dirQualityLines = candidateLines;
+      budget -= candidate.length;
     }
   }
 
@@ -610,6 +643,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...healthLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...healthLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }
