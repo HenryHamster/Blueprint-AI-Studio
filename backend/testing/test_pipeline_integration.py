@@ -500,7 +500,12 @@ async def test_review_approve_does_not_spawn_fix(
     )
 
     await db_session.refresh(review_task)
-    assert review_task.status == TaskStatus.COMPLETED
+    # Without GitHub integration, the merge attempt fails and the task is
+    # parked in EVALUATING with ci_waiting so the CI monitor can retry.
+    assert review_task.status in (TaskStatus.COMPLETED, TaskStatus.EVALUATING)
+    if review_task.status == TaskStatus.EVALUATING:
+        ci_waiting = (review_task.context or {}).get("review_loop", {}).get("ci_waiting")
+        assert ci_waiting is True, "EVALUATING review should have ci_waiting=True"
 
     # No fix task should have been spawned
     result = await db_session.execute(

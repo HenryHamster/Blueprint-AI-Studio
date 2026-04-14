@@ -765,10 +765,21 @@ async def _process_post_commit(
                                 logger.error(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
                             action_taken = True
                     except Exception as e:
-                        logger.warning(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}: {e}", exc_info=True)
-                        task.latest_status_message = f"Review approved but merge/CI-check failed: {type(e).__name__}: {e!r}"[:500]
+                        # Merge/CI-check failed — park in EVALUATING with ci_waiting so
+                        # the orchestrator's CI monitoring loop retries the merge instead
+                        # of silently orphaning the PR.
+                        logger.error(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}, parking in CI-wait: {e}", exc_info=True)
+                        task.status = TaskStatus.EVALUATING
+                        task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
+                        task.context = {**(task.context or {}), "review_loop": {
+                            **review_loop, "ci_waiting": True, "verdict": "APPROVE",
+                            "pr_number": pr_number,
+                            "branch": branch, "base_branch": base_branch,
+                            "original_task_id": original_task_id,
+                            "ci_wait_started": _utcnow().isoformat()}}
                         session.add(task)
                         await session.commit()
+                        action_taken = True
                 else:
                     # REQUEST_CHANGES — include CI errors if available (don't wait)
                     ci_errors_text = ""
