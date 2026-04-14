@@ -24,6 +24,7 @@ export interface HeaderBarProps {
   onToggleArchive: () => void;
   showMessages: boolean;
   onToggleMessages: () => void;
+  openMessageCount: number;
   needsAttentionCount?: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
@@ -376,12 +377,17 @@ export function HeaderBar(props: HeaderBarProps) {
           </button>
           <button
             onClick={onToggleMessages}
-            className={`p-2 rounded-md text-xs transition-colors ${
+            className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
               showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
             }`}
             title="Messages"
           >
             <MessageSquare className="w-4 h-4" />
+            {props.openMessageCount > 0 && (
+              <span className="ml-0.5 bg-blue-500 text-white text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
+                {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
+              </span>
+            )}
           </button>
           <button
             onClick={onToggleResearchBrowser}
@@ -457,6 +463,11 @@ export function HeaderBar(props: HeaderBarProps) {
               >
                 <MessageSquare className="w-4 h-4 shrink-0" />
                 <span>Messages</span>
+                {props.openMessageCount > 0 && (
+                  <span className="ml-auto bg-blue-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                    {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
+                  </span>
+                )}
               </button>
               <button
                 onClick={() => { onShowDirections(); setShowMobileMenu(false); }}

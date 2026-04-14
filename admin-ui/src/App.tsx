@@ -1,4 +1,4 @@
-import { useMemo, useRef, useEffect, useState } from 'react';
+import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Activity, AlertCircle, LayoutList, CheckSquare } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
@@ -11,7 +11,7 @@ import { ResearchBrowser } from './components/ResearchBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
-import { fetchTask } from './api';
+import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
@@ -55,6 +55,8 @@ export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
+  const [openMessageCount, setOpenMessageCount] = useState(0);
+  const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
   const [sortBy, setSortBy] = useState<SortBy>(() => {
     try {
       const stored = localStorage.getItem(SORT_KEY);
@@ -65,6 +67,28 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
+
+  // Fetch open message count periodically (when panel is closed the callback won't fire)
+  const selectedProjectId = s.selectedProjectId;
+  const showMessages = s.showMessages;
+  useEffect(() => {
+    if (!selectedProjectId || showMessages) return;
+    const pid = selectedProjectId; // narrowed to string
+    let cancelled = false;
+    async function fetchCount() {
+      try {
+        const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
+        const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const msgs: { from_type?: string }[] = data.messages ?? [];
+        if (!cancelled) setOpenMessageCount(msgs.filter(m => (m.from_type || '').toLowerCase() !== 'user').length);
+      } catch { /* ignore */ }
+    }
+    fetchCount();
+    const interval = setInterval(fetchCount, 30_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [selectedProjectId, showMessages]);
 
   useEffect(() => {
     function handleSearchShortcut(e: KeyboardEvent) {
@@ -288,6 +312,7 @@ export default function App() {
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
+        openMessageCount={openMessageCount}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
@@ -468,6 +493,7 @@ export default function App() {
           selectedProjectId={s.selectedProjectId}
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
+          onMessageCountChange={handleMessageCountChange}
         />
       ) : s.showArchive ? (
         <ArchiveView
