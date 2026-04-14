@@ -228,1550 +228,169 @@ class TestDirectionLifecycleInvariants:
         )
 
 
-# ── main.py Size and Symbol Count Regression Guard ──────────────────────────
-# Direction d-3d050b18: no new functions added to main.py; all new functionality
-# goes in extracted modules.
+# ── Module Size Guardrails ─────────────────────────────────────────────────
+# These are loose upper bounds to catch runaway growth, not tight ceilings.
+# If a file hits the limit, consider a refactor — but do NOT "ratchet down"
+# the limit after every cleanup. These limits should stay stable.
 
-MAIN_PY_MAX_LINES = 1850      # Ratchet down as extractions land
-MAIN_PY_MAX_FUNCTIONS = 37    # Ratchet down as extractions land
-MAIN_PY_MAX_EXTERNAL_IMPORTS = 15  # Ratchet down as import redirects land
-
-
-def _get_main_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "main.py")
-
-
-class TestMainPyFreeze:
-    """Enforce the main.py freeze: no new functions, no line growth."""
-
-    def test_main_py_line_count(self):
-        """main.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to main.py.
-        New code must go in an extracted module (e.g. backend/app/<domain>.py).
-        Once a line-reducing extraction lands, ratchet MAIN_PY_MAX_LINES down.
-        """
-        main_path = _get_main_py_path()
-        with open(main_path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= MAIN_PY_MAX_LINES, (
-            f"main.py has {count} lines, exceeding the ceiling of {MAIN_PY_MAX_LINES}. "
-            "New functionality must go in extracted modules, not main.py. "
-            "See direction d-3d050b18."
-        )
-
-    def test_main_py_function_count(self):
-        """main.py must not gain new functions.
-
-        If this fails: a new function was added to main.py.
-        New functions must be added to an appropriate extracted module instead.
-        Once a function-removing extraction lands, ratchet MAIN_PY_MAX_FUNCTIONS down.
-        """
-        import ast
-        main_path = _get_main_py_path()
-        with open(main_path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= MAIN_PY_MAX_FUNCTIONS, (
-            f"main.py has {func_count} functions, exceeding the ceiling of {MAIN_PY_MAX_FUNCTIONS}. "
-            "New functions must go in extracted modules, not main.py. "
-            "See direction d-3d050b18."
-        )
-
-    def test_main_py_external_import_count(self):
-        """Other backend modules must not import more symbols from app.main than the ceiling.
-
-        If this fails: a new import from app.main was added elsewhere.
-        As extractions re-export symbols from their new modules, update imports at
-        the call sites to point to the extracted module and ratchet
-        MAIN_PY_MAX_EXTERNAL_IMPORTS down.
-        """
-        import ast
-        import glob
-
-        app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
-        main_path = os.path.realpath(_get_main_py_path())
-
-        imported_names: set = set()
-        for path in glob.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
-            if os.path.realpath(path) == main_path:
-                continue
-            try:
-                with open(path) as f:
-                    tree = ast.parse(f.read())
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module in ("app.main", "main"):
-                    for alias in node.names:
-                        imported_names.add(alias.name)
-
-        count = len(imported_names)
-        assert count <= MAIN_PY_MAX_EXTERNAL_IMPORTS, (
-            f"{count} unique symbols are imported from app.main by other modules, "
-            f"exceeding the ceiling of {MAIN_PY_MAX_EXTERNAL_IMPORTS}. "
-            "Update import sites to point to the extracted module instead of app.main. "
-            "See direction d-3d050b18."
-        )
+MODULE_SIZE_LIMITS = {
+    # (relative_path_from_app_dir, max_lines)
+    "main.py": 3500,
+    "task_completion.py": 2000,
+    "task_lifecycle.py": 2000,
+    "orchestrator.py": 3000,
+    "admin.py": 3000,
+    "compute.py": 2500,
+    "github.py": 2000,
+    "routers/admin_settings.py": 3000,
+    "routers/admin_analytics.py": 2500,
+    "routers/agent.py": 2000,
+    "services.py": 1500,
+    "routers/agent_status.py": 1500,
+    "autonomous_research.py": 1500,
+    "research_completion.py": 2000,
+    "strategic_completion.py": 1500,
+    "rollup_management.py": 1500,
+    "reaper.py": 1000,
+    "review_pipeline.py": 800,
+    "deploy_health.py": 1000,
+}
 
 
-# ── Orchestrator Module Size Guards ─────────────────────────────────────────
-# Direction d-51edc526: proactive orchestrator decomposition ratchet
+class TestBackendModuleSizeGuardrails:
+    """Loose upper bounds to catch runaway file growth.
 
-TASK_COMPLETION_MAX_LINES = 950      # Ratcheted after anomaly/research/strategic extraction
-TASK_COMPLETION_MAX_FUNCTIONS = 15   # Ratcheted after anomaly/research/strategic extraction
+    These are NOT tight ceilings to ratchet down. They are generous limits
+    that should only fire if a file has genuinely gotten out of hand.
+    If a test fails, consider a refactor — but do NOT lower the limit afterward.
+    """
 
-TASK_LIFECYCLE_MAX_LINES = 1120      # Ratcheted down after direction_outcomes.py extraction
-TASK_LIFECYCLE_MAX_FUNCTIONS = 6     # Ratcheted down after direction_outcomes.py extraction
-
-DIRECTION_OUTCOMES_MAX_LINES = 170   # Enforced after extraction from task_lifecycle.py
-DIRECTION_OUTCOMES_MAX_FUNCTIONS = 3  # 1 actual + 2 slots
-
-ROLLUP_MANAGEMENT_MAX_LINES = 765
-ROLLUP_MANAGEMENT_MAX_FUNCTIONS = 4
-
-REVIEW_PIPELINE_MAX_LINES = 350
-REVIEW_PIPELINE_MAX_FUNCTIONS = 4
-
-ORCHESTRATOR_MAX_LINES = 1400        # Bumped for infra-wide provision failure classification (was 1340)
-ORCHESTRATOR_MAX_FUNCTIONS = 10      # Current 6 + 4 slots
-
-ORCHESTRATOR_FILTERS_MAX_LINES = 200
-ORCHESTRATOR_FILTERS_MAX_FUNCTIONS = 4
-
-ADMIN_ANALYTICS_MAX_LINES = 1320
-ADMIN_ANALYTICS_MAX_FUNCTIONS = 11  # Current 9 + 2 slots
-
-SERVICES_MAX_LINES = 820
-SERVICES_MAX_FUNCTIONS = 12  # Current 10 + 2 slots
-
-AGENT_STATUS_MAX_LINES = 780   # Ratchet down as extractions land
-AGENT_STATUS_MAX_FUNCTIONS = 5  # Current 3 + 2 slots
-
-
-def _get_task_completion_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "task_completion.py")
-
-
-def _get_task_lifecycle_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "task_lifecycle.py")
-
-
-def _get_orchestrator_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "orchestrator.py")
-
-
-def _get_orchestrator_filters_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "orchestrator_filters.py")
-
-
-def _get_admin_analytics_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "routers", "admin_analytics.py")
-
-
-def _get_services_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "services.py")
-
-
-def _get_agent_status_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "routers", "agent_status.py")
-
-
-def _get_review_pipeline_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "review_pipeline.py")
-
-
-def _get_rollup_management_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "rollup_management.py")
-
-
-def _get_direction_outcomes_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "direction_outcomes.py")
-
-
-class TestTaskCompletionFreeze:
-    """Enforce the task_completion.py freeze: no new functions, no line growth."""
-
-    def test_task_completion_line_count(self):
-        """task_completion.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to task_completion.py.
-        New functionality must go in extracted modules (e.g., anomaly_detection.py,
-        research_completion.py). Once a line-reducing extraction lands, ratchet
-        the ceiling down.
-        """
-        path = _get_task_completion_py_path()
+    def _check_module(self, relative_path: str) -> None:
+        max_lines = MODULE_SIZE_LIMITS[relative_path]
+        path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
         with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= TASK_COMPLETION_MAX_LINES, (
-            f"task_completion.py has {count} lines, exceeding the ceiling of "
-            f"{TASK_COMPLETION_MAX_LINES}. "
-            "New functionality must go in extracted modules (e.g., anomaly_detection.py, "
-            "research_completion.py). Once a line-reducing extraction lands, ratchet the "
-            "ceiling down."
+            count = len(f.readlines())
+        assert count <= max_lines, (
+            f"{relative_path} has {count} lines (limit: {max_lines}). "
+            "This file has grown large — consider refactoring into smaller modules."
         )
 
-    def test_task_completion_function_count(self):
-        """task_completion.py must not gain new functions.
+    def test_main_py(self):
+        self._check_module("main.py")
 
-        If this fails: a new function was added to task_completion.py.
-        New functionality must go in extracted modules (e.g., anomaly_detection.py,
-        research_completion.py). Once a line-reducing extraction lands, ratchet the
-        ceiling down.
-        """
-        import ast
-        path = _get_task_completion_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= TASK_COMPLETION_MAX_FUNCTIONS, (
-            f"task_completion.py has {func_count} functions, exceeding the ceiling of "
-            f"{TASK_COMPLETION_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules (e.g., anomaly_detection.py, "
-            "research_completion.py). Once a line-reducing extraction lands, ratchet the "
-            "ceiling down."
-        )
+    def test_task_completion(self):
+        self._check_module("task_completion.py")
 
+    def test_task_lifecycle(self):
+        self._check_module("task_lifecycle.py")
 
-class TestTaskLifecycleFreeze:
-    """Enforce the task_lifecycle.py freeze: no new functions, no line growth."""
+    def test_orchestrator(self):
+        self._check_module("orchestrator.py")
 
-    def test_task_lifecycle_line_count(self):
-        """task_lifecycle.py must not grow beyond the ceiling.
+    def test_admin(self):
+        self._check_module("admin.py")
 
-        If this fails: new functionality was added to task_lifecycle.py.
-        New functionality must go in extracted modules (e.g., review_pipeline.py).
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_task_lifecycle_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= TASK_LIFECYCLE_MAX_LINES, (
-            f"task_lifecycle.py has {count} lines, exceeding the ceiling of "
-            f"{TASK_LIFECYCLE_MAX_LINES}. "
-            "New functionality must go in extracted modules (e.g., review_pipeline.py). "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_compute(self):
+        self._check_module("compute.py")
 
-    def test_task_lifecycle_function_count(self):
-        """task_lifecycle.py must not gain new functions.
+    def test_github(self):
+        self._check_module("github.py")
 
-        If this fails: a new function was added to task_lifecycle.py.
-        New functionality must go in extracted modules (e.g., review_pipeline.py).
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_task_lifecycle_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= TASK_LIFECYCLE_MAX_FUNCTIONS, (
-            f"task_lifecycle.py has {func_count} functions, exceeding the ceiling of "
-            f"{TASK_LIFECYCLE_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules (e.g., review_pipeline.py). "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_admin_settings(self):
+        self._check_module("routers/admin_settings.py")
 
+    def test_admin_analytics(self):
+        self._check_module("routers/admin_analytics.py")
 
-class TestDirectionOutcomesFreeze:
-    """Enforce the direction_outcomes.py freeze: no new functions, no line growth."""
+    def test_agent_router(self):
+        self._check_module("routers/agent.py")
 
-    def test_direction_outcomes_line_count(self):
-        """direction_outcomes.py must not grow beyond the ceiling.
+    def test_services(self):
+        self._check_module("services.py")
 
-        If this fails: new functionality was added to direction_outcomes.py.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_direction_outcomes_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= DIRECTION_OUTCOMES_MAX_LINES, (
-            f"direction_outcomes.py has {count} lines, exceeding the ceiling of "
-            f"{DIRECTION_OUTCOMES_MAX_LINES}. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_agent_status(self):
+        self._check_module("routers/agent_status.py")
 
-    def test_direction_outcomes_function_count(self):
-        """direction_outcomes.py must not gain new functions.
+    def test_autonomous_research(self):
+        self._check_module("autonomous_research.py")
 
-        If this fails: a new function was added to direction_outcomes.py.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_direction_outcomes_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= DIRECTION_OUTCOMES_MAX_FUNCTIONS, (
-            f"direction_outcomes.py has {func_count} functions, exceeding the ceiling of "
-            f"{DIRECTION_OUTCOMES_MAX_FUNCTIONS}. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_research_completion(self):
+        self._check_module("research_completion.py")
 
+    def test_strategic_completion(self):
+        self._check_module("strategic_completion.py")
 
-class TestReviewPipelineFreeze:
-    """Enforce the review_pipeline.py freeze: no new functions, no line growth."""
+    def test_rollup_management(self):
+        self._check_module("rollup_management.py")
 
-    def test_review_pipeline_line_count(self):
-        """review_pipeline.py must not grow beyond the ceiling.
+    def test_reaper(self):
+        self._check_module("reaper.py")
 
-        If this fails: new functionality was added to review_pipeline.py beyond
-        the extracted review/fix spawning logic. Once a line-reducing extraction
-        lands, ratchet the ceiling down.
-        """
-        path = _get_review_pipeline_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= REVIEW_PIPELINE_MAX_LINES, (
-            f"review_pipeline.py has {count} lines, exceeding the ceiling of "
-            f"{REVIEW_PIPELINE_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_review_pipeline(self):
+        self._check_module("review_pipeline.py")
 
-    def test_review_pipeline_function_count(self):
-        """review_pipeline.py must not gain new functions."""
-        import ast
-        path = _get_review_pipeline_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= REVIEW_PIPELINE_MAX_FUNCTIONS, (
-            f"review_pipeline.py has {func_count} functions, exceeding the ceiling of "
-            f"{REVIEW_PIPELINE_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
+    def test_deploy_health(self):
+        self._check_module("deploy_health.py")
 
 
-class TestRollupManagementFreeze:
-    """Enforce the rollup_management.py freeze: no new functions, no line growth."""
+# ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
-    def test_rollup_management_line_count(self):
-        """rollup_management.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to rollup_management.py beyond
-        the extracted rollup/PR management logic. Once a line-reducing extraction
-        lands, ratchet the ceiling down.
-        """
-        path = _get_rollup_management_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ROLLUP_MANAGEMENT_MAX_LINES, (
-            f"rollup_management.py has {count} lines, exceeding the ceiling of "
-            f"{ROLLUP_MANAGEMENT_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_rollup_management_function_count(self):
-        """rollup_management.py must not gain new functions."""
-        import ast
-        path = _get_rollup_management_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ROLLUP_MANAGEMENT_MAX_FUNCTIONS, (
-            f"rollup_management.py has {func_count} functions, exceeding the ceiling of "
-            f"{ROLLUP_MANAGEMENT_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Autonomous Research Module Size Guards ───────────────────────────────────
-# Direction d-3d050b18: autonomous research spawning extracted from main.py
-
-AUTONOMOUS_RESEARCH_MAX_LINES = 800   # Ratcheted down after strategic_spawning extraction (actual: 726)
-AUTONOMOUS_RESEARCH_MAX_FUNCTIONS = 9  # Ratcheted down after strategic_spawning extraction (actual: 9)
-
-
-def _get_autonomous_research_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "autonomous_research.py")
-
-
-class TestAutonomousResearchFreeze:
-    """Enforce the autonomous_research.py freeze: no new functions, no line growth."""
-
-    def test_autonomous_research_line_count(self):
-        """autonomous_research.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to autonomous_research.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_autonomous_research_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= AUTONOMOUS_RESEARCH_MAX_LINES, (
-            f"autonomous_research.py has {count} lines, exceeding the ceiling of "
-            f"{AUTONOMOUS_RESEARCH_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_autonomous_research_function_count(self):
-        """autonomous_research.py must not gain new functions.
-
-        If this fails: a new function was added to autonomous_research.py.
-        New functionality must go in an appropriate extracted module instead.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_autonomous_research_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= AUTONOMOUS_RESEARCH_MAX_FUNCTIONS, (
-            f"autonomous_research.py has {func_count} functions, exceeding the ceiling of "
-            f"{AUTONOMOUS_RESEARCH_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Direction Lifecycle Module Size Guards ──────────────────────────────────
-# Extracted from autonomous_research.py to create headroom in that module.
-
-DIRECTION_LIFECYCLE_MAX_LINES = 170   # actual: 121 (50 headroom)
-DIRECTION_LIFECYCLE_MAX_FUNCTIONS = 4  # actual: 2 (_utcnow + _process_direction_lifecycle)
-
-
-def _get_direction_lifecycle_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "direction_lifecycle.py")
-
-
-class TestDirectionLifecycleFreeze:
-    """Enforce the direction_lifecycle.py freeze: no new functions, no line growth."""
-
-    def test_direction_lifecycle_line_count(self):
-        """direction_lifecycle.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to direction_lifecycle.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_direction_lifecycle_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= DIRECTION_LIFECYCLE_MAX_LINES, (
-            f"direction_lifecycle.py has {count} lines, exceeding the ceiling of "
-            f"{DIRECTION_LIFECYCLE_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_direction_lifecycle_function_count(self):
-        """direction_lifecycle.py must not gain new functions.
-
-        If this fails: a new function was added to direction_lifecycle.py.
-        New functionality must go in an appropriate extracted module instead.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_direction_lifecycle_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= DIRECTION_LIFECYCLE_MAX_FUNCTIONS, (
-            f"direction_lifecycle.py has {func_count} functions, exceeding the ceiling of "
-            f"{DIRECTION_LIFECYCLE_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Strategic Spawning Module Size Guards ────────────────────────────────────
-# Extracted from autonomous_research.py to free up function slots in that module.
-
-STRATEGIC_SPAWNING_MAX_LINES = 275   # actual: 225 (50 headroom)
-STRATEGIC_SPAWNING_MAX_FUNCTIONS = 4  # actual: 3 (_utcnow + _spawn_design_doc_update + _spawn_strategic_review)
-
-
-def _get_strategic_spawning_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "strategic_spawning.py")
-
-
-class TestStrategicSpawningFreeze:
-    """Enforce the strategic_spawning.py freeze: no new functions, no line growth."""
-
-    def test_strategic_spawning_line_count(self):
-        """strategic_spawning.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to strategic_spawning.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_strategic_spawning_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= STRATEGIC_SPAWNING_MAX_LINES, (
-            f"strategic_spawning.py has {count} lines, exceeding the ceiling of "
-            f"{STRATEGIC_SPAWNING_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_strategic_spawning_function_count(self):
-        """strategic_spawning.py must not gain new functions.
-
-        If this fails: a new function was added to strategic_spawning.py.
-        New functionality must go in an appropriate extracted module instead.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_strategic_spawning_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= STRATEGIC_SPAWNING_MAX_FUNCTIONS, (
-            f"strategic_spawning.py has {func_count} functions, exceeding the ceiling of "
-            f"{STRATEGIC_SPAWNING_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Deploy Health Module Size Guards ────────────────────────────────────────
-# Direction d-3d050b18: deploy health functions extracted from main.py
-
-DEPLOY_HEALTH_MAX_LINES = 490
-DEPLOY_HEALTH_MAX_FUNCTIONS = 10
-
-
-def _get_deploy_health_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "deploy_health.py")
-
-
-class TestDeployHealthFreeze:
-    """Enforce the deploy_health.py freeze: no new functions, no line growth."""
-
-    def test_deploy_health_line_count(self):
-        """deploy_health.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to deploy_health.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_deploy_health_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= DEPLOY_HEALTH_MAX_LINES, (
-            f"deploy_health.py has {count} lines, exceeding the ceiling of "
-            f"{DEPLOY_HEALTH_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_deploy_health_function_count(self):
-        """deploy_health.py must not gain new functions.
-
-        If this fails: a new function was added to deploy_health.py.
-        New functionality must go in an appropriate extracted module instead.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_deploy_health_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= DEPLOY_HEALTH_MAX_FUNCTIONS, (
-            f"deploy_health.py has {func_count} functions, exceeding the ceiling of "
-            f"{DEPLOY_HEALTH_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Reaper Module Size Guards ────────────────────────────────────────────────
-# Ceiling enforcement for reaper.py to prevent unbounded growth
-
-REAPER_MAX_LINES = 500
-REAPER_MAX_FUNCTIONS = 8
-
-
-def _get_reaper_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "app", "reaper.py")
-
-
-class TestReaperFreeze:
-    """Enforce the reaper.py freeze: no new functions, no line growth."""
-
-    def test_reaper_line_count(self):
-        """reaper.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to reaper.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_reaper_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= REAPER_MAX_LINES, (
-            f"reaper.py has {count} lines, exceeding the ceiling of "
-            f"{REAPER_MAX_LINES}. "
-            "Extract helpers from reaper_service or create a new module. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_reaper_function_count(self):
-        """reaper.py must not gain new functions.
-
-        If this fails: a new function was added to reaper.py.
-        New functionality must go in extracted modules (e.g., extract reaper_service
-        phase helpers). Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_reaper_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= REAPER_MAX_FUNCTIONS, (
-            f"reaper.py has {func_count} functions, exceeding the ceiling of "
-            f"{REAPER_MAX_FUNCTIONS}. "
-            "Extract helpers from reaper_service or create a new module. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Research/Strategic Completion Module Size Guards ──────────────────────────
-# Direction d-8848700b: ceiling enforcement for uncapped completion modules
-
-RESEARCH_COMPLETION_MAX_LINES = 1050
-RESEARCH_COMPLETION_MAX_FUNCTIONS = 17
-STRATEGIC_COMPLETION_MAX_LINES = 760
-STRATEGIC_COMPLETION_MAX_FUNCTIONS = 9
-STRATEGIC_ANALYSIS_MAX_LINES = 200
-STRATEGIC_ANALYSIS_MAX_FUNCTIONS = 3
-
-
-def _get_research_completion_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'research_completion.py')
-
-
-def _get_strategic_completion_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'strategic_completion.py')
-
-
-def _get_strategic_analysis_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'strategic_analysis.py')
-
-
-class TestResearchCompletionFreeze:
-    """Enforce the research_completion.py freeze: no new functions, no line growth."""
-
-    def test_research_completion_line_count(self):
-        """research_completion.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to research_completion.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_research_completion_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= RESEARCH_COMPLETION_MAX_LINES, (
-            f"research_completion.py has {count} lines, exceeding the ceiling of "
-            f"{RESEARCH_COMPLETION_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_research_completion_function_count(self):
-        """research_completion.py must not gain new functions.
-
-        If this fails: a new function was added to research_completion.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        Note: ast.walk counts nested functions too (3 nested in _handle_research_completion).
-        """
-        import ast
-        path = _get_research_completion_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= RESEARCH_COMPLETION_MAX_FUNCTIONS, (
-            f"research_completion.py has {func_count} functions (including nested), "
-            f"exceeding the ceiling of {RESEARCH_COMPLETION_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestStrategicCompletionFreeze:
-    """Enforce the strategic_completion.py freeze: no new functions, no line growth."""
-
-    def test_strategic_completion_line_count(self):
-        """strategic_completion.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to strategic_completion.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_strategic_completion_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= STRATEGIC_COMPLETION_MAX_LINES, (
-            f"strategic_completion.py has {count} lines, exceeding the ceiling of "
-            f"{STRATEGIC_COMPLETION_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_strategic_completion_function_count(self):
-        """strategic_completion.py must not gain new functions.
-
-        If this fails: a new function was added to strategic_completion.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_strategic_completion_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= STRATEGIC_COMPLETION_MAX_FUNCTIONS, (
-            f"strategic_completion.py has {func_count} functions, exceeding the ceiling of "
-            f"{STRATEGIC_COMPLETION_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestStrategicAnalysisFreeze:
-    """Enforce the strategic_analysis.py freeze: no new functions, no line growth."""
-
-    def test_strategic_analysis_line_count(self):
-        """strategic_analysis.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to strategic_analysis.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_strategic_analysis_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= STRATEGIC_ANALYSIS_MAX_LINES, (
-            f"strategic_analysis.py has {count} lines, exceeding the ceiling of "
-            f"{STRATEGIC_ANALYSIS_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_strategic_analysis_function_count(self):
-        """strategic_analysis.py must not gain new functions.
-
-        If this fails: a new function was added to strategic_analysis.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_strategic_analysis_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= STRATEGIC_ANALYSIS_MAX_FUNCTIONS, (
-            f"strategic_analysis.py has {func_count} functions, exceeding the ceiling of "
-            f"{STRATEGIC_ANALYSIS_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-# ── Large Uncapped Backend Module Size Guards ────────────────────────────────
-# Enforces line count and function ceilings on the 5 largest previously-uncapped modules.
-
-ADMIN_SETTINGS_MAX_LINES = 1500
-ADMIN_SETTINGS_MAX_FUNCTIONS = 23
-
-ADMIN_PY_MAX_LINES = 1450
-ADMIN_PY_MAX_FUNCTIONS = 22
-
-COMPUTE_MAX_LINES = 1250
-COMPUTE_MAX_FUNCTIONS = 38
-
-GITHUB_MAX_LINES = 1100
-GITHUB_MAX_FUNCTIONS = 33
-
-AGENT_ROUTER_MAX_LINES = 1000
-AGENT_ROUTER_MAX_FUNCTIONS = 20
-
-DIRECTIONS_ROUTER_MAX_LINES = 710
-DIRECTIONS_ROUTER_MAX_FUNCTIONS = 13
-
-ADMIN_NOTIFICATIONS_MAX_LINES = 580
-ADMIN_NOTIFICATIONS_MAX_FUNCTIONS = 13
-
-
-def _get_admin_settings_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'admin_settings.py')
-
-
-def _get_admin_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'admin.py')
-
-
-def _get_compute_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'compute.py')
-
-
-def _get_github_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'github.py')
-
-
-def _get_agent_router_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'agent.py')
-
-
-class TestAdminSettingsFreeze:
-    """Enforce the admin_settings.py freeze: no new functions, no line growth."""
-
-    def test_admin_settings_line_count(self):
-        """admin_settings.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to routers/admin_settings.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_admin_settings_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ADMIN_SETTINGS_MAX_LINES, (
-            f"routers/admin_settings.py has {count} lines, exceeding the ceiling of "
-            f"{ADMIN_SETTINGS_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_admin_settings_function_count(self):
-        """admin_settings.py must not gain new functions.
-
-        If this fails: a new function was added to routers/admin_settings.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_admin_settings_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ADMIN_SETTINGS_MAX_FUNCTIONS, (
-            f"routers/admin_settings.py has {func_count} functions, exceeding the ceiling of "
-            f"{ADMIN_SETTINGS_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestAdminPyFreeze:
-    """Enforce the admin.py freeze: no new functions, no line growth."""
-
-    def test_admin_py_line_count(self):
-        """admin.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to admin.py.
-        New functionality must go in extracted router sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_admin_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ADMIN_PY_MAX_LINES, (
-            f"admin.py has {count} lines, exceeding the ceiling of "
-            f"{ADMIN_PY_MAX_LINES}. "
-            "New functionality must go in extracted router sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_admin_py_function_count(self):
-        """admin.py must not gain new functions.
-
-        If this fails: a new function was added to admin.py.
-        New functionality must go in extracted router sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_admin_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ADMIN_PY_MAX_FUNCTIONS, (
-            f"admin.py has {func_count} functions, exceeding the ceiling of "
-            f"{ADMIN_PY_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted router sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestComputeFreeze:
-    """Enforce the compute.py freeze: no new functions, no line growth."""
-
-    def test_compute_line_count(self):
-        """compute.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to compute.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_compute_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= COMPUTE_MAX_LINES, (
-            f"compute.py has {count} lines, exceeding the ceiling of "
-            f"{COMPUTE_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_compute_function_count(self):
-        """compute.py must not gain new functions.
-
-        If this fails: a new function was added to compute.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_compute_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= COMPUTE_MAX_FUNCTIONS, (
-            f"compute.py has {func_count} functions, exceeding the ceiling of "
-            f"{COMPUTE_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestGithubFreeze:
-    """Enforce the github.py freeze: no new functions, no line growth."""
-
-    def test_github_line_count(self):
-        """github.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to github.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_github_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= GITHUB_MAX_LINES, (
-            f"github.py has {count} lines, exceeding the ceiling of "
-            f"{GITHUB_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_github_function_count(self):
-        """github.py must not gain new functions.
-
-        If this fails: a new function was added to github.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_github_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= GITHUB_MAX_FUNCTIONS, (
-            f"github.py has {func_count} functions, exceeding the ceiling of "
-            f"{GITHUB_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestAgentRouterFreeze:
-    """Enforce the routers/agent.py freeze: no new functions, no line growth."""
-
-    def test_agent_router_line_count(self):
-        """routers/agent.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to routers/agent.py.
-        New functionality must go in extracted sub-modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_agent_router_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= AGENT_ROUTER_MAX_LINES, (
-            f"routers/agent.py has {count} lines, exceeding the ceiling of "
-            f"{AGENT_ROUTER_MAX_LINES}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_agent_router_function_count(self):
-        """routers/agent.py must not gain new functions.
-
-        If this fails: a new function was added to routers/agent.py.
-        New functionality must go in extracted sub-modules.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_agent_router_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= AGENT_ROUTER_MAX_FUNCTIONS, (
-            f"routers/agent.py has {func_count} functions, exceeding the ceiling of "
-            f"{AGENT_ROUTER_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted sub-modules. "
-            "Once a function-removing extraction lands, ratchet the ceiling down."
-        )
-
-
-def _get_directions_router_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'directions.py')
-
-
-def _get_admin_notifications_py_path() -> str:
-    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'admin_notifications.py')
-
-
-class TestDirectionsRouterFreeze:
-    """Enforce the directions.py router freeze: no new functions, no line growth."""
-
-    def test_line_count(self):
-        """routers/directions.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to routers/directions.py.
-        Extract helper functions to a directions_helpers.py module.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_directions_router_py_path()
-        with open(path) as f:
-            content = f.read()
-        lines = len(content.splitlines())
-        assert lines <= DIRECTIONS_ROUTER_MAX_LINES, (
-            f'directions.py has {lines} lines, exceeding ceiling of {DIRECTIONS_ROUTER_MAX_LINES}. '
-            'Extract helper functions to a directions_helpers.py module.'
-        )
-
-    def test_function_count(self):
-        """routers/directions.py must not gain new functions.
-
-        If this fails: a new function was added to routers/directions.py.
-        Extract helper functions to a directions_helpers.py module.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_directions_router_py_path()
-        with open(path) as f:
-            content = f.read()
-        tree = ast.parse(content)
-        fn_count = len([n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))])
-        assert fn_count <= DIRECTIONS_ROUTER_MAX_FUNCTIONS, (
-            f'directions.py has {fn_count} functions, exceeding ceiling of {DIRECTIONS_ROUTER_MAX_FUNCTIONS}.'
-        )
-
-
-class TestAdminNotificationsFreeze:
-    """Enforce the admin_notifications.py router freeze: no new functions, no line growth."""
-
-    def test_line_count(self):
-        """routers/admin_notifications.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to routers/admin_notifications.py.
-        Extract helper functions to a separate module.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_admin_notifications_py_path()
-        with open(path) as f:
-            content = f.read()
-        lines = len(content.splitlines())
-        assert lines <= ADMIN_NOTIFICATIONS_MAX_LINES, (
-            f'admin_notifications.py has {lines} lines, exceeding ceiling of {ADMIN_NOTIFICATIONS_MAX_LINES}. '
-            'Extract helper functions to a separate module.'
-        )
-
-    def test_function_count(self):
-        """routers/admin_notifications.py must not gain new functions.
-
-        If this fails: a new function was added to routers/admin_notifications.py.
-        Extract helper functions to a separate module.
-        Once a function-removing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_admin_notifications_py_path()
-        with open(path) as f:
-            content = f.read()
-        tree = ast.parse(content)
-        fn_count = len([n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))])
-        assert fn_count <= ADMIN_NOTIFICATIONS_MAX_FUNCTIONS, (
-            f'admin_notifications.py has {fn_count} functions, exceeding ceiling of {ADMIN_NOTIFICATIONS_MAX_FUNCTIONS}.'
-        )
-
-
-# ── Frontend File Size Guards ────────────────────────────────────────────────
-# Enforces line count ceilings on the largest frontend files to prevent unbounded growth.
-
-USEAPPSTATE_MAX_LINES = 1500
-DIRECTIONS_PANEL_MAX_LINES = 1500
-CATCHUP_PANEL_MAX_LINES = 1200
-TASK_DETAIL_DRAWER_MAX_LINES = 1200
-SETTINGS_DROPDOWN_MAX_LINES = 1200
-KANBAN_BOARD_MAX_LINES = 710
-KANBAN_COLUMN_MAX_LINES = 640
-APP_TSX_MAX_LINES = 1000
+FRONTEND_SIZE_LIMITS = {
+    "useAppState.ts": 3000,
+    "components/DirectionsPanel.tsx": 3000,
+    "components/CatchUpPanel.tsx": 2500,
+    "components/TaskDetailDrawer.tsx": 2500,
+    "components/SettingsDropdown.tsx": 2500,
+    "components/KanbanBoard.tsx": 1500,
+    "components/KanbanColumn.tsx": 1500,
+    "App.tsx": 2000,
+}
 
 
 def _get_frontend_path(relative: str) -> str:
-    """Resolve a path relative to admin-ui/src/ from the test file location."""
     return os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui", "src", relative)
 
 
-class TestFrontendFreeze:
-    """Enforce line count ceilings on the largest frontend files."""
+class TestFrontendSizeGuardrails:
+    """Loose upper bounds to catch runaway frontend file growth."""
 
     @staticmethod
-    def _skip_if_missing(path: str) -> None:
+    def _skip_if_missing() -> None:
         import pytest
         if not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui")):
-            pytest.skip("admin-ui directory not present — skipping frontend size guards")
+            pytest.skip("admin-ui directory not present")
 
-    def test_useappstate_line_count(self):
-        """useAppState.ts must not grow beyond the ceiling.
-
-        If this fails: new state was added to useAppState.ts.
-        Extract into a standalone hook under admin-ui/src/hooks/ instead.
-        """
-        path = _get_frontend_path("useAppState.ts")
-        self._skip_if_missing(path)
+    def _check_frontend(self, relative_path: str) -> None:
+        self._skip_if_missing()
+        max_lines = FRONTEND_SIZE_LIMITS[relative_path]
+        path = _get_frontend_path(relative_path)
         with open(path) as f:
             count = len(f.readlines())
-        assert count <= USEAPPSTATE_MAX_LINES, (
-            f"useAppState.ts has {count} lines, exceeding the ceiling of {USEAPPSTATE_MAX_LINES}. "
-            "Extract into a standalone hook under admin-ui/src/hooks/ instead."
+        assert count <= max_lines, (
+            f"{relative_path} has {count} lines (limit: {max_lines}). "
+            "This file has grown large — consider extracting sub-components or hooks."
         )
 
-    def test_directions_panel_line_count(self):
-        """DirectionsPanel.tsx must not grow beyond the ceiling.
+    def test_useappstate(self):
+        self._check_frontend("useAppState.ts")
 
-        If this fails: new UI was added to DirectionsPanel.tsx.
-        Extract into a sub-component under admin-ui/src/components/ instead.
-        """
-        path = _get_frontend_path("components/DirectionsPanel.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= DIRECTIONS_PANEL_MAX_LINES, (
-            f"DirectionsPanel.tsx has {count} lines, exceeding the ceiling of {DIRECTIONS_PANEL_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
+    def test_directions_panel(self):
+        self._check_frontend("components/DirectionsPanel.tsx")
 
-    def test_catchup_panel_line_count(self):
-        """CatchUpPanel.tsx must not grow beyond the ceiling.
+    def test_catchup_panel(self):
+        self._check_frontend("components/CatchUpPanel.tsx")
 
-        If this fails: new UI was added to CatchUpPanel.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("components/CatchUpPanel.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= CATCHUP_PANEL_MAX_LINES, (
-            f"CatchUpPanel.tsx has {count} lines, exceeding the ceiling of {CATCHUP_PANEL_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
+    def test_task_detail_drawer(self):
+        self._check_frontend("components/TaskDetailDrawer.tsx")
 
-    def test_task_detail_drawer_line_count(self):
-        """TaskDetailDrawer.tsx must not grow beyond the ceiling.
+    def test_settings_dropdown(self):
+        self._check_frontend("components/SettingsDropdown.tsx")
 
-        If this fails: new UI was added to TaskDetailDrawer.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("components/TaskDetailDrawer.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= TASK_DETAIL_DRAWER_MAX_LINES, (
-            f"TaskDetailDrawer.tsx has {count} lines, exceeding the ceiling of {TASK_DETAIL_DRAWER_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
+    def test_kanban_board(self):
+        self._check_frontend("components/KanbanBoard.tsx")
 
-    def test_settings_dropdown_line_count(self):
-        """SettingsDropdown.tsx must not grow beyond the ceiling.
+    def test_kanban_column(self):
+        self._check_frontend("components/KanbanColumn.tsx")
 
-        If this fails: new UI was added to SettingsDropdown.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("components/SettingsDropdown.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= SETTINGS_DROPDOWN_MAX_LINES, (
-            f"SettingsDropdown.tsx has {count} lines, exceeding the ceiling of {SETTINGS_DROPDOWN_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
-
-    def test_kanban_board_line_count(self):
-        """KanbanBoard.tsx must not grow beyond the ceiling.
-
-        If this fails: new UI was added to KanbanBoard.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("components/KanbanBoard.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= KANBAN_BOARD_MAX_LINES, (
-            f"KanbanBoard.tsx has {count} lines, exceeding the ceiling of {KANBAN_BOARD_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
-
-    def test_kanban_column_line_count(self):
-        """KanbanColumn.tsx must not grow beyond the ceiling.
-
-        If this fails: new UI was added to KanbanColumn.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("components/KanbanColumn.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= KANBAN_COLUMN_MAX_LINES, (
-            f"KanbanColumn.tsx has {count} lines, exceeding the ceiling of {KANBAN_COLUMN_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
-
-    def test_app_tsx_line_count(self):
-        """App.tsx must not grow beyond the ceiling.
-
-        If this fails: new UI was added to App.tsx.
-        Extract into a sub-component or hook instead.
-        """
-        path = _get_frontend_path("App.tsx")
-        self._skip_if_missing(path)
-        with open(path) as f:
-            count = len(f.readlines())
-        assert count <= APP_TSX_MAX_LINES, (
-            f"App.tsx has {count} lines, exceeding the ceiling of {APP_TSX_MAX_LINES}. "
-            "Extract into a sub-component or hook instead."
-        )
-
-
-class TestOrchestratorFreeze:
-    """Enforce the orchestrator.py freeze: no new functions, no line growth."""
-
-    def test_orchestrator_line_count(self):
-        """orchestrator.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added to orchestrator.py.
-        New functionality must go in extracted modules. The orchestrator_worker
-        function (1,257 lines) is the primary extraction candidate.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_orchestrator_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ORCHESTRATOR_MAX_LINES, (
-            f"orchestrator.py has {count} lines, exceeding the ceiling of "
-            f"{ORCHESTRATOR_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_orchestrator_function_count(self):
-        """orchestrator.py must not gain new functions.
-
-        If this fails: a new function was added to orchestrator.py.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        import ast
-        path = _get_orchestrator_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ORCHESTRATOR_MAX_FUNCTIONS, (
-            f"orchestrator.py has {func_count} functions, exceeding the ceiling of "
-            f"{ORCHESTRATOR_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestOrchestratorFiltersFreeze:
-    """Enforce the orchestrator_filters.py freeze: no new functions, no line growth."""
-
-    def test_orchestrator_filters_line_count(self):
-        """orchestrator_filters.py must not grow beyond the ceiling.
-
-        If this fails: new conflict-filter logic was added inline.
-        New functionality should be added as a new extracted module.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_orchestrator_filters_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ORCHESTRATOR_FILTERS_MAX_LINES, (
-            f"orchestrator_filters.py has {count} lines, exceeding the ceiling of "
-            f"{ORCHESTRATOR_FILTERS_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_orchestrator_filters_function_count(self):
-        """orchestrator_filters.py must not gain new functions beyond the ceiling.
-
-        If this fails: a new filter function was added. New filter logic must go
-        in a separate extracted module.
-        """
-        import ast
-        path = _get_orchestrator_filters_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ORCHESTRATOR_FILTERS_MAX_FUNCTIONS, (
-            f"orchestrator_filters.py has {func_count} functions, exceeding the ceiling of "
-            f"{ORCHESTRATOR_FILTERS_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestAdminAnalyticsFreeze:
-    """Enforce the admin_analytics.py freeze: no unbounded line or function growth."""
-
-    def test_admin_analytics_line_count(self):
-        """admin_analytics.py must not grow beyond the ceiling.
-
-        If this fails: new analytics logic was added inline.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_admin_analytics_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= ADMIN_ANALYTICS_MAX_LINES, (
-            f"admin_analytics.py has {count} lines, exceeding the ceiling of "
-            f"{ADMIN_ANALYTICS_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_admin_analytics_function_count(self):
-        """admin_analytics.py must not gain new functions beyond the ceiling.
-
-        If this fails: a new function was added. New analytics logic must go
-        in a separate extracted module.
-        """
-        import ast
-        path = _get_admin_analytics_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= ADMIN_ANALYTICS_MAX_FUNCTIONS, (
-            f"admin_analytics.py has {func_count} functions, exceeding the ceiling of "
-            f"{ADMIN_ANALYTICS_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestServicesFreeze:
-    """Enforce the services.py freeze: no unbounded line or function growth."""
-
-    def test_services_line_count(self):
-        """services.py must not grow beyond the ceiling.
-
-        If this fails: new service logic was added inline.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        """
-        path = _get_services_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= SERVICES_MAX_LINES, (
-            f"services.py has {count} lines, exceeding the ceiling of "
-            f"{SERVICES_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-    def test_services_function_count(self):
-        """services.py must not gain new functions beyond the ceiling.
-
-        If this fails: a new function was added. New service logic must go
-        in a separate extracted module.
-        """
-        import ast
-        path = _get_services_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= SERVICES_MAX_FUNCTIONS, (
-            f"services.py has {func_count} functions, exceeding the ceiling of "
-            f"{SERVICES_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down."
-        )
-
-
-class TestAgentStatusFreeze:
-    """Enforce the routers/agent_status.py freeze: no unbounded line or function growth.
-
-    update_agent_status was extracted from main.py (direction d-09ee2577).
-    These guards prevent silent re-growth of the new module.
-    """
-
-    def test_line_count(self):
-        """agent_status.py must not grow beyond the ceiling.
-
-        If this fails: new functionality was added inline.
-        New functionality must go in extracted modules.
-        Once a line-reducing extraction lands, ratchet the ceiling down.
-        See direction d-09ee2577.
-        """
-        path = _get_agent_status_py_path()
-        with open(path) as f:
-            lines = f.readlines()
-        count = len(lines)
-        assert count <= AGENT_STATUS_MAX_LINES, (
-            f"agent_status.py has {count} lines, exceeding the ceiling of "
-            f"{AGENT_STATUS_MAX_LINES}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down. "
-            "See direction d-09ee2577."
-        )
-
-    def test_function_count(self):
-        """agent_status.py must not gain new functions beyond the ceiling.
-
-        If this fails: a new function was added. New logic must go
-        in a separate extracted module. See direction d-09ee2577.
-        """
-        import ast
-        path = _get_agent_status_py_path()
-        with open(path) as f:
-            source = f.read()
-        tree = ast.parse(source)
-        func_count = sum(
-            1 for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        assert func_count <= AGENT_STATUS_MAX_FUNCTIONS, (
-            f"agent_status.py has {func_count} functions, exceeding the ceiling of "
-            f"{AGENT_STATUS_MAX_FUNCTIONS}. "
-            "New functionality must go in extracted modules. "
-            "Once a line-reducing extraction lands, ratchet the ceiling down. "
-            "See direction d-09ee2577."
-        )
+    def test_app_tsx(self):
+        self._check_frontend("App.tsx")

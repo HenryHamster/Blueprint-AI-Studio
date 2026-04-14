@@ -26,6 +26,5 @@
 
 ## Common Patterns
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
-- `backend/app/main.py` and `agent/src/index.ts` are monolithic files — keep changes minimal and focused
 - Always run tests before finishing: backend uses Docker (`bash scripts/test-backend.sh`), frontend: `cd admin-ui && npm run build`
 - New admin endpoints need `@require_project_access` or `@require_role` decorators

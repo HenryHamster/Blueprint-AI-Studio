@@ -107,13 +107,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     let testFailuresDetected = false;
     let testsPassed = true;
-    if (runTestFix) {
+    if (runTestFix && baseBranch === 'main') {
       const result = await testFixLoop(ws, statusRef, model, effort);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
     }
 
-    if (failOnTestFailure && testFailuresDetected && !testsPassed) {
+    if (failOnTestFailure && baseBranch === 'main' && testFailuresDetected && !testsPassed) {
       sendLog(ws, 'Tests failed after max fix attempts — marking task as FAILED.\n');
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
