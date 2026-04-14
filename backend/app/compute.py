@@ -1117,6 +1117,7 @@ def get_zone_health() -> dict:
                 "last_failure_reason": data.get("last_failure_reason"),
                 "consecutive_failures": consecutive,
                 "cooldown_active": cooldown_active,
+                "cooldown_expires_at": cooldown_expires.isoformat() if cooldown_active and cooldown_expires else None,
             }
     return result
 
@@ -1129,6 +1130,11 @@ def get_zone_health_summary() -> dict:
         "total_zones": len(FALLBACK_ZONES),
         "available": len(FALLBACK_ZONES) - len(exhausted),
         "exhausted": exhausted,
+        "cooldown_recovery": {
+            z: health[z].get("cooldown_expires_at")
+            for z in exhausted
+            if health[z].get("cooldown_expires_at")
+        },
     }
 
 

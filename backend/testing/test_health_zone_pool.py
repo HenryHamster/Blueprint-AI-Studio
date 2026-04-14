@@ -355,8 +355,9 @@ class TestZoneHealth:
     def test_get_zone_health_summary_shape(self, clean_zone_state):
         """get_zone_health_summary() returns exactly the expected keys."""
         summary = get_zone_health_summary()
-        assert set(summary.keys()) == {"total_zones", "available", "exhausted"}
+        assert set(summary.keys()) == {"total_zones", "available", "exhausted", "cooldown_recovery"}
         assert isinstance(summary["exhausted"], list)
+        assert isinstance(summary["cooldown_recovery"], dict)
 
     def test_get_zone_health_summary_total_zones_matches_fallback_list(self, clean_zone_state):
         """total_zones equals the length of FALLBACK_ZONES."""

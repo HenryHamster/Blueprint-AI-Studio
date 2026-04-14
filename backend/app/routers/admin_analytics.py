@@ -740,6 +740,9 @@ async def get_digest(
         task_type = (t.first_payload).get("type", "create")
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
+        duration_seconds = None
+        if t.started_at and ts:
+            duration_seconds = int((ts - t.started_at).total_seconds())
         recent_completions.append({
             "task_id": tid,
             "title": t.title or "Completed task",
@@ -748,6 +751,7 @@ async def get_digest(
             "task_type": task_type,
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
+            "duration_seconds": duration_seconds,
         })
 
     # --- active_tasks list (up to 5, oldest started first) ---

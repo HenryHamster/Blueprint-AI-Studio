@@ -29,6 +29,23 @@ interface DirectionProgress {
   product_ratio?: number | null;
 }
 
+interface FailureGroup {
+  failure_class: string;
+  label: string;
+  count: number;
+}
+
+interface RecentCompletion {
+  task_id: string;
+  title: string;
+  completed_at: string | null;
+  pr_url: string | null;
+  task_type: string;
+  direction_id?: string | null;
+  direction_text?: string | null;
+  duration_seconds?: number | null;
+}
+
 interface DigestData {
   failed_count: number;
   success_rate?: number | null;
@@ -37,15 +54,8 @@ interface DigestData {
   direction_progress?: DirectionProgress[];
   pending_approval_count: number;
   overall_product_ratio?: number | null;
-}
-
-interface ActivityEvent {
-  id: string;
-  title: string;
-  timestamp: string;
-  pr_url?: string;
-  task_type?: string;
-  duration_seconds?: number;
+  failure_groups?: FailureGroup[];
+  recent_completions?: RecentCompletion[];
 }
 
 interface SparkPoint {
@@ -100,7 +110,6 @@ function Skeleton({ className = '' }: { className?: string }) {
 export function DashboardHome({ tasks, selectedProjectId, onViewTask }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
-  const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const sparkRef = useRef<SparkPoint[]>([]);
@@ -135,16 +144,6 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
       );
     }
 
-    // Activity
-    fetches.push(
-      (async () => {
-        try {
-          const res = await apiFetch('/api/admin/activity?limit=10&event_types=TASK_COMPLETED');
-          if (res.ok) { const data = await res.json(); setActivity(Array.isArray(data) ? data : (data.events ?? [])); }
-        } catch { /* silent */ }
-      })(),
-    );
-
     await Promise.allSettled(fetches);
     setLoading(false);
   }, [selectedProjectId]);
@@ -177,8 +176,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
   const issues = buildIssues(diagnostics, digest, tasks, onViewTask);
   const visibleIssues = showAllIssues ? issues : issues.slice(0, 3);
 
-  // Activity events with pr_url
-  const mergeEvents = activity.filter(e => e.pr_url);
+  // Recent completions with pr_url (from digest)
+  const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
 
   // Direction progress sorted by cycles
   const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => b.cycles_in_window - a.cycles_in_window);
@@ -196,8 +195,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
               <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
-              <MetricCard label="Failed (24h)" value={failedCount} color="red" spark={sparkData} dataKey="failed" loading={loading} />
-              <SuccessRateCard rate={successRate} trend={digest?.trend} loading={loading} />
+              <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
+              <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
             </div>
           </section>
 
@@ -294,17 +293,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
               {mergeEvents.map(ev => {
                 const dotColor = (ev.task_type === 'fix' || ev.task_type === 'review') ? 'bg-amber-500' : 'bg-emerald-500';
                 const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
+                const dirLabel = ev.direction_text ? ev.direction_text.slice(0, 30) + (ev.direction_text.length > 30 ? '…' : '') : null;
                 return (
-                  <div key={ev.id} className="relative pb-3">
+                  <div key={ev.task_id} className="relative pb-3">
                     <div className={`absolute -left-2.5 top-1.5 w-2 h-2 rounded-full ${dotColor} ring-2 ring-neutral-950`} />
                     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
                       <div className="flex items-start gap-2">
                         <GitMerge className="w-3.5 h-3.5 text-neutral-500 mt-0.5 shrink-0" />
                         <div className="flex-1 min-w-0">
                           <p className="text-xs text-neutral-200 truncate">{ev.title}</p>
+                          {dirLabel && <p className="text-[9px] text-neutral-500 truncate mt-0.5">{dirLabel}</p>}
                           <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500">
                             {ev.task_type && <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{ev.task_type}</span>}
-                            <span>{timeAgo(ev.timestamp)}</span>
+                            <span>{timeAgo(ev.completed_at ?? '')}</span>
                             {ev.duration_seconds != null && <span>{formatDurationSec(ev.duration_seconds)}</span>}
                           </div>
                         </div>
@@ -358,10 +359,73 @@ function MetricCard({ label, value, color, spark, dataKey, loading }: {
   );
 }
 
-function SuccessRateCard({ rate, trend, loading }: { rate?: number | null; trend?: string; loading: boolean }) {
+const FAILURE_CLASS_COLORS: Record<string, string> = {
+  CODE_ERROR: 'bg-red-500/20 text-red-400',
+  PROVISION_FAILURE: 'bg-orange-500/20 text-orange-400',
+  AGENT_TIMEOUT: 'bg-amber-500/20 text-amber-400',
+  RATE_LIMIT: 'bg-yellow-500/20 text-yellow-400',
+  EXTERNAL_API: 'bg-purple-500/20 text-purple-400',
+};
+
+const FAILURE_CLASS_SHORT: Record<string, string> = {
+  CODE_ERROR: 'code',
+  PROVISION_FAILURE: 'provision',
+  AGENT_TIMEOUT: 'timeout',
+  RATE_LIMIT: 'rate',
+  EXTERNAL_API: 'ext api',
+};
+
+function FailedCard({ value, groups, spark, loading }: {
+  value: number; groups?: FailureGroup[]; spark: SparkPoint[]; loading: boolean;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  const fill = SPARK_COLORS['red'];
+  const topGroups = (groups ?? []).slice(0, 3);
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Failed (24h)</p>
+      <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
+      {spark.length >= 3 && (
+        <div className="h-8 mt-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={spark}>
+              <defs>
+                <linearGradient id="grad-red" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={fill} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={fill} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <Area type="monotone" dataKey="failed" stroke={fill} fill="url(#grad-red)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+      {value > 0 && topGroups.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1.5">
+          {topGroups.map(g => {
+            const cls = FAILURE_CLASS_COLORS[g.failure_class] ?? 'bg-neutral-500/20 text-neutral-400';
+            const short = FAILURE_CLASS_SHORT[g.failure_class] ?? g.failure_class.toLowerCase();
+            return (
+              <span key={g.failure_class} className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${cls}`}>
+                {g.count} {short}
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuccessRateCard({ rate, trend, trendHistory, loading }: {
+  rate?: number | null; trend?: string;
+  trendHistory?: { success_rate: number | null; completed: number; failed: number }[];
+  loading: boolean;
+}) {
   if (loading) return <Skeleton className="h-20" />;
   const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
+  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 }));
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
@@ -369,6 +433,21 @@ function SuccessRateCard({ rate, trend, loading }: { rate?: number | null; trend
         <p className="text-2xl font-bold font-mono text-neutral-100">{rate != null ? `${Math.round(rate * 100)}%` : '--'}</p>
         <TrendIcon className={`w-4 h-4 ${trendColor}`} />
       </div>
+      {sparkPoints.length >= 3 && (
+        <div className="h-8 mt-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={sparkPoints}>
+              <defs>
+                <linearGradient id="grad-success" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#e5e5e5" stopOpacity={0.3} />
+                  <stop offset="100%" stopColor="#e5e5e5" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <Area type="monotone" dataKey="v" stroke="#e5e5e5" fill="url(#grad-success)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
     </div>
   );
 }
@@ -443,10 +522,20 @@ function buildIssues(
 
   // Zone exhaustion
   if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
+    const cooldownRecovery = diagnostics.zone_health.cooldown_recovery ?? {};
+    const now = Date.now();
+    const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
+      const expiresAt = cooldownRecovery[zone];
+      if (expiresAt) {
+        const minsLeft = Math.ceil((new Date(expiresAt).getTime() - now) / 60000);
+        return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
+      }
+      return zone;
+    });
     items.push({
       severity: 'warning',
       icon: AlertTriangle,
-      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${diagnostics.zone_health.exhausted.join(', ')}`,
+      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${zoneDetails.join(', ')}`,
     });
   }
 

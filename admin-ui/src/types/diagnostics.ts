@@ -16,7 +16,7 @@ export interface ProjectDiagnostics {
   circuit_breaker: { state: string; failure_count: number; opened_at: string | null };
   queued_count: number;
   in_progress_count: number;
-  zone_health: { available: number; exhausted: string[] };
+  zone_health: { available: number; exhausted: string[]; cooldown_recovery?: Record<string, string> };
 }
 
 export interface HealthOverviewIssue {

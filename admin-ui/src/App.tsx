@@ -128,6 +128,7 @@ function ColumnsPicker({ prefs, onPrefsChange }: { prefs: ColumnPref[]; onPrefsC
   );
 }
 
+
 export default function App() {
   const s = useAppState();
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -627,9 +628,7 @@ export default function App() {
             </button>
             )}
             <div className="flex-1" />
-            <span className="text-xs text-neutral-500">
-              {filteredTasks.length} of {s.tasks.length}
-            </span>
+            <span className="text-xs text-neutral-500">{filteredTasks.length} of {s.tasks.length}</span>
           </div>}
 
           {/* Quick-filter preset buttons */}
@@ -651,9 +650,7 @@ export default function App() {
           />
 
           {s.viewMode === 'home' ? (
-            <ErrorBoundary level="panel">
-              <DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} />
-            </ErrorBoundary>
+            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} /></ErrorBoundary>
           ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard
