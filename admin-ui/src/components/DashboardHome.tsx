@@ -77,6 +77,7 @@ interface DigestData {
   recent_completions?: RecentCompletion[];
   narrative_summary?: string | null;
   latest_cycle?: LatestCycle | null;
+  completed_count?: number;
 }
 
 interface SparkPoint {
@@ -176,11 +177,20 @@ function Skeleton({ className = '' }: { className?: string }) {
 
 // ---------- component ----------
 
+const WINDOW_OPTIONS = [
+  { label: '6h', value: 6 },
+  { label: '12h', value: 12 },
+  { label: '24h', value: 24 },
+  { label: '48h', value: 48 },
+  { label: '7d', value: 168 },
+];
+
 export function DashboardHome({ tasks, selectedProjectId, onViewTask }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [loading, setLoading] = useState(true);
   const [showAllIssues, setShowAllIssues] = useState(false);
+  const [windowHours, setWindowHours] = useState(24);
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
 
@@ -193,8 +203,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
       (async () => {
         try {
           const url = selectedProjectId
-            ? `/api/admin/digest?hours=24&project_id=${encodeURIComponent(selectedProjectId)}`
-            : '/api/admin/digest?hours=24';
+            ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
+            : `/api/admin/digest?hours=${windowHours}`;
           const res = await apiFetch(url);
           if (res.ok) setDigest(await res.json());
         } catch { /* silent */ }
@@ -215,7 +225,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
 
     await Promise.allSettled(fetches);
     setLoading(false);
-  }, [selectedProjectId]);
+  }, [selectedProjectId, windowHours]);
 
   // Initial + polling
   useEffect(() => {
@@ -255,6 +265,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
 
   return (
     <div className="flex-1 overflow-auto space-y-4">
+      {/* Header row with time window selector */}
+      <div className="flex items-center justify-end px-1">
+        <select
+          value={windowHours}
+          onChange={e => setWindowHours(Number(e.target.value))}
+          className="text-xs bg-neutral-800 text-neutral-300 border border-neutral-700 rounded px-2 py-1 focus:outline-none focus:border-neutral-500"
+        >
+          {WINDOW_OPTIONS.map(o => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+      </div>
+
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
 
@@ -264,9 +287,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
           {/* Section 1: Task Status Overview */}
           <section>
             <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Task Status</h2>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
               <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
+              <MetricCard label="Completed" value={digest?.completed_count ?? 0} color="violet" spark={[]} dataKey="active" loading={loading} />
               <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
             </div>
