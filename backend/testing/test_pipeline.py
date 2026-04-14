@@ -18,7 +18,8 @@ from sqlmodel import SQLModel
 from app.research_completion import _parse_research_findings
 from app.task_completion import _validate_plan_dependencies
 from app.failure_classification import classify_failure
-from app.main import record_task_result, should_rollback
+from app.routers.agent_status import record_task_result
+from app.main import should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion, _check_direction_starvation
 from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task
@@ -684,7 +685,7 @@ class TestTaskResultDedup:
     """Fix 2.7: record_task_result deduplicates by task_id."""
 
     def test_duplicate_result_ignored(self):
-        from app.main import record_task_result, _recorded_task_ids
+        from app.routers.agent_status import record_task_result, _recorded_task_ids
         from app.shared_state import deploy_monitoring
 
         # Reset state
@@ -699,7 +700,7 @@ class TestTaskResultDedup:
         assert len(deploy_monitoring["task_results"]) == initial_count + 1
 
     def test_different_task_ids_both_recorded(self):
-        from app.main import record_task_result, _recorded_task_ids
+        from app.routers.agent_status import record_task_result, _recorded_task_ids
         from app.shared_state import deploy_monitoring
 
         _recorded_task_ids.clear()

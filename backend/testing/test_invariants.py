@@ -232,8 +232,8 @@ class TestDirectionLifecycleInvariants:
 # Direction d-3d050b18: no new functions added to main.py; all new functionality
 # goes in extracted modules.
 
-MAIN_PY_MAX_LINES = 2500      # Ratchet down as extractions land
-MAIN_PY_MAX_FUNCTIONS = 40    # Ratchet down as extractions land
+MAIN_PY_MAX_LINES = 1850      # Ratchet down as extractions land
+MAIN_PY_MAX_FUNCTIONS = 37    # Ratchet down as extractions land
 MAIN_PY_MAX_EXTERNAL_IMPORTS = 15  # Ratchet down as import redirects land
 
 
@@ -350,6 +350,9 @@ ADMIN_ANALYTICS_MAX_FUNCTIONS = 11  # Current 9 + 2 slots
 SERVICES_MAX_LINES = 820
 SERVICES_MAX_FUNCTIONS = 12  # Current 10 + 2 slots
 
+AGENT_STATUS_MAX_LINES = 780   # Ratchet down as extractions land
+AGENT_STATUS_MAX_FUNCTIONS = 5  # Current 3 + 2 slots
+
 
 def _get_task_completion_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "task_completion.py")
@@ -373,6 +376,10 @@ def _get_admin_analytics_py_path() -> str:
 
 def _get_services_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "app", "services.py")
+
+
+def _get_agent_status_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "routers", "agent_status.py")
 
 
 def _get_review_pipeline_py_path() -> str:
@@ -1716,4 +1723,55 @@ class TestServicesFreeze:
             f"{SERVICES_MAX_FUNCTIONS}. "
             "New functionality must go in extracted modules. "
             "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+
+class TestAgentStatusFreeze:
+    """Enforce the routers/agent_status.py freeze: no unbounded line or function growth.
+
+    update_agent_status was extracted from main.py (direction d-09ee2577).
+    These guards prevent silent re-growth of the new module.
+    """
+
+    def test_line_count(self):
+        """agent_status.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added inline.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        See direction d-09ee2577.
+        """
+        path = _get_agent_status_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= AGENT_STATUS_MAX_LINES, (
+            f"agent_status.py has {count} lines, exceeding the ceiling of "
+            f"{AGENT_STATUS_MAX_LINES}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down. "
+            "See direction d-09ee2577."
+        )
+
+    def test_function_count(self):
+        """agent_status.py must not gain new functions beyond the ceiling.
+
+        If this fails: a new function was added. New logic must go
+        in a separate extracted module. See direction d-09ee2577.
+        """
+        import ast
+        path = _get_agent_status_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= AGENT_STATUS_MAX_FUNCTIONS, (
+            f"agent_status.py has {func_count} functions, exceeding the ceiling of "
+            f"{AGENT_STATUS_MAX_FUNCTIONS}. "
+            "New functionality must go in extracted modules. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down. "
+            "See direction d-09ee2577."
         )

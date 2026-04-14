@@ -190,9 +190,9 @@ async def orchestrator_worker():
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
-        record_task_result,
         _create_orchestrator_error_alerts,
     )
+    from app.routers.agent_status import record_task_result  # noqa: PLC0415
     from app.deploy_health import (  # noqa: PLC0415
         _check_monitoring_window,
         _check_external_health,

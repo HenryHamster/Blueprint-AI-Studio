@@ -45,7 +45,6 @@ from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.admin_analytics import router as admin_analytics_router
 from app.routers.agent_status import router as agent_status_router
-from app.routers.agent_status import record_task_result, _recorded_task_ids  # re-exported for backward compat
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -228,7 +227,6 @@ async def _get_actual_gcp_vm_count() -> int:
         return _last_gcp_vm_count  # Return stale count on failure
 
 # Webhook dedup state moved to app.routers.github
-# record_task_result, _recorded_task_ids moved to app.routers.agent_status
 
 async def _verify_schema_version():
     """Verify the database schema matches the expected alembic revision.
