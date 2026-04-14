@@ -217,13 +217,16 @@ async def reaper_service():
                     )
                     if is_rate_limited:
                         rl_acct_id = (task.context or {}).get("max_plan_account_id")
-                        logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing without burning retry")
+                        logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
-                        task.latest_status_message = f"Rate limited — requeued, waiting for account cooldown"
-                        # Blacklist the exhausted account and add cooldown
+                        task.latest_status_message = "Rate limited — requeued with exhausted account blacklisted"
+                        # Blacklist the exhausted account; let the orchestrator pick another
+                        # from the pool on the next cycle. If all accounts are rate-limited,
+                        # the orchestrator handles that case by skipping the task and retrying
+                        # next cycle — no need for a task-level retry_after delay.
                         rl_ctx = dict(task.context or {})
                         if rl_acct_id:
                             blacklisted = list(rl_ctx.get("blacklisted_accounts") or [])
@@ -232,8 +235,7 @@ async def reaper_service():
                             rl_ctx["blacklisted_accounts"] = blacklisted
                         rl_ctx.pop("max_plan_account_id", None)
                         rl_ctx.pop("_slot_released", None)
-                        # Wait 30 min before retrying — usage limits reset on longer windows
-                        rl_ctx["retry_after"] = (_utcnow() + timedelta(minutes=30)).isoformat()
+                        rl_ctx.pop("retry_after", None)  # clear any stale delay
                         task.context = rl_ctx
                         session.add(task)
                         await broadcast_to_project(str(task.project_id), "task_updated",

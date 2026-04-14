@@ -758,12 +758,17 @@ async def orchestrator_worker():
                                 stall_msg = f'All accounts rate-limited — earliest recovery in {int(wait_min)}min'
                             else:
                                 stall_msg = 'All accounts rate-limited — waiting for cooldown'
+                            # Short retry delay so we don't hot-loop while all accounts are blocked.
+                            # Cap at 2 min to stay responsive when accounts recover sooner.
+                            stall_ctx = dict(task.context or {})
+                            stall_ctx["retry_after"] = (_utcnow() + timedelta(minutes=2)).isoformat()
+                            task.context = stall_ctx
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg
-                                session.add(task)
                                 await broadcast_to_project(str(task.project_id), "task_updated",
                                     {"task_id": str(task.id), "status": task.status, "message": stall_msg})
+                            session.add(task)
                             continue
                         # No accounts at all — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
