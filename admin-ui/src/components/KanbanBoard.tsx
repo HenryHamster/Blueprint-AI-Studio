@@ -85,6 +85,7 @@ interface KanbanBoardProps {
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
+  onCtrlClick?: (taskId: string) => void;
   onBulkToggle: (taskIds: string[], selected: boolean) => void;
   onShiftSelect?: (taskId: string, orderedTaskIds: string[]) => void;
   onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
@@ -130,6 +131,7 @@ export function KanbanBoard({
   selectionMode,
   selectedTaskIds,
   onToggleTaskSelection,
+  onCtrlClick,
   onBulkToggle,
   onShiftSelect,
   onArchiveColumn,
@@ -350,7 +352,7 @@ export function KanbanBoard({
     return map;
   }, [tasks]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
 
   return (
     <DndContext
@@ -507,6 +509,7 @@ export function KanbanBoard({
                       selectedTaskIds={selectedTaskIds}
                       onToggleTaskSelection={onToggleTaskSelection}
                       onShiftClick={shiftClickHandler}
+                      onCtrlClick={onCtrlClick}
                       compact={compact}
                       blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
@@ -615,6 +618,7 @@ export function KanbanBoard({
               onViewLogs={onViewLogs}
               onTrack={onTrack}
               onToggleTaskSelection={onToggleTaskSelection}
+              onCtrlClick={onCtrlClick}
               toggleCollapse={toggleCollapse}
               handleResizeStart={handleResizeStart}
               showResizeHandle={showResizeHandle}

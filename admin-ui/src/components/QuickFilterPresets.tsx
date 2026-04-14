@@ -7,6 +7,8 @@ interface QuickFilterPresetsProps {
   blockedFilter: boolean;
   stuckFilter: boolean;
   stuckCount: number;
+  stuckCount1h: number;
+  stuckMinSeconds: number;
   searchQuery: string;
   setStatusFilter: (v: string[]) => void;
   setTaskTypeFilter: (v: string[]) => void;
@@ -14,6 +16,7 @@ interface QuickFilterPresetsProps {
   setRequiresApproval: (v: boolean) => void;
   setBlockedFilter: (v: boolean) => void;
   setStuckFilter: (v: boolean) => void;
+  setStuckMinSeconds: (v: number) => void;
   setSearchQuery: (v: string) => void;
 }
 
@@ -21,14 +24,14 @@ const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FA
 const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
 
 export function QuickFilterPresets({
-  statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, searchQuery,
-  setStatusFilter, setTaskTypeFilter, setDateRange, setRequiresApproval, setBlockedFilter, setStuckFilter, setSearchQuery,
+  statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, stuckCount1h, stuckMinSeconds, searchQuery,
+  setStatusFilter, setTaskTypeFilter, setDateRange, setRequiresApproval, setBlockedFilter, setStuckFilter, setStuckMinSeconds, setSearchQuery,
 }: QuickFilterPresetsProps) {
   const isFailedToday = statusFilter.length === 1 && statusFilter[0] === 'FAILED' && dateRange === '24h' && !requiresApproval && searchQuery === '';
-  const isStuckHour = statusFilter.length === 2 && statusFilter.includes('IN_PROGRESS') && statusFilter.includes('PROVISIONING') && dateRange === '1h' && !requiresApproval && searchQuery === '';
+  const isStuckHour = stuckFilter && stuckMinSeconds === 3600 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
   const isNeedsReview = requiresApproval && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
   const isBlocked = blockedFilter && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && !requiresApproval && searchQuery === '';
-  const isStuck = stuckFilter && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
+  const isStuck = stuckFilter && stuckMinSeconds === 0 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
 
   const clearAll = () => {
     setStatusFilter(ALL_STATUSES);
@@ -37,6 +40,7 @@ export function QuickFilterPresets({
     setRequiresApproval(false);
     setBlockedFilter(false);
     setStuckFilter(false);
+    setStuckMinSeconds(0);
     setSearchQuery('');
   };
 
@@ -55,15 +59,17 @@ export function QuickFilterPresets({
       },
     },
     {
-      label: 'Active last hour',
+      label: stuckCount1h > 0 ? `Stuck >1hr (${stuckCount1h})` : 'Stuck >1hr',
       active: isStuckHour,
-      danger: false,
+      danger: true,
       apply: () => {
         if (isStuckHour) { clearAll(); return; }
-        setStatusFilter(['IN_PROGRESS', 'PROVISIONING']);
-        setDateRange('1h');
+        setStuckFilter(true);
+        setStuckMinSeconds(3600);
+        setStatusFilter(ALL_STATUSES);
+        setDateRange('all');
         setRequiresApproval(false);
-        setStuckFilter(false);
+        setBlockedFilter(false);
         setSearchQuery('');
       },
     },
@@ -101,6 +107,7 @@ export function QuickFilterPresets({
       apply: () => {
         if (isStuck) { clearAll(); return; }
         setStuckFilter(true);
+        setStuckMinSeconds(0);
         setStatusFilter(ALL_STATUSES);
         setDateRange('all');
         setRequiresApproval(false);

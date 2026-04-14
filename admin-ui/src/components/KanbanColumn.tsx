@@ -21,12 +21,13 @@ const SORT_LABELS: Record<SortBy, string> = {
   attempts: 'Most retried',
 };
 
-export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
+export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
   onShiftClick?: (id: string) => void;
+  onCtrlClick?: (taskId: string) => void;
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   compact?: boolean;
@@ -76,6 +77,7 @@ export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSel
           blockingCount={blockingCount}
           selectionMode={selectionMode}
           onToggleTaskSelection={onToggleTaskSelection}
+          onCtrlClick={onCtrlClick}
           colIdx={colIdx}
           cardIdx={cardIdx}
           onNavigate={onNavigate}
@@ -104,6 +106,7 @@ export interface SortableCardProps {
   selectedTaskIds: Set<string>;
   onToggleTaskSelection: (id: string) => void;
   onShiftClick?: (id: string) => void;
+  onCtrlClick?: (taskId: string) => void;
   compact?: boolean;
   blockingCount?: number;
   onApprove: (id: string) => void;
@@ -132,6 +135,7 @@ export function SortableCard({
   selectedTaskIds,
   onToggleTaskSelection,
   onShiftClick,
+  onCtrlClick,
   compact,
   blockingCount,
   onApprove,
@@ -206,6 +210,7 @@ export function SortableCard({
           blockingCount={blockingCount}
           selectionMode={selectionMode}
           onToggleTaskSelection={onToggleTaskSelection}
+          onCtrlClick={onCtrlClick}
           colIdx={colIdx}
           cardIdx={cardIdx}
           onNavigate={onNavigate}
@@ -286,6 +291,7 @@ export interface KanbanColumnProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   onToggleTaskSelection: (id: string) => void;
+  onCtrlClick?: (taskId: string) => void;
   toggleCollapse: (colId: string) => void;
   handleResizeStart: (colId: string, e: React.MouseEvent) => void;
   showResizeHandle: boolean;
@@ -325,6 +331,7 @@ export function KanbanColumn({
   onViewLogs,
   onTrack,
   onToggleTaskSelection,
+  onCtrlClick,
   toggleCollapse,
   handleResizeStart,
   showResizeHandle,
@@ -338,7 +345,7 @@ export function KanbanColumn({
     ? (taskId: string) => onShiftSelect(taskId, taskIds)
     : undefined;
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
 
   let content: React.ReactNode;
 
@@ -455,6 +462,7 @@ export function KanbanColumn({
               selectedTaskIds={selectedTaskIds}
               onToggleTaskSelection={onToggleTaskSelection}
               onShiftClick={shiftClickHandler}
+              onCtrlClick={onCtrlClick}
               compact={compact}
               blockingCount={blockingMap[task.id]}
               colIdx={colIdx}

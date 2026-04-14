@@ -250,7 +250,8 @@ export default function App() {
       .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
   }, [effectiveColumnPrefs, s.statusFilter]);
 
-  const stuckTaskIds = useMemo(() => new Set(s.diagnostics?.stuck_tasks?.map((st: { task_id: string }) => st.task_id) ?? []), [s.diagnostics]);
+  const stuckTaskIds = useMemo(() => new Set((s.diagnostics?.stuck_tasks ?? []).filter((st: { task_id: string; stuck_for_seconds: number }) => st.stuck_for_seconds >= s.stuckMinSeconds).map((st: { task_id: string }) => st.task_id)), [s.diagnostics, s.stuckMinSeconds]);
+  const stuckCount1h = useMemo(() => (s.diagnostics?.stuck_tasks ?? []).filter((st: { stuck_for_seconds: number }) => st.stuck_for_seconds >= 3600).length, [s.diagnostics]);
 
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
   const filteredTasks = useMemo(() => {
@@ -271,7 +272,7 @@ export default function App() {
       return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, stuckTaskIds]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds]);
 
   const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
@@ -639,6 +640,8 @@ export default function App() {
             blockedFilter={s.blockedFilter}
             stuckFilter={s.stuckFilter}
             stuckCount={stuckTaskIds.size}
+            stuckCount1h={stuckCount1h}
+            stuckMinSeconds={s.stuckMinSeconds}
             searchQuery={s.searchQuery}
             setStatusFilter={s.setStatusFilter}
             setTaskTypeFilter={s.setTaskTypeFilter}
@@ -646,6 +649,7 @@ export default function App() {
             setRequiresApproval={s.setRequiresApproval}
             setBlockedFilter={s.setBlockedFilter}
             setStuckFilter={s.setStuckFilter}
+            setStuckMinSeconds={s.setStuckMinSeconds}
             setSearchQuery={s.setSearchQuery}
           />
 
@@ -664,6 +668,7 @@ export default function App() {
               selectionMode={s.selectionMode}
               selectedTaskIds={s.selectedTaskIds}
               onToggleTaskSelection={s.toggleTaskSelection}
+              onCtrlClick={(taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); }}
               onBulkToggle={s.bulkColumnToggle}
               onShiftSelect={s.shiftSelectRange}
               hasActiveFilters={hasActiveFilters}

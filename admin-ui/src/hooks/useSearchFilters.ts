@@ -16,6 +16,7 @@ export function useSearchFilters() {
   const [blockedFilter, setBlockedFilter] = useState(false);
   const [requiresApproval, setRequiresApproval] = useState(false);
   const [stuckFilter, setStuckFilter] = useState(false);
+  const [stuckMinSeconds, setStuckMinSeconds] = useState(0);
 
-  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter };
+  return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds };
 }

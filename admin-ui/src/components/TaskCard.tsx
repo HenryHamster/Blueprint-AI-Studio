@@ -111,6 +111,7 @@ interface TaskCardProps {
   compact?: boolean;
   selectionMode?: boolean;
   onToggleTaskSelection?: (id: string) => void;
+  onCtrlClick?: (taskId: string) => void;
   colIdx?: number;
   cardIdx?: number;
   onNavigate?: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
@@ -237,7 +238,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -387,6 +388,13 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       tabIndex={0}
       role="article"
       onKeyDown={handleRootKeyDown}
+      onClick={(e) => {
+        if ((e.ctrlKey || e.metaKey) && onCtrlClick) {
+          e.preventDefault();
+          e.stopPropagation();
+          onCtrlClick(task.id);
+        }
+      }}
       className={`relative group bg-neutral-900 rounded-lg border border-l-4 ${borderColor} transition-shadow outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 ${compact ? 'p-2' : 'px-3 py-2.5'} ${task.status === 'CANCELLED' ? 'opacity-60' : ''} ${isChild ? 'border-y-neutral-800 border-r-neutral-800 shadow-sm' : 'border-y-neutral-800 border-r-neutral-800 shadow-sm hover:shadow-md hover:border-y-neutral-700 hover:border-r-neutral-700'}`}
     >
       <div className="flex items-start gap-2 mb-1.5">
