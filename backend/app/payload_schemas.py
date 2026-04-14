@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -153,31 +153,31 @@ class _SystemPopulated(BasePayload):
 
 
 class ResearchPayload(_SystemPopulated):
-    directions: Optional[list] = None
+    directions: Optional[list[dict[str, Any]]] = None
     research_mode: Optional[str] = None
     current_direction_id: Optional[str] = None
-    anomaly_signals: Optional[list] = None
+    anomaly_signals: Optional[list[dict[str, Any]]] = None
     project_name: Optional[str] = None
-    design_doc: Optional[dict] = None
+    design_doc: Optional[dict[str, Any]] = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
-    design_doc: Optional[dict] = None
-    vision: Optional[dict] = None
-    directions_summary: Optional[list] = None
-    outcome_evaluation: Optional[dict] = None
-    open_messages: Optional[list] = None
+    design_doc: Optional[dict[str, Any]] = None
+    vision: Optional[dict[str, Any]] = None
+    directions_summary: Optional[list[dict[str, Any]]] = None
+    outcome_evaluation: Optional[dict[str, Any]] = None
+    open_messages: Optional[list[dict[str, Any]]] = None
     project_name: Optional[str] = None
     research_mode: Optional[str] = None
     max_active_directions: Optional[int] = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
-    design_doc: Optional[dict] = None
-    vision: Optional[dict] = None
-    open_messages: Optional[list] = None
+    design_doc: Optional[dict[str, Any]] = None
+    vision: Optional[dict[str, Any]] = None
+    open_messages: Optional[list[dict[str, Any]]] = None
     project_name: Optional[str] = None
-    proposed_changes: Optional[list] = None
+    proposed_changes: Optional[list[dict[str, Any]]] = None
 
 
 class SecurityAuditPayload(_SystemPopulated):
@@ -197,7 +197,7 @@ class DocsPayload(_SystemPopulated):
 
 
 class SmokestestPayload(_SystemPopulated):
-    health_check_urls: Optional[list] = None
+    health_check_urls: Optional[list[str]] = None
 
 
 class DebugPayload(_SystemPopulated):

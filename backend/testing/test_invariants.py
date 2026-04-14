@@ -826,6 +826,62 @@ class TestDeployHealthFreeze:
         )
 
 
+# ── Reaper Module Size Guards ────────────────────────────────────────────────
+# Ceiling enforcement for reaper.py to prevent unbounded growth
+
+REAPER_MAX_LINES = 500
+REAPER_MAX_FUNCTIONS = 8
+
+
+def _get_reaper_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "app", "reaper.py")
+
+
+class TestReaperFreeze:
+    """Enforce the reaper.py freeze: no new functions, no line growth."""
+
+    def test_reaper_line_count(self):
+        """reaper.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to reaper.py.
+        New functionality must go in extracted modules.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_reaper_py_path()
+        with open(path) as f:
+            lines = f.readlines()
+        count = len(lines)
+        assert count <= REAPER_MAX_LINES, (
+            f"reaper.py has {count} lines, exceeding the ceiling of "
+            f"{REAPER_MAX_LINES}. "
+            "Extract helpers from reaper_service or create a new module. "
+            "Once a line-reducing extraction lands, ratchet the ceiling down."
+        )
+
+    def test_reaper_function_count(self):
+        """reaper.py must not gain new functions.
+
+        If this fails: a new function was added to reaper.py.
+        New functionality must go in extracted modules (e.g., extract reaper_service
+        phase helpers). Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_reaper_py_path()
+        with open(path) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        func_count = sum(
+            1 for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        assert func_count <= REAPER_MAX_FUNCTIONS, (
+            f"reaper.py has {func_count} functions, exceeding the ceiling of "
+            f"{REAPER_MAX_FUNCTIONS}. "
+            "Extract helpers from reaper_service or create a new module. "
+            "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
 # ── Research/Strategic Completion Module Size Guards ──────────────────────────
 # Direction d-8848700b: ceiling enforcement for uncapped completion modules
 
