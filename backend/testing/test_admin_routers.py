@@ -1119,3 +1119,112 @@ class TestPlaybook:
 
         resp = await client.get(f"/api/admin/projects/{other.id}/playbook")
         assert resp.status_code == 403
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# notification_config settings — validation and webhook_url masking
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNotificationConfigSettings:
+    """Tests for PATCH /api/admin/settings notification_config validation and
+    GET /api/admin/settings webhook_url masking for non-admin callers."""
+
+    @pytest.mark.asyncio
+    async def test_patch_valid_notification_config(self, client: AsyncClient):
+        """PATCH with a valid notification_config is accepted."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {
+                "webhook_url": "https://hooks.example.com/token",
+                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED"],
+                "throttle_seconds": 60,
+            }
+        })
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_patch_notification_config_invalid_webhook_url(self, client: AsyncClient):
+        """webhook_url must start with http:// or https://."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {"webhook_url": "ftp://bad.example.com"}
+        })
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_notification_config_invalid_throttle_below_zero(self, client: AsyncClient):
+        """throttle_seconds must be >= 0."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {"throttle_seconds": -1}
+        })
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_notification_config_invalid_throttle_above_max(self, client: AsyncClient):
+        """throttle_seconds must be <= 3600."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {"throttle_seconds": 3601}
+        })
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_notification_config_unknown_event(self, client: AsyncClient):
+        """enabled_events rejects strings not in the known event set."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {
+                "enabled_events": ["TASK_FAILED", "UNKNOWN_EVENT_XYZ"],
+            }
+        })
+        assert resp.status_code == 400
+        assert "unknown" in resp.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_settings_admin_sees_webhook_url(self, client: AsyncClient):
+        """Admin caller receives the actual webhook_url in notification_config."""
+        # First configure a webhook URL as admin
+        await client.patch("/api/admin/settings", json={
+            "notification_config": {
+                "webhook_url": "https://hooks.example.com/secret-token",
+                "enabled_events": ["TASK_FAILED"],
+                "throttle_seconds": 30,
+            }
+        })
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        nc = resp.json()["notification_config"]
+        assert nc["webhook_url"] == "https://hooks.example.com/secret-token"
+
+    @pytest.mark.asyncio
+    async def test_get_settings_non_admin_webhook_url_masked(self, override_get_session):
+        """Non-admin caller gets empty webhook_url and a boolean configured flag instead."""
+        from app.main import app as _app
+        from app.auth import get_current_user as _gcu, require_admin as _ra
+
+        async def _non_admin():
+            return {"user_id": "non-admin-user", "email": "user@example.com", "role": "user"}
+
+        async def _reject_admin():
+            raise __import__('fastapi').HTTPException(status_code=403, detail="Forbidden")
+
+        # Set a webhook URL in runtime config first
+        from app.shared_state import runtime_config
+        runtime_config["notification_config"] = {
+            "webhook_url": "https://hooks.example.com/secret-token",
+            "enabled_events": ["TASK_FAILED"],
+            "throttle_seconds": 30,
+        }
+
+        _app.dependency_overrides[_gcu] = _non_admin
+        _app.dependency_overrides[_ra] = _reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=_app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get("/api/admin/settings")
+            assert resp.status_code == 200
+            nc = resp.json()["notification_config"]
+            assert nc["webhook_url"] == "", "webhook_url must be masked for non-admin"
+            assert nc["webhook_url_configured"] is True, "configured flag must be True when URL is set"
+        finally:
+            _app.dependency_overrides.pop(_gcu, None)
+            _app.dependency_overrides.pop(_ra, None)
+            # Restore runtime_config
+            runtime_config.pop("notification_config", None)

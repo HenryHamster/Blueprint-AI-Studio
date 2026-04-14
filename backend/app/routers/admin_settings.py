@@ -254,6 +254,23 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
     }
 
 
+def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict:
+    """Return notification config, masking webhook_url for non-admin callers.
+
+    Webhook URLs (Slack, PagerDuty, Discord) embed auth tokens, so they must
+    not be returned to non-admin users. Non-admins receive a boolean flag
+    indicating whether a URL is configured instead.
+    """
+    if is_admin:
+        return config
+    return {
+        "webhook_url": "",
+        "webhook_url_configured": bool(config.get("webhook_url")),
+        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"]),
+        "throttle_seconds": config.get("throttle_seconds", 30),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Settings endpoints
 # ---------------------------------------------------------------------------
@@ -293,11 +310,14 @@ async def get_settings(
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
-        "notification_config": _runtime_config.get("notification_config", {
-            "webhook_url": "",
-            "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"],
-            "throttle_seconds": 30,
-        }),
+        "notification_config": _build_notification_config_response(
+            _runtime_config.get("notification_config", {
+                "webhook_url": "",
+                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"],
+                "throttle_seconds": 30,
+            }),
+            is_admin=current_user.get("role") == "admin",
+        ),
         "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
@@ -491,9 +511,19 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             raise HTTPException(status_code=400, detail="notification_config.webhook_url must be a string")
         if webhook_url and not webhook_url.startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail="notification_config.webhook_url must start with http:// or https://")
+        _VALID_NOTIFICATION_EVENTS = frozenset([
+            "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
+        ])
         enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT"])
         if not isinstance(enabled_events, list):
             raise HTTPException(status_code=400, detail="notification_config.enabled_events must be a list")
+        invalid_events = [e for e in enabled_events if e not in _VALID_NOTIFICATION_EVENTS]
+        if invalid_events:
+            raise HTTPException(
+                status_code=400,
+                detail=f"notification_config.enabled_events contains unknown events: {invalid_events}. "
+                       f"Valid values: {sorted(_VALID_NOTIFICATION_EVENTS)}",
+            )
         throttle_seconds = val.get("throttle_seconds", 30)
         try:
             throttle_seconds = int(throttle_seconds)
@@ -511,7 +541,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         webhook_url = nc.get("webhook_url", "")
         if not webhook_url:
             raise HTTPException(status_code=400, detail="No webhook URL configured")
-        import httpx
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(webhook_url, json={"type": "TEST", "message": "Blueprint test notification"})
