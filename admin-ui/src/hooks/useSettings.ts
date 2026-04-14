@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { MaxPlanAccount } from '../types/settings';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
+import type { BuildConfig } from '../types/project';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 
 type AddToast = (message: string, type: 'success' | 'error' | 'info') => void;
@@ -26,6 +27,7 @@ export function useSettings(addToast: AddToast) {
     enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
     throttle_seconds: 30,
   });
+  const [buildConfig, setBuildConfig] = useState<BuildConfig | null>(null);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -306,6 +308,22 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateBuildConfig = async (projectId: string, config: BuildConfig) => {
+    const prev = buildConfig;
+    setBuildConfig(config);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ build_config: config }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setBuildConfig(prev);
+      throw new Error('Failed to save build config');
+    }
+  };
+
   const updateNotificationConfig = async (config: Partial<NotificationConfig>) => {
     const prev = notificationConfig;
     const next = { ...notificationConfig, ...config };
@@ -331,6 +349,7 @@ export function useSettings(addToast: AddToast) {
     githubAccount, setGithubAccount,
     requireApprovalGates,
     notificationConfig,
+    buildConfig, setBuildConfig,
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
@@ -342,5 +361,6 @@ export function useSettings(addToast: AddToast) {
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     updateHealthCheckUrls, updateRequireApprovalGates,
     updateNotificationConfig,
+    updateBuildConfig,
   };
 }

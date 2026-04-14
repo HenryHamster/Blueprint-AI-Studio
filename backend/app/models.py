@@ -98,6 +98,8 @@ class Project(SQLModel, table=True):
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
+    # Build configuration: directories, commands, git identity for the agent
+    build_config: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
 
     tasks: List["Task"] = Relationship(
         back_populates="project",

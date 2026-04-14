@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { SettingsAdvancedSection } from './SettingsAdvancedSection';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
-import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell } from 'lucide-react';
+import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
+import type { BuildConfig } from '../types/project';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
 import type { DeployState, MaxPlanAccount } from '../types/settings';
@@ -89,6 +91,13 @@ interface SettingsDropdownProps {
   onSignOut: () => void;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
+  // Build config (project-scoped)
+  selectedProjectId: string | null;
+  selectedProjectOwner: string | null;
+  selectedProjectRepo: string | null;
+  buildConfig: BuildConfig | null;
+  onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
+  onDetectBuildConfig: () => Promise<void>;
 }
 
 
@@ -111,15 +120,16 @@ const ALL_PROMPT_SUFFIX_TYPES = [
   'investigate', 'rollup', 'strategic_review', 'design_doc_update',
 ] as const;
 
-type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced';
+type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config';
 
-const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean }[] = [
+const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
   { id: 'task-types', label: 'Task Types', icon: ListChecks },
   { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
   { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
   { id: 'accounts', label: 'Accounts', icon: User },
   { id: 'notifications', label: 'Notifications', icon: Bell },
+  { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -206,6 +216,12 @@ export function SettingsDropdown({
   onSignOut,
   showUserManagement,
   onToggleUserManagement,
+  selectedProjectId,
+  selectedProjectOwner,
+  selectedProjectRepo,
+  buildConfig,
+  onUpdateBuildConfig,
+  onDetectBuildConfig,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -265,7 +281,9 @@ export function SettingsDropdown({
   }, [showSettings, onToggleSettings]);
 
   const isAdmin = userRole === 'admin';
-  const visibleSections = SECTIONS.filter(s => !s.adminOnly || isAdmin);
+  const visibleSections = SECTIONS.filter(s =>
+    (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
+  );
 
   // --- Section renderers ---
 
@@ -908,6 +926,19 @@ export function SettingsDropdown({
     );
   }
 
+  function renderBuildConfig() {
+    return (
+      <ProjectBuildConfigSection
+        githubOwner={selectedProjectOwner}
+        githubRepo={selectedProjectRepo}
+        buildConfig={buildConfig}
+        onSave={onUpdateBuildConfig}
+        onDetect={onDetectBuildConfig}
+        detectAvailable={false}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
@@ -916,6 +947,7 @@ export function SettingsDropdown({
       case 'deploy': return renderDeploy();
       case 'accounts': return renderAccounts();
       case 'notifications': return renderNotifications();
+      case 'build-config': return renderBuildConfig();
       case 'advanced': return renderAdvanced();
     }
   }

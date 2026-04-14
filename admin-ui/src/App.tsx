@@ -384,6 +384,12 @@ export default function App() {
         userRole={s.userRole}
         notificationConfig={s.notificationConfig}
         onUpdateNotificationConfig={s.updateNotificationConfig}
+        selectedProjectId={s.selectedProjectId}
+        selectedProjectOwner={selectedProject?.github_owner ?? null}
+        selectedProjectRepo={selectedProject?.github_repo ?? null}
+        buildConfig={s.buildConfig}
+        onUpdateBuildConfig={s.handleUpdateBuildConfig}
+        onDetectBuildConfig={s.handleDetectBuildConfig}
       />
 
       <div
