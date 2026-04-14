@@ -37,6 +37,8 @@ class HeartbeatMetrics(BaseModel):
     heap_used_mb: Optional[float] = None
     disk_free_mb: Optional[float] = None
     disk_total_mb: Optional[float] = None
+    cgroup_mb: Optional[float] = None
+    cgroup_limit_mb: Optional[float] = None
 
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

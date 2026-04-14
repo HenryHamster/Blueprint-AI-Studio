@@ -81,6 +81,23 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   design_doc_update: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-400', icon: FileText, label: 'Design Doc' },
 };
 
+function parsePhase(statusMessage: string): string {
+  // Strip '[XXmb]' heap prefix if present
+  const msg = statusMessage.replace(/^\[\d+(\.\d+)?MB\]\s*/i, '');
+  if (/cloning/i.test(msg)) return 'Cloning repo';
+  if (/running claude/i.test(msg)) return 'Working';
+  const toolMatch = msg.match(/using tool:\s*(\S+)/i);
+  if (toolMatch) return `Using ${toolMatch[1]}`;
+  if (/pushing/i.test(msg)) return 'Pushing changes';
+  if (/creating pull request/i.test(msg)) return 'Creating PR';
+  if (/running test|running lint|running pre-commit/i.test(msg)) return 'Running checks';
+  if (/rebasing/i.test(msg)) return 'Rebasing';
+  if (/spawning/i.test(msg)) return 'Spawning subtasks';
+  if (/addressing review/i.test(msg)) return 'Fixing review feedback';
+  if (/strategic/i.test(msg)) return 'Strategic analysis';
+  return msg.slice(0, 40).trim();
+}
+
 const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint: string; suggestion: string; retryLabel: string }> = {
   CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400', hint: 'Application code error — review error logs for root cause', suggestion: 'Review error logs before retrying', retryLabel: 'Edit & Retry' },
   PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400', hint: 'VM startup failed — check zone health. Auto-retries on different zone', suggestion: 'VM startup failed — will use alternate zone on retry', retryLabel: 'Retry' },
@@ -478,6 +495,16 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         <div className="bg-amber-950/40 border border-amber-900/50 text-amber-400 rounded px-2 py-1 text-xs flex items-center gap-1.5 mb-2">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" style={{ width: 14, height: 14 }} />
           No heartbeat for 5+ minutes — task may be stuck
+        </div>
+      )}
+
+      {task.status === 'IN_PROGRESS' && task.latest_status_message && (
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <span className="relative flex h-1.5 w-1.5 shrink-0">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neutral-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-neutral-500" />
+          </span>
+          <span className="text-[11px] text-neutral-400 truncate">{parsePhase(task.latest_status_message)}</span>
         </div>
       )}
 

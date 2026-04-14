@@ -612,7 +612,17 @@ async def agent_heartbeat(
         task.latest_status_message = req.status_message
     if req.metrics:
         ctx = dict(task.context or {})
-        ctx['last_metrics'] = req.metrics.model_dump(exclude_none=True)
+        metrics_dump = req.metrics.model_dump(exclude_none=True)
+        ctx['last_metrics'] = metrics_dump
+        history = list(ctx.get('metrics_history', []))
+        entry: dict = {'t': _utcnow().isoformat()}
+        for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
+            if metrics_dump.get(k) is not None:
+                entry[k] = metrics_dump[k]
+        history.append(entry)
+        if len(history) > 30:
+            history = history[-30:]
+        ctx['metrics_history'] = history
         task.context = ctx
 
     session.add(task)

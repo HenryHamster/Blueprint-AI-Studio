@@ -109,6 +109,37 @@ function DirectionsSection({ directions }: { directions: { text: string; priorit
   );
 }
 
+interface MetricsSnapshot {
+  t: string;
+  rss_mb?: number;
+  heap_used_mb?: number;
+  disk_free_mb?: number;
+  disk_total_mb?: number;
+  cgroup_mb?: number;
+  cgroup_limit_mb?: number;
+}
+
+function Sparkline({ values }: { values: number[] }) {
+  if (values.length < 2) return null;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const W = 40, H = 16, PAD = 1;
+  const pts = values.map((v, i) => {
+    const x = PAD + (i / (values.length - 1)) * (W - PAD * 2);
+    const y = PAD + (1 - (v - min) / range) * (H - PAD * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const latest = values[values.length - 1];
+  const pct = (latest - min) / range;
+  const stroke = pct > 0.9 ? '#f87171' : pct > 0.7 ? '#fbbf24' : '#34d399';
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="inline-block align-middle">
+      <polyline points={pts} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 const DEP_STATUS_COLORS: Record<string, string> = { COMPLETED: 'text-emerald-400', IN_PROGRESS: 'text-amber-400', FAILED: 'text-red-400', CANCELLED: 'text-neutral-500', EVALUATING: 'text-blue-400', PROVISIONING: 'text-blue-400', QUEUED: 'text-neutral-400' };
 function DependencyItem({ dep, depTask, hasCycle, onNavigateToTask }: { dep: string; depTask?: Task; hasCycle?: boolean; onNavigateToTask?: (id: string) => void }) {
   const statusColor = depTask ? (DEP_STATUS_COLORS[depTask.status] ?? 'text-neutral-400') : '';
@@ -283,14 +314,63 @@ function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }:
       {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
 
       {(() => {
-        const metrics = task.context?.last_metrics as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number } | undefined;
+        const metrics = task.context?.last_metrics as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number; cgroup_mb?: number; cgroup_limit_mb?: number } | undefined;
+        const history = (task.context?.metrics_history ?? []) as MetricsSnapshot[];
         if (!metrics) return null;
+        const useSparklines = history.length >= 2;
+        const rssVals = useSparklines ? history.map(h => h.rss_mb).filter((v): v is number => v != null) : [];
+        const heapVals = useSparklines ? history.map(h => h.heap_used_mb).filter((v): v is number => v != null) : [];
+        const diskUsedVals = useSparklines
+          ? history
+              .filter(h => h.disk_free_mb != null && h.disk_total_mb != null)
+              .map(h => h.disk_total_mb! - h.disk_free_mb!)
+          : [];
+        const cgroupVals = useSparklines ? history.map(h => h.cgroup_mb).filter((v): v is number => v != null) : [];
+        const diskTotal = metrics.disk_total_mb;
+        const diskUsed = diskTotal != null && metrics.disk_free_mb != null ? diskTotal - metrics.disk_free_mb : null;
+        const diskPct = diskUsed != null && diskTotal ? Math.round((diskUsed / diskTotal) * 100) : null;
+        const cgroupColor = metrics.cgroup_mb != null && metrics.cgroup_limit_mb != null && metrics.cgroup_limit_mb > 0
+          ? (metrics.cgroup_mb / metrics.cgroup_limit_mb) > 0.85 ? 'text-red-400'
+          : (metrics.cgroup_mb / metrics.cgroup_limit_mb) > 0.70 ? 'text-amber-400'
+          : 'text-green-400'
+          : '';
         return (
           <>
             <SectionHeader>System Metrics</SectionHeader>
-            {metrics.rss_mb != null && <DetailRow label="RSS Memory"><span className="font-mono text-sm">{metrics.rss_mb} MB</span></DetailRow>}
-            {metrics.heap_used_mb != null && <DetailRow label="Heap Used"><span className="font-mono text-sm">{metrics.heap_used_mb} MB</span></DetailRow>}
-            {metrics.disk_free_mb != null && metrics.disk_total_mb != null && <DetailRow label="Disk (/tmp)"><span className="font-mono text-sm">{metrics.disk_free_mb} MB free / {metrics.disk_total_mb} MB total</span></DetailRow>}
+            {metrics.cgroup_mb != null && metrics.cgroup_limit_mb != null && (
+              <DetailRow label="Container Memory">
+                <span className="inline-flex items-center gap-2">
+                  {cgroupVals.length >= 2 && <Sparkline values={cgroupVals} />}
+                  <span className={`font-mono text-sm ${cgroupColor}`}>
+                    {metrics.cgroup_mb} MB / {metrics.cgroup_limit_mb} MB ({Math.round(metrics.cgroup_mb / metrics.cgroup_limit_mb * 100)}%)
+                  </span>
+                </span>
+              </DetailRow>
+            )}
+            {metrics.rss_mb != null && (
+              <DetailRow label="RSS Memory">
+                <span className="inline-flex items-center gap-2">
+                  {rssVals.length >= 2 && <Sparkline values={rssVals} />}
+                  <span className="font-mono text-sm">{metrics.rss_mb} MB</span>
+                </span>
+              </DetailRow>
+            )}
+            {metrics.heap_used_mb != null && (
+              <DetailRow label="Heap Used">
+                <span className="inline-flex items-center gap-2">
+                  {heapVals.length >= 2 && <Sparkline values={heapVals} />}
+                  <span className="font-mono text-sm">{metrics.heap_used_mb} MB</span>
+                </span>
+              </DetailRow>
+            )}
+            {diskUsed != null && diskTotal != null && (
+              <DetailRow label="Disk (/tmp)">
+                <span className="inline-flex items-center gap-2">
+                  {diskUsedVals.length >= 2 && <Sparkline values={diskUsedVals} />}
+                  <span className="font-mono text-sm">{diskUsed.toFixed(1)} MB used{diskPct != null ? ` (${diskPct}%)` : ''} / {diskTotal} MB</span>
+                </span>
+              </DetailRow>
+            )}
           </>
         );
       })()}
