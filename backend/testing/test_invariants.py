@@ -54,6 +54,30 @@ class TestSafetyConstants:
         )
 
 
+# ── Schema Revision Sync ───────────────────────────────────────────────────
+
+class TestSchemaRevisionSync:
+    def test_expected_revision_matches_latest_migration(self):
+        """EXPECTED_SCHEMA_REVISION must match the latest alembic migration.
+
+        If this fails, you added a migration but forgot to bump
+        EXPECTED_SCHEMA_REVISION in main.py. The orchestrator will crash
+        on startup with a schema version mismatch.
+        """
+        import glob as globmod
+        from app.main import EXPECTED_SCHEMA_REVISION
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        assert files, "No migration files found"
+
+        latest = max(os.path.basename(f).split("_")[0] for f in files)
+        assert EXPECTED_SCHEMA_REVISION == latest, (
+            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but latest "
+            f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        )
+
+
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
 class TestSecurityIntegrity:
