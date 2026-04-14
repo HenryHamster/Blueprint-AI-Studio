@@ -29,10 +29,18 @@ interface DirectionProgress {
   product_ratio?: number | null;
 }
 
+interface FailureGroupTask {
+  task_id: string;
+  title: string;
+  error_snippet?: string;
+  attempt_count?: number;
+}
+
 interface FailureGroup {
   failure_class: string;
   label: string;
   count: number;
+  tasks: FailureGroupTask[];
 }
 
 interface RecentCompletion {
@@ -86,6 +94,14 @@ export interface DashboardHomeProps {
 
 // ---------- helpers ----------
 
+const FAILURE_CLASS_COLORS: Record<string, string> = {
+  CODE_ERROR: 'bg-red-500/20 text-red-400 border-red-500/30',
+  PROVISION_FAILURE: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+  AGENT_TIMEOUT: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  RATE_LIMIT: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
+  EXTERNAL_API: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+};
+
 const TASK_TYPE_COLORS: Record<string, string> = {
   create: 'bg-emerald-500/20 text-emerald-400',
   fix: 'bg-red-500/20 text-red-400',
@@ -109,6 +125,46 @@ function priorityBadge(p: string) {
     case 'medium': return 'bg-amber-500/20 text-amber-400 border-amber-500/30';
     default: return 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
   }
+}
+
+// ---------- failure class pill ----------
+
+function FailureClassPill({ group }: { group: FailureGroup }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const topTasks = group.tasks.slice(0, 3);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
+        onClick={() => setOpen(v => !v)}
+        title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
+      >
+        {group.label}
+        <span className="font-bold">{group.count}</span>
+      </button>
+      {open && topTasks.length > 0 && (
+        <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
+          <div className="space-y-1">
+            {topTasks.map(t => (
+              <div key={t.task_id} className="text-[10px] text-neutral-300 truncate">{t.title}</div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ---------- skeleton ----------
@@ -214,6 +270,17 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
             </div>
           </section>
+
+          {/* Section 1b: Failure Breakdown by Class */}
+          {!loading && digest?.failure_groups && digest.failure_groups.length > 0 && (
+            <section>
+              <div className="flex flex-wrap gap-1.5">
+                {digest.failure_groups.map(g => (
+                  <FailureClassPill key={g.failure_class} group={g} />
+                ))}
+              </div>
+            </section>
+          )}
 
           {/* Section 2: Direction Portfolio Health */}
           <section>
@@ -412,14 +479,6 @@ function MetricCard({ label, value, color, spark, dataKey, loading }: {
     </div>
   );
 }
-
-const FAILURE_CLASS_COLORS: Record<string, string> = {
-  CODE_ERROR: 'bg-red-500/20 text-red-400',
-  PROVISION_FAILURE: 'bg-orange-500/20 text-orange-400',
-  AGENT_TIMEOUT: 'bg-amber-500/20 text-amber-400',
-  RATE_LIMIT: 'bg-yellow-500/20 text-yellow-400',
-  EXTERNAL_API: 'bg-purple-500/20 text-purple-400',
-};
 
 const FAILURE_CLASS_SHORT: Record<string, string> = {
   CODE_ERROR: 'code',
