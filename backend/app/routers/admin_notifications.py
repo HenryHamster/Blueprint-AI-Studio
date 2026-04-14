@@ -2,6 +2,7 @@
 import re
 import uuid
 import json
+from datetime import timezone
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -347,12 +348,33 @@ async def admin_playbook_list(
     for k, v in doc.items():
         if k.startswith("playbook/") and isinstance(v, dict):
             short_key = k[len("playbook/"):]
+            last_referenced_at = v.get("last_referenced_at")
+            updated_at = v.get("updated_at", "")
+            # Compute stale: True if no reference in 30 days (or never referenced and updated 30+ days ago)
+            now_utc = _utcnow()
+            _STALE_DAYS = 30
+            stale = False
+            reference_ts = last_referenced_at or updated_at
+            if reference_ts:
+                try:
+                    from datetime import datetime
+                    ts = datetime.fromisoformat(reference_ts)
+                    if ts.tzinfo is not None:
+                        ts = ts.replace(tzinfo=None)
+                    stale = (now_utc - ts).days >= _STALE_DAYS
+                except Exception:
+                    pass
+            else:
+                stale = True
             entries[short_key] = {
                 "content": v.get("content", ""),
                 "source_task_id": v.get("source_task_id"),
-                "updated_at": v.get("updated_at", ""),
+                "updated_at": updated_at,
                 "confirmed_count": v.get("confirmed_count", 0),
                 "applicable_types": v.get("applicable_types"),
+                "reference_count": v.get("reference_count", 0),
+                "last_referenced_at": last_referenced_at,
+                "stale": stale,
             }
     return {"entries": entries, "count": len(entries)}
 

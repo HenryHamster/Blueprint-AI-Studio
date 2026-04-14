@@ -646,3 +646,32 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...healthLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }
+
+// ── Retry context injection ──────────────────────────────────────────────────
+/**
+ * Builds a section describing the previous failed attempt, to be inserted
+ * before the raw task prompt so the agent knows what went wrong and can avoid
+ * the same mistake.  Returns an empty string for first-attempt tasks.
+ */
+export function buildRetryContext(task: Record<string, unknown>): string {
+  const ctx = (task.context as Record<string, unknown> | undefined) || {};
+  const attemptNumber = typeof ctx._attempt_number === 'number' ? ctx._attempt_number : 1;
+  if (attemptNumber <= 1) return '';
+
+  const previousError = strVal(ctx._previous_error as unknown);
+  const previousFailureClass = strVal(ctx._previous_failure_class as unknown);
+  const prevAttempt = attemptNumber - 1;
+
+  const lines: string[] = [
+    `## Previous Attempt (attempt #${prevAttempt} failed)`,
+    `Failure type: ${previousFailureClass || 'UNKNOWN'}`,
+  ];
+  if (previousError) {
+    lines.push(`Error: ${previousError}`);
+  }
+  lines.push(
+    'Analyze the error above and avoid the same mistake. If it was a test failure, check the specific test first. If it was a lint error, run the linter before committing.',
+    '',
+  );
+  return lines.join('\n');
+}

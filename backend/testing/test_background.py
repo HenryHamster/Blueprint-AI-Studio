@@ -579,3 +579,31 @@ async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
     # RATE_LIMIT → no guidance injected; prompt_suffix absent or empty
     suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix")
     assert not suffix
+
+
+@pytest.mark.asyncio
+async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
+    """clone_ctx contains _attempt_number incremented, _previous_error, and _previous_failure_class."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "do something"}],
+        child_context={"_attempt_number": 1, "scope": "medium"},
+        child_status_message="pytest test_foo failed with AssertionError: expected 1 got 2",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    # _attempt_number must be incremented from 1 → 2
+    assert clone_ctx.get("_attempt_number") == 2
+    # _previous_error must contain the original status message
+    assert "AssertionError" in (clone_ctx.get("_previous_error") or "")
+    # _previous_failure_class must be set (CODE_ERROR for a pytest failure)
+    assert clone_ctx.get("_previous_failure_class") == "CODE_ERROR"

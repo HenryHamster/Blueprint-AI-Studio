@@ -880,3 +880,126 @@ async def test_playbook_claim_includes_entry_when_type_matches(client: AsyncClie
     assert "playbook" in data
     assert "build-hint" in data["playbook"]
     assert data["playbook"]["build-hint"] == "build instruction"
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_increments_reference_count(client: AsyncClient, db_session):
+    """
+    After claim, reference_count is incremented and last_referenced_at is set
+    for served playbook entries. Non-served entries (filtered by applicable_types) are NOT incremented.
+    """
+    project = Project(name="Playbook RefCount Test", user_id="test-user-prc")
+    project.design_doc = {
+        "playbook/served-entry": {
+            "content": "served content",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 2,
+        },
+        "playbook/unserved-entry": {
+            "content": "write-only content",
+            "applicable_types": ["review"],  # won't match 'create' task
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 0,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-prc-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prc-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "playbook" in data
+    assert "served-entry" in data["playbook"]
+    assert "unserved-entry" not in data["playbook"]
+
+    # Verify reference_count incremented for served entry
+    await db_session.refresh(project)
+    served = project.design_doc["playbook/served-entry"]
+    assert served["reference_count"] == 3
+    assert served["last_referenced_at"] is not None
+
+    # Verify unserved entry unchanged
+    unserved = project.design_doc["playbook/unserved-entry"]
+    assert unserved["reference_count"] == 0
+    assert "last_referenced_at" not in unserved
+
+
+@pytest.mark.asyncio
+async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
+    """
+    Admin playbook list endpoint returns reference_count, last_referenced_at, and stale flag.
+    Stale is True if no reference in 30+ days; False if recently referenced.
+    Auth is mocked by conftest to test-user-123 (admin).
+    """
+    from app.models import ProjectMember
+
+    project = Project(name="Playbook Stale Test", user_id="test-user-123")
+    project.design_doc = {
+        "playbook/fresh-entry": {
+            "content": "fresh content",
+            "updated_at": "2026-04-10T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 5,
+            "last_referenced_at": "2026-04-13T00:00:00",  # 1 day ago — not stale
+        },
+        "playbook/stale-entry": {
+            "content": "old content",
+            "updated_at": "2025-12-01T00:00:00",  # >30 days ago, never referenced
+            "confirmed_count": 0,
+            "reference_count": 0,
+        },
+        "playbook/stale-ref-entry": {
+            "content": "referenced long ago",
+            "updated_at": "2025-12-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 3,
+            "last_referenced_at": "2025-12-15T00:00:00",  # >30 days ago
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add project member matching the mocked current_user (test-user-123)
+    member = ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    # No auth header needed — conftest mocks get_current_user to test-user-123
+    resp = await client.get(f"/api/admin/projects/{project.id}/playbook")
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+
+    fresh = entries["fresh-entry"]
+    assert fresh["reference_count"] == 5
+    assert fresh["last_referenced_at"] == "2026-04-13T00:00:00"
+    assert fresh["stale"] is False
+
+    stale_entry = entries["stale-entry"]
+    assert stale_entry["reference_count"] == 0
+    assert stale_entry["last_referenced_at"] is None
+    assert stale_entry["stale"] is True
+
+    stale_ref = entries["stale-ref-entry"]
+    assert stale_ref["reference_count"] == 3
+    assert stale_ref["stale"] is True
+
+    stale_ref = entries["stale-ref-entry"]
+    assert stale_ref["reference_count"] == 3
+    assert stale_ref["stale"] is True

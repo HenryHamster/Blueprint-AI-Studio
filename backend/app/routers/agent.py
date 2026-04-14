@@ -9,6 +9,7 @@ from typing import Dict
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.auth import verify_agent_jwt, create_agent_token
@@ -525,6 +526,23 @@ async def claim_task(
                 playbook_entries[short_key] = v.get("content", "")
         if playbook_entries:
             response["playbook"] = playbook_entries
+            # Track reference counts — fire-and-forget, must not fail claim response
+            try:
+                now_iso = _utcnow().isoformat()
+                doc = dict(project_for_playbook.design_doc)
+                for short_key in playbook_entries:
+                    full_key = f"playbook/{short_key}"
+                    if full_key in doc and isinstance(doc[full_key], dict):
+                        entry = dict(doc[full_key])
+                        entry["reference_count"] = entry.get("reference_count", 0) + 1
+                        entry["last_referenced_at"] = now_iso
+                        doc[full_key] = entry
+                project_for_playbook.design_doc = doc
+                flag_modified(project_for_playbook, "design_doc")
+                session.add(project_for_playbook)
+                await session.commit()
+            except Exception:
+                pass
 
     # Inject direction quality signal when acceptance rate is low (reuse project already loaded above)
     direction_id = (task.context or {}).get("direction_id")

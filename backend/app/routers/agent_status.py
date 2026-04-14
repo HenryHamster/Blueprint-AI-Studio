@@ -158,6 +158,169 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         logger.warning(f"[NOTIFY] BUDGET_EXCEEDED dispatch setup failed: {_ne}")
 
 
+_STOPWORDS = frozenset([
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "was", "are", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "shall", "can", "not", "no", "nor",
+    "so", "yet", "both", "either", "neither", "each", "few", "more", "most",
+    "other", "some", "such", "than", "too", "very", "just", "task", "error",
+    "failed", "failure", "retries", "exhausted", "attempt", "status",
+    "message", "timeout", "unknown", "none", "null", "true", "false",
+    "code", "line", "file", "test", "run", "running", "agent", "vm",
+])
+
+_AUTO_PLAYBOOK_CAP = 5
+
+
+async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
+    """Check for recurring failure patterns and auto-create playbook entries.
+
+    Queries the last 30 FAILED tasks for this project within the past 7 days,
+    groups by failure_class, and creates a playbook entry when 3+ tasks share
+    common keywords in their status messages. Capped at 5 auto-generated entries
+    per project.
+    """
+    import hashlib as _hashlib  # noqa: PLC0415
+    from collections import Counter  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(days=7)
+
+    recent_failed = (await session.execute(
+        select(Task).where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,  # exclude current task (session-commit-exclusion-pattern)
+            Task.status == TaskStatus.FAILED,
+            Task.created_at >= cutoff,
+        ).order_by(Task.created_at.desc()).limit(30)
+    )).scalars().all()
+
+    # Add the current task's contribution manually (it was excluded above)
+    all_failed = list(recent_failed) + [task]
+
+    # Group by failure_class
+    by_class: dict[str, list] = {}
+    for t in all_failed:
+        fc = classify_failure(t)
+        by_class.setdefault(fc, []).append(t)
+
+    for failure_class, tasks_in_class in by_class.items():
+        if len(tasks_in_class) < 3:
+            continue
+
+        # Tokenize status messages and find keywords appearing in 3+ tasks
+        task_keyword_sets: list[set[str]] = []
+        for t in tasks_in_class:
+            msg = (t.latest_status_message or "").lower()
+            tokens = set()
+            for word in msg.split():
+                word = word.strip(".,;:!?\"'()[]{}|/\\-")
+                if len(word) >= 4 and word not in _STOPWORDS and word.isalpha():
+                    tokens.add(word)
+            task_keyword_sets.append(tokens)
+
+        keyword_counts = Counter(kw for kw_set in task_keyword_sets for kw in kw_set)
+        common_keywords = sorted(
+            kw for kw, count in keyword_counts.items() if count >= 3
+        )[:10]
+
+        if len(common_keywords) < 2:
+            continue
+
+        # Check if an existing auto-entry already covers these keywords
+        project = await session.get(Project, task.project_id)
+        if not project:
+            continue
+
+        doc = dict(project.design_doc or {})
+        existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
+
+        # Check duplicate: look for any existing entry whose keywords overlap significantly
+        already_covered = False
+        keyword_set = set(common_keywords)
+        for existing_key in existing_auto_keys:
+            entry = doc.get(existing_key, {})
+            entry_content = entry.get("content", "").lower()
+            overlap = sum(1 for kw in keyword_set if kw in entry_content)
+            if overlap >= max(2, len(keyword_set) // 2):
+                # Update the count in the existing entry
+                updated_entry = dict(entry)
+                updated_entry["content"] = (
+                    f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+                    f"Common pattern: {', '.join(common_keywords)}. "
+                    f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+                    f"Agents should check for this issue before starting work."
+                )
+                updated_entry["updated_at"] = _utcnow().isoformat()
+                updated_entry["applicable_types"] = _get_applicable_types(tasks_in_class)
+                doc[existing_key] = updated_entry
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+                logger.info(f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern")
+                already_covered = True
+                break
+
+        if already_covered:
+            continue
+
+        # Cap at 5 auto-generated entries
+        if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
+            logger.info(f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping")
+            continue
+
+        # Create a new auto-entry
+        short_hash = _hashlib.md5(",".join(sorted(common_keywords)).encode()).hexdigest()[:6]
+        entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
+
+        applicable_types = _get_applicable_types(tasks_in_class)
+        content = (
+            f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+            f"Common pattern: {', '.join(common_keywords)}. "
+            f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+            f"Agents should check for this issue before starting work."
+        )
+
+        doc[entry_key] = {
+            "content": content,
+            "source_task_id": None,
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+            "applicable_types": applicable_types,
+        }
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        logger.info(
+            f"[PLAYBOOK] Auto-created entry {entry_key} for {failure_class} pattern "
+            f"({len(tasks_in_class)} occurrences, keywords: {common_keywords})"
+        )
+
+
+def _truncate_examples(tasks: list) -> str:
+    """Build a short string of recent failure messages for playbook content."""
+    parts = []
+    for t in tasks:
+        msg = (t.latest_status_message or "")[:150].strip()
+        if msg:
+            parts.append(f'"{msg}"')
+    return "; ".join(parts) if parts else "(no message)"
+
+
+def _get_applicable_types(tasks: list) -> list[str]:
+    """Extract unique task types from a list of tasks."""
+    types = set()
+    for t in tasks:
+        fp = t.first_payload
+        if fp:
+            task_type = fp.get("type", "")
+            if task_type:
+                types.add(task_type)
+    return sorted(types) if types else []
+
+
 @router.post("/api/agent/status")
 @limiter.limit("120/minute")
 async def update_agent_status(
@@ -671,6 +834,13 @@ async def update_agent_status(
                 session.add(task)
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
+
+        # Auto-create playbook entries from recurring failure patterns
+        if payload.status == TaskStatus.FAILED:
+            try:
+                await _check_recurring_failures(task, session)
+            except Exception as _pbe:
+                logger.warning(f"[PLAYBOOK] Failed to check recurring failures for task {task.id}: {_pbe}")
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload

@@ -131,6 +131,9 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         task_scope = child_ctx.get("scope", "medium")
         attempt = child_ctx.get("_attempt_number", 1)
         clone_ctx = {k: v for k, v in child_ctx.items() if k != "max_plan_account_id"}
+        clone_ctx["_attempt_number"] = attempt + 1
+        clone_ctx["_previous_error"] = (original_status_message or "")[:1500]
+        clone_ctx["_previous_failure_class"] = failure_class
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""
