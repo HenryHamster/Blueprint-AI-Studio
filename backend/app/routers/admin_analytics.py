@@ -823,17 +823,23 @@ async def get_digest(
             if t.status == TaskStatus.COMPLETED
             and _p_start <= _derive_completed_at(t) < _p_end
         )
-        _p_failed = sum(
-            1 for t in all_tasks
+        _p_failed_tasks = [
+            t for t in all_tasks
             if t.status == TaskStatus.FAILED
             and _p_start <= _derive_completed_at(t) < _p_end
-        )
+        ]
+        _p_failed = len(_p_failed_tasks)
+        _p_by_class: dict[str, int] = {}
+        for _ft in _p_failed_tasks:
+            _cls = _classify_failure(_ft)
+            _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
         _p_total = _p_completed + _p_failed
         trend_history.append({
             "period_end": _p_end.isoformat(),
             "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
             "completed": _p_completed,
             "failed": _p_failed,
+            "failed_by_class": _p_by_class,
         })
 
     # Action-first narrative: executives want "what do I need to do?" before "how did things go?"

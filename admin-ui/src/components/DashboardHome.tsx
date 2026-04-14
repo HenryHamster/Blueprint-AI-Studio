@@ -50,7 +50,7 @@ interface DigestData {
   failed_count: number;
   success_rate?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number }[];
+  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number> }[];
   direction_progress?: DirectionProgress[];
   pending_approval_count: number;
   overall_product_ratio?: number | null;
