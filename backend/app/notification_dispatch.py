@@ -238,6 +238,29 @@ async def post_auto_fix_result_message(
     )
 
 
+async def post_issue_implementation_spawned_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    issue_number: int,
+    issue_title: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when an issue-to-implementation task is spawned."""
+    summary = f"Blueprint is implementing issue #{issue_number}: {issue_title}"
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="issue_implementation_spawned",
+        summary=summary,
+        context={
+            "issue_number": issue_number,
+            "issue_title": issue_title,
+            "task_id": str(task_id) if task_id else None,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_feedback_acknowledgment(
     session: AsyncSession,
     project_id: uuid.UUID,

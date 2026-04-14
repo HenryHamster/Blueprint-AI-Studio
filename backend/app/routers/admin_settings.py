@@ -1569,3 +1569,88 @@ async def update_auto_remediation_config(
 
     config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
+
+
+# ---------------------------------------------------------------------------
+# Issue-to-Implementation Config
+# ---------------------------------------------------------------------------
+
+_ISSUE_IMPLEMENTATION_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "trigger_label": "blueprint:implement",
+    "max_per_hour": 3,
+    "max_concurrent": 3,
+    "base_branch": "main",
+    "default_effort": "high",
+}
+
+
+@router.get("/projects/{project_id}/issue-implementation")
+async def get_issue_implementation_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the current issue-implementation config for a project, merged with defaults."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    stored = (project.design_doc or {}).get("_issue_implementation", {})
+    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    return {"project_id": str(project_id), "config": config}
+
+
+@router.patch("/projects/{project_id}/issue-implementation")
+async def update_issue_implementation_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update issue-implementation config fields (partial update)."""
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+
+    # Validate incoming fields
+    allowed = set(_ISSUE_IMPLEMENTATION_DEFAULTS.keys())
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown config fields: {sorted(unknown)}")
+
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        raise HTTPException(status_code=422, detail="'enabled' must be a boolean")
+
+    if "trigger_label" in body:
+        v = body["trigger_label"]
+        if not isinstance(v, str) or not v.strip():
+            raise HTTPException(status_code=422, detail="'trigger_label' must be a non-empty string")
+
+    if "max_per_hour" in body:
+        v = body["max_per_hour"]
+        if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 10):
+            raise HTTPException(status_code=422, detail="'max_per_hour' must be an integer between 1 and 10")
+
+    if "max_concurrent" in body:
+        v = body["max_concurrent"]
+        if not isinstance(v, int) or isinstance(v, bool) or not (1 <= v <= 5):
+            raise HTTPException(status_code=422, detail="'max_concurrent' must be an integer between 1 and 5")
+
+    if "base_branch" in body:
+        v = body["base_branch"]
+        if not isinstance(v, str) or not v.strip():
+            raise HTTPException(status_code=422, detail="'base_branch' must be a non-empty string")
+
+    if "default_effort" in body:
+        v = body["default_effort"]
+        if not isinstance(v, str) or v not in ("low", "medium", "high"):
+            raise HTTPException(status_code=422, detail="'default_effort' must be one of: low, medium, high")
+
+    # Merge into existing stored config
+    design_doc = dict(project.design_doc or {})
+    stored = dict(design_doc.get("_issue_implementation", {}))
+    stored.update(body)
+    design_doc["_issue_implementation"] = stored
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    return {"project_id": str(project_id), "config": config}

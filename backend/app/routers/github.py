@@ -481,4 +481,39 @@ async def github_webhook(
                 session.add(task)
                 await session.commit()
 
+    # NOTE: The 'issues' event must be enabled in the GitHub App's webhook settings.
+    elif event_type == 'issues':
+        action = data.get('action')
+        if action == 'labeled':
+            issue = data.get('issue', {})
+            label = data.get('label', {})
+            repo_data = data.get('repository', {})
+            repo_full = repo_data.get('full_name', '')
+            issue_number = issue.get('number')
+            issue_title = issue.get('title', '')
+            label_name = label.get('name', '')
+
+            if '/' in repo_full and issue_number:
+                owner, repo_name = repo_full.split('/', 1)
+                project = (await session.execute(
+                    select(Project).where(
+                        Project.github_owner == owner,
+                        Project.github_repo == repo_name,
+                    )
+                )).scalars().first()
+                if project:
+                    config = (project.design_doc or {}).get('_issue_implementation', {})
+                    if config.get('enabled') and label_name == config.get('trigger_label', 'blueprint:implement'):
+                        from app.issue_implementation import _handle_issue_implementation
+                        background_tasks.add_task(
+                            _handle_issue_implementation,
+                            owner=owner,
+                            repo=repo_name,
+                            issue_number=issue_number,
+                            issue_title=issue_title,
+                            project_id=project.id,
+                            config=config,
+                        )
+                        return {'status': 'issue_implementation_triggered'}
+
     return {"status": "received"}

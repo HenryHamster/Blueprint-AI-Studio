@@ -36,11 +36,13 @@ vi.mock('../prompt.js', () => ({
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   formatPlaybook: vi.fn().mockReturnValue(''),
+  buildRetryContext: vi.fn().mockReturnValue(''),
 }));
 
-vi.mock('../build-config.js', () => ({
-  resolveBuildConfig: vi.fn().mockReturnValue(undefined),
-}));
+vi.mock('../build-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../build-config.js')>();
+  return { ...actual };
+});
 
 vi.mock('fs', () => ({
   default: {
@@ -76,7 +78,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode, testFixLoop, git } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, git } from '../index.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -223,6 +225,33 @@ describe('handleCreate configuration', () => {
       handleCreate(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()),
     ).rejects.toThrow('No prompt found');
   });
+
+  it('includes Closes #N in PR body when task.context.issue_number is set', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts'); // diff has changes
+    const task = { title: 'My Task', description: '', context: { issue_number: 42 } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Closes #42');
+  });
+
+  it('uses issue_url over issue_number in PR body when both are set', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    const task = { title: 'My Task', description: '', context: { issue_number: 42, issue_url: 'https://github.com/owner/repo/issues/42' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Closes https://github.com/owner/repo/issues/42');
+  });
+
+  it('does not include Closes in PR body when no issue context', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    const task = { title: 'My Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).not.toContain('Closes');
+  });
 });
 
 describe('handleRefactor configuration', () => {
@@ -347,7 +376,7 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, {},
+      WS, expect.any(Object), undefined, undefined, undefined,
     );
   });
 });

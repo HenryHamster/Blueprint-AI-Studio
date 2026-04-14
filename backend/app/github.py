@@ -594,6 +594,94 @@ async def get_issues(
 
     return response.json()
 
+async def get_single_issue(
+    token: str,
+    owner: str,
+    repo: str,
+    issue_number: int,
+) -> dict:
+    """Fetch a single issue by number."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    response = await _github_request(
+        "GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}",
+        headers,
+    )
+
+    if response.status_code != 200:
+        logger.error(f"Failed to get issue #{issue_number}: {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve issue #{issue_number} from GitHub.",
+        )
+
+    return response.json()
+
+
+async def get_issue_comments(
+    token: str,
+    owner: str,
+    repo: str,
+    issue_number: int,
+    per_page: int = 30,
+) -> list:
+    """Fetch comments on an issue. Returns [] on any failure (graceful degradation)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page={per_page}",
+            headers,
+        )
+        if response.status_code != 200:
+            logger.warning(f"Failed to get comments for issue #{issue_number}: {response.status_code}")
+            return []
+        return response.json()
+    except Exception as exc:
+        logger.warning(f"Error fetching comments for issue #{issue_number}: {exc}")
+        return []
+
+
+async def create_issue_comment(
+    token: str,
+    owner: str,
+    repo: str,
+    issue_number: int,
+    body: str,
+) -> dict:
+    """Post a comment on an issue (GitHub treats PRs as issues for comments)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    response = await _github_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments",
+        headers,
+        json={"body": body},
+    )
+
+    if response.status_code != 201:
+        logger.error(f"Failed to create comment on issue #{issue_number}: {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create comment on issue #{issue_number}.",
+        )
+
+    return response.json()
+
+
 async def create_branch(
     token: str,
     owner: str,

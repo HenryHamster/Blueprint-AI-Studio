@@ -13,7 +13,6 @@ import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
-import type { BuildConfig } from '../index.js';
 import { resolveBuildConfig } from '../build-config.js';
 
 // ── Build instruction generator for review prompts ───────────────────────────

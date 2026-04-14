@@ -34,6 +34,7 @@ export interface StandardHandlerOpts {
   failOnTestFailure?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
+  issueReference?: string;
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -46,6 +47,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     failOnTestFailure = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
+    issueReference,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -142,6 +144,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const testSummary = testsPassed ? '\u2705 Tests passed' : testFailuresDetected ? '\u26a0\ufe0f Test failures detected' : '\u26a0\ufe0f Could not run tests';
       prBody += `## Test Results\n\n${testSummary}\n\n`;
     }
+    if (issueReference) {
+      prBody += `${issueReference}\n\n`;
+    }
     prBody += `---\n*Automated by Blueprint Agent*`;
 
     const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `${prTitlePrefix} ${taskTitle}`, prBody, ws, statusRef);
@@ -172,6 +177,13 @@ export async function handleCreate(
   const taskTitleStr = strVal(task.title);
   const prompt = taskTitleStr ? `Task: ${taskTitleStr}\n\n${rawPrompt}` : rawPrompt;
   if (!prompt) throw new Error('No prompt found in task payloads');
+
+  const taskCtx = task.context as Record<string, unknown> | undefined;
+  const issueNumber = taskCtx?.issue_number as number | undefined;
+  const issueUrl = taskCtx?.issue_url as string | undefined;
+  const issueReference = issueNumber != null
+    ? `Closes ${issueUrl || ('#' + issueNumber)}`
+    : undefined;
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const siblingTasks = projectCtx?.sibling_tasks;
@@ -206,6 +218,7 @@ export async function handleCreate(
     failOnTestFailure: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
+    issueReference,
   });
 }
 

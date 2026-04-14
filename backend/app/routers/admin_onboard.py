@@ -217,6 +217,14 @@ async def onboard_project(
         'max_concurrent': 2,
         'require_review': True,
     }
+    design_doc['_issue_implementation'] = {
+        'enabled': False,
+        'trigger_label': 'blueprint:implement',
+        'max_per_hour': 3,
+        'max_concurrent': 3,
+        'base_branch': default_branch or 'main',
+        'default_effort': 'high',
+    }
     project.design_doc = design_doc
     flag_modified(project, 'design_doc')
 
