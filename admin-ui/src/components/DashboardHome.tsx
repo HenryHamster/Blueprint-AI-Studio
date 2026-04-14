@@ -73,6 +73,8 @@ interface DigestData {
   trend?: 'improving' | 'declining' | 'stable';
   trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number>; period_cost_usd?: number | null }[];
   total_estimated_cost_usd?: number | null;
+  daily_cost_usd?: number | null;
+  daily_cost_ceiling_usd?: number | null;
   direction_progress?: DirectionProgress[];
   pending_approval_count: number;
   overall_product_ratio?: number | null;
@@ -729,6 +731,25 @@ function buildIssues(
       icon: Clock,
       title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
     });
+  }
+
+  // Cost ceiling
+  if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
+    const ceiling = digest.daily_cost_ceiling_usd!;
+    const daily = digest.daily_cost_usd ?? 0;
+    if (daily >= ceiling) {
+      items.push({
+        severity: 'warning',
+        icon: AlertTriangle,
+        title: `Daily cost ceiling exceeded ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
+      });
+    } else if (daily >= ceiling * 0.8) {
+      items.push({
+        severity: 'info',
+        icon: AlertTriangle,
+        title: `Daily cost approaching ceiling ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
+      });
+    }
   }
 
   // Zone exhaustion
