@@ -186,6 +186,7 @@ async def onboard_project(
 
     # Auto-detect build config from GitHub repo
     build_config: Dict[str, Any] = {}
+    token = None
     try:
         from app.github import get_repo_installation_token
         token = await get_repo_installation_token(payload.github_owner, payload.github_repo)
@@ -204,10 +205,34 @@ async def onboard_project(
     flag_modified(project, "build_config")
     session.add(project)
 
+    # Detect default branch and initialize auto_remediation config
+    default_branch = 'main'
+    try:
+        from app.github import get_repo_default_branch
+        if token:
+            default_branch = await get_repo_default_branch(token, payload.github_owner, payload.github_repo)
+    except Exception as e:
+        logger.warning(f'[ONBOARD] Default branch detection failed: {e}')
+
+    branch_whitelist = ['main', 'master']
+    if default_branch and default_branch not in branch_whitelist:
+        branch_whitelist.insert(0, default_branch)
+    design_doc = dict(project.design_doc or {})
+    design_doc['_auto_remediation'] = {
+        'enabled': False,
+        'branch_whitelist': branch_whitelist,
+        'max_per_hour': 2,
+        'max_concurrent': 2,
+        'require_review': True,
+    }
+    project.design_doc = design_doc
+    flag_modified(project, 'design_doc')
+
     await session.commit()
     await session.refresh(project)
 
     return {
         "project_id": str(project.id),
         "build_config": project.build_config or {},
+        "default_branch": default_branch,
     }

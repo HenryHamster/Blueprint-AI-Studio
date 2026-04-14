@@ -3,7 +3,8 @@ import { SettingsAdvancedSection } from './SettingsAdvancedSection';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
-import type { BuildConfig } from '../types/project';
+import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
+import type { BuildConfig, AutoRemediationConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
@@ -98,6 +99,9 @@ interface SettingsDropdownProps {
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
+  // Auto-remediation config (project-scoped)
+  autoRemediationConfig: AutoRemediationConfig | null;
+  onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
 }
 
 
@@ -120,7 +124,7 @@ const ALL_PROMPT_SUFFIX_TYPES = [
   'investigate', 'rollup', 'strategic_review', 'design_doc_update',
 ] as const;
 
-type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config';
+type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -130,6 +134,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'accounts', label: 'Accounts', icon: User },
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
+  { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -222,6 +227,8 @@ export function SettingsDropdown({
   buildConfig,
   onUpdateBuildConfig,
   onDetectBuildConfig,
+  autoRemediationConfig,
+  onUpdateAutoRemediationConfig,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -939,6 +946,17 @@ export function SettingsDropdown({
     );
   }
 
+  function renderAutoRemediation() {
+    return (
+      <ProjectAutoRemediationSection
+        githubOwner={selectedProjectOwner}
+        githubRepo={selectedProjectRepo}
+        config={autoRemediationConfig}
+        onSave={onUpdateAutoRemediationConfig}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
@@ -948,6 +966,7 @@ export function SettingsDropdown({
       case 'accounts': return renderAccounts();
       case 'notifications': return renderNotifications();
       case 'build-config': return renderBuildConfig();
+      case 'auto-remediation': return renderAutoRemediation();
       case 'advanced': return renderAdvanced();
     }
   }

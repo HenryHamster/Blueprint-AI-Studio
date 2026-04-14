@@ -390,6 +390,8 @@ export default function App() {
         buildConfig={s.buildConfig}
         onUpdateBuildConfig={s.handleUpdateBuildConfig}
         onDetectBuildConfig={s.handleDetectBuildConfig}
+        autoRemediationConfig={s.autoRemediationConfig}
+        onUpdateAutoRemediationConfig={s.handleUpdateAutoRemediationConfig}
       />
 
       <div

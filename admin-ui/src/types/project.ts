@@ -50,6 +50,14 @@ export interface Project {
   build_config?: BuildConfig | null;
 }
 
+export interface AutoRemediationConfig {
+  enabled: boolean;
+  branch_whitelist: string[];
+  max_per_hour: number;
+  max_concurrent: number;
+  require_review: boolean;
+}
+
 export interface ProjectMemberEntry {
   id: string;
   user_id: string;

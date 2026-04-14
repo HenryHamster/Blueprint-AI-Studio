@@ -1,0 +1,200 @@
+import { useState, useEffect } from 'react';
+import { Plus, Trash2 } from 'lucide-react';
+import type { AutoRemediationConfig } from '../types/project';
+
+interface ProjectAutoRemediationSectionProps {
+  githubOwner: string | null;
+  githubRepo: string | null;
+  config: AutoRemediationConfig | null;
+  onSave: (config: AutoRemediationConfig) => Promise<void>;
+}
+
+const DEFAULT_CONFIG: AutoRemediationConfig = {
+  enabled: false,
+  branch_whitelist: ['main', 'master'],
+  max_per_hour: 2,
+  max_concurrent: 2,
+  require_review: true,
+};
+
+export function ProjectAutoRemediationSection({
+  githubOwner,
+  githubRepo,
+  config,
+  onSave,
+}: ProjectAutoRemediationSectionProps) {
+  const effective = config ?? DEFAULT_CONFIG;
+
+  const [enabled, setEnabled] = useState(effective.enabled);
+  const [branchWhitelist, setBranchWhitelist] = useState<string[]>(effective.branch_whitelist);
+  const [maxPerHour, setMaxPerHour] = useState(effective.max_per_hour);
+  const [maxConcurrent, setMaxConcurrent] = useState(effective.max_concurrent);
+  const [requireReview, setRequireReview] = useState(effective.require_review);
+  const [newBranch, setNewBranch] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const e = config ?? DEFAULT_CONFIG;
+    setEnabled(e.enabled);
+    setBranchWhitelist(e.branch_whitelist);
+    setMaxPerHour(e.max_per_hour);
+    setMaxConcurrent(e.max_concurrent);
+    setRequireReview(e.require_review);
+  }, [config]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await onSave({
+        enabled,
+        branch_whitelist: branchWhitelist,
+        max_per_hour: maxPerHour,
+        max_concurrent: maxConcurrent,
+        require_review: requireReview,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addBranch = () => {
+    const trimmed = newBranch.trim();
+    if (trimmed && !branchWhitelist.includes(trimmed)) {
+      setBranchWhitelist(prev => [...prev, trimmed]);
+    }
+    setNewBranch('');
+  };
+
+  const removeBranch = (branch: string) => {
+    setBranchWhitelist(prev => prev.filter(b => b !== branch));
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Repository info */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Repository</h3>
+        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center gap-2">
+          <span className="text-xs text-neutral-400">Repository</span>
+          <span className="text-xs text-neutral-100 font-mono ml-auto">
+            {githubOwner && githubRepo ? `${githubOwner}/${githubRepo}` : '—'}
+          </span>
+        </div>
+      </div>
+
+      {/* Enable/disable toggle */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Auto-Remediation</h3>
+        <p className="text-[11px] text-neutral-600 mb-3">
+          When enabled, Blueprint automatically opens fix PRs for CI failures on protected branches.
+        </p>
+        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
+          <span className="text-xs text-neutral-300">Enable auto-remediation</span>
+          <button
+            onClick={() => setEnabled(v => !v)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
+          </button>
+        </div>
+      </div>
+
+      {/* Branch whitelist */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Protected Branches</h3>
+        <p className="text-[11px] text-neutral-600 mb-3">
+          Auto-remediation only triggers for CI failures on these branches.
+        </p>
+        <div className="space-y-1.5 mb-2">
+          {branchWhitelist.map(branch => (
+            <div key={branch} className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded px-3 py-1.5">
+              <span className="text-xs font-mono text-neutral-200 flex-1">{branch}</span>
+              <button
+                onClick={() => removeBranch(branch)}
+                className="text-neutral-600 hover:text-red-400 transition-colors"
+                title="Remove branch"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={newBranch}
+            onChange={e => setNewBranch(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') addBranch(); }}
+            placeholder="branch-name"
+            className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          />
+          <button
+            onClick={addBranch}
+            disabled={!newBranch.trim()}
+            className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-40"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Add
+          </button>
+        </div>
+      </div>
+
+      {/* Rate limits */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Rate Limits</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs text-neutral-400 mb-1">Max per hour <span className="text-neutral-600">(1–10)</span></label>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={maxPerHour}
+              onChange={e => setMaxPerHour(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-neutral-400 mb-1">Max concurrent <span className="text-neutral-600">(1–5)</span></label>
+            <input
+              type="number"
+              min={1}
+              max={5}
+              value={maxConcurrent}
+              onChange={e => setMaxConcurrent(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Require review */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Review</h3>
+        <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-4 py-3 flex items-center justify-between">
+          <div>
+            <span className="text-xs text-neutral-300">Require human review before merge</span>
+            <p className="text-[11px] text-neutral-600 mt-0.5">Auto-remediation PRs will wait for approval before auto-merging.</p>
+          </div>
+          <button
+            onClick={() => setRequireReview(v => !v)}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-4 ${requireReview ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+          >
+            <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${requireReview ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
+          </button>
+        </div>
+      </div>
+
+      {/* Save button */}
+      <div className="flex justify-end pt-2">
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+        >
+          {saving ? 'Saving...' : 'Save Auto-Remediation Config'}
+        </button>
+      </div>
+    </div>
+  );
+}

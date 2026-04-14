@@ -5,7 +5,7 @@ import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig } from '../types/project';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -112,6 +112,9 @@ export interface HeaderBarProps {
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
+  // Auto-remediation config (project-scoped)
+  autoRemediationConfig: AutoRemediationConfig | null;
+  onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
 }
 
 
@@ -380,6 +383,8 @@ export function HeaderBar(props: HeaderBarProps) {
           buildConfig={props.buildConfig}
           onUpdateBuildConfig={props.onUpdateBuildConfig}
           onDetectBuildConfig={props.onDetectBuildConfig}
+          autoRemediationConfig={props.autoRemediationConfig}
+          onUpdateAutoRemediationConfig={props.onUpdateAutoRemediationConfig}
         />
 
         {/* More secondary buttons — desktop only */}

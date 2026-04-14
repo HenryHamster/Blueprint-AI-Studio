@@ -156,6 +156,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     assert task.context["auto_remediation"] is True
     assert task.context["ci_failure_sha"] == "deadbeef"
     assert task.context["ci_failure_branch"] == "main"
+    assert task.context["ci_failure_type"] == "test"
     assert task.first_payload["type"] == "create"
     assert task.first_payload["base_branch"] == "main"
     assert "deadbeef" in task.first_payload["prompt"]
@@ -449,6 +450,7 @@ def test_build_remediation_prompt_includes_context():
         head_sha="abc123def456",
         failed_checks=["CI / tests", "CI / lint"],
         error_summary="AssertionError: expected True",
+        failure_type="test",
     )
     assert "main" in prompt
     assert "abc123def456" in prompt
@@ -456,6 +458,8 @@ def test_build_remediation_prompt_includes_context():
     assert "CI / lint" in prompt
     assert "AssertionError" in prompt
     assert "fix branch" in prompt.lower() or "Fix" in prompt
+    assert "test" in prompt
+    assert "Failure classification" in prompt
 
 
 def test_build_remediation_prompt_empty_checks():
@@ -465,6 +469,8 @@ def test_build_remediation_prompt_empty_checks():
         head_sha="deadbeef",
         failed_checks=[],
         error_summary="",
+        failure_type="unknown",
     )
     assert "master" in prompt
     assert "not available" in prompt.lower() or "no error" in prompt.lower()
+    assert "unknown" in prompt

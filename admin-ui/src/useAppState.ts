@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project } from './types/project';
+import type { Project, AutoRemediationConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -880,6 +880,40 @@ export function useAppState() {
     }
   };
 
+  // ── Auto-remediation config (project-scoped) ────────────────────────────
+  const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setAutoRemediationConfig(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-remediation`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data?.config) setAutoRemediationConfig(data.config); })
+      .catch(() => {});
+  }, [selectedProjectId]);
+
+  const handleUpdateAutoRemediationConfig = async (config: AutoRemediationConfig) => {
+    if (!selectedProjectId) return;
+    const prev = autoRemediationConfig;
+    setAutoRemediationConfig(config);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-remediation`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify(config),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAutoRemediationConfig(data.config);
+      addToast('Auto-remediation config saved', 'success');
+    } catch {
+      setAutoRemediationConfig(prev);
+      addToast('Failed to save auto-remediation config', 'error');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -939,6 +973,7 @@ export function useAppState() {
     healthCheckUrls, updateHealthCheckUrls,
     notificationConfig, updateNotificationConfig,
     buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
+    autoRemediationConfig, handleUpdateAutoRemediationConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,

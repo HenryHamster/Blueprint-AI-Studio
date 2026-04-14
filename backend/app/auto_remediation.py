@@ -133,6 +133,7 @@ async def _handle_main_branch_ci_failure_inner(
         head_sha=head_sha,
         failed_checks=failed_checks,
         error_summary=error_summary,
+        failure_type=failure_type,
     )
 
     task = Task(
@@ -150,6 +151,7 @@ async def _handle_main_branch_ci_failure_inner(
             "ci_failure_sha": head_sha,
             "ci_failure_branch": head_branch,
             "ci_failure_checks": failed_checks,
+            "ci_failure_type": failure_type,
         },
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REMEDIATION",
@@ -245,19 +247,31 @@ def _build_remediation_prompt(
     head_sha: str,
     failed_checks: list[str],
     error_summary: str,
+    failure_type: str = "unknown",
 ) -> str:
     """Build the agent prompt for a CI auto-remediation task."""
     checks_text = "\n".join(f"  - {name}" for name in failed_checks) if failed_checks else "  (check names not available)"
     # Truncate error summary for prompt to avoid excessive token usage
     summary_text = error_summary[:2000] if error_summary else "(no error logs available)"
 
+    type_guidance_map = {
+        "test": "Focus on test assertions, fixtures, and test setup — the production code may be fine but tests may need updating to match changed behavior.",
+        "build": "Check imports, missing dependencies, syntax errors, and module resolution — this is likely a compilation or import failure.",
+        "lint": "Check style rules, formatting, and linting configuration — run the project's linter locally to identify all violations.",
+        "mixed": "Multiple failure categories detected — address build/import errors first, then test failures, then lint issues.",
+        "unknown": "Diagnose the failure type from the error output before applying a fix.",
+    }
+    type_guidance = type_guidance_map.get(failure_type, type_guidance_map["unknown"])
+
     return (
         f"CI is failing on the `{head_branch}` branch at commit {head_sha}.\n\n"
+        f"Failure classification: {failure_type} (test failures, build errors, lint issues, or mixed)\n\n"
         f"Failed checks:\n{checks_text}\n\n"
         f"Error output (truncated):\n```\n{summary_text}\n```\n\n"
         f"Instructions:\n"
         f"1. Create a fix branch off `{head_branch}`.\n"
         f"2. Diagnose the root cause from the error context above.\n"
+        f"   Guidance: {type_guidance}\n"
         f"3. Fix the issue — the fix should be minimal and targeted.\n"
         f"4. Run the project's test suite before committing to verify the fix.\n"
         f"5. Open a PR targeting `{head_branch}`.\n"
