@@ -16,6 +16,7 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
+import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -102,6 +103,9 @@ export default function App() {
     document.addEventListener('keydown', handleSearchShortcut);
     return () => document.removeEventListener('keydown', handleSearchShortcut);
   }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
+
+  // New project modal
+  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
 
   // Project members panel
   const [showProjectMembers] = useState(false);
@@ -414,6 +418,8 @@ export default function App() {
         tasks={s.tasks}
         selectedProjectId={s.selectedProjectId}
         onSelectProject={s.setSelectedProjectId}
+        userRole={s.userRole}
+        onNewProject={() => setShowNewProjectModal(true)}
       />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (
@@ -711,6 +717,16 @@ export default function App() {
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
+        />
+      )}
+
+      {showNewProjectModal && (
+        <NewProjectModal
+          onClose={() => setShowNewProjectModal(false)}
+          onSuccess={() => {
+            s.fetchProjects();
+            setShowNewProjectModal(false);
+          }}
         />
       )}
 

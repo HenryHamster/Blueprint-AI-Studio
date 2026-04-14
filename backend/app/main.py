@@ -45,6 +45,7 @@ from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.admin_analytics import router as admin_analytics_router
 from app.routers.agent_status import router as agent_status_router
+from app.routers.admin_onboard import router as admin_onboard_router
 from app.security import scan_pr_for_injection
 from app.github import (
     validate_fine_grained_pat,
@@ -741,6 +742,7 @@ app.include_router(admin_users_router)
 app.include_router(admin_notifications_router)
 app.include_router(admin_analytics_router)
 app.include_router(agent_status_router)
+app.include_router(admin_onboard_router)
 
 def _get_zone_health_summary() -> dict:
     """Get zone health summary from compute module, with fallback if not in GCP mode."""

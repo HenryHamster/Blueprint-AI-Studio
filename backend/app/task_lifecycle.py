@@ -527,6 +527,7 @@ async def _process_post_commit(
                     logger.warning(f"[REVIEW PIPELINE] Failed to post review comment: {e}", exc_info=True)
 
                 action_taken = False
+                head_sha = ""
                 if verdict == "APPROVE":
                     head_sha = ""
                     try:

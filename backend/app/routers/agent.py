@@ -525,6 +525,12 @@ async def claim_task(
         if playbook_entries:
             response["playbook"] = playbook_entries
 
+    # Inject build_config so the agent knows how to lint/test/build
+    if project_for_playbook and project_for_playbook.build_config:
+        response["build_config"] = project_for_playbook.build_config
+    else:
+        response["build_config"] = {}
+
     return response
 
 @router.post("/artifacts/upload-url")

@@ -5,8 +5,9 @@ import {
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop,
 } from '../index.js';
+import type { BuildConfig } from '../index.js';
 import {
-  TASK_TYPE_HINTS, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
+  getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
 } from '../prompt.js';
@@ -47,6 +48,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     includeTaskTypeHints = true,
   } = opts;
 
+  const buildConfig = (task.build_config || {}) as BuildConfig;
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
   const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
@@ -63,8 +65,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const taskTypeKey = strVal(payload.type);
-  const taskTypeHint = includeTaskTypeHints && TASK_TYPE_HINTS[taskTypeKey]
-    ? `\n\n${TASK_TYPE_HINTS[taskTypeKey].replace(/\{\{BASE_BRANCH\}\}/g, baseBranch)}`
+  const taskTypeHintsMap = getTaskTypeHints(buildConfig);
+  const taskTypeHint = includeTaskTypeHints && taskTypeHintsMap[taskTypeKey]
+    ? `\n\n${taskTypeHintsMap[taskTypeKey].replace(/\{\{BASE_BRANCH\}\}/g, baseBranch)}`
     : '';
 
   const claudeMd = readClaudeMd();
@@ -72,7 +75,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const playbookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
   const finalPrompt = claudeMdPrefix + playbookSection + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
-  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef);
+  const { workBranch, shortId } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
@@ -103,7 +106,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
     if (runLintFix) {
-      await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort);
+      await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
     }
 
     let testFailuresDetected = false;
@@ -187,7 +190,8 @@ export async function handleCreate(
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-  const relatedTestContext = discoverRelatedTests(ws, relatedFiles);
+  const createBuildConfig = (task.build_config || {}) as BuildConfig;
+  const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
