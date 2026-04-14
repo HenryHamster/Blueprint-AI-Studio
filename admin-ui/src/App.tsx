@@ -31,6 +31,9 @@ import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 // StatusBar removed — redundant connection info
 // HealthOverviewCard removed — redundant with CatchUp panel
+import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
+import { VersionMismatchBanner } from './components/VersionMismatchBanner';
+import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -168,20 +171,11 @@ export default function App() {
     }
   }, [showProjectMembers, s.selectedProjectId, s.fetchProjectMembers]);
 
-  // Backend version mismatch detection
-  const [versionMismatch, setVersionMismatch] = useState(false);
-  useEffect(() => {
-    const expectedSha = import.meta.env.VITE_EXPECTED_BACKEND_SHA;
-    if (!expectedSha) return; // Dev mode or not configured
-    fetch('/api/version')
-      .then(r => r.json())
-      .then(data => {
-        if (data.sha && data.sha !== expectedSha) {
-          setVersionMismatch(true);
-        }
-      })
-      .catch(() => {}); // Silently ignore if backend unreachable
-  }, []);
+  const handleViewTask = (taskId: string) => {
+    const task = s.tasks.find(t => t.id === taskId);
+    if (task) s.handleViewLogs(task);
+    else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
+  };
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
@@ -234,10 +228,7 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
 
-  const selectedTasks = useMemo(
-    () => s.tasks.filter(t => s.selectedTaskIds.has(t.id)),
-    [s.tasks, s.selectedTaskIds],
-  );
+  const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
   const failedTasks = useMemo(() => selectedTasks.filter(t => t.status === 'FAILED'), [selectedTasks]);
   const terminalTasks = useMemo(() => selectedTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
@@ -458,6 +449,16 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
+      <OrchestratorHealthBar
+        health={s.orchestratorHealth}
+        detailedHealth={s.detailedHealth}
+        apiHealthy={s.apiHealthy}
+        wsConnected={s.wsConnected}
+        lastFetchTime={s.lastFetchTime}
+        tasks={s.tasks}
+        pipelineThrottle={s.pipelineThrottle}
+      />
+
       <ProjectDashboard
         projects={s.projects}
         tasks={s.tasks}
@@ -476,13 +477,7 @@ export default function App() {
         />
       )}
 
-      {versionMismatch && (
-        <div className="mx-4 mb-2 p-3 bg-yellow-900/50 border border-yellow-700 rounded-lg text-yellow-200 text-sm flex items-center gap-2">
-          <AlertCircle size={16} />
-          <span>Backend version mismatch — some features may not work as expected. Try refreshing the page.</span>
-          <button onClick={() => setVersionMismatch(false)} className="ml-auto text-yellow-400 hover:text-yellow-200">&times;</button>
-        </div>
-      )}
+      <VersionMismatchBanner />
 
       <AlertsBanner
         alerts={[...zoneHealthAlerts, ...s.alerts]}
@@ -494,11 +489,7 @@ export default function App() {
           setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
           s.dismissAllAlerts();
         }}
-        onViewTask={(taskId) => {
-          const task = s.tasks.find(t => t.id === taskId);
-          if (task) s.handleViewLogs(task);
-          else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
-        }}
+        onViewTask={handleViewTask}
       />
 
       {!s.showArchive && !s.showUserManagement && (
@@ -519,6 +510,12 @@ export default function App() {
           wsRef={s.wsRef}
         />
       )}
+
+      <DiagnosticsPanel
+        diagnostics={s.diagnostics}
+        onViewTask={handleViewTask}
+      />
+
 
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">

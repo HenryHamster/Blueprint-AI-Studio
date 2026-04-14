@@ -373,6 +373,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     debug: 'border-l-rose-400',
     smoketest: 'border-l-lime-400',
     rollup: 'border-l-violet-400',
+    perf: 'border-l-pink-400',
+    strategic_review: 'border-l-emerald-400',
+    design_doc_update: 'border-l-sky-400',
   };
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
