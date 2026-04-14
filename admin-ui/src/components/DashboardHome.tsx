@@ -46,6 +46,16 @@ interface RecentCompletion {
   duration_seconds?: number | null;
 }
 
+interface LatestCycle {
+  cycle_id: string;
+  started_at: string;
+  completed_at: string | null;
+  outcome: string;
+  directions_created: number;
+  directions_retired: number;
+  vision_updated: boolean;
+}
+
 interface DigestData {
   failed_count: number;
   success_rate?: number | null;
@@ -56,6 +66,8 @@ interface DigestData {
   overall_product_ratio?: number | null;
   failure_groups?: FailureGroup[];
   recent_completions?: RecentCompletion[];
+  narrative_summary?: string | null;
+  latest_cycle?: LatestCycle | null;
 }
 
 interface SparkPoint {
@@ -186,6 +198,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
 
   return (
     <div className="flex-1 overflow-auto space-y-4">
+      {/* System Status */}
+      <SystemStatusCard digest={digest} loading={loading} />
+
       {/* Main grid: 2-col on large screens */}
       <div className="lg:grid lg:grid-cols-3 lg:gap-4 space-y-4 lg:space-y-0">
         <div className="lg:col-span-2 space-y-4">
@@ -324,6 +339,45 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------- system status ----------
+
+function SystemStatusCard({ digest, loading }: { digest: DigestData | null; loading: boolean }) {
+  const cycle = digest?.latest_cycle ?? null;
+  const hasContent = digest?.narrative_summary || cycle;
+
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Status</h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+        {loading ? (
+          <Skeleton className="h-16 w-full" />
+        ) : !hasContent ? (
+          <p className="text-neutral-500 text-xs">No recent activity</p>
+        ) : (
+          <>
+            {digest?.narrative_summary && (
+              <p className="text-sm text-neutral-300 leading-relaxed">{digest.narrative_summary}</p>
+            )}
+            {cycle && (
+              <div className="text-[10px] text-neutral-500 mt-2 flex items-center gap-2">
+                {cycle.outcome === 'completed' ? (
+                  <CheckCircle className="w-3 h-3 text-emerald-400 shrink-0" />
+                ) : (
+                  <AlertTriangle className="w-3 h-3 text-red-400 shrink-0" />
+                )}
+                <span>
+                  Last cycle: {timeAgo(cycle.completed_at ?? cycle.started_at)} &mdash;{' '}
+                  {cycle.directions_created} created, {cycle.directions_retired} retired
+                </span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 

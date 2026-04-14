@@ -944,6 +944,25 @@ async def get_digest(
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = overall_type_distribution.get(ttype, 0) + cnt
 
+    # --- Latest strategic cycle ---
+    latest_cycle = None
+    if project_id:
+        _proj = await session.get(Project, project_id)
+        if _proj:
+            cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
+            completed_cycles = [c for c in cycle_history if c.get("outcome") not in (None, "in_progress")]
+            if completed_cycles:
+                last = max(completed_cycles, key=lambda c: c.get("started_at") or "")
+                latest_cycle = {
+                    "cycle_id": last.get("cycle_id"),
+                    "started_at": last.get("started_at"),
+                    "completed_at": last.get("phase2_completed_at"),
+                    "outcome": last.get("outcome"),
+                    "directions_created": last.get("directions_created", 0),
+                    "directions_retired": last.get("directions_retired", 0),
+                    "vision_updated": last.get("vision_updated", False),
+                }
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -973,6 +992,7 @@ async def get_digest(
         "success_rate_delta": success_rate_delta,
         "trend": trend,
         "trend_history": trend_history,
+        "latest_cycle": latest_cycle,
     }
 
 
