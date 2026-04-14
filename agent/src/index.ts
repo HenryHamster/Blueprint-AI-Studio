@@ -83,7 +83,7 @@ async function tryRefreshToken(): Promise<boolean> {
   return false;
 }
 
-export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = API_MAX_RETRIES) {
+export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = API_MAX_RETRIES, timeoutMs = API_TIMEOUT) {
   // Cap logs field to avoid 422 from backend's max_length=500000 validation.
   // A 422 is a 4xx = no retry = agent dies silently.
   if (body.logs && typeof body.logs === 'string' && body.logs.length > LOGS_MAX_LENGTH) {
@@ -93,7 +93,7 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
+      const timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
       const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
         method: 'POST', headers: apiHeaders, body: JSON.stringify(body), signal: controller.signal,
       });
@@ -557,7 +557,7 @@ export async function pushAndCreatePR(
     const prRes = await apiPost('/api/agent/github/pull-requests', {
       task_id: taskId, owner, repo, title,
       head: workBranch, base: baseBranch, body,
-    }) as { data?: { html_url?: string } };
+    }, API_MAX_RETRIES, 90_000) as { data?: { html_url?: string } };
     prUrl = prRes.data?.html_url ?? '';
     sendLog(ws, `PR created: ${prUrl}\n`);
   } catch (e) {

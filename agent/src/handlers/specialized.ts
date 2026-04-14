@@ -250,7 +250,7 @@ CRITICAL RULES:
       const prRes = await apiPost('/api/agent/github/pull-requests', {
         task_id: taskId, owner, repo, title: `migrate: ${taskTitle}`,
         head: workBranch, base: baseBranch, body: prBody,
-      }) as { data?: { html_url?: string } };
+      }, undefined, 90_000) as { data?: { html_url?: string } };
       prUrl = prRes.data?.html_url ?? '';
       sendLog(ws, `PR created: ${prUrl}\n`);
     } catch (e) { sendLog(ws, `Failed to create PR: ${String(e)}\n`); }
