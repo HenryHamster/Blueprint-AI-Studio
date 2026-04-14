@@ -176,9 +176,41 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
 
+  // Collapsed resolved + "show older" for mobile perf
+  const [showResolved, setShowResolved] = useState(false);
+  const INITIAL_VISIBLE = 20;
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
+
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
+
+  // Sort ALL messages chronologically (oldest first for chat layout)
+  const sortedMessages = [...messages].sort((a, b) => {
+    const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+    const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+    return ta - tb;
+  });
+
+  const openMessages = messages.filter(m => m.status === 'open');
+  const resolvedMessages = messages.filter(m => m.status === 'resolved');
+  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
+
+  // Show all open + last few resolved for context; toggle to show all resolved
+  const RECENT_RESOLVED = 5;
+  const sortedResolved = [...resolvedMessages].sort((a, b) => {
+    const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+    const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+    return ta - tb;
+  });
+  const recentResolvedIds = new Set(
+    showResolved ? resolvedMessages.map(m => m.id)
+      : sortedResolved.slice(-RECENT_RESOLVED).map(m => m.id)
+  );
+  const hiddenResolvedCount = showResolved ? 0 : Math.max(0, resolvedMessages.length - RECENT_RESOLVED);
+  const filteredMessages = sortedMessages.filter(m => m.status === 'open' || recentResolvedIds.has(m.id));
+  const hiddenOlderCount = Math.max(0, filteredMessages.length - visibleCount);
+  const visibleMessages = hiddenOlderCount > 0 ? filteredMessages.slice(hiddenOlderCount) : filteredMessages;
 
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
@@ -188,7 +220,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const msgs: ProjectMessage[] = data.messages ?? [];
-      setMessages(msgs);
+      // Only update state if messages actually changed — prevents scroll jumps from polling
+      setMessages(prev => {
+        if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
+        return msgs;
+      });
       const openCount = msgs.filter(m => m.status === 'open' && (m.from_type || '').toLowerCase() !== 'user').length;
       onMessageCountChange?.(openCount);
     } catch {
@@ -204,20 +240,26 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return () => clearInterval(interval);
   }, [fetchMessages]);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom only on initial load or when user sends a new message
+  // (new message = count increased AND user is near the bottom)
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = messages.length;
-    if (currentCount > prevMessageCountRef.current) {
-      // New message — scroll to bottom if near bottom already
+    const currentCount = visibleMessages.length;
+    const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
+    if (isInitialLoad) {
+      // First load — jump to bottom instantly
+      requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
+    } else if (currentCount > prevMessageCountRef.current) {
+      // New message arrived — only scroll if user is already near bottom
       const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      if (nearBottom || prevMessageCountRef.current === 0) {
-        requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: prevMessageCountRef.current === 0 ? 'instant' : 'smooth' }));
+      if (nearBottom) {
+        requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
       }
     }
+    // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [messages]);
+  }, [visibleMessages]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -334,23 +376,30 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     }
   }
 
+  const KEEP_RESOLVED = 20;
+
   async function handleBulkDeleteResolved() {
-    const resolved = messages.filter(m => m.status === 'resolved');
-    if (resolved.length === 0) return;
+    // Keep the 20 most recent resolved, delete the rest
+    const sorted = [...resolvedMessages].sort((a, b) => {
+      const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+      const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+      return ta - tb;
+    });
+    const toDelete = sorted.slice(0, -KEEP_RESOLVED);
+    if (toDelete.length === 0) {
+      addToast(`Only ${sorted.length} resolved — nothing to clear`, 'info');
+      return;
+    }
     let count = 0;
-    for (const msg of resolved) {
+    for (const msg of toDelete) {
       try {
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, { method: 'DELETE' });
         if (res.ok) count++;
       } catch { /* skip */ }
     }
-    if (count > 0) addToast(`Cleared ${count} resolved message${count > 1 ? 's' : ''}`, 'success');
+    if (count > 0) addToast(`Cleared ${count} old resolved (kept ${Math.min(sorted.length, KEEP_RESOLVED)} recent)`, 'success');
     await fetchMessages();
   }
-
-  const openMessages = messages.filter(m => m.status === 'open');
-  const resolvedMessages = messages.filter(m => m.status === 'resolved');
-  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
 
   function toggleSelect(msgId: string) {
     setSelectedIds(prev => {
@@ -374,13 +423,6 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     setSelectMode(false);
     if (count > 0) addToast(`${count} direction${count > 1 ? 's' : ''} created`, 'success');
   }
-
-  // Sort ALL messages chronologically (oldest first for chat layout)
-  const sortedMessages = [...messages].sort((a, b) => {
-    const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
-    const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
-    return ta - tb;
-  });
 
   function renderBubble(msg: ProjectMessage, faded = false) {
     const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
@@ -553,17 +595,45 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           </div>
         ) : (
           <>
-            {/* All messages in chronological order — resolved ones are faded */}
-            {sortedMessages.map(msg => renderBubble(msg, msg.status === 'resolved'))}
+            {/* Load older messages button */}
+            {hiddenOlderCount > 0 && (
+              <div className="flex justify-center pb-2">
+                <button
+                  onClick={() => setVisibleCount(c => c + 20)}
+                  className="text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-800/50 border border-neutral-700/50 px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  Load {Math.min(hiddenOlderCount, 20)} older messages ({hiddenOlderCount} hidden)
+                </button>
+              </div>
+            )}
 
-            {/* Clear resolved — only when there are resolved messages */}
-            {resolvedMessages.length > 0 && (
-              <div className="flex justify-center pt-1">
+            {/* Visible messages — resolved ones are faded */}
+            {visibleMessages.map(msg => renderBubble(msg, msg.status === 'resolved'))}
+
+            {/* Resolved toggle + clear */}
+            {hiddenResolvedCount > 0 && (
+              <div className="flex justify-center gap-3 pt-1">
+                <button
+                  onClick={() => setShowResolved(true)}
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                >
+                  Show {hiddenResolvedCount} older resolved
+                </button>
+              </div>
+            )}
+            {showResolved && resolvedMessages.length > 0 && (
+              <div className="flex justify-center gap-3 pt-1">
+                <button
+                  onClick={() => setShowResolved(false)}
+                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
+                >
+                  Hide older resolved
+                </button>
                 <button
                   onClick={handleBulkDeleteResolved}
                   className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1"
                 >
-                  Clear {resolvedMessages.length} resolved
+                  Clear all resolved
                 </button>
               </div>
             )}

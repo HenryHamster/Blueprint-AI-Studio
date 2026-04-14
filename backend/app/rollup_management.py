@@ -58,9 +58,13 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
             try:
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
-            except HTTPException as auth_err:
-                if auth_err.status_code != 401:
+            except HTTPException as api_err:
+                if api_err.status_code not in (401, 500, 502, 503):
                     raise
+                if api_err.status_code != 401:
+                    # Transient GitHub API failure — can't verify now, will retry next cycle
+                    logger.warning(f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping")
+                    return False
                 # Token expired — invalidate cache and retry once with a fresh token
                 from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
                 invalidate_github_token_cache(str(task.project_id))

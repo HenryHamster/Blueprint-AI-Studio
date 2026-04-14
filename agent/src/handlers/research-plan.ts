@@ -6,6 +6,7 @@ import {
   apiPost, persistAndPostStatus, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { extractJsonObject, extractJsonArray } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers,
@@ -180,8 +181,8 @@ Rules:
     if (lastResultText && lastResultText.includes('"subtasks"')) {
       logs = sanitize(lastResultText);
     } else {
-      const jsonMatch = allOutput.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
-      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+      const planObj = extractJsonObject(allOutput, 'subtasks');
+      logs = sanitize(planObj ? JSON.stringify(planObj) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 
@@ -192,8 +193,7 @@ Rules:
       try {
         planData = JSON.parse(logs) as Record<string, unknown>;
       } catch {
-        const match = logs.match(/\{[\s\S]*"subtasks"\s*:\s*\[[\s\S]*\]\s*\}/);
-        if (match) planData = JSON.parse(match[0]) as Record<string, unknown>;
+        planData = extractJsonObject(logs, 'subtasks');
       }
 
       const subtasks = planData?.subtasks;
@@ -874,8 +874,8 @@ ${analysisText.slice(0, 50_000)}
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
     let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
     if (!logs) {
-      const jsonMatch = allOutput.match(/\{[\s\S]*?"vision"[\s\S]*?"direction_operations"[\s\S]*?\}\s*$/);
-      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+      const stratObj = extractJsonObject(allOutput, 'vision', 'direction_operations');
+      logs = sanitize(stratObj ? JSON.stringify(stratObj) : (lastResultText || allOutput.slice(-50_000)));
     }
 
     try {
@@ -1088,8 +1088,8 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     if (lastResultText && lastResultText.includes('"prompt"')) {
       logs = sanitize(lastResultText);
     } else {
-      const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"prompt"[\s\S]*\}\s*\]/);
-      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArray(allOutput, 'prompt');
+      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 

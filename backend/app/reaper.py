@@ -425,6 +425,36 @@ async def reaper_service():
                             except Exception as e:
                                 logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
+                # Step 3: Sweep EVALUATING parents with stale unmerged children.
+                # When the initial review spawn after a child completes fails silently,
+                # no event re-triggers _check_and_trigger_rollup.  This sweep catches
+                # those stuck parents and lets the stale-PR recovery path respawn reviews.
+                try:
+                    stale_cutoff = now - timedelta(minutes=15)
+                    evaluating_parents = (await session.execute(
+                        select(Task).where(
+                            Task.status == TaskStatus.EVALUATING,
+                            Task.updated_at < stale_cutoff,
+                        )
+                    )).scalars().all()
+                    for parent in evaluating_parents:
+                        # Find a completed child to use as the trigger for _check_and_trigger_rollup
+                        child = (await session.execute(
+                            select(Task).where(
+                                Task.parent_task_id == parent.id,
+                                Task.status == TaskStatus.COMPLETED,
+                            ).limit(1)
+                        )).scalars().first()
+                        if child:
+                            try:
+                                await _check_and_trigger_rollup(child, session)
+                            except Exception as e:
+                                logger.error(f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}", exc_info=True)
+                    if evaluating_parents:
+                        logger.info(f"[REAPER] Swept {len(evaluating_parents)} stale EVALUATING parents")
+                except Exception as e:
+                    logger.error(f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True)
+
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break

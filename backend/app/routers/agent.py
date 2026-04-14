@@ -729,13 +729,10 @@ async def spawn_subtask(
     if spawn_depth >= MAX_SPAWN_DEPTH:
         raise HTTPException(status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")
 
-    # When a plan agent spawns children it immediately posts a status update that triggers
-    # backend enrichment (_handle_plan_completion).  There is a window between task creation
-    # here and the enrichment commit where a worker could pick up a child with the wrong
-    # base_branch (parent's branch instead of the plan branch).  Hold children with
-    # requires_approval=True so the orchestrator ignores them until enrichment sets the
-    # correct value based on child_risk.
-    is_plan_spawn = bool((req.context or {}).get("agent_spawned"))
+    # Plan-spawned children are created by _handle_plan_completion AFTER branch creation,
+    # so they get the correct base_branch. Don't pre-spawn them here.
+    if (req.context or {}).get("agent_spawned"):
+        return {"message": "Plan children deferred to post-branch-creation", "task_ids": [], "requires_approval": False}
 
     new_tasks = []
     for payload in req.payloads:
@@ -758,9 +755,7 @@ async def spawn_subtask(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",
-            # Plan-spawned children are held (requires_approval=True) until _handle_plan_completion
-            # enriches them with the correct base_branch and sets the real approval flag.
-            requires_approval=True if is_plan_spawn else req.requires_approval,
+            requires_approval=req.requires_approval,
             parent_task_id=parent_task.id,
             **({"priority": req.priority} if req.priority is not None else {}),
         )

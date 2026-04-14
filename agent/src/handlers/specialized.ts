@@ -6,6 +6,7 @@ import {
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { extractJsonArray } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook,
@@ -92,8 +93,8 @@ Rules:
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
     } else {
-      const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"severity"[\s\S]*\}\s*\]/);
-      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArray(allOutput, 'severity');
+      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 
@@ -571,8 +572,8 @@ Rules:
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
     } else {
-      const jsonMatch = allOutput.match(/\[\s*\{[\s\S]*"severity"[\s\S]*\}\s*\]/);
-      logs = sanitize(jsonMatch ? jsonMatch[0] : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArray(allOutput, 'severity');
+      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 

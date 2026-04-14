@@ -529,17 +529,30 @@ async def _process_post_commit(
                     except (json.JSONDecodeError, TypeError):
                         logger.error(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
 
-                # Method 2: Parse JSON from log output
+                # Method 2: Parse JSON from log output (string-aware bracket counting)
                 if not verdict_parsed:
                     try:
-                        # Find all JSON objects containing "verdict" key (handles any key order)
                         for m in re.finditer(r'\{[^{}]*"verdict"', verdict_text):
                             start = m.start()
                             depth = 0
+                            in_string = False
+                            escape_next = False
                             for i in range(start, len(verdict_text)):
-                                if verdict_text[i] == '{':
+                                c = verdict_text[i]
+                                if escape_next:
+                                    escape_next = False
+                                    continue
+                                if c == '\\' and in_string:
+                                    escape_next = True
+                                    continue
+                                if c == '"' and not escape_next:
+                                    in_string = not in_string
+                                    continue
+                                if in_string:
+                                    continue
+                                if c == '{':
                                     depth += 1
-                                elif verdict_text[i] == '}':
+                                elif c == '}':
                                     depth -= 1
                                     if depth == 0:
                                         try:

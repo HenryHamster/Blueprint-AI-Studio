@@ -43,11 +43,13 @@ async def _post_cycle_summary_message(
         f"{dirs_created} direction(s) created, {dirs_retired} retired, "
         f"{active_dirs} active total."
     )
-    # Append brief direction titles for context (cap at 800 chars total)
+    # Append brief direction titles for context
+    from app.strategic_constants import CYCLE_SUMMARY_MAX  # noqa: PLC0415
     if dirs_created > 0 or dirs_retired > 0:
         lines = []
         for d in (project.directions or []):
-            title = (d.get("text") or "")[:80]
+            raw_title = (d.get("text") or "")
+            title = raw_title[:120] + ("…" if len(raw_title) > 120 else "")
             if d.get("status") == "active" and dirs_created > 0:
                 notes = d.get("notes") or []
                 if any(cycle_id and cycle_id in (n.get("text") or "") for n in notes):
@@ -58,7 +60,7 @@ async def _post_cycle_summary_message(
                     lines.append(f"  - {title}")
         if lines:
             detail = "\n" + "\n".join(lines[:10])
-            if len(content) + len(detail) <= 800:
+            if len(content) + len(detail) <= CYCLE_SUMMARY_MAX:
                 content += detail
 
     summary_msg = ProjectMessage(
@@ -66,7 +68,7 @@ async def _post_cycle_summary_message(
         message_type=MessageType.NOTE,
         from_type="strategic",
         from_task_id=task.id,
-        content=content[:800],
+        content=content[:CYCLE_SUMMARY_MAX],
         context={
             "event_type": "cycle_summary",
             "cycle_id": cycle_id,

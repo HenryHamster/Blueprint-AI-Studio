@@ -51,19 +51,36 @@ TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 # ---------------------------------------------------------------------------
 
 def _parse_plan_output(text: str) -> Optional[Dict[str, Any]]:
-    """Extract structured plan JSON from agent output text."""
+    """Extract structured plan JSON from agent output text.
+
+    Uses string-aware bracket counting so braces inside JSON string values
+    (e.g. code snippets in prompts) don't break extraction.
+    """
+    text = text[:500_000]
     try:
-        # Find the start of the JSON block containing "subtasks"
         match = re.search(r'\{\s*"subtasks"\s*:\s*\[', text)
         if not match:
             return None
         start = match.start()
-        # Walk forward to find the matching closing brace using bracket counting
         depth = 0
+        in_string = False
+        escape_next = False
         for i in range(start, len(text)):
-            if text[i] == '{':
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == '\\' and in_string:
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '{':
                 depth += 1
-            elif text[i] == '}':
+            elif c == '}':
                 depth -= 1
                 if depth == 0:
                     candidate = text[start:i + 1]
@@ -282,108 +299,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
     session.add(task)
 
-    # Check if agent already spawned children via /api/agent/spawn
-    existing_children_result = await session.execute(
-        select(Task).where(Task.parent_task_id == task.id)
-    )
-    all_children = existing_children_result.scalars().all()
-
-    # Use spawned_task_ids from plan_data (embedded by agent) to preserve original spawn order.
-    # Relying on created_at is non-deterministic: tasks spawned in a single batch share the same
-    # timestamp and PostgreSQL returns ties in heap order, which may not match subtasks order.
-    spawned_task_ids = plan_data.get("spawned_task_ids", [])
-    if spawned_task_ids and all_children:
-        children_by_id = {str(c.id): c for c in all_children}
-        existing_children = [children_by_id[sid] for sid in spawned_task_ids if sid in children_by_id]
-    else:
-        existing_children = list(all_children)
-
-    if existing_children:
-        # Agent already spawned subtasks — enrich with branch info, dependencies, and approval
-        logger.info(f"[PLAN] Agent already spawned {len(existing_children)} children, enriching...")
-        parent_payload = task.first_payload
-        model = parent_payload.get('model')
-        effort = parent_payload.get('effort')
-        create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
-        parent_direction_id = (task.context or {}).get('direction_id')
-        parent_research_task_id = (task.context or {}).get('research_task_id')
-
-        for i, child in enumerate(existing_children):
-            child_payload = child.first_payload
-            child_risk = child_payload.get('risk', 'low')
-            related_files = child_payload.get('related_files', [])
-
-            # Enrich prompt with related files if not already present
-            prompt_text = child_payload.get('prompt', '')
-            if related_files and 'Key files to review or modify' not in prompt_text:
-                child_payload['prompt'] = prompt_text + "\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)
-
-            # Update base_branch to plan branch and inherit model/effort
-            child_payload['base_branch'] = plan_branch
-            if model and not child_payload.get('model'):
-                child_payload['model'] = model
-            if effort and not child_payload.get('effort'):
-                child_payload['effort'] = effort
-            if create_suffix and not child_payload.get('prompt_suffix'):
-                child_payload['prompt_suffix'] = create_suffix
-
-            # Normalize type
-            _allowed_types = {'create', 'refactor', 'migrate', 'qa'}
-            raw_type = child_payload.get('type', 'create')
-            child_payload['type'] = raw_type if raw_type in _allowed_types else 'create'
-
-            child.payloads = [validate_internal_payload(child_payload, f"plan_enrichment:child_{i}")]
-            child.requires_approval = False  # high-risk children execute freely; approval gates the final rollup merge
-            child_approval_reason = child_payload.get('approval_reason') if child_risk == 'high' else None
-            existing_ctx = child.context or {}
-            child.context = {
-                **existing_ctx,
-                "plan_branch": plan_branch,
-                "parent_base": parent_base,
-                "scope": child_payload.get('scope', 'small'),
-                "risk": child_risk,
-                "related_files": related_files,
-                **({"approval_reason": child_approval_reason} if child_approval_reason else {}),
-                # Inherit direction_id from plan parent if present and not overridden by finding
-                **({"direction_id": parent_direction_id} if parent_direction_id and not existing_ctx.get('direction_id') else {}),
-                **({"research_task_id": parent_research_task_id} if parent_research_task_id and not existing_ctx.get('research_task_id') else {}),
-            }
-            session.add(child)
-
-        # Resolve dependencies in the same pass — do NOT commit between enrichment and
-        # dependency wiring.  A mid-enrichment commit would let workers pick up children
-        # with the correct base_branch but missing depends_on, causing out-of-order execution.
-        for i, subtask_def in enumerate(subtasks):
-            if i < len(existing_children):
-                dep_indices = subtask_def.get("depends_on_indices", [])
-                existing_children[i].depends_on = [
-                    str(existing_children[j].id)
-                    for j in dep_indices
-                    if 0 <= j < len(existing_children)
-                ]
-                session.add(existing_children[i])
-
-        overlaps = _log_file_overlaps(subtasks, "PLAN")
-        for (i, j, shared_files) in overlaps:
-            for idx in (i, j):
-                if idx < len(existing_children):
-                    ctx = dict(existing_children[idx].context or {})
-                    warnings = ctx.get('file_overlap_warnings', [])
-                    other_title = subtasks[j if idx == i else i].get('title', f'#{j if idx == i else i}')
-                    warnings.append({'shared_files': sorted(shared_files), 'with_task': other_title})
-                    ctx['file_overlap_warnings'] = warnings
-                    existing_children[idx].context = ctx
-                    session.add(existing_children[idx])
-        # Single atomic commit: base_branch, requires_approval, context, and depends_on
-        # are all written together so no worker can observe a partially-enriched child.
-        await session.commit()
-
-        for ct in existing_children:
-            await broadcast_to_project(str(task.project_id), "task_updated",
-                                       {"task_id": str(ct.id), "status": str(ct.status)})
-
-        logger.info(f"[PLAN] Enriched {len(existing_children)} agent-spawned subtasks for plan {task.id}")
-        return
+    # Children are created here (after branch creation) so they get the correct
+    # base_branch and don't need a requires_approval hold.
 
     # First pass: create all child tasks
     parent_payload = task.first_payload

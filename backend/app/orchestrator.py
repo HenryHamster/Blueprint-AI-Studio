@@ -17,6 +17,7 @@ from typing import Dict, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.compute import (
@@ -537,13 +538,14 @@ async def orchestrator_worker():
                                     narrow_broken += 1
                                 await fix_session.commit()
 
-                    # Broader scan: check ALL QUEUED tasks older than 10 min (not just candidate batch)
+                    # Broader scan: check QUEUED tasks older than 10 min with deps (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
                     broad_stmt = select(Task).where(
                         Task.status == TaskStatus.QUEUED,
                         Task.created_at < ten_min_ago,
                         Task.requires_approval.is_(False),
-                    )
+                        Task.depends_on.isnot(None),
+                    ).options(load_only(Task.id, Task.depends_on, Task.status, Task.created_at)).limit(100)
                     broad_stuck = (await session.execute(broad_stmt)).scalars().all()
                     candidate_task_ids = {t.id for t in candidate_tasks}
                     broad_stuck = [t for t in broad_stuck
@@ -570,10 +572,10 @@ async def orchestrator_worker():
                         broad_dep_status: dict = {}
                         if all_dep_ids_broad:
                             broad_dep_rows = await session.execute(
-                                select(Task).where(Task.id.in_(all_dep_ids_broad))
+                                select(Task.id, Task.status).where(Task.id.in_(all_dep_ids_broad))
                             )
-                            for dep_task in broad_dep_rows.scalars().all():
-                                broad_dep_status[dep_task.id] = dep_task.status
+                            for dep_id, dep_status in broad_dep_rows.all():
+                                broad_dep_status[dep_id] = dep_status
 
                         broad_classified = _classify_stuck_tasks(
                             broad_stuck, broad_task_dep_uuids, broad_dep_status, broad_stuck_ids
@@ -962,7 +964,7 @@ async def orchestrator_worker():
                 # Check tasks waiting on CI (review approved, CI pending)
                 CI_WAIT_TIMEOUT_MINUTES = 60
                 ci_waiting_tasks = (await session.execute(
-                    select(Task).where(Task.status == TaskStatus.EVALUATING)
+                    select(Task).where(Task.status == TaskStatus.EVALUATING).limit(200)
                 )).scalars().all()
                 for ci_task in ci_waiting_tasks:
                     ci_loop = (ci_task.context or {}).get("review_loop", {})

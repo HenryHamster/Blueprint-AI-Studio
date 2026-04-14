@@ -2,6 +2,7 @@ import { spawn, execFileSync } from 'child_process';
 import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
+import { extractJsonObject, extractJsonArray } from './json-extract.js';
 import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
@@ -392,19 +393,11 @@ export function readHandlerOutput<T = unknown>(
   } catch (err: unknown) {
     sendLog(ws, `[WARNING] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
     // Try extracting a JSON array (research findings, plans)
-    const arrayMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-    if (arrayMatch) {
-      try {
-        return JSON.parse(arrayMatch[0]) as T;
-      } catch { /* no fallback available */ }
-    }
+    const arrayResult = extractJsonArray<T>(raw);
+    if (arrayResult) return arrayResult;
     // Try extracting a JSON object (strategic output)
-    const objMatch = raw.match(/\{[\s\S]*?"vision"[\s\S]*?"direction_operations"[\s\S]*?\}\s*$/);
-    if (objMatch) {
-      try {
-        return JSON.parse(objMatch[0]) as T;
-      } catch { /* no fallback available */ }
-    }
+    const objResult = extractJsonObject<T>(raw, 'vision', 'direction_operations');
+    if (objResult) return objResult;
     return null;
   }
 }
