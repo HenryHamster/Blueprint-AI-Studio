@@ -81,13 +81,15 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   design_doc_update: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-400', icon: FileText, label: 'Design Doc' },
 };
 
-const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint: string }> = {
-  CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400', hint: 'Application code error — review error logs for root cause' },
-  PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400', hint: 'VM startup failed — check zone health. Auto-retries on different zone' },
-  AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400', hint: 'Agent died or timed out — possible OOM or stuck execution' },
-  EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400', hint: 'External service failure — typically transient, auto-retries' },
-  RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400', hint: 'API quota exhausted — auto-retries with different account' },
+const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint: string; suggestion: string; retryLabel: string }> = {
+  CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400', hint: 'Application code error — review error logs for root cause', suggestion: 'Review error logs before retrying', retryLabel: 'Edit & Retry' },
+  PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400', hint: 'VM startup failed — check zone health. Auto-retries on different zone', suggestion: 'VM startup failed — will use alternate zone on retry', retryLabel: 'Retry' },
+  AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400', hint: 'Agent died or timed out — possible OOM or stuck execution', suggestion: 'Agent process died — check for OOM or stuck execution', retryLabel: 'Retry' },
+  EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400', hint: 'External service failure — typically transient, auto-retries', suggestion: 'Transient service error — typically auto-retries', retryLabel: 'Retry' },
+  RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400', hint: 'API quota exhausted — auto-retries with different account', suggestion: 'API quota exhausted — auto-retries with different account', retryLabel: 'Retry' },
 };
+
+export { FAILURE_CLASS_CONFIG };
 
 function HighlightText({ text, query }: { text: string; query?: string }) {
   if (!query || !text) return <>{text}</>;
@@ -528,12 +530,26 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.status === 'FAILED' && task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? (
-        <span
-          className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold mb-2 ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
-          title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
-        >
-          {FAILURE_CLASS_CONFIG[task.failure_class].label}
-        </span>
+        <div className="mb-2">
+          <span
+            className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
+            title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
+          >
+            {FAILURE_CLASS_CONFIG[task.failure_class].label}
+          </span>
+          <p className="text-[10px] text-neutral-500 mt-0.5">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</p>
+          {(() => {
+            const retryAfter = task.context?.retry_after as string | undefined;
+            if (!retryAfter) return null;
+            const retryTime = new Date(retryAfter).getTime();
+            const isFuture = retryTime > now30;
+            if (isFuture) {
+              const mins = Math.ceil((retryTime - now30) / 60000);
+              return <p className="text-[10px] text-emerald-400 mt-0.5">Auto-retrying in {mins}m</p>;
+            }
+            return <p className="text-[10px] text-amber-400 mt-0.5">Auto-retry pending</p>;
+          })()}
+        </div>
       ) : null}
 
       {task.status === 'FAILED' && task.error_logs ? (
@@ -691,8 +707,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             </button>
             {showOverflowMenu && (
               <div className="mt-1 flex gap-1.5">
-                <button onClick={() => { onRetry(task.id); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-                  {actionLoading === 'retry' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Retry
+                <button onClick={() => { if (task.failure_class === 'CODE_ERROR') { setEditing(true); setShowOverflowMenu(false); } else { onRetry(task.id); setShowOverflowMenu(false); } }} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                  {actionLoading === 'retry' ? <Activity className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} {task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? FAILURE_CLASS_CONFIG[task.failure_class].retryLabel : 'Retry'}
                 </button>
                 <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
                   <Pencil className="w-3 h-3" />
@@ -732,8 +748,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             ) : (
               <>
                 <div className="flex gap-2">
-                  <button onClick={() => onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
-                    {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} Retry
+                  <button onClick={() => task.failure_class === 'CODE_ERROR' ? setEditing(true) : onRetry(task.id)} disabled={!!actionLoading} className={`flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading && actionLoading !== 'retry' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
+                    {actionLoading === 'retry' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />} {task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? FAILURE_CLASS_CONFIG[task.failure_class].retryLabel : 'Retry'}
                   </button>
                   <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
                     <Pencil className="w-3.5 h-3.5" /> Edit
