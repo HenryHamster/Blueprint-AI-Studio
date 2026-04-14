@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Plus, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight } from 'lucide-react';
-import { API_BASE_URL, authHeaders } from '../api';
+import { apiFetch } from '../api';
 import DesignDocViewer from './DesignDocViewer';
 import VisionViewer from './VisionViewer';
 import { DirectionCard } from './DirectionCard';
@@ -132,8 +132,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
 
   async function fetchProjects() {
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects`, { headers: h });
+      const res = await apiFetch('/api/admin/projects');
       if (!res.ok) throw new Error('Failed to fetch projects');
       const data = await res.json();
       const list = Array.isArray(data) ? data : data.projects ?? [];
@@ -148,10 +147,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function fetchDirections() {
     setLoading(true);
     try {
-      const h = await authHeaders();
       const [res, countsRes] = await Promise.all([
-        fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, { headers: h }),
-        fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/task-counts`, { headers: h }),
+        apiFetch(`/api/admin/projects/${selectedProjectId}/directions`),
+        apiFetch(`/api/admin/projects/${selectedProjectId}/directions/task-counts`),
       ]);
       if (!res.ok) throw new Error('Failed to fetch directions');
       const data = await res.json();
@@ -174,11 +172,10 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     if (!form.newText.trim() || !selectedProjectId) return;
     setError(null);
     try {
-      const h = await authHeaders();
       const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
       if (form.newCategory) body.category = form.newCategory;
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions`, {
-        method: 'POST', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions`, {
+        method: 'POST',
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error('Failed to add direction');
@@ -192,9 +189,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function updateDirection(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
@@ -209,9 +205,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     setError(null);
     const newStatus = currentStatus === 'active' ? 'paused' : 'active';
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ status: newStatus }),
       });
       if (!res.ok) throw new Error('Failed to update status');
@@ -224,9 +219,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function reactivateDirection(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ status: 'active' }),
       });
       if (!res.ok) throw new Error('Failed to reactivate direction');
@@ -239,9 +233,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function markDirectionComplete(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ status: 'completed' }),
       });
       if (!res.ok) throw new Error('Failed to mark direction as complete');
@@ -254,9 +247,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function approveProposal(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ status: 'active' }),
       });
       if (!res.ok) throw new Error('Failed to approve proposal');
@@ -270,9 +262,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function rejectProposal(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'DELETE', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'DELETE',
       });
       if (!res.ok) throw new Error('Failed to reject proposal');
       addToast('Direction proposal rejected', 'info');
@@ -285,9 +276,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function reviveProposal(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: { ...h, 'Content-Type': 'application/json' },
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ status: 'proposed' }),
       });
       if (!res.ok) throw new Error('Failed to revive proposal');
@@ -302,13 +292,12 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     if (!d.pending_update) return;
     setError(null);
     try {
-      const h = await authHeaders();
       const updated: Record<string, unknown> = { pending_update: null };
       if (d.pending_update.suggested_text) updated.text = d.pending_update.suggested_text;
       if (d.pending_update.suggested_priority) updated.priority = d.pending_update.suggested_priority;
       if (d.pending_update.suggested_paths) updated.paths = d.pending_update.suggested_paths;
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${d.id}`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${d.id}`, {
+        method: 'PATCH',
         body: JSON.stringify(updated),
       });
       if (!res.ok) throw new Error('Failed to apply direction update');
@@ -321,9 +310,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   async function dismissDirectionUpdate(id: string) {
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'PATCH',
         body: JSON.stringify({ pending_update: null }),
       });
       if (!res.ok) throw new Error('Failed to dismiss direction update');
@@ -337,9 +325,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     if (!window.confirm('Are you sure you want to delete this direction?')) return;
     setError(null);
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}`, {
-        method: 'DELETE', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
+        method: 'DELETE',
       });
       if (!res.ok) throw new Error('Failed to delete direction');
       fetchDirections();
@@ -352,9 +339,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     setError(null);
     const newValue = !autonomousEnabled;
     try {
-      const h = await authHeaders();
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/autonomous`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/autonomous`, {
+        method: 'PATCH',
         body: JSON.stringify({ enabled: newValue }),
       });
       if (!res.ok) throw new Error('Failed to toggle autonomous mode');
@@ -372,11 +358,10 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     });
     setError(null);
     try {
-      const h = await authHeaders();
       const nonActive = previousDirections.filter(d => d.status !== 'active');
       const allOrdered = [...newOrder, ...nonActive];
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/reorder`, {
-        method: 'PATCH', headers: h,
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/reorder`, {
+        method: 'PATCH',
         body: JSON.stringify({ direction_ids: allOrdered.map(d => d.id) }),
       });
       if (!res.ok) throw new Error('Failed to reorder directions');
@@ -391,9 +376,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     setForceConfirmId(null);
     setError(null);
     try {
-      const h = await authHeaders();
-      const url = `${API_BASE_URL}/api/admin/projects/${selectedProjectId}/directions/${id}/research${bypass ? '?bypass_cooldown=true' : ''}`;
-      const res = await fetch(url, { method: 'POST', headers: h });
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}/research${bypass ? '?bypass_cooldown=true' : ''}`, { method: 'POST' });
       if (!res.ok) throw new Error('Failed to trigger research');
       setResearchSuccessIds(prev => ({ ...prev, [id]: true }));
       setTimeout(() => setResearchSuccessIds(prev => ({ ...prev, [id]: false })), 3000);

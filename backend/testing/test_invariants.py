@@ -1059,6 +1059,12 @@ GITHUB_MAX_FUNCTIONS = 33
 AGENT_ROUTER_MAX_LINES = 1000
 AGENT_ROUTER_MAX_FUNCTIONS = 20
 
+DIRECTIONS_ROUTER_MAX_LINES = 710
+DIRECTIONS_ROUTER_MAX_FUNCTIONS = 13
+
+ADMIN_NOTIFICATIONS_MAX_LINES = 580
+ADMIN_NOTIFICATIONS_MAX_FUNCTIONS = 13
+
 
 def _get_admin_settings_py_path() -> str:
     return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'admin_settings.py')
@@ -1302,6 +1308,88 @@ class TestAgentRouterFreeze:
             f"{AGENT_ROUTER_MAX_FUNCTIONS}. "
             "New functionality must go in extracted sub-modules. "
             "Once a function-removing extraction lands, ratchet the ceiling down."
+        )
+
+
+def _get_directions_router_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'directions.py')
+
+
+def _get_admin_notifications_py_path() -> str:
+    return os.path.join(os.path.dirname(__file__), '..', 'app', 'routers', 'admin_notifications.py')
+
+
+class TestDirectionsRouterFreeze:
+    """Enforce the directions.py router freeze: no new functions, no line growth."""
+
+    def test_line_count(self):
+        """routers/directions.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to routers/directions.py.
+        Extract helper functions to a directions_helpers.py module.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_directions_router_py_path()
+        with open(path) as f:
+            content = f.read()
+        lines = len(content.splitlines())
+        assert lines <= DIRECTIONS_ROUTER_MAX_LINES, (
+            f'directions.py has {lines} lines, exceeding ceiling of {DIRECTIONS_ROUTER_MAX_LINES}. '
+            'Extract helper functions to a directions_helpers.py module.'
+        )
+
+    def test_function_count(self):
+        """routers/directions.py must not gain new functions.
+
+        If this fails: a new function was added to routers/directions.py.
+        Extract helper functions to a directions_helpers.py module.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_directions_router_py_path()
+        with open(path) as f:
+            content = f.read()
+        tree = ast.parse(content)
+        fn_count = len([n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))])
+        assert fn_count <= DIRECTIONS_ROUTER_MAX_FUNCTIONS, (
+            f'directions.py has {fn_count} functions, exceeding ceiling of {DIRECTIONS_ROUTER_MAX_FUNCTIONS}.'
+        )
+
+
+class TestAdminNotificationsFreeze:
+    """Enforce the admin_notifications.py router freeze: no new functions, no line growth."""
+
+    def test_line_count(self):
+        """routers/admin_notifications.py must not grow beyond the ceiling.
+
+        If this fails: new functionality was added to routers/admin_notifications.py.
+        Extract helper functions to a separate module.
+        Once a line-reducing extraction lands, ratchet the ceiling down.
+        """
+        path = _get_admin_notifications_py_path()
+        with open(path) as f:
+            content = f.read()
+        lines = len(content.splitlines())
+        assert lines <= ADMIN_NOTIFICATIONS_MAX_LINES, (
+            f'admin_notifications.py has {lines} lines, exceeding ceiling of {ADMIN_NOTIFICATIONS_MAX_LINES}. '
+            'Extract helper functions to a separate module.'
+        )
+
+    def test_function_count(self):
+        """routers/admin_notifications.py must not gain new functions.
+
+        If this fails: a new function was added to routers/admin_notifications.py.
+        Extract helper functions to a separate module.
+        Once a function-removing extraction lands, ratchet the ceiling down.
+        """
+        import ast
+        path = _get_admin_notifications_py_path()
+        with open(path) as f:
+            content = f.read()
+        tree = ast.parse(content)
+        fn_count = len([n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))])
+        assert fn_count <= ADMIN_NOTIFICATIONS_MAX_FUNCTIONS, (
+            f'admin_notifications.py has {fn_count} functions, exceeding ceiling of {ADMIN_NOTIFICATIONS_MAX_FUNCTIONS}.'
         )
 
 
