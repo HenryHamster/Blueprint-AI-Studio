@@ -558,7 +558,6 @@ async def get_digest(
                     continue
 
                 tasks_for_dir = dir_tasks.get(did, [])
-
                 cycles_in_window = sum(
                     1 for t in tasks_for_dir
                     if t.status == TaskStatus.COMPLETED
@@ -621,6 +620,7 @@ async def get_digest(
                     "product_ratio": dir_product_ratio,
                     "type_distribution": agg_type_distribution or None,
                     "estimated_cost_usd": round(dir_cost, 2),
+                    "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)

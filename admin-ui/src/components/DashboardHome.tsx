@@ -28,6 +28,7 @@ interface DirectionProgress {
   possibly_saturated: boolean;
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
+  cost_per_merged_pr?: number | null;
 }
 
 interface FailureGroupTask {
