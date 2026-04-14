@@ -710,15 +710,18 @@ You are a product advisor. Think about where this project should go.
 
 You have everything you need above: the design document (what exists), the vision (what we're aiming for), outcome data (what's actually been shipping), current directions (what we're working on), and user feedback. Do NOT explore the codebase — the architecture agent handles that.
 
-Write a strategic analysis. Think freely. Some questions to consider:
+Write a strategic analysis. Think freely. Cover the FULL landscape — don't laser-focus on one area. Some questions to consider:
 
-- What should this project BECOME? Not incrementally — what's the most ambitious, transformative thing it could achieve?
+- Is the purpose (product identity) still accurate? It should describe what the product IS, not what you're building next. Only change it if the product's fundamental nature has shifted.
+- Are the focus items (current strategic bets) still the right bets? What should we be actively building NOW? Which goals have been achieved and should rotate out? What new goals deserve a slot?
 - Are we stuck in a local optimum? Lots of small improvements instead of one big leap?
-- Is the current vision ambitious enough, or does it just describe what already exists?
 - Look at the outcome data honestly — are directions producing real value, or just easy-to-merge busywork?
 - What high-impact work is nobody doing? What would make a user say "I can't work without this"?
 - Are we defaulting to structural/infrastructure work when product features would matter more?
-- What should we STOP doing?
+- What should we STOP doing? Which directions overlap or should be merged?
+- Are there directions that can't meaningfully start until other work finishes? Those should be paused, not active.
+
+Think about the WHAT, not the HOW. Direction text should describe outcomes ("users can X", "the system handles Y"), not implementation steps. Leave the implementation planning to research agents.
 
 If you're unsure about what the user wants or values — ASK. Use \`./messages send 'your question' QUESTION\`. One good question is worth more than a wrong guess. If there are open messages, respond to them.
 
@@ -735,22 +738,24 @@ Don't worry about formatting, JSON, or direction operations. Just think and writ
       `# Executor Agent\nYour ONLY job is to call ./strategic and ./design-doc commands.\nDo NOT analyze code. Do NOT write prose. Just run the bash commands.\n`
     );
 
-    const executorPrompt = `You are an executor. Your ONLY job is to translate the strategic analysis below into API calls using ./strategic and ./design-doc bash commands.
+    const executorPrompt = `You are a strategic executor. Your job is to translate the analysis below into direction operations, but with JUDGMENT — not blind execution. You decide how the analysis maps to directions.
 
-Do NOT analyze code. Do NOT explore the codebase. Do NOT write explanations. Just run the commands.
+Do NOT analyze code. Do NOT explore the codebase. Think briefly about each operation, then run the commands.
 
 # Commands available
 
 \`\`\`bash
 # Set the vision (REQUIRED)
-./strategic set-vision '{"purpose": "...", "success_criteria": ["..."], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "..."}'
+# "purpose" = stable product identity (what the product IS — change rarely)
+# "focus" = current strategic bets (what we're building NOW — update every cycle, can have multiple parallel goals)
+./strategic set-vision '{"purpose": "...", "focus": ["current goal 1", "current goal 2"], "success_criteria": ["..."], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "..."}'
 
-# Create research directions (max 5)
+# Create research directions
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel
 ./strategic create-direction '{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "...", "conflicts_with": ["d-xxx"]}'
 
 # Update existing directions (can set conflicts_with to control parallel execution)
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "conflicts_with": ["d-yyy"]}, "rationale": "..."}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "text": "...", "conflicts_with": ["d-yyy"]}, "rationale": "..."}'
 
 # Retire directions
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
@@ -773,14 +778,34 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. Read the analysis carefully. Extract the vision and direction recommendations.
-2. Run ./strategic set-vision with the vision from the analysis (update purpose, success_criteria, systems, priorities).
-3. Run ./strategic create-direction for each new direction the analysis recommends. Use category "product" or "structural".
-4. Run ./strategic retire-direction for any directions the analysis says to retire or stop.
-5. Run ./strategic update-direction for any priority or scope changes.
-6. Run ./design-doc set "notes/strategic-review" with key observations.
+1. Run ./strategic set-vision with the vision from the analysis. The "purpose" is the stable product identity — what the product IS at its core. Only change it if the product's fundamental nature has shifted. The "focus" is a list of current strategic bets — what you're actively building NOW. These change every cycle as goals complete or priorities shift. Multiple parallel goals are normal.
+
+2. **Before creating or updating any directions, plan your operations.** For each idea in the analysis:
+   - Does an existing direction already cover this? → UPDATE it (merge the ideas), don't create a duplicate.
+   - Can two similar ideas be combined into one direction? → Create one direction, not two.
+   - Does this depend on another direction being done first? → PAUSE it (status: "paused") or don't create it yet.
+   Direction text should describe the desired OUTCOME ("users can X", "the system handles Y"), not implementation steps. Keep implementation details in the rationale field.
+
+3. **Priority is a scarce resource.** The system researches one direction per cycle. Having 5+ high-priority directions means random selection. Be deliberate:
+   - high: 1-2 directions max — the most important work RIGHT NOW
+   - medium: the next tier — important but can wait for high-priority work
+   - low: nice to have, opportunistic
+
+4. Run the direction operations (create/update/retire).
+
+5. Run ./design-doc set "notes/strategic-review" with key observations.
+
+6. **Leave feedback for next cycle.** Run ./design-doc set "notes/strategic-feedback" with honest observations about what's working and what isn't. Examples:
+   - "Direction X has had 3 cycles with zero merges — research keeps proposing the same thing"
+   - "The thinker keeps creating overlapping directions around Y"
+   - "Priority spread is good, directions are well-scoped"
+   - "Research agents are ignoring the dependency ordering"
+   This persists in the design doc and will be visible to the thinker on the next strategic cycle.
+
 7. Review open messages — resolve addressed ones, respond to questions.
-8. Guardrails: ensure at least 3 active directions remain and at least one has category="product". If the analysis doesn't cover this, add a direction to fill the gap.
+
+8. Guardrails: ensure at least 3 active directions remain and at least one has category="product".
+
 9. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
@@ -798,7 +823,7 @@ ${analysisText.slice(0, 50_000)}
         const retryResult = await runClaudeCode(
           'Your previous attempt did not call ./strategic set-vision. This is REQUIRED.\n\n' +
           'Run this command NOW with the vision from your analysis:\n' +
-          './strategic set-vision \'{"purpose": "...", "success_criteria": [...], "systems": [...], "priorities": [...]}\'\n' +
+          './strategic set-vision \'{"purpose": "...", "focus": ["..."], "success_criteria": [...], "systems": [...], "priorities": [...]}\'\n' +
           'Extract the vision from the analysis and call the command. Nothing else.',
           ws, statusRef, model, effort, disallowedTools
         );

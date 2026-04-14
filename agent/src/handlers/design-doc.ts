@@ -182,7 +182,11 @@ ${codebaseSummary}${fileTreeSection}
 5. For notes/observations: \`./design-doc set "notes/<topic>" '"..."'\`
 6. Use stable system IDs (sys-auth, sys-pipeline, sys-frontend, etc.)
 7. Focus on WHAT IS. Document missing things as missing.
-8. If open messages mention architecture or systems, incorporate those observations into the relevant pages.
+8. For each system, include a "ready_for_features" field (true/false) with a brief reason.
+   A system is ready if other systems can reliably build on it (APIs work, tests pass, config is wired up).
+   A system is NOT ready if it's stub/partial, untested, or has unfinished wiring.
+   This helps the strategic agent avoid proposing features on shaky foundations.
+9. If open messages mention architecture or systems, incorporate those observations into the relevant pages.
    Do NOT resolve messages — the strategic review agent handles message responses and resolution.
 9. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
    and validate that entries reflect the current codebase state. Use ./playbook delete <key>
