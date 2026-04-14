@@ -231,6 +231,7 @@ Rules:
       status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
       ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
       logs,
+      ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post plan completion status: ${e}\n`);
@@ -859,6 +860,7 @@ ${analysisText.slice(0, 50_000)}
         status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
         ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
         logs,
+        ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
       });
     } catch (e) {
       sendLog(ws, `[ERROR] Failed to post strategic completion status: ${e}\n`);
@@ -1050,6 +1052,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
       status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
       ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
       logs,
+      ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post research completion status: ${e}\n`);

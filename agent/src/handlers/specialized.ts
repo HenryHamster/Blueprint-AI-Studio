@@ -254,6 +254,7 @@ CRITICAL RULES:
   } else {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: 'claude_code_failed',
     });
   }
 }
@@ -366,6 +367,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: 'claude_code_failed',
     });
   }
 }
@@ -472,6 +474,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: 'claude_code_failed',
     });
   }
 }
@@ -614,6 +617,7 @@ IMPORTANT:
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
       logs: `Failed to read investigation report from /tmp/investigation_report_${taskId}.json`,
+      failure_category: 'parse_failed',
     });
     return;
   }

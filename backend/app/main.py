@@ -1819,6 +1819,10 @@ async def update_agent_status(
     # Preserve logs on the task when no artifact is created (e.g., "no changes" completion)
     if payload.logs and not payload.artifact_type:
         task.latest_status_message = payload.logs[:2000]
+    if payload.failure_category:
+        ctx = dict(task.context or {})
+        ctx['failure_category'] = payload.failure_category
+        task.context = ctx
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)

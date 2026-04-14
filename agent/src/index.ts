@@ -15,6 +15,9 @@ import {
   CLAUDE_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 } from './constants.js';
 
+// ── Failure categories ───────────────────────────────────────────────────────
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal';
+
 // ── Environment ─────────────────────────────────────────────────────────────
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
 let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
@@ -1033,6 +1036,7 @@ async function main() {
         await persistAndPostStatus(taskId, {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: sanitize(`Fatal error: ${errMsg}`),
+          failure_category: 'fatal' as FailureCategory,
         });
         break; // Success — stop retrying
       } catch (e) {

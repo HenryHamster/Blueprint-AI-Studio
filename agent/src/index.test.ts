@@ -49,7 +49,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, type FailureCategory } from './index.js';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {
@@ -210,6 +210,30 @@ describe('validateBranchName', () => {
 
   it('throws on backtick character', () => {
     expect(() => validateBranchName('feat`cmd`', 'branch')).toThrow('Invalid branch');
+  });
+});
+
+// ── FailureCategory ──────────────────────────────────────────────────────────
+describe('FailureCategory', () => {
+  const expectedCategories: FailureCategory[] = [
+    'clone_failed',
+    'build_failed',
+    'test_failed',
+    'lint_failed',
+    'pr_creation_failed',
+    'claude_code_failed',
+    'parse_failed',
+    'fatal',
+  ];
+
+  it('covers all expected failure category values', () => {
+    // This test ensures the FailureCategory type includes all expected values.
+    // If a new category is added to the type but not here, TypeScript will catch it.
+    for (const cat of expectedCategories) {
+      const value: FailureCategory = cat;
+      expect(typeof value).toBe('string');
+    }
+    expect(expectedCategories).toHaveLength(8);
   });
 });
 

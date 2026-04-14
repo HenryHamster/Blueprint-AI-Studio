@@ -173,6 +173,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
     ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : {}),
     logs,
     ...(verdictJsonField ? { verdict_json: verdictJsonField } : {}),
+    ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
   });
 }
 
@@ -498,6 +499,7 @@ export async function handleFix(
   } else {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: 'claude_code_failed',
     });
   }
 }

@@ -221,5 +221,6 @@ ${codebaseSummary}${fileTreeSection}
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
     logs: exitCode === 0 ? 'Architecture review completed. Design doc updated via API.' : 'Architecture review failed.',
+    ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
   });
 }

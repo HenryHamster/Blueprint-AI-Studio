@@ -118,6 +118,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`,
+        failure_category: 'test_failed',
       });
       return;
     }
@@ -150,6 +151,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   } else {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: 'claude_code_failed',
     });
   }
 }

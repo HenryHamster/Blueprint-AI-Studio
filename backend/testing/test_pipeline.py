@@ -327,6 +327,56 @@ class TestFailureClassification:
         task = self._make_task("staging branch not found or was deleted during rollup")
         assert classify_failure(task) == "EXTERNAL_API"
 
+    def _make_task_with_category(self, failure_category: str) -> Task:
+        task = MagicMock(spec=Task)
+        task.latest_status_message = ""
+        task.context = {"failure_category": failure_category}
+        return task
+
+    def test_failure_category_claude_code_failed_returns_code_error(self):
+        """Agent-reported claude_code_failed maps to CODE_ERROR fast path."""
+        task = self._make_task_with_category("claude_code_failed")
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_failure_category_test_failed_returns_code_error(self):
+        task = self._make_task_with_category("test_failed")
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_failure_category_clone_failed_returns_provision_failure(self):
+        task = self._make_task_with_category("clone_failed")
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_failure_category_pr_creation_failed_returns_external_api(self):
+        task = self._make_task_with_category("pr_creation_failed")
+        assert classify_failure(task) == "EXTERNAL_API"
+
+    def test_failure_category_takes_priority_over_regex(self):
+        """failure_category from context wins even when regex would give a different result."""
+        task = MagicMock(spec=Task)
+        # status message looks like a provision failure, but agent said it was a code error
+        task.latest_status_message = "vm failed to start"
+        task.context = {"failure_category": "claude_code_failed"}
+        assert classify_failure(task) == "CODE_ERROR"
+
+    def test_failure_category_falls_back_to_regex_when_absent(self):
+        """When failure_category is not in context, regex classification still works."""
+        task = MagicMock(spec=Task)
+        task.latest_status_message = "vm failed to start"
+        task.context = {}
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_failure_category_falls_back_to_regex_when_context_is_none(self):
+        task = self._make_task("vm failed to start")
+        task.context = None
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
+    def test_failure_category_unknown_value_falls_back_to_regex(self):
+        """Unknown failure_category values are ignored and regex runs normally."""
+        task = MagicMock(spec=Task)
+        task.latest_status_message = "vm failed to start"
+        task.context = {"failure_category": "unknown_future_category"}
+        assert classify_failure(task) == "PROVISION_FAILURE"
+
 
 # ── Deployment Monitoring ───────────────────────────────────────────────────
 

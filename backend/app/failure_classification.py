@@ -5,10 +5,27 @@ if TYPE_CHECKING:
     from app.models import Task
 
 
+_AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
+    'clone_failed': 'PROVISION_FAILURE',
+    'build_failed': 'CODE_ERROR',
+    'test_failed': 'CODE_ERROR',
+    'lint_failed': 'CODE_ERROR',
+    'pr_creation_failed': 'EXTERNAL_API',
+    'claude_code_failed': 'CODE_ERROR',
+    'parse_failed': 'CODE_ERROR',
+    'fatal': 'CODE_ERROR',
+}
+
+
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
     from app.max_plan_pool import RATE_LIMIT_KEYWORDS  # noqa: PLC0415
+
+    # Fast path: agent already reported a structured category — prefer it over regex.
+    agent_category = (task.context or {}).get('failure_category')
+    if agent_category and agent_category in _AGENT_CATEGORY_TO_CLASS:
+        return _AGENT_CATEGORY_TO_CLASS[agent_category]
 
     status_msg = (task.latest_status_message or "").lower()
     logs_lower = (logs or "").lower()
