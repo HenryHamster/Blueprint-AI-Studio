@@ -34,6 +34,7 @@ from app.shared_state import runtime_config as _runtime_config
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
+from app.notification_dispatch import post_auto_fix_result_message
 from app.failure_classification import classify_failure
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,20 @@ async def _process_post_commit(
                 except Exception as _strat_exc:
                     logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
 
+            # Post result message for permanently failed auto-remediation tasks
+            if (task.context or {}).get("auto_remediation") is True:
+                try:
+                    _ar_branch = (task.context or {}).get("ci_failure_branch", "main")
+                    await post_auto_fix_result_message(
+                        session, task.project_id,
+                        branch=_ar_branch,
+                        result="failed",
+                        task_id=task.id,
+                    )
+                    await session.commit()
+                except Exception as _ar_exc:
+                    logger.warning("[AUTO-REMEDIATION] Failed to post failure result message: %s", _ar_exc)
+
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
             task_payload = task.first_payload
@@ -312,6 +327,17 @@ async def _process_post_commit(
                                 task.requires_approval = True
                                 task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
                                 session.add(task)
+                                if (task.context or {}).get("auto_remediation") is True:
+                                    try:
+                                        await post_auto_fix_result_message(
+                                            session, task.project_id,
+                                            branch=(task.context or {}).get("ci_failure_branch", base_branch),
+                                            result="review_needed",
+                                            pr_number=pr_number,
+                                            task_id=task.id,
+                                        )
+                                    except Exception as _ar_exc:
+                                        logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
                                 await session.commit()
                                 if scan_result["findings"]:
                                     await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
@@ -323,6 +349,17 @@ async def _process_post_commit(
                             task.requires_approval = True
                             task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
                             session.add(task)
+                            if (task.context or {}).get("auto_remediation") is True:
+                                try:
+                                    await post_auto_fix_result_message(
+                                        session, task.project_id,
+                                        branch=(task.context or {}).get("ci_failure_branch", base_branch),
+                                        result="review_needed",
+                                        pr_number=pr_number,
+                                        task_id=task.id,
+                                    )
+                                except Exception as _ar_exc:
+                                    logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
                             await session.commit()
                             return {"status": "accepted"}
 
@@ -572,6 +609,7 @@ async def _process_post_commit(
                 action_taken = False
                 head_sha = ""
                 if verdict == "APPROVE":
+                    head_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         # Validate PR head branch matches before merging
@@ -671,6 +709,28 @@ async def _process_post_commit(
                                             orig.status = TaskStatus.COMPLETED
                                             orig.latest_status_message = "Rollup PR merged"
                                         session.add(orig)
+                                        # Post result message for auto-remediation tasks
+                                        if (orig.context or {}).get("auto_remediation") is True:
+                                            try:
+                                                _ar_branch = (orig.context or {}).get("ci_failure_branch", base_branch)
+                                                await post_auto_fix_result_message(
+                                                    session, orig.project_id,
+                                                    branch=_ar_branch,
+                                                    result="merged",
+                                                    pr_number=pr_number,
+                                                    task_id=orig.id,
+                                                )
+                                                try:
+                                                    from app.notification_dispatch import dispatch_external_notification
+                                                    asyncio.ensure_future(dispatch_external_notification(
+                                                        orig.project_id,
+                                                        "AUTO_FIX_MERGED",
+                                                        {"branch": _ar_branch, "pr_number": pr_number},
+                                                    ))
+                                                except Exception as _wh_exc:
+                                                    logger.warning("[AUTO-REMEDIATION] Failed to dispatch AUTO_FIX_MERGED webhook: %s", _wh_exc)
+                                            except Exception as _ar_exc:
+                                                logger.warning("[AUTO-REMEDIATION] Failed to post result message: %s", _ar_exc)
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)

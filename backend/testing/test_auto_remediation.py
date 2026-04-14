@@ -1,0 +1,470 @@
+"""Tests for CI auto-remediation (auto_remediation.py + webhook extension in github.py)."""
+import hashlib
+import hmac
+import json
+import uuid
+from datetime import timedelta
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
+from app.models import Project, Task, TaskStatus
+from app.auto_remediation import (
+    _handle_main_branch_ci_failure_inner,
+    _extract_ci_context,
+    _build_remediation_prompt,
+    _utcnow,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _create_project(session: AsyncSession, **overrides) -> Project:
+    """Create a minimal project for testing."""
+    defaults = {
+        "name": "Test Repo",
+        "user_id": "test-user-123",
+        "github_owner": "acme",
+        "github_repo": "webapp",
+        "design_doc": {"_auto_remediation": {"enabled": True}},
+    }
+    defaults.update(overrides)
+    project = Project(**defaults)
+    session.add(project)
+    await session.flush()
+    return project
+
+
+async def _create_auto_remediation_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    status: TaskStatus = TaskStatus.IN_PROGRESS,
+    sha: str = "abc123",
+    created_at_offset: timedelta | None = None,
+) -> Task:
+    """Create an auto-remediation task for guard-rail testing."""
+    task = Task(
+        project_id=project_id,
+        title="Auto-fix: CI failure on main",
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        context={
+            "auto_remediation": True,
+            "ci_failure_sha": sha,
+            "ci_failure_branch": "main",
+        },
+        status=status,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+    )
+    if created_at_offset is not None:
+        task.created_at = _utcnow() + created_at_offset
+    session.add(task)
+    await session.flush()
+    return task
+
+
+def _default_config(**overrides) -> dict:
+    cfg = {
+        "enabled": True,
+        "branch_whitelist": ["main", "master"],
+        "max_per_hour": 2,
+        "max_concurrent": 2,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Webhook-level test helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TEST_WEBHOOK_SECRET = "test-webhook-secret-for-pytest"
+
+
+def _build_check_run_webhook_payload(
+    owner: str = "acme",
+    repo: str = "webapp",
+    head_sha: str = "deadbeef1234567890",
+    head_branch: str = "main",
+    conclusion: str = "failure",
+) -> dict:
+    """Build a minimal GitHub check_run webhook payload."""
+    return {
+        "action": "completed",
+        "check_run": {
+            "head_sha": head_sha,
+            "conclusion": conclusion,
+            "check_suite": {"head_branch": head_branch},
+        },
+        "repository": {"full_name": f"{owner}/{repo}"},
+    }
+
+
+def _sign_webhook_payload(payload_bytes: bytes) -> str:
+    """Generate the x-hub-signature-256 header value."""
+    return "sha256=" + hmac.new(
+        _TEST_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+
+
+async def _count_auto_tasks(session: AsyncSession, project_id: uuid.UUID) -> int:
+    """Count tasks with auto_remediation=True in the project."""
+    all_tasks = (await session.execute(
+        select(Task).where(Task.project_id == project_id)
+    )).scalars().all()
+    return sum(1 for t in all_tasks if (t.context or {}).get("auto_remediation") is True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: _handle_main_branch_ci_failure_inner
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_happy_path_spawns_task(db_session: AsyncSession):
+    """Basic success: a CI failure on main spawns a fix task."""
+    project = await _create_project(db_session)
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock) as mock_msg, \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: 1 != 2", "test")
+
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    assert await _count_auto_tasks(db_session, project.id) == 1
+
+    # Verify the created task
+    tasks = (await session_tasks(db_session, project.id))
+    task = tasks[0]
+    assert task.status == TaskStatus.QUEUED
+    assert task.created_by == "SYSTEM_AUTO_REMEDIATION"
+    assert task.context["auto_remediation"] is True
+    assert task.context["ci_failure_sha"] == "deadbeef"
+    assert task.context["ci_failure_branch"] == "main"
+    assert task.first_payload["type"] == "create"
+    assert task.first_payload["base_branch"] == "main"
+    assert "deadbeef" in task.first_payload["prompt"]
+
+    # Verify notification was posted with correct branch and checks
+    mock_msg.assert_called_once()
+    call_kwargs = mock_msg.call_args
+    assert call_kwargs[1]["branch"] == "main"
+    assert call_kwargs[1]["failed_checks"] == ["CI / tests"]
+
+
+async def session_tasks(session: AsyncSession, project_id: uuid.UUID) -> list[Task]:
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+        )
+    )
+    return [t for t in result.scalars().all() if (t.context or {}).get("auto_remediation")]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_rejects_third_spawn(db_session: AsyncSession):
+    """With max_per_hour=2, a third spawn within the hour is rejected."""
+    project = await _create_project(db_session)
+
+    # Create 2 recent auto-remediation tasks (within the last hour)
+    await _create_auto_remediation_task(db_session, project.id, sha="sha1", status=TaskStatus.COMPLETED)
+    await _create_auto_remediation_task(db_session, project.id, sha="sha2", status=TaskStatus.COMPLETED)
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="sha3",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(max_per_hour=2),
+            session=db_session,
+        )
+
+    # Should NOT have spawned a 3rd task
+    assert await _count_auto_tasks(db_session, project.id) == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_sha_rejected(db_session: AsyncSession):
+    """An active task with the same SHA blocks a duplicate spawn."""
+    project = await _create_project(db_session)
+
+    # Existing active task for this SHA
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="deadbeef", status=TaskStatus.IN_PROGRESS,
+    )
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    # Only the original task should exist
+    assert await _count_auto_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_limit_blocks_spawn(db_session: AsyncSession):
+    """With max_concurrent=2, a 3rd concurrent auto-remediation is blocked."""
+    project = await _create_project(db_session)
+
+    # Two active auto-remediation tasks
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha1", status=TaskStatus.IN_PROGRESS,
+    )
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha2", status=TaskStatus.QUEUED,
+    )
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="sha3",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(max_concurrent=2),
+            session=db_session,
+        )
+
+    # No new task should have been spawned
+    assert await _count_auto_tasks(db_session, project.id) == 2
+
+
+@pytest.mark.asyncio
+async def test_different_sha_spawns_second_task(db_session: AsyncSession):
+    """A different SHA spawns a second task when limits allow."""
+    project = await _create_project(db_session)
+
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha_old", status=TaskStatus.IN_PROGRESS,
+    )
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / build"], "SyntaxError", "build")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="sha_new",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    assert await _count_auto_tasks(db_session, project.id) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: webhook-level filtering (via the check_run handler in github.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_non_protected_branch_ignored(client: AsyncClient, db_session: AsyncSession):
+    """CI failure on a non-whitelisted branch is ignored at the webhook level."""
+    project = await _create_project(db_session)
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(head_branch="feature/xyz", conclusion="failure")
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored_auto_remediation_disabled"
+    # No auto-remediation task should have been created
+    assert await _count_auto_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncSession):
+    """check_run with conclusion='success' returns no_match at the webhook level."""
+    project = await _create_project(db_session)
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(head_branch="main", conclusion="success")
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
+    """COMPLETED auto-remediation tasks don't count toward concurrent limit."""
+    project = await _create_project(db_session)
+
+    # Create 2 completed tasks — these should NOT block new spawns
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha1", status=TaskStatus.COMPLETED,
+    )
+    await _create_auto_remediation_task(
+        db_session, project.id, sha="sha2", status=TaskStatus.FAILED,
+    )
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="sha3",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(max_concurrent=2, max_per_hour=10),
+            session=db_session,
+        )
+
+    # New task should have been spawned (completed tasks don't count as concurrent)
+    assert await _count_auto_tasks(db_session, project.id) == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: CI context extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_ci_context_test_failure():
+    """Logs containing 'FAILED' should be classified as 'test'."""
+    mock_ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [
+            {"name": "CI / tests", "status": "completed", "conclusion": "failure"},
+            {"name": "CI / lint", "status": "completed", "conclusion": "success"},
+        ],
+        "failed_logs": "FAILED tests/test_main.py::test_foo - AssertionError: 1 != 2\n2 failed",
+    }
+
+    with patch("app.auto_remediation.get_check_runs", new_callable=AsyncMock) as mock_runs, \
+         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "ghp_test_token"
+        mock_runs.return_value = mock_ci_result
+
+        failed_checks, error_summary, failure_type = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failed_checks == ["CI / tests"]
+    assert "AssertionError" in error_summary
+    assert failure_type == "test"
+
+
+@pytest.mark.asyncio
+async def test_extract_ci_context_build_failure():
+    """Logs containing 'ImportError' should be classified as 'build'."""
+    mock_ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [
+            {"name": "CI / build", "status": "completed", "conclusion": "failure"},
+        ],
+        "failed_logs": "ImportError: No module named 'missing_dep'\nBuild failed.",
+    }
+
+    with patch("app.auto_remediation.get_check_runs", new_callable=AsyncMock) as mock_runs, \
+         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "ghp_test_token"
+        mock_runs.return_value = mock_ci_result
+
+        failed_checks, error_summary, failure_type = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failed_checks == ["CI / build"]
+    assert failure_type == "build"
+
+
+@pytest.mark.asyncio
+async def test_extract_ci_context_no_token():
+    """When no GitHub token is available, returns empty defaults."""
+    with patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = None
+
+        failed_checks, error_summary, failure_type = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failed_checks == []
+    assert error_summary == ""
+    assert failure_type == "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: prompt building
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_build_remediation_prompt_includes_context():
+    """The remediation prompt should include branch, SHA, checks, and error logs."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc123def456",
+        failed_checks=["CI / tests", "CI / lint"],
+        error_summary="AssertionError: expected True",
+    )
+    assert "main" in prompt
+    assert "abc123def456" in prompt
+    assert "CI / tests" in prompt
+    assert "CI / lint" in prompt
+    assert "AssertionError" in prompt
+    assert "fix branch" in prompt.lower() or "Fix" in prompt
+
+
+def test_build_remediation_prompt_empty_checks():
+    """Prompt handles missing check names gracefully."""
+    prompt = _build_remediation_prompt(
+        head_branch="master",
+        head_sha="deadbeef",
+        failed_checks=[],
+        error_summary="",
+    )
+    assert "master" in prompt
+    assert "not available" in prompt.lower() or "no error" in prompt.lower()

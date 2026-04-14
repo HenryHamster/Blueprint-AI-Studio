@@ -192,6 +192,52 @@ async def post_failure_alert_message(
     )
 
 
+async def post_auto_fix_spawned_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    branch: str,
+    failed_checks: list[str],
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when CI auto-remediation spawns a fix task."""
+    check_names = ', '.join(failed_checks[:3])
+    suffix = f' +{len(failed_checks) - 3} more' if len(failed_checks) > 3 else ''
+    summary = f'CI auto-fix spawned: {check_names}{suffix} failed on {branch}'
+    return await post_event_message(
+        session,
+        project_id,
+        event_type='auto_fix_spawned',
+        summary=summary,
+        context={'branch': branch, 'failed_checks': failed_checks[:10], 'task_id': str(task_id) if task_id else None},
+        task_id=task_id,
+    )
+
+
+async def post_auto_fix_result_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    branch: str,
+    result: str,  # 'merged', 'failed', 'review_needed'
+    pr_number: Optional[int] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when a CI auto-fix task completes."""
+    if result == 'merged':
+        summary = f'CI auto-fix merged: PR #{pr_number} fixed {branch}'
+    elif result == 'failed':
+        summary = f'CI auto-fix failed on {branch} — manual intervention needed'
+    else:
+        summary = f'CI auto-fix on {branch} needs review: PR #{pr_number}'
+    return await post_event_message(
+        session,
+        project_id,
+        event_type='auto_fix_result',
+        summary=summary,
+        context={'branch': branch, 'result': result, 'pr_number': pr_number},
+        task_id=task_id,
+    )
+
+
 async def post_feedback_acknowledgment(
     session: AsyncSession,
     project_id: uuid.UUID,

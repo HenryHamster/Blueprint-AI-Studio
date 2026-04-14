@@ -428,6 +428,30 @@ async def github_webhook(
                     and (t.context or {}).get('review_loop', {}).get('head_sha') == head_sha]
 
         if not matching:
+            # No EVALUATING tasks match — check if this is a protected-branch CI failure
+            conclusion = check_run.get('conclusion')
+            head_branch = (check_run.get('check_suite') or {}).get('head_branch')
+            if conclusion == 'failure' and head_branch:
+                # Read auto-remediation config from project
+                auto_remediation_config = (project.design_doc or {}).get('_auto_remediation', {})
+                enabled = auto_remediation_config.get('enabled', False)
+                branch_whitelist = auto_remediation_config.get('branch_whitelist', ['main', 'master'])
+
+                if not enabled or head_branch not in branch_whitelist:
+                    return {'status': 'ignored_auto_remediation_disabled'}
+
+                from app.auto_remediation import _handle_main_branch_ci_failure
+                background_tasks.add_task(
+                    _handle_main_branch_ci_failure,
+                    owner=owner,
+                    repo=repo,
+                    head_sha=head_sha,
+                    head_branch=head_branch,
+                    project_id=project.id,
+                    config=auto_remediation_config,
+                )
+                return {'status': 'auto_remediation_triggered'}
+
             return {'status': 'no_match'}
 
         # Fetch full check status for this SHA (1 API call covers all check runs)

@@ -15,6 +15,8 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'PR_MERGED', label: 'PR Merged', description: 'When a pull request is merged', defaultOn: false },
   { key: 'DEPLOY_HEALTH_ALERT', label: 'Deploy Health Alert', description: 'Deployment state changes and health alerts', defaultOn: true },
   { key: 'BUDGET_EXCEEDED', label: 'Budget Exceeded', description: 'When projected cost exceeds budget ceiling', defaultOn: false },
+  { key: 'AUTO_FIX_SPAWNED', label: 'CI Auto-Fix Spawned', description: 'When Blueprint auto-spawns a fix task for a CI failure', defaultOn: false },
+  { key: 'AUTO_FIX_MERGED', label: 'CI Auto-Fix Merged', description: 'When a Blueprint auto-remediation fix PR is merged', defaultOn: false },
 ];
 
 interface SettingsNotificationsSectionProps {
