@@ -369,6 +369,11 @@ async def bulk_action_tasks(
         try:
             if body.action == 'retry':
                 task.status = TaskStatus.QUEUED
+                # If the task was FAILED/CANCELLED, the SQLAlchemy set event added
+                # task.id to _terminated_task_ids, revoking any outstanding JWT.
+                # Drop the cache entry so the next provisioned VM can claim.
+                from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                _terminated_task_ids.pop(str(task.id), None)
                 task_type = (task.first_payload).get("type", "")
                 is_parent_type = task_type in ("research", "plan")
                 from app.task_lifecycle import _requeue_parent_task

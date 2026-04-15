@@ -665,6 +665,12 @@ async def update_agent_status(
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
                         task.status = TaskStatus.QUEUED
+                        # The earlier FAILED assignment fired the SQLAlchemy set event
+                        # which added task.id to _terminated_task_ids, revoking the JWT.
+                        # Since we're requeuing, drop the cache entry so the next
+                        # provisioned VM can successfully claim.
+                        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                        _terminated_task_ids.pop(str(task.id), None)
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
                         task.started_at = None
@@ -752,6 +758,12 @@ async def update_agent_status(
         if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
             task.status = TaskStatus.QUEUED
+            # The earlier FAILED assignment fired the SQLAlchemy set event
+            # which added task.id to _terminated_task_ids, revoking the JWT.
+            # Since we're retrying, drop the cache entry so the next
+            # provisioned VM can successfully claim.
+            from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+            _terminated_task_ids.pop(str(task.id), None)
             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             task.last_heartbeat = None
             task.started_at = None  # Fresh timeout window for the new VM

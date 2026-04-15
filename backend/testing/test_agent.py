@@ -1521,3 +1521,201 @@ async def test_agent_create_pr_returns_cached_when_open(client: AsyncClient, db_
     assert resp.status_code == 200
     assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/7"
     mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_requeue_clears_terminated_cache(client: AsyncClient, db_session, mocker):
+    """
+    Regression test for the 401 cascade bug.
+
+    When an agent reports FAILED with a rate-limit failure, agent_status.py:359
+    sets task.status = FAILED, firing the SQLAlchemy set event that adds task.id
+    to _terminated_task_ids. Then the RATE_LIMIT requeue path overwrites the
+    status back to QUEUED. Without the fix, the cache entry persists — every
+    subsequent claim for the requeued task returns 401 until the 9-hour TTL
+    expires.
+
+    This test pins the fix: after a rate-limit requeue, _terminated_task_ids
+    must NOT contain the task_id.
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Rate Limit Requeue Test", user_id="test-user-rl-cache")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        vm_instance_id="agent-vm-rl-cache",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    # Make sure no stale cache entry exists from a prior test
+    _terminated_task_ids.pop(task_id_str, None)
+
+    token = create_agent_token(task_id_str, "agent-vm-rl-cache")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "rate_limited",
+        "logs": "You've hit your usage limit - View usage",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Task must be requeued, not left in a terminal state
+    assert task.status == TaskStatus.QUEUED, (
+        f"Rate-limited task should be requeued to QUEUED, got {task.status}"
+    )
+    # The fix: cache entry must be cleared so the next VM can claim the task
+    assert task_id_str not in _terminated_task_ids, (
+        f"Task {task_id_str} must not be in _terminated_task_ids after rate-limit "
+        f"requeue — entry would block every subsequent claim with 401 until the "
+        f"9-hour TTL expires."
+    )
+
+    # Clean up to avoid polluting other tests
+    _terminated_task_ids.pop(task_id_str, None)
+
+
+@pytest.mark.asyncio
+async def test_completed_terminal_populates_terminated_cache(client: AsyncClient, db_session, mocker):
+    """
+    Inverse of test_rate_limit_requeue_clears_terminated_cache: a genuinely
+    terminal COMPLETED status MUST populate _terminated_task_ids so the agent's
+    JWT is revoked and a second process can't reuse it.
+
+    Pins the intended semantics of the SQLAlchemy terminal callback.
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Terminal Cache Test", user_id="test-user-terminal-cache")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        vm_instance_id="agent-vm-terminal-cache",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+    token = create_agent_token(task_id_str, "agent-vm-terminal-cache")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": task_id_str,
+        "status": "COMPLETED",
+        "logs": "task finished",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    # The SQLAlchemy set event must have populated the cache for this truly
+    # terminal transition — otherwise verify_agent_token would accept the
+    # agent's old JWT for continued heartbeats.
+    assert task_id_str in _terminated_task_ids, (
+        f"Task {task_id_str} must be in _terminated_task_ids after COMPLETED so "
+        f"verify_agent_token revokes the agent's JWT."
+    )
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, db_session, mocker):
+    """
+    End-to-end regression: after a rate-limit requeue, a fresh VM must be able
+    to re-claim the task without hitting the 401 cascade. Before the fix, the
+    verify_agent_token dependency rejected every request for the requeued
+    task because _terminated_task_ids still contained the task_id.
+
+    We exercise the non-/api/agent/status code path (/api/agent/heartbeat) so
+    the cache check in verify_agent_token is actually reached.
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Rate Limit E2E Test", user_id="test-user-rl-e2e")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        vm_instance_id="agent-vm-rl-e2e-old",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+    # Step 1: old agent reports rate-limit FAILED → task requeued to QUEUED
+    old_token = create_agent_token(task_id_str, "agent-vm-rl-e2e-old")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "rate_limited",
+        "logs": "You've hit your usage limit - View usage",
+    }
+    resp = await client.post(
+        "/api/agent/status",
+        json=payload,
+        headers={"x-agent-token": old_token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+    # Step 2: orchestrator will later provision a new VM for this task. Simulate
+    # that VM's agent heartbeating with a JWT bound to the new vm_instance_id
+    # (which agent_status.py rewrote on requeue). The request must NOT be
+    # rejected with 401 — that would reproduce the cascade.
+    new_vm_id = task.vm_instance_id
+    assert new_vm_id != "agent-vm-rl-e2e-old", (
+        "Requeue path should rotate vm_instance_id so the next VM has its own identity"
+    )
+    new_token = create_agent_token(task_id_str, new_vm_id)
+    hb_resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": task_id_str, "status_message": "new VM started"},
+        headers={"x-agent-token": new_token},
+    )
+    assert hb_resp.status_code != 401, (
+        f"Heartbeat from fresh VM after rate-limit requeue must not return 401. "
+        f"Got {hb_resp.status_code}: {hb_resp.text}. This is the 401 cascade bug."
+    )
+
+    _terminated_task_ids.pop(task_id_str, None)
