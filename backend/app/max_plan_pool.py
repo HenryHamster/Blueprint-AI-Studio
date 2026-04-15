@@ -120,8 +120,8 @@ async def load_max_plan_pool():
                 try:
                     from app.secrets_manager import get_user_secret
                     token = await get_user_secret(token)
-                except Exception as e:
-                    logger.error(f"[POOL] Failed to fetch token from Secret Manager for account {acct.name}: {e}")
+                except Exception:
+                    logger.exception(f"[POOL] Failed to fetch token from Secret Manager for account {acct.name}")
                     token = None
             entry = {
                 "id": acct_id,

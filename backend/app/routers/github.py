@@ -273,7 +273,7 @@ async def github_webhook(
                     logger.info(f"[WEBHOOK] Duplicate delivery {delivery_id}, skipping (Redis)")
                     return {"status": "duplicate", "delivery_id": delivery_id}
             except Exception:
-                pass  # Fall through to in-memory check
+                logger.exception(f"[WEBHOOK] Redis dedup check failed for delivery {delivery_id}; falling through to in-memory")
         else:
             async with _webhook_dedup_lock:
                 now = time.time()

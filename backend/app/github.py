@@ -271,7 +271,7 @@ async def generate_installation_access_token(installation_id: str, repositories:
             headers, json=payload
         )
     except httpx.HTTPError as e:
-        logger.error(f"Network error generating installation token: {e}")
+        logger.exception("Network error generating installation token")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to reach GitHub API: {e}"
@@ -813,7 +813,7 @@ async def create_branch(
             logger.info(f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing")
             return {"ref": f"refs/heads/{branch_name}", "object": {"sha": existing_sha}}
         except Exception:
-            pass  # fall through to error below
+            logger.exception(f"Branch '{branch_name}' 422 but get_branch_sha also failed; falling through")
 
     if response.status_code != 201:
         logger.error(f"Failed to create branch: {response.status_code} {response.text}")
@@ -1365,7 +1365,7 @@ async def get_check_runs(
                         got_logs = True
                         break
                 except Exception:
-                    pass
+                    logger.exception(f"[CI LOGS] Failed to fetch logs for check-run {name}")
             if got_logs:
                 continue
 
@@ -1385,7 +1385,7 @@ async def get_check_runs(
                         line = ann.get("start_line", "")
                         log_lines.append(f"  [{name}] {path}:{line} — {msg}")
             except Exception:
-                pass
+                logger.exception(f"[CI LOGS] Failed to fetch annotations for check-run {name}")
 
             # Also include output summary if available
             output = cr.get("output", {})

@@ -257,7 +257,7 @@ def _check_base64_hidden_text(text: str, source: str) -> List[Dict[str, str]]:
                 f["severity"] = "high"  # Encoded injection is always high
                 f["category"] = "encoded_injection"
                 findings.append(f)
-        except Exception:
+        except Exception:  # noqa: S110 — malformed base64 is expected when scanning arbitrary diff hunks
             pass
     return findings
 

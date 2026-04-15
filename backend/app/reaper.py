@@ -351,8 +351,8 @@ async def reaper_service():
                                             f"[REAPER] Serial log for dying agent {vm_id} "
                                             f"(task {task.id}):\n{serial_log[-500:]}"
                                         )
-                                except Exception as capture_err:
-                                    logger.warning(f"[REAPER] Serial capture failed for {vm_id}: {capture_err}")
+                                except Exception:
+                                    logger.exception(f"[REAPER] Failed to capture serial log for VM {vm_id}")
 
                             # Blacklist the account so retry uses a different one.
                             blacklisted = list((task.context or {}).get("blacklisted_accounts") or [])
@@ -580,7 +580,7 @@ async def reaper_service():
             try:
                 await session.rollback()
             except Exception:
-                pass
+                logger.exception("[REAPER] Rollback after reaper error failed")
 
         # Sleep for 1 minute before checking again
         try:

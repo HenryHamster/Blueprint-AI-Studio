@@ -117,7 +117,7 @@ async def get_current_user(
             if admin_user and admin_user.firebase_uid:
                 admin_uid = admin_user.firebase_uid
         except Exception:
-            pass  # Fall back to literal if DB unavailable
+            logger.exception("Failed to resolve admin UID from DB; falling back to literal")
         return {"user_id": admin_uid, "email": "admin@system.local", "role": "admin"}
 
     try:

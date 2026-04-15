@@ -93,7 +93,7 @@ async def _release_provision_slot(vm_id: str):
         try:
             await r.zrem(_PROVISION_REDIS_KEY, vm_id)
         except Exception:
-            pass  # Best-effort — TTL will reclaim
+            logger.exception(f"[COMPUTE] Failed to release provision slot for {vm_id} (TTL will reclaim)")
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
@@ -160,7 +160,7 @@ def _validate_image_family() -> None:
         client.get_from_family(project=project, family=family_name)
         logger.info(f"[STARTUP] Image family '{family_name}' validated in project '{project}'")
     except Exception as e:
-        logger.error(f"[STARTUP] Image family validation failed: {e}")
+        logger.exception("[STARTUP] Image family validation failed")
         raise RuntimeError(f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}")
 
 _image_family_valid: Optional[bool] = None  # None = not yet checked, True/False = result
@@ -173,10 +173,10 @@ if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run �
         _validate_image_family()
         _image_family_valid = True
         _image_family_last_check = time.time()
-    except Exception as e:
+    except Exception:
         _image_family_valid = False
         _image_family_last_check = time.time()
-        logger.error(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s: {e}")
+        logger.exception(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s")
 
 from app.auth import create_agent_token  # must be after env vars are loaded above
 
@@ -251,9 +251,9 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                 _image_family_valid = True
                 _image_family_last_check = now
                 logger.info("[COMPUTE] Image family re-validation succeeded — provisioning re-enabled")
-            except Exception as e:
+            except Exception:
                 _image_family_last_check = now
-                logger.error(f"[COMPUTE] Image family re-validation still failing: {e}")
+                logger.exception("[COMPUTE] Image family re-validation still failing")
                 raise RuntimeError(
                     f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
                     f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
@@ -348,8 +348,8 @@ async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri:
 
         asyncio.create_task(_monitor())  # noqa: RUF006 — fire-and-forget monitor; lives for the subprocess lifetime
         return True
-    except Exception as e:
-        logger.error(f"[LOCAL] Failed to spawn agent: {e}")
+    except Exception:
+        logger.exception("[LOCAL] Failed to spawn agent")
         return False
 
 
@@ -363,8 +363,8 @@ async def _delete_local(vm_instance_id: str):
                 await asyncio.to_thread(proc.wait, timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        except Exception as e:
-            logger.error(f"[LOCAL] Failed to kill subprocess: {e}")
+        except Exception:
+            logger.exception("[LOCAL] Failed to kill subprocess")
             return False
     return True
 
@@ -901,8 +901,8 @@ STATICENV
                         _zone_failures.pop(wait_zone, None)
                     logger.info(f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)")
                     return operation.name
-                except Exception as retry_err:
-                    logger.error(f"Retry after cooldown wait failed for {wait_zone}: {retry_err}")
+                except Exception:
+                    logger.exception(f"Retry after cooldown wait failed for {wait_zone}")
                     raise
             else:
                 logger.critical(
@@ -927,7 +927,7 @@ STATICENV
         return True
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         _cancel_event.set()  # Signal thread to stop trying more zones
-        logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
+        logger.exception(f"Failed to provision VM {vm_instance_id}")
         _last_provision_error[vm_instance_id] = str(e)[:300]
         if len(_last_provision_error) > _PROVISION_ERROR_MAX:
             _last_provision_error.popitem(last=False)
@@ -935,7 +935,7 @@ STATICENV
         return False
     except Exception as e:
         _cancel_event.set()
-        logger.error(f"Failed to provision VM {vm_instance_id}: {e}")
+        logger.exception(f"Failed to provision VM {vm_instance_id}")
         _last_provision_error[vm_instance_id] = str(e)[:300]
         if len(_last_provision_error) > _PROVISION_ERROR_MAX:
             _last_provision_error.popitem(last=False)
@@ -980,7 +980,7 @@ def _delete_single_vm(vm_name: str, zone: str) -> bool:
     except Exception as e:
         if "was not found" in str(e) or "404" in str(e):
             return True  # Already gone
-        logger.error(f"[VM DELETE] Failed to delete {vm_name} in {zone}: {e}")
+        logger.exception(f"[VM DELETE] Failed to delete {vm_name} in {zone}")
         return False
 
 
@@ -994,8 +994,8 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
             project=GCP_PROJECT_ID, zone=zone, filter='name:agent-vm-'
         )
         results = [(instance.name, zone, instance.status) for instance in client.list(request=request)]
-    except Exception as e:
-        logger.error(f"[GCP CLEANUP] Failed to list VMs in zone {zone}: {e}")
+    except Exception:
+        logger.exception(f"[GCP CLEANUP] Failed to list VMs in zone {zone}")
     return results
 
 
@@ -1047,10 +1047,10 @@ async def _delete_gcp(vm_instance_id: str):
             await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
     except asyncio.TimeoutError:
-        logger.error(f"Timeout deleting VM {vm_instance_id} (>60s)")
+        logger.exception(f"Timeout deleting VM {vm_instance_id} (>60s)")
         return False
-    except Exception as e:
-        logger.error(f"Failed to terminate VM {vm_instance_id}: {e}")
+    except Exception:
+        logger.exception(f"Failed to terminate VM {vm_instance_id}")
         return False
 
 
@@ -1121,15 +1121,15 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
                     async with _gcp_ops_semaphore:
                         await asyncio.to_thread(_delete_agent_secret, name)
                 except Exception:
-                    pass
+                    logger.exception(f"[GCP CLEANUP] Failed to clean up secret for orphan {name}")
             else:
                 result.failed.append(name)
         except asyncio.TimeoutError:
             result.failed.append(name)
-            logger.error(f"[GCP CLEANUP] Timeout deleting orphan {name}")
-        except Exception as e:
+            logger.exception(f"[GCP CLEANUP] Timeout deleting orphan {name}")
+        except Exception:
             result.failed.append(name)
-            logger.error(f"[GCP CLEANUP] Exception deleting orphan {name}: {e}")
+            logger.exception(f"[GCP CLEANUP] Exception deleting orphan {name}")
 
     delete_tasks = [_delete_orphan(name, zone, status) for name, zone, status in orphans]
     await asyncio.gather(*delete_tasks, return_exceptions=True)

@@ -1,4 +1,5 @@
 """Alert, message, and playbook management endpoints."""
+import logging
 import re
 import uuid
 import json
@@ -17,6 +18,8 @@ from app.models import Alert, ProjectMember, ProjectMessage, MessageType, Projec
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -363,7 +366,7 @@ async def admin_playbook_list(
                         ts = ts.replace(tzinfo=None)
                     stale = (now_utc - ts).days >= _STALE_DAYS
                 except Exception:
-                    pass
+                    logger.exception(f"[PLAYBOOK] Failed to parse reference_ts={reference_ts}")
             else:
                 stale = True
             entries[short_key] = {

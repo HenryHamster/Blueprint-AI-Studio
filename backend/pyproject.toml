@@ -15,6 +15,8 @@ select = [
     "C4",    # flake8-comprehensions: replace map/filter with comprehensions
     "SIM",   # flake8-simplify: simplifiable code patterns (nested if, ternary, etc.)
     "PERF",  # perflint: performance anti-patterns (unnecessary list casts, manual comprehensions)
+    "TRY400", # use logger.exception in except blocks (captures traceback)
+    "S110",  # forbid try/except/pass (silent failures)
 ]
 # Skip typing-modernization rules — existing code uses Optional/List/Dict from typing and a
 # mass refactor is out of scope here. New code in app/ should use built-in generics, but we
