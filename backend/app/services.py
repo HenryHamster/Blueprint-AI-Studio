@@ -449,9 +449,11 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         f"CI wait backstop timeout after {hours}h ({reason})"
                     )
-                    from app.failure_classification import classify_failure  # noqa: PLC0415
+                    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
-                    record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
+                    _fc = classify_failure(task)
+                    persist_failure_category(task, _fc)
+                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
                     session.add(task)
                     children = (await session.execute(
                         select(Task).where(Task.parent_task_id == task.id)
@@ -534,9 +536,11 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         "Evaluation timeout — children did not complete within 6 hours"
                     )
-                    from app.failure_classification import classify_failure  # noqa: PLC0415
+                    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
-                    record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
+                    _fc = classify_failure(task)
+                    persist_failure_category(task, _fc)
+                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
                     session.add(task)
 
                     # Cascade-cancel non-terminal children

@@ -363,8 +363,9 @@ async def update_agent_status(
     if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
         task.latest_status_message = payload.logs[:2000]
     if payload.failure_category:
+        from app.failure_classification import normalize_agent_failure_category  # noqa: PLC0415
         ctx = dict(task.context or {})
-        ctx['failure_category'] = payload.failure_category
+        ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
         task.context = ctx
     session.add(task)
 
@@ -620,6 +621,8 @@ async def update_agent_status(
                         logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
+                from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                persist_failure_category(task, failure_class)
                 record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
                 _shared_state.tasks_failed_total += 1
 

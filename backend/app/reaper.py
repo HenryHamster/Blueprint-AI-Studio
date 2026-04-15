@@ -34,7 +34,7 @@ async def reaper_service():
         _maybe_create_failure_alert,
     )
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
     from app.broadcast import broadcast_to_project  # noqa: PLC0415
     from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
     from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
@@ -406,9 +406,7 @@ async def reaper_service():
                             extra_log_parts.append(provision_err or "")
                         extra_logs = " ".join(filter(None, extra_log_parts))
                         failure_class = classify_failure(task, logs=extra_logs or None)
-                        fail_ctx = dict(task.context or {})
-                        fail_ctx["failure_category"] = failure_class
-                        task.context = fail_ctx
+                        persist_failure_category(task, failure_class)
                         record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
                         session.add(task)
                         await _maybe_create_failure_alert(task, session)
