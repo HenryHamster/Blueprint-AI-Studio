@@ -631,14 +631,24 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
+                confirmed = v.get("confirmed_count", 0)
+                referenced = v.get("reference_count", 0)
+                # Demote entries with high reference count but zero confirmations
+                ineffective = 1 if (referenced >= 10 and confirmed == 0) else 0
+                if ineffective:
+                    logger.info(
+                        "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
+                        short_key, referenced,
+                    )
                 _playbook_candidates.append((
-                    -v.get("confirmed_count", 0),
-                    -v.get("reference_count", 0),
+                    ineffective,
+                    -confirmed,
+                    -referenced,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, _, short_key, content in _playbook_candidates:
+        for _, _, _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
