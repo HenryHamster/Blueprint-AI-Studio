@@ -32,7 +32,7 @@ async def reaper_service():
     Marks them as FAILED and issues a delete command to GCP if they haven't sent a heartbeat in 5 minutes.
     """
     # Deferred imports to avoid circular dependency with app.main
-    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
+    from app.max_plan_pool import release_max_plan_account, disable_account_model, _extract_task_model  # noqa: PLC0415
     from app.main import (  # noqa: PLC0415
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
@@ -218,6 +218,19 @@ async def reaper_service():
                     if is_rate_limited:
                         rl_acct_id = (task.context or {}).get("max_plan_account_id")
                         logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")
+                        # Disable the exhausted model on the account so the orchestrator's
+                        # blacklist pruning preserves this entry on the next dispatch cycle.
+                        # Without this, the pool sees disabled_models empty, _account_available
+                        # returns True, and the same account gets re-selected immediately.
+                        rl_model = _extract_task_model(task)
+                        if not rl_model:
+                            _rl_task_type = (task.first_payload or {}).get("type", "create")
+                            rl_model = _runtime_config.get("task_type_models", {}).get(_rl_task_type)
+                        if rl_acct_id and rl_model:
+                            try:
+                                await disable_account_model(rl_acct_id, rl_model)
+                            except Exception as _disable_err:
+                                logger.warning(f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: {_disable_err}")
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None

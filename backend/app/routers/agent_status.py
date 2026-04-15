@@ -16,10 +16,10 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
-from app.database import get_session, AsyncSessionLocal
+from app.database import get_session
 from app.models import (
     Task, Artifact, TaskHistory, Alert, AlertSeverity,
-    TaskStatus, ArtifactType, MaxPlanAccount, Project,
+    TaskStatus, ArtifactType, Project,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import limiter
@@ -31,12 +31,12 @@ from app.routers.agent import verify_agent_token
 from app.max_plan_pool import (
     _max_plan_pool_lock,
     _account_by_id,
-    _pending_rl_persists,
     release_max_plan_account,
     _account_available_for_model,
     _max_plan_pools,
     _extract_task_model,
-    cascade_disabled_models,
+    clear_rate_limit_state_on_success,
+    disable_account_model,
 )
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
@@ -603,6 +603,15 @@ async def update_agent_status(
             if payload.status == TaskStatus.COMPLETED:
                 record_task_result(success=True, task_id=str(task.id))
                 _shared_state.tasks_completed_total += 1
+                # Probe success: clear cascade-scoped disabled_models entries.
+                # No-op if the account wasn't probing anything for this model.
+                acct_id_clear = (task.context or {}).get("max_plan_account_id")
+                model_clear = _extract_task_model(task)
+                if acct_id_clear and model_clear:
+                    try:
+                        await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
+                    except Exception as e:
+                        logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
                 record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
@@ -618,45 +627,9 @@ async def update_agent_status(
                         task.context = {**(task.context or {}), "_slot_released": True}
                         if failure_class == "RATE_LIMIT" and model:
                             # Only disable a specific model when we know which one hit the limit.
-                            # Previously defaulted to sonnet, causing false rate-limit marks.
-                            rl_model = model
-                            # Cascade: Opus 429 implies Sonnet/Haiku are also blocked
-                            # (shared session quota on Claude Max plan), so mark the
-                            # whole downstream tier at once. Asymmetric by design.
-                            cascade_models = cascade_disabled_models(rl_model)
-                            async with _max_plan_pool_lock:
-                                acct = _account_by_id.get(acct_id)
-                                if acct:
-                                    dm = acct.setdefault("disabled_models", {})
-                                    now = _utcnow()
-                                    for m in cascade_models:
-                                        info = dm.setdefault(m, {"hits": 0})
-                                        info["hits"] += 1
-                                        info["at"] = now
-                                    primary_hits = dm[rl_model]["hits"]
-                                    cooldown = min(30 * (2 ** (primary_hits - 1)), 240)
-                                    cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
-                                    logger.warning(f"[POOL] Account {acct['name']} disabled models {list(cascade_models)} (primary {rl_model} hit #{primary_hits}, cooldown {cooldown:.0f}min)")
-                                # Persist rate-limit state to DB so it survives deploys
-                                if acct:
-                                    try:
-                                        async with AsyncSessionLocal() as rl_session:
-                                            db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct_id))
-                                            if db_acct:
-                                                dm = acct.get("disabled_models", {})
-                                                db_acct.rate_limit_state = {
-                                                    "disabled_models": {
-                                                        m: {"hits": i["hits"], "at": i["at"].isoformat()}
-                                                        for m, i in dm.items()
-                                                    }
-                                                } if dm else None
-                                                db_acct.enabled = acct.get("enabled", True)
-                                                rl_session.add(db_acct)
-                                                await rl_session.commit()
-                                    except Exception as e:
-                                        logger.warning(f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry")
-                                        if acct_id not in _pending_rl_persists:
-                                            _pending_rl_persists.append(acct_id)
+                            # cascade_disabled_models() inside the helper handles tier cascading
+                            # (Opus 429 → sonnet + haiku disabled too).
+                            await disable_account_model(acct_id, model)
                         # EXTERNAL_API: don't disable account (transient outage)
 
                     # Track API failure retries to prevent infinite loops
