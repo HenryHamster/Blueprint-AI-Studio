@@ -4,8 +4,9 @@ import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
-import type { BuildConfig, AutoRemediationConfig } from '../types/project';
-import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench } from 'lucide-react';
+import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
+import type { BuildConfig, AutoRemediationConfig, IssueImplementationConfig } from '../types/project';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
 import type { DeployState, MaxPlanAccount } from '../types/settings';
@@ -102,6 +103,9 @@ interface SettingsDropdownProps {
   // Auto-remediation config (project-scoped)
   autoRemediationConfig: AutoRemediationConfig | null;
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
+  // Issue implementation config (project-scoped)
+  issueImplementationConfig: IssueImplementationConfig | null;
+  onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
 }
 
 
@@ -124,7 +128,7 @@ const ALL_PROMPT_SUFFIX_TYPES = [
   'investigate', 'rollup', 'strategic_review', 'design_doc_update',
 ] as const;
 
-type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation';
+type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -135,6 +139,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
   { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
+  { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -229,6 +234,8 @@ export function SettingsDropdown({
   onDetectBuildConfig,
   autoRemediationConfig,
   onUpdateAutoRemediationConfig,
+  issueImplementationConfig,
+  onUpdateIssueImplementationConfig,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -957,6 +964,17 @@ export function SettingsDropdown({
     );
   }
 
+  function renderIssueImplementation() {
+    return (
+      <ProjectIssueImplementationSection
+        githubOwner={selectedProjectOwner}
+        githubRepo={selectedProjectRepo}
+        config={issueImplementationConfig}
+        onSave={onUpdateIssueImplementationConfig}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
@@ -967,6 +985,7 @@ export function SettingsDropdown({
       case 'notifications': return renderNotifications();
       case 'build-config': return renderBuildConfig();
       case 'auto-remediation': return renderAutoRemediation();
+      case 'issue-implementation': return renderIssueImplementation();
       case 'advanced': return renderAdvanced();
     }
   }
