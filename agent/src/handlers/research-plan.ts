@@ -1165,13 +1165,34 @@ ${designDocHighlight}${designDocSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${anomalySection}
 # DEDUP — do not re-propose these
-${recentlyCompleted.length > 0
-  ? recentlyCompleted.map(t => {
+${(() => {
+  const lines: string[] = [];
+  if (activeTasks.length > 0) {
+    lines.push('## Active (IN_PROGRESS / EVALUATING)');
+    for (const t of activeTasks) {
+      const dirId = strVal(t['direction_id']);
+      const dirAttr = dirId ? ` [direction: ${dirId}]` : '';
+      lines.push(`- [${strVal(t['task_type'])}] ${strVal(t['title'])} (active)${dirAttr}`);
+    }
+  }
+  if (queuedTasks.length > 0) {
+    lines.push('## Queued (awaiting execution)');
+    for (const t of queuedTasks) {
+      const dirId = strVal(t['direction_id']);
+      const dirAttr = dirId ? ` [direction: ${dirId}]` : '';
+      lines.push(`- [${strVal(t['task_type'])}] ${strVal(t['title'])} (queued)${dirAttr}`);
+    }
+  }
+  if (recentlyCompleted.length > 0) {
+    lines.push('## Recently completed / failed / merged');
+    for (const t of recentlyCompleted) {
       const status = t.status ?? 'completed';
       const label = status === 'failed' ? '(FAILED)' : status === 'cancelled' ? '(cancelled)' : '(merged)';
-      return `- [${t.task_type}] ${t.title} ${label}`;
-    }).join('\n')
-  : '(none yet)'}
+      lines.push(`- [${t.task_type}] ${t.title} ${label}`);
+    }
+  }
+  return lines.length > 0 ? lines.join('\n') : '(none yet)';
+})()}
 
 # HOW TO RESEARCH
 
