@@ -455,11 +455,13 @@ export async function handleFix(
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
     await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
 
-    const { testFailuresDetected: fixTestFailures } = await testFixLoop(ws, statusRef, model, effort, buildConfig);
+    const { testFailuresDetected: fixTestFailures, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig);
 
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
-    const testNote = fixTestFailures ? '\n\nNote: test failures detected, manual review recommended' : '';
+    const testNote = fixTestFailures
+      ? `\n\nNote: test failures detected, manual review recommended${fixTestFailureSummary ? `:\n${fixTestFailureSummary.slice(0, 500)}` : ''}`
+      : '';
     // Only create a new commit if there are uncommitted changes (Claude may have already committed)
     const fixStaged = git(['status', '--porcelain']);
     if (fixStaged.length > 0) {

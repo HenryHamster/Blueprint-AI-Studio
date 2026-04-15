@@ -25,6 +25,8 @@ vi.mock('fs', () => ({
     existsSync: vi.fn().mockReturnValue(false),
     appendFileSync: vi.fn(),
     mkdirSync: vi.fn(),
+    openSync: vi.fn().mockReturnValue(3),
+    closeSync: vi.fn(),
   },
 }));
 
@@ -50,8 +52,8 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, type FailureCategory } from './index.js';
-import { execFileSync } from 'child_process';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, type FailureCategory } from './index.js';
+import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {
@@ -375,5 +377,58 @@ describe('runProjectLintChecks', () => {
     // Should use hardcoded ruff check (via execFileSync for the try/catch ruff path)
     // We just verify it doesn't throw and execFileSync was called for something
     expect(typeof runProjectLintChecks).toBe('function');
+  });
+});
+
+// ── testFixLoop failureSummary ────────────────────────────────────────────────
+describe('testFixLoop failureSummary', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    // Make spawn immediately emit 'close' with exit code 0 so runClaudeCode resolves
+    vi.mocked(spawn).mockImplementation(() => {
+      const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+      const proc = {
+        pid: 123,
+        stderr: { on: vi.fn() },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (!handlers[event]) handlers[event] = [];
+          handlers[event].push(cb);
+          if (event === 'close') setImmediate(() => cb(0));
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+  });
+
+  it('returns undefined failureSummary when tests pass', async () => {
+    // Provide a buildConfig with a test_cmd so a runner is created
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    // execFileSync succeeds (tests pass)
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+
+    expect(result.passed).toBe(true);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.failureSummary).toBeUndefined();
+  });
+
+  it('returns failureSummary with combined failure messages when tests fail after all attempts', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    const errorMessage = 'Error: Test suite failed\n  at Object.<anonymous> (test.ts:10:5)';
+    // execFileSync throws only for 'npm' (the test runner), not for 'git'
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errorMessage);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.failureSummary).toBeDefined();
+    expect(result.failureSummary).toContain(errorMessage);
   });
 });

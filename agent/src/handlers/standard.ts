@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
-  runClaudeCode, lintFixLoop, testFixLoop,
+  runClaudeCode, lintFixLoop, testFixLoop, matchesRateLimit,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -114,22 +114,36 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
     if (runLintFix) {
-      await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
+      const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
+      if (!lintPassed && failOnTestFailure) {
+        sendLog(ws, 'Lint checks still failing after max attempts — marking task as FAILED.\n');
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
+          failure_category: 'lint_failed',
+        });
+        return;
+      }
     }
 
     let testFailuresDetected = false;
     let testsPassed = true;
+    let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
       const result = await testFixLoop(ws, statusRef, model, effort, buildConfig);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
+      testFailureSummary = result.failureSummary;
     }
 
     if (failOnTestFailure && baseBranch === 'main' && testFailuresDetected && !testsPassed) {
       sendLog(ws, 'Tests failed after max fix attempts — marking task as FAILED.\n');
+      const failedLogs = testFailureSummary
+        ? `Test suite failed after max fix attempts. Failing tests:\n${testFailureSummary}`
+        : `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`;
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`,
+        logs: failedLogs,
         failure_category: 'test_failed',
       });
       return;
@@ -188,16 +202,29 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
+      let selfReviewFailed = false;
       for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
-        await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+        const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+        if (reviewExitCode !== 0) {
+          if (matchesRateLimit(reviewOutput)) {
+            sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
+          } else {
+            sendLog(ws, `\nWARNING: Self-review could not complete (exit code ${reviewExitCode}), proceeding without review.\n`);
+          }
+          selfReviewFailed = true;
+          break;
+        }
       }
 
-      const headAfterReview = git(['rev-parse', 'HEAD']);
-      const statusAfterReview = git(['status', '--porcelain']);
-      const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
-
-      selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
-      sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+      if (selfReviewFailed) {
+        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false };
+      } else {
+        const headAfterReview = git(['rev-parse', 'HEAD']);
+        const statusAfterReview = git(['status', '--porcelain']);
+        const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
+        selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
+        sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+      }
     }
 
     git(['add', '-A']);
@@ -247,7 +274,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       } catch { /* grep exit 1 means no matches — good */ }
     }
 
-    const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
+    const commitNote = testFailuresDetected
+      ? `\n\nNote: test failures detected, manual review recommended${testFailureSummary ? `:\n${testFailureSummary.slice(0, 500)}` : ''}`
+      : '';
     // Only create a new commit if there are staged changes — Claude may have
     // already committed, and lint/test fix loops may not have added new changes.
     const staged = git(['status', '--porcelain']);
@@ -258,7 +287,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let prBody = `## Summary\n\n${lastResultText.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
     if (runTestFix) {
       const testSummary = testsPassed ? '\u2705 Tests passed' : testFailuresDetected ? '\u26a0\ufe0f Test failures detected' : '\u26a0\ufe0f Could not run tests';
-      prBody += `## Test Results\n\n${testSummary}\n\n`;
+      const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
+      prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
@@ -278,6 +308,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
+      ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
