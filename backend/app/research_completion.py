@@ -425,7 +425,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             Task.status.in_([TaskStatus.QUEUED, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING, TaskStatus.PROVISIONING])
         )
     )).scalars().all()
-    existing_titles = [t.title.lower() for t in existing_tasks]
+    # Build (direction_id, title) pairs to enable direction-aware dedup thresholds
+    existing_tasks_with_dirs = [
+        ((t.context or {}).get("direction_id"), t.title.lower())
+        for t in existing_tasks
+    ]
 
     # Query recent tasks (last 90 days) for hash-based deduplication across research cycles
     ninety_days_ago = _utcnow() - timedelta(days=90)
@@ -499,9 +503,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             Artifact.pr_url.isnot(None),
             Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
         )
-        .limit(20)
+        .limit(200)
     )
     open_pr_rows = (await session.execute(open_pr_stmt)).all()
+    if len(open_pr_rows) >= 200:
+        logger.warning(f"[RESEARCH] open PR artifact query hit 200-row cap for project {task.project_id} — file-overlap dedup may be incomplete")
     open_pr_files: set[str] = set()
     for _, _, task_ctx in open_pr_rows:
         if task_ctx:
@@ -511,14 +517,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     def _finding_hash(title: str, description: str) -> str:
         return hashlib.sha256((title + description).encode()).hexdigest()[:16]
 
-    def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
+    def _is_duplicate(finding_title: str, finding_dir_id: str | None, existing: list[tuple]) -> bool:
         STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
                      'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
                      'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
         words = set(finding_title.lower().split()) - STOPWORDS
-        for title in existing:
+        for task_dir_id, title in existing:
             overlap = words & (set(title.lower().split()) - STOPWORDS)
-            if len(overlap) >= 4:  # 4+ meaningful words in common
+            # Cross-direction: require 6+ word overlap. Independent strategic tracks rarely
+            # produce true duplicates, so a higher threshold avoids false positives.
+            # If either direction is unknown (None), treat as same-direction (safer default).
+            same_direction = (
+                not finding_dir_id
+                or not task_dir_id
+                or finding_dir_id == task_dir_id
+            )
+            threshold = 4 if same_direction else 6
+            if len(overlap) >= threshold:
                 return True
         return False
 
@@ -530,7 +545,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     indexed_findings.sort(key=lambda x: priority_order.get(x[1].get("priority", "medium"), 1))
 
     # Deduplicate findings against recent tasks
-    skipped_duplicates = 0
+    hash_dedup_count = 0
+    word_overlap_count = 0
+    file_overlap_count = 0
+    type_filtered_count = 0
+    empty_prompt_count = 0
     deduplicated: list[tuple[int, dict, str]] = []  # (orig_i, finding, fhash)
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i+1}")
@@ -539,17 +558,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if fhash in recent_finding_hashes:
             outcome = failed_hashes.get(fhash, "prior")
             logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {outcome} task")
-            skipped_duplicates += 1
+            hash_dedup_count += 1
             continue
-        if _is_duplicate(title, existing_titles):
+        finding_dir_id = finding.get("direction_id") or (task.context or {}).get("direction_id")
+        if _is_duplicate(title, finding_dir_id, existing_tasks_with_dirs):
             logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
-            skipped_duplicates += 1
+            word_overlap_count += 1
             continue
         # Skip if all related_files for this finding are already covered by open PRs
         finding_files = set(finding.get('related_files', []))
         if finding_files and finding_files.issubset(open_pr_files):
             logger.info(f"[RESEARCH] Skipping finding '{title}' — all related files already have open PRs")
-            skipped_duplicates += 1
+            file_overlap_count += 1
             continue
         deduplicated.append((orig_i, finding, fhash))
 
@@ -584,15 +604,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 obs_project.design_doc = doc
                 flag_modified(obs_project, "design_doc")
                 session.add(obs_project)
+            type_filtered_count += 1
             continue  # Don't create a task
 
         if finding_type == "direction_update":
             # Process as a direction modification proposal, not a task
             target_id = finding.get("direction_id")
             if not target_id:
+                type_filtered_count += 1
                 continue  # direction_update requires a target direction_id
             dir_project = await session.get(Project, task.project_id)
             if not dir_project:
+                type_filtered_count += 1
                 continue
             directions = list(dir_project.directions or [])
             for d in directions:
@@ -609,9 +632,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             dir_project.directions = directions
             flag_modified(dir_project, "directions")
             session.add(dir_project)
+            type_filtered_count += 1
             continue  # Don't create a task for direction_update findings
 
         if not prompt:
+            empty_prompt_count += 1
             continue
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
@@ -751,7 +776,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             direction_ids_with_findings.add(did)
     # If all findings were deduped, still put the current direction on cooldown
     current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
+    skipped_duplicates = hash_dedup_count + word_overlap_count + file_overlap_count
     all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
+    # Build filter breakdown string (computed here so it's available for summary artifact below)
+    _filter_parts = []
+    if hash_dedup_count:
+        _filter_parts.append(f"{hash_dedup_count} hash-dedup")
+    if word_overlap_count:
+        _filter_parts.append(f"{word_overlap_count} word-overlap")
+    if file_overlap_count:
+        _filter_parts.append(f"{file_overlap_count} file-overlap")
+    if type_filtered_count:
+        _filter_parts.append(f"{type_filtered_count} type-filtered")
+    if empty_prompt_count:
+        _filter_parts.append(f"{empty_prompt_count} empty-prompt")
+    _filter_str = f" ({', '.join(_filter_parts)} skipped)" if _filter_parts else ""
     if all_deduped and current_direction_id:
         direction_ids_with_findings.add(current_direction_id)
     if direction_ids_with_findings:
@@ -794,6 +833,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
                         "finding_titles": titles,
                         "key_finding_descriptions": descriptions,
+                        "filter_breakdown": {
+                            "hash_dedup": hash_dedup_count,
+                            "word_overlap_dedup": word_overlap_count,
+                            "file_overlap_dedup": file_overlap_count,
+                            "type_filtered": type_filtered_count,
+                            "empty_prompt": empty_prompt_count,
+                        },
                     }
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
                     new_history = history + [entry]
@@ -986,7 +1032,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         summary_lines = [
             f'# Research Summary',
             f'**Direction**: {direction_texts[0][:200] if direction_texts else "general"}',
-            f'**Tasks Created**: {len(child_tasks)} ({skipped_duplicates} duplicates skipped)',
+            f'**Tasks Created**: {len(child_tasks)}{_filter_str}',
             f'',
             f'## Findings:',
         ]
@@ -1005,7 +1051,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_id = (task.context or {}).get("direction_id", "?")
     status_msg = (
         f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
-        + (f" ({skipped_duplicates} skipped as duplicates)" if skipped_duplicates else "")
+        + _filter_str
         + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
     )
 
@@ -1015,10 +1061,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
         session.add(task)
 
+        _note_parts = []
+        if skipped_duplicates:
+            _note_parts.append(f"{skipped_duplicates} duplicate(s) skipped"
+                               + (f" ({hash_dedup_count} hash-match, {word_overlap_count} word-overlap,"
+                                  f" {file_overlap_count} file-overlap)"
+                                  if hash_dedup_count or word_overlap_count or file_overlap_count else ""))
+        if type_filtered_count:
+            _note_parts.append(f"{type_filtered_count} type-filtered (design_doc_observation/direction_update)")
+        if empty_prompt_count:
+            _note_parts.append(f"{empty_prompt_count} had no prompt")
+        _note_filter = ("; ".join(_note_parts) + ".") if _note_parts else "not actionable."
         note = (
-            f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks"
-            f" ({skipped_duplicates} duplicates skipped). "
-            "All findings were either already addressed or not actionable."
+            f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks: "
+            + _note_filter
         )
         project = await session.get(Project, task.project_id)
         if project and str(direction_id) != "?" and direction_id != "crosscutting":
