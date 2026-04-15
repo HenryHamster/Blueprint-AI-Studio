@@ -560,6 +560,7 @@ async def claim_task(
     if project_for_playbook and project_for_playbook.design_doc:
         task_type = (task.first_payload).get("type", "create")
         playbook_entries = {}
+        _playbook_candidates = []
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 applicable_types = v.get("applicable_types")
@@ -569,7 +570,15 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
-                playbook_entries[short_key] = v.get("content", "")
+                _playbook_candidates.append((
+                    -v.get("confirmed_count", 0),
+                    -v.get("reference_count", 0),
+                    short_key,
+                    v.get("content", ""),
+                ))
+        _playbook_candidates.sort()
+        for _, _, short_key, content in _playbook_candidates:
+            playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
         )

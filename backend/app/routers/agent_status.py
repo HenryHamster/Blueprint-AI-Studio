@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
 from app.models import (
@@ -808,6 +809,7 @@ async def update_agent_status(
                 _ctx["_first_attempt_succeeded"] = _compute_first_attempt_succeeded(
                     task.attempt_count, payload.status
                 )
+                _proj = None
                 try:
                     _proj = await session.get(Project, task.project_id)
                     _playbook_count = sum(
@@ -823,6 +825,34 @@ async def update_agent_status(
                         f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
                         f"type={task.first_payload.get('type', 'unknown')}"
                     )
+                # Increment confirmed_count on applicable playbook entries for successful first attempts
+                if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
+                    try:
+                        _task_type = task.first_payload.get("type", "create")
+                        _PLAYBOOK_DEFAULT_TYPES = {
+                            "create", "fix", "refactor", "review", "qa", "smoketest",
+                            "deps", "migrate", "debug", "docs",
+                        }
+                        _doc = dict(_proj.design_doc or {})
+                        _confirmed_changed = False
+                        for _pk, _pv in list(_doc.items()):
+                            if _pk.startswith("playbook/") and isinstance(_pv, dict):
+                                _applicable = _pv.get("applicable_types")
+                                if _applicable is not None:
+                                    if _task_type not in _applicable:
+                                        continue
+                                elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
+                                    continue
+                                _entry = dict(_pv)
+                                _entry["confirmed_count"] = _entry.get("confirmed_count", 0) + 1
+                                _doc[_pk] = _entry
+                                _confirmed_changed = True
+                        if _confirmed_changed:
+                            _proj.design_doc = _doc
+                            flag_modified(_proj, "design_doc")
+                            session.add(_proj)
+                    except Exception as _pce:
+                        logger.warning(f"[PLAYBOOK] Failed to increment confirmed_count for task {task.id}: {_pce}")
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
 

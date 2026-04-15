@@ -153,6 +153,24 @@ ${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Co
 
 ${buildTypeCheckInstructions(reviewBuildConfig)}
 
+**Severity Classification Guide:**
+Use these definitions when assigning severity to issues. Severity affects how the review appears in GitHub (critical = failure annotation, major = warning, minor = notice).
+
+- **CRITICAL** — Issues that could cause security vulnerabilities, data loss, crashes, or correctness bugs in production. Examples:
+  - SQL/command injection from unsanitized user input passed directly to a query or shell
+  - Missing auth check on a new endpoint that exposes sensitive data
+  - Off-by-one in a loop that silently skips or double-processes records in a DB migration
+
+- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, or violations of the codebase's established patterns. Examples:
+  - Async function whose rejection is silently swallowed (missing try/catch or .catch())
+  - New API endpoint with no test coverage at all
+  - New code that bypasses an existing invariant (e.g., writing to a field that has a single designated writer elsewhere in the codebase)
+
+- **MINOR** — Style inconsistencies, naming suggestions, documentation gaps, or optional improvements that do not affect correctness. Examples:
+  - Variable named \`data\` where \`userRecord\` would be clearer
+  - Missing docstring on a public function
+  - Redundant else after a return statement
+
 After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
 
 If the changes look good and should be merged:

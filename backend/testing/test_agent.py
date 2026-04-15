@@ -1005,6 +1005,166 @@ async def test_playbook_claim_increments_reference_count(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
+async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_session):
+    """
+    Playbook entries returned by claim are sorted by confirmed_count descending,
+    then reference_count descending as tiebreaker. Most-validated entries come first.
+    """
+    project = Project(name="Playbook Order Test", user_id="test-user-order")
+    project.design_doc = {
+        "playbook/low-count": {
+            "content": "low confirmed",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 10,
+        },
+        "playbook/high-count": {
+            "content": "high confirmed",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 5,
+            "reference_count": 2,
+        },
+        "playbook/tiebreak": {
+            "content": "same confirmed, more references",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 5,
+            "reference_count": 8,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-order-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-order-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # confirmed_count=5 entries first; among those, reference_count=8 before reference_count=2
+    assert keys.index("tiebreak") < keys.index("high-count")
+    assert keys.index("high-count") < keys.index("low-count")
+
+
+@pytest.mark.asyncio
+async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a task completes on first attempt and the project has playbook entries,
+    confirmed_count is incremented for entries applicable to that task type.
+    Entries not applicable to the task type are NOT incremented.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    project = Project(name="Playbook Confirm Test", user_id="test-user-confirm")
+    project.design_doc = {
+        "playbook/create-entry": {
+            "content": "create guidance",
+            "applicable_types": ["create", "fix"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+        },
+        "playbook/review-only": {
+            "content": "review guidance",
+            "applicable_types": ["review"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-confirm-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-confirm-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    # create-entry is applicable to 'create' tasks — confirmed_count should be incremented
+    assert project.design_doc["playbook/create-entry"]["confirmed_count"] == 3
+    # review-only is NOT applicable to 'create' tasks — confirmed_count unchanged
+    assert project.design_doc["playbook/review-only"]["confirmed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_playbook_confirmed_count_not_incremented_on_retry_success(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a task completes after retries (attempt_count >= 2), confirmed_count
+    is NOT incremented — only first-attempt successes count as confirmation.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    project = Project(name="Playbook No Confirm Retry", user_id="test-user-no-confirm")
+    project.design_doc = {
+        "playbook/some-entry": {
+            "content": "some guidance",
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-no-confirm-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,  # not first attempt
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-confirm-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    # attempt_count=2 → _first_attempt_succeeded=False → confirmed_count unchanged
+    assert project.design_doc["playbook/some-entry"]["confirmed_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
     Admin playbook list endpoint returns reference_count, last_referenced_at, and stale flag.
