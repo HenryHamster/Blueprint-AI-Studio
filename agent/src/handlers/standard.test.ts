@@ -17,7 +17,7 @@ vi.mock('../index.js', () => ({
   setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
   pushAndCreatePR: vi.fn().mockResolvedValue('https://github.com/owner/repo/pull/1'),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  lintFixLoop: vi.fn().mockResolvedValue(undefined),
+  lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
@@ -79,7 +79,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, git } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, git, lintFixLoop, persistAndPostStatus } from '../index.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -484,6 +484,38 @@ describe('testFixLoop buildConfig propagation', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
       WS, expect.any(Object), undefined, undefined, undefined,
+    );
+  });
+});
+
+// ── Lint failure handling ─────────────────────────────────────────────────────
+describe('lint failure handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+  });
+
+  it('marks task as FAILED when lintFixLoop returns false for a create task', async () => {
+    vi.mocked(lintFixLoop).mockResolvedValue(false);
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'lint_failed' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('does not mark task as FAILED when lintFixLoop returns true', async () => {
+    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'lint_failed' }),
     );
   });
 });

@@ -114,7 +114,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
     if (runLintFix) {
-      await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
+      const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
+      if (!lintPassed && failOnTestFailure) {
+        sendLog(ws, 'Lint checks still failing after max attempts — marking task as FAILED.\n');
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
+          failure_category: 'lint_failed',
+        });
+        return;
+      }
     }
 
     let testFailuresDetected = false;
