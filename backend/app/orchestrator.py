@@ -166,6 +166,70 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
+async def _check_candidate_task_deps(
+    task: Task,
+    dep_tasks: list,
+    dep_uuids: list,
+    session: "AsyncSession",
+    verify_pr_merged,
+) -> tuple[str, dict]:
+    """Check whether a candidate task's dependencies are satisfied.
+
+    Handles requeue-cancelled dependencies: if a dep task is CANCELLED but has
+    ``_replaced_by_task_id`` in its context (set by ``_requeue_parent_task``),
+    the replacement clone's status is used instead of treating the dependency as
+    permanently failed.
+
+    Returns:
+        (result, deps_remapped) where:
+        - result is ``'cascade_cancel'``, ``'eligible'``, or ``'waiting'``
+        - deps_remapped maps old cancelled dep IDs to replacement IDs (for
+          persisting remap so future cycles skip the lookup)
+    """
+    all_met = True
+    any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
+    deps_remapped: dict[str, str] = {}
+
+    for dt in dep_tasks:
+        effective_dt = dt
+        if dt.status == TaskStatus.CANCELLED:
+            replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
+            if replacement_id_str:
+                try:
+                    replacement = await session.get(Task, uuid.UUID(replacement_id_str))
+                except (ValueError, AttributeError):
+                    replacement = None
+                if replacement:
+                    deps_remapped[str(dt.id)] = str(replacement.id)
+                    effective_dt = replacement
+                else:
+                    # Replacement task is gone — treat as permanently cancelled
+                    any_failed = True
+                    break
+            else:
+                # Permanently cancelled (no replacement recorded)
+                any_failed = True
+                break
+
+        if effective_dt.status in [TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            any_failed = True
+            break
+        if effective_dt.status != TaskStatus.COMPLETED:
+            all_met = False
+            continue
+        # For create tasks, also require PR to be merged
+        dt_type = (effective_dt.first_payload).get("type", "create")
+        if dt_type in ("create", "") and not await verify_pr_merged(effective_dt, session):
+            all_met = False
+
+    if any_failed:
+        return "cascade_cancel", deps_remapped
+    elif all_met:
+        return "eligible", deps_remapped
+    else:
+        return "waiting", deps_remapped
+
+
 async def orchestrator_worker():
     """
     Background worker that polls for QUEUED tasks and provisions VMs.
@@ -427,19 +491,28 @@ async def orchestrator_worker():
                         missing = [d for d in deps if d not in found_ids]
                         logger.error(f"[ORCHESTRATOR] Task {task.id} has {len(missing)} deleted dependencies: {missing}")
 
-                    all_met = True
-                    any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
-                    for dt in dep_tasks:
-                        if dt.status in [TaskStatus.FAILED, TaskStatus.CANCELLED]:
-                            any_failed = True
-                            break
-                        if dt.status != TaskStatus.COMPLETED:
-                            all_met = False
-                            continue
-                        # For create tasks, also require PR to be merged
-                        dt_type = (dt.first_payload).get("type", "create")
-                        if dt_type in ("create", "") and not await _verify_pr_merged(dt, session):
-                            all_met = False
+                    dep_result_str, deps_remapped = await _check_candidate_task_deps(
+                        task, dep_tasks, dep_uuids, session, _verify_pr_merged
+                    )
+                    all_met = dep_result_str == "eligible"
+                    any_failed = dep_result_str == "cascade_cancel"
+
+                    # Persist remap of requeue-cancelled dep IDs → replacement clone IDs
+                    # so future orchestrator cycles skip the _replaced_by_task_id lookup.
+                    if deps_remapped and not any_failed:
+                        new_deps = [deps_remapped.get(d, d) for d in (task.depends_on or [])]
+                        if new_deps != list(task.depends_on or []):
+                            async with AsyncSessionLocal() as remap_session:
+                                remap_task = await remap_session.get(Task, task.id)
+                                if remap_task:
+                                    remap_task.depends_on = new_deps
+                                    remap_session.add(remap_task)
+                                    await remap_session.commit()
+                            task.depends_on = new_deps
+                            logger.info(
+                                f"[ORCHESTRATOR] Remapped {len(deps_remapped)} requeue-cancelled "
+                                f"dep(s) for task {task.id}"
+                            )
 
                     if any_failed:
                         # Use separate session to avoid polluting the main dispatch session

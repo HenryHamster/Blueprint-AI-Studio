@@ -12,6 +12,7 @@ from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
 from app.services import _run_stale_branch_cleanup
 from app.task_lifecycle import _requeue_parent_task
+from app.orchestrator import _check_candidate_task_deps
 
 
 # The reaper creates its own DB sessions via AsyncSessionLocal. Tests must
@@ -1464,3 +1465,228 @@ async def test_reaper_force_lock_threshold_is_five(reaper_db, mocker, clear_reap
     assert orphaned.status in (TaskStatus.QUEUED, TaskStatus.FAILED)
     # stale_id cleaned up by stale-entry sweep (not in orphaned_ids)
     assert stale_id not in _reaper_skip_counts
+
+
+# ── _check_candidate_task_deps — requeue-cancelled dependency handling ───────
+
+
+async def _noop_verify_pr_merged(task, session):
+    """Stub for verify_pr_merged: always returns True (PR merged) for COMPLETED tasks."""
+    return True
+
+
+@pytest.mark.asyncio
+async def test_requeue_stores_replaced_by_task_id(requeue_db, mocker):
+    """_requeue_parent_task sets _replaced_by_task_id on the cancelled child pointing to the clone."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "do the thing"}],
+        child_status_message="ruff lint error",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    await requeue_db.refresh(child)
+    clone = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+
+    assert clone is not None
+    assert child.status == TaskStatus.CANCELLED
+    assert child.context.get("_replaced_by_task_id") == str(clone.id), (
+        "Cancelled child must record clone ID so orchestrator can resolve dep replacements"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_deps_requeue_cancelled_not_cascade_cancelled(requeue_db, mocker):
+    """(a) External task depending on a requeue-cancelled child is NOT cascade-cancelled.
+
+    When a dep is CANCELLED but has _replaced_by_task_id pointing to a QUEUED clone,
+    _check_candidate_task_deps must return 'waiting', not 'cascade_cancel'.
+    """
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Dep Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    # Cancelled child with a replacement clone
+    clone = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "clone"}],
+        status=TaskStatus.QUEUED,
+    )
+    requeue_db.add(clone)
+    await requeue_db.commit()
+    await requeue_db.refresh(clone)
+
+    cancelled_child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "original"}],
+        status=TaskStatus.CANCELLED,
+        latest_status_message="Parent requeued — replaced by retry",
+        context={"_replaced_by_task_id": str(clone.id)},
+    )
+    requeue_db.add(cancelled_child)
+    await requeue_db.commit()
+    await requeue_db.refresh(cancelled_child)
+
+    # External task that depends on the (now-cancelled) child
+    external = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "external"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(cancelled_child.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    dep_uuids = [uuid.UUID(str(cancelled_child.id))]
+    result, deps_remapped = await _check_candidate_task_deps(
+        external, [cancelled_child], dep_uuids, requeue_db, _noop_verify_pr_merged
+    )
+
+    assert result == "waiting", (
+        f"Expected 'waiting' (replacement clone is QUEUED), got {result!r}"
+    )
+    assert str(cancelled_child.id) in deps_remapped
+    assert deps_remapped[str(cancelled_child.id)] == str(clone.id)
+
+
+@pytest.mark.asyncio
+async def test_check_deps_remap_to_clone(requeue_db, mocker):
+    """(b) External task's depends_on is remapped to the clone ID after resolution."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Remap Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    # COMPLETED clone — this will cause 'eligible' result
+    clone = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "clone", "pr_number": 1, "branch": "fix/1"}],
+        status=TaskStatus.COMPLETED,
+    )
+    requeue_db.add(clone)
+    await requeue_db.commit()
+    await requeue_db.refresh(clone)
+
+    cancelled_child = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "original", "pr_number": 1, "branch": "fix/1"}],
+        status=TaskStatus.CANCELLED,
+        latest_status_message="Parent requeued — replaced by retry",
+        context={"_replaced_by_task_id": str(clone.id)},
+    )
+    requeue_db.add(cancelled_child)
+    await requeue_db.commit()
+    await requeue_db.refresh(cancelled_child)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "external"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(cancelled_child.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    dep_uuids = [uuid.UUID(str(cancelled_child.id))]
+    result, deps_remapped = await _check_candidate_task_deps(
+        external, [cancelled_child], dep_uuids, requeue_db, _noop_verify_pr_merged
+    )
+
+    assert result == "eligible"
+    assert str(cancelled_child.id) in deps_remapped
+    assert deps_remapped[str(cancelled_child.id)] == str(clone.id)
+
+
+@pytest.mark.asyncio
+async def test_check_deps_truly_cancelled_triggers_cascade(requeue_db, mocker):
+    """(c) Truly cancelled deps (no _replaced_by_task_id) return 'cascade_cancel'."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Cascade Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    # Permanently cancelled dep — no replacement
+    perm_cancelled = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "cancelled dep"}],
+        status=TaskStatus.CANCELLED,
+        latest_status_message="Manually cancelled",
+        context={},
+    )
+    requeue_db.add(perm_cancelled)
+    await requeue_db.commit()
+    await requeue_db.refresh(perm_cancelled)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "external"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(perm_cancelled.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    dep_uuids = [uuid.UUID(str(perm_cancelled.id))]
+    result, deps_remapped = await _check_candidate_task_deps(
+        external, [perm_cancelled], dep_uuids, requeue_db, _noop_verify_pr_merged
+    )
+
+    assert result == "cascade_cancel", (
+        "Permanently cancelled deps (no _replaced_by_task_id) must trigger cascade cancellation"
+    )
+    assert not deps_remapped
+
+
+@pytest.mark.asyncio
+async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
+    """FAILED dep (not CANCELLED) must always trigger cascade cancellation."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="Failed Dep Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    failed_dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "failed dep"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="CODE_ERROR",
+        context={},
+    )
+    requeue_db.add(failed_dep)
+    await requeue_db.commit()
+    await requeue_db.refresh(failed_dep)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "external"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(failed_dep.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    dep_uuids = [uuid.UUID(str(failed_dep.id))]
+    result, deps_remapped = await _check_candidate_task_deps(
+        external, [failed_dep], dep_uuids, requeue_db, _noop_verify_pr_merged
+    )
+
+    assert result == "cascade_cancel"
+    assert not deps_remapped

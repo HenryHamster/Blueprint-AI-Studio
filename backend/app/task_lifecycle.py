@@ -189,6 +189,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         await session.flush()  # Assigns new_child.id
         old_to_new[str(child.id)] = str(new_child.id)
         cloned_pairs.append((child, new_child))
+        # Record the clone's ID in the cancelled child's context so the
+        # orchestrator can resolve requeue-cancelled dependencies without
+        # cascade-cancelling external tasks that depend on this child.
+        child.context = {**(child.context or {}), "_replaced_by_task_id": str(new_child.id)}
+        flag_modified(child, "context")
         retried_count += 1
 
         history = TaskHistory(task_id=new_child.id, action="SPAWNED",
