@@ -499,7 +499,7 @@ async def test_hash_deduplication_skips_finding_with_matching_hash(db_session, m
 
 @pytest.mark.asyncio
 async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker):
-    """A finding with 3+ meaningful words overlapping an active task title is skipped."""
+    """A finding with 4+ meaningful words overlapping an active task title is skipped."""
     direction = _active_direction("d-worddup1", "Word overlap direction")
     project = Project(
         name="Word Overlap Dedup", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
@@ -527,7 +527,7 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[{
-            # "database", "connection", "pooling", "configuration" overlap existing → ≥3 words
+            # "database", "connection", "pooling", "configuration" overlap existing → ≥4 words
             "title": "tune database connection pooling configuration settings",
             "description": "Improve pooling",
             "prompt": "Tune the connection pool",
@@ -549,6 +549,59 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
     assert len(result.scalars().all()) == 0, "Word-overlap duplicate must not create a task"
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED, "Research task must be auto-completed when all findings are duplicates"
+
+
+@pytest.mark.asyncio
+async def test_word_overlap_deduplication_allows_common_word_findings(db_session, mocker):
+    """Findings sharing only common stopwords/prepositions are NOT falsely deduplicated."""
+    direction = _active_direction("d-worddup2", "Stopword false-positive direction")
+    project = Project(
+        name="Stopword False Positive Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active task whose title shares only stopwords with the new finding
+    existing = Task(
+        project_id=project.id,
+        title="inject context into agent prompt for better results",
+        payloads=[{"type": "create", "prompt": "...", "base_branch": "main"}],
+        context={},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            # Shares only stopwords ("inject", "into", "for") with existing — should NOT be deduplicated
+            "title": "inject rate limiting into api gateway for security",
+            "description": "Add rate limiting to protect the API",
+            "prompt": "Add rate limiting middleware",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "Finding with only stopword overlap must NOT be deduplicated"
 
 
 @pytest.mark.asyncio

@@ -516,10 +516,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return hashlib.sha256((title + description).encode()).hexdigest()[:16]
 
     def _is_duplicate(finding_title: str, existing: list[str]) -> bool:
-        words = set(finding_title.lower().split()) - {'the', 'a', 'an', 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
+        STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
+                     'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
+                     'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
+        words = set(finding_title.lower().split()) - STOPWORDS
         for title in existing:
-            overlap = words & set(title.split())
-            if len(overlap) >= 3:  # 3+ meaningful words in common
+            overlap = words & (set(title.lower().split()) - STOPWORDS)
+            if len(overlap) >= 4:  # 4+ meaningful words in common
                 return True
         return False
 

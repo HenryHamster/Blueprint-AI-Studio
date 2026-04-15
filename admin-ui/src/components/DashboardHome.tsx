@@ -83,6 +83,7 @@ interface DigestData {
   narrative_summary?: string | null;
   latest_cycle?: LatestCycle | null;
   completed_count?: number;
+  pipeline_conversion_rate?: number | null;
 }
 
 interface SparkPoint {
@@ -323,6 +324,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
               <MetricCard label="Completed" value={digest?.completed_count ?? 0} color="violet" spark={[]} dataKey="active" loading={loading} />
               <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
+              <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
               <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
             </div>
           </section>
@@ -629,6 +631,22 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
           </ResponsiveContainer>
         </div>
       )}
+    </div>
+  );
+}
+
+function ConversionRateCard({ rate, loading }: {
+  rate?: number | null;
+  loading: boolean;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  const pct = rate != null ? Math.round(rate * 100) : null;
+  const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
+      <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
+      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / tasks created</p>
     </div>
   );
 }
