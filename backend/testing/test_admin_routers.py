@@ -1376,3 +1376,76 @@ class TestDispatchExternalNotification:
 
         # Must not raise
         await dispatch_external_notification(uuid.uuid4(), "TASK_FAILED", {})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# notification_config startup restore — survives Cloud Run restart
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNotificationConfigStartupRestore:
+    """Verify that notification_config in runtime_config_json is restored on startup."""
+
+    @pytest.mark.asyncio
+    async def test_notification_config_restored_from_runtime_config_json(self, mocker):
+        """notification_config written to DeploymentState.runtime_config_json
+        must be loaded back into shared_state.runtime_config on _init_deployment_state.
+        """
+        import sqlalchemy
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from app import shared_state
+        from app.models import DeploymentState
+        from app.main import _init_deployment_state
+
+        # Create isolated in-memory SQLite DB (same pattern as test_services.py)
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+
+        _Session = sessionmaker(
+            bind=_engine, class_=AsyncSession,
+            autocommit=False, autoflush=False, expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+        notification_cfg = {
+            "webhook_url": "https://hooks.example.com/token123",
+            "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED"],
+            "throttle_seconds": 120,
+        }
+
+        # Seed DeploymentState with notification_config in runtime_config_json
+        async with _Session() as session:
+            state = DeploymentState(
+                id=1,
+                current_revision="r1",
+                current_sha="abc123",
+                runtime_config_json={"notification_config": notification_cfg},
+            )
+            session.add(state)
+            await session.commit()
+
+        # Clear the in-memory value so we can verify it is populated by the restore
+        saved = shared_state.runtime_config.pop("notification_config", None)
+        try:
+            await _init_deployment_state()
+            restored = shared_state.runtime_config.get("notification_config")
+            assert restored is not None, "notification_config must be restored from runtime_config_json"
+            assert restored["webhook_url"] == "https://hooks.example.com/token123"
+            assert restored["enabled_events"] == ["TASK_FAILED", "APPROVAL_NEEDED"]
+            assert restored["throttle_seconds"] == 120
+        finally:
+            # Restore previous state to avoid leaking into other tests
+            if saved is not None:
+                shared_state.runtime_config["notification_config"] = saved
+            else:
+                shared_state.runtime_config.pop("notification_config", None)
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()

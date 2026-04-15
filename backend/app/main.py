@@ -307,7 +307,8 @@ async def _init_deployment_state():
             config_json = getattr(state, 'runtime_config_json', None)
             if config_json and isinstance(config_json, dict):
                 for key in ("task_type_models", "task_type_efforts", "agent_prompt_suffixes",
-                             "autonomous_periodic_tasks", "health_check_urls"):
+                             "autonomous_periodic_tasks", "health_check_urls",
+                             "notification_config"):
                     if key in config_json:
                         _runtime_config[key] = config_json[key]
                 if "autonomous_research_wave_size" in config_json:
