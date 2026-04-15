@@ -611,6 +611,277 @@ async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
     assert clone_ctx.get("_previous_failure_class") == "CODE_ERROR"
 
 
+async def _make_parent_with_children(session, children_specs, parent_context=None):
+    """Helper: create a parent with multiple children.
+
+    Each entry in children_specs is a dict with optional keys:
+      - payloads: list of payload dicts (default: [{"type": "create", "prompt": "task"}])
+      - status: TaskStatus (default: FAILED)
+      - context: dict (default: {})
+      - status_message: str (default: None)
+      - depends_on_indices: list of int indices into children_specs (resolved after creation)
+
+    Returns (parent, [children]) — all objects are refreshed with DB-assigned IDs.
+    """
+    project = Project(name="Requeue Test Multi", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        attempt_count=0,
+        context=parent_context or {},
+    )
+    session.add(parent)
+    await session.commit()
+    await session.refresh(parent)
+
+    # First pass: create all children without depends_on so IDs are assigned.
+    children = []
+    for spec in children_specs:
+        child = Task(
+            project_id=project.id,
+            payloads=spec.get("payloads", [{"type": "create", "prompt": "task"}]),
+            parent_task_id=parent.id,
+            status=spec.get("status", TaskStatus.FAILED),
+            context=spec.get("context", {}),
+            latest_status_message=spec.get("status_message"),
+            depends_on=[],
+        )
+        session.add(child)
+        children.append(child)
+
+    await session.commit()
+    for c in children:
+        await session.refresh(c)
+
+    # Second pass: wire up depends_on using resolved IDs.
+    for child, spec in zip(children, children_specs):
+        dep_indices = spec.get("depends_on_indices", [])
+        if dep_indices:
+            child.depends_on = [str(children[i].id) for i in dep_indices]
+            session.add(child)
+
+    await session.commit()
+    for c in children:
+        await session.refresh(c)
+
+    return parent, children
+
+
+@pytest.mark.asyncio
+async def test_requeue_count_limit_boundary_succeeds(requeue_db, mocker):
+    """Parent with _requeue_count=2 (one below MAX_PARENT_REQUEUES=3) still requeues."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task"}],
+        child_status_message="ruff lint error: E501 line too long",
+    )
+    parent.context = {"_requeue_count": 2}
+    requeue_db.add(parent)
+    await requeue_db.commit()
+    await requeue_db.refresh(parent)
+
+    result = await _requeue_parent_task(parent, requeue_db)
+
+    assert result == 1
+    await requeue_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context.get("_requeue_count") == 3
+
+
+@pytest.mark.asyncio
+async def test_requeue_count_limit_at_limit_fails_permanently(requeue_db, mocker):
+    """Parent with _requeue_count=3 (at MAX_PARENT_REQUEUES) is set to FAILED and alert fired."""
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task"}],
+        child_status_message="ruff lint error: E501 line too long",
+    )
+    parent.context = {"_requeue_count": 3}
+    requeue_db.add(parent)
+    await requeue_db.commit()
+    await requeue_db.refresh(parent)
+
+    result = await _requeue_parent_task(parent, requeue_db)
+
+    assert result == 0
+    await requeue_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit" in parent.latest_status_message
+    assert "3" in parent.latest_status_message
+    mock_alert.assert_called_once()
+    # No clones should have been created
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_cancelled_parent_returns_zero(requeue_db, mocker):
+    """CANCELLED parent returns 0 immediately without creating any clones."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task"}],
+        child_status_message="some failure",
+    )
+    parent.status = TaskStatus.CANCELLED
+    requeue_db.add(parent)
+    await requeue_db.commit()
+    await requeue_db.refresh(parent)
+
+    result = await _requeue_parent_task(parent, requeue_db)
+
+    assert result == 0
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_dependency_remapping(requeue_db, mocker):
+    """Pass 2: deps on other failed children remapped to clone IDs; COMPLETED sibling dep preserved."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    # child_A: FAILED (no deps)
+    # child_B: FAILED, depends on child_A (FAILED) and child_C (COMPLETED)
+    # child_C: COMPLETED (should not be cloned; its ID preserved in clone_B.depends_on)
+    parent, children = await _make_parent_with_children(
+        requeue_db,
+        [
+            {"payloads": [{"type": "create", "prompt": "task A"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error"},
+            {"payloads": [{"type": "create", "prompt": "task B"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [0, 2]},
+            {"payloads": [{"type": "create", "prompt": "task C"}], "status": TaskStatus.COMPLETED},
+        ],
+    )
+    child_a, child_b, child_c = children
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 2
+
+    clones_by_prompt = {c.payloads[0]["prompt"]: c for c in clones}
+    clone_a = clones_by_prompt["task A"]
+    clone_b = clones_by_prompt["task B"]
+
+    # clone_B.depends_on: child_A.id remapped to clone_A.id; child_C.id preserved as-is
+    assert str(clone_a.id) in clone_b.depends_on
+    assert str(child_c.id) in clone_b.depends_on
+    # The old cancelled child_A.id must not appear in clone_B
+    assert str(child_a.id) not in clone_b.depends_on
+
+
+@pytest.mark.asyncio
+async def test_requeue_cycle_detection_clears_all_depends_on(requeue_db, mocker):
+    """Pass 3: circular deps in cloned subgraph are all cleared to prevent deadlock."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    # child_A depends on child_B and child_B depends on child_A — mutual cycle
+    parent, _children = await _make_parent_with_children(
+        requeue_db,
+        [
+            {"payloads": [{"type": "create", "prompt": "task A"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [1]},
+            {"payloads": [{"type": "create", "prompt": "task B"}], "status": TaskStatus.FAILED, "status_message": "ruff lint error", "depends_on_indices": [0]},
+        ],
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 2
+    # All depends_on must be cleared due to cycle detection
+    for clone in clones:
+        assert not clone.depends_on
+
+
+@pytest.mark.asyncio
+async def test_requeue_strips_max_plan_account_id(requeue_db, mocker):
+    """Clone context must not carry over max_plan_account_id from the failed child."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task"}],
+        child_context={"max_plan_account_id": "acct-123", "scope": "small"},
+        child_status_message="ruff lint error",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    assert "max_plan_account_id" not in clone_ctx
+    # Other context fields must still be present
+    assert clone_ctx.get("scope") == "small"
+
+
+@pytest.mark.asyncio
+async def test_requeue_refreshes_base_branch_from_plan_branch(requeue_db, mocker):
+    """Clone payload uses parent's plan_branch as base_branch, replacing the stale child value."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task", "base_branch": "old-deleted-branch"}],
+        child_status_message="ruff lint error",
+    )
+    parent.context = {"plan_branch": "plan/abc123"}
+    requeue_db.add(parent)
+    await requeue_db.commit()
+    await requeue_db.refresh(parent)
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    assert clones[0].payloads[0].get("base_branch") == "plan/abc123"
+
+
+@pytest.mark.asyncio
+async def test_requeue_refreshes_base_branch_from_research_branch(requeue_db, mocker):
+    """Clone payload uses parent's research_branch as base_branch when plan_branch is absent."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task", "base_branch": "stale-branch"}],
+        child_status_message="ruff lint error",
+    )
+    parent.context = {"research_branch": "research/xyz456"}
+    requeue_db.add(parent)
+    await requeue_db.commit()
+    await requeue_db.refresh(parent)
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    assert clones[0].payloads[0].get("base_branch") == "research/xyz456"
+
+
 # ── Provision failure classification ───────────────────────────────────────
 
 
