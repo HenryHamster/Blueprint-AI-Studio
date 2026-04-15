@@ -1392,6 +1392,12 @@ async def _process_post_commit(
                 ])
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
+                    # The earlier COMPLETED/FAILED assignment fired the SQLAlchemy set
+                    # event which added task.id to _terminated_task_ids, revoking the
+                    # JWT. Since the completion handler hit a transient error and we're
+                    # requeuing, drop the cache entry so the next VM can claim.
+                    from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                    _terminated_task_ids.pop(str(task.id), None)
                     task.attempt_count += 1
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
