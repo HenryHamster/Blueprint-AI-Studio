@@ -1010,6 +1010,7 @@ async def orchestrator_worker():
                                                     # Exhausted retries — permanent failure
                                                     failed_task.status = TaskStatus.FAILED
                                                     failed_task.latest_status_message = f"VM provisioning failed {prov_failures} times — giving up: {provision_err or 'unknown error'}"
+                                                    ctx["failure_category"] = "PROVISION_FAILURE"
                                                     await _maybe_create_failure_alert(
                                                         failed_task, inner_session,
                                                         (provision_err or "unknown error")[:200]

@@ -546,8 +546,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
         }
 
-    from app.failure_classification import classify_failure  # noqa: PLC0415
-    _infra_classes = frozenset({"PROVISION_FAILURE", "AGENT_TIMEOUT", "RATE_LIMIT"})
+    from app.failure_classification import INFRA_CLASSES, classify_failure  # noqa: PLC0415
     _code_error_cooldown = timedelta(hours=48)
     _dedup_now = _utcnow()
 
@@ -565,7 +564,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Exclude transient infra failures (task never ran, should be retried)
         and not (
             t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and classify_failure(t) in _infra_classes
+            and classify_failure(t) in INFRA_CLASSES
         )
         # Exclude CODE_ERROR failures older than cooldown — codebase may have changed,
         # or improved context may allow a different implementation approach.

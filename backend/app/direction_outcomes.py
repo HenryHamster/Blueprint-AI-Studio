@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.failure_classification import classify_failure as _classify_failure
+from app.failure_classification import INFRA_CLASSES, classify_failure as _classify_failure
 from app.models import Project, Task, TaskStatus
 
 
@@ -85,7 +85,6 @@ async def _update_direction_research_outcomes(
             ]
             entry["avg_time_to_merge_hours"] = round(sum(merge_durations) / len(merge_durations), 2) if merge_durations else None
             # Capture failed task details so research agents can see WHY tasks failed
-            INFRA_CATEGORIES = {"PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"}
             failed_details = []
             infra_failures = 0
             for ct in child_tasks_rows:
@@ -93,7 +92,7 @@ async def _update_direction_research_outcomes(
                     reason = (ct.latest_status_message or "")[:120]
                     category = (ct.context or {}).get("failure_category", "")
                     failed_details.append({"title": ct.title or "", "reason": reason, "category": category})
-                    if category in INFRA_CATEGORIES:
+                    if category in INFRA_CLASSES:
                         infra_failures += 1
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
             entry["tasks_failed_infra"] = infra_failures
@@ -108,7 +107,7 @@ async def _update_direction_research_outcomes(
                     if fc == "CODE_ERROR":
                         sd_code_error += 1
                         sd_code_error_ids.add(ct.id)
-                    elif fc in INFRA_CATEGORIES:
+                    elif fc in INFRA_CLASSES:
                         sd_infra += 1
             # tasks_required_approval: non-completed tasks that required manual approval
             # Exclude tasks already counted as CODE_ERROR to avoid double-counting

@@ -15,7 +15,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.failure_classification import classify_failure
+from app.failure_classification import (
+    INFRA_CLASSES,
+    classify_failure,
+    normalize_agent_failure_category,
+)
 from app.max_plan_pool import RATE_LIMIT_PATTERNS
 from app.models import Task
 
@@ -124,3 +128,64 @@ def test_logs_field_is_searched():
     """classify_failure also scans the logs parameter, not just status message."""
     t = _task("")
     assert classify_failure(t, logs="trace: API Error: Rate limit reached\n") == "RATE_LIMIT"
+
+
+# ── normalize_agent_failure_category ───────────────────────────────────────
+
+def test_normalize_agent_category_maps_lowercase_rate_limited_to_uppercase():
+    """Agent posts lowercase 'rate_limited' — must persist as canonical RATE_LIMIT."""
+    t = _task("")
+    assert normalize_agent_failure_category("rate_limited", t) == "RATE_LIMIT"
+
+
+def test_normalize_agent_category_maps_claude_code_failed_to_code_error():
+    t = _task("")
+    assert normalize_agent_failure_category("claude_code_failed", t) == "CODE_ERROR"
+
+
+def test_normalize_agent_category_maps_clone_failed_to_provision_failure():
+    t = _task("")
+    assert normalize_agent_failure_category("clone_failed", t) == "PROVISION_FAILURE"
+
+
+def test_normalize_agent_category_accepts_already_canonical_names():
+    """If the caller already hands us an uppercase class name, pass it through."""
+    t = _task("")
+    for canonical in ["PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API", "CODE_ERROR"]:
+        assert normalize_agent_failure_category(canonical, t) == canonical
+
+
+def test_normalize_agent_category_unknown_label_falls_back_to_classify():
+    """Unknown labels must not silently pass through — they should re-classify via text match."""
+    t = _task("API Error: Rate limit reached")
+    assert normalize_agent_failure_category("some_unknown_thing", t) == "RATE_LIMIT"
+
+
+def test_normalize_agent_category_none_falls_back_to_classify():
+    t = _task("failed to provision VM")
+    assert normalize_agent_failure_category(None, t) == "PROVISION_FAILURE"
+
+
+# ── Provision phrase match (not bare substring) ────────────────────────────
+
+def test_since_provisioning_is_not_provision_failure():
+    """Reaper status like 'No heartbeat received after 300s since provisioning'
+    must classify as AGENT_TIMEOUT (via 'no heartbeat'), not PROVISION_FAILURE."""
+    t = _task("No heartbeat received after 300s since provisioning")
+    assert classify_failure(t) == "AGENT_TIMEOUT"
+
+
+def test_failed_to_provision_still_matches():
+    """Existing 'failed to provision VM' path must keep classifying as PROVISION_FAILURE."""
+    assert classify_failure(_task("failed to provision VM")) == "PROVISION_FAILURE"
+    assert classify_failure(_task("Provisioning failed for zone us-central1")) == "PROVISION_FAILURE"
+
+
+def test_infra_classes_includes_external_api():
+    """Guard against regression: research_completion and direction_outcomes must
+    agree on which classes count as infra. EXTERNAL_API must be in the unified set."""
+    assert "EXTERNAL_API" in INFRA_CLASSES
+    assert "PROVISION_FAILURE" in INFRA_CLASSES
+    assert "RATE_LIMIT" in INFRA_CLASSES
+    assert "AGENT_TIMEOUT" in INFRA_CLASSES
+    assert "CODE_ERROR" not in INFRA_CLASSES

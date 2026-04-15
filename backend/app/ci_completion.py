@@ -277,9 +277,11 @@ async def handle_ci_completion(
             task.status = TaskStatus.FAILED
             task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None ({source})")
-            from app.failure_classification import classify_failure  # noqa: PLC0415
+            from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
             from app.routers.agent_status import record_task_result  # noqa: PLC0415
-            record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
+            _fc = classify_failure(task)
+            persist_failure_category(task, _fc)
+            record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
 
     if task.status == TaskStatus.FAILED:
         await _maybe_create_failure_alert(

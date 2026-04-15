@@ -1,21 +1,98 @@
 """Task failure classification for deployment monitoring in Blueprint AI Studio."""
+import logging
+import re
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from app.models import Task
 
+logger = logging.getLogger(__name__)
+
+
+# Canonical failure classes that the classifier and rollups use.
+# Any mutation here must be reflected in the analytics sets that import INFRA_CLASSES.
+CODE_ERROR = "CODE_ERROR"
+PROVISION_FAILURE = "PROVISION_FAILURE"
+AGENT_TIMEOUT = "AGENT_TIMEOUT"
+EXTERNAL_API = "EXTERNAL_API"
+RATE_LIMIT = "RATE_LIMIT"
+
+
+# Failure classes that don't penalize direction health / research productivity —
+# the task never really ran because the infra (VMs, rate limits, upstream APIs,
+# agent lifecycle) got in the way. Imported by direction_outcomes and
+# research_completion so both stay in sync.
+INFRA_CLASSES: frozenset[str] = frozenset({
+    PROVISION_FAILURE,
+    RATE_LIMIT,
+    AGENT_TIMEOUT,
+    EXTERNAL_API,
+})
+
 
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
-    'clone_failed': 'PROVISION_FAILURE',
-    'build_failed': 'CODE_ERROR',
-    'test_failed': 'CODE_ERROR',
-    'lint_failed': 'CODE_ERROR',
-    'pr_creation_failed': 'EXTERNAL_API',
-    'claude_code_failed': 'CODE_ERROR',
-    'parse_failed': 'CODE_ERROR',
-    'fatal': 'CODE_ERROR',
-    'rate_limited': 'RATE_LIMIT',
+    'clone_failed': PROVISION_FAILURE,
+    'build_failed': CODE_ERROR,
+    'test_failed': CODE_ERROR,
+    'lint_failed': CODE_ERROR,
+    'pr_creation_failed': EXTERNAL_API,
+    'claude_code_failed': CODE_ERROR,
+    'parse_failed': CODE_ERROR,
+    'fatal': CODE_ERROR,
+    'rate_limited': RATE_LIMIT,
 }
+
+
+# Explicit phrase match so status messages like
+# "No heartbeat received after 300s since provisioning" (which aren't
+# provision failures — they're heartbeat/startup timeouts) don't get
+# misclassified just because they contain the substring "provision".
+# The pattern matches the verbs/nouns that clearly mean "provisioning broke"
+# ("failed to provision", "provisioning failed", "provision error", "VM provisioning …")
+# while rejecting benign references like "since provisioning".
+_PROVISION_PHRASE_RE = re.compile(
+    r"\b("
+    r"failed to provision"
+    r"|provision(?:ing)? failed"
+    r"|provision(?:ing)? error"
+    r"|vm provisioning"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def persist_failure_category(task: "Task", failure_class: str) -> None:
+    """Write ``failure_class`` onto ``task.context['failure_category']`` in place.
+
+    All terminal-FAILED code paths must call this (or write the key themselves)
+    so direction rollups and research dedup can tell infra from code failures.
+    """
+    ctx = dict(task.context or {})
+    ctx["failure_category"] = failure_class
+    task.context = ctx
+
+
+def normalize_agent_failure_category(raw: Optional[str], task: "Task") -> str:
+    """Canonicalize an agent-reported ``failure_category`` label to an uppercase class name.
+
+    The agent posts lowercase short labels (``rate_limited``, ``claude_code_failed``, …)
+    but every consumer (rollups, dedup, analytics) compares against the uppercase
+    canonical names. Normalize at the write boundary so the rest of the system sees
+    a single vocabulary.
+    """
+    if not raw:
+        return classify_failure(task)
+    label = raw.strip()
+    mapped = _AGENT_CATEGORY_TO_CLASS.get(label.lower())
+    if mapped:
+        return mapped
+    if label in INFRA_CLASSES or label == CODE_ERROR:
+        return label
+    logger.warning(
+        "[FAILURE_CLASS] Unknown agent failure_category=%r on task %s; falling back to classify_failure",
+        raw, getattr(task, "id", "?"),
+    )
+    return classify_failure(task)
 
 
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
@@ -24,9 +101,14 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     from app.max_plan_pool import RATE_LIMIT_PATTERNS  # noqa: PLC0415
 
     # Fast path: agent already reported a structured category — prefer it over regex.
+    # Accept both the legacy lowercase labels (pre-normalization writes) and the
+    # canonical uppercase names written by normalize_agent_failure_category().
     agent_category = (task.context or {}).get('failure_category')
-    if agent_category and agent_category in _AGENT_CATEGORY_TO_CLASS:
-        return _AGENT_CATEGORY_TO_CLASS[agent_category]
+    if agent_category:
+        if agent_category in _AGENT_CATEGORY_TO_CLASS:
+            return _AGENT_CATEGORY_TO_CLASS[agent_category]
+        if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
+            return agent_category
 
     status_msg = (task.latest_status_message or "").lower()
     logs_lower = (logs or "").lower()
@@ -40,17 +122,24 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
                                       "operator does not exist"]):
         return "EXTERNAL_API"
 
-    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion
-    if any(kw in combined for kw in ["provision", "quota", "cpus_all_regions", "in_use_addresses",
-                                      "vm failed to start", "failed to provision",
-                                      "connection refused", "connection reset by peer",
-                                      "timed out waiting for operation", "sshd", "startup script",
-                                      "no space left on device", "disk quota exceeded",
-                                      "filesystem is full",
-                                      "address already in use", "failed to connect",
-                                      "service is temporarily unavailable", "compute.googleapis.com",
-                                      "resource not found", "container killed"]):
-        return "PROVISION_FAILURE"
+    # Provision failures — GCP quota, network, VM startup issues, SSH/init script errors, disk exhaustion.
+    # "provision" is matched via _PROVISION_PHRASE_RE so benign mentions like
+    # "No heartbeat received after 300s since provisioning" (heartbeat timeout, not
+    # provision failure) don't get misclassified.
+    if _PROVISION_PHRASE_RE.search(combined) or any(
+        kw in combined for kw in [
+            "quota", "cpus_all_regions", "in_use_addresses",
+            "vm failed to start",
+            "connection refused", "connection reset by peer",
+            "timed out waiting for operation", "sshd", "startup script",
+            "no space left on device", "disk quota exceeded",
+            "filesystem is full",
+            "address already in use", "failed to connect",
+            "service is temporarily unavailable", "compute.googleapis.com",
+            "resource not found", "container killed",
+        ]
+    ):
+        return PROVISION_FAILURE
 
     # Anthropic 529 overload — server-side capacity, NOT account-specific. Must
     # requeue transiently but MUST NOT disable the account.
