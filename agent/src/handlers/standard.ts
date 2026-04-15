@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
-  runClaudeCode, lintFixLoop, testFixLoop,
+  runClaudeCode, lintFixLoop, testFixLoop, matchesRateLimit,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -201,16 +201,29 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
+      let selfReviewFailed = false;
       for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
-        await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+        const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+        if (reviewExitCode !== 0) {
+          if (matchesRateLimit(reviewOutput)) {
+            sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
+          } else {
+            sendLog(ws, `\nWARNING: Self-review could not complete (exit code ${reviewExitCode}), proceeding without review.\n`);
+          }
+          selfReviewFailed = true;
+          break;
+        }
       }
 
-      const headAfterReview = git(['rev-parse', 'HEAD']);
-      const statusAfterReview = git(['status', '--porcelain']);
-      const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
-
-      selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
-      sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+      if (selfReviewFailed) {
+        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false };
+      } else {
+        const headAfterReview = git(['rev-parse', 'HEAD']);
+        const statusAfterReview = git(['status', '--porcelain']);
+        const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
+        selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
+        sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+      }
     }
 
     git(['add', '-A']);
@@ -294,6 +307,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
     });
   } else if (exitCode === 0) {

@@ -33,7 +33,7 @@ const RATE_LIMIT_PATTERNS: readonly string[] = [
   "this request would exceed your account's rate limit",
 ] as const;
 
-function matchesRateLimit(text: string): boolean {
+export function matchesRateLimit(text: string): boolean {
   const lower = text.toLowerCase();
   return RATE_LIMIT_PATTERNS.some(p => lower.includes(p));
 }

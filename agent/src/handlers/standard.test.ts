@@ -17,6 +17,7 @@ vi.mock('../index.js', () => ({
   setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
   pushAndCreatePR: vi.fn().mockResolvedValue('https://github.com/owner/repo/pull/1'),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+  matchesRateLimit: vi.fn().mockReturnValue(false),
   lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
   cloneWithRetry: vi.fn(),
@@ -438,6 +439,27 @@ describe('self-review phase', () => {
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
     expect(prBodyArg).toContain('Self-Review');
     expect(prBodyArg).toContain('No critical issues found');
+  });
+
+  it('sets selfReviewOutcome categories to self_review_failed when runClaudeCode exits non-zero', async () => {
+    // First runClaudeCode call (main task) succeeds, second (self-review) fails with exitCode=1
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 1, allOutput: 'some error', lastResultText: '' });
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // self_review_outcome should be reported to backend with categories=['self_review_failed']
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { categories: string[] };
+    expect(outcome).toBeDefined();
+    expect(outcome.categories).toContain('self_review_failed');
   });
 });
 
