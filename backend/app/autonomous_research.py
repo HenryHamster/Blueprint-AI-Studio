@@ -413,8 +413,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
-        # Build lightweight direction summaries — full histories are available
-        # via the API. This keeps the payload under the OS E2BIG limit (~128KB).
+        # Build lightweight direction summaries — include compact history for
+        # agent-side stats (aggregateDirectionStats, buildScopeCalibrationSignal).
+        # Full histories are available via the API. This keeps the payload under
+        # the OS E2BIG limit (~128KB).
+        _HISTORY_NUMERIC_FIELDS = {
+            "tasks_created", "prs_merged", "tasks_failed",
+            "failed_task_details", "scope_breakdown", "avg_time_to_merge_hours",
+        }
+        _AGGREGATE_FIELDS = {
+            "total_cycles", "total_tasks_created", "total_prs_merged",
+            "total_tasks_failed", "total_prs_rejected",
+        }
+        current_dir_id = None if chosen_direction is None else chosen_direction.get("id")
         direction_summaries = []
         for d in all_active_directions:
             summary: dict = {
@@ -435,6 +446,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             ctx = d.get("research_context")
             if ctx:
                 summary["research_context"] = ctx[:2000]
+            # Include compact history for agent-side analysis functions
+            raw_history = d.get("research_history") or []
+            raw_agg = d.get("history_aggregate") or {}
+            agg_compact = {k: raw_agg[k] for k in _AGGREGATE_FIELDS if k in raw_agg}
+            if agg_compact:
+                summary["history_aggregate"] = agg_compact
+            if d.get("id") == current_dir_id:
+                # Current direction: last 3 cycles with numeric fields only
+                compact_history = [
+                    {k: entry[k] for k in _HISTORY_NUMERIC_FIELDS if k in entry}
+                    for entry in raw_history[-3:]
+                ]
+                if compact_history:
+                    summary["research_history"] = compact_history
             direction_summaries.append(summary)
 
         # Design doc summary — just keys and playbook, not full content.
