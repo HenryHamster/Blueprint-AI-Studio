@@ -234,6 +234,27 @@ The playbook persists operational knowledge across all agent tasks in this proje
 \`\`\`
 `;
 
+export const FIRST_TASK_GUIDANCE = `
+## IMPORTANT: First Task on This Repository — Capture What You Learn
+
+This is the first agent task on this repository. There are no existing playbook entries.
+Everything you discover through trial and error is NEW knowledge that will benefit every future agent.
+
+**Before you finish this task, use \`./playbook set\` to record:**
+- The exact build and test commands that worked (e.g. \`npm run build\`, \`pytest\`, \`make test\`)
+- Any linting or type-check quirks (config files, flags, common false positives)
+- Dependency installation steps or version constraints discovered
+- Non-obvious directory structure or naming conventions
+- Any workarounds required to get things running
+
+These are high-value entries — saving even 2–3 facts now will save future agents hours of rediscovery.
+
+\`\`\`bash
+./playbook set "test-commands" "Run tests with: <command>"
+./playbook set "lint-setup" "Lint runs via: <command>"
+\`\`\`
+`;
+
 // ── Shared helper: read CLAUDE.md from workspace ────────────────────────────
 export function readClaudeMd(): string {
   const claudeMdPath = `${WORKSPACE}/CLAUDE.md`;

@@ -570,6 +570,10 @@ async def claim_task(
                     continue
                 short_key = k[len("playbook/"):]
                 playbook_entries[short_key] = v.get("content", "")
+        total_playbook_count = sum(
+            1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
+        )
+        response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
             response["playbook"] = playbook_entries
             # Track reference counts — fire-and-forget, must not fail claim response

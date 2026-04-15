@@ -816,6 +816,11 @@ async def update_agent_status(
                 _ctx["_had_playbook"] = bool(_playbook_count)
                 task.context = _ctx
                 session.add(task)
+                if payload.status == TaskStatus.COMPLETED and not bool(_playbook_count):
+                    logger.info(
+                        f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
+                        f"type={task.first_payload.get('type', 'unknown')}"
+                    )
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
 
