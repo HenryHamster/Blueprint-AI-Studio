@@ -272,14 +272,47 @@ export function readClaudeMd(): string {
 // ── Shared prompt assembly helpers ──────────────────────────────────────
 export function buildContextPrefix(task: Record<string, unknown>): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
-  if (!projectCtx) return '';
-  const hasData = Object.keys(projectCtx).some(k => {
-    const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
-  });
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] as Record<string, unknown> | undefined;
   const taskType = payload ? strVal(payload.type) : '';
-  return hasData ? formatProjectContext(projectCtx, taskType) + '\n\n' : '';
+  const taskContext = task.context as Record<string, unknown> | undefined;
+  const taskScope = taskContext ? strVal(taskContext.scope) : '';
+
+  let prefix = '';
+  if (projectCtx) {
+    const hasData = Object.keys(projectCtx).some(k => {
+      const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
+    });
+    if (hasData) {
+      prefix = formatProjectContext(projectCtx, taskType, taskScope) + '\n\n';
+    }
+  }
+
+  // Append direction context section when present (title, priority, failed approaches)
+  const dirCtx = task.direction_context as Record<string, unknown> | undefined;
+  if (dirCtx) {
+    const dcLines: string[] = ['## Direction Context'];
+    const title = strVal(dirCtx.title);
+    if (title) dcLines.push(`**Goal:** ${title}`);
+    const priority = strVal(dirCtx.priority);
+    if (priority) dcLines.push(`**Priority:** ${priority}`);
+    const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as string[] : [];
+    if (failedApproaches.length > 0) {
+      dcLines.push('**Avoid (already tried and failed):**');
+      for (const fa of failedApproaches) {
+        dcLines.push(`- ${fa}`);
+      }
+    }
+    const recentOutcomes = Array.isArray(dirCtx.recent_outcomes) ? dirCtx.recent_outcomes as Array<Record<string, unknown>> : [];
+    if (recentOutcomes.length > 0) {
+      const parts = recentOutcomes.map(o => `${o.prs_merged}/${o.tasks_created} merged`);
+      dcLines.push(`Recent cycles: ${parts.join(', ')}`);
+    }
+    dcLines.push('');
+    prefix += dcLines.join('\n') + '\n';
+  }
+
+  return prefix;
 }
 
 export function buildFileTree(ws: WebSocket | null): string {
@@ -450,7 +483,7 @@ function parseResearchSummary(raw: string): string {
 }
 
 // ── Shared: Format project_context into a markdown section ────────────────
-export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''): string {
+export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = ''): string {
   const CONTEXT_BUDGET = 8000;
 
   const header = [
@@ -499,29 +532,37 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines].join('\n');
   let budget = CONTEXT_BUDGET - fixedContent.length;
 
-  // Build queued tasks section — fall back to one-liners if over budget
+  // Build lessons section first — lessons directly prevent mistakes and take priority over informational sections
+  const lessonsData = ctx.lessons as Array<Record<string, unknown>> | undefined;
+  let lessonsLines: string[] = [];
+  if (lessonsData && lessonsData.length > 0) {
+    const candidateLines: string[] = ['### Lessons from Past Reviews'];
+    for (const l of lessonsData) {
+      const fcSuffix = l.failure_class ? ` [${strVal(l.failure_class)}]` : '';
+      candidateLines.push(`- **${strVal(l.task_title)}** (${String(l.iterations)} cycles)${fcSuffix}: ${strVal(l.last_feedback)}`);
+    }
+    candidateLines.push('');
+    const candidateContent = candidateLines.join('\n');
+    if (candidateContent.length <= budget) {
+      lessonsLines = candidateLines;
+      budget -= candidateContent.length;
+    }
+  }
+
+  // Build queued tasks section — one-liners only to preserve budget for higher-priority content
   const queuedTasks = ctx.queued_tasks as Array<Record<string, unknown>> | undefined;
   let queuedLines: string[] = [];
   if (queuedTasks && queuedTasks.length > 0) {
-    const fullLines: string[] = ['### Queued Tasks'];
+    const shortLines: string[] = ['### Queued Tasks'];
     for (const t of queuedTasks) {
-      fullLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}** — ${strVal(t.prompt).slice(0, 400)}`);
+      shortLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**`);
     }
-    fullLines.push('');
-    const fullContent = fullLines.join('\n');
-
-    if (fullContent.length <= budget) {
-      queuedLines = fullLines;
-    } else {
-      // Reduce to one-liners
-      const shortLines: string[] = ['### Queued Tasks'];
-      for (const t of queuedTasks) {
-        shortLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**`);
-      }
-      shortLines.push('');
+    shortLines.push('');
+    const shortContent = shortLines.join('\n');
+    if (shortContent.length <= budget) {
       queuedLines = shortLines;
+      budget -= shortContent.length;
     }
-    budget -= queuedLines.join('\n').length;
   }
 
   // Build recently completed section — drop oldest entries to fit budget
@@ -556,23 +597,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
-  // Build lessons section — only if budget allows
-  const lessonsData = ctx.lessons as Array<Record<string, unknown>> | undefined;
-  let lessonsLines: string[] = [];
-  if (lessonsData && lessonsData.length > 0) {
-    const candidateLines: string[] = ['### Lessons from Past Reviews'];
-    for (const l of lessonsData) {
-      const fcSuffix = l.failure_class ? ` [${strVal(l.failure_class)}]` : '';
-      candidateLines.push(`- **${strVal(l.task_title)}** (${String(l.iterations)} cycles)${fcSuffix}: ${strVal(l.last_feedback)}`);
-    }
-    candidateLines.push('');
-    const candidateContent = candidateLines.join('\n');
-    if (candidateContent.length <= budget) {
-      lessonsLines = candidateLines;
-      budget -= candidateContent.length;
-    }
-  }
-
   // Build pipeline health section — only if budget allows, capped at 400 chars
   const pipelineHealth = ctx.pipeline_health as Record<string, unknown> | null | undefined;
   let healthLines: string[] = [];
@@ -598,7 +622,13 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         const typePct = Math.round(byType[taskType] * 100);
         perTypeSuffix = ` Your task type (${taskType}): ${typePct}%.`;
       }
-      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${String(fasr.sample_size)}.${perTypeSuffix}`);
+      const byScope = fasr.by_scope as Record<string, number> | undefined;
+      let perScopeSuffix = '';
+      if (taskScope && byScope && byScope[taskScope] !== undefined) {
+        const scopePct = Math.round(byScope[taskScope] * 100);
+        perScopeSuffix = ` Your scope (${taskScope}): ${scopePct}%.`;
+      }
+      parts.push(`First-attempt success: ${faPct}%${faTrendStr}, sample: ${String(fasr.sample_size)}.${perTypeSuffix}${perScopeSuffix}`);
     }
 
     const failureDist = pipelineHealth.failure_distribution as Record<string, number> | undefined;
@@ -671,7 +701,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...queuedLines, ...recentLines, ...lessonsLines, ...healthLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }
 

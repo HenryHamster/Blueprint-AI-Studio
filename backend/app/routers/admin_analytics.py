@@ -454,6 +454,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if rate is not None:
             first_attempt_by_type[task_type] = rate
 
+    by_scope: Dict[str, list] = {}
+    for t in terminal_tasks_24h:
+        scope = (t.context or {}).get("scope", "unknown")
+        by_scope.setdefault(scope, []).append(t)
+
+    first_attempt_by_scope = {}
+    for scope, tasks in by_scope.items():
+        rate = _first_attempt_rate(tasks)
+        if rate is not None:
+            first_attempt_by_scope[scope] = rate
+
     current_first_attempt_rate = _first_attempt_rate(terminal_tasks_24h)
 
     # Previous window for first_attempt trend comparison
@@ -477,6 +488,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "without_playbook": _first_attempt_rate(tasks_without_playbook) if tasks_without_playbook else None,
         "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),
         "by_type": first_attempt_by_type,
+        "by_scope": first_attempt_by_scope,
     }
 
     return {

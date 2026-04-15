@@ -673,6 +673,107 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
     assert playbook["test-commands"] == "bash scripts/test-backend.sh"
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_direction_context_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint injects direction_context for create/fix/refactor tasks when direction_id is set."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    research_context = (
+        "## Overview\nImprove auth flow for users.\n\n"
+        "## Failed Approaches\n"
+        "- JWT in cookies caused CSRF issues\n"
+        "- Session-based auth had scaling problems\n"
+        "## Next Steps\nTry token refresh pattern.\n"
+    )
+    project = Project(name="Direction Context Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Improve auth flow",
+            "priority": "high",
+            "research_context": research_context,
+            "research_history": [
+                {"tasks_created": 3, "prs_merged": 2, "prs_rejected": 1},
+                {"tasks_created": 4, "prs_merged": 1, "prs_rejected": 0},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Implement auth improvements"}],
+        vm_instance_id="agent-vm-dir-ctx-create",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-ctx-create")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "direction_context" in data, f"Expected direction_context in claim response, got keys: {list(data.keys())}"
+    dc = data["direction_context"]
+    assert dc["title"] == "Improve auth flow"
+    assert dc["priority"] == "high"
+    assert "JWT in cookies caused CSRF issues" in dc["failed_approaches"]
+    assert "Session-based auth had scaling problems" in dc["failed_approaches"]
+    # recent_outcomes: last 2 history entries with tasks_created > 0
+    assert len(dc["recent_outcomes"]) == 2
+    assert dc["recent_outcomes"][0]["prs_merged"] == 2
+    assert dc["recent_outcomes"][1]["prs_merged"] == 1
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_direction_context_for_review_task(client: AsyncClient, db_session):
+    """Claim endpoint does NOT inject direction_context for review tasks (only create/fix/refactor)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Direction Context Review Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Fix bug in login",
+            "priority": "medium",
+            "research_context": "## Failed Approaches\n- Tried patching the validator\n",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 42, "branch": "fix/login"}],
+        vm_instance_id="agent-vm-dir-ctx-review",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dir-ctx-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "direction_context" not in data, (
+        f"direction_context should be absent for review tasks, got: {data.get('direction_context')}"
+    )
+
+
 def test_agent_ws_invalid_token_closes_with_1008(mocker):
     """
     Tests that connecting to the agent WebSocket without a valid token causes

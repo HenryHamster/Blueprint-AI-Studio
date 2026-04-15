@@ -123,6 +123,64 @@ describe('buildContextPrefix', () => {
   it('returns empty string when project_context is undefined', () => {
     expect(buildContextPrefix({ project_context: undefined })).toBe('');
   });
+
+  it('renders ## Direction Context section with goal, priority and failed approaches when direction_context is present', () => {
+    const task = {
+      project_context: {
+        active_tasks: [
+          { task_type: 'create', title: 'Some task', status: 'IN_PROGRESS', prompt: 'Do it' },
+        ],
+      },
+      direction_context: {
+        title: 'Improve auth flow',
+        priority: 'high',
+        failed_approaches: ['JWT in cookies', 'Session-based auth'],
+        recent_outcomes: [
+          { tasks_created: 3, prs_merged: 2 },
+          { tasks_created: 4, prs_merged: 1 },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Goal:** Improve auth flow');
+    expect(result).toContain('**Priority:** high');
+    expect(result).toContain('**Avoid (already tried and failed):**');
+    expect(result).toContain('- JWT in cookies');
+    expect(result).toContain('- Session-based auth');
+    expect(result).toContain('Recent cycles:');
+    expect(result).toContain('2/3 merged');
+    expect(result).toContain('1/4 merged');
+  });
+
+  it('renders direction_context without failed approaches or recent_outcomes when arrays are empty', () => {
+    const task = {
+      direction_context: {
+        title: 'Optimize DB queries',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Goal:** Optimize DB queries');
+    expect(result).toContain('**Priority:** medium');
+    expect(result).not.toContain('Avoid');
+    expect(result).not.toContain('Recent cycles');
+  });
+
+  it('does not render direction_context section when direction_context is absent', () => {
+    const task = {
+      project_context: {
+        active_tasks: [
+          { task_type: 'review', title: 'Review PR', status: 'IN_PROGRESS', prompt: 'Check it' },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('## Direction Context');
+  });
 });
 
 // ── formatProjectContext ──────────────────────────────────────────────────────
@@ -239,6 +297,25 @@ describe('formatProjectContext', () => {
     expect(result).toContain('Pipeline Health');
     expect(result).toContain('Success rate');
     expect(result).toContain('90%');
+  });
+
+  it('includes scope-specific pipeline health stat when by_scope is provided', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.85,
+        trend: 'stable',
+        first_attempt_success_rate: {
+          overall: 0.72,
+          sample_size: 50,
+          by_type: { create: 0.9 },
+          by_scope: { medium: 0.75 },
+        },
+        failure_distribution: {},
+        direction_stats: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create', 'medium');
+    expect(result).toContain('Your scope (medium): 75%');
   });
 });
 

@@ -660,6 +660,31 @@ async def claim_task(
                         response["project_context"] = {}
                     response["project_context"]["direction_quality"] = direction_quality
 
+            # Inject direction context (title, goals, failed approaches) for implementing agents
+            if task_type in ("create", "fix", "refactor"):
+                failed_approaches: list = []
+                rc_text = direction.get("research_context", "") or ""
+                in_failed_section = False
+                for rc_line in rc_text.splitlines():
+                    rc_stripped = rc_line.strip()
+                    if rc_stripped == "## Failed Approaches":
+                        in_failed_section = True
+                    elif rc_stripped.startswith("## "):
+                        in_failed_section = False
+                    elif in_failed_section and rc_stripped.startswith("- "):
+                        failed_approaches.append(rc_stripped[2:])
+                recent_outcomes = [
+                    {"tasks_created": h.get("tasks_created", 0), "prs_merged": h.get("prs_merged", 0)}
+                    for h in history[-2:]
+                    if h.get("tasks_created", 0) > 0
+                ]
+                response["direction_context"] = {
+                    "title": direction.get("title", ""),
+                    "priority": direction.get("priority", ""),
+                    "failed_approaches": [a[:120] for a in failed_approaches[:5]],
+                    "recent_outcomes": recent_outcomes,
+                }
+
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
         response["build_config"] = project_for_playbook.build_config

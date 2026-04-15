@@ -460,8 +460,13 @@ async def extract_review_feedback_to_playbook(
 
     doc = dict(project.design_doc or {})
 
-    # Pick the top-2 categories by issue count
-    top_cats = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:2]
+    # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
+    _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+    top_cats = sorted(
+        buckets.items(),
+        key=lambda kv: sum(_severity_weights.get(i["severity"], 1) for i in kv[1]),
+        reverse=True,
+    )[:2]
 
     created_keys: list[str] = []
     for cat_name, issues in top_cats:
