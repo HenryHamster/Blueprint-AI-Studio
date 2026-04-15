@@ -614,3 +614,132 @@ async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
     assert task.latest_status_message == "PR #42 closed without merging", (
         f"Expected in-memory latest_status_message to reflect closure, got: {task.latest_status_message!r}"
     )
+
+
+# ── skip_locked lock contention tests ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rollup_skips_when_parent_lock_held(eval_db, mocker, caplog):
+    """Regression for LockNotAvailableError observed in prod: when a concurrent
+    sibling child holds the row lock on the parent task, the SELECT ... FOR
+    UPDATE SKIP LOCKED returns zero rows.  _check_and_trigger_rollup must
+    detect that, log the deferral, and return without raising — the reaper's
+    stale EVALUATING sweep retries within 15 minutes as the safety net.
+    """
+    import logging
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Lock Skip Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "child create"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    await eval_db.refresh(child)
+
+    # Simulate the parent row being locked by another session: the first
+    # session.execute call (the parent SELECT ... FOR UPDATE SKIP LOCKED) must
+    # return an empty scalar result.  Subsequent execute calls (if any) pass
+    # through to the real session.
+    original_execute = eval_db.execute
+    call_count = {"n": 0}
+
+    class _EmptyResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return None
+
+        def all(self):
+            return []
+
+    async def _mock_execute(stmt, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _EmptyResult()
+        return await original_execute(stmt, *args, **kwargs)
+
+    # Use the same pattern as test_diagnostics.py: pytest-mock auto-wraps async
+    # side_effect fns into AsyncMock when the target is awaited.
+    mocker.patch.object(eval_db, "execute", new=AsyncMock(side_effect=_mock_execute))
+
+    with caplog.at_level(logging.INFO, logger="app.rollup_management"):
+        # Must not raise LockNotAvailableError or any other exception
+        await _check_and_trigger_rollup(child, eval_db)
+
+    # Verify the expected skip log line was emitted
+    assert any(
+        "Skipped rollup check" in rec.message and "parent lock held" in rec.message
+        for rec in caplog.records
+    ), f"Expected '[ROLLUP] Skipped rollup check ... parent lock held' log, got: {[r.message for r in caplog.records]}"
+
+    # Parent status must remain EVALUATING (rollup was deferred, not processed)
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Expected EVALUATING (skip path defers work) but got {parent.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_proceeds_when_parent_lock_available(eval_db, mocker):
+    """Complement to test_rollup_skips_when_parent_lock_held: when the parent
+    row is NOT locked, _check_and_trigger_rollup must proceed with the rollup
+    decision normally (exercising the review/fix-only short-circuit path
+    already covered by test_rollup_empty_children_after_filter, but here the
+    point is that skip_locked=True does not break the happy path).
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(name="Lock Available Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent create"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # All children are review/fix (excluded from ROLLUP_TYPES) — short-circuits
+    # to parent COMPLETED without needing github/PR mocks.
+    review_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.COMPLETED,
+    )
+    eval_db.add(review_child)
+    await eval_db.commit()
+    await eval_db.refresh(review_child)
+
+    # No mock on session.execute — lock is available, query returns the parent row.
+    await _check_and_trigger_rollup(review_child, eval_db)
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Expected COMPLETED (happy path with available lock) but got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
