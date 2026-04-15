@@ -221,13 +221,18 @@ The playbook persists operational knowledge across all agent tasks in this proje
 - After wasting time on a wrong approach: save what didn't work and why
 - After finding an undocumented dependency between modules: save the relationship
 - After learning that a test requires special setup: save the setup steps
+- After successfully running build/test commands: save the exact commands that work, especially non-obvious ones (custom scripts, required flags, env vars)
+- After setting up a new repo environment: save version requirements, virtualenv steps, database setup, or prerequisites not documented in README/CLAUDE.md
+- After learning repo-specific test patterns: save fixture conventions, mock helpers, or test utilities unique to this codebase
+- After identifying key architectural patterns: save the pattern (e.g., "all API handlers use X decorator", "DB models follow Y convention") so future agents write consistent code
+- After discovering undocumented linting or formatting rules: save the rule and how to fix violations
 
 **What NOT to save:**
 - Anything already in CLAUDE.md (check first)
 - Task-specific details (PR numbers, branch names, specific bug descriptions)
 - Obvious patterns that any developer would know
 
-**Before completing your task**, briefly reflect: did you learn anything that would save the next agent time? If so, save it now. Even one good entry per task compounds across hundreds of tasks.
+**Before completing your task**, reflect on repo-level knowledge you gained: Did you discover build/test commands, environment setup steps, architectural patterns, or conventions specific to this repo? If so, save them now — the next agent starts cold, and one good entry compounds across hundreds of tasks.
 
 \`\`\`bash
 ./playbook set "key-name" "Concise operational knowledge here."
