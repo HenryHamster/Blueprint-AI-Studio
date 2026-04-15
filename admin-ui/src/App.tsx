@@ -106,6 +106,13 @@ export default function App() {
 
   // New project modal
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [setupProjectId, setSetupProjectId] = useState<string | null>(null);
+  const setupProject = useMemo(() => {
+    if (!setupProjectId) return undefined;
+    const p = s.projects.find(proj => proj.id === setupProjectId);
+    if (!p) return undefined;
+    return { id: p.id, owner: p.github_owner, repo: p.github_repo };
+  }, [setupProjectId, s.projects]);
 
   // Project members panel
   const [showProjectMembers] = useState(false);
@@ -430,6 +437,7 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
         userRole={s.userRole}
         onNewProject={() => setShowNewProjectModal(true)}
+        onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
       />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (
@@ -730,13 +738,14 @@ export default function App() {
         />
       )}
 
-      {showNewProjectModal && (
+      {(showNewProjectModal || setupProjectId) && (
         <NewProjectModal
-          onClose={() => setShowNewProjectModal(false)}
+          onClose={() => { setShowNewProjectModal(false); setSetupProjectId(null); }}
           onSuccess={() => {
+            // Refresh project list but keep modal open so the setup guide is visible
             s.fetchProjects();
-            setShowNewProjectModal(false);
           }}
+          setupProject={setupProject}
         />
       )}
 

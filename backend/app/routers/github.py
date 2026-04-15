@@ -364,6 +364,39 @@ async def github_webhook(
                         except Exception as _ne:
                             logger.warning(f"[NOTIFY] PR_MERGED dispatch setup failed: {_ne}")
 
+        elif action in ("opened", "synchronize"):
+            # Auto-review: spawn a review task when a PR is opened or pushed to
+            pr_data = data.get("pull_request", {})
+            repo_full = data.get("repository", {}).get("full_name", "")
+            pr_number = pr_data.get("number")
+            if "/" in repo_full and pr_number:
+                ar_owner, ar_repo = repo_full.split("/", 1)
+                auto_review_project = (await session.execute(
+                    select(Project).where(
+                        Project.github_owner == ar_owner,
+                        Project.github_repo == ar_repo,
+                    )
+                )).scalars().first()
+                if auto_review_project:
+                    auto_review_config = (auto_review_project.design_doc or {}).get("_auto_review", {})
+                    if auto_review_config.get("enabled"):
+                        branch = pr_data.get("head", {}).get("ref", "")
+                        base_branch = pr_data.get("base", {}).get("ref", "main")
+                        pr_title = pr_data.get("title", "")
+                        from app.auto_review import _handle_auto_review  # noqa: PLC0415
+                        background_tasks.add_task(
+                            _handle_auto_review,
+                            owner=ar_owner,
+                            repo=ar_repo,
+                            pr_number=pr_number,
+                            branch=branch,
+                            base_branch=base_branch,
+                            pr_title=pr_title,
+                            project_id=auto_review_project.id,
+                            config=auto_review_config,
+                        )
+                        return {"status": "auto_review_triggered"}
+
         elif action == "closed" and not merged:
             # PR closed without merge — record as operator rejection signal
             repo_full = data.get("repository", {}).get("full_name", "")
