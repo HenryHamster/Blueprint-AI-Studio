@@ -1731,3 +1731,75 @@ async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
 
     assert result == "cascade_cancel"
     assert not deps_remapped
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Diagnostic observability — compute.py helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_capture_serial_for_vm_logs_on_failure(caplog, mocker):
+    """
+    _capture_serial_for_vm must not swallow exceptions silently — it is the
+    only forensic source for agent startup failures, so operators must see
+    WHY capture failed (VM already gone vs permission vs API quota).
+    """
+    import logging
+    from app import compute
+
+    # The function does `from google.cloud import compute_v1` locally.
+    # Patch InstancesClient on the real module so the local import sees the
+    # raising stub. google-cloud-compute is a real test-env dependency so
+    # the module is importable; we only replace the client constructor.
+    mocker.patch(
+        "google.cloud.compute_v1.InstancesClient",
+        side_effect=RuntimeError("boom from test"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = compute._capture_serial_for_vm("agent-vm-abc", "us-central1-a")
+
+    assert result is None
+    assert "failed for vm=agent-vm-abc" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "boom from test" in caplog.text
+
+
+def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
+    """
+    The startup-script success heartbeat must be gated on a 30s settle window
+    plus a fresh systemctl is-active check. Type=simple returns as soon as npm
+    is fork()ed, so the pre-fix heartbeat fired before the agent had loaded a
+    line of TypeScript — making "startup succeeded" a lie for in-flight
+    silent-death failures.
+
+    This test parses the _provision_gcp source (the f-string template that
+    produces the bash script) and asserts the settle window sits between the
+    service-start block and the success-heartbeat curl.
+    """
+    import inspect
+    from app import compute
+
+    source = inspect.getsource(compute._provision_gcp)
+
+    # Locate the success-heartbeat region by its unique status_message.
+    success_msg = "Startup script completed, agent service started"
+    assert success_msg in source, "success heartbeat block missing"
+    success_idx = source.index(success_msg)
+
+    # The preceding region must contain the settle window + is-active check.
+    # Bound the search to a window immediately before the heartbeat curl so
+    # we don't accidentally match the earlier `systemctl restart` block.
+    window_start = max(0, success_idx - 600)
+    pre_heartbeat = source[window_start:success_idx]
+    assert "sleep 30" in pre_heartbeat, (
+        "expected 30s settle window before success heartbeat — Type=simple "
+        "returns before the agent is actually running"
+    )
+    assert "is-active" in pre_heartbeat, (
+        "expected systemctl is-active re-check before success heartbeat"
+    )
+
+    # And the skip-message branch must exist (fall-through to wait loop).
+    assert "skipping success heartbeat" in source, (
+        "expected an explicit skip branch when the agent died in settle window"
+    )

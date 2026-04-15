@@ -1246,4 +1246,16 @@ process.on('SIGTERM', () => {
   _crashReport('SIGTERM', 'VM shutting down', 143);
 });
 
-main().catch((err: unknown) => { console.error('Agent failed to start:', err instanceof Error ? err.message : String(err)); process.exit(1); });
+main().catch((err: unknown) => {
+  // Route through _crashReport so rejections before startHeartbeat() reaches
+  // its first tick still produce a FATAL heartbeat the orchestrator can see.
+  // Without this, the catch handler swallows the rejection and no global
+  // handler fires — the task stays IN_PROGRESS until the reaper gives up.
+  try {
+    const detail = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
+    _crashReport('main_failed', detail, 1);
+  } catch (reportErr) {
+    console.error('Fatal error (crash report also failed):', err, reportErr);
+    process.exit(1);
+  }
+});

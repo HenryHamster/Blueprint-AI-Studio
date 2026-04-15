@@ -620,14 +620,25 @@ STATICENV
     }}
 
     # 7b. Notify orchestrator that startup completed — early health signal
-    # Reads AGENT_SECRET_TOKEN from env file (written from Secret Manager above)
-    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
-    ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
-    curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
-      -H "Content-Type: application/json" \
-      -H "X-Agent-Token: $AGENT_TOKEN" \
-      -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
-      --connect-timeout 10 --max-time 15 && echo "PROVISION_HEALTH_OK" || echo "PROVISION_HEALTH_FAILED (agent will self-report via heartbeat)"
+    # Settle window: Type=simple returns as soon as npm is fork()ed, which is
+    # not the same as the agent actually running a line of TypeScript. Wait 30s
+    # and re-check is-active before claiming success. If the agent has already
+    # died in this window we skip the success heartbeat and fall through to
+    # the wait loop + poweroff path, so the reaper's no-heartbeat handler sees
+    # the failure with its real classification.
+    sleep 30
+    if systemctl is-active --quiet blueprint-agent; then
+      # Reads AGENT_SECRET_TOKEN from env file (written from Secret Manager above)
+      AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
+      ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+      curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Token: $AGENT_TOKEN" \
+        -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
+        --connect-timeout 10 --max-time 15 && echo "PROVISION_HEALTH_OK" || echo "PROVISION_HEALTH_FAILED (agent will self-report via heartbeat)"
+    else
+      echo "Agent service died within 30s of start — skipping success heartbeat"
+    fi
 
     # Wait for the service to finish (with TTL guard)
     POLL_START=$(date +%s)
@@ -911,7 +922,13 @@ def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
             project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10
         )
         return (serial.contents or "")[-2000:]
-    except Exception:
+    except Exception as e:
+        # Serial capture is the only forensic source for agent startup failures;
+        # when it fails we must know why (VM already gone vs permission vs quota).
+        logger.warning(
+            "[COMPUTE] _capture_serial_for_vm failed for vm=%s zone=%s: %s: %s",
+            vm_name, zone, type(e).__name__, e,
+        )
         return None
 
 
