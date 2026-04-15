@@ -1,7 +1,10 @@
-"""Standalone tests for compute_pipeline_health_summary.
+"""Pipeline-health tests.
 
-These tests do not require a database — all DB calls are mocked.
-Run with: bash scripts/test-backend.sh testing/test_pipeline_health.py --standalone
+The original block tests `compute_pipeline_health_summary` against a fully
+mocked AsyncSession — those need no DB and are imported via conftest.
+The pipeline-event monitor block at the bottom exercises the in-memory
+rolling buffer in `app.shared_state` plus the /api/health/detailed endpoint.
+Run with: bash scripts/test-backend.sh testing/test_pipeline_health.py
 """
 import uuid
 import pytest
@@ -527,3 +530,190 @@ async def test_review_accuracy_skips_tasks_without_verdict():
     ra = result["review_accuracy"]
     assert ra is not None
     assert ra["total_reviews"] == 5
+
+
+# ── Pipeline-health rolling event monitor ────────────────────────────────────
+
+import app.shared_state as _ss  # noqa: E402
+from app.shared_state import (  # noqa: E402
+    PIPELINE_ALERT_DEDUP_SECONDS,
+    PIPELINE_ALERT_THRESHOLDS,
+    count_pipeline_events,
+    get_pipeline_health_snapshot,
+    record_pipeline_event,
+)
+
+
+@pytest.fixture()
+def clean_pipeline_events():
+    """Reset the pipeline event buffer + alert dedup state around each test."""
+    buf = _ss.deploy_monitoring["pipeline_events"]
+    last_ts = _ss.deploy_monitoring["pipeline_alert_last_ts"]
+    saved_events = list(buf)
+    saved_last_ts = dict(last_ts)
+    buf.clear()
+    last_ts.clear()
+    yield
+    buf.clear()
+    last_ts.clear()
+    buf.extend(saved_events)
+    last_ts.update(saved_last_ts)
+
+
+def test_below_threshold_does_not_fire_alert(clean_pipeline_events, mocker):
+    """Recording fewer events than the threshold leaves alerts_active empty
+    and never invokes the post helper."""
+    spy = mocker.patch("app.shared_state._post_pipeline_alert")
+    threshold = PIPELINE_ALERT_THRESHOLDS["heartbeat_timeout_post_claim"]
+
+    for i in range(threshold - 1):
+        record_pipeline_event(
+            "heartbeat_timeout_post_claim",
+            task_id=f"t{i}",
+            vm_id=f"vm{i}",
+            zone="us-central1-a",
+        )
+
+    snapshot = get_pipeline_health_snapshot()
+    assert snapshot["counts_1h"]["heartbeat_timeout_post_claim"] == threshold - 1
+    assert "heartbeat_timeout_post_claim" not in snapshot["alerts_active"]
+    spy.assert_not_called()
+
+
+def test_threshold_cross_fires_alert_exactly_once(clean_pipeline_events, mocker):
+    """Crossing threshold by recording exactly N events fires the alert
+    once for the per-category threshold."""
+    spy = mocker.patch("app.shared_state._post_pipeline_alert")
+    threshold = PIPELINE_ALERT_THRESHOLDS["account_blacklisted"]
+
+    for i in range(threshold):
+        record_pipeline_event(
+            "account_blacklisted",
+            task_id=f"t{i}",
+            account_id=f"acct-{i}",
+        )
+
+    blacklist_calls = [c for c in spy.call_args_list if c.args[0] == "account_blacklisted"]
+    assert len(blacklist_calls) == 1
+    assert blacklist_calls[0].args == ("account_blacklisted", threshold, threshold)
+    snapshot = get_pipeline_health_snapshot()
+    assert "account_blacklisted" in snapshot["alerts_active"]
+
+
+def test_threshold_cross_twice_within_dedup_window_fires_once(clean_pipeline_events, mocker):
+    """Hitting threshold a second time inside the dedup window must NOT
+    trigger a second alert."""
+    spy = mocker.patch("app.shared_state._post_pipeline_alert")
+    threshold = PIPELINE_ALERT_THRESHOLDS["provision_timeout_pre_claim"]
+
+    for i in range(threshold + 5):
+        record_pipeline_event(
+            "provision_timeout_pre_claim",
+            task_id=f"t{i}",
+            vm_id=f"vm{i}",
+            zone="us-central1-a",
+        )
+
+    pre_calls = [c for c in spy.call_args_list if c.args[0] == "provision_timeout_pre_claim"]
+    assert len(pre_calls) == 1
+
+
+def test_alert_fires_again_after_dedup_window_elapses(clean_pipeline_events, mocker):
+    """Forcing the dedup last-ts older than PIPELINE_ALERT_DEDUP_SECONDS lets
+    the next over-threshold event trigger a fresh alert."""
+    spy = mocker.patch("app.shared_state._post_pipeline_alert")
+    threshold = PIPELINE_ALERT_THRESHOLDS["account_blacklisted"]
+
+    for i in range(threshold):
+        record_pipeline_event("account_blacklisted", task_id=f"t{i}", account_id=f"a{i}")
+    pre_calls = [c for c in spy.call_args_list if c.args[0] == "account_blacklisted"]
+    assert len(pre_calls) == 1
+
+    _ss.deploy_monitoring["pipeline_alert_last_ts"]["account_blacklisted"] = (
+        datetime.utcnow() - timedelta(seconds=PIPELINE_ALERT_DEDUP_SECONDS + 60)
+    )
+
+    record_pipeline_event("account_blacklisted", task_id="t-new", account_id="a-new")
+
+    post_calls = [c for c in spy.call_args_list if c.args[0] == "account_blacklisted"]
+    assert len(post_calls) == 2
+
+
+def test_events_older_than_one_hour_excluded_from_counts(clean_pipeline_events):
+    """Stale events older than the rolling 1h window must not be counted."""
+    stale_ts = datetime.utcnow() - timedelta(hours=2)
+    for i in range(20):
+        _ss.deploy_monitoring["pipeline_events"].append({
+            "type": "heartbeat_timeout_post_claim",
+            "ts": stale_ts,
+            "task_id": f"old-{i}",
+            "vm_id": f"vm-{i}",
+            "zone": None,
+            "account_id": None,
+        })
+    record_pipeline_event(
+        "heartbeat_timeout_post_claim",
+        task_id="fresh",
+        vm_id="vm-fresh",
+    )
+
+    assert count_pipeline_events("heartbeat_timeout_post_claim") == 1
+    snapshot = get_pipeline_health_snapshot()
+    assert snapshot["counts_1h"]["heartbeat_timeout_post_claim"] == 1
+    assert "heartbeat_timeout_post_claim" not in snapshot["alerts_active"]
+
+
+def test_reap_rate_aggregate_threshold_fires_alert(clean_pipeline_events, mocker):
+    """Mixed reap reasons that individually stay below their per-category
+    threshold should still trip the aggregate reap_rate_per_hour alert."""
+    spy = mocker.patch("app.shared_state._post_pipeline_alert")
+    threshold = PIPELINE_ALERT_THRESHOLDS["reap_rate_per_hour"]
+
+    reasons = ["never_started", "absolute_timeout", "heartbeat_timeout_post_claim"]
+    for i in range(threshold):
+        record_pipeline_event(reasons[i % len(reasons)], task_id=f"t{i}")
+
+    rate_calls = [c for c in spy.call_args_list if c.args[0] == "reap_rate_per_hour"]
+    assert len(rate_calls) == 1
+    snapshot = get_pipeline_health_snapshot()
+    assert snapshot["counts_1h"]["reap_rate_per_hour"] >= threshold
+    assert "reap_rate_per_hour" in snapshot["alerts_active"]
+
+
+def test_unknown_event_type_dropped(clean_pipeline_events):
+    """Typo/unknown event_type must not be appended to the buffer."""
+    record_pipeline_event("not_a_real_event", task_id="t1")
+    assert len(_ss.deploy_monitoring["pipeline_events"]) == 0
+
+
+def test_snapshot_shape_matches_contract(clean_pipeline_events):
+    """get_pipeline_health_snapshot returns the documented keys regardless
+    of whether any events were recorded."""
+    snapshot = get_pipeline_health_snapshot()
+    assert set(snapshot.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active"}
+    for et in PIPELINE_ALERT_THRESHOLDS:
+        assert et in snapshot["thresholds"]
+    assert snapshot["alerts_active"] == []
+
+
+@pytest.mark.asyncio
+async def test_health_detailed_endpoint_includes_pipeline_health(
+    client, clean_pipeline_events
+):
+    """/api/health/detailed exposes the pipeline_health block at top level
+    and inside components, with the documented shape."""
+    record_pipeline_event("never_started", task_id="t1")
+    record_pipeline_event("heartbeat_timeout_post_claim", task_id="t2", vm_id="vm2")
+
+    resp = await client.get("/api/health/detailed")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "pipeline_health" in data
+    ph = data["pipeline_health"]
+    assert set(ph.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active"}
+    assert ph["counts_1h"]["never_started"] == 1
+    assert ph["counts_1h"]["heartbeat_timeout_post_claim"] == 1
+
+    assert "pipeline_health" in data["components"]
+    assert data["components"]["pipeline_health"]["status"] == "ok"

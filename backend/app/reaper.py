@@ -13,6 +13,7 @@ from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import record_pipeline_event
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -229,6 +230,13 @@ async def reaper_service():
                         'vm_instance_id': fresh_task.vm_instance_id,
                     })
 
+                    record_pipeline_event(
+                        reap_reason_code,
+                        task_id=str(task.id),
+                        vm_id=fresh_task.vm_instance_id,
+                        zone=(task.context or {}).get("provision_zone"),
+                    )
+
                     # Capture old VM ID before any overwrite — deletion happens after commit
                     if fresh_task.vm_instance_id:
                         _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
@@ -284,6 +292,13 @@ async def reaper_service():
                             blacklisted = list(rl_ctx.get("blacklisted_accounts") or [])
                             if rl_acct_id not in blacklisted:
                                 blacklisted.append(rl_acct_id)
+                                record_pipeline_event(
+                                    "account_blacklisted",
+                                    task_id=str(task.id),
+                                    vm_id=fresh_task.vm_instance_id,
+                                    zone=(task.context or {}).get("provision_zone"),
+                                    account_id=rl_acct_id,
+                                )
                             rl_ctx["blacklisted_accounts"] = blacklisted
                         rl_ctx.pop("max_plan_account_id", None)
                         rl_ctx.pop("_slot_released", None)
@@ -346,6 +361,13 @@ async def reaper_service():
                                 logger.warning(
                                     f"[REAPER] Agent startup failure on {prov_zone} acct={failed_acct[:8]} "
                                     f"— blacklisting account for task {task.id}"
+                                )
+                                record_pipeline_event(
+                                    "account_blacklisted",
+                                    task_id=str(task.id),
+                                    vm_id=fresh_task.vm_instance_id,
+                                    zone=prov_zone,
+                                    account_id=failed_acct,
                                 )
                             new_ctx = {
                                 **(task.context or {}),

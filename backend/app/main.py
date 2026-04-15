@@ -942,6 +942,11 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         "consecutive_failures": consecutive_failures,
     }
 
+    # --- Pipeline Health (rolling reaper signals) ---
+    ph_snapshot = _shared_state.get_pipeline_health_snapshot()
+    ph_status = "degraded" if ph_snapshot["alerts_active"] else "ok"
+    components["pipeline_health"] = dict(ph_snapshot, status=ph_status)
+
     # --- Overall Status ---
     statuses = [c["status"] for c in components.values() if isinstance(c, dict) and "status" in c]
     if "down" in statuses:
@@ -951,7 +956,7 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     else:
         overall = "healthy"
 
-    return {"status": overall, "components": components}
+    return {"status": overall, "components": components, "pipeline_health": ph_snapshot}
 
 @app.get("/api/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
