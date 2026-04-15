@@ -8,6 +8,7 @@ greenlet==3.0.1
 google-cloud-storage==2.13.0
 google-cloud-compute==1.15.0
 google-cloud-secret-manager==2.16.2
+google-cloud-logging==3.9.0
 httpx==0.25.2
 opentelemetry-api==1.21.0
 opentelemetry-sdk==1.21.0

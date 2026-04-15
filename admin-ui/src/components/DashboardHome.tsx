@@ -13,6 +13,7 @@ import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
+import { RecentErrorsWidget } from './RecentErrorsWidget';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -311,6 +312,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
+
+      {/* Orchestrator Errors widget: high-visibility observability for prod errors */}
+      <RecentErrorsWidget />
 
       {/* Main grid: 2-col on large screens */}
       <div className="lg:grid lg:grid-cols-3 lg:gap-4 space-y-4 lg:space-y-0">
