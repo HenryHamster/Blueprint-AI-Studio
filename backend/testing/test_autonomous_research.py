@@ -2378,7 +2378,7 @@ async def test_stage_dropout_breakdown(db_session):
     dropout = entry.get("stage_dropout", {})
 
     assert dropout.get("tasks_failed_code_error") == 1, f"Expected 1 code error, got {dropout}"
-    assert dropout.get("tasks_review_capped") == 1, f"Expected 1 review capped, got {dropout}"
+    assert dropout.get("tasks_required_approval") == 1, f"Expected 1 required approval, got {dropout}"
     # rollup succeeded (research task COMPLETED) — no staging-only merges
     assert dropout.get("tasks_merged_staging_only") == 0, f"Expected 0 staging-only, got {dropout}"
 

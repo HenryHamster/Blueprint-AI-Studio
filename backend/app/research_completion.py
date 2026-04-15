@@ -995,51 +995,61 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             )
                             and f.get("title")
                         ][:3]
-                        _deadlock_alert = Alert(
-                            project_id=task.project_id,
-                            severity=AlertSeverity.WARNING,
-                            title="Dedup deadlock detected",
-                            message=(
-                                f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
-                                f"{_consec} consecutive research cycles with 0 tasks created "
-                                f"due to deduplication. "
-                                + (
-                                    f"Top blocked findings: {'; '.join(_blocked_titles)}."
-                                    if _blocked_titles else ""
-                                )
-                            ),
-                            task_id=task.id,
-                        )
-                        session.add(_deadlock_alert)
-                        _deadlock_msg = ProjectMessage(
-                            project_id=task.project_id,
-                            message_type=MessageType.BUG_REPORT,
-                            from_type="agent",
-                            from_task_id=task.id,
-                            content=(
-                                f"Dedup deadlock detected for direction "
-                                f"'{d.get('text', did)[:80]}' (id: {did}): "
-                                f"{_consec} consecutive research cycles produced 0 tasks "
-                                f"because findings keep matching existing hashes or "
-                                f"word-overlapping active tasks. "
-                                + (
-                                    f"Blocked: {'; '.join(_blocked_titles)}. "
-                                    if _blocked_titles else ""
-                                )
-                                + "Consider resetting the direction or waiting for "
-                                "blocked tasks to complete."
-                            ),
-                            context={
-                                "source": "dedup_deadlock",
-                                "direction_id": did,
-                                "consecutive_empty_cycles": _consec,
-                            },
-                        )
-                        session.add(_deadlock_msg)
-                        logger.warning(
-                            f"[RESEARCH] Dedup deadlock: direction {did}, "
-                            f"{_consec} consecutive empty cycles (task {task.id})"
-                        )
+                        # Guard: only create alert if no undismissed alert exists for this direction
+                        _existing_deadlock_alert = (await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == task.project_id,
+                                Alert.title == "Dedup deadlock detected",
+                                Alert.dismissed_at.is_(None),
+                                Alert.message.contains(did),
+                            )
+                        )).scalars().first()
+                        if not _existing_deadlock_alert:
+                            _deadlock_alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title="Dedup deadlock detected",
+                                message=(
+                                    f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
+                                    f"{_consec} consecutive research cycles with 0 tasks created "
+                                    f"due to deduplication. "
+                                    + (
+                                        f"Top blocked findings: {'; '.join(_blocked_titles)}."
+                                        if _blocked_titles else ""
+                                    )
+                                ),
+                                task_id=task.id,
+                            )
+                            session.add(_deadlock_alert)
+                            _deadlock_msg = ProjectMessage(
+                                project_id=task.project_id,
+                                message_type=MessageType.BUG_REPORT,
+                                from_type="agent",
+                                from_task_id=task.id,
+                                content=(
+                                    f"Dedup deadlock detected for direction "
+                                    f"'{d.get('text', did)[:80]}' (id: {did}): "
+                                    f"{_consec} consecutive research cycles produced 0 tasks "
+                                    f"because findings keep matching existing hashes or "
+                                    f"word-overlapping active tasks. "
+                                    + (
+                                        f"Blocked: {'; '.join(_blocked_titles)}. "
+                                        if _blocked_titles else ""
+                                    )
+                                    + "Consider resetting the direction or waiting for "
+                                    "blocked tasks to complete."
+                                ),
+                                context={
+                                    "source": "dedup_deadlock",
+                                    "direction_id": did,
+                                    "consecutive_empty_cycles": _consec,
+                                },
+                            )
+                            session.add(_deadlock_msg)
+                            logger.warning(
+                                f"[RESEARCH] Dedup deadlock: direction {did}, "
+                                f"{_consec} consecutive empty cycles (task {task.id})"
+                            )
 
                     d["research_context"] = _build_research_context(
                         prior_context=d.get("research_context"),

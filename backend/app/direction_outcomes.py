@@ -99,17 +99,25 @@ async def _update_direction_research_outcomes(
             entry["tasks_failed_infra"] = infra_failures
 
             # Stage dropout: per-cycle breakdown of why tasks didn't reach main
-            _INFRA_CLASSES = {"PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"}
             sd_code_error = 0
             sd_infra = 0
+            sd_code_error_ids: set = set()
             for ct in child_tasks_rows:
                 if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                     fc = _classify_failure(ct)
                     if fc == "CODE_ERROR":
                         sd_code_error += 1
-                    elif fc in _INFRA_CLASSES:
+                        sd_code_error_ids.add(ct.id)
+                    elif fc in INFRA_CATEGORIES:
                         sd_infra += 1
-            sd_review_capped = sum(1 for ct in child_tasks_rows if ct.requires_approval)
+            # tasks_required_approval: non-completed tasks that required manual approval
+            # Exclude tasks already counted as CODE_ERROR to avoid double-counting
+            sd_required_approval = sum(
+                1 for ct in child_tasks_rows
+                if ct.requires_approval
+                and ct.status not in (TaskStatus.COMPLETED,)
+                and ct.id not in sd_code_error_ids
+            )
             research_task_obj = await session.get(Task, research_task_uuid)
             rollup_failed = (
                 research_task_obj is not None
@@ -124,7 +132,7 @@ async def _update_direction_research_outcomes(
             entry["stage_dropout"] = {
                 "tasks_failed_code_error": sd_code_error,
                 "tasks_failed_infra": sd_infra,
-                "tasks_review_capped": sd_review_capped,
+                "tasks_required_approval": sd_required_approval,
                 "tasks_merged_staging_only": sd_staging_only,
             }
 

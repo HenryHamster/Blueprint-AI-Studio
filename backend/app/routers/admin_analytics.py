@@ -394,7 +394,11 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                     pass
 
             dir_conversion_rate = round(prs_merged / tasks_created_total, 3) if tasks_created_total > 0 else None
-            dominant_dropout = max(sd_totals, key=lambda k: sd_totals[k]) if sd_totals else None
+            dominant_dropout = (
+                max(sd_totals, key=lambda k: sd_totals[k])
+                if sd_totals and max(sd_totals.values()) > 0
+                else None
+            )
             direction_stats.append({
                 "direction_id": did,
                 "merge_rate": round(prs_merged / cycles, 2),
