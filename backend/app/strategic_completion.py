@@ -143,6 +143,18 @@ def _check_direction_health(direction: dict) -> Optional[str]:
         if total_created_3 > 0 and code_failed_3 / total_created_3 > 0.7:
             return f"High code failure rate: >70% of spawned tasks failed for code reasons in last 3 cycles ({code_failed_3}/{total_created_3}, {infra_failed_3} infra failures excluded)"
 
+    # Rule 4: Recent cycle stall — last 3 cycles all either failed as research
+    # tasks (crash/timeout/provision) or produced children with ≥1 failed and
+    # zero merges. Pauses faster than Rule 2's 5-cycle threshold.
+    if len(history) >= 3:
+        recent3 = history[-3:]
+        def _cycle_failed(e: dict) -> bool:
+            if e.get("research_task_failed"):
+                return True
+            return e.get("tasks_failed", 0) > 0 and e.get("prs_merged", 0) == 0
+        if all(_cycle_failed(e) for e in recent3):
+            return "Recent stall: last 3 research cycles all failed or produced no merges"
+
     return None
 
 

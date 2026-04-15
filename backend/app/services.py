@@ -324,7 +324,11 @@ async def _persist_circuit_breakers():
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
             # Prune: don't persist CLOSED breakers with no failures (default state)
-            if v.get("state") == "CLOSED" and v.get("failure_count", 0) == 0:
+            if (
+                v.get("state") == "CLOSED"
+                and v.get("failure_count", 0) == 0
+                and v.get("infra_failure_count", 0) == 0
+            ):
                 continue
             serializable[k] = {
                 **v,

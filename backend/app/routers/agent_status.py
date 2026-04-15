@@ -722,6 +722,10 @@ async def update_agent_status(
                             ctx.pop("retry_after", None)
                         ctx.pop("max_plan_account_id", None)
                         ctx.pop("_slot_released", None)
+                        # The task just ran on a VM successfully enough to POST a result —
+                        # provisioning path worked. Don't carry a stale provision budget
+                        # into the retry, or one more provision hiccup will fail it outright.
+                        ctx.pop("provision_failures", None)
                         task.context = ctx
                         session.add(task)
                         await session.commit()
@@ -796,6 +800,9 @@ async def update_agent_status(
                 logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
             else:
                 ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
+                # Agent reached the point of POSTing a result, so provisioning worked —
+                # don't carry a stale provision budget into the retry.
+                ctx.pop("provision_failures", None)
             task.context = ctx
             session.add(task)
 
@@ -940,16 +947,22 @@ async def update_agent_status(
             logger.error(f"[DEBUG] Spawned debug task {debug_task.id} for permanently failed task {task.id}")
 
         # Circuit breaker for autonomous tasks (CLOSED/OPEN/HALF-OPEN)
-        # Only count code errors toward the breaker — rate limits and provision failures aren't code quality issues
+        # Tracks two separate failure classes:
+        #  - failure_count: code-quality failures (CODE_ERROR, AGENT_TIMEOUT) → opens at 3
+        #  - infra_failure_count: infra wall (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API) → opens at 5
+        # Both walls block autonomous spawning, but infra opens use a shorter cooldown
+        # because infra cascades typically self-heal faster than code regressions.
         _cb_failure_class = classify_failure(task, payload.logs)
-        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR" and _cb_failure_class not in ("RATE_LIMIT", "PROVISION_FAILURE"):
+        if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
-            # Only CODE_ERROR and AGENT_TIMEOUT indicate code regressions; infra/rate-limit
-            # failures are transient and should not trip the breaker.
-            is_code_failure = failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
+            is_code_failure = _cb_failure_class in ("CODE_ERROR", "AGENT_TIMEOUT")
+            is_infra_failure = _cb_failure_class in ("PROVISION_FAILURE", "RATE_LIMIT", "EXTERNAL_API")
             if is_code_failure:
                 breaker["failure_count"] += 1
+                breaker["success_count"] = 0
+            elif is_infra_failure:
+                breaker["infra_failure_count"] = breaker.get("infra_failure_count", 0) + 1
                 breaker["success_count"] = 0
 
             # HALF-OPEN test task failed → back to OPEN with doubled cooldown
@@ -965,15 +978,40 @@ async def update_agent_status(
                     f"HALF-OPEN test task failed — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
                 )
 
-            # CLOSED → OPEN after 3 consecutive failures
+            # CLOSED → OPEN after 3 consecutive code failures
             elif breaker["state"] == "CLOSED" and breaker["failure_count"] >= 3:
                 breaker["state"] = "OPEN"
+                breaker["open_reason"] = "code"
                 breaker["opened_at"] = _utcnow()
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 await broadcast_to_project(project_key, "autonomous_paused",
-                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive failures"})
-                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN for {project_key} after {breaker['failure_count']} failures")
-                _cb_alert_text = f"Circuit breaker opened after {breaker['failure_count']} consecutive failures (cooldown: {breaker['cooldown_seconds']}s)"
+                                           {"reason": f"Circuit breaker OPEN after {breaker['failure_count']} consecutive code failures"})
+                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN (code) for {project_key} after {breaker['failure_count']} failures")
+                _cb_alert_text = f"Circuit breaker opened after {breaker['failure_count']} consecutive code failures (cooldown: {breaker['cooldown_seconds']}s)"
+                await _maybe_create_circuit_breaker_alert(
+                    task.project_id, session,
+                    _cb_alert_text,
+                )
+                try:
+                    from app.notification_dispatch import post_failure_alert_message  # noqa: PLC0415
+                    await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
+                except Exception as _e:
+                    logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
+
+            # CLOSED → OPEN after 5 consecutive infra failures (wall of provisioning/rate-limit)
+            elif breaker["state"] == "CLOSED" and breaker.get("infra_failure_count", 0) >= 5:
+                breaker["state"] = "OPEN"
+                breaker["open_reason"] = "infra"
+                breaker["opened_at"] = _utcnow()
+                # Shorter cooldown than code breaker — infra outages usually self-heal faster
+                breaker["cooldown_seconds"] = 300  # 5 min
+                await broadcast_to_project(project_key, "autonomous_paused",
+                                           {"reason": f"Circuit breaker OPEN after {breaker['infra_failure_count']} consecutive infra failures ({_cb_failure_class})"})
+                logger.warning(f"[CIRCUIT BREAKER] CLOSED → OPEN (infra) for {project_key} after {breaker['infra_failure_count']} infra failures")
+                _cb_alert_text = (
+                    f"Circuit breaker opened: {breaker['infra_failure_count']} consecutive infra failures "
+                    f"({_cb_failure_class}). Cooldown: {breaker['cooldown_seconds']}s."
+                )
                 await _maybe_create_circuit_breaker_alert(
                     task.project_id, session,
                     _cb_alert_text,
@@ -984,7 +1022,11 @@ async def update_agent_status(
                 except Exception as _e:
                     logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
             # Persist breaker state on any transition
-            if breaker["state"] != "CLOSED" or breaker["failure_count"] == 0:
+            if (
+                breaker["state"] != "CLOSED"
+                or breaker["failure_count"] > 0
+                or breaker.get("infra_failure_count", 0) > 0
+            ):
                 await _orch._persist_circuit_breakers()
         # When review/fix fails permanently, cancel the original create task so rollup
         # skips it (via cancelled-child logic) instead of hanging forever.
@@ -1014,19 +1056,26 @@ async def update_agent_status(
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)
             breaker["failure_count"] = 0
+            breaker["infra_failure_count"] = 0
             breaker["success_count"] += 1
 
             # HALF-OPEN test task succeeded → back to CLOSED
             if breaker["state"] == "HALF_OPEN" and str(task.id) == breaker.get("half_open_task_id"):
                 breaker["state"] = "CLOSED"
+                breaker["open_reason"] = None
                 breaker["cooldown_seconds"] = breaker["base_cooldown"]
                 breaker["half_open_task_id"] = None
                 logger.warning(f"[CIRCUIT BREAKER] HALF-OPEN → CLOSED for {project_key} (test task succeeded)")
             elif breaker["state"] == "OPEN":
                 # Shouldn't happen (OPEN blocks spawning), but reset if it does
                 breaker["state"] = "CLOSED"
+                breaker["open_reason"] = None
             # Persist on state transition back to CLOSED
-            if breaker["state"] == "CLOSED" and breaker["failure_count"] == 0:
+            if (
+                breaker["state"] == "CLOSED"
+                and breaker["failure_count"] == 0
+                and breaker["infra_failure_count"] == 0
+            ):
                 await _orch._persist_circuit_breakers()
 
         if payload.status == TaskStatus.COMPLETED:

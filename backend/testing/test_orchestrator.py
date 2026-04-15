@@ -355,6 +355,142 @@ class TestReaperService:
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED  # unchanged
 
+    # ── Test 7: PROVISIONING + no heartbeat + stale vm_provisioned_at → pre-claim reap ──
+
+    @pytest.mark.asyncio
+    async def test_reaper_provision_timeout_before_agent_claim(self, db_session, mocker):
+        """
+        A VM that was dispatched 7 minutes ago but whose agent never claimed
+        (last_heartbeat is None, status still PROVISIONING) must be reaped
+        as a pre-claim failure and charged against provision_failures,
+        NOT against attempt_count.
+        """
+        mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        StopLoop = self._stop_after_one_cycle(mocker)
+
+        project = make_project(name="Pre-claim reap test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = datetime.utcnow()
+        task = make_task(
+            project_id=project.id,
+            vm_instance_id="silent-vm-001",
+            status=TaskStatus.PROVISIONING,
+            started_at=now - timedelta(minutes=7),
+            vm_provisioned_at=now - timedelta(minutes=7),
+            last_heartbeat=None,  # agent never contacted us
+            attempt_count=0,
+            context={"provision_zone": "us-east1-b"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        try:
+            await reaper_service()
+        except StopLoop:
+            pass
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED, "Pre-claim reaped task should be requeued"
+        assert task.attempt_count == 0, "Pre-claim failures must NOT burn attempt_count"
+        assert (task.context or {}).get("provision_failures") == 1, (
+            "Pre-claim failures must charge provision_failures"
+        )
+
+    # ── Test 8: IN_PROGRESS + stale heartbeat → attempt budget, not provision budget ──
+
+    @pytest.mark.asyncio
+    async def test_reaper_does_not_charge_provision_budget_post_claim(self, db_session, mocker):
+        """
+        A task that successfully claimed (status=IN_PROGRESS) and then went
+        silent must charge attempt_count, NOT provision_failures. This is the
+        clock-separation guarantee: once an agent claims, provision budget is
+        out of scope for any further reap on this attempt.
+        """
+        mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        StopLoop = self._stop_after_one_cycle(mocker)
+
+        project = make_project(name="Post-claim crash test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = datetime.utcnow()
+        task = make_task(
+            project_id=project.id,
+            vm_instance_id="crashed-vm-001",
+            status=TaskStatus.IN_PROGRESS,
+            vm_provisioned_at=now - timedelta(minutes=10),
+            last_heartbeat=now - timedelta(minutes=6),  # stale
+            attempt_count=0,
+            # Pre-existing provision_failures must NOT be bumped here.
+            context={"provision_failures": 1},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        try:
+            await reaper_service()
+        except StopLoop:
+            pass
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.attempt_count == 1, "Post-claim crash must increment attempt_count"
+        assert (task.context or {}).get("provision_failures") == 1, (
+            "Post-claim crash must NOT touch provision_failures"
+        )
+
+    # ── Test 9: fresh vm_provisioned_at → NOT reaped even with no heartbeat ────
+
+    @pytest.mark.asyncio
+    async def test_reaper_respects_pre_claim_grace_window(self, db_session, mocker):
+        """
+        A VM that was just dispatched (vm_provisioned_at < 6min ago) and has
+        no heartbeat yet must NOT be reaped — the agent is still within its
+        boot + auth + claim budget.
+        """
+        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        StopLoop = self._stop_after_one_cycle(mocker)
+
+        project = make_project(name="Grace window test", user_id="user1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        now = datetime.utcnow()
+        task = make_task(
+            project_id=project.id,
+            vm_instance_id="booting-vm-001",
+            status=TaskStatus.PROVISIONING,
+            started_at=now - timedelta(minutes=2),
+            vm_provisioned_at=now - timedelta(minutes=2),
+            last_heartbeat=None,
+            attempt_count=0,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        try:
+            await reaper_service()
+        except StopLoop:
+            pass
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PROVISIONING, "Fresh VM must be left alone"
+        mock_delete.assert_not_called()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 2 — Max Plan Account Pool

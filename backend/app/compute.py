@@ -597,10 +597,14 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       fi
     done
 
-    # 3. Write static env vars first, then append secrets from Secret Manager
+    # 3. Write static env vars first, then append secrets from Secret Manager.
+    # TASK_ID is baked here so the agent can POST pre-claim failure heartbeats
+    # (the JWT already binds sub=task_id, so the backend heartbeat endpoint
+    # accepts the same task_id before claim has happened).
     cat <<'STATICENV' > /etc/agent.env
 VM_INSTANCE_ID="{vm_instance_id}"
 ORCHESTRATOR_URL="{ORCHESTRATOR_URL}"
+TASK_ID="{task_id}"
 STATICENV
 
     # Append the credential lines retrieved from Secret Manager
@@ -946,6 +950,9 @@ STATICENV
 def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
     """Best-effort serial capture. Returns tail or None."""
     from google.cloud import compute_v1
+    if not zone or zone == "unknown":
+        logger.warning(f"[COMPUTE] Serial capture skipped for {vm_name}: zone='{zone}'")
+        return None
     try:
         client = compute_v1.InstancesClient()
         serial = client.get_serial_port_output(

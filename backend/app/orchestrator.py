@@ -126,7 +126,11 @@ async def _persist_circuit_breakers():
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
             # Prune: don't persist CLOSED breakers with no failures (default state)
-            if v.get("state") == "CLOSED" and v.get("failure_count", 0) == 0:
+            if (
+                v.get("state") == "CLOSED"
+                and v.get("failure_count", 0) == 0
+                and v.get("infra_failure_count", 0) == 0
+            ):
                 continue
             serializable[k] = {
                 **v,
@@ -857,11 +861,15 @@ async def orchestrator_worker():
                     # Store which account this task uses for cleanup on completion
                     task.context = {**(task.context or {}), "max_plan_account_id": account_id}
 
-                    # Mark as PROVISIONING to prevent other workers from picking it up
+                    # Mark as PROVISIONING to prevent other workers from picking it up.
+                    # last_heartbeat is intentionally NOT set here — it must reflect real
+                    # agent activity only. The reaper uses vm_provisioned_at as the clock
+                    # for the pre-claim window so it can distinguish "VM created but agent
+                    # never claimed" from "agent claimed and crashed".
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
-                    task.last_heartbeat = _utcnow()  # Reset stale-recovery clock from dispatch
+                    task.last_heartbeat = None
                     _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
                     try:
@@ -921,7 +929,12 @@ async def orchestrator_worker():
                                             success = False
                                             return
                                         if hb_task.status == TaskStatus.PROVISIONING:
-                                            hb_task.last_heartbeat = _utcnow()
+                                            # Refresh vm_provisioned_at to the point the GCE API
+                                            # confirmed the VM is running. This gives the agent a
+                                            # fresh window to claim before the reaper considers it
+                                            # a silent startup failure. last_heartbeat is left alone
+                                            # so only real agent activity writes it.
+                                            hb_task.vm_provisioned_at = _utcnow()
                                             # Save provision zone for diagnostics
                                             prov_zone = get_vm_zone(vm_id)
                                             hb_task.context = {**(hb_task.context or {}), "provision_zone": prov_zone}

@@ -329,6 +329,16 @@ async def _process_post_commit(
                 except Exception as _strat_exc:
                     logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
 
+            # Record research task failures so _check_direction_health can see
+            # cycles that never reached _handle_research_completion (VM crash,
+            # provision failure, agent timeout, etc.)
+            if task.first_payload.get("type") == "research":
+                try:
+                    from app.research_completion import _record_research_task_failure  # noqa: PLC0415
+                    await _record_research_task_failure(task, session)
+                except Exception as _res_exc:
+                    logger.error(f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}", exc_info=True)
+
             # Post result message for permanently failed auto-remediation tasks
             if (task.context or {}).get("auto_remediation") is True:
                 try:
@@ -1402,6 +1412,11 @@ async def _process_post_commit(
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
                     task.started_at = None
+                    # Handler ran after a successful VM provision — reset provision budget
+                    # so a transient handler failure doesn't consume retries meant for VM issues.
+                    handler_ctx = dict(task.context or {})
+                    handler_ctx.pop("provision_failures", None)
+                    task.context = handler_ctx
                     task.latest_status_message = f"Handler hit transient error, requeuing (attempt {task.attempt_count}): {type(handler_exc).__name__}"
                     logger.warning(f"[HANDLER] Transient error for {task.id}, requeuing: {handler_exc}")
                 else:

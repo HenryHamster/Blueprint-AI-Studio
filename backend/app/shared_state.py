@@ -78,12 +78,14 @@ def get_circuit_breaker(project_id: str) -> Dict:
     if project_id not in circuit_breakers:
         circuit_breakers[project_id] = {
             "state": "CLOSED",           # CLOSED, OPEN, HALF_OPEN
-            "failure_count": 0,          # consecutive failures
+            "failure_count": 0,          # consecutive code-quality failures (CODE_ERROR, AGENT_TIMEOUT)
+            "infra_failure_count": 0,    # consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API)
             "success_count": 0,          # consecutive successes (for half-open)
             "opened_at": None,           # when the breaker tripped
             "cooldown_seconds": 1800,    # 30 min initial cooldown
             "base_cooldown": 1800,       # for exponential backoff reset
             "half_open_task_id": None,   # the test task in HALF_OPEN
+            "open_reason": None,         # "code" or "infra" — why the breaker opened
         }
     return circuit_breakers[project_id]
 

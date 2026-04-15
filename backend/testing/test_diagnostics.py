@@ -26,6 +26,7 @@ def _make_task(
     status: TaskStatus,
     created_ago_secs: int = 0,
     started_ago_secs: int = 0,
+    provisioned_ago_secs: int = 0,
     heartbeat_ago_secs: int = 0,
     no_heartbeat: bool = False,
     depends_on=None,
@@ -43,6 +44,14 @@ def _make_task(
     )
     if started_ago_secs:
         task.started_at = now - timedelta(seconds=started_ago_secs)
+    # vm_provisioned_at is the orchestrator-side VM clock used by the
+    # provision_timeout diagnostic. Default to started_ago_secs if not given
+    # so existing tests that passed started_ago_secs still exercise the
+    # pre-claim window.
+    if provisioned_ago_secs:
+        task.vm_provisioned_at = now - timedelta(seconds=provisioned_ago_secs)
+    elif started_ago_secs and status == TaskStatus.PROVISIONING:
+        task.vm_provisioned_at = now - timedelta(seconds=started_ago_secs)
     if not no_heartbeat and heartbeat_ago_secs:
         task.last_heartbeat = now - timedelta(seconds=heartbeat_ago_secs)
     return task
@@ -154,14 +163,14 @@ class TestBuildStuckTasks:
 
     @pytest.mark.asyncio
     async def test_provision_timeout_detected(self, db_session):
-        """PROVISIONING task with no heartbeat and started >5 min ago is detected."""
+        """PROVISIONING task with no heartbeat and vm_provisioned_at >6 min ago is detected."""
         project = Project(name="diag-test", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          started_ago_secs=7 * 60, no_heartbeat=True)
+                          provisioned_ago_secs=8 * 60, no_heartbeat=True)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -175,14 +184,14 @@ class TestBuildStuckTasks:
 
     @pytest.mark.asyncio
     async def test_provision_timeout_not_triggered_when_too_young(self, db_session):
-        """PROVISIONING task started only 3 min ago must NOT be flagged."""
+        """PROVISIONING task whose VM was provisioned only 3 min ago must NOT be flagged."""
         project = Project(name="diag-test2", user_id="test-user-123")
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
 
         task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          started_ago_secs=3 * 60, no_heartbeat=True)
+                          provisioned_ago_secs=3 * 60, no_heartbeat=True)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -199,7 +208,7 @@ class TestBuildStuckTasks:
         await db_session.refresh(project)
 
         task = _make_task(project.id, TaskStatus.PROVISIONING,
-                          started_ago_secs=7 * 60, heartbeat_ago_secs=60)
+                          provisioned_ago_secs=8 * 60, heartbeat_ago_secs=60)
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)

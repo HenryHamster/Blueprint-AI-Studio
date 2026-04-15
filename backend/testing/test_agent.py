@@ -165,6 +165,47 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(client: AsyncClient, db_session):
+    """
+    Tests that the heartbeat endpoint accepts a heartbeat from an agent whose task
+    is still in PROVISIONING state. This is the pre-claim failure reporting path:
+    an agent that dies during token validation or claim needs to post a final
+    PRE_CLAIM_FAILED heartbeat so the reaper has forensic evidence instead of a
+    silent provision failure.
+    """
+    project = Project(name="Pre-claim Heartbeat Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task is in PROVISIONING — matches the state during the agent's pre-claim window.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-preclaim",
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-preclaim")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status_message": "PRE_CLAIM_FAILED: token validation rate-limited",
+    }
+
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PROVISIONING, "heartbeat must not mutate status"
+    assert task.latest_status_message == "PRE_CLAIM_FAILED: token validation rate-limited"
+    assert task.last_heartbeat is not None
+
+
+@pytest.mark.asyncio
 async def test_agent_status_complete_with_artifacts_creates_artifact_record(client: AsyncClient, db_session, mocker):
     """
     Tests that completing a task with artifact information creates an Artifact record
@@ -922,7 +963,10 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
             payloads=[{"cmd": "test"}],
             vm_instance_id=f"agent-vm-backoff-{retry_num}",
             status=TaskStatus.IN_PROGRESS,
-            context={"_api_failure_retries": retry_num - 1},
+            # Pre-seed provision_failures to verify it gets cleared on graceful requeue —
+            # otherwise a single provision hiccup on a previously-successful task would
+            # immediately exhaust the 3-retry budget on the next dispatch.
+            context={"_api_failure_retries": retry_num - 1, "provision_failures": 2},
         )
         db_session.add(task)
         await db_session.commit()
@@ -945,6 +989,9 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         assert task.status == TaskStatus.QUEUED, f"retry {retry_num}: expected QUEUED"
         ctx = task.context or {}
         assert "retry_after" in ctx, f"retry {retry_num}: retry_after not set"
+        assert "provision_failures" not in ctx, (
+            f"retry {retry_num}: provision_failures should be cleared on graceful requeue"
+        )
 
         retry_after_dt = datetime.fromisoformat(ctx["retry_after"])
         expected_delay = min(2 ** retry_num * 120, 1800)

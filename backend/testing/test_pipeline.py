@@ -567,15 +567,21 @@ class TestCausationAnalysis:
 # ── Circuit Breaker ─────────────────────────────────────────────────────────
 
 class TestCircuitBreaker:
-    def test_initial_state_is_closed(self):
+    def _fresh(self, project_id: str):
         import app.shared_state as ss
-        breaker = ss.get_circuit_breaker("test-project-cb")
+        ss.circuit_breakers.pop(project_id, None)
+        return ss.get_circuit_breaker(project_id)
+
+    def test_initial_state_is_closed(self):
+        breaker = self._fresh("test-project-cb")
         assert breaker["state"] == "CLOSED"
         assert breaker["failure_count"] == 0
+        assert breaker["infra_failure_count"] == 0
+        assert breaker["open_reason"] is None
 
     def test_breaker_state_persistence(self):
         import app.shared_state as ss
-        breaker = ss.get_circuit_breaker("test-project-cb2")
+        breaker = self._fresh("test-project-cb2")
         breaker["state"] = "OPEN"
         breaker["failure_count"] = 5
         # Same project returns same dict
@@ -584,11 +590,16 @@ class TestCircuitBreaker:
         assert same["failure_count"] == 5
 
     def test_different_projects_independent(self):
-        import app.shared_state as ss
-        b1 = ss.get_circuit_breaker("proj-a")
-        b2 = ss.get_circuit_breaker("proj-b")
+        b1 = self._fresh("proj-a")
+        b2 = self._fresh("proj-b")
         b1["state"] = "OPEN"
         assert b2["state"] == "CLOSED"
+
+    def test_initial_state_has_infra_counter(self):
+        """Regression: infra_failure_count must default to 0 for fresh breakers."""
+        breaker = self._fresh("test-project-cb-infra-init")
+        assert breaker.get("infra_failure_count") == 0
+        assert breaker.get("open_reason") is None
 
 
 # ── Review-Fix Iteration Cap ───────────────────────────────────────────────

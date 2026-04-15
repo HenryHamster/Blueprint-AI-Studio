@@ -50,26 +50,50 @@ async def reaper_service():
 
                 now = _utcnow()
                 five_minutes_ago = now - timedelta(minutes=5)
-                four_minutes_ago = now - timedelta(minutes=4)
+                six_minutes_ago = now - timedelta(minutes=6)
                 ten_minutes_ago = now - timedelta(minutes=10)
-
                 fifteen_minutes_ago = now - timedelta(minutes=15)
+
+                # State-machine invariants after the clock-separation fix:
+                #   - vm_provisioned_at: written by orchestrator when the VM is dispatched
+                #     and when GCE confirms it's running. Never written by the agent.
+                #   - last_heartbeat: written only by the agent (claim + heartbeat interval).
+                #     None on a PROVISIONING task means the agent has not contacted us yet.
+                #
+                # Thresholds:
+                #   - IN_PROGRESS + last_heartbeat > 5min ago → agent crashed mid-run (attempt budget)
+                #   - PROVISIONING + vm_provisioned_at > 6min ago + no heartbeat → silent pre-claim
+                #     death (provision budget). 6min gives margin over the ~90-150s nominal cold
+                #     boot + auth validation + claim sequence.
+                #   - PROVISIONING + started_at > 15min ago → absolute catch-all.
                 orphaned_ids = []
                 for task in active_tasks:
                     if not task.vm_instance_id:
                         continue
-                    if task.status == TaskStatus.PROVISIONING and task.started_at and task.started_at < fifteen_minutes_ago:
-                        orphaned_ids.append(task.id)  # PROVISIONING timeout regardless of heartbeat
-                        logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
-                    elif task.last_heartbeat:
-                        # Has heartbeat — ONLY check heartbeat freshness.
-                        # Do NOT fall through to started_at — that's for tasks with no heartbeat.
-                        if task.last_heartbeat < five_minutes_ago:
+                    if task.status == TaskStatus.PROVISIONING:
+                        if task.started_at and task.started_at < fifteen_minutes_ago:
+                            orphaned_ids.append(task.id)  # absolute provisioning ceiling
+                            logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
+                        elif task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
+                            # Rare: agent claimed during PROVISIONING (shouldn't happen since
+                            # claim_task also flips status to IN_PROGRESS), then went silent.
                             orphaned_ids.append(task.id)
-                    elif task.started_at:
-                        # No heartbeat ever received — startup callback should arrive within ~2 min.
-                        # 4-minute threshold gives 2.5x margin for slow boots.
-                        if task.started_at < four_minutes_ago:
+                        elif task.vm_provisioned_at and task.vm_provisioned_at < six_minutes_ago and task.last_heartbeat is None:
+                            # Silent pre-claim death: VM was dispatched 6+ min ago and the
+                            # agent never claimed. Charge provision budget.
+                            orphaned_ids.append(task.id)
+                    elif task.status == TaskStatus.IN_PROGRESS:
+                        if task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
+                            orphaned_ids.append(task.id)
+                        elif task.last_heartbeat is None and task.started_at and task.started_at < six_minutes_ago:
+                            # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
+                            # (claim_task sets last_heartbeat at agent.py:312) but if we hit
+                            # it, treat as a post-claim crash.
+                            orphaned_ids.append(task.id)
+                        elif task.last_heartbeat is None and task.started_at is None and task.created_at < ten_minutes_ago:
+                            # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
+                            # that's been alive for >10 min — data corruption or a path that
+                            # forgot to set started_at. Reap as a catch-all.
                             orphaned_ids.append(task.id)
                     elif task.created_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
@@ -131,20 +155,28 @@ async def reaper_service():
                             del _reaper_skip_counts[tid]
 
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
-                    # expire_all() above ensures these objects have fresh DB values
+                    # expire_all() above ensures these objects have fresh DB values.
+                    # Mirrors the state machine above — same thresholds, same branching.
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
                     five_minutes_ago = now - timedelta(minutes=5)
-                    four_minutes_ago = now - timedelta(minutes=4)
+                    six_minutes_ago = now - timedelta(minutes=6)
                     ten_minutes_ago = now - timedelta(minutes=10)
+                    fifteen_minutes_ago = now - timedelta(minutes=15)
                     verified = []
                     for t in orphaned_tasks:
-                        if t.last_heartbeat:
-                            # Has heartbeat — ONLY reap if stale. Fresh heartbeat = healthy.
-                            if t.last_heartbeat < five_minutes_ago:
+                        if t.status == TaskStatus.PROVISIONING:
+                            if t.started_at and t.started_at < fifteen_minutes_ago:
                                 verified.append(t)
-                        elif t.started_at:
-                            # No heartbeat — startup callback should arrive within ~2 min
-                            if t.started_at < four_minutes_ago:
+                            elif t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
+                                verified.append(t)
+                            elif t.vm_provisioned_at and t.vm_provisioned_at < six_minutes_ago and t.last_heartbeat is None:
+                                verified.append(t)
+                        elif t.status == TaskStatus.IN_PROGRESS:
+                            if t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
+                                verified.append(t)
+                            elif t.last_heartbeat is None and t.started_at and t.started_at < six_minutes_ago:
+                                verified.append(t)
+                            elif t.last_heartbeat is None and t.started_at is None and t.created_at < ten_minutes_ago:
                                 verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)
@@ -162,15 +194,28 @@ async def reaper_service():
                         continue
                     task = fresh_task  # Use fresh data for all subsequent reads and writes
 
-                    # Determine why the reaper flagged this task (use fresh_task for accurate data)
-                    if fresh_task.last_heartbeat:
+                    # Determine why the reaper flagged this task. The classification slices
+                    # into three cases based on status + which clock expired first.
+                    if fresh_task.status == TaskStatus.PROVISIONING and fresh_task.started_at and fresh_task.started_at < fifteen_minutes_ago:
+                        age = int((now - fresh_task.started_at).total_seconds())
+                        reap_reason = f"Absolute provision timeout — {age}s since dispatch"
+                        reap_reason_code = 'absolute_timeout'
+                    elif fresh_task.status == TaskStatus.PROVISIONING and fresh_task.last_heartbeat is None:
+                        # VM created, agent never contacted us. Use vm_provisioned_at if available,
+                        # else fall back to started_at for the age display.
+                        clock = fresh_task.vm_provisioned_at or fresh_task.started_at
+                        age = int((now - clock).total_seconds()) if clock else 0
+                        reap_reason = f"Silent pre-claim death — {age}s since VM provisioned, no heartbeat"
+                        reap_reason_code = 'provision_timeout_pre_claim'
+                    elif fresh_task.last_heartbeat:
                         age = int((now - fresh_task.last_heartbeat).total_seconds())
                         reap_reason = f"No heartbeat for {age}s (last: {fresh_task.last_heartbeat.isoformat()})"
-                        reap_reason_code = 'heartbeat_timeout'
+                        reap_reason_code = 'heartbeat_timeout_post_claim'
                     elif fresh_task.started_at:
+                        # IN_PROGRESS without a heartbeat (defensive branch — should be rare).
                         age = int((now - fresh_task.started_at).total_seconds())
-                        reap_reason = f"No heartbeat received after {age}s since provisioning"
-                        reap_reason_code = 'provision_timeout'
+                        reap_reason = f"IN_PROGRESS without heartbeat for {age}s since dispatch"
+                        reap_reason_code = 'heartbeat_timeout_post_claim'
                     else:
                         age = int((now - fresh_task.created_at).total_seconds())
                         reap_reason = f"Never started — {age}s since creation, no heartbeat"
@@ -243,6 +288,9 @@ async def reaper_service():
                         rl_ctx.pop("max_plan_account_id", None)
                         rl_ctx.pop("_slot_released", None)
                         rl_ctx.pop("retry_after", None)  # clear any stale delay
+                        # Rate-limit is an account-level issue, not a provision failure —
+                        # don't carry provision budget into the next dispatch.
+                        rl_ctx.pop("provision_failures", None)
                         task.context = rl_ctx
                         session.add(task)
                         await broadcast_to_project(str(task.project_id), "task_updated",
@@ -251,7 +299,18 @@ async def reaper_service():
 
                     if is_provision_failure:
                         provision_failures += 1
-                        prov_zone = (task.context or {}).get("provision_zone")
+                        # Resolve zone with a fallback chain so serial log capture works
+                        # even when the in-memory _vm_zones cache has been cleared (e.g.
+                        # after an orchestrator restart between provision and reap).
+                        #   1. get_vm_zone() — in-memory cache, populated at provision time
+                        #   2. task.context["provision_zone"] — persisted at orchestrator.py:862
+                        prov_zone = None
+                        if fresh_task.vm_instance_id:
+                            cached = get_vm_zone(fresh_task.vm_instance_id)
+                            if cached and cached != "unknown":
+                                prov_zone = cached
+                        if not prov_zone:
+                            prov_zone = (task.context or {}).get("provision_zone")
                         failed_acct = (task.context or {}).get("max_plan_account_id")
 
                         # Classify: infra-wide (all zones/quota exhausted) vs task-specific
@@ -262,11 +321,12 @@ async def reaper_service():
                             or (not prov_zone and not any_zone_available())
                         )
 
+                        serial_log = None
                         if prov_zone:
                             # VM was created (GCP API succeeded) but agent never claimed.
                             # Capture serial logs before the VM is deleted — this is the
-                            # only way to diagnose agent startup crashes.
-                            serial_log = None
+                            # only way to diagnose agent startup crashes. Serial log is
+                            # persisted to task.context so it survives in the UI/db.
                             vm_id = fresh_task.vm_instance_id
                             if vm_id:
                                 try:
@@ -276,8 +336,8 @@ async def reaper_service():
                                             f"[REAPER] Serial log for dying agent {vm_id} "
                                             f"(task {task.id}):\n{serial_log[-500:]}"
                                         )
-                                except Exception:
-                                    pass
+                                except Exception as capture_err:
+                                    logger.warning(f"[REAPER] Serial capture failed for {vm_id}: {capture_err}")
 
                             # Blacklist the account so retry uses a different one.
                             blacklisted = list((task.context or {}).get("blacklisted_accounts") or [])
@@ -295,7 +355,12 @@ async def reaper_service():
                                 new_ctx["last_serial_log"] = serial_log[-500:]
                             record_zone_failure(prov_zone, reason="AGENT_STARTUP_FAILURE")
                         else:
-                            # No provision_zone — VM may never have been created.
+                            # No provision_zone — VM may never have been created, or the
+                            # fallback chain couldn't resolve one.
+                            logger.warning(
+                                f"[REAPER] Skipping serial capture for task {task.id}: "
+                                f"zone unknown (vm_id={fresh_task.vm_instance_id})"
+                            )
                             new_ctx = dict(task.context or {})
 
                         if is_infra:
