@@ -807,6 +807,34 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   return lines.join('\n');
 }
 
+// ── Self-review helpers ───────────────────────────────────────────────────────
+function buildSelfReviewChecklist(taskScope?: string): string {
+  if (taskScope === 'small') {
+    return `Check for:
+1. **Correctness** — Off-by-one errors, null/undefined handling, edge cases in the changed logic?
+2. **Missing test coverage** — Is there new behavior with no corresponding test?`;
+  }
+  if (taskScope === 'large') {
+    return `Check for:
+1. **Missing test coverage** — Is there new behavior with no corresponding test?
+2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
+3. **Scope violations** — Are there changes unrelated to the task requirements?
+4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
+5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
+6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?
+7. **Backwards compatibility** — Are any existing callers broken by signature or behavior changes?
+8. **Data model safety** — Are schema changes (DB, JSONB, API response shapes) backwards-compatible?
+9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
+  }
+  // medium or unspecified: standard 5-item checklist
+  return `Check for:
+1. **Missing test coverage** — Is there new behavior with no corresponding test?
+2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
+3. **Scope violations** — Are there changes unrelated to the task requirements?
+4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
+5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?`;
+}
+
 // ── Self-review prompt builder ───────────────────────────────────────────────
 /**
  * Builds a focused self-review prompt for the agent to check its own diff
@@ -820,9 +848,22 @@ export function buildSelfReviewPrompt(opts: {
   claudeMd: string;
   buildConfig?: BuildConfig;
   changedFiles?: string[];
+  reviewIssueDistribution?: Record<string, number>;
+  taskScope?: string;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
+    : '';
+
+  const issueDistSection = opts.reviewIssueDistribution && Object.keys(opts.reviewIssueDistribution).length > 0
+    ? (() => {
+        const sorted = Object.entries(opts.reviewIssueDistribution!)
+          .sort(([, a], [, b]) => b - a)
+          .slice(0, 5)
+          .map(([cat, count]) => `${cat} (${Math.round(count * 100)}%)`)
+          .join(', ');
+        return `\n## Project-Specific Review Patterns\nIn this project, the most common review issues are: ${sorted}. Prioritize these checks.\n`;
+      })()
     : '';
 
   const playbookSection = Object.keys(opts.reviewPlaybook).length > 0
@@ -859,17 +900,12 @@ export function buildSelfReviewPrompt(opts: {
 
 ## Task Requirements
 ${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
-${restrictionsSection}${playbookSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${playbookSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 
-Check for:
-1. **Missing test coverage** — Is there new behavior with no corresponding test?
-2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
-3. **Scope violations** — Are there changes unrelated to the task requirements?
-4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
-5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
+${buildSelfReviewChecklist(opts.taskScope)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
 If everything looks good, output exactly: SELF-REVIEW PASSED`;

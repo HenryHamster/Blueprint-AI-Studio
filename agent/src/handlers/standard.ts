@@ -165,14 +165,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         changedFiles = [...allNames];
       }
 
-      // Filter playbook to review-related entries
+      // Pass all playbook entries — backend already filters by applicable_types,
+      // so every entry is relevant to this task type.
       const playbook = task.playbook as Record<string, string> | undefined;
-      const reviewPlaybook: Record<string, string> = {};
-      if (playbook) {
-        for (const [k, v] of Object.entries(playbook)) {
-          if (k.toLowerCase().includes('review')) reviewPlaybook[k] = v;
-        }
-      }
+      const reviewPlaybook: Record<string, string> = playbook ? { ...playbook } : {};
+
+      const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
+      const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
 
       const selfReviewPrompt = buildSelfReviewPrompt({
         rawPrompt,
@@ -182,6 +181,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         claudeMd,
         buildConfig,
         changedFiles,
+        reviewIssueDistribution: reviewIssueDist,
+        taskScope: (task.context as Record<string, unknown> | undefined)?.scope as string | undefined,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);

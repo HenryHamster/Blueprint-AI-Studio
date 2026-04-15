@@ -668,4 +668,101 @@ describe('buildSelfReviewPrompt', () => {
     const result = buildSelfReviewPrompt(baseOpts);
     expect(result).toContain('fix the errors before proceeding with the review checklist');
   });
+
+  it('renders project-specific review patterns when reviewIssueDistribution is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      reviewIssueDistribution: { 'test-coverage': 0.35, 'type-safety': 0.25, 'error-handling': 0.20 },
+    });
+    expect(result).toContain('## Project-Specific Review Patterns');
+    expect(result).toContain('test-coverage (35%)');
+    expect(result).toContain('type-safety (25%)');
+    expect(result).toContain('error-handling (20%)');
+    expect(result).toContain('Prioritize these checks');
+  });
+
+  it('sorts review issue distribution by frequency descending', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      reviewIssueDistribution: { 'error-handling': 0.10, 'test-coverage': 0.40, 'type-safety': 0.20 },
+    });
+    const patternsSection = result.slice(result.indexOf('## Project-Specific Review Patterns'));
+    const testCoveragePos = patternsSection.indexOf('test-coverage');
+    const typeSafetyPos = patternsSection.indexOf('type-safety');
+    const errorHandlingPos = patternsSection.indexOf('error-handling');
+    expect(testCoveragePos).toBeLessThan(typeSafetyPos);
+    expect(typeSafetyPos).toBeLessThan(errorHandlingPos);
+  });
+
+  it('omits project-specific review patterns when reviewIssueDistribution is undefined', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    expect(result).not.toContain('## Project-Specific Review Patterns');
+  });
+
+  it('omits project-specific review patterns when reviewIssueDistribution is empty', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, reviewIssueDistribution: {} });
+    expect(result).not.toContain('## Project-Specific Review Patterns');
+  });
+});
+
+// ── buildSelfReviewChecklist (via buildSelfReviewPrompt) ─────────────────────
+describe('buildSelfReviewChecklist', () => {
+  const baseOpts = {
+    rawPrompt: 'Implement feature X',
+    taskTitle: 'feat: add X',
+    diff: 'diff --git a/foo.ts b/foo.ts',
+    reviewPlaybook: {},
+    claudeMd: '',
+  };
+
+  it('taskScope=small produces a 2-item correctness-focused checklist', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'small' });
+    expect(result).toContain('Correctness');
+    expect(result).toContain('Missing test coverage');
+    expect(result).not.toContain('Type safety violations');
+    expect(result).not.toContain('Scope violations');
+    expect(result).not.toContain('Security issues');
+    expect(result).not.toContain('Pattern violations');
+  });
+
+  it('taskScope=large produces a 9-item comprehensive checklist', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'large' });
+    expect(result).toContain('Missing test coverage');
+    expect(result).toContain('Type safety violations');
+    expect(result).toContain('Scope violations');
+    expect(result).toContain('Security issues');
+    expect(result).toContain('Pattern violations');
+    expect(result).toContain('Cross-file consistency');
+    expect(result).toContain('Backwards compatibility');
+    expect(result).toContain('Data model safety');
+    expect(result).toContain('Import/dependency verification');
+  });
+
+  it('taskScope=undefined produces the standard 5-item checklist', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
+    expect(result).toContain('Missing test coverage');
+    expect(result).toContain('Type safety violations');
+    expect(result).toContain('Scope violations');
+    expect(result).toContain('Security issues');
+    expect(result).toContain('Pattern violations');
+    expect(result).not.toContain('Cross-file consistency');
+    expect(result).not.toContain('Backwards compatibility');
+    expect(result).not.toContain('Data model safety');
+    expect(result).not.toContain('Import/dependency verification');
+    expect(result).not.toContain('Correctness');
+  });
+
+  it('taskScope=medium (explicit) produces the same 5-item checklist as undefined', () => {
+    const resultUndefined = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
+    const resultMedium = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'medium' });
+    expect(resultMedium).toContain('Missing test coverage');
+    expect(resultMedium).toContain('Type safety violations');
+    expect(resultMedium).toContain('Scope violations');
+    expect(resultMedium).toContain('Security issues');
+    expect(resultMedium).toContain('Pattern violations');
+    expect(resultMedium).not.toContain('Cross-file consistency');
+    expect(resultMedium).not.toContain('Correctness');
+    // medium and undefined produce identical checklist output
+    expect(resultMedium).toBe(resultUndefined);
+  });
 });
