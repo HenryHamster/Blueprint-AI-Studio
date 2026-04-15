@@ -303,7 +303,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             stale_threshold = timedelta(minutes=10)
             respawned = 0
             for c in unmerged:
-                age = (now - c.started_at).total_seconds() if c.started_at else 0
+                age = (now - c.updated_at).total_seconds() if c.updated_at else 0
                 if age < stale_threshold.total_seconds():
                     continue  # Too recent — normal pipeline may still be working
                 # Look up PR artifact to get pr_number and branch
@@ -707,7 +707,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 select(_func.count()).select_from(Task).where(
                                     Task.status == TaskStatus.COMPLETED,
                                     Task.id != parent.id,
-                                    Task.started_at >= _utcnow() - timedelta(hours=1),
+                                    Task.updated_at >= _utcnow() - timedelta(hours=1),
                                     Task.context["rollup_pr_url"].as_string().is_not(None),
                                 )
                             )).scalar() or 0

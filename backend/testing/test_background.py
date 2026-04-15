@@ -46,14 +46,12 @@ async def reaper_db(mocker):
     await reaper_engine.dispose()
 
 @pytest.mark.asyncio
-async def test_reaper_evaluating_sweep_queries_started_at(reaper_db, mocker):
-    """Regression: the EVALUATING stale-parent sweep queried Task.updated_at,
-    which does not exist on the Task SQLModel and raised AttributeError every
-    reaper cycle — making the sweep entirely non-functional in production.
-
-    The sweep must build the query against started_at, find stale EVALUATING
-    parents (> 15 min old), and invoke _check_and_trigger_rollup on a completed
-    child so the stale-PR recovery path can respawn a review.
+async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
+    """Regression: the EVALUATING stale-parent sweep originally queried
+    Task.updated_at before that column existed, raising AttributeError every
+    reaper cycle. The stopgap swapped the query to started_at. Migration 0033
+    adds the real updated_at column; this test pins the sweep to the real
+    column and verifies the path end-to-end.
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
@@ -70,12 +68,12 @@ async def test_reaper_evaluating_sweep_queries_started_at(reaper_db, mocker):
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
-    # Stale EVALUATING parent: started 20 minutes ago, well past the 15-min cutoff.
+    # Stale EVALUATING parent: last touched 20 minutes ago, past the 15-min cutoff.
     parent = Task(
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck evaluating"}],
         status=TaskStatus.EVALUATING,
-        started_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()

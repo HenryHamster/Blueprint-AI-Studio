@@ -159,6 +159,13 @@ class Task(SQLModel, table=True):
     attempt_count: int = Field(default=0)
     created_at: datetime = Field(default_factory=_utcnow)
     started_at: Optional[datetime] = Field(default=None)
+    # Auto-populated on INSERT (default_factory) and UPDATE (onupdate). Consumed by
+    # reaper.py's EVALUATING stale sweep and rollup_management.py age calculations
+    # so "last touched" can be distinguished from "first started".
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column_kwargs={"onupdate": _utcnow},
+    )
     archived: bool = Field(default=False)
 
     # VM lifecycle timing for cost tracking

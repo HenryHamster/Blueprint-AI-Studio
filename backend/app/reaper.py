@@ -464,7 +464,7 @@ async def reaper_service():
                     evaluating_parents = (await session.execute(
                         select(Task).where(
                             Task.status == TaskStatus.EVALUATING,
-                            Task.started_at < stale_cutoff,
+                            Task.updated_at < stale_cutoff,
                         )
                     )).scalars().all()
                     for parent in evaluating_parents:
