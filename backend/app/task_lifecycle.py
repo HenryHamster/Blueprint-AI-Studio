@@ -835,6 +835,20 @@ async def _process_post_commit(
                                                     logger.warning("[AUTO-REMEDIATION] Failed to dispatch AUTO_FIX_MERGED webhook: %s", _wh_exc)
                                             except Exception as _ar_exc:
                                                 logger.warning("[AUTO-REMEDIATION] Failed to post result message: %s", _ar_exc)
+                                        # Extract review feedback as persistent playbook entries
+                                        # when a PR merges after a multi-iteration review cycle (3+)
+                                        try:
+                                            from app.playbook_learning import extract_review_feedback_to_playbook
+                                            _orig_task_type = orig.first_payload.get("type", "create")
+                                            await extract_review_feedback_to_playbook(
+                                                task=task,
+                                                review_loop=review_loop,
+                                                pr_number=pr_number,
+                                                original_task_type=_orig_task_type,
+                                                session=session,
+                                            )
+                                        except Exception as _rp_exc:
+                                            logger.warning("[REVIEW_PLAYBOOK] Failed to extract review feedback: %s", _rp_exc)
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)

@@ -20,6 +20,45 @@ from sqlmodel import select
 
 from app.models import Task, Project, TaskStatus, _utcnow
 
+# ---------------------------------------------------------------------------
+# Review feedback category keywords
+# ---------------------------------------------------------------------------
+
+_REVIEW_CATEGORIES: dict[str, list[str]] = {
+    "test-coverage": [
+        "test", "coverage", "assert", "unit test", "integration test",
+        "spec", "test case", "test suite", "missing test", "untested",
+    ],
+    "error-handling": [
+        "error handling", "exception", "try/catch", "try except", "fallback",
+        "guard", "null check", "none check", "unhandled", "raise",
+    ],
+    "security": [
+        "security", "injection", "xss", "csrf", "sanitize", "validate input",
+        "auth", "permission", "secret", "credential", "escape",
+    ],
+    "style-conventions": [
+        "style", "format", "naming", "convention", "whitespace", "indentation",
+        "pep8", "lint", "camelcase", "snake_case", "consistent",
+    ],
+    "type-safety": [
+        "type hint", "type annotation", "typing", "typevar", "optional",
+        "union", "cast", "mypy", "type error", "untyped",
+    ],
+    "documentation": [
+        "docstring", "documentation", "comment", "readme", "inline comment",
+        "missing doc", "undocumented",
+    ],
+    "performance": [
+        "performance", "optimize", "cache", "slow", "n+1", "index", "memory",
+        "efficiency", "bottleneck",
+    ],
+    "architecture": [
+        "refactor", "separation of concerns", "coupling", "dependency",
+        "abstraction", "pattern", "interface", "modularity", "cohesion",
+    ],
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -226,3 +265,128 @@ async def _maybe_auto_playbook(
         task.project_id, key, signature, total_count,
     )
     return key
+
+
+# ---------------------------------------------------------------------------
+# Review-feedback extraction
+# ---------------------------------------------------------------------------
+
+def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
+    """Scan review_history entries and bucket issues by category.
+
+    Returns a mapping of {category_name: [{"desc": ..., "severity": ..., "iteration": ...}]}.
+    Only CRITICAL/MAJOR/MINOR severity issues are considered.
+    Each issue is assigned to the *first* matching category.
+    """
+    buckets: dict[str, list[dict]] = {}
+
+    for entry in review_history:
+        issues = entry.get("issues") or []
+        for issue in issues:
+            desc = (issue.get("description") or "").strip()
+            severity = (issue.get("severity") or "").upper()
+            if not desc or severity not in ("CRITICAL", "MAJOR", "MINOR"):
+                continue
+            desc_lower = desc.lower()
+            for cat_name, keywords in _REVIEW_CATEGORIES.items():
+                if any(kw in desc_lower for kw in keywords):
+                    buckets.setdefault(cat_name, []).append({
+                        "desc": desc,
+                        "severity": severity,
+                        "iteration": entry.get("iteration", 0),
+                    })
+                    break  # first matching category wins
+
+    return buckets
+
+
+async def extract_review_feedback_to_playbook(
+    task: Task,
+    review_loop: dict,
+    pr_number: int,
+    original_task_type: str,
+    session: AsyncSession,
+) -> list[str]:
+    """Extract recurring review feedback themes and persist them as playbook entries.
+
+    Called after a PR merges following a multi-iteration review cycle (3+ iterations).
+    Creates at most 2 entries per completed review cycle, tagged with
+    ``source='review-extracted'`` so they are distinguishable from failure-pattern
+    and manually written entries.
+
+    Deduplicates by playbook key: if ``playbook/review-<category>`` already exists
+    for the project the entry is skipped.
+
+    Returns the list of created playbook keys (may be empty).
+    """
+    iteration = review_loop.get("iteration", 0)
+    review_history = review_loop.get("review_history") or []
+
+    if iteration < 3 or not review_history:
+        return []
+
+    buckets = _categorize_review_issues(review_history)
+    if not buckets:
+        return []
+
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return []
+
+    doc = dict(project.design_doc or {})
+
+    # Pick the top-2 categories by issue count
+    top_cats = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:2]
+
+    created_keys: list[str] = []
+    for cat_name, issues in top_cats:
+        playbook_full_key = f"playbook/review-{cat_name}"
+
+        if playbook_full_key in doc:
+            logger.debug(
+                "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
+                task.project_id, playbook_full_key,
+            )
+            continue
+
+        # Surface up to 3 highest-severity examples
+        severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
+        top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
+        examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
+
+        content = (
+            f"Review pattern from PR #{pr_number} ({iteration} iterations): "
+            f"{cat_name.replace('-', ' ')} issues were repeatedly flagged. "
+            f"Examples: {examples[:300]}. "
+            f"Applicable to: {original_task_type} tasks."
+        )
+
+        doc[playbook_full_key] = {
+            "content": content,
+            "source_task_id": str(task.id),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+            "source": "review-extracted",
+            "applicable_types": [original_task_type],
+            "pr_number": pr_number,
+            "iteration_count": iteration,
+        }
+        created_keys.append(f"review-{cat_name}")
+
+    if created_keys:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "review-playbook"
+        doc["_meta"] = meta
+
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+
+        logger.info(
+            "[REVIEW_PLAYBOOK] project=%s PR #%d iteration=%d created entries: %s",
+            task.project_id, pr_number, iteration, created_keys,
+        )
+
+    return created_keys
