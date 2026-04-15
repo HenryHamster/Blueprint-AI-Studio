@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -683,3 +684,742 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
 
     await db_session.refresh(task)
     assert task.context.get("pr_rejected") is None
+
+
+# ---------------------------------------------------------------------------
+# Webhook helpers shared by the three new handler test sections
+# ---------------------------------------------------------------------------
+
+def _make_pr_merged_payload(owner: str, repo: str, pr_number: int, body: str = "") -> bytes:
+    """Build a minimal pull_request closed+merged webhook payload."""
+    return json.dumps({
+        "action": "closed",
+        "pull_request": {
+            "number": pr_number,
+            "merged": True,
+            "body": body,
+        },
+        "repository": {
+            "full_name": f"{owner}/{repo}",
+        },
+    }).encode()
+
+
+def _make_check_run_payload(
+    owner: str,
+    repo: str,
+    head_sha: str,
+    *,
+    action: str = "completed",
+    conclusion: str = "success",
+    head_branch: str = "feature/test",
+) -> bytes:
+    """Build a minimal check_run webhook payload."""
+    return json.dumps({
+        "action": action,
+        "check_run": {
+            "id": 999,
+            "name": "CI / test",
+            "status": "completed",
+            "conclusion": conclusion,
+            "head_sha": head_sha,
+            "check_suite": {
+                "head_branch": head_branch,
+                "pull_requests": [],
+            },
+        },
+        "repository": {
+            "full_name": f"{owner}/{repo}",
+        },
+    }).encode()
+
+
+def _make_pr_event_payload(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    action: str,
+    *,
+    branch: str = "feature/my-branch",
+    base_branch: str = "main",
+    title: str = "My PR",
+) -> bytes:
+    """Build a minimal pull_request opened/synchronize webhook payload."""
+    return json.dumps({
+        "action": action,
+        "pull_request": {
+            "number": pr_number,
+            "merged": False,
+            "body": "",
+            "head": {"ref": branch},
+            "base": {"ref": base_branch},
+            "title": title,
+        },
+        "repository": {
+            "full_name": f"{owner}/{repo}",
+        },
+    }).encode()
+
+
+async def _post_webhook(client, payload_bytes: bytes, event_type: str):
+    """Send a signed webhook POST and return the response."""
+    return await client.post(
+        "/api/github/webhook",
+        content=payload_bytes,
+        headers={
+            "content-type": "application/json",
+            "x-github-event": event_type,
+            "x-github-delivery": f"test-{uuid.uuid4()}",
+            "x-hub-signature-256": _make_webhook_sig(payload_bytes),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Webhook tests: pull_request closed+merged handler
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, mocker):
+    """
+    A pull_request webhook with action=closed and merged=True sets pr_merged=True
+    on the matching task's context.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+
+    project = Project(
+        name="Merge Test",
+        user_id="user1",
+        github_owner="mergeorg",
+        github_repo="mergerepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Add feature",
+        payloads=[{"type": "create", "prompt": "do it"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/mergeorg/mergerepo/pull/55",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload("mergeorg", "mergerepo", 55)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is True
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_unregistered_repo_ignored(client, db_session, mocker):
+    """
+    A closed+merged webhook for a repo that has no registered project returns
+    status=ignored and makes no DB changes.
+    """
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    payload_bytes = _make_pr_merged_payload("ghostorg", "ghostrepo", 1)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_already_merged_task_is_idempotent(client, db_session, mocker):
+    """
+    A second closed+merged webhook for a task that is already pr_merged=True
+    does not trigger another rollup check.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+
+    project = Project(
+        name="Idempotent Merge",
+        user_id="user1",
+        github_owner="idemorg",
+        github_repo="idemrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already merged",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/idemorg/idemrepo/pull/3",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload("idemorg", "idemrepo", 3)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    # Task was already merged — rollup should NOT be triggered again
+    rollup_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_triggers_rollup_for_affected_tasks(client, db_session, mocker):
+    """
+    A closed+merged webhook triggers _check_and_trigger_rollup for each
+    task whose artifact matched the merged PR.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+
+    project = Project(
+        name="Rollup Test",
+        user_id="user1",
+        github_owner="rolluporg",
+        github_repo="rolluprepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Rollup candidate",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/rolluporg/rolluprepo/pull/77",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload("rolluporg", "rolluprepo", 77)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    rollup_mock.assert_called_once()
+    called_task = rollup_mock.call_args[0][0]
+    assert called_task.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_no_matching_artifact_is_noop(client, db_session, mocker):
+    """
+    A closed+merged webhook for a PR number that has no matching artifact
+    does not set pr_merged on any task.
+    """
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+
+    project = Project(
+        name="Noop Merge",
+        user_id="user1",
+        github_owner="noopmergeorg",
+        github_repo="nooprepomerge",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Unrelated task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Artifact for PR #10; webhook is for PR #99
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/noopmergeorg/nooprepomerge/pull/10",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload("noopmergeorg", "nooprepomerge", 99)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is None
+
+
+# ---------------------------------------------------------------------------
+# Webhook tests: check_run completed handler
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_check_run_non_completed_action_is_ignored(client, db_session, mocker):
+    """
+    A check_run webhook with action != 'completed' is immediately ignored.
+    """
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    payload_bytes = _make_check_run_payload(
+        "ciorg", "cirepo", "abc123", action="created"
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_check_run_unregistered_repo_ignored(client, db_session, mocker):
+    """
+    A completed check_run for an unregistered repo is ignored.
+    """
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    payload_bytes = _make_check_run_payload("ghostorg", "ghostrepo", "deadbeef")
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_check_run_completed_calls_handle_ci_completion(client, db_session, mocker):
+    """
+    A completed check_run whose head_sha matches an EVALUATING ci_waiting task
+    calls handle_ci_completion with the task.
+    """
+    from app.models import Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    head_sha = "cafebabe1234567890abcdef"
+    gh_token = "gh-test-token"
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=(gh_token, "ciorg2", "cirepo2"),
+    )
+    mock_get_check_runs = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+        },
+    )
+    mock_handle_ci = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="CI Test",
+        user_id="user1",
+        github_owner="ciorg2",
+        github_repo="cirepo2",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Waiting for CI",
+        payloads=[{"type": "review", "pr_number": 10, "branch": "feature/x"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "head_sha": head_sha,
+                "iteration": 1,
+            }
+        },
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "ciorg2", "cirepo2", head_sha, conclusion="success"
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    mock_get_check_runs.assert_called_once()
+    mock_handle_ci.assert_called_once()
+    called_task = mock_handle_ci.call_args[0][0]
+    assert called_task.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_check_run_completed_pending_checks_skips_ci_completion(client, db_session, mocker):
+    """
+    When get_check_runs returns status != 'completed' (some checks still pending),
+    handle_ci_completion is NOT called.
+    """
+    from app.models import Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    head_sha = "pending1234567890abcdef"
+    gh_token = "gh-test-token"
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=(gh_token, "pendorg", "pendrepo"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={"status": "in_progress", "conclusion": None, "failed_logs": ""},
+    )
+    mock_handle_ci = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Pending CI",
+        user_id="user1",
+        github_owner="pendorg",
+        github_repo="pendrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Still waiting",
+        payloads=[{"type": "review", "pr_number": 5, "branch": "feature/y"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"ci_waiting": True, "head_sha": head_sha}},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload("pendorg", "pendrepo", head_sha)
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    mock_handle_ci.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_run_no_matching_tasks_returns_no_match(client, db_session, mocker):
+    """
+    When no EVALUATING tasks match the head_sha and auto-remediation is not
+    configured, the handler returns status=no_match.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    project = Project(
+        name="No Match",
+        user_id="user1",
+        github_owner="nomatchorg",
+        github_repo="nomatchrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "nomatchorg", "nomatchrepo", "00000000", conclusion="success"
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_check_run_failure_triggers_auto_remediation(client, db_session, mocker):
+    """
+    A CI failure on a protected branch triggers _handle_main_branch_ci_failure
+    when auto-remediation is enabled and the branch is whitelisted.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    remediation_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Auto Remediation",
+        user_id="user1",
+        github_owner="remediateorg",
+        github_repo="remediaterepo",
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_whitelist": ["main"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "remediateorg",
+        "remediaterepo",
+        "failsha123456",
+        conclusion="failure",
+        head_branch="main",
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "auto_remediation_triggered"
+    remediation_mock.assert_called_once()
+    call_kwargs = remediation_mock.call_args[1]
+    assert call_kwargs["head_branch"] == "main"
+    assert call_kwargs["head_sha"] == "failsha123456"
+
+
+@pytest.mark.asyncio
+async def test_check_run_failure_auto_remediation_disabled(client, db_session, mocker):
+    """
+    A CI failure on a protected branch does NOT trigger auto-remediation when
+    auto-remediation is disabled in the project config.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    project = Project(
+        name="No Auto Remediation",
+        user_id="user1",
+        github_owner="nodoreorg",
+        github_repo="nodorepo",
+        design_doc={"_auto_remediation": {"enabled": False}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "nodoreorg", "nodorepo", "failsha999", conclusion="failure", head_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored_auto_remediation_disabled"
+
+
+@pytest.mark.asyncio
+async def test_check_run_failure_branch_not_in_whitelist(client, db_session, mocker):
+    """
+    A CI failure on a branch NOT in the whitelist does not trigger auto-remediation.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    project = Project(
+        name="Branch Not Whitelisted",
+        user_id="user1",
+        github_owner="wlorg",
+        github_repo="wlrepo",
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_whitelist": ["main"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "wlorg", "wlrepo", "devsha999", conclusion="failure", head_branch="develop"
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored_auto_remediation_disabled"
+
+
+# ---------------------------------------------------------------------------
+# Webhook tests: pull_request opened/synchronize auto-review handler
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pr_opened_auto_review_enabled_triggers_review(client, db_session, mocker):
+    """
+    A pull_request opened webhook triggers _handle_auto_review when the
+    project has auto_review enabled.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Auto Review",
+        user_id="user1",
+        github_owner="arorg",
+        github_repo="arrepo",
+        design_doc={"_auto_review": {"enabled": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_event_payload("arorg", "arrepo", 42, "opened")
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "auto_review_triggered"
+    auto_review_mock.assert_called_once()
+    call_kwargs = auto_review_mock.call_args[1]
+    assert call_kwargs["pr_number"] == 42
+    assert call_kwargs["owner"] == "arorg"
+
+
+@pytest.mark.asyncio
+async def test_pr_synchronize_auto_review_enabled_triggers_review(client, db_session, mocker):
+    """
+    A pull_request synchronize webhook (push to existing PR) also triggers
+    _handle_auto_review when auto_review is enabled.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Auto Review Sync",
+        user_id="user1",
+        github_owner="arsyncorg",
+        github_repo="arsyncrepo",
+        design_doc={"_auto_review": {"enabled": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_event_payload("arsyncorg", "arsyncrepo", 7, "synchronize")
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "auto_review_triggered"
+    auto_review_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pr_opened_auto_review_disabled_no_trigger(client, db_session, mocker):
+    """
+    A pull_request opened webhook does NOT trigger auto_review when the
+    project has auto_review disabled.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Auto Review Disabled",
+        user_id="user1",
+        github_owner="ardisabledorg",
+        github_repo="ardisabledrepo",
+        design_doc={"_auto_review": {"enabled": False}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_event_payload("ardisabledorg", "ardisabledrepo", 5, "opened")
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    # auto_review_triggered is NOT returned when disabled
+    assert resp.json().get("status") != "auto_review_triggered"
+    auto_review_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pr_opened_unregistered_repo_no_auto_review(client, db_session, mocker):
+    """
+    A pull_request opened webhook for an unregistered repo does not trigger
+    auto_review.
+    """
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    payload_bytes = _make_pr_event_payload("unknownorg", "unknownrepo", 1, "opened")
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    auto_review_mock.assert_not_called()

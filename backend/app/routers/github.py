@@ -311,7 +311,8 @@ async def github_webhook(
                         Project.github_repo == repo,
                     )
                 )
-                if not project_check.scalars().first():
+                project = project_check.scalars().first()
+                if not project:
                     logger.info(f"[WEBHOOK] Ignoring event for unregistered repo {repo_full}")
                     return {"status": "ignored"}
                 from app.autonomous_research import _check_autonomous_research

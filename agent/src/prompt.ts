@@ -312,6 +312,24 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     prefix += dcLines.join('\n') + '\n';
   }
 
+  // Append task scope section for create/fix/refactor task types
+  const scopeApplicable = ['create', 'fix', 'refactor'].includes(taskType);
+  if (taskScope && scopeApplicable) {
+    const scopeDescriptions: Record<string, string> = {
+      small: 'expect <50 lines across 1-3 files. Keep changes minimal and focused.',
+      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes.',
+      large: 'cross-component, 200+ lines — plan before coding.',
+    };
+    const scopeDesc = scopeDescriptions[taskScope] ?? '';
+    const effort = payload ? strVal(payload.effort) : '';
+    const scopeLines: string[] = ['## Task Scope'];
+    const scopeLine = scopeDesc ? `Scope: ${taskScope} — ${scopeDesc}` : `Scope: ${taskScope}`;
+    scopeLines.push(scopeLine);
+    if (effort) scopeLines.push(`Effort: ${effort}`);
+    scopeLines.push('');
+    prefix += scopeLines.join('\n') + '\n';
+  }
+
   return prefix;
 }
 

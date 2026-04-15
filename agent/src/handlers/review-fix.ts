@@ -11,7 +11,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -255,6 +255,12 @@ export async function handleFix(
   writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
   const fixBuildConfig = resolveBuildConfig(task);
+  const fixRelatedFiles = (
+    ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+    (payload.related_files as string[] | undefined) ||
+    []
+  );
+  const fixRelatedTestContext = discoverRelatedTests(ws, fixRelatedFiles, fixBuildConfig);
 
   git(['config', 'user.email', fixBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', fixBuildConfig?.git_user_name || 'Blueprint Agent']);
@@ -405,6 +411,11 @@ export async function handleFix(
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {
     enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${strVal(fixParentCtx.parent_title)}**\nParent goal: ${strVal(fixParentCtx.parent_prompt)}\n\n${enrichedPrompt}`;
+  }
+
+  // Prepend related test context so the agent knows which tests to update
+  if (fixRelatedTestContext) {
+    enrichedPrompt = `${fixRelatedTestContext}${enrichedPrompt}`;
   }
 
   // Prepend CLAUDE.md instructions + playbook

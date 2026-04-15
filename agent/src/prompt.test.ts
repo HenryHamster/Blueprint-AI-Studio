@@ -181,6 +181,64 @@ describe('buildContextPrefix', () => {
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Direction Context');
   });
+
+  it('renders ## Task Scope section for create task with small scope', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'small' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Scope: small — expect <50 lines across 1-3 files');
+  });
+
+  it('renders ## Task Scope section for fix task with medium scope', () => {
+    const task = {
+      payloads: [{ type: 'fix' }],
+      context: { scope: 'medium' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Scope: medium — expect 50-200 lines across 2-5 files');
+  });
+
+  it('renders ## Task Scope section for refactor task with large scope', () => {
+    const task = {
+      payloads: [{ type: 'refactor' }],
+      context: { scope: 'large' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Scope: large — cross-component');
+  });
+
+  it('includes effort in scope section when set on payload', () => {
+    const task = {
+      payloads: [{ type: 'create', effort: 'high' }],
+      context: { scope: 'medium' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Effort: high');
+  });
+
+  it('does not render ## Task Scope for review task type', () => {
+    const task = {
+      payloads: [{ type: 'review' }],
+      context: { scope: 'small' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('## Task Scope');
+  });
+
+  it('does not render ## Task Scope when scope is absent', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('## Task Scope');
+  });
 });
 
 // ── formatProjectContext ──────────────────────────────────────────────────────

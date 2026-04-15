@@ -239,12 +239,20 @@ export async function handleRefactor(
       ).join('\n') + '\n\n'
     : '';
 
+  const refactorRelatedFiles = (
+    (payload.related_files as string[] | undefined) ||
+    ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+    []
+  );
+  const refactorBuildConfig = resolveBuildConfig(task);
+  const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
+
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).
