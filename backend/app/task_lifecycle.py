@@ -1419,6 +1419,12 @@ async def _process_post_commit(
                 terminal_task_status = TaskStatus.COMPLETED if new_project_status == ProjectStatus.COMPLETED else TaskStatus.FAILED if new_project_status == ProjectStatus.FAILED else TaskStatus.CANCELLED
                 for pt in parent_tasks:
                     pt.status = terminal_task_status
+                    if terminal_task_status == TaskStatus.FAILED:
+                        pt.latest_status_message = "Project aggregation: child task failed"
+                    elif terminal_task_status == TaskStatus.COMPLETED:
+                        pt.latest_status_message = "Project completed"
+                    else:
+                        pt.latest_status_message = "Project cancelled"
                     session.add(pt)
                 await session.commit()
                 await broadcast_to_project(str(project.id), "project_updated", {"status": new_project_status})

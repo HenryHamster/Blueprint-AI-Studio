@@ -300,6 +300,131 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
     return buckets
 
 
+# ---------------------------------------------------------------------------
+# Success-pattern capture
+# ---------------------------------------------------------------------------
+
+_PLAYBOOK_DEFAULT_TYPES = frozenset({
+    "create", "fix", "refactor", "review", "qa", "smoketest",
+    "deps", "migrate", "debug", "docs",
+})
+
+
+async def capture_success_pattern(
+    task: Task,
+    session: AsyncSession,
+) -> Optional[str]:
+    """Capture a positive pattern from a first-attempt success as a playbook entry.
+
+    Only creates an entry when the task type already has failure-derived playbook
+    entries (``source='auto-generated'``, ``source='review-extracted'``, or a
+    ``playbook/auto-*`` key written by ``_check_recurring_failures``).  This
+    sampling gate ensures the playbook only records successes for task types that
+    are known to be challenging, avoiding noise from routine completions.
+
+    One entry per task type (key ``playbook/success-{task_type}``) is maintained.
+    If the entry already exists its ``success_count`` is incremented and the
+    content refreshed.  Entries are tagged ``source='success-pattern'`` to
+    distinguish them from failure-derived entries and participate in the same
+    ``confirmed_count``-based priority ordering.
+
+    Returns the short key (e.g. ``"success-create"``) if an entry was created or
+    updated, ``None`` if the sampling gate was not met.
+    """
+    task_type = task.first_payload.get("type", "")
+    if not task_type:
+        return None
+
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+
+    # Sampling gate: require at least one failure-derived entry applicable to
+    # this task type before capturing a success pattern.
+    has_negative_entry = False
+    for pk, pv in doc.items():
+        if not pk.startswith("playbook/") or not isinstance(pv, dict):
+            continue
+        entry_source = pv.get("source", "")
+        # _check_recurring_failures writes auto-* keys but omits "source"; detect by key prefix.
+        is_negative = (
+            entry_source in ("auto-generated", "review-extracted")
+            or pk.startswith("playbook/auto-")
+        )
+        if not is_negative:
+            continue
+        applicable = pv.get("applicable_types")
+        if applicable is not None:
+            if task_type in applicable:
+                has_negative_entry = True
+                break
+        elif task_type in _PLAYBOOK_DEFAULT_TYPES:
+            # Entries without applicable_types apply to all default task types.
+            has_negative_entry = True
+            break
+
+    if not has_negative_entry:
+        return None
+
+    # One entry per task type — create on first observation, update thereafter.
+    key = f"success-{task_type}"
+    playbook_full_key = f"playbook/{key}"
+
+    related_files: list[str] = list((task.context or {}).get("related_files") or [])
+    scope: str = (task.context or {}).get("scope") or ""
+    files_note = f" Files: {', '.join(related_files[:5])}." if related_files else ""
+
+    existing = doc.get(playbook_full_key)
+    if existing and isinstance(existing, dict):
+        entry = dict(existing)
+        count = entry.get("success_count", 1) + 1
+        entry["success_count"] = count
+        entry["updated_at"] = _utcnow().isoformat()
+        entry["content"] = (
+            f"First-attempt success pattern for {task_type} tasks "
+            f"({count} observations, latest scope: {scope or 'unspecified'}).{files_note} "
+            f"These tasks completed cleanly without review iterations despite "
+            f"this task type having prior failures in this project."
+        )
+        doc[playbook_full_key] = entry
+        action = "updated"
+    else:
+        content = (
+            f"First-attempt success pattern for {task_type} tasks "
+            f"(1 observation, scope: {scope or 'unspecified'}).{files_note} "
+            f"This task completed cleanly without review iterations despite "
+            f"this task type having prior failures in this project."
+        )
+        doc[playbook_full_key] = {
+            "content": content,
+            "source_task_id": str(task.id),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+            "success_count": 1,
+            "source": "success-pattern",
+            "applicable_types": [task_type],
+        }
+        action = "created"
+
+    meta = dict(doc.get("_meta", {"revision": 0}))
+    meta["revision"] = meta.get("revision", 0) + 1
+    meta["last_updated"] = _utcnow().isoformat()
+    meta["updated_by"] = "success-playbook"
+    doc["_meta"] = meta
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s",
+        task.project_id, action, key, task_type,
+    )
+    return key
+
+
 async def extract_review_feedback_to_playbook(
     task: Task,
     review_loop: dict,

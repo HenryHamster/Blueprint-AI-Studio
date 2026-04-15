@@ -123,5 +123,12 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in ["waiting on", "dependencies cleared"]):
         return "AGENT_TIMEOUT"
 
+    # Cascade cancellations — children cancelled by orchestrator/services due to parent timeout or failure.
+    # These are infrastructure cascades, not agent code defects.
+    if any(kw in combined for kw in ["cancelled: parent evaluation timeout",
+                                      "cancelled: parent ci wait backstop",
+                                      "cancelled: parent dependency failed"]):
+        return "AGENT_TIMEOUT"
+
     # Default: code error
     return "CODE_ERROR"

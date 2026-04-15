@@ -130,6 +130,18 @@ class TestClassifyStuckFailure:
         assert _classify_stuck_failure(self._task_with_message("API ERROR: RATE LIMIT REACHED")) == "RATE_LIMIT"
         assert _classify_stuck_failure(self._task_with_message("VM FAILED TO START")) == "PROVISION_FAILURE"
 
+    def test_cascade_cancellation_messages(self):
+        """Cascade-cancelled children should be AGENT_TIMEOUT, not CODE_ERROR."""
+        from app.failure_classification import classify_failure
+        cases = [
+            ("Cancelled: parent evaluation timeout after 2.0h", "AGENT_TIMEOUT"),
+            ("Cancelled: parent CI wait backstop timeout after 1.9h (reason)", "AGENT_TIMEOUT"),
+            ("Cancelled: parent dependency failed", "AGENT_TIMEOUT"),
+        ]
+        for msg, expected in cases:
+            t = self._task_with_message(msg)
+            assert classify_failure(t) == expected, f"{msg!r} → expected {expected}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Section 2 — _build_stuck_tasks()

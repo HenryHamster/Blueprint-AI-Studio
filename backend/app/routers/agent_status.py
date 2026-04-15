@@ -853,6 +853,13 @@ async def update_agent_status(
                             session.add(_proj)
                     except Exception as _pce:
                         logger.warning(f"[PLAYBOOK] Failed to increment confirmed_count for task {task.id}: {_pce}")
+                # Capture positive pattern for sampling-eligible first-attempt successes
+                if _ctx["_first_attempt_succeeded"] and _proj:
+                    try:
+                        from app.playbook_learning import capture_success_pattern  # noqa: PLC0415
+                        await capture_success_pattern(task, session)
+                    except Exception as _sce:
+                        logger.warning(f"[PLAYBOOK] Failed to capture success pattern for task {task.id}: {_sce}")
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
 
