@@ -28,6 +28,24 @@ from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 logger = logging.getLogger(__name__)
 
+
+async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
+    """Close a WebSocket, tolerating the double-close race.
+
+    starlette raises ``RuntimeError('Unexpected ASGI message "websocket.close",
+    after sending "websocket.close"')`` when the peer already hung up mid-auth
+    — ``receive_json`` raised ``WebSocketDisconnect``, which silently sent a
+    close frame, and our explicit close then tries to send a second one. That
+    specific race is cosmetic; any other RuntimeError is real and re-raised.
+    """
+    try:
+        await ws.close(code=code, reason=reason)
+    except RuntimeError as exc:
+        if "websocket.close" in str(exc):
+            return
+        raise
+
+
 router = APIRouter(tags=["projects"])
 
 
@@ -270,18 +288,18 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         ticket = auth_message.get("ticket")
         if not ticket:
-            await websocket.close(code=1008, reason="Missing ticket")
+            await _safe_ws_close(websocket, code=1008, reason="Missing ticket")
             return
 
         payload = verify_ws_ticket(ticket)
         if payload.get("project_id") != project_id:
-            await websocket.close(code=1008, reason="Project ID mismatch")
+            await _safe_ws_close(websocket, code=1008, reason="Project ID mismatch")
             return
     except asyncio.TimeoutError:
-        await websocket.close(code=1008, reason="Authentication timeout")
+        await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
     except Exception:
-        await websocket.close(code=1008, reason="Authentication failed")
+        await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
     if not await manager.connect(websocket, project_id):
@@ -304,13 +322,13 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=90.0)
             except asyncio.TimeoutError:
-                await websocket.close(code=1001, reason="Idle timeout")
+                await _safe_ws_close(websocket, code=1001, reason="Idle timeout")
                 return
 
             manager.update_activity(websocket)
 
             if len(data) > 10000: # 10KB limit
-                await websocket.close(code=1009, reason="Message too big")
+                await _safe_ws_close(websocket, code=1009, reason="Message too big")
                 return
 
             # Handle ping messages — infrastructure keepalive, not counted toward rate limit
@@ -327,7 +345,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             if current_time - last_message_time < 1.0:
                 message_count += 1
                 if message_count > 10:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
+                    await _safe_ws_close(websocket, code=1008, reason="Rate limit exceeded")
                     return
             else:
                 last_message_time = current_time
@@ -352,18 +370,18 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         token = auth_message.get("token")
         if not token:
-            await websocket.close(code=1008, reason="Missing token")
+            await _safe_ws_close(websocket, code=1008, reason="Missing token")
             return
 
         payload = verify_agent_jwt(token)
         if payload.get("sub") != str(task_id):
-            await websocket.close(code=1008, reason="Task ID mismatch")
+            await _safe_ws_close(websocket, code=1008, reason="Task ID mismatch")
             return
     except asyncio.TimeoutError:
-        await websocket.close(code=1008, reason="Authentication timeout")
+        await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
     except Exception:
-        await websocket.close(code=1008, reason="Authentication failed")
+        await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
     # Get project_id for this task
@@ -371,7 +389,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         stmt = select(Task).where(Task.id == task_id)
         task = (await session.execute(stmt)).scalars().first()
         if not task:
-            await websocket.close(code=1008)
+            await _safe_ws_close(websocket, code=1008)
             return
         project_id = str(task.project_id)
 
@@ -384,7 +402,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         while True:
             text_data = await websocket.receive_text()
             if len(text_data) > 100000: # 100KB limit for agent logs
-                await websocket.close(code=1009, reason="Message too big")
+                await _safe_ws_close(websocket, code=1009, reason="Message too big")
                 return
 
             # Simple rate limiting: 20 messages per second
@@ -392,7 +410,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             if current_time - last_message_time < 1.0:
                 message_count += 1
                 if message_count > 20:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
+                    await _safe_ws_close(websocket, code=1008, reason="Rate limit exceeded")
                     return
             else:
                 last_message_time = current_time
