@@ -392,6 +392,102 @@ async def update_commit_status(
 
     return response.json()
 
+async def create_check_run(
+    token: str,
+    owner: str,
+    repo: str,
+    head_sha: str,
+    name: str = "Blueprint Code Review",
+    details_url: str = "",
+) -> dict | None:
+    """Create a Check Run for a commit in 'in_progress' state.
+
+    Returns the check run dict (including its id) on success, or None on error.
+    Uses the Checks API (POST /repos/{owner}/{repo}/check-runs).
+    Requires a GitHub App token with checks:write permission.
+    """
+    import datetime as _dt
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload: dict = {
+        "name": name,
+        "head_sha": head_sha,
+        "status": "in_progress",
+        "started_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if details_url:
+        payload["details_url"] = details_url
+
+    response = await _github_request(
+        "POST", f"https://api.github.com/repos/{owner}/{repo}/check-runs",
+        headers, json=payload
+    )
+
+    if response.status_code == 201:
+        return response.json()
+    logger.warning(
+        f"[GITHUB] create_check_run failed for {owner}/{repo} sha={head_sha[:8]}: "
+        f"{response.status_code} {response.text[:200]}"
+    )
+    return None
+
+
+async def update_check_run(
+    token: str,
+    owner: str,
+    repo: str,
+    check_run_id: int,
+    conclusion: str,
+    title: str,
+    summary: str,
+    annotations: list[dict] | None = None,
+) -> dict | None:
+    """Update an existing Check Run to 'completed' with a conclusion.
+
+    conclusion must be one of: 'success', 'failure', 'neutral', 'cancelled',
+    'skipped', 'timed_out', 'action_required'.
+
+    annotations is an optional list of dicts with keys:
+        path, start_line, end_line, annotation_level ('notice'|'warning'|'failure'),
+        message.  GitHub caps annotations at 50 per request.
+    """
+    import datetime as _dt
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    output: dict = {
+        "title": title,
+        "summary": summary[:65535],
+    }
+    if annotations:
+        output["annotations"] = annotations[:50]
+
+    payload: dict = {
+        "status": "completed",
+        "conclusion": conclusion,
+        "completed_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "output": output,
+    }
+
+    response = await _github_request(
+        "PATCH", f"https://api.github.com/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        headers, json=payload
+    )
+
+    if response.status_code == 200:
+        return response.json()
+    logger.warning(
+        f"[GITHUB] update_check_run failed for {owner}/{repo} run_id={check_run_id}: "
+        f"{response.status_code} {response.text[:200]}"
+    )
+    return None
+
+
 async def create_pr_comment(
     token: str,
     owner: str,

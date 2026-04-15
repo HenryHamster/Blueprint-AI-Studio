@@ -246,7 +246,7 @@ async def _process_post_commit(
     from app.security import scan_pr_for_injection  # noqa: PLC0415
     from app.github import (  # noqa: PLC0415
         create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs, submit_pr_review,
+        get_pr_files, get_check_runs, submit_pr_review, update_check_run,
     )
     from app.task_completion import (  # noqa: PLC0415
         _handle_plan_completion, _handle_design_doc_completion,
@@ -660,6 +660,50 @@ async def _process_post_commit(
                         await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
                     except Exception as e2:
                         logger.warning(f"[REVIEW PIPELINE] Fallback comment also failed: {e2}", exc_info=True)
+
+                # Update Check Run with verdict conclusion (best-effort — errors are swallowed)
+                check_run_id = (task.context or {}).get("check_run_id")
+                if check_run_id:
+                    try:
+                        _cr_token, _cr_owner, _cr_repo = await get_github_token_for_task(task.id, session)
+                        _severity_map = {"critical": "failure", "major": "warning", "minor": "notice"}
+                        _conclusion = (
+                            "success" if verdict == "APPROVE"
+                            else ("neutral" if verdict == "COMMENT" else "action_required")
+                        )
+                        _annotations = []
+                        for _issue in issues:
+                            if _issue.get("file") and _issue.get("line"):
+                                _lvl = _severity_map.get(_issue.get("severity", "minor"), "notice")
+                                _ln = int(_issue["line"])
+                                _annotations.append({
+                                    "path": _issue["file"],
+                                    "start_line": _ln,
+                                    "end_line": _ln,
+                                    "annotation_level": _lvl,
+                                    "message": _issue.get("description", ""),
+                                })
+                        _issue_counts = {}
+                        for _issue in issues:
+                            _sev = _issue.get("severity", "minor")
+                            _issue_counts[_sev] = _issue_counts.get(_sev, 0) + 1
+                        _counts_line = ", ".join(
+                            f"{v} {k}" for k, v in sorted(_issue_counts.items())
+                        ) if _issue_counts else "no issues"
+                        _cr_summary = f"**Blueprint Code Review**: {verdict}\n\n{feedback[:3000]}"
+                        if _issue_counts:
+                            _cr_summary += f"\n\n**Issue summary**: {_counts_line}"
+                        await update_check_run(
+                            _cr_token, _cr_owner, _cr_repo,
+                            check_run_id,
+                            conclusion=_conclusion,
+                            title=f"Blueprint Code Review: {verdict}",
+                            summary=_cr_summary,
+                            annotations=_annotations or None,
+                        )
+                        logger.info(f"[CHECK RUN] Updated check run {check_run_id} → {_conclusion} for task {task.id}")
+                    except Exception as _cr_exc:
+                        logger.warning(f"[CHECK RUN] Failed to update check run {check_run_id} for task {task.id}: {_cr_exc}")
 
                 # Store Blueprint's verdict on the review task context so the
                 # pull_request_review webhook handler can correlate quality signals.
