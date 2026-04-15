@@ -1,6 +1,7 @@
 """Background service functions: GCP cleanup, secret reconciliation, and orchestrator helpers."""
 
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ async def gcp_cleanup_service():
     Deletes any VMs prefixed with 'agent-vm-' that do not have an active task.
     Zone-parallel with per-cycle timeout.
     """
-    from app.compute import cleanup_orphaned_vms  # noqa: PLC0415
+    from app.compute import cleanup_orphaned_vms
 
     while True:
         try:
@@ -55,7 +56,7 @@ async def gcp_cleanup_service():
                         )
                     # Cache total GCP VM count for orchestrator concurrency check
                     if hasattr(cleanup_result, 'total_gcp_vms'):
-                        import app.main as _app_main  # noqa: PLC0415
+                        import app.main as _app_main
                         _app_main._last_gcp_vm_count = cleanup_result.total_gcp_vms
                         _app_main._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
@@ -76,7 +77,7 @@ async def gcp_cleanup_service():
 
 async def secret_reconciliation_service():
     """Periodic cleanup of orphaned agent credential secrets (every 30 min)."""
-    from app.compute import reconcile_orphaned_secrets  # noqa: PLC0415
+    from app.compute import reconcile_orphaned_secrets
 
     while True:
         try:
@@ -115,12 +116,12 @@ _STALE_BRANCH_AGE_DAYS = 7
 
 async def _get_project_github_token(project, session):
     """Retrieve a GitHub token for a project via its UserIntegration."""
-    from app.models import UserIntegration  # noqa: PLC0415
-    from app.github import (  # noqa: PLC0415
+    from app.models import UserIntegration
+    from app.github import (
         generate_installation_access_token,
         get_repo_installation_token,
     )
-    from app.secrets_manager import get_user_secret  # noqa: PLC0415
+    from app.secrets_manager import get_user_secret
 
     integration = (await session.execute(
         select(UserIntegration).where(UserIntegration.user_id == project.user_id)
@@ -139,8 +140,8 @@ async def _get_project_github_token(project, session):
 
 async def _run_stale_branch_cleanup():
     """Delete branches that have no active task and are older than N days."""
-    from app.models import Project  # noqa: PLC0415
-    from app.github import list_branches, delete_branch, get_commit_date  # noqa: PLC0415
+    from app.models import Project
+    from app.github import list_branches, delete_branch, get_commit_date
 
     stale_age = timedelta(days=_STALE_BRANCH_AGE_DAYS)
     total_deleted = 0
@@ -316,7 +317,7 @@ async def stale_branch_cleanup_service():
 
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
-    from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update
 
     try:
         serializable = {}
@@ -340,7 +341,7 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
 
     try:
         from app.compute import _zone_health, _zone_lock
@@ -371,8 +372,8 @@ async def _check_evaluating_timeouts():
     - If evaluating >6h → FAIL with ERROR alert.
     - Skips CI-waiting tasks (they have their own 20-min escalation timeout).
     """
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
-    from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert
+    from app.rollup_management import _check_and_trigger_rollup
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
@@ -399,15 +400,31 @@ async def _check_evaluating_timeouts():
                     # CI-waiting tasks have their own 20-min escalation in orchestrator.py.
                     # Apply a 30-minute absolute backstop so tasks can never
                     # hang forever regardless of field state.
+                    #
+                    # Time base: prefer review_loop.ci_wait_started (when CI wait
+                    # actually began) over the last EVALUATING transition. A task
+                    # may sit in EVALUATING for a long time waiting on subtasks
+                    # before the rollup PR is opened and CI polling starts — using
+                    # the EVALUATING transition would false-positive the backstop
+                    # the instant CI finally begins.
+                    rl = ctx.get("review_loop", {})
+                    ci_ws_val = rl.get("ci_wait_started")
+                    was_escalated = rl.get("escalated", False)
                     evaluating_since = None
-                    for entry in reversed(task.status_log or []):
-                        msg = entry.get("msg", "")
-                        if "→ EVALUATING" in msg:
-                            try:
-                                evaluating_since = datetime.fromisoformat(entry["t"])
-                            except (KeyError, ValueError, TypeError):
-                                pass
-                            break
+                    ci_ws_valid = False
+                    if ci_ws_val is not None:
+                        try:
+                            evaluating_since = datetime.fromisoformat(ci_ws_val)
+                            ci_ws_valid = True
+                        except (ValueError, TypeError):
+                            evaluating_since = None
+                    if evaluating_since is None:
+                        for entry in reversed(task.status_log or []):
+                            msg = entry.get("msg", "")
+                            if "→ EVALUATING" in msg:
+                                with contextlib.suppress(KeyError, ValueError, TypeError):
+                                    evaluating_since = datetime.fromisoformat(entry["t"])
+                                break
                     if evaluating_since is None:
                         evaluating_since = task.started_at or task.created_at
 
@@ -417,17 +434,12 @@ async def _check_evaluating_timeouts():
                         continue
                     # Over backstop threshold — diagnose why and hard-kill
                     hours = round(elapsed / 3600, 1)
-                    rl = ctx.get("review_loop", {})
-                    ci_ws_val = rl.get("ci_wait_started")
-                    was_escalated = rl.get("escalated", False)
                     if ci_ws_val is None:
                         reason = "ci_wait_started missing from review_loop"
+                    elif not ci_ws_valid:
+                        reason = f"ci_wait_started corrupt: {ci_ws_val!r}"
                     else:
-                        try:
-                            datetime.fromisoformat(ci_ws_val)
-                            reason = "CI polling stalled after escalation" if was_escalated else "CI did not complete within backstop window"
-                        except (ValueError, TypeError):
-                            reason = f"ci_wait_started corrupt: {ci_ws_val!r}"
+                        reason = "CI polling stalled after escalation" if was_escalated else "CI did not complete within backstop window"
                     logger.error(
                         f"[EVAL TIMEOUT] CI-waiting task {str(task.id)[:8]} has been "
                         f"EVALUATING for {hours}h — backstop timeout ({reason}), marking FAILED"
@@ -440,8 +452,8 @@ async def _check_evaluating_timeouts():
                     children = (await session.execute(
                         select(Task).where(Task.parent_task_id == task.id)
                     )).scalars().all()
-                    from app.main import _ensure_vm_deleted  # noqa: PLC0415
-                    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
+                    from app.main import _ensure_vm_deleted
+                    from app.max_plan_pool import release_max_plan_account
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
                     vms_to_delete = []
                     for child in non_terminal_children:
@@ -477,10 +489,8 @@ async def _check_evaluating_timeouts():
                 for entry in reversed(task.status_log or []):
                     msg = entry.get("msg", "")
                     if "→ EVALUATING" in msg:
-                        try:
+                        with contextlib.suppress(KeyError, ValueError, TypeError):
                             evaluating_since = datetime.fromisoformat(entry["t"])
-                        except (KeyError, ValueError, TypeError):
-                            pass
                         break
                 if evaluating_since is None:
                     # Fallback to started_at or created_at
@@ -522,8 +532,8 @@ async def _check_evaluating_timeouts():
                     session.add(task)
 
                     # Cascade-cancel non-terminal children
-                    from app.main import _ensure_vm_deleted  # noqa: PLC0415
-                    from app.max_plan_pool import release_max_plan_account  # noqa: PLC0415
+                    from app.main import _ensure_vm_deleted
+                    from app.max_plan_pool import release_max_plan_account
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
                     vms_to_delete = []
                     for child in non_terminal_children:
@@ -542,12 +552,12 @@ async def _check_evaluating_timeouts():
                         )
 
                     # Close orphaned rollup PRs from CI-waiting children
-                    from app.github import close_pull_request  # noqa: PLC0415
+                    from app.github import close_pull_request
                     for child in children:
                         child_pr = (child.context or {}).get("review_loop", {}).get("pr_number")
                         if child_pr and not (child.context or {}).get("pr_merged"):
                             try:
-                                from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                                from app.routers.agent import get_github_token_for_task
                                 _gh, _owner, _repo = await get_github_token_for_task(child.id, session)
                                 await close_pull_request(_gh, _owner, _repo, child_pr)
                                 logger.info(f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}")
@@ -615,8 +625,8 @@ async def _check_evaluating_timeouts():
 
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task
+    from app.review_pipeline import _spawn_pipeline_task
 
     try:
         async with AsyncSessionLocal() as session:

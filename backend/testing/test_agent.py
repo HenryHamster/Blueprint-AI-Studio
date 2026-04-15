@@ -1067,3 +1067,137 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     stale_ref = entries["stale-ref-entry"]
     assert stale_ref["reference_count"] == 3
     assert stale_ref["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClient, db_session, mocker):
+    """If the cached PR artifact points at a closed PR (e.g. branch was deleted
+    on requeue, auto-closing the PR), the endpoint must NOT return the stale URL.
+    It should delete the stale artifact and create a fresh PR.
+
+    Regression for task 512c4514: the idempotency check returned a closed PR's
+    URL to the agent, which then reported COMPLETED on a phantom PR.
+    """
+    from unittest.mock import AsyncMock
+
+    project = Project(name="Stale PR Recreate", user_id="test-user-stale-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-stale-pr",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/foo/bar/pull/42",
+    ))
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.routers.agent.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+    mock_create = AsyncMock(return_value={"html_url": "https://github.com/foo/bar/pull/99", "number": 99})
+    mocker.patch("app.routers.agent.create_pull_request", new=mock_create)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-pr")
+    headers = {"x-agent-token": token}
+    resp = await client.post(
+        "/api/agent/github/pull-requests",
+        json={
+            "task_id": str(task.id),
+            "owner": "foo",
+            "repo": "bar",
+            "title": "fresh PR",
+            "head": "blueprint/task-deadbeef",
+            "base": "main",
+            "body": "body",
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/99"
+    mock_create.assert_called_once()
+
+    artifacts = (await db_session.execute(
+        select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+    )).scalars().all()
+    pr_urls = sorted(a.pr_url for a in artifacts)
+    assert "https://github.com/foo/bar/pull/99" in pr_urls
+    assert "https://github.com/foo/bar/pull/42" not in pr_urls, (
+        "Stale closed-PR artifact should have been removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_create_pr_returns_cached_when_open(client: AsyncClient, db_session, mocker):
+    """If the cached PR artifact points at an OPEN PR, the endpoint should
+    short-circuit and return its URL without calling create_pull_request."""
+    from unittest.mock import AsyncMock
+
+    project = Project(name="Open PR Cached", user_id="test-user-open-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-open-pr",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/foo/bar/pull/7",
+    ))
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.routers.agent.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    mock_create = AsyncMock()
+    mocker.patch("app.routers.agent.create_pull_request", new=mock_create)
+
+    token = create_agent_token(str(task.id), "agent-vm-open-pr")
+    headers = {"x-agent-token": token}
+    resp = await client.post(
+        "/api/agent/github/pull-requests",
+        json={
+            "task_id": str(task.id),
+            "owner": "foo",
+            "repo": "bar",
+            "title": "should not be created",
+            "head": "blueprint/task-cafef00d",
+            "base": "main",
+            "body": "body",
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/7"
+    mock_create.assert_not_called()

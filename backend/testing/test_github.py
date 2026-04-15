@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import uuid
 
 import pytest
 from fastapi import HTTPException
@@ -456,6 +457,7 @@ async def test_pr_close_without_merge_sets_pr_rejected(client, db_session, mocke
         headers={
             "content-type": "application/json",
             "x-github-event": "pull_request",
+            "x-github-delivery": f"test-{uuid.uuid4()}",
             "x-hub-signature-256": _make_webhook_sig(payload_bytes),
         },
     )
@@ -514,6 +516,7 @@ async def test_pr_close_without_merge_is_idempotent(client, db_session, mocker):
         headers={
             "content-type": "application/json",
             "x-github-event": "pull_request",
+            "x-github-delivery": f"test-{uuid.uuid4()}",
             "x-hub-signature-256": _make_webhook_sig(payload_bytes),
         },
     )
@@ -573,6 +576,7 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
         headers={
             "content-type": "application/json",
             "x-github-event": "pull_request",
+            "x-github-delivery": f"test-{uuid.uuid4()}",
             "x-hub-signature-256": _make_webhook_sig(payload_bytes),
         },
     )

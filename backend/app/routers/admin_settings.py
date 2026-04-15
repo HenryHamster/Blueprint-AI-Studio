@@ -355,8 +355,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             val = int(payload["max_concurrent_vms"])
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="max_concurrent_vms must be a number")
-        if not (1 <= val <= 100):
-            raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 1 and 100")
+        if not (0 <= val <= 100):
+            raise HTTPException(status_code=400, detail="max_concurrent_vms must be between 0 and 100")
         _runtime_config["max_concurrent_vms"] = val
         # Clear PAUSED/HALTED state if user explicitly sets VMs > 0
         # Otherwise the next cold start will override back to 0

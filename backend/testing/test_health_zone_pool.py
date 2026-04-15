@@ -20,6 +20,8 @@ from app.max_plan_pool import (
     _max_plan_pools,
     _account_by_id,
     _max_plan_pool_lock,
+    _account_available_for_model,
+    cascade_disabled_models,
 )
 from app.compute import (
     get_zone_health,
@@ -814,3 +816,80 @@ class TestMaxPlanAccountPool:
                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
 
         assert _account_by_id["a1"]["rl_hit_count"] == 2  # second hit → count=2 → 60 min cooldown
+
+    # ── Model tier cascade tests ──────────────────────────────────────────────
+    # Claude Max plan shares session quota across tiers: Opus 429 implies
+    # Sonnet/Haiku are also rate-limited (asymmetric — Sonnet 429 does NOT
+    # block Opus). The cascade must apply on both the mark side
+    # (disabled_models) and the check side (_account_available_for_model).
+
+    def test_cascade_disabled_models_opus_covers_all_tiers(self):
+        cascade = cascade_disabled_models("claude-opus-4-6")
+        assert "claude-opus-4-6" in cascade
+        assert "claude-sonnet-4-6" in cascade
+        assert "claude-haiku-4-5-20251001" in cascade
+
+    def test_cascade_disabled_models_sonnet_covers_haiku_not_opus(self):
+        cascade = cascade_disabled_models("claude-sonnet-4-6")
+        assert "claude-sonnet-4-6" in cascade
+        assert "claude-haiku-4-5-20251001" in cascade
+        assert "claude-opus-4-6" not in cascade
+
+    def test_cascade_disabled_models_unknown_falls_back_to_single(self):
+        # Unknown variants must not silently cascade to the whole account.
+        assert cascade_disabled_models("claude-some-future-model") == ("claude-some-future-model",)
+
+    def test_account_available_opus_disable_blocks_sonnet(self, clean_max_plan_pool):
+        """An Opus rate-limit must also block Sonnet selection (shared quota)."""
+        acct = {
+            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "disabled_models": {"claude-opus-4-6": {"hits": 1, "at": datetime.utcnow()}},
+        }
+        assert _account_available_for_model(acct, "claude-opus-4-6") is False
+        assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
+        assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
+
+    def test_account_available_sonnet_disable_does_not_block_opus(self, clean_max_plan_pool):
+        """Sonnet 429 must NOT block Opus — the cascade is one-way."""
+        acct = {
+            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "disabled_models": {"claude-sonnet-4-6": {"hits": 1, "at": datetime.utcnow()}},
+        }
+        assert _account_available_for_model(acct, "claude-opus-4-6") is True
+        assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
+        assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
+
+    def test_account_available_unknown_model_skips_account_with_disables(self, clean_max_plan_pool):
+        """model=None must NOT bypass the rate-limit check when disables exist.
+        Previously returned True, which caused rate-limited accounts to be picked
+        for tasks whose model resolution failed upstream."""
+        acct = {
+            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "disabled_models": {"claude-opus-4-6": {"hits": 1, "at": datetime.utcnow()}},
+        }
+        assert _account_available_for_model(acct, None) is False
+
+    def test_account_available_unknown_model_no_disables_allowed(self, clean_max_plan_pool):
+        """model=None on a healthy account is still allowed (only disables skip it)."""
+        acct = {
+            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+        }
+        assert _account_available_for_model(acct, None) is True
+
+    @pytest.mark.asyncio
+    async def test_select_skips_account_when_opus_disabled_request_sonnet(self, clean_max_plan_pool):
+        """select_max_plan_account with model=sonnet must skip an opus-disabled account."""
+        _add_to_pool({
+            "id": "a1", "name": "rate_limited", "enabled": True, "active_tasks": 0,
+            "disabled_models": {"claude-opus-4-6": {"hits": 1, "at": datetime.utcnow()}},
+        })
+        _add_to_pool({
+            "id": "a2", "name": "healthy", "enabled": True, "active_tasks": 5,
+        })
+        result = await select_max_plan_account(_TEST_USER, model="claude-sonnet-4-6")
+        assert result is not None
+        assert result["id"] == "a2"  # healthy account chosen despite higher active_tasks

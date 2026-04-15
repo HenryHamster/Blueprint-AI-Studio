@@ -205,6 +205,109 @@ async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_evaluating_ci_backstop_uses_ci_wait_started(eval_db, mocker):
+    """Regression: the CI backstop must measure elapsed time from
+    review_loop.ci_wait_started, not from the EVALUATING transition.
+
+    A research task may sit in EVALUATING for a long time waiting on subtasks
+    before the rollup PR opens and CI wait actually begins. Using the
+    EVALUATING transition as the time base false-positives the backstop the
+    instant CI polling starts (seen in task 5b1fa3ee: killed after ~3min of
+    healthy CI because the task had been EVALUATING for ~48min waiting on
+    subtasks).
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    project = Project(name="CI Backstop Time Base", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-subtask task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # EVALUATING transition was 48 minutes ago (subtask phase took 45 min,
+    # then CI wait began) — well beyond the 30-min backstop threshold.
+    evaluating_since = _naive_utc_ago(minutes=48)
+    # But CI wait only actually started 3 minutes ago — still healthy.
+    ci_wait_started = _naive_utc_ago(minutes=3)
+    parent.status_log = [
+        {"t": evaluating_since.isoformat(), "msg": "Status changed: COMPLETED → EVALUATING"}
+    ]
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "pr_number": 1381,
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Expected EVALUATING (CI still within backstop window) but got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluating_ci_backstop_fires_when_ci_wait_started_old(eval_db, mocker):
+    """Complement: when review_loop.ci_wait_started IS older than the backstop
+    threshold, the task must be hard-killed."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    project = Project(name="CI Backstop Fires", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stalled CI task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # CI wait started 45 minutes ago — over the 30-min backstop.
+    ci_wait_started = _naive_utc_ago(minutes=45)
+    parent.status_log = [
+        {"t": _naive_utc_ago(minutes=60).isoformat(),
+         "msg": "Status changed: COMPLETED → EVALUATING"}
+    ]
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "pr_number": 9999,
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED (CI wait exceeded backstop) but got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    assert "backstop" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_evaluating_warning_alert_created(eval_db, mocker):
     """A task EVALUATING for >2 hours (the warning threshold) with non-terminal
     children should produce an undismissed WARNING alert."""
@@ -362,3 +465,69 @@ async def test_evaluating_unmerged_pr_verification(eval_db, mocker):
         "Expected child context to have pr_merged=True after _verify_pr_merged succeeded"
     )
     mock_verify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
+    """When _verify_pr_merged sees a closed-but-not-merged PR, it must set
+    latest_status_message on the in-memory task — not just inside the separate
+    write_session that may fail with a row-lock or commit error.
+
+    Regression for task 512c4514: the verifier flipped task.status to FAILED
+    via the outer session, but the explanatory message was only written in a
+    failing write_session, leaving the row with FAILED status and a stale
+    'Creating pull request...' message.
+    """
+    from app.rollup_management import _verify_pr_merged
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Closed PR Verify Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "make a thing"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        latest_status_message="Creating pull request for blueprint/task-deadbeef...",
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    eval_db.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/foo/bar/pull/42",
+    ))
+    await eval_db.commit()
+
+    # _verify_pr_merged imports these inside the function body, so patch at the
+    # source modules (not on app.rollup_management).
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+    # The separate write_session path goes through AsyncSessionLocal — force it
+    # to fail so we exercise the in-memory message fallback.
+    mocker.patch(
+        "app.rollup_management.AsyncSessionLocal",
+        side_effect=RuntimeError("simulated row lock"),
+    )
+
+    result = await _verify_pr_merged(task, eval_db)
+
+    assert result is True, "verifier should return True so callers don't block on FAILED tasks"
+    assert task.status == TaskStatus.FAILED
+    assert task.context.get("pr_closed_unmerged") is True
+    assert task.latest_status_message == "PR #42 closed without merging", (
+        f"Expected in-memory latest_status_message to reflect closure, got: {task.latest_status_message!r}"
+    )

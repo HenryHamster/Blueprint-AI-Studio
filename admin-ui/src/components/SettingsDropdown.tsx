@@ -639,15 +639,15 @@ export function SettingsDropdown({
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pipeline Settings</h3>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (1-100)</label>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (0-100)</label>
               <input
                 type="number"
-                min={1}
+                min={0}
                 max={100}
                 value={vmInputVal}
                 onChange={e => setVmInputVal(e.target.value)}
-                onBlur={() => { const n = parseInt(vmInputVal); if (n >= 1 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
-                onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 1 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
+                onBlur={() => { const n = parseInt(vmInputVal); if (n >= 0 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); }}
+                onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(vmInputVal); if (n >= 0 && n <= 100) onUpdateMaxVMs(n); else setVmInputVal(String(maxConcurrentVMs)); } }}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
             </div>

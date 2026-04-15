@@ -36,6 +36,7 @@ from app.max_plan_pool import (
     _account_available_for_model,
     _max_plan_pools,
     _extract_task_model,
+    cascade_disabled_models,
 )
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
@@ -619,16 +620,23 @@ async def update_agent_status(
                             # Only disable a specific model when we know which one hit the limit.
                             # Previously defaulted to sonnet, causing false rate-limit marks.
                             rl_model = model
+                            # Cascade: Opus 429 implies Sonnet/Haiku are also blocked
+                            # (shared session quota on Claude Max plan), so mark the
+                            # whole downstream tier at once. Asymmetric by design.
+                            cascade_models = cascade_disabled_models(rl_model)
                             async with _max_plan_pool_lock:
                                 acct = _account_by_id.get(acct_id)
                                 if acct:
                                     dm = acct.setdefault("disabled_models", {})
-                                    info = dm.setdefault(rl_model, {"hits": 0})
-                                    info["hits"] += 1
-                                    info["at"] = _utcnow()
-                                    cooldown = min(30 * (2 ** (info["hits"] - 1)), 240)
+                                    now = _utcnow()
+                                    for m in cascade_models:
+                                        info = dm.setdefault(m, {"hits": 0})
+                                        info["hits"] += 1
+                                        info["at"] = now
+                                    primary_hits = dm[rl_model]["hits"]
+                                    cooldown = min(30 * (2 ** (primary_hits - 1)), 240)
                                     cooldown = cooldown * random.uniform(0.85, 1.15)  # ±15% jitter
-                                    logger.warning(f"[POOL] Account {acct['name']} model {rl_model} disabled (hit #{info['hits']}, cooldown {cooldown:.0f}min)")
+                                    logger.warning(f"[POOL] Account {acct['name']} disabled models {list(cascade_models)} (primary {rl_model} hit #{primary_hits}, cooldown {cooldown:.0f}min)")
                                 # Persist rate-limit state to DB so it survives deploys
                                 if acct:
                                     try:

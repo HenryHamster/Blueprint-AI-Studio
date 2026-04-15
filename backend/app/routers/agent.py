@@ -39,6 +39,7 @@ from app.github import (
     get_issues,
     create_branch,
     create_pull_request,
+    get_pull_request,
 )
 from app.broadcast import broadcast_to_project
 
@@ -1036,7 +1037,12 @@ async def agent_github_create_pr(
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
-    # Idempotency: if this task already has a PR artifact, return it
+    gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
+
+    # Idempotency: if this task already has a PR artifact, verify the PR is still
+    # open before returning it. If it was closed (e.g. branch deleted on requeue),
+    # fall through and create a new PR — otherwise the agent reports COMPLETED on
+    # a phantom PR and the rollup verifier later flips it to FAILED.
     existing_artifact = (await session.execute(
         select(Artifact).where(
             Artifact.task_id == req.task_id,
@@ -1044,10 +1050,30 @@ async def agent_github_create_pr(
         )
     )).scalars().first()
     if existing_artifact and existing_artifact.pr_url:
-        logger.info(f"[PR] Task {req.task_id} already has PR artifact: {existing_artifact.pr_url}")
-        return {"status": "success", "data": {"html_url": existing_artifact.pr_url}}
+        try:
+            pr_number = int(existing_artifact.pr_url.rstrip("/").split("/")[-1])
+            pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            if pr_data.get("state") == "open":
+                logger.info(f"[PR] Task {req.task_id} already has open PR artifact: {existing_artifact.pr_url}")
+                return {"status": "success", "data": {"html_url": existing_artifact.pr_url}}
+            logger.warning(
+                f"[PR] Task {req.task_id} cached PR #{pr_number} is {pr_data.get('state')} "
+                f"(merged={pr_data.get('merged')}) — recreating PR and replacing artifact"
+            )
+            await session.delete(existing_artifact)
+            await session.flush()
+        except HTTPException as exc:
+            if exc.status_code in (404, 410):
+                logger.warning(f"[PR] Task {req.task_id} cached PR no longer exists ({exc.status_code}) — recreating")
+                await session.delete(existing_artifact)
+                await session.flush()
+            else:
+                raise
+        except (ValueError, IndexError):
+            logger.warning(f"[PR] Could not parse PR number from cached URL {existing_artifact.pr_url} — recreating")
+            await session.delete(existing_artifact)
+            await session.flush()
 
-    gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_pull_request(
         token=gh_token,
         owner=owner,

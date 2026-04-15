@@ -13,7 +13,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from app.database import AsyncSessionLocal
 
@@ -39,6 +39,23 @@ RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "rate-limit", "429", "credit"
                        "resource_exhausted", "daily limit", "tokens per minute",
                        "quota exceeded", "exceeded your", "plan limit",
                        "requests per minute", "overloaded"]
+
+# Claude Max plan shares session quota across model tiers — a 429 on a higher
+# tier implies lower tiers are also rate-limited (Opus usage drains the same
+# bucket that feeds Sonnet/Haiku). Not symmetric: Sonnet hitting its limit
+# does not necessarily block Opus, which has its own stricter sub-bucket.
+_MODEL_TIER_CASCADE: Dict[str, tuple] = {
+    "claude-opus-4-6": ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
+    "claude-sonnet-4-6": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
+    "claude-haiku-4-5-20251001": ("claude-haiku-4-5-20251001",),
+}
+
+
+def cascade_disabled_models(model: str) -> tuple:
+    """Return every model that should be marked disabled when `model` hits a 429.
+    Falls back to the single model for unknown names so new variants don't silently
+    cascade to the whole account."""
+    return _MODEL_TIER_CASCADE.get(model, (model,))
 
 
 # Backward compat: flat view for code that needs all accounts
@@ -113,23 +130,30 @@ async def load_max_plan_pool():
         logger.info(f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)")
 
 
-def _account_available_for_model(acct: dict, model: Optional[str]) -> bool:
+def _account_available_for_model(acct: dict, model: str | None) -> bool:
     """Check if an account is available for the given model."""
     if not acct.get("oauth_token"):
         return False  # Token missing (Secret Manager failure at startup)
     if not acct.get("enabled", True):
         return False  # Entirely disabled (legacy path)
     dm = acct.get("disabled_models", {})
-    if not model:
-        # No model specified — allow the account. Per-model disables only block
-        # tasks that explicitly request that model. Previously this blocked the
-        # account entirely when ANY model was disabled, causing false rejections
-        # (e.g., Opus rate-limit blocking all Sonnet/unknown-model tasks).
+    if not dm:
         return True
-    return model not in dm
+    if not model:
+        # Unknown model — be conservative and skip any account with disables.
+        # Previously returned True, which let rate-limited accounts get picked
+        # for tasks whose model resolution failed upstream.
+        return False
+    if model in dm:
+        return False
+    # A higher-tier disable cascades to lower tiers (see _MODEL_TIER_CASCADE).
+    for disabled_model in dm:
+        if model in _MODEL_TIER_CASCADE.get(disabled_model, ()):
+            return False
+    return True
 
 
-def _extract_task_model(task: Any) -> Optional[str]:
+def _extract_task_model(task: Any) -> str | None:
     """Extract which model a task uses from its payload."""
     payloads = task.payloads or []
     if payloads:
@@ -137,7 +161,7 @@ def _extract_task_model(task: Any) -> Optional[str]:
     return None
 
 
-async def select_max_plan_account(user_id: str, model: Optional[str] = None, blacklist: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+async def select_max_plan_account(user_id: str, model: str | None = None, blacklist: List[str] | None = None) -> Dict[str, Any] | None:
     """Select the Max plan account with the lowest active task count for a specific user.
     Filters by model availability — accounts with a specific model disabled are skipped.
     Pre-increments active_tasks atomically under lock to prevent races."""

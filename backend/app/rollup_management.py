@@ -90,9 +90,12 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
             # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
                 logger.warning(f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected")
-                # Update in-memory first
+                # Update in-memory first — set message AND status together so the
+                # outer session's commit always carries the explanatory message,
+                # even if the separate write_session below fails (row lock, etc.).
                 task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                 task.status = TaskStatus.FAILED
+                task.latest_status_message = f"PR #{pr_number} closed without merging"
                 try:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)

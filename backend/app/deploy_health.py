@@ -368,6 +368,11 @@ async def _check_pause_mode():
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state and state.status == DeploymentStatus.PAUSED and state.pre_pause_max_vms is not None:
+                # Only auto-resume pauses we initiated (external dep down).
+                # Don't override a manual admin pause — the operator paused on purpose.
+                if not (state.pause_reason or "").startswith("External dependency down"):
+                    _health_recovery_streak = 0
+                    return
                 _health_recovery_streak += 1
                 if _health_recovery_streak < 3:
                     logger.info(f"[PAUSE] Recovery streak {_health_recovery_streak}/3 — all deps healthy, waiting for confirmation")

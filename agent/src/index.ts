@@ -465,6 +465,33 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
   }
 }
 
+/** List open PRs whose head branch matches `branch` on `owner/repo`. */
+export async function listOpenPullRequestsForBranch(
+  ghToken: string, owner: string, repo: string, branch: string
+): Promise<{ number: number; html_url: string }[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=10`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => { controller.abort(); }, 30_000);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${ghToken}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      log(`listOpenPullRequestsForBranch ${branch} got HTTP ${res.status} — assuming no open PRs`);
+      return [];
+    }
+    const data = await res.json() as Array<{ number: number; html_url: string }>;
+    return Array.isArray(data) ? data : [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ── Workspace + PR Helpers ───────────────────────────────────────────────────
 export async function setupWorkspace(
   owner: string, repo: string, ghToken: string, baseBranch: string,
@@ -483,16 +510,27 @@ export async function setupWorkspace(
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   const workBranch = `blueprint/${branchPrefix}-${shortId}`;
-  // Clean up stale remote branch from previous attempt (requeue scenario)
+  // Clean up stale remote branch from previous attempt (requeue scenario).
+  // CRITICAL: if the stale branch has an open PR, deleting it auto-closes the PR
+  // and triggers head_ref_deleted on GitHub — silently destroying the previous
+  // attempt's work. Bail out so the operator can decide what to do with the PR.
   let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);
     staleBranchExists = true;
   } catch { /* branch doesn't exist on remote — normal case */ }
   if (staleBranchExists) {
+    const openPrs = await listOpenPullRequestsForBranch(ghToken, owner, repo, workBranch);
+    if (openPrs.length > 0) {
+      const prList = openPrs.map(p => `#${p.number}`).join(', ');
+      throw new Error(
+        `Refusing to delete stale branch ${workBranch}: has ${openPrs.length} open PR(s) (${prList}) ` +
+        `from a previous attempt. Resolve the PR(s) manually before retrying.`
+      );
+    }
     try {
       git(['push', 'origin', '--delete', workBranch]);
-      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt (no open PRs)\n`);
     } catch (e) {
       sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : String(e)}\n`);
     }

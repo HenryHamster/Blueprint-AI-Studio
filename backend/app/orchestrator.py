@@ -706,6 +706,11 @@ async def orchestrator_worker():
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(task, "payloads")
                         session.add(task)
+                    # Keep task_model in sync with the payload — otherwise
+                    # select_max_plan_account gets model=None and bypasses
+                    # disabled_models filtering entirely.
+                    if task.payloads:
+                        task_model = task.payloads[0].get("model") or task_model
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
                     if _blacklist:

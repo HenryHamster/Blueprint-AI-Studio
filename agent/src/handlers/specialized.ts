@@ -3,6 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   apiPost, persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
+  listOpenPullRequestsForBranch,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -145,9 +146,19 @@ export async function handleMigrate(
     staleBranchExists = true;
   } catch { /* branch doesn't exist on remote — normal case */ }
   if (staleBranchExists) {
+    // Refuse to delete the branch if it has open PRs — that auto-closes them
+    // and silently destroys the previous attempt's work.
+    const openPrs = await listOpenPullRequestsForBranch(ghToken, owner, repo, workBranch);
+    if (openPrs.length > 0) {
+      const prList = openPrs.map(p => `#${p.number}`).join(', ');
+      throw new Error(
+        `Refusing to delete stale branch ${workBranch}: has ${openPrs.length} open PR(s) (${prList}) ` +
+        `from a previous attempt. Resolve the PR(s) manually before retrying.`
+      );
+    }
     try {
       git(['push', 'origin', '--delete', workBranch]);
-      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt\n`);
+      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt (no open PRs)\n`);
     } catch (e) {
       sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : String(e)}\n`);
     }

@@ -10,12 +10,11 @@ Covers scenarios that could cause the pipeline to stall or waste resources over 
   6. Deadlock detection clears failed/cancelled dependencies
 """
 import asyncio
+import contextlib
 import pytest
 import pytest_asyncio
-import time
-import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -143,10 +142,8 @@ async def _run_one_cycle(mocker):
     catches and uses to break cleanly.
     """
     mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await _orch_module.orchestrator_worker()
-    except asyncio.CancelledError:
-        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -175,7 +172,11 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
     sleep_calls = []
     call_count = [0]
 
-    class _StopAfter3(Exception):
+    # Must inherit from BaseException, not Exception — the orchestrator worker
+    # has broad `except Exception` blocks around both the main cycle and the
+    # sleep call (orchestrator.py:1297, 1357) that would otherwise swallow this
+    # signal, causing the test to loop forever until pytest-timeout fires.
+    class _StopAfter3(BaseException):
         pass
 
     async def _capturing_sleep(n):
@@ -197,6 +198,11 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
 
     _orch_module._last_pool_refresh = _naive_utcnow()
     _orch_module._last_zone_health_persist = _naive_utcnow()
+
+    # Reset periodic-check timestamps so the unmocked _recover_orphaned_tasks /
+    # _check_evaluating_timeouts paths aren't reached during this test.
+    _orch_module._last_orphan_check = _naive_utcnow()
+    _orch_module._last_evaluating_timeout_check = _naive_utcnow()
 
     try:
         await _orch_module.orchestrator_worker()
@@ -555,7 +561,6 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
     await session.refresh(task_a)
 
     task_b_id = task_b.id
-    task_a_id = task_a.id
 
     # Force the deadlock check to run this cycle (reset throttle timestamp)
     _orch_module._last_deadlock_check = 0.0

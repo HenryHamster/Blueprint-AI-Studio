@@ -301,6 +301,7 @@ async def test_non_protected_branch_ignored(client: AsyncClient, db_session: Asy
             headers={
                 "x-hub-signature-256": signature,
                 "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
                 "content-type": "application/json",
             },
         )
@@ -314,7 +315,7 @@ async def test_non_protected_branch_ignored(client: AsyncClient, db_session: Asy
 @pytest.mark.asyncio
 async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncSession):
     """check_run with conclusion='success' returns no_match at the webhook level."""
-    project = await _create_project(db_session)
+    await _create_project(db_session)
     await db_session.commit()
 
     payload_dict = _build_check_run_webhook_payload(head_branch="main", conclusion="success")
@@ -328,6 +329,7 @@ async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncS
             headers={
                 "x-hub-signature-256": signature,
                 "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
                 "content-type": "application/json",
             },
         )
@@ -415,7 +417,7 @@ async def test_extract_ci_context_build_failure():
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        failed_checks, error_summary, failure_type = await _extract_ci_context(
+        failed_checks, _error_summary, failure_type = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
