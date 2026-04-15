@@ -1,7 +1,16 @@
 import { useState, useEffect } from 'react';
-import { X, GitBranch, Loader2, CheckCircle, Plus, Search } from 'lucide-react';
-import { onboardProject, authGet, API_BASE_URL } from '../api';
-import type { BuildConfig } from '../types/project';
+import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag } from 'lucide-react';
+import { onboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
+import type { BuildConfig, AutoRemediationConfig } from '../types/project';
+
+interface IssueImplementationConfig {
+  enabled: boolean;
+  trigger_label: string;
+  max_per_hour: number;
+  max_concurrent: number;
+  base_branch: string;
+  default_effort: string;
+}
 
 type Step = 'repo' | 'config' | 'submitting' | 'success';
 
@@ -10,9 +19,17 @@ interface RepoOption {
   default_branch: string;
 }
 
+interface SetupProject {
+  id: string;
+  owner: string;
+  repo: string;
+}
+
 interface NewProjectModalProps {
   onClose: () => void;
   onSuccess: (projectId: string) => void;
+  /** When provided, skip the wizard and show the setup guide for an existing project. */
+  setupProject?: SetupProject;
 }
 
 function parseRepoInput(input: string): { owner: string; repo: string } | null {
@@ -26,14 +43,24 @@ function parseRepoInput(input: string): { owner: string; repo: string } | null {
 
 const STEP_LABELS: Record<string, string> = { repo: 'Repository', config: 'Confirm', success: 'Created' };
 
-export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
-  const [step, setStep] = useState<Step>('repo');
+export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProjectModalProps) {
+  const [step, setStep] = useState<Step>(setupProject ? 'success' : 'repo');
   const [repoInput, setRepoInput] = useState('');
   const [projectName, setProjectName] = useState('');
   const [repoError, setRepoError] = useState('');
   const [submitError, setSubmitError] = useState('');
-  const [createdProjectId, setCreatedProjectId] = useState('');
+  const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
   const [detectedConfig, setDetectedConfig] = useState<BuildConfig | null>(null);
+
+  // Repo picker state
+  const [detectedDefaultBranch, setDetectedDefaultBranch] = useState('');
+
+  // Feature configs for the post-install setup guide
+  const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
+  const [issueImplementationConfig, setIssueImplementationConfig] = useState<IssueImplementationConfig | null>(null);
+  const [featureConfigLoading, setFeatureConfigLoading] = useState(false);
+  const [autoRemSaving, setAutoRemSaving] = useState(false);
+  const [issueImplSaving, setIssueImplSaving] = useState(false);
 
   // Repo picker state
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
@@ -44,7 +71,6 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
 
   useEffect(() => {
     let cancelled = false;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setRepoLoading(true);
     setRepoFetchError(null);
     authGet(`${API_BASE_URL}/api/admin/github/repos`)
@@ -75,6 +101,26 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
     return () => { cancelled = true; };
   }, []);
 
+  // When opened in setup-guide mode for an existing project, load its feature configs
+  useEffect(() => {
+    if (!setupProject) return;
+    setFeatureConfigLoading(true);
+    Promise.all([
+      apiFetch(`/api/admin/projects/${encodeURIComponent(setupProject.id)}/auto-remediation`),
+      apiFetch(`/api/admin/projects/${encodeURIComponent(setupProject.id)}/issue-implementation`),
+    ]).then(async ([arRes, iiRes]) => {
+      if (arRes.ok) {
+        const arData = await arRes.json();
+        if (arData?.config) setAutoRemediationConfig(arData.config as AutoRemediationConfig);
+      }
+      if (iiRes.ok) {
+        const iiData = await iiRes.json();
+        if (iiData?.config) setIssueImplementationConfig(iiData.config as IssueImplementationConfig);
+      }
+    }).catch(() => {}).finally(() => setFeatureConfigLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const parsed = parseRepoInput(repoInput);
 
   const handleRepoNext = () => {
@@ -96,13 +142,76 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
         parsed.repo,
         projectName.trim() || undefined,
       );
-      setCreatedProjectId(data.project_id);
+      const projectId = data.project_id;
+      setCreatedProjectId(projectId);
       setDetectedConfig((data.build_config as BuildConfig) || null);
+      setDetectedDefaultBranch((data as Record<string, unknown>).default_branch as string || '');
       setStep('success');
-      onSuccess(data.project_id);
+      onSuccess(projectId);
+
+      // Load feature configs for the setup guide
+      setFeatureConfigLoading(true);
+      try {
+        const [arRes, iiRes] = await Promise.all([
+          apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/auto-remediation`),
+          apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/issue-implementation`),
+        ]);
+        if (arRes.ok) {
+          const arData = await arRes.json();
+          if (arData?.config) setAutoRemediationConfig(arData.config as AutoRemediationConfig);
+        }
+        if (iiRes.ok) {
+          const iiData = await iiRes.json();
+          if (iiData?.config) setIssueImplementationConfig(iiData.config as IssueImplementationConfig);
+        }
+      } finally {
+        setFeatureConfigLoading(false);
+      }
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : 'Unknown error');
       setStep('config');
+    }
+  };
+
+  const handleToggleAutoRemediation = async () => {
+    if (!createdProjectId || !autoRemediationConfig) return;
+    const next = !autoRemediationConfig.enabled;
+    setAutoRemediationConfig({ ...autoRemediationConfig, enabled: next });
+    setAutoRemSaving(true);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(createdProjectId)}/auto-remediation`, {
+        method: 'PATCH',
+        body: JSON.stringify({ ...autoRemediationConfig, enabled: next }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.config) setAutoRemediationConfig(data.config as AutoRemediationConfig);
+      }
+    } catch {
+      setAutoRemediationConfig({ ...autoRemediationConfig, enabled: !next });
+    } finally {
+      setAutoRemSaving(false);
+    }
+  };
+
+  const handleToggleIssueImplementation = async () => {
+    if (!createdProjectId || !issueImplementationConfig) return;
+    const next = !issueImplementationConfig.enabled;
+    setIssueImplementationConfig({ ...issueImplementationConfig, enabled: next });
+    setIssueImplSaving(true);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(createdProjectId)}/issue-implementation`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.config) setIssueImplementationConfig(data.config as IssueImplementationConfig);
+      }
+    } catch {
+      setIssueImplementationConfig({ ...issueImplementationConfig, enabled: !next });
+    } finally {
+      setIssueImplSaving(false);
     }
   };
 
@@ -119,7 +228,7 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
         <div className="flex justify-between items-center p-5 border-b border-neutral-800">
           <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
             <Plus className="w-4 h-4 text-neutral-400" />
-            New Project
+            {setupProject ? 'Project Setup' : 'New Project'}
           </h2>
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors">
             <X className="w-4 h-4" />
@@ -127,8 +236,8 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
         </div>
 
         <div className="p-5">
-          {/* Step indicators */}
-          <div className="flex items-center gap-2 mb-6">
+          {/* Step indicators — hidden in setup-guide re-entry mode */}
+          <div className={`flex items-center gap-2 mb-6 ${setupProject ? 'hidden' : ''}`}>
             {stepKeys.map((s, i) => {
               const isCompleted = i < currentStepIndex;
               const isCurrent = i === currentStepIndex;
@@ -350,39 +459,49 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
             </div>
           )}
 
-          {/* Step 3: Success */}
+          {/* Step 3: Success / Setup Guide */}
           {step === 'success' && (
             <div>
-              <div className="flex items-center gap-2 mb-4">
+              {/* Header */}
+              <div className="flex items-center gap-2 mb-5">
                 <CheckCircle className="w-5 h-5 text-emerald-500 shrink-0" />
                 <span className="text-sm font-semibold text-neutral-100">Project created</span>
               </div>
 
+              {/* Repository confirmed */}
               <div className="mb-4 p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
-                <div className="text-[11px] text-neutral-500 mb-1">Project ID</div>
-                <div className="text-xs font-mono text-neutral-300 break-all">{createdProjectId}</div>
+                <div className="flex items-center gap-2">
+                  <GitBranch className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                  <span className="text-xs font-mono text-neutral-200">
+                    {setupProject ? `${setupProject.owner}/${setupProject.repo}` : `${parsed?.owner}/${parsed?.repo}`}
+                  </span>
+                  {detectedDefaultBranch && (
+                    <span className="ml-auto text-[10px] text-neutral-500 flex items-center gap-1 shrink-0">
+                      default: <span className="font-mono text-neutral-400">{detectedDefaultBranch}</span>
+                    </span>
+                  )}
+                </div>
               </div>
 
+              {/* Build config */}
               {detectedConfig && (
-                <div className="mb-5">
-                  <div className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-                    Detected Build Config
-                  </div>
-
-                  {detectedConfig.language && (
-                    <div className="flex items-center gap-2 mb-3">
-                      <span className="text-[11px] text-neutral-500">Language:</span>
-                      <span className="px-2 py-0.5 bg-blue-500/10 text-blue-400 rounded text-[11px] font-mono border border-blue-500/20">
+                <div className="mb-4">
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <Wrench className="w-3 h-3 text-neutral-500" />
+                    <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                      Build Config Detected
+                    </span>
+                    {detectedConfig.language && (
+                      <span className="ml-auto px-1.5 py-0.5 bg-blue-500/10 text-blue-400 rounded text-[10px] font-mono border border-blue-500/20">
                         {detectedConfig.language}
                       </span>
-                    </div>
-                  )}
-
+                    )}
+                  </div>
                   {detectedConfig.directories && detectedConfig.directories.length > 0 ? (
-                    <div className="space-y-2">
+                    <div className="space-y-1.5">
                       {detectedConfig.directories.map((dir, i) => (
-                        <div key={i} className="p-2.5 bg-neutral-950 rounded border border-neutral-800">
-                          <div className="text-[11px] font-mono text-neutral-300 mb-2">{dir.path}</div>
+                        <div key={i} className="p-2 bg-neutral-950 rounded border border-neutral-800">
+                          <div className="text-[11px] font-mono text-neutral-300 mb-1">{dir.path}</div>
                           {(['install_cmd', 'lint_cmd', 'build_cmd', 'test_cmd'] as const).map(cmd =>
                             dir[cmd] ? (
                               <div key={cmd} className="flex items-baseline gap-2 mb-0.5">
@@ -396,15 +515,113 @@ export function NewProjectModal({ onClose, onSuccess }: NewProjectModalProps) {
                         </div>
                       ))}
                     </div>
-                  ) : (
-                    !detectedConfig.language && (
-                      <p className="text-xs text-neutral-500">
-                        No build configuration detected. Configure it in project settings.
-                      </p>
-                    )
-                  )}
+                  ) : !detectedConfig.language ? (
+                    <p className="text-xs text-neutral-500">
+                      No build configuration detected. Configure it in project settings.
+                    </p>
+                  ) : null}
                 </div>
               )}
+
+              {/* Feature toggles */}
+              <div className="mb-4">
+                <div className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                  Automation Features
+                </div>
+                {featureConfigLoading ? (
+                  <div className="flex items-center gap-2 py-3 text-neutral-500 text-xs">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Loading feature config…
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {/* Auto-remediation toggle */}
+                    <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Zap className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium text-neutral-200">Auto-Remediation</div>
+                            <div className="text-[10px] text-neutral-500 mt-0.5">
+                              Auto-fix CI failures on the default branch
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          onClick={handleToggleAutoRemediation}
+                          disabled={autoRemSaving || !autoRemediationConfig}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${
+                            autoRemediationConfig?.enabled ? 'bg-emerald-600' : 'bg-neutral-700'
+                          }`}
+                        >
+                          <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                            autoRemediationConfig?.enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'
+                          }`} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Issue-to-implementation toggle */}
+                    <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700/50">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Tag className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium text-neutral-200">Issue-to-Implementation</div>
+                            <div className="text-[10px] text-neutral-500 mt-0.5">
+                              Label an issue{' '}
+                              <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">
+                                {issueImplementationConfig?.trigger_label ?? 'blueprint:implement'}
+                              </code>
+                              {' '}to spawn a task
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          onClick={handleToggleIssueImplementation}
+                          disabled={issueImplSaving || !issueImplementationConfig}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${
+                            issueImplementationConfig?.enabled ? 'bg-emerald-600' : 'bg-neutral-700'
+                          }`}
+                        >
+                          <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                            issueImplementationConfig?.enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'
+                          }`} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Next steps */}
+              <div className="mb-5 p-3 bg-blue-500/5 rounded-lg border border-blue-500/15">
+                <div className="text-[11px] font-semibold text-blue-400 uppercase tracking-wider mb-2">
+                  What happens next
+                </div>
+                <ul className="space-y-1.5 text-[11px] text-neutral-400">
+                  <li className="flex items-start gap-2">
+                    <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
+                    <span>Open a PR and Blueprint will automatically review it in the Checks tab</span>
+                  </li>
+                  {autoRemediationConfig?.enabled && (
+                    <li className="flex items-start gap-2">
+                      <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
+                      <span>CI failures on <span className="font-mono text-neutral-300">{detectedDefaultBranch || 'main'}</span> will trigger an automatic fix PR</span>
+                    </li>
+                  )}
+                  {issueImplementationConfig?.enabled && (
+                    <li className="flex items-start gap-2">
+                      <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
+                      <span>Label a GitHub issue <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">{issueImplementationConfig.trigger_label}</code> to automatically spawn an implementation task</span>
+                    </li>
+                  )}
+                  <li className="flex items-start gap-2">
+                    <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
+                    <span>Configure more options in project settings (build config, directions, advanced)</span>
+                  </li>
+                </ul>
+              </div>
 
               <div className="flex justify-end">
                 <button

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus } from 'lucide-react';
+import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings } from 'lucide-react';
 import type { Task } from './TaskCard';
 
 export type { Project } from '../types/project';
@@ -14,6 +14,16 @@ interface ProjectDashboardProps {
   onToggleMembers?: () => void;
   userRole?: 'admin' | 'user' | null;
   onNewProject?: () => void;
+  onOpenSetupGuide?: (projectId: string) => void;
+}
+
+/** A project is considered "new / setup incomplete" if it was created within the last hour
+ *  and has no completed tasks yet. */
+function isNewProject(project: Project, completedCount: number): boolean {
+  if (!project.created_at) return false;
+  const createdMs = new Date(project.created_at).getTime();
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  return createdMs > oneHourAgo && completedCount === 0;
 }
 
 
@@ -29,7 +39,7 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
-export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject }: ProjectDashboardProps) {
+export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
@@ -108,6 +118,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           {projects.map(project => {
             const counts = getTaskCounts(tasks, project.id);
             const isSelected = selectedProjectId === project.id;
+            const showSetupNudge = isNewProject(project, counts.completed);
 
             return (
               <div
@@ -118,8 +129,11 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     : 'bg-neutral-900/50 border-neutral-800/50 hover:border-neutral-700'
                 }`}
               >
-                {counts.failed > 0 && (
+                {counts.failed > 0 && !showSetupNudge && (
                   <span className="absolute top-2 right-2 text-[9px] font-bold bg-red-500/15 text-red-400 border border-red-500/20 rounded px-1 py-0.5">{counts.failed} failed</span>
+                )}
+                {showSetupNudge && (
+                  <span className="absolute top-2 right-2 text-[9px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/20 rounded px-1 py-0.5">setup</span>
                 )}
                 <div className="flex items-center justify-between mb-1.5">
                   <button
@@ -140,6 +154,15 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                         title="Project Members"
                       >
                         <UserPlus className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    {showSetupNudge && onOpenSetupGuide && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onOpenSetupGuide(project.id); }}
+                        className="p-1 rounded text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"
+                        title="Complete project setup"
+                      >
+                        <Settings className="w-3.5 h-3.5" />
                       </button>
                     )}
                     <span className={`w-2 h-2 rounded-full ${project.autonomous_enabled ? 'bg-emerald-500' : 'bg-red-500'}`}
