@@ -456,9 +456,10 @@ async def _check_evaluating_timeouts():
                     from app.max_plan_pool import release_max_plan_account
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
                     vms_to_delete = []
+                    child_cancel_msg = f"Cancelled: parent CI wait backstop timeout after {hours}h ({reason})"
                     for child in non_terminal_children:
                         child.status = TaskStatus.CANCELLED
-                        child.latest_status_message = "Cancelled: parent task timed out"
+                        child.latest_status_message = child_cancel_msg
                         if child.vm_instance_id:
                             vms_to_delete.append(child)
                         child_acct = (child.context or {}).get("max_plan_account_id")
@@ -536,9 +537,10 @@ async def _check_evaluating_timeouts():
                     from app.max_plan_pool import release_max_plan_account
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
                     vms_to_delete = []
+                    hard_timeout_cancel_msg = f"Cancelled: parent evaluation timeout after {hours}h"
                     for child in non_terminal_children:
                         child.status = TaskStatus.CANCELLED
-                        child.latest_status_message = "Cancelled: parent task timed out"
+                        child.latest_status_message = hard_timeout_cancel_msg
                         if child.vm_instance_id:
                             vms_to_delete.append(child)
                         child_acct = (child.context or {}).get("max_plan_account_id")

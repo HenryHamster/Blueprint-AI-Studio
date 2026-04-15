@@ -404,7 +404,14 @@ async def reaper_service():
                             )
                         else:
                             task.latest_status_message = f"{fail_reason.capitalize()} — last reap: {reap_reason}"
-                        record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
+                        extra_log_parts = [
+                            (task.context or {}).get("last_error", ""),
+                            (task.context or {}).get("last_serial_log", ""),
+                        ]
+                        if is_provision_failure:
+                            extra_log_parts.append(provision_err or "")
+                        extra_logs = " ".join(filter(None, extra_log_parts))
+                        record_task_result(success=False, failure_class=classify_failure(task, logs=extra_logs or None), task_id=str(task.id))
                         session.add(task)
                         await _maybe_create_failure_alert(task, session)
 

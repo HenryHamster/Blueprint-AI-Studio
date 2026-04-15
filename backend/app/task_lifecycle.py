@@ -105,7 +105,8 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             continue
 
         # Capture before cancellation — cancellation overwrites both
-        failure_class = classify_failure(child)
+        child_extra_logs = (child.context or {}).get("last_error", "")
+        failure_class = classify_failure(child, logs=child_extra_logs or None)
         original_status_message = child.latest_status_message
 
         # Auto-generate playbook entry if this failure pattern is recurring
