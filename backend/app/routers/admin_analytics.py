@@ -381,22 +381,27 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
             prs_merged = 0
             tasks_created_total = 0
+            sd_totals: Dict[str, int] = {}
             for entry in d.get("research_history") or []:
                 try:
                     entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
+                        for k, v in (entry.get("stage_dropout") or {}).items():
+                            sd_totals[k] = sd_totals.get(k, 0) + (v or 0)
                 except (ValueError, TypeError):
                     pass
 
             dir_conversion_rate = round(prs_merged / tasks_created_total, 3) if tasks_created_total > 0 else None
+            dominant_dropout = max(sd_totals, key=lambda k: sd_totals[k]) if sd_totals else None
             direction_stats.append({
                 "direction_id": did,
                 "merge_rate": round(prs_merged / cycles, 2),
                 "cycles": cycles,
                 "possibly_saturated": bool(d.get("possibly_saturated", False)),
                 "conversion_rate": dir_conversion_rate,
+                "dominant_dropout_stage": dominant_dropout,
             })
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)

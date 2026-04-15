@@ -2280,6 +2280,109 @@ async def test_type_distribution_and_product_ratio(db_session):
     assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
 
 
+@pytest.mark.asyncio
+async def test_stage_dropout_breakdown(db_session):
+    """stage_dropout is populated with per-category failure counts."""
+    direction_id = "d-stagedrop01"
+    direction = _active_direction(direction_id, "Stage dropout test")
+
+    project = Project(
+        name="Stage Dropout Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # code_error_task: FAILED with CODE_ERROR message
+    code_error_task = Task(
+        project_id=project.id,
+        title="Fix broken parser",
+        payloads=[{"type": "fix", "prompt": "fix parser"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Build failed: syntax error in main.py",
+        created_by="ORCHESTRATOR",
+    )
+    # review_capped_task: requires_approval=True (hit iteration cap)
+    review_capped_task = Task(
+        project_id=project.id,
+        title="Add feature flag",
+        payloads=[{"type": "create", "prompt": "add flag"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Review-fix cap reached for PR #42 (10 total iterations)",
+        requires_approval=True,
+        created_by="ORCHESTRATOR",
+    )
+    # merged_task: COMPLETED with pr_merged=True
+    merged_task = Task(
+        project_id=project.id,
+        title="Add caching layer",
+        payloads=[{"type": "create", "prompt": "add cache"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    for t in (code_error_task, review_capped_task, merged_task):
+        db_session.add(t)
+    await db_session.commit()
+    for t in (code_error_task, review_capped_task, merged_task):
+        await db_session.refresh(t)
+
+    # Research task (parent) in COMPLETED state — rollup succeeded
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Stage dropout test",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    for t in (code_error_task, review_capped_task, merged_task):
+        t.parent_task_id = research_task.id
+        db_session.add(t)
+    await db_session.commit()
+
+    dirs = list(project.directions or [])
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [{
+                "timestamp": "2026-04-07T00:00:00",
+                "task_id": str(research_task.id),
+                "tasks_created": 3,
+                "finding_titles": [],
+            }]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+    dropout = entry.get("stage_dropout", {})
+
+    assert dropout.get("tasks_failed_code_error") == 1, f"Expected 1 code error, got {dropout}"
+    assert dropout.get("tasks_review_capped") == 1, f"Expected 1 review capped, got {dropout}"
+    # rollup succeeded (research task COMPLETED) — no staging-only merges
+    assert dropout.get("tasks_merged_staging_only") == 0, f"Expected 0 staging-only, got {dropout}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _strategic_failures auto-decay
 # ─────────────────────────────────────────────────────────────────────────────
