@@ -95,7 +95,6 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
   const failedDetails = Array.isArray(lastEntry.failed_task_details)
     ? lastEntry.failed_task_details as Array<{title: string; reason: string; category: string}>
     : [];
-  if (failedDetails.length === 0) return '';
 
   const classified = failedDetails.map(fd => ({ ...fd, cls: classifyFailureCategory(fd.category) }));
   const codeErrors = classified.filter(fd => fd.cls === 'CODE_ERROR');
@@ -132,7 +131,38 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     }
   }
 
-  return line1 + line2;
+  // Scope success from last 3 cycles: aggregate scope_breakdown to show merged/created per scope
+  const recent = history.slice(-3);
+  const aggScope: Record<string, {created: number; merged: number}> = {};
+  for (const h of recent) {
+    const sb = h.scope_breakdown as Record<string, {created: number; merged: number; failed: number}> | undefined;
+    if (!sb || typeof sb !== 'object') continue;
+    for (const [scope, counts] of Object.entries(sb)) {
+      if (!aggScope[scope]) aggScope[scope] = { created: 0, merged: 0 };
+      aggScope[scope].created += (counts.created as number) || 0;
+      aggScope[scope].merged += (counts.merged as number) || 0;
+    }
+  }
+  const scopeOrder = ['small', 'medium', 'large'];
+  const scopeParts: string[] = [];
+  for (const scope of scopeOrder) {
+    if (aggScope[scope] && aggScope[scope].created > 0) {
+      scopeParts.push(`${scope} ${aggScope[scope].merged}/${aggScope[scope].created}`);
+    }
+  }
+  // Include any non-standard scopes
+  for (const scope of Object.keys(aggScope)) {
+    if (!scopeOrder.includes(scope) && aggScope[scope].created > 0) {
+      scopeParts.push(`${scope} ${aggScope[scope].merged}/${aggScope[scope].created}`);
+    }
+  }
+  const cycleLabel = recent.length === 1 ? '1 cycle' : `${recent.length} cycles`;
+  const line3 = scopeParts.length > 0
+    ? `\n  Scope success (last ${cycleLabel}): ${scopeParts.join(', ')}`
+    : '';
+
+  if (!line1 && !line2 && !line3) return '';
+  return line1 + line2 + line3;
 }
 
 export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {

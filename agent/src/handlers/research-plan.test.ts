@@ -351,4 +351,50 @@ describe('buildScopeCalibrationSignal', () => {
     expect(result).toContain('1 CODE_ERROR');
     expect(result).toContain('1 infra failure');
   });
+
+  it('shows scope success line from scope_breakdown across last 3 cycles', () => {
+    const history = [
+      { scope_breakdown: { small: { created: 3, merged: 2, failed: 1 }, medium: { created: 2, merged: 1, failed: 1 } } },
+      { scope_breakdown: { small: { created: 2, merged: 2, failed: 0 } } },
+      { scope_breakdown: { large: { created: 1, merged: 0, failed: 1 } } },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Scope success (last 3 cycles)');
+    expect(result).toContain('small 4/5');
+    expect(result).toContain('medium 1/2');
+    expect(result).toContain('large 0/1');
+  });
+
+  it('shows scope success even when there are no failures in last cycle', () => {
+    const history = [{
+      failed_task_details: [],
+      scope_breakdown: { small: { created: 4, merged: 3, failed: 1 } },
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Scope success (last 1 cycle)');
+    expect(result).toContain('small 3/4');
+    expect(result).not.toContain('Last cycle failures');
+  });
+
+  it('aggregates scope_breakdown from up to 3 most recent cycles only', () => {
+    const history = [
+      { scope_breakdown: { small: { created: 10, merged: 10, failed: 0 } } }, // older, excluded
+      { scope_breakdown: { small: { created: 1, merged: 1, failed: 0 } } },
+      { scope_breakdown: { small: { created: 1, merged: 0, failed: 1 } } },
+      { scope_breakdown: { small: { created: 1, merged: 1, failed: 0 } } },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    // Only last 3 cycles: 1+1+1=3 created, 1+0+1=2 merged
+    expect(result).toContain('small 2/3');
+    expect(result).not.toContain('small 12/13');
+  });
+
+  it('omits scope success line when scope_breakdown is absent from all recent cycles', () => {
+    const history = [
+      { failed_task_details: [{ title: 'feat: X', reason: 'build failed', category: 'build_failed' }] },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('CODE_ERROR');
+    expect(result).not.toContain('Scope success');
+  });
 });

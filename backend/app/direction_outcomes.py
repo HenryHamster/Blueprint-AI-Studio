@@ -114,6 +114,19 @@ async def _update_direction_research_outcomes(
             entry["product_ratio"] = round(product_count / total_typed, 2) if total_typed > 0 else 0.0
             entry["structural_count"] = structural_count
 
+            # Track per-scope merge rates so research agents can calibrate scope assignments
+            scope_breakdown: dict = {}
+            for ct in child_tasks_rows:
+                scope = (ct.first_payload or {}).get("scope", "unknown")
+                if scope not in scope_breakdown:
+                    scope_breakdown[scope] = {"created": 0, "merged": 0, "failed": 0}
+                scope_breakdown[scope]["created"] += 1
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+                    scope_breakdown[scope]["merged"] += 1
+                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    scope_breakdown[scope]["failed"] += 1
+            entry["scope_breakdown"] = scope_breakdown
+
             # Maintain research_context: promote proposed findings based on outcomes
             ctx = d.get("research_context", "")
             if ctx:

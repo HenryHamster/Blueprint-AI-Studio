@@ -868,6 +868,203 @@ async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker
         f"Unexpected status message: {parent.latest_status_message}"
 
 
+@pytest.mark.asyncio
+async def test_rollup_retries_failed_children_before_partial_rollup(rollup_db, mocker):
+    """When some children fail and some succeed, _requeue_parent_task should be
+    called (retry) instead of immediately proceeding to partial rollup, as long
+    as the requeue limit hasn't been reached."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = Project(name="Retry Before Partial Rollup Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={},  # _requeue_count not set → defaults to 0 (below limit)
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    succeeded = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    failed = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="pytest assertion failed",
+    )
+    rollup_db.add(succeeded)
+    rollup_db.add(failed)
+    await rollup_db.commit()
+    await rollup_db.refresh(succeeded)
+    await rollup_db.refresh(failed)
+
+    await _check_and_trigger_rollup(failed, rollup_db)
+
+    mock_requeue.assert_called_once_with(parent, rollup_db)
+    # Parent should still be EVALUATING — mock _requeue_parent_task didn't change it
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_rollup_retries_all_failed_children(rollup_db, mocker):
+    """When ALL children fail (none succeeded), _requeue_parent_task should still
+    be called if the requeue limit hasn't been reached — don't fail the parent yet."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = Project(name="All Failed Retry Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 1},  # Below limit of 3
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    failed1 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="lint error: E501",
+    )
+    failed2 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="test assertion failed",
+    )
+    rollup_db.add(failed1)
+    rollup_db.add(failed2)
+    await rollup_db.commit()
+    await rollup_db.refresh(failed1)
+    await rollup_db.refresh(failed2)
+
+    await _check_and_trigger_rollup(failed1, rollup_db)
+
+    mock_requeue.assert_called_once_with(parent, rollup_db)
+
+
+@pytest.mark.asyncio
+async def test_rollup_partial_after_requeue_limit_exhausted(rollup_db, mocker):
+    """When requeue limit is exhausted (_requeue_count == MAX_PARENT_REQUEUES),
+    the rollup should skip retry and proceed with partial rollup of succeeded children."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(name="Partial Rollup After Limit Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    # _requeue_count = 3 == MAX_PARENT_REQUEUES → no more retries
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    succeeded = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    failed_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="test error",
+    )
+    rollup_db.add(succeeded)
+    rollup_db.add(failed_child)
+    await rollup_db.commit()
+    await rollup_db.refresh(succeeded)
+    await rollup_db.refresh(failed_child)
+
+    await _check_and_trigger_rollup(failed_child, rollup_db)
+
+    # Retry should NOT be called — limit exhausted
+    mock_requeue.assert_not_called()
+    # Partial rollup proceeds: some succeeded, so parent should reach COMPLETED
+    # (no staging branch → else branch → COMPLETED)
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Expected COMPLETED (partial rollup) but got {parent.status}: {parent.latest_status_message}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, mocker):
+    """When requeue limit is exhausted AND no children succeeded, the parent
+    should be marked FAILED (not retry, not partial rollup)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="All Failed Limit Exhausted Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    failed1 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="compilation error",
+    )
+    rollup_db.add(failed1)
+    await rollup_db.commit()
+    await rollup_db.refresh(failed1)
+
+    await _check_and_trigger_rollup(failed1, rollup_db)
+
+    mock_requeue.assert_not_called()
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED but got {parent.status}: {parent.latest_status_message}"
+    )
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()

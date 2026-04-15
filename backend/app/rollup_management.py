@@ -338,7 +338,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             await session.commit()
             return
 
-        # No unmerged PRs — only failed/cancelled/merged children remain
+        # No unmerged PRs — only failed/cancelled/merged children remain.
+        # Before giving up on failed children, attempt retry via _requeue_parent_task.
+        if failed:
+            MAX_PARENT_REQUEUES = 3
+            parent_ctx = parent.context or {}
+            requeue_count = parent_ctx.get("_requeue_count", 0)
+            if requeue_count < MAX_PARENT_REQUEUES:
+                # Retry: clone and re-queue failed children; parent returns to EVALUATING.
+                # Next rollup cycle will produce a full rollup if retries succeed, or fall
+                # through to partial rollup once the requeue limit is exhausted.
+                from app.task_lifecycle import _requeue_parent_task
+                logger.info(
+                    f"[ROLLUP] Parent {parent.id} — {len(failed)} failed, "
+                    f"{len(completed_merged)} succeeded. Requeuing failed children "
+                    f"(attempt {requeue_count + 1}/{MAX_PARENT_REQUEUES}) before partial rollup."
+                )
+                await _requeue_parent_task(parent, session)
+                return
+            # Requeue limit exhausted — fall through to partial rollup or full failure.
+            logger.warning(
+                f"[ROLLUP] Parent {parent.id} — requeue limit reached "
+                f"({requeue_count}/{MAX_PARENT_REQUEUES}); proceeding with partial rollup or failure."
+            )
+
         if completed_merged:
             # Some succeeded — proceed with partial rollup of what worked
             logger.warning(f"[ROLLUP] Parent {parent.id} — {len(failed)} failed, {len(completed_merged)} succeeded. Rolling up successes.")
