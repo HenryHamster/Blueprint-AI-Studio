@@ -8,6 +8,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
 
+# Copy root CLAUDE.md into the Docker build context so test_claude_md_* in
+# test_invariants.py finds it at /app/CLAUDE.md inside the image — mirrors
+# CI (.github/workflows/ci.yml already does this same cp before its own
+# docker build). Cleaned up on exit (including error/interrupt paths) via
+# trap so local dev doesn't see a stray file. backend/CLAUDE.md is already
+# in .gitignore as a safety net if the trap doesn't fire.
+if [ -f ../CLAUDE.md ]; then
+  cp ../CLAUDE.md CLAUDE.md
+  trap 'rm -f CLAUDE.md' EXIT
+fi
+
 ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
   -e GCP_PROJECT_ID=test-project \
   -e LOCAL_MODE=true \
