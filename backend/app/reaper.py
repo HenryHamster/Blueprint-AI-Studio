@@ -405,7 +405,11 @@ async def reaper_service():
                         if is_provision_failure:
                             extra_log_parts.append(provision_err or "")
                         extra_logs = " ".join(filter(None, extra_log_parts))
-                        record_task_result(success=False, failure_class=classify_failure(task, logs=extra_logs or None), task_id=str(task.id))
+                        failure_class = classify_failure(task, logs=extra_logs or None)
+                        fail_ctx = dict(task.context or {})
+                        fail_ctx["failure_category"] = failure_class
+                        task.context = fail_ctx
+                        record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
                         session.add(task)
                         await _maybe_create_failure_alert(task, session)
 

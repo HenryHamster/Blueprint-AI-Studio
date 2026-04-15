@@ -163,6 +163,47 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mocker):
+    """
+    When the reaper terminally fails a task whose heartbeat never arrived,
+    the classifier's AGENT_TIMEOUT verdict must be persisted to
+    task.context["failure_category"] so downstream direction rollups bucket
+    the failure as infrastructure, not a code defect.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Category Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[],
+        vm_instance_id="category-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,  # At retry limit → reaper must mark FAILED
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+
+
+@pytest.mark.asyncio
 async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
     """
     Tests that a task whose last heartbeat was 6 minutes ago (just past the
