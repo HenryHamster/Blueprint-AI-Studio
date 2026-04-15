@@ -213,6 +213,7 @@ def _build_research_context(
     key_finding_descriptions: list,
     cycle_insights: list,
     history_entry: dict,
+    finding_scopes: Optional[list] = None,
 ) -> str:
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
@@ -223,11 +224,13 @@ def _build_research_context(
     # Append new findings to Established Findings as (proposed)
     for i, title in enumerate(finding_titles):
         desc = key_finding_descriptions[i] if i < len(key_finding_descriptions) else ""
+        scope = (finding_scopes[i] if finding_scopes and i < len(finding_scopes) else None) or "small"
+        scope_tag = f" [{scope}]"
         if desc:
             first_sentence = desc.split(".")[0].strip()
-            entry_text = f"{title} (proposed). {first_sentence}" if first_sentence else f"{title} (proposed)"
+            entry_text = f"{title}{scope_tag} (proposed). {first_sentence}" if first_sentence else f"{title}{scope_tag} (proposed)"
         else:
-            entry_text = f"{title} (proposed)"
+            entry_text = f"{title}{scope_tag} (proposed)"
         parsed["established"].append(entry_text)
 
     # Add cycle_insights to Open Questions (deduplicate)
@@ -763,6 +766,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Append to research_history for each direction that produced findings
             finding_titles_by_dir: dict = {}
             finding_descriptions_by_dir: dict = {}
+            finding_scopes_by_dir: dict = {}
             for orig_i, finding, fhash in deduplicated:
                 did = finding.get("direction_id")
                 if did:
@@ -771,6 +775,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     )
                     finding_descriptions_by_dir.setdefault(did, []).append(
                         (finding.get("description", finding.get("prompt", "")))[:200]
+                    )
+                    finding_scopes_by_dir.setdefault(did, []).append(
+                        finding.get("scope", "small")
                     )
             for d in directions:
                 did = d.get("id")
@@ -815,6 +822,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         prior_context=d.get("research_context"),
                         finding_titles=finding_titles_by_dir.get(did, [])[:5],
                         key_finding_descriptions=finding_descriptions_by_dir.get(did, [])[:5],
+                        finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
                         cycle_insights=[i["summary"][:200] for i in insights[:3]],
                         history_entry=entry,
                     )

@@ -54,7 +54,85 @@ export function aggregateDirectionStats(
   const parts = [`${totalCycles} cycles`, `${totalTasks} tasks`];
   if (totalMerged > 0) parts.push(`${totalMerged} merged`);
   if (totalFailed > 0) parts.push(`${totalFailed} failed`);
+
+  // Conversion rate from last 3 cycles: findings that became merged PRs
+  const recent = history.slice(-3);
+  const recentTasksCreated = recent.reduce((s, h) => s + ((h.tasks_created as number) || 0), 0);
+  if (recentTasksCreated > 0) {
+    const recentMerged = recent.reduce((s, h) => s + ((h.prs_merged as number) || 0), 0);
+    const pct = Math.round((recentMerged / recentTasksCreated) * 100);
+    const cycleLabel = recent.length === 1 ? '1 cycle' : `${recent.length} cycles`;
+    parts.push(`conversion: ${pct}% (${recentMerged}/${recentTasksCreated} findings merged last ${cycleLabel})`);
+  }
+
   return `Stats: ${parts.join(', ')}`;
+}
+
+/** Maps raw agent-reported failure_category to a high-level failure class. */
+export function classifyFailureCategory(rawCat: string): string {
+  const CODE_ERROR_CATS: Record<string, true> = {
+    build_failed: true, test_failed: true, lint_failed: true,
+    claude_code_failed: true, parse_failed: true, fatal: true,
+  };
+  if (CODE_ERROR_CATS[rawCat]) return 'CODE_ERROR';
+  if (rawCat === 'clone_failed') return 'PROVISION_FAILURE';
+  if (rawCat === 'rate_limited') return 'RATE_LIMIT';
+  if (rawCat === 'pr_creation_failed') return 'EXTERNAL_API';
+  // Pass through if already a high-level class name or unknown
+  return rawCat || 'unknown';
+}
+
+const _INFRA_CLASSES = new Set(['PROVISION_FAILURE', 'RATE_LIMIT', 'AGENT_TIMEOUT', 'EXTERNAL_API']);
+
+/**
+ * Builds a compact (0-2 line) failure-calibration signal from direction history.
+ * Line 1: last cycle's failures with class and actionability hint.
+ * Line 2 (optional): recurring CODE_ERROR trend → urge smaller scope.
+ */
+export function buildScopeCalibrationSignal(history: Array<Record<string, unknown>>): string {
+  if (history.length === 0) return '';
+  const lastEntry = history[history.length - 1];
+  const failedDetails = Array.isArray(lastEntry.failed_task_details)
+    ? lastEntry.failed_task_details as Array<{title: string; reason: string; category: string}>
+    : [];
+  if (failedDetails.length === 0) return '';
+
+  const classified = failedDetails.map(fd => ({ ...fd, cls: classifyFailureCategory(fd.category) }));
+  const codeErrors = classified.filter(fd => fd.cls === 'CODE_ERROR');
+  const infraErrors = classified.filter(fd => _INFRA_CLASSES.has(fd.cls));
+
+  const parts: string[] = [];
+  if (codeErrors.length > 0) {
+    const names = codeErrors.slice(0, 2).map(fd => `"${fd.title.slice(0, 40)}"`).join(', ');
+    parts.push(`${codeErrors.length} CODE_ERROR (${names}) → over-scoped/under-specified`);
+  }
+  if (infraErrors.length > 0) {
+    parts.push(`${infraErrors.length} infra failure(s) → retry ok`);
+  }
+  const other = classified.length - codeErrors.length - infraErrors.length;
+  if (other > 0) {
+    parts.push(`${other} other`);
+  }
+
+  const line1 = parts.length > 0 ? `\n  Last cycle failures: ${parts.join('; ')}` : '';
+
+  // Scope trend: CODE_ERRORs recurring in prior cycles too → strongly urge smaller scope
+  let line2 = '';
+  if (codeErrors.length > 0 && history.length >= 2) {
+    const prevEntries = history.slice(-3, -1);
+    let prevCodeErrors = 0;
+    for (const h of prevEntries) {
+      const prevDetails = Array.isArray(h.failed_task_details)
+        ? h.failed_task_details as Array<{category: string}>
+        : [];
+      prevCodeErrors += prevDetails.filter(fd => classifyFailureCategory(fd.category) === 'CODE_ERROR').length;
+    }
+    if (prevCodeErrors > 0) {
+      line2 = `\n  Scope trend: CODE_ERRORs in ${Math.min(history.length, 3)} consecutive cycles → strongly prefer smaller, narrower findings`;
+    }
+  }
+
+  return line1 + line2;
 }
 
 export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {
@@ -337,6 +415,7 @@ ${hotspotsSection}
         const agg = (d.history_aggregate || {}) as Record<string, number | string | null>;
         const statsResult = aggregateDirectionStats(history, agg);
         const statsLine = statsResult ? `\n  ${statsResult}` : '';
+        const calibrationSignal = buildScopeCalibrationSignal(history);
 
         // Research context — restructure to avoid anchoring on small past findings.
         // Show failed approaches and open questions in full (high-signal steering).
@@ -395,7 +474,7 @@ ${hotspotsSection}
           }
         }
 
-        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${statsLine}${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
+        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${statsLine}${calibrationSignal}${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
       }).join('\n\n')
     : 'No specific directions provided. Identify general improvements.';
 

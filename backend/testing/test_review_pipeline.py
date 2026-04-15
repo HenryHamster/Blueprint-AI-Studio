@@ -156,7 +156,7 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=101, branch="feat/x", base_branch="main",
     )
@@ -191,7 +191,7 @@ async def test_global_cap_under_limit_allows_spawn(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=102, branch="feat/y", base_branch="main",
         fix_prompt="Fix the lint error",
@@ -241,7 +241,7 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=103, branch="feat/z", base_branch="main",
         original_task_id=str(original_task.id),
@@ -299,7 +299,7 @@ async def test_per_chain_cap_small_vs_medium_scope(db_session, mocker):
         await db_session.commit()
         await db_session.refresh(source)
 
-        result = await _spawn_pipeline_task(
+        result, _ = await _spawn_pipeline_task(
             source, "fix", db_session,
             pr_number=source.first_payload["pr_number"],
             branch="b", base_branch="main",
@@ -369,7 +369,7 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
     # Current iteration repeats 100% of CRITICAL issues from the prior entry.
     current_issues = [_issue("null pointer dereference", "CRITICAL")]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=301, branch="b1", base_branch="main",
         original_task_id=str(original_task.id),
@@ -440,7 +440,7 @@ async def test_stuck_cycle_not_triggered_below_threshold(db_session, mocker):
         _issue("new issue D", "MAJOR"),
     ]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=302, branch="b2", base_branch="main",
         original_task_id=str(original_task.id),
@@ -507,7 +507,7 @@ async def test_refactor_stuck_threshold_is_75pct(db_session, mocker):
         _issue("new issue Y", "MAJOR"),
     ]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=303, branch="b3", base_branch="main",
         original_task_id=str(original_task.id),
@@ -575,7 +575,7 @@ async def test_refactor_stuck_at_80pct(db_session, mocker):
         _issue("new issue Z", "CRITICAL"),
     ]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=304, branch="b4", base_branch="main",
         original_task_id=str(original_task.id),
@@ -622,7 +622,7 @@ async def test_edge_empty_review_history_no_stuck_cycle(db_session, mocker):
 
     current_issues = [_issue("some bug", "CRITICAL")]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=401, branch="b10", base_branch="main",
         fix_prompt="Fix the bug",
@@ -666,7 +666,7 @@ async def test_edge_zero_current_issues_no_stuck_cycle(db_session, mocker):
     await db_session.refresh(source_task)
 
     # Zero current CRITICAL/MAJOR issues → no stuck cycle possible.
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=402, branch="b11", base_branch="main",
         fix_prompt="All fixed now",
@@ -718,7 +718,7 @@ async def test_edge_issues_without_severity_ignored_by_stuck_cycle(db_session, m
         {"description": "another style suggestion", "severity": "minor"},  # case insensitive check
     ]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=403, branch="b12", base_branch="main",
         fix_prompt="Style fixes only",
@@ -779,7 +779,7 @@ async def test_edge_only_major_issues_count_for_stuck_cycle(db_session, mocker):
     # Same MAJOR issue repeats 100% → stuck (MAJOR is counted).
     current_issues = [_issue("memory leak in handler", "MAJOR")]
 
-    result = await _spawn_pipeline_task(
+    result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
         pr_number=404, branch="b13", base_branch="main",
         original_task_id=str(original_task.id),

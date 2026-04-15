@@ -4,6 +4,8 @@ import {
   parseResearchContext,
   aggregateDirectionStats,
   mapSubtaskToSpawnPayload,
+  classifyFailureCategory,
+  buildScopeCalibrationSignal,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -132,7 +134,7 @@ describe('aggregateDirectionStats', () => {
 
   it('returns stats string for single cycle with 1 task', () => {
     const history = [{ tasks_created: 1, prs_merged: 0, tasks_failed: 0 }];
-    expect(aggregateDirectionStats(history, {})).toBe('Stats: 1 cycles, 1 tasks');
+    expect(aggregateDirectionStats(history, {})).toBe('Stats: 1 cycles, 1 tasks, conversion: 0% (0/1 findings merged last 1 cycle)');
   });
 
   it('includes merged count when merges exist', () => {
@@ -151,7 +153,34 @@ describe('aggregateDirectionStats', () => {
     const history = [{ tasks_created: 1, prs_merged: 0, tasks_failed: 0 }];
     const aggregate = { total_cycles: 5, total_tasks_created: 10, total_prs_merged: 3, total_tasks_failed: 2 };
     const result = aggregateDirectionStats(history, aggregate);
-    expect(result).toBe('Stats: 6 cycles, 11 tasks, 3 merged, 2 failed');
+    expect(result).toBe('Stats: 6 cycles, 11 tasks, 3 merged, 2 failed, conversion: 0% (0/1 findings merged last 1 cycle)');
+  });
+
+  it('includes conversion rate from last 3 cycles when tasks were created', () => {
+    const history = [
+      { tasks_created: 4, prs_merged: 1, tasks_failed: 0 },
+      { tasks_created: 4, prs_merged: 1, tasks_failed: 0 },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('conversion: 25% (2/8 findings merged last 2 cycles)');
+  });
+
+  it('omits conversion rate when no tasks were created in recent history', () => {
+    const history = [{ tasks_created: 0, prs_merged: 0, tasks_failed: 0 }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('conversion:');
+  });
+
+  it('uses at most last 3 cycles for conversion rate', () => {
+    const history = [
+      { tasks_created: 10, prs_merged: 10, tasks_failed: 0 },  // older, ignored
+      { tasks_created: 4, prs_merged: 0, tasks_failed: 0 },
+      { tasks_created: 4, prs_merged: 0, tasks_failed: 0 },
+      { tasks_created: 4, prs_merged: 0, tasks_failed: 0 },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    // last 3 cycles: 12 tasks, 0 merged → 0%
+    expect(result).toContain('conversion: 0% (0/12 findings merged last 3 cycles)');
   });
 
   it('returns empty string when totalCycles is 0 from aggregate', () => {
@@ -212,5 +241,114 @@ describe('mapSubtaskToSpawnPayload', () => {
   it('uses Untitled subtask as default title when title missing', () => {
     const result = mapSubtaskToSpawnPayload({ prompt: 'Some prompt' }, 'main');
     expect(result.title).toBe('Untitled subtask');
+  });
+});
+
+describe('classifyFailureCategory', () => {
+  it('classifies build/test/lint/parse/fatal/claude_code_failed as CODE_ERROR', () => {
+    for (const cat of ['build_failed', 'test_failed', 'lint_failed', 'parse_failed', 'fatal', 'claude_code_failed']) {
+      expect(classifyFailureCategory(cat)).toBe('CODE_ERROR');
+    }
+  });
+
+  it('classifies clone_failed as PROVISION_FAILURE', () => {
+    expect(classifyFailureCategory('clone_failed')).toBe('PROVISION_FAILURE');
+  });
+
+  it('classifies rate_limited as RATE_LIMIT', () => {
+    expect(classifyFailureCategory('rate_limited')).toBe('RATE_LIMIT');
+  });
+
+  it('classifies pr_creation_failed as EXTERNAL_API', () => {
+    expect(classifyFailureCategory('pr_creation_failed')).toBe('EXTERNAL_API');
+  });
+
+  it('passes through unknown categories unchanged', () => {
+    expect(classifyFailureCategory('some_unknown_cat')).toBe('some_unknown_cat');
+  });
+
+  it('returns unknown for empty string', () => {
+    expect(classifyFailureCategory('')).toBe('unknown');
+  });
+});
+
+describe('buildScopeCalibrationSignal', () => {
+  it('returns empty string for empty history', () => {
+    expect(buildScopeCalibrationSignal([])).toBe('');
+  });
+
+  it('returns empty string when last entry has no failed_task_details', () => {
+    expect(buildScopeCalibrationSignal([{ tasks_created: 2 }])).toBe('');
+  });
+
+  it('returns empty string when failed_task_details is empty array', () => {
+    expect(buildScopeCalibrationSignal([{ failed_task_details: [] }])).toBe('');
+  });
+
+  it('includes CODE_ERROR signal with task names when last cycle has code errors', () => {
+    const history = [{
+      failed_task_details: [
+        { title: 'fix: auth refresh', reason: 'review iterations exhausted', category: 'claude_code_failed' },
+      ],
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('CODE_ERROR');
+    expect(result).toContain('"fix: auth refresh"');
+    expect(result).toContain('over-scoped/under-specified');
+  });
+
+  it('includes infra signal when last cycle has clone/provision failures', () => {
+    const history = [{
+      failed_task_details: [
+        { title: 'feat: db migration', reason: 'vm failed to start', category: 'clone_failed' },
+      ],
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('infra failure');
+    expect(result).toContain('retry ok');
+  });
+
+  it('shows scope trend line when CODE_ERRORs recur across multiple cycles', () => {
+    const history = [
+      {
+        failed_task_details: [
+          { title: 'feat: prev task', reason: 'build failed', category: 'build_failed' },
+        ],
+      },
+      {
+        failed_task_details: [
+          { title: 'fix: auth refresh', reason: 'claude_code_failed', category: 'claude_code_failed' },
+        ],
+      },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Scope trend');
+    expect(result).toContain('smaller');
+  });
+
+  it('does not show scope trend when only last cycle has CODE_ERRORs', () => {
+    const history = [
+      { failed_task_details: [] },
+      {
+        failed_task_details: [
+          { title: 'fix: auth refresh', reason: 'build failed', category: 'build_failed' },
+        ],
+      },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('CODE_ERROR');
+    expect(result).not.toContain('Scope trend');
+  });
+
+  it('handles mixed failure types and groups them correctly', () => {
+    const history = [{
+      failed_task_details: [
+        { title: 'feat: A', reason: '', category: 'build_failed' },
+        { title: 'feat: B', reason: '', category: 'clone_failed' },
+      ],
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('1 CODE_ERROR');
+    expect(result).toContain('1 infra failure');
   });
 });

@@ -58,6 +58,8 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if (ct.context or {}).get("pr_rejected")
             )
+            _tasks_created = entry.get("tasks_created", 0)
+            entry["conversion_rate"] = round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
             # Review quality signals: track how users respond to Blueprint's reviews
             entry["reviews_dismissed"] = sum(
                 1 for ct in child_tasks_rows

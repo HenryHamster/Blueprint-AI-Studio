@@ -290,6 +290,12 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 pass
         return t.created_at
 
+    def _safe_ts_in_window(ts_str: Optional[str], cutoff: datetime) -> bool:
+        try:
+            return datetime.fromisoformat(ts_str or "") >= cutoff
+        except (ValueError, TypeError):
+            return False
+
     # Query tasks from extended 48h window to compute both current and previous period
     tasks_result = await session.execute(
         select(Task).where(
@@ -374,22 +380,41 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 continue
 
             prs_merged = 0
+            tasks_created_total = 0
             for entry in d.get("research_history") or []:
                 try:
                     entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        tasks_created_total += entry.get("tasks_created") or 0
                 except (ValueError, TypeError):
                     pass
 
+            dir_conversion_rate = round(prs_merged / tasks_created_total, 3) if tasks_created_total > 0 else None
             direction_stats.append({
                 "direction_id": did,
                 "merge_rate": round(prs_merged / cycles, 2),
                 "cycles": cycles,
                 "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                "conversion_rate": dir_conversion_rate,
             })
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
+
+    # Pipeline-level conversion rate: total prs_merged / total tasks_created across all directions
+    _pipeline_total_created = sum(
+        entry.get("tasks_created") or 0
+        for d in (project.directions or [] if project else [])
+        for entry in (d.get("research_history") or [])
+        if _safe_ts_in_window(entry.get("timestamp"), window_start)
+    )
+    _pipeline_total_merged = sum(
+        entry.get("prs_merged") or 0
+        for d in (project.directions or [] if project else [])
+        for entry in (d.get("research_history") or [])
+        if _safe_ts_in_window(entry.get("timestamp"), window_start)
+    )
+    pipeline_conversion_rate = round(_pipeline_total_merged / _pipeline_total_created, 3) if _pipeline_total_created > 0 else None
 
     # First-attempt success rate: tasks that completed on the first try
     terminal_tasks_24h = completed_tasks + failed_tasks
@@ -460,6 +485,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "failure_distribution": failure_distribution,
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
+        "pipeline_conversion_rate": pipeline_conversion_rate,
     }
 
 
@@ -573,6 +599,7 @@ async def get_digest(
                 # prs_merged / prs_rejected: sum from research_history entries within window
                 prs_merged = 0
                 prs_rejected = 0
+                findings_tasks_created = 0
                 merge_time_values: List[float] = []
                 for entry in d.get("research_history") or []:
                     try:
@@ -580,6 +607,7 @@ async def get_digest(
                         if entry_ts >= window_start:
                             prs_merged += entry.get("prs_merged") or 0
                             prs_rejected += entry.get("prs_rejected") or 0
+                            findings_tasks_created += entry.get("tasks_created") or 0
                             atm = entry.get("avg_time_to_merge_hours")
                             if atm is not None:
                                 merge_time_values.append(float(atm))
@@ -616,6 +644,7 @@ async def get_digest(
                 total_prs = prs_merged + prs_rejected
                 acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
                 avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
+                conversion_rate = round(prs_merged / findings_tasks_created, 3) if findings_tasks_created > 0 else None
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -625,6 +654,7 @@ async def get_digest(
                     "prs_merged": prs_merged,
                     "prs_rejected": prs_rejected,
                     "acceptance_rate": acceptance_rate,
+                    "conversion_rate": conversion_rate,
                     "avg_time_to_merge_hours": avg_time_to_merge_hours,
                     "possibly_saturated": bool(d.get("possibly_saturated", False)),
                     "latest_insights": latest_insights,

@@ -1866,17 +1866,17 @@ async def test_research_context_accumulates_across_cycles(db_session, mocker):
         ctx = d.get("research_context", "")
         assert ctx, f"research_context should exist after cycle {i + 1}"
 
-        # All findings up to this cycle should be present
+        # All findings up to this cycle should be present (with scope tag)
         for title in expected_titles[: i + 1]:
-            assert f"{title} (proposed)" in ctx, (
-                f"'{title} (proposed)' should be in research_context after cycle {i + 1}"
+            assert f"{title} [small] (proposed)" in ctx, (
+                f"'{title} [small] (proposed)' should be in research_context after cycle {i + 1}"
             )
 
     # Final assertions after all 3 cycles
     assert "## Established Findings" in ctx
-    assert "Finding Alpha (proposed)" in ctx
-    assert "Finding Beta (proposed)" in ctx
-    assert "Finding Gamma (proposed)" in ctx
+    assert "Finding Alpha [small] (proposed)" in ctx
+    assert "Finding Beta [small] (proposed)" in ctx
+    assert "Finding Gamma [small] (proposed)" in ctx
 
 
 @pytest.mark.asyncio
