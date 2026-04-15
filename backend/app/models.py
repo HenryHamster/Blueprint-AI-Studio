@@ -6,13 +6,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
 from datetime import datetime, timezone
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class ProjectStatus(str, Enum):
     DRAFT = "DRAFT"

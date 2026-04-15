@@ -18,13 +18,9 @@ from sqlmodel import select
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
 from app.strategic_completion import _is_direction_duplicate
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _normalize_error_message(msg: str) -> str:

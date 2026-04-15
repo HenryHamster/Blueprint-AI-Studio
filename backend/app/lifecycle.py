@@ -15,13 +15,9 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal, init_db
 from app.models import AllowedUser, Alert, AlertSeverity, Project
+from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _seed_initial_admin():

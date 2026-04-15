@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers,
+  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
 } from '../prompt.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
@@ -38,6 +38,8 @@ export async function handleDesignDocUpdate(
     : '';
   const fileTreeSection = buildFileTree(ws);
   const projectName = strVal(payload.project_name, 'Unknown Project');
+  const designDocRetryContext = buildRetryContext(task);
+  const designDocFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
   // Build existing pages summary from current design doc
   const designDoc = payload.design_doc as Record<string, unknown> | undefined;
@@ -143,7 +145,7 @@ echo ""
     `# Design Doc Agent\nCRITICAL: Your ONLY output is via \`./design-doc set\` commands.\nAny text you write will be DISCARDED. Only ./design-doc calls persist.\nBefore finishing, confirm you called ./design-doc set at least once.\n`
   );
 
-  const prompt = `${contextPrefix}# YOUR ONLY OUTPUT MECHANISM
+  const prompt = `${contextPrefix}${designDocRetryContext}# YOUR ONLY OUTPUT MECHANISM
 
 Your text output will be DISCARDED. The ONLY way to save your work is the \`./design-doc\` command:
 
@@ -193,7 +195,7 @@ ${codebaseSummary}${fileTreeSection}
    for stale entries.`;
 
   statusRef.value = 'Running architecture review...';
-  let { exitCode } = await runClaudeCode(prompt, ws, statusRef, model, effort, disallowedTools);
+  let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Post-check: verify the agent actually called ./design-doc
   try {

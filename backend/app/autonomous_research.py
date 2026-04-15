@@ -26,6 +26,7 @@ from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,6 @@ def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
         _spawn_locks[project_id] = asyncio.Lock()
     return _spawn_locks[project_id]
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):

@@ -22,13 +22,9 @@ from app.github import (
 )
 from app.models import Task, TaskStatus
 from app.notification_dispatch import post_issue_implementation_spawned_message
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _handle_issue_implementation(

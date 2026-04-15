@@ -13,13 +13,9 @@ from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # Reaper: track tasks skipped by skip_locked to force-reap after repeated skips

@@ -18,13 +18,9 @@ from sqlmodel import select
 from app.models import Project, ProjectMessage, MessageType, Task, TaskStatus
 from app.research_completion import _update_cycle_history, _compute_saturation
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _post_cycle_summary_message(

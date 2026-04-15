@@ -12,13 +12,9 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Project
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _process_direction_lifecycle(

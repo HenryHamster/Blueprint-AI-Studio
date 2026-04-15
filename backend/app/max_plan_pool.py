@@ -19,13 +19,9 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import AsyncSessionLocal
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # --- Max Plan Account Pool ---

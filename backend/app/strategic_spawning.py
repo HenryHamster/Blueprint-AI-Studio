@@ -16,13 +16,9 @@ from sqlmodel import select
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:

@@ -39,13 +39,9 @@ from app.task_completion import (
     _log_file_overlaps,
     TASK_PRIORITY_MAP,
 )
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _compute_momentum_factor(d: dict) -> float:

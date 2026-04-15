@@ -44,15 +44,11 @@ from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results

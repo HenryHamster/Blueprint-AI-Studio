@@ -16,13 +16,9 @@ from app.database import AsyncSessionLocal
 from app.github import get_check_runs, get_repo_installation_token
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _handle_main_branch_ci_failure(

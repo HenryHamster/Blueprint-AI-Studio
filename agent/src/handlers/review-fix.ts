@@ -10,8 +10,8 @@ import {
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
+  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -192,7 +192,7 @@ For each issue in the \`issues\` array:
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 
   statusRef.value = 'Running code review...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
 
@@ -410,17 +410,19 @@ export async function handleFix(
   // Prepend CLAUDE.md instructions + playbook
   const fixClaudeMd = readClaudeMd();
   const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const fixRetryContext = buildRetryContext(task);
+  const fixFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   if (fixClaudeMd) {
-    enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${fixPlaybookSection}${enrichedPrompt}`;
-  } else if (fixPlaybookSection) {
-    enrichedPrompt = `${fixPlaybookSection}${enrichedPrompt}`;
+    enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;
+  } else if (fixPlaybookSection || fixRetryContext) {
+    enrichedPrompt = `${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;
   }
 
   // Append fix-specific task type hint and playbook guidance
   if (TASK_TYPE_HINTS['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${TASK_TYPE_HINTS['fix']}`;
   }
-  enrichedPrompt = `${enrichedPrompt}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';

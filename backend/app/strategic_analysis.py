@@ -3,11 +3,7 @@
 Extracted from app.strategic_completion to keep that module under its line ceiling.
 """
 from datetime import datetime, timezone
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+from app.time_utils import _utcnow
 
 
 def _build_outcome_evaluation(project) -> dict:

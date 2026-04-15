@@ -29,13 +29,9 @@ from app.health_check_primitives import (
 )
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _get_zone_health_summary() -> dict:

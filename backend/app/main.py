@@ -73,12 +73,9 @@ from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def _cap_str(value: Any, max_len: int, field_name: str, warnings: Optional[List[str]] = None) -> str:
     """Cap a string field, appending a human-readable warning if truncation occurred."""

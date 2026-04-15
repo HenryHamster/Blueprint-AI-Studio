@@ -9,8 +9,8 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { extractJsonArray } from '../json-extract.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -41,11 +41,13 @@ export async function handleSecurityAudit(
 
   const fileTreeSection = buildFileTree(ws);
   const secPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const secRetryContext = buildRetryContext(task);
+  const secFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
   const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
 
-  const securityPrompt = `${codebaseSummary}${secPlaybookSection}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
+  const securityPrompt = `${codebaseSummary}${secPlaybookSection}${secRetryContext}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
 
 Analyze the codebase for the following vulnerability categories:
 1. OWASP Top 10 vulnerabilities
@@ -87,7 +89,7 @@ Rules:
   const secTypeHints = getTaskTypeHints(secBuildConfig);
   const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + securityPromptSuffix, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -212,10 +214,12 @@ CRITICAL RULES:
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const migrateRetryContext = buildRetryContext(task);
+  const migrateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePlaybookSection + migratePrompt + PLAYBOOK_GUIDANCE + migratePromptSuffix, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext + migratePrompt + migrateFirstTaskSection + PLAYBOOK_GUIDANCE + migratePromptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const diff = git(['status', '--porcelain']);
   const currentHead = git(['rev-parse', 'HEAD']);
@@ -306,7 +310,9 @@ export async function handleSmoketest(
   const smoketestPyDir = smoketestPythonDirs.length > 0 ? smoketestPythonDirs[0].path.replace(/\/$/, '') : 'backend';
   const smoketestConfigPath = `${smoketestPyDir}/testing/smoketest.yaml`;
 
-  const smoketestPrompt = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
+  const smoketestRetryContext = buildRetryContext(task);
+  const smoketestFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  const smoketestPrompt = `${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
@@ -345,7 +351,9 @@ Follow these steps:
 
 Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
-IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
+IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
+
+${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running smoke tests...';
   const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -443,9 +451,11 @@ export async function handleDebug(
   const claudeMd = readClaudeMd();
   const contextPrefix = buildContextPrefix(task);
   const fileTree = buildFileTree(ws);
+  const debugRetryContext = buildRetryContext(task);
+  const debugFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
   const debugPrompt = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
-${claudeMd ? `\n## Codebase Instructions\n${claudeMd}\n` : ''}${contextPrefix ? `\n${contextPrefix}` : ''}${fileTree ? `\n## Repository File Tree\n${fileTree}\n` : ''}
+${claudeMd ? `\n## Codebase Instructions\n${claudeMd}\n` : ''}${debugRetryContext}${contextPrefix ? `\n${contextPrefix}` : ''}${fileTree ? `\n## Repository File Tree\n${fileTree}\n` : ''}
 ## Failed Task
 Title: ${failedTaskTitle}
 ${failedTaskId ? `Task ID: ${failedTaskId}` : ''}
@@ -497,7 +507,7 @@ Set confidence to:
 IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
-  const { allOutput } = await runClaudeCode(debugPrompt + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n', ws, statusRef, model, effort, disallowedTools);
+  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput<{ root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string }>(taskId, 'debug_report', ws);
 
@@ -544,8 +554,10 @@ export async function handlePerf(
   const perfNodeDirs = perfDirs.filter(d => d.type === 'node');
   const perfPyDir = perfPythonDirs.length > 0 ? perfPythonDirs[0].path.replace(/\/$/, '') : 'backend';
   const perfNodeDir = perfNodeDirs.length > 0 ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
+  const perfRetryContext = buildRetryContext(task);
+  const perfFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
-  const perfPrompt = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
+  const perfPrompt = `${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
@@ -589,7 +601,7 @@ Rules:
   const perfTypeHints = getTaskTypeHints(perfBuildConfig);
   const perfTypeHint = perfTypeHints['perf'] ? '\n\n' + perfTypeHints['perf'] : '';
   statusRef.value = 'Running performance analysis...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfPerfSuffix, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -628,8 +640,10 @@ export async function handleInvestigate(
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('investigate');
+  const investigateRetryContext = buildRetryContext(task);
+  const investigateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
-  const investigatePrompt = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
+  const investigatePrompt = `${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 
 Issue to investigate:
 ${userPrompt}
@@ -657,7 +671,7 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
-  const { exitCode } = await runClaudeCode(investigatePrompt + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n', ws, statusRef, model, effort, disallowedTools);
+  const { exitCode } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {

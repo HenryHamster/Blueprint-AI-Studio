@@ -34,12 +34,9 @@ from app.routers.agent import get_github_token_for_task
 from app.shared_state import runtime_config as _runtime_config
 from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -> bool:
     """Return True if the task completed successfully on its first attempt (attempt_count <= 1)."""
@@ -256,6 +253,9 @@ async def _ensure_branch(
     e = last_err
     task.status = TaskStatus.FAILED
     task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+    record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
     session.add(task)
     await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
     await session.commit()
@@ -274,6 +274,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     if not plan_data or not plan_data.get("subtasks"):
         task.latest_status_message = "Plan agent produced no valid subtasks"
         task.status = TaskStatus.FAILED
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.routers.agent_status import record_task_result  # noqa: PLC0415
+        record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
         session.add(task)
         await _maybe_create_failure_alert(task, session, "Plan agent produced no valid subtasks")
         await session.commit()
@@ -289,6 +292,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     if not _validate_plan_dependencies(subtasks):
         task.latest_status_message = "Plan has circular dependencies"
         task.status = TaskStatus.FAILED
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.routers.agent_status import record_task_result  # noqa: PLC0415
+        record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
         session.add(task)
         await _maybe_create_failure_alert(task, session, "Plan has circular dependencies")
         await session.commit()

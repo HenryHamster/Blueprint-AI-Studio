@@ -76,7 +76,8 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in ["iteration cap", "review not spawned", "fix not spawned",
                                       "review-fix cap reached", "review-fix cycle limit",
                                       "ci wait exceeded", "ci wait timed out", "ci in progress",
-                                      "stuck in ci-wait"]):
+                                      "stuck in ci-wait",
+                                      "backstop timeout", "evaluation timeout"]):
         return "AGENT_TIMEOUT"
 
     # Merge-blocking GitHub responses — branch protection, rule violations, not-mergeable states.
@@ -84,11 +85,14 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in ["merge blocked", "merge attempt", "merge conflicts",
                                       "merge check failed", "not mergeable",
                                       "repository rule", "rule violations",
-                                      "required status check", "branch protection"]):
+                                      "required status check", "branch protection",
+                                      "closed without merging"]):
         return "EXTERNAL_API"
 
-    # External API failures — GitHub, Claude API outages, DNS/TLS/network errors
-    if any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
+    # External API failures — GitHub, Claude API outages, DNS/TLS/network errors.
+    # Also catches branch creation failures (GitHub API errors from _ensure_branch).
+    if ("failed to create" in combined and "branch" in combined) or \
+       any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "500 internal server error",
                                       "502 bad gateway", "503 service unavailable",
                                       "github api error", "claude api",

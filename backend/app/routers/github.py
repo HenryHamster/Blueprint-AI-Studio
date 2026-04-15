@@ -30,6 +30,7 @@ from app.github import (
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus, UserIntegration
 from app.secrets_manager import store_user_secret
 from app.shared_state import limiter
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +41,6 @@ _webhook_delivery_ids: OrderedDict = OrderedDict()  # id -> timestamp (in-memory
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
-
-
-def _utcnow():
-    from app.main import _utcnow as _main_utcnow
-    return _main_utcnow()
 
 
 class GitHubPATInstallRequest(BaseModel):

@@ -15,13 +15,9 @@ from app.models import (
 )
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-def _utcnow() -> datetime:
-    """Naive UTC timestamp, compatible with TIMESTAMP WITHOUT TIME ZONE columns."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def gcp_cleanup_service():
@@ -448,6 +444,9 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         f"CI wait backstop timeout after {hours}h ({reason})"
                     )
+                    from app.failure_classification import classify_failure  # noqa: PLC0415
+                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                     session.add(task)
                     children = (await session.execute(
                         select(Task).where(Task.parent_task_id == task.id)
@@ -530,6 +529,9 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         "Evaluation timeout — children did not complete within 6 hours"
                     )
+                    from app.failure_classification import classify_failure  # noqa: PLC0415
+                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    record_task_result(success=False, failure_class=classify_failure(task), task_id=str(task.id))
                     session.add(task)
 
                     # Cascade-cancel non-terminal children
