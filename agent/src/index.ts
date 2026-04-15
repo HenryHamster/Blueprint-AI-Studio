@@ -749,7 +749,7 @@ export async function lintFixLoop(
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig
-): Promise<{ passed: boolean; testFailuresDetected: boolean }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
   const { existsSync, readFileSync } = fs;
 
   interface TestRunner {
@@ -879,7 +879,8 @@ export async function testFixLoop(
       git(['add', '-A']);
     } else {
       sendLog(ws, `WARNING: Tests still failing after ${MAX_TEST_FIX_ATTEMPTS} fix attempts. Proceeding with commit.\n`);
-      return { passed: false, testFailuresDetected: true };
+      const failureSummary = combinedFailures.slice(0, 2000);
+      return { passed: false, testFailuresDetected: true, failureSummary };
     }
   }
   return { passed: false, testFailuresDetected: true };

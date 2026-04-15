@@ -128,17 +128,22 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     let testFailuresDetected = false;
     let testsPassed = true;
+    let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
       const result = await testFixLoop(ws, statusRef, model, effort, buildConfig);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
+      testFailureSummary = result.failureSummary;
     }
 
     if (failOnTestFailure && baseBranch === 'main' && testFailuresDetected && !testsPassed) {
       sendLog(ws, 'Tests failed after max fix attempts — marking task as FAILED.\n');
+      const failedLogs = testFailureSummary
+        ? `Test suite failed after max fix attempts. Failing tests:\n${testFailureSummary}`
+        : `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`;
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Test suite failed after max fix attempts. Last test output:\n${sanitize(allOutput.slice(-10_000))}`,
+        logs: failedLogs,
         failure_category: 'test_failed',
       });
       return;
@@ -255,7 +260,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       } catch { /* grep exit 1 means no matches — good */ }
     }
 
-    const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
+    const commitNote = testFailuresDetected
+      ? `\n\nNote: test failures detected, manual review recommended${testFailureSummary ? `:\n${testFailureSummary.slice(0, 500)}` : ''}`
+      : '';
     // Only create a new commit if there are staged changes — Claude may have
     // already committed, and lint/test fix loops may not have added new changes.
     const staged = git(['status', '--porcelain']);
@@ -266,7 +273,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let prBody = `## Summary\n\n${lastResultText.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;
     if (runTestFix) {
       const testSummary = testsPassed ? '\u2705 Tests passed' : testFailuresDetected ? '\u26a0\ufe0f Test failures detected' : '\u26a0\ufe0f Could not run tests';
-      prBody += `## Test Results\n\n${testSummary}\n\n`;
+      const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
+      prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
@@ -286,6 +294,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
