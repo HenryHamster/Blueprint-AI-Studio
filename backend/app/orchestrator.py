@@ -1012,10 +1012,12 @@ async def orchestrator_worker():
 
                     # Ensure ci_wait_started is always set — some paths set ci_waiting=True
                     # without setting ci_wait_started, which silently disables the timeout.
+                    # Commit immediately so the update is persisted even if we continue below.
                     if not ci_loop.get("ci_wait_started"):
                         ci_loop["ci_wait_started"] = _utcnow().isoformat()
                         ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
                         session.add(ci_task)
+                        await session.commit()
 
                     # Exponential backoff: skip if not enough time has elapsed since last poll.
                     # Webhooks handle the fast path — polling is a fallback.

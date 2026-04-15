@@ -360,8 +360,10 @@ async def update_agent_status(
 
     # 2. Update task status
     task.status = payload.status
-    # Preserve logs on the task when no artifact is created (e.g., "no changes" completion)
-    if payload.logs and not payload.artifact_type:
+    # Preserve logs as status message when:
+    # - no artifact is created (e.g., "no changes" completion), OR
+    # - task is failing (artifact-bearing failures must not silently lose diagnostic text)
+    if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
         task.latest_status_message = payload.logs[:2000]
     if payload.failure_category:
         ctx = dict(task.context or {})

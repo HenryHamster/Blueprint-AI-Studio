@@ -105,7 +105,8 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             continue
 
         # Capture before cancellation — cancellation overwrites both
-        failure_class = classify_failure(child)
+        child_extra_logs = (child.context or {}).get("last_error", "")
+        failure_class = classify_failure(child, logs=child_extra_logs or None)
         original_status_message = child.latest_status_message
 
         # Auto-generate playbook entry if this failure pattern is recurring
@@ -228,6 +229,33 @@ from app.review_pipeline import (
 )
 
 from app.rollup_management import _check_and_trigger_rollup, _verify_pr_merged, _cleanup_branches
+
+import random as _random
+
+async def _merge_with_retry(
+    merge_pull_request_fn, gh_token: str, owner: str, repo: str,
+    pr_number: int, project_id: str, max_attempts: int = 3
+) -> dict:
+    """Call merge_pull_request with exponential backoff for transient 5xx errors.
+
+    Returns the merge result dict on success/conflict (same semantics as
+    merge_pull_request).  Only retries on raised exceptions — non-200 merge
+    results (405/409) are returned as-is without retrying.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return await merge_pull_request_fn(gh_token, owner, repo, pr_number, project_id=project_id)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                backoff = (2 ** attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
+                logger.warning(
+                    f"[PIPELINE] Merge attempt {attempt + 1} for PR #{pr_number} raised {type(exc).__name__}, "
+                    f"retrying in {backoff:.1f}s: {exc!r}"
+                )
+                await asyncio.sleep(backoff)
+    raise last_exc  # type: ignore[misc]
 
 async def _process_post_commit(
     task_id: uuid.UUID,
@@ -373,7 +401,7 @@ async def _process_post_commit(
                             await session.commit()
                             return {"status": "accepted"}
 
-                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                        merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
@@ -796,7 +824,7 @@ async def _process_post_commit(
                             except Exception as e:
                                 logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
 
-                        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                        merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
 
                         if merge_result.get("merged"):
                             await create_pr_comment(gh_token, owner, repo, pr_number,

@@ -10,11 +10,13 @@ research_completion.py, strategic_completion.py).
 import asyncio
 import json
 import logging
+import random
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -232,11 +234,19 @@ async def _ensure_branch(
                     await get_branch_sha(gh_token, owner, repo, branch_name)
                     logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
                     return True
+                except HTTPException as verify_exc:
+                    if verify_exc.status_code == 404:
+                        # Branch genuinely doesn't exist — count against attempt budget
+                        pass
+                    else:
+                        # Transient server error during verification (e.g. 502) — don't
+                        # conclude the branch is missing; continue retrying.
+                        logger.warning(f"[{label}] Transient error verifying branch {branch_name} ({verify_exc.status_code}), will retry")
                 except Exception:
                     pass
             if _attempt < max_retries - 1:
-                backoff = 10 * (2 ** _attempt)  # 10, 20, 40, 80s
-                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff}s: {e!r}")
+                backoff = 10 * (2 ** _attempt) * (0.75 + 0.5 * random.random())  # jitter: 10-20s, 20-40s, …
+                logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff:.1f}s: {e!r}")
                 await asyncio.sleep(backoff)
             else:
                 if gh_token:
