@@ -28,6 +28,7 @@ vi.mock('../prompt.js', () => ({
   getTaskTypeHints: vi.fn().mockReturnValue({}),
   DEFAULT_TOOL_GUIDANCE: '',
   PLAYBOOK_GUIDANCE: '',
+  FIRST_TASK_GUIDANCE: '',
   readClaudeMd: vi.fn().mockReturnValue(''),
   buildContextPrefix: vi.fn().mockReturnValue(''),
   buildFileTree: vi.fn().mockReturnValue(''),
@@ -36,6 +37,8 @@ vi.mock('../prompt.js', () => ({
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   formatPlaybook: vi.fn().mockReturnValue(''),
+  buildRetryContext: vi.fn().mockReturnValue(''),
+  buildSelfReviewPrompt: vi.fn().mockReturnValue(''),
 }));
 
 vi.mock('../build-config.js', () => ({

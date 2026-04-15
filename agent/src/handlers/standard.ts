@@ -9,8 +9,10 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
+  buildSelfReviewPrompt,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { MAX_SELF_REVIEW_ATTEMPTS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 export interface StandardHandlerOpts {
@@ -32,6 +34,7 @@ export interface StandardHandlerOpts {
   runLintFix?: boolean;
   runTestFix?: boolean;
   failOnTestFailure?: boolean;
+  runSelfReview?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
@@ -45,6 +48,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     runLintFix = true,
     runTestFix = false,
     failOnTestFailure = false,
+    runSelfReview = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
@@ -131,7 +135,99 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       return;
     }
 
+    // ── Self-Review Phase ──────────────────────────────────────────────────────
+    // Runs after lint/test validation, before committing, to catch critical issues.
+    let selfReviewOutcome: { issues_found: boolean; categories: string[]; fixes_applied: boolean } | undefined;
+    if (runSelfReview) {
+      sendLog(ws, '\nRunning self-review...\n');
+      statusRef.value = 'Running self-review...';
+
+      // Gather diff: committed changes since base + any uncommitted changes
+      const committedDiff = currentHead !== baseCommit
+        ? git(['diff', `${baseCommit}..HEAD`]).slice(0, 5000)
+        : '';
+      const uncommittedDiff = git(['diff', 'HEAD']).slice(0, 3000);
+      const reviewDiff = (committedDiff + (uncommittedDiff ? '\n' + uncommittedDiff : '')).trim();
+
+      // Filter playbook to review-related entries
+      const playbook = task.playbook as Record<string, string> | undefined;
+      const reviewPlaybook: Record<string, string> = {};
+      if (playbook) {
+        for (const [k, v] of Object.entries(playbook)) {
+          if (k.toLowerCase().includes('review')) reviewPlaybook[k] = v;
+        }
+      }
+
+      const selfReviewPrompt = buildSelfReviewPrompt({
+        rawPrompt,
+        taskTitle,
+        diff: reviewDiff,
+        reviewPlaybook,
+        claudeMd,
+      });
+
+      const headBeforeReview = git(['rev-parse', 'HEAD']);
+      const statusBeforeReview = git(['status', '--porcelain']);
+
+      for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
+        await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+      }
+
+      const headAfterReview = git(['rev-parse', 'HEAD']);
+      const statusAfterReview = git(['status', '--porcelain']);
+      const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
+
+      selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
+      sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+    }
+
     git(['add', '-A']);
+
+    // ── Guard 1: File restriction violations ────────────────────────────────
+    // Parse restricted paths from CLAUDE.md and unstage any violations before commit.
+    {
+      const claudeMdContent = readClaudeMd();
+      if (claudeMdContent) {
+        const restrictedPaths: string[] = [];
+        for (const line of claudeMdContent.split('\n')) {
+          // Match lines like: "- Do NOT modify files in `.github/workflows/`"
+          // or "- Do NOT modify `backend/alembic/` migration files"
+          const match = line.match(/Do NOT modify.*?`([^`]+)`/i);
+          if (match) restrictedPaths.push(match[1]);
+        }
+        if (restrictedPaths.length > 0) {
+          let stagedFiles: string[];
+          try {
+            stagedFiles = execFileSync('git', ['-C', WORKSPACE, 'diff', '--name-only', '--cached'], { encoding: 'utf-8' })
+              .trim().split('\n').filter(Boolean);
+          } catch { stagedFiles = []; }
+          const violations = stagedFiles.filter(f => restrictedPaths.some(p => f.startsWith(p)));
+          if (violations.length > 0) {
+            sendLog(ws, `WARNING: Unstaging ${violations.length} restricted file(s) that must not be modified:\n${violations.join('\n')}\n`);
+            for (const v of violations) {
+              try { execFileSync('git', ['-C', WORKSPACE, 'restore', '--staged', v], { encoding: 'utf-8' }); } catch { /* ignore */ }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Guard 2: Conflict marker detection ──────────────────────────────────
+    // Detect conflict markers in staged files before committing.
+    {
+      try {
+        const conflictFiles = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--cached', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+        if (conflictFiles) {
+          sendLog(ws, `WARNING: Conflict markers detected in staged files:\n${conflictFiles}\nAsking Claude to resolve...\n`);
+          await runClaudeCode(
+            `CRITICAL: These staged files contain git conflict markers (<<<<<<<, =======, >>>>>>>):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
+            ws, statusRef, model, effort
+          );
+          git(['add', '-A']);
+        }
+      } catch { /* grep exit 1 means no matches — good */ }
+    }
+
     const commitNote = testFailuresDetected ? '\n\nNote: test failures detected, manual review recommended' : '';
     // Only create a new commit if there are staged changes — Claude may have
     // already committed, and lint/test fix loops may not have added new changes.
@@ -144,6 +240,12 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     if (runTestFix) {
       const testSummary = testsPassed ? '\u2705 Tests passed' : testFailuresDetected ? '\u26a0\ufe0f Test failures detected' : '\u26a0\ufe0f Could not run tests';
       prBody += `## Test Results\n\n${testSummary}\n\n`;
+    }
+    if (selfReviewOutcome) {
+      const reviewStatus = selfReviewOutcome.fixes_applied
+        ? '\u26a0\ufe0f Issues found and auto-fixed'
+        : '\u2705 No critical issues found';
+      prBody += `## Self-Review\n\n${reviewStatus}\n\n`;
     }
     if (issueReference) {
       prBody += `${issueReference}\n\n`;
@@ -217,6 +319,7 @@ export async function handleCreate(
     runLintFix: true,
     runTestFix: true,
     failOnTestFailure: true,
+    runSelfReview: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
@@ -269,6 +372,7 @@ ${rp}`,
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
+    runSelfReview: true,
     lintContext: 'the refactored code',
   });
 }

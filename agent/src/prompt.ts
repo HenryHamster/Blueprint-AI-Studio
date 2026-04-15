@@ -751,3 +751,51 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   );
   return lines.join('\n');
 }
+
+// ── Self-review prompt builder ───────────────────────────────────────────────
+/**
+ * Builds a focused self-review prompt for the agent to check its own diff
+ * before committing.  Concentrates only on CRITICAL and MAJOR issues.
+ */
+export function buildSelfReviewPrompt(opts: {
+  rawPrompt: string;
+  taskTitle: string;
+  diff: string;
+  reviewPlaybook: Record<string, string>;
+  claudeMd: string;
+}): string {
+  const restrictionsSection = opts.claudeMd
+    ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
+    : '';
+
+  const playbookSection = Object.keys(opts.reviewPlaybook).length > 0
+    ? `\n## Review Failure Patterns\nAvoid these known patterns:\n\n${
+        Object.entries(opts.reviewPlaybook)
+          .map(([k, v]) => `### ${k}\n${v}`)
+          .join('\n\n')
+      }\n`
+    : '';
+
+  const diffSection = opts.diff
+    ? `\n## Diff (changes since base branch)\n\`\`\`diff\n${opts.diff}\n\`\`\`\n`
+    : '\n## Diff\nNo diff available — review the changed files directly.\n';
+
+  return `You are performing a self-review of the changes you just made for this task.
+
+## Task Requirements
+${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
+${restrictionsSection}${playbookSection}${diffSection}
+## Self-Review Instructions
+
+Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
+
+Check for:
+1. **Missing test coverage** — Is there new behavior with no corresponding test?
+2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
+3. **Scope violations** — Are there changes unrelated to the task requirements?
+4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
+5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
+
+If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
+If everything looks good, output exactly: SELF-REVIEW PASSED`;
+}

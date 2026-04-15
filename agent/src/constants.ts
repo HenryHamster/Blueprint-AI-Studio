@@ -41,6 +41,9 @@ export const RUFF_TIMEOUT = 60_000;
 export const MAX_TEST_FIX_ATTEMPTS = 2;
 export const TEST_RUNNER_TIMEOUT = 180_000;
 
+// Self-review loop
+export const MAX_SELF_REVIEW_ATTEMPTS = 1;
+
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 export const MAX_OUTPUT_BYTES = 10_000_000;

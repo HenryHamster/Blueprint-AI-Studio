@@ -37,6 +37,7 @@ vi.mock('../prompt.js', () => ({
   writeMessagesHelper: vi.fn(),
   formatPlaybook: vi.fn().mockReturnValue(''),
   buildRetryContext: vi.fn().mockReturnValue(''),
+  buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {
@@ -331,6 +332,101 @@ describe('handleDeps configuration', () => {
     const task = { title: 'Deps task', description: '' };
     await handleDeps(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('dependency update agent');
+  });
+});
+
+// ── Self-review phase ────────────────────────────────────────────────────────
+describe('self-review phase', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('runs self-review for handleCreate when there are changes', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')       // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file') // status --porcelain → hasChanges = true
+      .mockReturnValue('');          // all remaining git calls
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // runClaudeCode should be called twice: once for main task, once for self-review
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+  });
+
+  it('runs self-review for handleRefactor when there are changes', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips self-review when there are no changes', async () => {
+    // Default git mock returns '' everywhere → no changes, goes to no-changes branch
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run self-review for handleDocs even when there are changes', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const task = { title: 'Docs task', description: '' };
+    await handleDocs(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // docs handler does not set runSelfReview — only one runClaudeCode call
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('includes self-review result in PR body when fixes were applied', async () => {
+    // Simulate: main task diff, then self-review changes something (HEAD changes)
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD before Claude)
+      .mockReturnValueOnce('M file')   // diff (status --porcelain → hasChanges)
+      .mockReturnValueOnce('')         // currentHead (rev-parse HEAD after Claude, same as base)
+      .mockReturnValueOnce('')         // diff --name-only committed paths
+      .mockReturnValueOnce('')         // committedDiff for self-review (diff baseCommit..HEAD)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview (rev-parse HEAD)
+      .mockReturnValueOnce('')         // statusBeforeReview (status --porcelain)
+      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied
+      .mockReturnValueOnce('M fixed')  // statusAfterReview
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Self-Review');
+    expect(prBodyArg).toContain('Issues found and auto-fixed');
+  });
+
+  it('includes self-review result in PR body when no issues found', async () => {
+    // headBefore === headAfter and status unchanged → no fixes applied.
+    // Call sequence when currentHead === baseCommit (no committedDiff git call):
+    // 1: rev-parse HEAD → baseCommit
+    // 2: status --porcelain → 'M file' (hasChanges)
+    // 3: rev-parse HEAD → currentHead (same as base)
+    // 4: diff HEAD → uncommittedDiff (self-review, since no commits)
+    // 5: rev-parse HEAD → headBeforeReview
+    // 6: status --porcelain → statusBeforeReview
+    // 7: rev-parse HEAD → headAfterReview — SAME → no fixes
+    // 8: status --porcelain → statusAfterReview — SAME → no fixes
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // 1: baseCommit
+      .mockReturnValueOnce('M file')   // 2: hasChanges
+      .mockReturnValueOnce('')         // 3: currentHead (same as base)
+      .mockReturnValueOnce('')         // 4: uncommittedDiff
+      .mockReturnValueOnce('abc123')   // 5: headBeforeReview
+      .mockReturnValueOnce('')         // 6: statusBeforeReview
+      .mockReturnValueOnce('abc123')   // 7: headAfterReview — SAME → no fixes
+      .mockReturnValueOnce('')         // 8: statusAfterReview — SAME
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Self-Review');
+    expect(prBodyArg).toContain('No critical issues found');
   });
 });
 
