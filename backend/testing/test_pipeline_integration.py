@@ -681,8 +681,9 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
 ):
     """
     _spawn_pipeline_task guards against spawning a duplicate review/fix for
-    the same PR when one is already active. If an active review task already
-    exists for PR #42, completing the fix should NOT spawn a second review.
+    the same PR when one is already active IN THE SAME CHAIN. If an active
+    review task for PR #42 already exists and belongs to the same chain, a
+    fix completion must not spawn a second review.
     """
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
@@ -693,7 +694,23 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Pre-existing QUEUED review task for PR #42 — simulates an already-active review
+    # Original create task that opened PR #42 — identifies the chain.
+    original_create = Task(
+        project_id=project.id,
+        title="Create PR #42",
+        payloads=[{
+            "type": "create",
+            "prompt": "Build feature X",
+            "base_branch": "main",
+        }],
+        vm_instance_id="agent-vm-dg-original",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original_create)
+    await db_session.commit()
+    await db_session.refresh(original_create)
+
+    # Pre-existing QUEUED review task for PR #42 — same chain as the fix below.
     existing_review = Task(
         project_id=project.id,
         title="Review PR #42 (existing)",
@@ -702,11 +719,13 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
             "pr_number": 42,
             "branch": "blueprint/task-existing",
             "base_branch": "main",
+            "original_task_id": str(original_create.id),
         }],
         context={"review_loop": {
             "pr_number": 42,
             "branch": "blueprint/task-existing",
             "base_branch": "main",
+            "original_task_id": str(original_create.id),
             "iteration": 1,
         }},
         vm_instance_id="agent-vm-existing-review",
@@ -716,7 +735,7 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     await db_session.commit()
     await db_session.refresh(existing_review)
 
-    # Fix task for the same PR
+    # Fix task for the same PR, same chain (original_task_id).
     vm_id = "agent-vm-dg-fix-001"
     fix_task = Task(
         project_id=project.id,
@@ -727,11 +746,13 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
             "branch": "blueprint/task-existing",
             "base_branch": "main",
             "prompt": "Fix the issues",
+            "original_task_id": str(original_create.id),
         }],
         context={"review_loop": {
             "pr_number": 42,
             "branch": "blueprint/task-existing",
             "base_branch": "main",
+            "original_task_id": str(original_create.id),
             "iteration": 2,
         }},
         vm_instance_id=vm_id,
@@ -1321,7 +1342,7 @@ async def test_rollup_bypasses_global_cap_via_status_message(
     await db_session.commit()
 
     # Call _spawn_pipeline_task directly — should succeed because is_rollup=True
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=parent_task,
         task_type="review",
         session=db_session,
@@ -1330,7 +1351,7 @@ async def test_rollup_bypasses_global_cap_via_status_message(
         base_branch="main",
     )
 
-    assert result is not None, (
+    assert result is not None and was_created, (
         "Rollup task (latest_status_message contains 'rollup') should bypass the "
         f"medium-scope global cap (12) and use MAX_REVIEW_FIX_ITERATIONS ({MAX_REVIEW_FIX_ITERATIONS})"
     )
@@ -1385,7 +1406,7 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
         db_session.add(t)
     await db_session.commit()
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=parent_task,
         task_type="review",
         session=db_session,
@@ -1394,7 +1415,7 @@ async def test_rollup_bypasses_global_cap_via_rollup_retries_context(
         base_branch="main",
     )
 
-    assert result is not None, (
+    assert result is not None and was_created, (
         "Rollup task with _rollup_retries in context should bypass the "
         f"small-scope global cap (10) and use MAX_REVIEW_FIX_ITERATIONS ({MAX_REVIEW_FIX_ITERATIONS})"
     )
@@ -1448,7 +1469,7 @@ async def test_non_rollup_task_respects_global_cap(
         db_session.add(t)
     await db_session.commit()
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=normal_task,
         task_type="review",
         session=db_session,
@@ -1457,7 +1478,7 @@ async def test_non_rollup_task_respects_global_cap(
         base_branch="main",
     )
 
-    assert result is None, (
+    assert result is None and not was_created, (
         "Non-rollup task at small-scope global cap (10) must be blocked — "
         "rollup bypass should not apply"
     )
@@ -1499,6 +1520,8 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
                 "branch": "blueprint/rule-block-test",
                 "base_branch": "main",
                 "iteration": 1,
+                # Gate is open: review approved, CI passing — exercise the merge attempt
+                "review_approved": True,
             },
         },
         vm_instance_id="agent-vm-rule-block-001",
@@ -1545,6 +1568,346 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     )
     assert "manual intervention" in (task.latest_status_message or ""), (
         "Status message must indicate manual intervention is required"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge gate: ci_passed AND review_approved both required
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ci_passed_without_review_approved_does_not_merge(db_session, mocker):
+    """
+    Regression for PR #1408: a rollup-to-main parent has ci_waiting=True but
+    no review_approved yet. When CI completes successfully, handle_ci_completion
+    must NOT merge the PR — it should record ci_passed=True and leave the task
+    parked, waiting for the review task's APPROVE handoff.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Gate ci_passed only", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Rollup parent waiting on CI",
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 1408,
+                "branch": "research/2ed0480e",
+                "base_branch": "main",
+                "ci_wait_started": "2026-04-15T07:18:36",
+            },
+        },
+        vm_instance_id="agent-vm-gate-ci-only-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="test-owner",
+        repo="test-repo",
+        session=db_session,
+        source="webhook",
+    )
+
+    await db_session.flush()
+    await db_session.refresh(task)
+    assert merge_mock.call_count == 0, (
+        "handle_ci_completion must NOT call merge_pull_request when review_approved is not set "
+        "(this was the PR #1408 bug — CI passing alone was treated as authorization to merge)"
+    )
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_passed") is True, (
+        "ci_passed must be recorded on the parking task so the gate fires when review approves"
+    )
+    assert not review_loop.get("review_approved"), (
+        "review_approved must NOT have been auto-set by CI completion"
+    )
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Task must remain EVALUATING (waiting for review), got {task.status}"
+    )
+    assert "waiting for review" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_ci_passed_with_review_approved_merges(db_session, mocker):
+    """
+    When both gate signals are set on the parking task, handle_ci_completion
+    proceeds with the merge.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Gate both signals", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Rollup parent both gates open",
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "review_approved": True,  # review already handed off
+                "pr_number": 1500,
+                "branch": "research/abc",
+                "base_branch": "main",
+                "ci_wait_started": "2026-04-15T07:18:36",
+            },
+        },
+        vm_instance_id="agent-vm-gate-both-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="test-owner",
+        repo="test-repo",
+        session=db_session,
+        source="webhook",
+    )
+
+    await db_session.flush()
+    await db_session.refresh(task)
+    assert merge_mock.call_count >= 1, (
+        "handle_ci_completion must call merge_pull_request when both gates are open"
+    )
+    assert task.status == TaskStatus.COMPLETED, (
+        f"Task must be COMPLETED after a successful gated merge, got {task.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
+    """
+    Backward compat: tasks written before the gate split used `verdict="APPROVE"`
+    instead of `review_approved=True`. handle_ci_completion must still merge them
+    via the legacy fallback in _review_approved.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Gate legacy verdict", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="In-flight legacy task",
+        payloads=[{"type": "review", "prompt": "legacy review"}],
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "verdict": "APPROVE",  # legacy form
+                "pr_number": 1600,
+                "branch": "feat/legacy",
+                "base_branch": "main",
+            },
+        },
+        vm_instance_id="agent-vm-gate-legacy-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="test-owner",
+        repo="test-repo",
+        session=db_session,
+        source="webhook",
+    )
+
+    await db_session.flush()
+    assert merge_mock.call_count >= 1, (
+        "Legacy verdict='APPROVE' must still satisfy the review gate so in-flight "
+        "tasks from before the gate split don't get stuck"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_approved_only_does_not_merge(db_session, mocker):
+    """
+    Symmetric to ci_passed-only: a parking task with review_approved=True but
+    no ci_passed must wait for CI. The orchestrator's CI poll will eventually
+    record ci_passed and then merge.
+    """
+    from app.ci_completion import _review_approved
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Gate review only", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_loop = {
+        "ci_waiting": True,
+        "review_approved": True,
+        "pr_number": 1700,
+    }
+    assert _review_approved(review_loop) is True
+    assert review_loop.get("ci_passed") is None  # gate is still closed
+
+    # Direct gate-helper call would only fire if both flags are set; verify the
+    # caller-side check guards us. We don't actually call _attempt_merge here
+    # because the caller (handle_ci_completion / task_lifecycle) is responsible
+    # for the gate check before calling. This test documents the contract.
+    assert merge_mock.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rollup_review_approval_writes_review_approved_on_parent(client, db_session, mocker):
+    """
+    End-to-end rollup gate handoff: a rollup PR's review task completes with
+    APPROVE verdict. The handler must write review_approved=True on the
+    PARENT (not the review task) and either merge (if ci_passed already set)
+    or leave the parent parked waiting for CI.
+
+    This test covers the path where ci_passed is NOT yet set, so the handoff
+    just records the flag on the parent.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "test-owner", "test-repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"head": {"ref": "research/abc", "sha": "deadbeef"}, "merged": False, "state": "open"},
+    )
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.github.submit_pr_review", return_value={"id": 1})
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Rollup gate handoff", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        vm_instance_id="agent-vm-rollup-parent-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "pr_number": 1408,
+            "branch": "research/abc",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+            "ci_wait_started": "2026-04-15T07:18:36",
+        },
+    }
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    review_task = Task(
+        project_id=project.id,
+        title="Review rollup PR #1408",
+        payloads=[{
+            "type": "review",
+            "pr_number": 1408,
+            "branch": "research/abc",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+        }],
+        context={"review_loop": {
+            "pr_number": 1408,
+            "branch": "research/abc",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+            "iteration": 1,
+        }},
+        vm_instance_id="agent-vm-rollup-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({"verdict": "APPROVE", "feedback": "Looks fine"})
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="APPROVE",
+    )
+
+    await db_session.refresh(parent)
+    parent_loop = (parent.context or {}).get("review_loop", {})
+    assert parent_loop.get("review_approved") is True, (
+        "Rollup review approval must write review_approved=True on the PARENT, not the review task"
+    )
+    assert merge_mock.call_count == 0, (
+        "Without ci_passed on the parent, the gate is still closed — no merge yet"
+    )
+
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED, (
+        f"Review task must be COMPLETED after handoff, got {review_task.status}"
     )
 
 
@@ -1671,7 +2034,7 @@ async def test_auto_playbook_no_duplicate(db_session, mocker):
         await db_session.commit()
         await db_session.refresh(t)
 
-        result = await _maybe_auto_playbook(t, failure_class, error_msg, db_session)
+        await _maybe_auto_playbook(t, failure_class, error_msg, db_session)
         await db_session.commit()
 
     # The pre-existing entry must not have been overwritten

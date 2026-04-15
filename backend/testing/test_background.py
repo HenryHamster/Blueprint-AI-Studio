@@ -567,7 +567,7 @@ async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
     parent, _child = await _make_parent_child(
         requeue_db,
         child_payloads=[{"type": "create", "prompt": "some task"}],
-        child_status_message="usage limit exceeded — billing quota exhausted",
+        child_status_message="API Error: Rate limit reached",
     )
 
     await _requeue_parent_task(parent, requeue_db)

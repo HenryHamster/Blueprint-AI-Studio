@@ -34,9 +34,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     Uses its own session for DB writes to avoid polluting the caller's session state.
     The passed session is only used for reads (artifact lookup).
     """
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.github import get_pull_request  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert
+    from app.routers.agent import get_github_token_for_task
+    from app.github import get_pull_request
 
     if (task.context or {}).get("pr_merged"):
         return True
@@ -66,7 +66,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     logger.warning(f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping")
                     return False
                 # Token expired — invalidate cache and retry once with a fresh token
-                from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                from app.routers.agent import invalidate_github_token_cache
                 invalidate_github_token_cache(str(task.project_id))
                 logger.warning(f"[PR_VERIFY] Auth failure for task {task.id} PR #{pr_number} — retrying with fresh token")
                 gh_token, owner, repo = await get_github_token_for_task(task.id, session, force_refresh=True)
@@ -118,8 +118,8 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
 
 async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     """Delete staging and feature branches that are no longer needed."""
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.github import delete_branch  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task
+    from app.github import delete_branch
 
     ctx = task.context or {}
     gh_token = owner = repo = None
@@ -194,7 +194,7 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
             deleted = await delete_branch(gh_token, owner, repo, branch)
             if deleted:
                 logger.info(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
-        except Exception as e:
+        except Exception as e:  # noqa: PERF203 — per-branch try is required so one delete failure doesn't abort the rest
             logger.warning(f"[CLEANUP] Failed to delete {branch}: {e}", exc_info=True)
 
 async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> None:
@@ -203,11 +203,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     Called after a child task completes, fails, or is cancelled.
     Also called from admin PATCH when status/context changes.
     """
-    from app.main import _maybe_create_failure_alert, _utcnow  # noqa: PLC0415
-    from app.broadcast import broadcast_to_project  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.security import scan_pr_for_injection  # noqa: PLC0415
-    from app.github import (  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert, _utcnow
+    from app.broadcast import broadcast_to_project
+    from app.routers.agent import get_github_token_for_task
+    from app.security import scan_pr_for_injection
+    from app.github import (
         create_pr_comment, delete_branch, create_pull_request,
         merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
     )
@@ -320,7 +320,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 branch = (c.context or {}).get("branch") or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
                 base_branch = c_payload.get("base_branch", "main")
                 original_prompt = c_payload.get("prompt", c.description or "")
-                review_task = await _spawn_pipeline_task(
+                review_task, _ = await _spawn_pipeline_task(
                     c, "review", session, pr_number, branch, base_branch,
                     original_prompt=original_prompt, original_task_id=str(c.id),
                 )
@@ -396,7 +396,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                 except HTTPException as api_err:
                     if api_err.status_code == 401:
-                        from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                        from app.routers.agent import invalidate_github_token_cache
                         invalidate_github_token_cache(str(parent.project_id))
                         logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
                         gh_token, owner, repo = await get_github_token_for_task(parent.id, session, force_refresh=True)
@@ -425,7 +425,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             f"Target branch '{target_branch}' does not exist — "
                             f"cannot create rollup PR. This indicates a branch was "
                             f"deleted out of order."
-                        )
+                        ) from branch_err
                     # Transient GitHub error — defer to next evaluation cycle
                     logger.warning(
                         f"[ROLLUP] Transient GitHub error checking target branch "
@@ -650,7 +650,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.warning(f"[ROLLUP] Failed to delete staging branch {staging_branch}: {del_err}")
                         logger.info(f"[ROLLUP] Auto-merged rollup into {target_branch}")
                         try:
-                            from app.notification_dispatch import post_pr_merged_message  # noqa: PLC0415
+                            from app.notification_dispatch import post_pr_merged_message
                             _direction_id = (parent.context or {}).get("direction_id")
                             _direction_text = "unknown direction"
                             if _direction_id:
@@ -708,7 +708,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
                             f"4. Run: git rebase --continue after resolving each file"
                         )
-                        fix_task = await _spawn_pipeline_task(
+                        fix_task, _ = await _spawn_pipeline_task(
                             parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
                             fix_prompt=fix_prompt,
                             original_task_id=str(parent.id)
@@ -722,6 +722,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
                 else:
+                    # Rollup-to-main / large rollup: review and CI run in parallel.
+                    # ci_waiting=True only tells the orchestrator to poll CI; it is
+                    # NOT permission to merge. Both ci_passed and review_approved
+                    # must be set on this review_loop before the merge gate fires
+                    # (see app.ci_completion._review_approved + the rollup gate
+                    # handoff in app.task_lifecycle's verdict==APPROVE branch).
+                    # Do NOT pre-seed review_approved here — the spawned review task
+                    # writes it back to this parent's review_loop on APPROVE.
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {**parent_ctx,
                                       "rollup_pr_url": rollup_pr_url,
@@ -735,7 +743,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                           "original_task_id": str(parent.id),
                                           "ci_wait_started": _utcnow().isoformat(),
                                       }}
-                    review_task = await _spawn_pipeline_task(
+                    review_task, _ = await _spawn_pipeline_task(
                         parent, "review", session, rollup_pr_number, staging_branch, target_branch,
                         original_prompt=parent.description or parent.title,
                         original_task_id=str(parent.id)
@@ -752,7 +760,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
                 if isinstance(e, HTTPException) and e.status_code == 401:
-                    from app.routers.agent import invalidate_github_token_cache  # noqa: PLC0415
+                    from app.routers.agent import invalidate_github_token_cache
                     invalidate_github_token_cache(str(parent.project_id))
                     logger.warning(f"[ROLLUP] Auth failure (401) for parent {parent.id} — invalidated token cache")
                 is_transient = (

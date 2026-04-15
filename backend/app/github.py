@@ -1126,6 +1126,75 @@ async def merge_pull_request(
     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")
 
 
+async def enable_auto_merge(
+    token: str, owner: str, repo: str, pr_number: int, merge_method: str = "SQUASH",
+    project_id: str | None = None,
+) -> dict:
+    """Enable GitHub auto-merge on a PR via the GraphQL enablePullRequestAutoMerge mutation.
+
+    Auto-merge queues the PR to merge automatically once branch-protection gates
+    pass (CI, required reviews, etc.). It is a defensive layer for the imperative
+    merge_pull_request — when merge_pull_request fails with 405 because a check is
+    still pending, calling this afterwards lets GitHub complete the merge when
+    the gate clears, so the task doesn't have to keep retrying.
+
+    Works when mergeable_state is CLEAN, UNSTABLE, or BLOCKED. Fails on DIRTY
+    (real merge conflict) or BEHIND — the caller should check mergeable_state
+    before calling rather than relying on this function to surface that.
+
+    Does not raise on GraphQL-level or PR-level errors; returns
+    {"enabled": bool, "message": str} mirroring merge_pull_request's contract.
+    """
+    merge_method = (merge_method or "SQUASH").upper()
+    if merge_method not in ("SQUASH", "MERGE", "REBASE"):
+        return {"enabled": False, "message": f"Invalid merge_method: {merge_method}"}
+
+    # Fetch node_id via the REST PR endpoint — GraphQL needs the global ID.
+    try:
+        pr_data = await get_pull_request(token, owner, repo, pr_number, project_id=project_id)
+    except HTTPException as exc:
+        return {"enabled": False, "message": f"Failed to fetch PR #{pr_number}: {exc.detail}"}
+    pr_node_id = pr_data.get("node_id")
+    if not pr_node_id:
+        return {"enabled": False, "message": f"PR #{pr_number} has no node_id in REST response"}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    mutation = (
+        "mutation($prId: ID!, $method: PullRequestMergeMethod!) {"
+        "  enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: $method}) {"
+        "    pullRequest { autoMergeRequest { enabledAt } }"
+        "  }"
+        "}"
+    )
+    body = {"query": mutation, "variables": {"prId": pr_node_id, "method": merge_method}}
+
+    response = await _github_request(
+        "POST", "https://api.github.com/graphql",
+        headers, json=body, project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(f"[AUTO-MERGE] PR #{pr_number} GraphQL {response.status_code}: {response.text[:200]}")
+        return {"enabled": False, "message": f"GraphQL HTTP {response.status_code}"}
+    data = response.json() or {}
+    # GraphQL returns 200 even on application-level errors — check the errors array.
+    if data.get("errors"):
+        err_msgs = "; ".join(str(e.get("message", "")) for e in data["errors"])
+        logger.info(f"[AUTO-MERGE] PR #{pr_number} rejected by GitHub: {err_msgs}")
+        return {"enabled": False, "message": err_msgs or "GraphQL error"}
+    enabled_at = (
+        data.get("data", {}).get("enablePullRequestAutoMerge", {})
+        .get("pullRequest", {}).get("autoMergeRequest", {}) or {}
+    ).get("enabledAt")
+    if enabled_at:
+        logger.info(f"[AUTO-MERGE] PR #{pr_number} queued for auto-merge ({merge_method}) at {enabled_at}")
+        return {"enabled": True, "message": f"Auto-merge enabled at {enabled_at}"}
+    return {"enabled": False, "message": "GraphQL returned no enabledAt — auto-merge not confirmed"}
+
+
 async def close_pull_request(
     token: str, owner: str, repo: str, pr_number: int,
     project_id: str | None = None,

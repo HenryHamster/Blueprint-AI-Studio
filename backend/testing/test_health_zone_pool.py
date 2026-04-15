@@ -826,31 +826,35 @@ class TestMaxPlanAccountPool:
         assert _account_by_id["a1"]["rl_hit_count"] == 2  # second hit → count=2 → 60 min cooldown
 
     # ── Model tier cascade tests ──────────────────────────────────────────────
-    # Claude Max plan shares session quota across tiers: Opus 429 implies
-    # Sonnet/Haiku are also rate-limited (asymmetric — Sonnet 429 does NOT
-    # block Opus). The cascade must apply on both the mark side
-    # (disabled_models) and the check side (_account_available_for_model).
+    # Claude Max plan: Opus 429 implies Sonnet is also rate-limited (shared
+    # session bucket), but Sonnet 429 does NOT block Opus (Opus has its own
+    # stricter sub-bucket). Haiku shares Opus's meter exactly — it has no
+    # separate bucket, so rate-limit tracking normalizes Haiku → Opus.
 
-    def test_cascade_disabled_models_opus_covers_all_tiers(self):
+    def test_cascade_disabled_models_opus_covers_opus_and_sonnet(self):
         cascade = cascade_disabled_models("claude-opus-4-6")
         assert "claude-opus-4-6" in cascade
         assert "claude-sonnet-4-6" in cascade
-        assert "claude-haiku-4-5-20251001" in cascade
 
-    def test_cascade_disabled_models_sonnet_covers_haiku_not_opus(self):
+    def test_cascade_disabled_models_sonnet_only_covers_sonnet(self):
         cascade = cascade_disabled_models("claude-sonnet-4-6")
-        assert "claude-sonnet-4-6" in cascade
-        assert "claude-haiku-4-5-20251001" in cascade
+        assert cascade == ("claude-sonnet-4-6",)
         assert "claude-opus-4-6" not in cascade
+
+    def test_cascade_disabled_models_haiku_normalizes_to_opus(self):
+        # Haiku shares Opus's meter — cascade must key off Opus's bucket.
+        cascade = cascade_disabled_models("claude-haiku-4-5-20251001")
+        assert "claude-opus-4-6" in cascade
+        assert "claude-sonnet-4-6" in cascade
+        assert "claude-haiku-4-5-20251001" not in cascade
 
     def test_cascade_disabled_models_unknown_falls_back_to_single(self):
         # Unknown variants must not silently cascade to the whole account.
         assert cascade_disabled_models("claude-some-future-model") == ("claude-some-future-model",)
 
     def test_opus_rate_limit_blocks_all_tiers_via_mark_cascade(self, clean_max_plan_pool):
-        """After an Opus 429, the mark path writes cascade entries for all three
-        tiers (opus+sonnet+haiku). The check is a direct lookup, so all three
-        requests see their own entry and are blocked."""
+        """After an Opus 429, the mark path writes cascade entries for opus+sonnet.
+        A Haiku lookup normalizes to Opus, so all three requests are blocked."""
         now = datetime.utcnow()
         acct = {
             "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
@@ -859,11 +863,12 @@ class TestMaxPlanAccountPool:
         }
         assert _account_available_for_model(acct, "claude-opus-4-6") is False
         assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
+        # Haiku normalizes to Opus → also blocked (shared meter).
         assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
 
-    def test_sonnet_rate_limit_blocks_sonnet_and_haiku_not_opus(self, clean_max_plan_pool):
-        """After a Sonnet 429, the mark path writes (sonnet, haiku) entries —
-        the cascade is one-way, so Opus is NOT touched and remains available."""
+    def test_sonnet_rate_limit_blocks_sonnet_only(self, clean_max_plan_pool):
+        """Sonnet 429 writes only {sonnet}. Opus and Haiku (shared Opus meter)
+        remain available because the cascade is one-way (opus → sonnet)."""
         now = datetime.utcnow()
         acct = {
             "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
@@ -872,7 +877,7 @@ class TestMaxPlanAccountPool:
         }
         assert _account_available_for_model(acct, "claude-opus-4-6") is True
         assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
-        assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
+        assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is True
 
     def test_account_available_unknown_model_skips_account_with_disables(self, clean_max_plan_pool):
         """model=None must NOT bypass the rate-limit check when disables exist.
@@ -895,7 +900,7 @@ class TestMaxPlanAccountPool:
 
     @pytest.mark.asyncio
     async def test_select_skips_account_after_opus_rate_limit_cascade(self, clean_max_plan_pool):
-        """After an Opus 429 marks (opus, sonnet, haiku), a Sonnet request must
+        """After an Opus 429 marks (opus, sonnet), a Sonnet request must
         skip that account in favor of a healthy one — even if the healthy
         account has more active tasks."""
         now = datetime.utcnow()
@@ -1016,24 +1021,26 @@ class TestCircuitBreaker:
     # ── Clear-on-success path ────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_clear_opus_success_clears_all_three_tiers(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_opus_success_clears_opus_and_sonnet(self, clean_max_plan_pool, monkeypatch):
+        # Haiku is never a separate key (normalized to opus), so opus clear
+        # leaves the account fully healthy.
         now = datetime.utcnow()
         _add_to_pool(_acct_with_disables("a1", {
             OPUS: {"hits": 1, "at": now},
             SONNET: {"hits": 1, "at": now},
-            HAIKU: {"hits": 1, "at": now},
         }))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", OPUS) is True
         assert "disabled_models" not in _account_by_id["a1"] or not _account_by_id["a1"]["disabled_models"]
 
     @pytest.mark.asyncio
-    async def test_clear_sonnet_success_clears_sonnet_and_haiku_only(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_sonnet_success_clears_sonnet_only(self, clean_max_plan_pool, monkeypatch):
+        # Sonnet success proves only sonnet's bucket is fine — opus (and haiku,
+        # which shares opus's meter) stay disabled.
         now = datetime.utcnow()
         _add_to_pool(_acct_with_disables("a1", {
             OPUS: {"hits": 1, "at": now},
             SONNET: {"hits": 1, "at": now},
-            HAIKU: {"hits": 1, "at": now},
         }))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", SONNET) is True
@@ -1041,17 +1048,18 @@ class TestCircuitBreaker:
         assert set(dm.keys()) == {OPUS}
 
     @pytest.mark.asyncio
-    async def test_clear_haiku_success_clears_haiku_only(self, clean_max_plan_pool, monkeypatch):
+    async def test_clear_haiku_success_clears_opus_and_sonnet(self, clean_max_plan_pool, monkeypatch):
+        # Haiku success proves Opus's meter is fine (shared bucket). That also
+        # clears sonnet, since opus's cascade includes sonnet.
         now = datetime.utcnow()
         _add_to_pool(_acct_with_disables("a1", {
             OPUS: {"hits": 1, "at": now},
             SONNET: {"hits": 1, "at": now},
-            HAIKU: {"hits": 1, "at": now},
         }))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", HAIKU) is True
         dm = _account_by_id["a1"].get("disabled_models") or {}
-        assert set(dm.keys()) == {OPUS, SONNET}
+        assert dm == {}
 
     @pytest.mark.asyncio
     async def test_clear_on_healthy_account_is_noop(self, clean_max_plan_pool, monkeypatch):
@@ -1124,8 +1132,8 @@ class TestDisableAccountModel:
     three others sat idle)."""
 
     @pytest.mark.asyncio
-    async def test_disables_primary_and_cascade_models(self, clean_max_plan_pool, monkeypatch):
-        """Sonnet disable cascades to haiku but NOT opus; primary model is marked with hits=1."""
+    async def test_disables_sonnet_does_not_cascade_to_opus(self, clean_max_plan_pool, monkeypatch):
+        """Sonnet 429 writes only {sonnet}; Opus (and Haiku, which shares Opus's meter) untouched."""
         _add_to_pool({"id": "a1", "name": "fresh", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
@@ -1133,21 +1141,40 @@ class TestDisableAccountModel:
 
         dm = _account_by_id["a1"]["disabled_models"]
         assert SONNET in dm
-        assert "claude-haiku-4-5-20251001" in dm
         assert OPUS not in dm, "Sonnet rate limit must not cascade upward to Opus"
+        assert HAIKU not in dm, "Haiku is tracked under Opus's key, never as its own entry"
         assert dm[SONNET]["hits"] == 1
         assert _account_state_for_model(_account_by_id["a1"], SONNET) == "unavailable"
+        # Haiku lookup normalizes to Opus → still available.
+        assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "healthy"
 
     @pytest.mark.asyncio
     async def test_opus_cascade_blocks_all_tiers(self, clean_max_plan_pool, monkeypatch):
-        """Opus rate limit cascades to sonnet and haiku (shared quota bucket)."""
+        """Opus 429 writes {opus, sonnet}. Haiku lookup normalizes to Opus, so all three are blocked."""
         _add_to_pool({"id": "a1", "name": "opus_limited", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
         await disable_account_model("a1", OPUS)
 
         dm = _account_by_id["a1"]["disabled_models"]
-        assert OPUS in dm and SONNET in dm and "claude-haiku-4-5-20251001" in dm
+        assert OPUS in dm and SONNET in dm
+        assert HAIKU not in dm, "Haiku is never a separate key — it shares Opus's meter"
+        assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_disable_haiku_marks_opus_shared_meter(self, clean_max_plan_pool, monkeypatch):
+        """Haiku 429 normalizes to Opus: writes {opus, sonnet}, blocks all three."""
+        _add_to_pool({"id": "a1", "name": "haiku_limited", "active_tasks": 0})
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+
+        await disable_account_model("a1", HAIKU)
+
+        dm = _account_by_id["a1"]["disabled_models"]
+        assert OPUS in dm, "Haiku 429 must disable Opus (shared meter)"
+        assert SONNET in dm, "Opus cascade still covers Sonnet"
+        assert HAIKU not in dm
+        assert _account_state_for_model(_account_by_id["a1"], OPUS) == "unavailable"
+        assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
 
     @pytest.mark.asyncio
     async def test_repeated_disable_increments_hits(self, clean_max_plan_pool, monkeypatch):

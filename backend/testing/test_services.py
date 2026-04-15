@@ -231,7 +231,7 @@ async def test_orphan_recovery_creates_artifact_and_review_when_pr_found(svc_db,
     mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
         new_callable=AsyncMock,
-        return_value=mock_review_task,
+        return_value=(mock_review_task, True),
     )
 
     await _recover_orphaned_tasks()

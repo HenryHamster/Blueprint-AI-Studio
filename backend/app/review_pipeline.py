@@ -53,30 +53,51 @@ async def _spawn_pipeline_task(
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
     current_feedback: str = "", fix_reason: str = "", current_issues: list = None
-) -> Optional[Task]:
+) -> tuple[Optional[Task], bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
-    Returns None if the review-fix cycle limit has been reached.
-    Returns the existing active task if a review/fix is already active for this PR."""
-    # Guard: don't spawn if PR is already merged
-    orig_id = original_task_id or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "") or (source_task.first_payload).get("original_task_id", "")
-    if orig_id:
-        try:
-            orig_task = await session.get(Task, uuid.UUID(orig_id))
-            if orig_task and (orig_task.context or {}).get("pr_merged"):
-                logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {orig_id[:8]})")
-                source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
-                session.add(source_task)
-                return None
-        except Exception:
-            logger.debug(f"[PIPELINE] Could not verify pr_merged for original task {orig_id[:8]}: skipping check")
-    # Also check the source task itself
+
+    Returns (task, was_created):
+    - (None, False)          → spawn suppressed (PR already merged, cap reached,
+                                stuck cycle detected — caller must decide follow-up)
+    - (existing_task, False) → dedup hit: a review/fix for the SAME chain is
+                                already in flight (matched on original_task_id).
+                                Caller can trust that the existing task will
+                                handle the work.
+    - (new_task, True)       → a fresh review/fix task was created.
+    """
+    # Resolve the chain identifier once, so the "already merged" guard, the
+    # dedup guard, and the spawn path all agree on which chain this is.
+    # A chain is identified by the *create* task that opened the PR; review/fix
+    # tasks in the chain carry that id in payload.original_task_id. For a source
+    # task that has no explicit chain id, fall back to its own id (the source IS
+    # the create task in that case).
+    resolved_original_id = (
+        original_task_id
+        or (source_task.context or {}).get("review_loop", {}).get("original_task_id", "")
+        or (source_task.first_payload).get("original_task_id", "")
+        or str(source_task.id)
+    )
+
+    # Guard: don't spawn if PR is already merged (check both original and source).
+    try:
+        orig_task = await session.get(Task, uuid.UUID(resolved_original_id))
+        if orig_task and (orig_task.context or {}).get("pr_merged"):
+            logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})")
+            source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
+            session.add(source_task)
+            return (None, False)
+    except Exception:
+        logger.debug(f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check")
     if (source_task.context or {}).get("pr_merged"):
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
-        return None
+        return (None, False)
 
-    # Guard: don't spawn if there's already an ACTIVE review or fix for this PR.
-    # Same-type check prevents duplicates. Cross-type check prevents spawning a
-    # review while a fix is running (the fix will spawn its own review when done).
+    # Guard: don't spawn if there's already an ACTIVE review or fix for this PR
+    # IN THE SAME CHAIN. Matching on `original_task_id` prevents conflation with
+    # unrelated reviews/fixes that happen to share the pr_number (rollup retries,
+    # concurrent sources targeting the same branch). Same-chain in-flight review
+    # means the current spawn would duplicate work; unrelated pipeline tasks do
+    # not block us.
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -88,11 +109,14 @@ async def _spawn_pipeline_task(
             continue
         t_payload = t.first_payload
         t_type = t_payload.get("type")
-        if t_payload.get("pr_number") == pr_number and t_type in ("review", "fix"):
-            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — {t_type} already active: {t.id}")
+        t_orig = t_payload.get("original_task_id") or ""
+        if (t_payload.get("pr_number") == pr_number
+                and t_type in ("review", "fix")
+                and t_orig == resolved_original_id):
+            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — same-chain {t_type} already active: {t.id}")
             source_task.latest_status_message = f"{task_type.title()} skipped for PR #{pr_number} — {t_type} active → {str(t.id)[:8]}"
             session.add(source_task)
-            return t
+            return (t, False)
 
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
     # Filter to tasks matching this PR number (check payloads JSONB)
@@ -123,35 +147,32 @@ async def _spawn_pipeline_task(
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
         source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
         session.add(source_task)
-        return None
+        return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain)
     source_loop = (source_task.context or {}).get("review_loop", {})
-    source_payload = source_task.first_payload
     iteration = source_loop.get("iteration", 0) + 1
     per_chain_cap = _max_review_iterations(source_task)
 
     if iteration > per_chain_cap:
-        # Cap reached — require manual intervention
-        orig_id = original_task_id or source_loop.get("original_task_id", "") or source_payload.get("original_task_id", "")
-        if orig_id:
-            try:
-                orig = await session.get(Task, uuid.UUID(orig_id))
-                if orig:
-                    orig.requires_approval = True
-                    orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
-                    session.add(orig)
-                    await session.commit()
-            except Exception as e:
-                logger.warning(f"[PIPELINE] Failed to mark iteration cap on {orig_id}: {e}", exc_info=True)
+        # Cap reached — require manual intervention on the chain's root task.
+        try:
+            orig = await session.get(Task, uuid.UUID(resolved_original_id))
+            if orig:
+                orig.requires_approval = True
+                orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
+                session.add(orig)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"[PIPELINE] Failed to mark iteration cap on {resolved_original_id}: {e}", exc_info=True)
         logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
-        return None
+        return (None, False)
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
     # Determine parent: use the original task's parent (so review/fix are siblings of the
-    # create task under the plan/research parent), falling back to original task itself
-    resolved_original_id = original_task_id or str(source_task.id)
+    # create task under the plan/research parent), falling back to original task itself.
+    # resolved_original_id was computed at the top of this function.
     parent_id = None
     inherited_priority = source_task.priority
     try:
@@ -290,7 +311,7 @@ async def _spawn_pipeline_task(
                         f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
                         exc_info=True,
                     )
-                return None
+                return (None, False)
 
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}
@@ -324,4 +345,4 @@ async def _spawn_pipeline_task(
 
     await broadcast_to_project(str(source_task.project_id), "task_updated",
                                {"task_id": str(new_task.id), "status": TaskStatus.QUEUED})
-    return new_task
+    return (new_task, True)

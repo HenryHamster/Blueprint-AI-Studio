@@ -702,7 +702,7 @@ async def _recover_orphaned_tasks():
 
                 # Spawn review
                 original_prompt = task.first_payload.get("prompt", task.description or "")
-                review_task = await _spawn_pipeline_task(
+                review_task, _ = await _spawn_pipeline_task(
                     task, "review", session, pr_number, branch, base_branch,
                     original_prompt=original_prompt, original_task_id=str(task.id)
                 )
@@ -776,7 +776,7 @@ async def _recover_orphaned_tasks():
                 session.add(locked)
 
                 original_prompt = locked.first_payload.get("prompt", locked.description or "")
-                review_task = await _spawn_pipeline_task(
+                review_task, _ = await _spawn_pipeline_task(
                     locked, "review", session, pr_number, branch, base_branch,
                     original_prompt=original_prompt, original_task_id=str(locked.id)
                 )

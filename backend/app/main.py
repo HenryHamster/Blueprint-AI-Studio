@@ -135,7 +135,7 @@ from app.max_plan_pool import (  # noqa: E402
     _account_by_id,
     _max_plan_pool_lock,
     _pending_rl_persists,
-    RATE_LIMIT_KEYWORDS,
+    RATE_LIMIT_PATTERNS,
     _all_accounts,
     load_max_plan_pool,
     _account_available_for_model,

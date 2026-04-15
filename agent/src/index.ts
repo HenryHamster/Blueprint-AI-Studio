@@ -19,6 +19,25 @@ import {
 // ── Failure categories ───────────────────────────────────────────────────────
 export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal';
 
+// Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
+// Must stay in sync with backend/app/max_plan_pool.py:RATE_LIMIT_PATTERNS.
+// Do NOT add loose keywords like "credit", "billing", "429", or "overloaded" —
+// those cause false positives that disable accounts for unrelated failures.
+const RATE_LIMIT_PATTERNS: readonly string[] = [
+  "you've hit your limit",
+  "you've hit your usage limit",
+  "claude ai usage limit reached",
+  "you're out of extra usage",
+  "5-hour limit reached",
+  "api error: rate limit reached",
+  "this request would exceed your account's rate limit",
+] as const;
+
+function matchesRateLimit(text: string): boolean {
+  const lower = text.toLowerCase();
+  return RATE_LIMIT_PATTERNS.some(p => lower.includes(p));
+}
+
 // ── Build configuration (from project settings, passed via claim response) ───
 export interface DirectoryConfig {
   path: string;
@@ -1031,11 +1050,11 @@ echo ""
 
   sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
 
-  // Detect usage exhaustion / rate limits from Claude's stderr output
+  // Detect Claude rate-limit / usage exhaustion from stderr using exact
+  // substrings from RATE_LIMIT_PATTERNS.
   if (exitCode !== 0) {
-    const combined = (stderrBuffer + allOutput.slice(-5000)).toLowerCase();
-    const isUsageExhausted = /usage.*limit|rate.*limit|quota.*exceeded|credit|billing|exceeded.*plan|max.*usage|token.*limit|out of.*credit/i.test(combined);
-    if (isUsageExhausted) {
+    const combined = stderrBuffer + allOutput.slice(-5000);
+    if (matchesRateLimit(combined)) {
       throw new Error(`Claude API usage exhausted — ${stderrBuffer.slice(0, 500)}`);
     }
   }
@@ -1077,7 +1096,7 @@ async function main() {
       check.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
       check.on('close', (code) => { clearTimeout(valTimeout); resolve({ exitCode: code ?? 1, stderr }); });
     });
-    if (valResult.exitCode !== 0 && /usage.*exhausted|rate.*limit|credit|billing/i.test(valResult.stderr)) {
+    if (valResult.exitCode !== 0 && matchesRateLimit(valResult.stderr)) {
       log(`Token validation FAILED — account rate-limited: ${valResult.stderr.slice(0, 200)}`);
       // Exit immediately — reaper will catch the task in PROVISIONING and requeue.
       // Don't waste 2+ minutes of setup only to discover the same thing.
@@ -1153,9 +1172,9 @@ async function main() {
     const safeErr = sanitize(errMsg);
     log(`Fatal error: ${safeErr}`);
     sendLog(ws, `\nFatal error: ${safeErr}\n`);
-    // Classify the failure — rate limit / usage exhaustion should NOT burn retry budget
-    const errLower = errMsg.toLowerCase();
-    const isRateLimit = /usage.*exhaust|usage.*limit|rate.*limit|quota.*exceeded|credit|billing|exceeded.*plan|max.*usage|token.*limit|out of.*credit/i.test(errLower);
+    // Classify the failure — rate limit / usage exhaustion should NOT burn retry budget.
+    // Uses exact Claude-specific substrings only (see RATE_LIMIT_PATTERNS).
+    const isRateLimit = matchesRateLimit(errMsg);
     const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' as FailureCategory : 'fatal' as FailureCategory;
     // Surface the error through the heartbeat so it's visible even if the
     // status POST fails — the heartbeat updates latest_status_message on the

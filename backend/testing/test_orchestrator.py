@@ -1110,7 +1110,7 @@ class TestClassifyFailure:
         assert classify_failure(task) == "PROVISION_FAILURE"
 
     def test_rate_limit(self):
-        task = self._make_task("rate limit exceeded")
+        task = self._make_task("API Error: Rate limit reached")
         assert classify_failure(task) == "RATE_LIMIT"
 
     def test_code_error_default(self):

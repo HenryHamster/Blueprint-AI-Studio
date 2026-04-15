@@ -69,17 +69,41 @@ class TestClassifyStuckFailure:
         assert _classify_stuck_failure(self._task_with_message("cpus_all_regions quota exceeded")) == "PROVISION_FAILURE"
 
     def test_rate_limit_keywords(self):
-        # "overloaded" without billing context → EXTERNAL_API per canonical classifier (not RATE_LIMIT)
-        for kw in ["rate limit hit", "rate_limit exceeded", "429 too many", "credit exhausted", "too many requests"]:
+        # Exact verbatim Claude Code CLI / Anthropic API rate-limit strings — see RATE_LIMIT_PATTERNS.
+        for kw in [
+            "You've hit your limit · resets 5am (Asia/Seoul)",
+            "You've hit your usage limit - View usage",
+            "Claude AI usage limit reached, please try again after 2pm",
+            "You're out of extra usage · resets 11:30am (Asia/Colombo)",
+            "5-hour limit reached - resets 9pm",
+            "API Error: Rate limit reached",
+            "This request would exceed your account's rate limit. Please try again later.",
+        ]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "RATE_LIMIT", kw
 
     def test_external_api_keywords(self):
         for kw in ["api.github.com error", "api.anthropic.com down", "502 bad gateway", "503 service unavailable", "ssl handshake", "certificate expired"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API", kw
 
-    def test_overloaded_without_billing_is_external_api(self):
-        # canonical classifier: "overloaded" without billing/usage keywords → EXTERNAL_API (not RATE_LIMIT)
+    def test_overloaded_is_external_api(self):
+        # Anthropic 529 is server-side capacity — not a Claude rate limit, must not disable accounts.
         assert _classify_stuck_failure(self._task_with_message("overloaded server")) == "EXTERNAL_API"
+        assert _classify_stuck_failure(self._task_with_message("Error: Overloaded")) == "EXTERNAL_API"
+
+    def test_non_claude_rate_limit_words_are_not_rate_limit(self):
+        # Broad keywords that previously caused false-positive account disables.
+        # None of these are real Claude rate-limit messages; classifier must not flag them.
+        from app.failure_classification import classify_failure
+        for msg, expected in [
+            ("credit card declined", "CODE_ERROR"),                       # generic "credit"
+            ("billing address required", "CODE_ERROR"),                   # generic "billing"
+            ("GitHub API rate limit exceeded", "EXTERNAL_API"),            # GitHub 429
+            ("too many requests to downstream service", "CODE_ERROR"),    # generic 429 phrase
+            ("HTTP 429 from upstream", "CODE_ERROR"),                     # bare 429
+            ("disk quota exceeded on /var", "PROVISION_FAILURE"),         # GCP/disk quota
+        ]:
+            t = self._task_with_message(msg)
+            assert classify_failure(t) == expected, f"{msg!r} → expected {expected}"
 
     def test_agent_timeout_keywords(self):
         for kw in ["no heartbeat received", "reaped by watchdog", "execution timed out", "node process killed", "oom-kill", "killed by oom", "sigterm received", "exit code 137", "exit code 143"]:
@@ -103,7 +127,7 @@ class TestClassifyStuckFailure:
         assert _classify_stuck_failure(t) is None
 
     def test_case_insensitive(self):
-        assert _classify_stuck_failure(self._task_with_message("RATE LIMIT HIT")) == "RATE_LIMIT"
+        assert _classify_stuck_failure(self._task_with_message("API ERROR: RATE LIMIT REACHED")) == "RATE_LIMIT"
         assert _classify_stuck_failure(self._task_with_message("VM FAILED TO START")) == "PROVISION_FAILURE"
 
 
@@ -467,7 +491,7 @@ class TestBuildStuckTasks:
         await db_session.refresh(project)
 
         task = _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=35 * 60,
-                          status_message="rate limit hit")
+                          status_message="API Error: Rate limit reached")
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)

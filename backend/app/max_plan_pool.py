@@ -3,7 +3,7 @@ Max Plan account pool — in-memory cache of DB-persisted Claude Code OAuth acco
 
 Extracted from main.py. This module owns:
   - Global pool state (_max_plan_pools, _account_by_id, _max_plan_pool_lock, _pending_rl_persists)
-  - RATE_LIMIT_KEYWORDS constant (shared with classify_failure in main.py and reaper.py)
+  - RATE_LIMIT_PATTERNS constant (shared with classify_failure in main.py and reaper.py)
   - Pool lifecycle: load_max_plan_pool, select_max_plan_account, release_max_plan_account,
     recheck_disabled_accounts
   - Helpers: _all_accounts, _account_available_for_model, _extract_task_model
@@ -36,29 +36,57 @@ _account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
 _pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
 
-# Rate-limit keyword patterns — shared between classify_failure() and reaper
-RATE_LIMIT_KEYWORDS = ["rate limit", "rate_limit", "rate-limit", "429", "credit", "billing",
-                       "usage limit", "usage exhausted", "too many requests",
-                       "resource_exhausted", "daily limit", "tokens per minute",
-                       "quota exceeded", "exceeded your", "plan limit",
-                       "requests per minute", "overloaded"]
+# Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
+# Shared between classify_failure() and any caller that needs to detect a real
+# Claude rate-limit (vs GitHub 429, GCP quota, Anthropic 529 overload, etc).
+#
+# Sourced from verbatim error strings reported in anthropics/claude-code issues.
+# Do NOT add loose keywords like "credit", "billing", "429", "quota exceeded",
+# or "overloaded" — those caused false positives that disabled accounts for
+# unrelated failures (GCP quota, credit-card setup errors, Anthropic 529s).
+RATE_LIMIT_PATTERNS = [
+    # Subscription / Max-plan quota exhausted (CLI messages)
+    "you've hit your limit",                                 # "...· resets 5am (Asia/Seoul)"
+    "you've hit your usage limit",
+    "claude ai usage limit reached",
+    "you're out of extra usage",
+    "5-hour limit reached",
+    # Anthropic API 429
+    "api error: rate limit reached",                         # Claude Code's wrapper around 429
+    "this request would exceed your account's rate limit",   # raw 429 JSON body
+]
 
-# Claude Max plan shares session quota across model tiers — a 429 on a higher
-# tier implies lower tiers are also rate-limited (Opus usage drains the same
-# bucket that feeds Sonnet/Haiku). Not symmetric: Sonnet hitting its limit
-# does not necessarily block Opus, which has its own stricter sub-bucket.
+# Claude Max plan shares session quota across model tiers. Empirically:
+#   - Opus 429 implies Sonnet is also rate-limited (shared session bucket);
+#     not symmetric, since Opus has a stricter sub-bucket of its own.
+#   - Haiku shares Opus's meter exactly — it does NOT have its own bucket,
+#     so haiku tracking normalizes to opus via _normalize_rl_model().
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
-    "claude-opus-4-6": ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
-    "claude-sonnet-4-6": ("claude-sonnet-4-6", "claude-haiku-4-5-20251001"),
-    "claude-haiku-4-5-20251001": ("claude-haiku-4-5-20251001",),
+    "claude-opus-4-6": ("claude-opus-4-6", "claude-sonnet-4-6"),
+    "claude-sonnet-4-6": ("claude-sonnet-4-6",),
 }
+
+_HAIKU_MODEL = "claude-haiku-4-5-20251001"
+_OPUS_MODEL = "claude-opus-4-6"
+
+
+def _normalize_rl_model(model: str | None) -> str | None:
+    """Map Haiku to Opus for rate-limit tracking — they share the same budget.
+    Used at every rate-limit code path that keys into disabled_models so Haiku
+    tasks bookkeep against Opus's meter and Opus disable/clear automatically
+    covers Haiku."""
+    if model == _HAIKU_MODEL:
+        return _OPUS_MODEL
+    return model
 
 
 def cascade_disabled_models(model: str) -> tuple:
     """Return every model that should be marked disabled when `model` hits a 429.
-    Falls back to the single model for unknown names so new variants don't silently
-    cascade to the whole account."""
-    return _MODEL_TIER_CASCADE.get(model, (model,))
+    Normalizes Haiku to Opus first (shared meter). Falls back to the single
+    model for unknown names so new variants don't silently cascade to the
+    whole account."""
+    normalized = _normalize_rl_model(model)
+    return _MODEL_TIER_CASCADE.get(normalized, (normalized,) if normalized else (model,))
 
 
 # Backward compat: flat view for code that needs all accounts
@@ -159,6 +187,8 @@ def _account_state_for_model(acct: dict, model: str | None, now: datetime | None
         # Conservative: unknown model with any disable is unavailable. Preserves
         # the existing behavior for health checks and the autonomous-research gate.
         return "unavailable"
+    # Haiku shares Opus's meter — look up Opus's entry.
+    model = _normalize_rl_model(model)
     info = dm.get(model)
     if info is None:
         return "healthy"
@@ -273,6 +303,8 @@ async def disable_account_model(acct_id: str, model: str) -> None:
     """
     if not acct_id or not model:
         return
+    # Normalize Haiku → Opus so the meter is keyed correctly.
+    model = _normalize_rl_model(model)
     cascade = cascade_disabled_models(model)
     async with _max_plan_pool_lock:
         acct = _account_by_id.get(acct_id)
@@ -311,6 +343,8 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
     On DB persist failure, appends to _pending_rl_persists for retry."""
     if not acct_id or not model:
         return False
+    # Normalize Haiku → Opus so clearing Haiku's bucket clears the shared meter.
+    model = _normalize_rl_model(model)
     cascade = cascade_disabled_models(model)
     async with _max_plan_pool_lock:
         acct = _account_by_id.get(acct_id)

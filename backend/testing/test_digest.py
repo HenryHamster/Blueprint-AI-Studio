@@ -994,7 +994,7 @@ async def test_trend_none_when_no_previous_terminal_tasks(client: AsyncClient, d
 
 @pytest.mark.asyncio
 async def test_failure_group_rate_limit(client: AsyncClient, db_session):
-    """Task with 'rate limit exceeded' in status message is classified into RATE_LIMIT failure group."""
+    """Task with an exact Claude rate-limit message is classified into RATE_LIMIT failure group."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -1005,7 +1005,7 @@ async def test_failure_group_rate_limit(client: AsyncClient, db_session):
         project_id=project.id,
         title="Rate Limited Task",
         status=TaskStatus.FAILED,
-        latest_status_message="rate limit exceeded",
+        latest_status_message="API Error: Rate limit reached",
         created_at=curr,
         status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
     ))
@@ -1108,7 +1108,7 @@ async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db
         project_id=project.id,
         title="Rate Limit Task",
         status=TaskStatus.FAILED,
-        latest_status_message="rate limit exceeded",
+        latest_status_message="API Error: Rate limit reached",
         created_at=curr,
         status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
     ))

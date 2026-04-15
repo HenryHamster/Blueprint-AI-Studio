@@ -11,21 +11,17 @@ imports (task_lifecycle is imported BY main) and preserve test-patchability
 import copy
 import json
 import logging
-import re
 import uuid
 import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, List
+from typing import Dict
 
-from fastapi import HTTPException
-from sqlalchemy import func as _func
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import (
-    Task, Artifact, TaskHistory, Project,
+    Task, TaskHistory, Project,
     TaskStatus, ArtifactType, Alert, AlertSeverity, ProjectStatus,
 )
 from app.schemas import AgentStatusPayload
@@ -66,7 +62,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert
 
     # Don't resurrect a cancelled parent
     if parent.status == TaskStatus.CANCELLED:
@@ -111,7 +107,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Auto-generate playbook entry if this failure pattern is recurring
         try:
-            from app.playbook_learning import _maybe_auto_playbook  # noqa: PLC0415
+            from app.playbook_learning import _maybe_auto_playbook
             await _maybe_auto_playbook(child, failure_class, original_status_message, session)
         except Exception:
             logger.exception("[AUTO_PLAYBOOK] Failed to process playbook for task %s", child.id)
@@ -224,11 +220,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     return retried_count
 
 from app.review_pipeline import (
-    _spawn_pipeline_task, _max_review_iterations,
-    MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR,
+    _spawn_pipeline_task,
 )
 
-from app.rollup_management import _check_and_trigger_rollup, _verify_pr_merged, _cleanup_branches
+from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 
 import random as _random
 
@@ -246,7 +241,7 @@ async def _merge_with_retry(
     for attempt in range(max_attempts):
         try:
             return await merge_pull_request_fn(gh_token, owner, repo, pr_number, project_id=project_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
             last_exc = exc
             if attempt < max_attempts - 1:
                 backoff = (2 ** attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
@@ -268,21 +263,21 @@ async def _process_post_commit(
     status endpoint while making GitHub API calls (which can hang 15-120s).
     _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
-    from app.main import _utcnow  # noqa: PLC0415
-    from app.broadcast import broadcast_to_project  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.security import scan_pr_for_injection  # noqa: PLC0415
-    from app.github import (  # noqa: PLC0415
+    from app.main import _utcnow
+    from app.broadcast import broadcast_to_project
+    from app.routers.agent import get_github_token_for_task
+    from app.security import scan_pr_for_injection
+    from app.github import (
         create_pr_comment, merge_pull_request, get_pull_request,
         get_pr_files, get_check_runs, submit_pr_review, update_check_run,
     )
-    from app.task_completion import (  # noqa: PLC0415
+    from app.task_completion import (
         _handle_plan_completion, _handle_design_doc_completion,
         _handle_security_audit_completion, _handle_perf_completion,
         _handle_investigation_completion,
     )
-    from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure  # noqa: PLC0415
-    from app.research_completion import _handle_research_completion  # noqa: PLC0415
+    from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure
+    from app.research_completion import _handle_research_completion
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
@@ -410,15 +405,39 @@ async def _process_post_commit(
                             logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
                         else:
                             logger.error(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
-                            # Fall through to review pipeline for conflict resolution
-                            review_task = await _spawn_pipeline_task(
+                            # Defensive layer: if the PR is blocked on checks (not a
+                            # real conflict), ask GitHub to auto-merge once the gates
+                            # clear. This does nothing for DIRTY/BEHIND states (real
+                            # conflict or out-of-date branch — the review/fix pipeline
+                            # is the only thing that can resolve those).
+                            try:
+                                from app.github import enable_auto_merge  # noqa: PLC0415
+                                pr_detail = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                                ms = (pr_detail.get("mergeable_state") or "").lower()
+                                if ms in ("blocked", "unstable"):
+                                    am_result = await enable_auto_merge(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
+                                    if am_result.get("enabled"):
+                                        logger.info(f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})")
+                                    else:
+                                        logger.info(f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}")
+                            except Exception as _am_exc:
+                                logger.warning(f"[PIPELINE] Auto-merge enablement attempt failed for PR #{pr_number}: {_am_exc}")
+                            # Fall through to review pipeline for conflict resolution.
+                            # Branch on was_created: a fresh review handles the work,
+                            # a dedup hit means an existing same-chain task is handling it,
+                            # and (None, False) means nothing is handling it → park.
+                            review_task, was_created = await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
-                            if not review_task:
-                                logger.error(f"[PIPELINE] Auto-merge failed and review spawn returned None for PR #{pr_number} — parking in CI-wait")
+                            if was_created:
+                                logger.info(f"[PIPELINE] Spawned review task {review_task.id} for PR #{pr_number} after auto-merge failure")
+                            elif review_task is not None:
+                                logger.info(f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {review_task.first_payload.get('type')} task {review_task.id} ({review_task.status}) already handling it")
+                            else:
+                                logger.warning(f"[PIPELINE] Auto-merge failed and no review spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait")
                                 task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number}, review cap hit — CI monitor will retry merge"
+                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
                                 task.context = {**(task.context or {}), "review_loop": {
                                     "ci_waiting": True, "pr_number": pr_number,
                                     "branch": branch, "base_branch": base_branch,
@@ -430,14 +449,18 @@ async def _process_post_commit(
                         logger.error(f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}", exc_info=True)
                         # Fallback: spawn review so the pipeline doesn't die
                         try:
-                            fallback_review = await _spawn_pipeline_task(
+                            fallback_review, fb_was_created = await _spawn_pipeline_task(
                                 task, "review", session, pr_number, branch, base_branch,
                                 original_prompt=original_prompt, original_task_id=str(task.id)
                             )
-                            if not fallback_review:
-                                logger.warning(f"[PIPELINE] Fallback review spawn returned None for PR #{pr_number} — parking in CI-wait")
+                            if fb_was_created:
+                                logger.info(f"[PIPELINE] Spawned fallback review {fallback_review.id} for PR #{pr_number} after merge error")
+                            elif fallback_review is not None:
+                                logger.info(f"[PIPELINE] Merge errored for PR #{pr_number} — same-chain task {fallback_review.id} already handling it")
+                            else:
+                                logger.warning(f"[PIPELINE] Merge error and no fallback review spawned for PR #{pr_number} — parking in CI-wait")
                                 task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = f"Auto-merge error for PR #{pr_number}, review cap hit — CI monitor will retry merge"
+                                task.latest_status_message = f"Auto-merge error for PR #{pr_number} — parked for CI-wait retry"
                                 task.context = {**(task.context or {}), "review_loop": {
                                     "ci_waiting": True, "pr_number": pr_number,
                                     "branch": branch, "base_branch": base_branch,
@@ -501,7 +524,7 @@ async def _process_post_commit(
                             logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
                     if not task.requires_approval:
-                        review_task = await _spawn_pipeline_task(
+                        review_task, _ = await _spawn_pipeline_task(
                             task, "review", session, pr_number, branch, base_branch,
                             original_prompt=original_prompt, original_task_id=str(task.id)
                         )
@@ -741,6 +764,62 @@ async def _process_post_commit(
                 action_taken = False
                 head_sha = ""
                 if verdict == "APPROVE":
+                    # Rollup gate handoff: when the original task is parking in CI wait
+                    # (rollup-to-main / large rollup path in rollup_management), the parent
+                    # owns the merge gate. The review task must NOT merge directly — it
+                    # writes review_approved=True on the parent and lets the CI gate fire
+                    # the merge once both signals are in. Without this branch, the review
+                    # races the parent's CI poll and whichever finishes first wins, which
+                    # is exactly the "merged before review" bug.
+                    if original_task_id:
+                        try:
+                            from app.ci_completion import (
+                                _attempt_merge_with_retry_and_escalation,
+                            )
+                            from app.routers.agent import get_github_token_for_task
+                            _orig_q = select(Task).where(
+                                Task.id == uuid.UUID(original_task_id)
+                            ).with_for_update()
+                            _orig = (await session.execute(_orig_q)).scalars().first()
+                            _orig_loop = (_orig.context or {}).get("review_loop", {}) if _orig else {}
+                            if _orig and _orig_loop.get("ci_waiting"):
+                                _orig_loop["review_approved"] = True
+                                _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
+                                flag_modified(_orig, "context")
+                                session.add(_orig)
+                                task.status = TaskStatus.COMPLETED
+                                task.latest_status_message = (
+                                    f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
+                                )
+                                session.add(task)
+
+                                if _orig_loop.get("ci_passed"):
+                                    try:
+                                        _gh, _own, _rep = await get_github_token_for_task(_orig.id, session)
+                                        await _attempt_merge_with_retry_and_escalation(
+                                            _orig, _gh, _own, _rep, session, source="review_approval",
+                                        )
+                                    except Exception as _gate_e:
+                                        logger.error(
+                                            f"[REVIEW PIPELINE] Gate merge failed for rollup PR #{pr_number}: {_gate_e}",
+                                            exc_info=True,
+                                        )
+
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(_orig.project_id), "task_updated",
+                                    {"task_id": str(_orig.id), "status": _orig.status},
+                                )
+                                logger.info(
+                                    f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig.id})"
+                                )
+                                return {"status": "accepted"}
+                        except Exception as _rollup_e:
+                            logger.warning(
+                                f"[REVIEW PIPELINE] Rollup gate handoff failed for PR #{pr_number}: {_rollup_e}",
+                                exc_info=True,
+                            )
+
                     head_sha = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -766,7 +845,7 @@ async def _process_post_commit(
                             task.status = TaskStatus.EVALUATING
                             task.latest_status_message = f"Review approved, waiting for CI on PR #{pr_number}..."
                             task.context = {**(task.context or {}), "review_loop": {
-                                **review_loop, "ci_waiting": True, "verdict": "APPROVE",
+                                **review_loop, "ci_waiting": True, "review_approved": True,
                                 "head_sha": head_sha, "pr_number": pr_number,
                                 "branch": branch, "base_branch": base_branch,
                                 "original_task_id": original_task_id,
@@ -788,7 +867,7 @@ async def _process_post_commit(
                                 f"Fix only the build/lint/test errors. The code review is already "
                                 f"approved — don't change logic, just fix CI failures."
                             )
-                            fix_task = await _spawn_pipeline_task(
+                            fix_task, _ = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
                                 fix_prompt=ci_fix_prompt,
                                 original_task_id=original_task_id,
@@ -854,7 +933,7 @@ async def _process_post_commit(
                                                 )
                                                 try:
                                                     from app.notification_dispatch import dispatch_external_notification
-                                                    asyncio.ensure_future(dispatch_external_notification(
+                                                    asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget webhook dispatch from background flow
                                                         orig.project_id,
                                                         "AUTO_FIX_MERGED",
                                                         {"branch": _ar_branch, "pr_number": pr_number},
@@ -1022,7 +1101,7 @@ async def _process_post_commit(
                                 f"4. Run: git rebase --continue after resolving each conflicting file\n"
                                 f"5. If rebase is too complex, abort with git rebase --abort, then use git merge origin/{base_branch} and resolve conflict markers"
                             )
-                            fix_task = await _spawn_pipeline_task(
+                            fix_task, _ = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
                                 fix_prompt=fix_prompt,
                                 original_task_id=original_task_id
@@ -1038,7 +1117,7 @@ async def _process_post_commit(
                         task.status = TaskStatus.EVALUATING
                         task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
                         task.context = {**(task.context or {}), "review_loop": {
-                            **review_loop, "ci_waiting": True, "verdict": "APPROVE",
+                            **review_loop, "ci_waiting": True, "review_approved": True,
                             "head_sha": head_sha, "pr_number": pr_number,
                             "branch": branch, "base_branch": base_branch,
                             "original_task_id": original_task_id,
@@ -1080,7 +1159,7 @@ async def _process_post_commit(
                         fix_prompt_text = f"A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
                     else:
                         fix_prompt_text = f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
-                    fix_task = await _spawn_pipeline_task(
+                    fix_task, _ = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=fix_prompt_text,
                         original_prompt=original_prompt,
@@ -1178,9 +1257,13 @@ async def _process_post_commit(
                 fix_reason = review_loop.get("fix_reason", "code_review")
                 if not scan_blocked and fix_reason == "ci_failure":
                     # CI-only fix: skip re-review, go straight to CI check + merge.
-                    # The original review already approved the code logic.
+                    # The original review already approved the code logic, so the
+                    # review-side gate is open. Set review_approved explicitly even
+                    # though the inherited review_loop should already carry it from
+                    # the prior approval write.
                     ci_loop = review_loop.copy()
                     ci_loop["ci_waiting"] = True
+                    ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
                     ci_loop["ci_poll_interval"] = 10
                     task.status = TaskStatus.EVALUATING
@@ -1190,7 +1273,7 @@ async def _process_post_commit(
                     await session.commit()
                     logger.info(f"[REVIEW PIPELINE] CI-only fix for PR #{pr_number} — skipping re-review, waiting for CI")
                 elif not scan_blocked:
-                    review_task = await _spawn_pipeline_task(
+                    review_task, _ = await _spawn_pipeline_task(
                         task, "review", session, pr_number, branch, base_branch,
                         original_task_id=original_task_id
                     )
@@ -1297,7 +1380,7 @@ async def _process_post_commit(
             and payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ):
             try:
-                from app.direction_outcomes import _update_direction_research_outcomes  # noqa: PLC0415
+                from app.direction_outcomes import _update_direction_research_outcomes
                 await _update_direction_research_outcomes(
                     task.project_id,
                     _task_ctx["direction_id"],

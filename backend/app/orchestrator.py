@@ -1175,7 +1175,7 @@ async def orchestrator_worker():
                                 f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
                                 f"every fix — do not leave uncommitted changes."
                             )
-                            fix_task = await _spawn_pipeline_task(
+                            fix_task, _ = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
                                 fix_prompt=fix_prompt, original_task_id=ci_orig_id
                             )

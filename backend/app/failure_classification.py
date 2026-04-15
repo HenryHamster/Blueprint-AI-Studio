@@ -21,7 +21,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
-    from app.max_plan_pool import RATE_LIMIT_KEYWORDS  # noqa: PLC0415
+    from app.max_plan_pool import RATE_LIMIT_PATTERNS  # noqa: PLC0415
 
     # Fast path: agent already reported a structured category — prefer it over regex.
     agent_category = (task.context or {}).get('failure_category')
@@ -52,19 +52,22 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
                                       "resource not found", "container killed"]):
         return "PROVISION_FAILURE"
 
-    # Transient API overload — server-side, not account-specific (must be checked before RATE_LIMIT
-    # because "overloaded" would otherwise trigger the rate limit classifier and disable accounts)
-    if "overloaded" in combined and not any(kw in combined for kw in ["usage limit", "usage exhausted", "billing", "credit"]):
+    # Anthropic 529 overload — server-side capacity, NOT account-specific. Must
+    # requeue transiently but MUST NOT disable the account.
+    if "overloaded" in combined:
         return "EXTERNAL_API"
 
-    # GitHub rate limits (429, "rate limit") — external API issue, NOT Claude account exhaustion.
-    # Must be checked before generic RATE_LIMIT to prevent disabling Claude accounts for GitHub outages.
+    # GitHub rate limits — external API issue, NOT Claude account exhaustion.
+    # RATE_LIMIT_PATTERNS is now specific enough that a plain "API rate limit
+    # exceeded" from GitHub can't match it, but we still route GitHub errors to
+    # EXTERNAL_API so they don't fall through to CODE_ERROR.
     if any(gh_kw in combined for gh_kw in ["github", "api.github.com"]) and \
        any(kw in combined for kw in ["rate limit", "429", "too many requests"]):
         return "EXTERNAL_API"
 
-    # Rate limit — Claude API usage exhausted, account-level billing/quota issues
-    if any(kw in combined for kw in RATE_LIMIT_KEYWORDS):
+    # Claude API rate limit — exact Claude Code / Anthropic API error strings only.
+    # See RATE_LIMIT_PATTERNS docstring for why broad keywords were removed.
+    if any(kw in combined for kw in RATE_LIMIT_PATTERNS):
         return "RATE_LIMIT"
 
     # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors).

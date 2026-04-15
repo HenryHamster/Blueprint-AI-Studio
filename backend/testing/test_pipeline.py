@@ -168,7 +168,7 @@ class TestFailureClassification:
         assert classify_failure(task, "api.github.com returned 502 Bad Gateway") == "EXTERNAL_API"
 
     def test_rate_limit(self):
-        task = self._make_task("rate limit exceeded")
+        task = self._make_task("API Error: Rate limit reached")
         assert classify_failure(task) == "RATE_LIMIT"
 
     def test_agent_timeout_no_heartbeat(self):
@@ -1665,7 +1665,7 @@ async def test_review_task_inherits_priority_100(spawn_db, mocker):
 
     source = await _make_spawn_task(spawn_db, project.id, priority=100)
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=source,
         task_type="review",
         pr_number=42,
@@ -1675,7 +1675,7 @@ async def test_review_task_inherits_priority_100(spawn_db, mocker):
         session=spawn_db,
     )
 
-    assert result is not None
+    assert result is not None and was_created
     assert result.priority == 100, f"Expected priority 100 but got {result.priority}"
 
 
@@ -1708,7 +1708,7 @@ async def test_fix_task_inherits_priority_from_original(spawn_db, mocker):
     await spawn_db.commit()
     await spawn_db.refresh(review)
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=review,
         task_type="fix",
         pr_number=42,
@@ -1719,7 +1719,7 @@ async def test_fix_task_inherits_priority_from_original(spawn_db, mocker):
         session=spawn_db,
     )
 
-    assert result is not None
+    assert result is not None and was_created
     assert result.priority == 100, f"Expected priority 100 but got {result.priority}"
 
 
@@ -1735,7 +1735,7 @@ async def test_default_priority_50_source_produces_priority_50_review(spawn_db, 
 
     source = await _make_spawn_task(spawn_db, project.id, priority=50)
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=source,
         task_type="review",
         pr_number=7,
@@ -1745,8 +1745,149 @@ async def test_default_priority_50_source_produces_priority_50_review(spawn_db, 
         session=spawn_db,
     )
 
-    assert result is not None
+    assert result is not None and was_created
     assert result.priority == 50, f"Expected priority 50 but got {result.priority}"
+
+
+# ── _spawn_pipeline_task dedup narrowing ──────────────────────────────────────
+#
+# Regression: previously the dedup guard matched on (project_id, pr_number, type),
+# which conflated unrelated reviews that happened to share a pr_number — e.g. a
+# rollup retry or two chains targeting the same PR. That would block the
+# second legitimate spawn and orphan its source task in COMPLETED-without-pr_merged
+# (see the PR 1404 post-mortem). The guard now also matches on original_task_id
+# so only same-chain in-flight tasks dedup.
+
+
+@pytest.mark.asyncio
+async def test_dedup_blocks_same_chain_review(spawn_db, mocker):
+    """An active review for the same chain blocks a new spawn from the same chain."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    original = await _make_spawn_task(spawn_db, project.id, priority=50)
+
+    # Existing active review for PR #7 spawned from the same chain (original.id)
+    existing_review = Task(
+        project_id=project.id,
+        title="Review PR #7",
+        payloads=[{"type": "review", "pr_number": 7,
+                   "original_task_id": str(original.id)}],
+        status=TaskStatus.IN_PROGRESS,
+        priority=50,
+    )
+    spawn_db.add(existing_review)
+    await spawn_db.commit()
+    await spawn_db.refresh(existing_review)
+
+    result, was_created = await _spawn_pipeline_task(
+        source_task=original,
+        task_type="review",
+        pr_number=7,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(original.id),
+        session=spawn_db,
+    )
+
+    # Dedup hit: returns the existing review, was_created is False.
+    assert result is not None
+    assert not was_created, "Same-chain dedup must report was_created=False"
+    assert result.id == existing_review.id
+
+
+@pytest.mark.asyncio
+async def test_dedup_does_not_block_different_chain_on_same_pr(spawn_db, mocker):
+    """An active review from a DIFFERENT chain on the same PR number must NOT block.
+
+    Regression case: two sources legitimately target the same pr_number (rollup
+    retry, or parallel create tasks whose PRs land on the same number). Before
+    the fix, the second caller would get the first's stale task back and its
+    source task would orphan. After the fix, a fresh task is created.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    chain_a = await _make_spawn_task(spawn_db, project.id, priority=50)
+    chain_b = await _make_spawn_task(spawn_db, project.id, priority=50)
+
+    # Active review belongs to chain A
+    existing_review = Task(
+        project_id=project.id,
+        title="Review PR #99 (chain A)",
+        payloads=[{"type": "review", "pr_number": 99,
+                   "original_task_id": str(chain_a.id)}],
+        status=TaskStatus.IN_PROGRESS,
+        priority=50,
+    )
+    spawn_db.add(existing_review)
+    await spawn_db.commit()
+    await spawn_db.refresh(existing_review)
+
+    # Chain B tries to spawn a review for the same pr_number
+    result, was_created = await _spawn_pipeline_task(
+        source_task=chain_b,
+        task_type="review",
+        pr_number=99,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(chain_b.id),
+        session=spawn_db,
+    )
+
+    # Fresh task: chain_b's spawn must NOT be blocked by chain_a's review.
+    assert result is not None and was_created, (
+        "Dedup must not conflate two distinct chains that share a pr_number"
+    )
+    assert result.id != existing_review.id
+
+
+@pytest.mark.asyncio
+async def test_cap_reached_returns_none_false(spawn_db, mocker):
+    """When the global cap is reached, spawn returns (None, False)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="P", user_id="u1")
+    spawn_db.add(project)
+    await spawn_db.commit()
+    await spawn_db.refresh(project)
+
+    source = await _make_spawn_task(spawn_db, project.id, priority=50,
+                                     context={"scope": "small"})
+
+    # Seed small-scope cap (10) with completed review/fix for this PR
+    for i in range(10):
+        t = Task(
+            project_id=project.id,
+            title=f"Prior {i}",
+            payloads=[{"type": "review" if i % 2 == 0 else "fix", "pr_number": 55,
+                       "original_task_id": str(source.id)}],
+            status=TaskStatus.COMPLETED,
+            priority=50,
+        )
+        spawn_db.add(t)
+    await spawn_db.commit()
+
+    result, was_created = await _spawn_pipeline_task(
+        source_task=source,
+        task_type="review",
+        pr_number=55,
+        branch="b",
+        base_branch="main",
+        original_task_id=str(source.id),
+        session=spawn_db,
+    )
+
+    assert result is None
+    assert was_created is False
 
 
 # ── Error Message Fingerprinting ────────────────────────────────────────────
@@ -1881,7 +2022,7 @@ async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
     await spawn_db.commit()
     await spawn_db.refresh(fix2)
 
-    result = await _spawn_pipeline_task(
+    result, was_created = await _spawn_pipeline_task(
         source_task=fix2,
         task_type="review",
         pr_number=10,
@@ -1891,7 +2032,7 @@ async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
         session=spawn_db,
     )
 
-    assert result is not None
+    assert result is not None and was_created
     assert result.priority == 80, f"Expected priority 80 but got {result.priority}"
 
 

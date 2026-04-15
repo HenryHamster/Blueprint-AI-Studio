@@ -204,17 +204,15 @@ async def reaper_service():
                     max_provision_retries = _runtime_config["max_provision_retries"]
                     can_retry = False
 
-                    # Rate-limited tasks: requeue without burning retry budget
-                    # Check status message, error_logs, error_logs artifact, AND failure_category
-                    from app.max_plan_pool import RATE_LIMIT_KEYWORDS  # noqa: PLC0415 — deferred to avoid circular import
-                    msg_lower = (task.latest_status_message or "").lower()
-                    error_lower = ((task.context or {}).get("last_error") or "").lower()
-                    error_logs_lower = ((task.error_logs or "") if hasattr(task, 'error_logs') else "").lower()
-                    is_rate_limited = (
-                        (task.context or {}).get("failure_category") == "rate_limited"
-                        or any(kw in msg_lower + " " + error_lower + " " + error_logs_lower
-                               for kw in RATE_LIMIT_KEYWORDS)
+                    # Rate-limited tasks: requeue without burning retry budget.
+                    # Delegate to classify_failure so the reaper path applies the same
+                    # Anthropic-529/GitHub-429 guards as the agent-status path, and
+                    # matches real Claude rate-limit strings only (RATE_LIMIT_PATTERNS).
+                    combined_logs = (
+                        ((task.context or {}).get("last_error") or "") + "\n"
+                        + ((task.error_logs or "") if hasattr(task, 'error_logs') else "")
                     )
+                    is_rate_limited = classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
                     if is_rate_limited:
                         rl_acct_id = (task.context or {}).get("max_plan_account_id")
                         logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")

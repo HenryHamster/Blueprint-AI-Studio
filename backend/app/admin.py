@@ -509,7 +509,7 @@ async def bulk_action_tasks(
                             else:
                                 from app.review_pipeline import _spawn_pipeline_task
                                 original_prompt = task_payload.get("prompt", task.description or "")
-                                review_task = await _spawn_pipeline_task(
+                                review_task, _was_created = await _spawn_pipeline_task(
                                     task, "review", session, pr_number, branch, base_branch,
                                     original_prompt=original_prompt, original_task_id=str(task.id)
                                 )
@@ -875,13 +875,13 @@ async def request_changes(
 
     from app.review_pipeline import _spawn_pipeline_task
     if payload.action == "fix":  # noqa: SIM108 — two distinct multi-line async calls, ternary unreadable
-        spawned = await _spawn_pipeline_task(
+        spawned, _ = await _spawn_pipeline_task(
             task, "fix", session, pr_number, branch, base_branch,
             fix_prompt=f"Human reviewer requested changes:\n\n{payload.feedback}",
             original_task_id=str(task.id)
         )
     else:
-        spawned = await _spawn_pipeline_task(
+        spawned, _ = await _spawn_pipeline_task(
             task, "review", session, pr_number, branch, base_branch,
             original_prompt=task_payload.get("prompt", task.description or ""),
             original_task_id=str(task.id)
@@ -1164,7 +1164,7 @@ async def modify_task(
                         # Security scan approval: review hasn't happened yet, spawn it
                         from app.review_pipeline import _spawn_pipeline_task
                         original_prompt = task_payload.get("prompt", task.description or "")
-                        review_task = await _spawn_pipeline_task(
+                        review_task, _was_created = await _spawn_pipeline_task(
                             task, "review", session, pr_number, branch, base_branch,
                             original_prompt=original_prompt, original_task_id=str(task.id)
                         )
@@ -1356,7 +1356,7 @@ async def trigger_rollup(
             task.latest_status_message = f"Rollup merge failed: {merge_result.get('message')}"
     else:
         task.context = {**ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-        review_task = await _spawn_pipeline_task(
+        review_task, _ = await _spawn_pipeline_task(
             task, "review", session, rollup_pr_number, staging_branch, target_branch,
             original_prompt=task.description or task.title,
             original_task_id=str(task.id)

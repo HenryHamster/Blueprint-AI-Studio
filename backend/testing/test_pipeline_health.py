@@ -120,7 +120,7 @@ async def test_failure_distribution_uses_classify_failure_categories():
                   latest_status_message="gcp quota exceeded for zone us-central1"),
         # RATE_LIMIT
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="claude api rate limit reached"),
+                  latest_status_message="API Error: Rate limit reached"),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -151,7 +151,7 @@ async def test_failure_distribution_top_3_only():
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
                   latest_status_message="vm startup failed network"),
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=6),
-                  latest_status_message="claude rate limit"),  # RATE_LIMIT x1 (should be cut)
+                  latest_status_message="API Error: Rate limit reached"),  # RATE_LIMIT x1 (should be cut)
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=7),
                   latest_status_message="heartbeat lost timeout oom"),  # AGENT_TIMEOUT x1 (should be cut)
     ]
