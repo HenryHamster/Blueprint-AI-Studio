@@ -709,6 +709,15 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     for (const [cat, pct] of entries) {
       candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback`);
     }
+    // Append specific recurring patterns if available
+    type FirstReviewIssue = { description: string; count: number; category: string };
+    const topIssues = ctx.top_first_review_issues as FirstReviewIssue[] | null | undefined;
+    if (topIssues && topIssues.length > 0) {
+      candidateLines.push('**Specific patterns to avoid:**');
+      for (const issue of topIssues) {
+        candidateLines.push(`- "${issue.description}" (seen ${issue.count}x, category: ${issue.category})`);
+      }
+    }
     candidateLines.push('');
     const candidate = candidateLines.join('\n');
     if (candidate.length <= budget) {
