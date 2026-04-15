@@ -390,6 +390,15 @@ async def bulk_action_tasks(
                     task.attempt_count = 0
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     task.last_heartbeat = None
+                    # Reset retry counters for a clean slate — matches single-task admin retry
+                    bulk_ctx = dict(task.context or {})
+                    bulk_ctx.pop("provision_failures", None)
+                    bulk_ctx.pop("retry_after", None)
+                    bulk_ctx.pop("max_plan_account_id", None)
+                    bulk_ctx.pop("blacklisted_accounts", None)
+                    bulk_ctx.pop("_slot_released", None)
+                    bulk_ctx.pop("_api_failure_retries", None)
+                    task.context = bulk_ctx
                 history = TaskHistory(
                     task_id=task.id,
                     action="MODIFIED",

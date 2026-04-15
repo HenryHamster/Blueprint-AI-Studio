@@ -6,12 +6,17 @@ endpoints need to read or mutate autonomous-loop / runtime-config state.
 
 import os
 import asyncio
+import logging
 from collections import deque
-from datetime import datetime
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+
+from app.time_utils import _utcnow
+
+logger = logging.getLogger(__name__)
 
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
@@ -78,12 +83,14 @@ def get_circuit_breaker(project_id: str) -> Dict:
     if project_id not in circuit_breakers:
         circuit_breakers[project_id] = {
             "state": "CLOSED",           # CLOSED, OPEN, HALF_OPEN
-            "failure_count": 0,          # consecutive failures
+            "failure_count": 0,          # consecutive code-quality failures (CODE_ERROR, AGENT_TIMEOUT)
+            "infra_failure_count": 0,    # consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API)
             "success_count": 0,          # consecutive successes (for half-open)
             "opened_at": None,           # when the breaker tripped
             "cooldown_seconds": 1800,    # 30 min initial cooldown
             "base_cooldown": 1800,       # for exponential backoff reset
             "half_open_task_id": None,   # the test task in HALF_OPEN
+            "open_reason": None,         # "code" or "infra" — why the breaker opened
         }
     return circuit_breakers[project_id]
 
@@ -106,7 +113,164 @@ deploy_monitoring: Dict = {
     "last_dispatch_time": None,     # last time orchestrator dispatched a task
     "last_completion_time": None,   # last time an agent reported completion
     "consecutive_health_failures": 0,
+    # Bounded ring buffer of pipeline-health events written by the reaper.
+    # Each entry: {"type": str, "ts": datetime, "task_id": str,
+    #              "vm_id": Optional[str], "zone": Optional[str],
+    #              "account_id": Optional[str]}
+    "pipeline_events": deque(maxlen=500),
+    # event_type -> last datetime an alert fired (for dedup window)
+    "pipeline_alert_last_ts": {},
 }
+
+# Pipeline-health event taxonomy. The reaper writes one of these into
+# deploy_monitoring["pipeline_events"] at each terminal decision point.
+PIPELINE_EVENT_TYPES = frozenset({
+    "heartbeat_timeout_post_claim",
+    "provision_timeout_pre_claim",
+    "absolute_timeout",
+    "never_started",
+    "account_blacklisted",
+})
+
+# Threshold counts (per 1h window) that trigger a system-level alert.
+# "reap_rate_per_hour" aggregates all reap-reason events to catch
+# cascading infra failure even when no single category trips.
+PIPELINE_ALERT_THRESHOLDS = {
+    "heartbeat_timeout_post_claim": int(os.getenv("ALERT_HEARTBEAT_TIMEOUT", "10")),
+    "provision_timeout_pre_claim": int(os.getenv("ALERT_PROVISION_TIMEOUT", "5")),
+    "account_blacklisted": int(os.getenv("ALERT_ACCOUNT_BLACKLIST", "3")),
+    "reap_rate_per_hour": int(os.getenv("ALERT_REAP_RATE", "15")),
+}
+PIPELINE_ALERT_DEDUP_SECONDS = 1800
+
+# Reap-reason codes that contribute to the aggregate reap_rate counter.
+_REAP_REASON_EVENT_TYPES = frozenset({
+    "heartbeat_timeout_post_claim",
+    "provision_timeout_pre_claim",
+    "absolute_timeout",
+    "never_started",
+})
+
+
+def record_pipeline_event(event_type: str, **kwargs: Any) -> None:
+    """Append a pipeline-health event and, if a threshold is crossed, fire an alert.
+
+    Unknown event types are dropped silently so callers don't break the reaper
+    on a typo — the snapshot endpoint will simply not expose them.
+    """
+    if event_type not in PIPELINE_EVENT_TYPES:
+        return
+    event = {
+        "type": event_type,
+        "ts": _utcnow(),
+        "task_id": kwargs.get("task_id"),
+        "vm_id": kwargs.get("vm_id"),
+        "zone": kwargs.get("zone"),
+        "account_id": kwargs.get("account_id"),
+    }
+    deploy_monitoring["pipeline_events"].append(event)
+    _maybe_fire_pipeline_alert(event_type)
+
+
+def count_pipeline_events(event_type: str, window_seconds: int = 3600) -> int:
+    """Count events of `event_type` (or all reap reasons for "reap_rate_per_hour")
+    within the trailing `window_seconds`."""
+    cutoff = _utcnow() - timedelta(seconds=window_seconds)
+    if event_type == "reap_rate_per_hour":
+        return sum(
+            1 for e in deploy_monitoring["pipeline_events"]
+            if e.get("ts") and e["ts"] >= cutoff and e.get("type") in _REAP_REASON_EVENT_TYPES
+        )
+    return sum(
+        1 for e in deploy_monitoring["pipeline_events"]
+        if e.get("ts") and e["ts"] >= cutoff and e.get("type") == event_type
+    )
+
+
+def get_pipeline_health_snapshot() -> Dict[str, Any]:
+    """Snapshot for /api/health/detailed: rolling counts, last-seen timestamps,
+    thresholds, and which alert categories are currently above threshold."""
+    counts: Dict[str, int] = {}
+    last_event_ts: Dict[str, Optional[str]] = {}
+    for et in PIPELINE_EVENT_TYPES:
+        counts[et] = count_pipeline_events(et)
+        last_event_ts[et] = None
+    counts["reap_rate_per_hour"] = count_pipeline_events("reap_rate_per_hour")
+
+    for e in deploy_monitoring["pipeline_events"]:
+        et = e.get("type")
+        ts = e.get("ts")
+        if et in PIPELINE_EVENT_TYPES and ts is not None:
+            iso = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+            prev = last_event_ts.get(et)
+            if prev is None or iso > prev:
+                last_event_ts[et] = iso
+
+    alerts_active = [
+        et for et, threshold in PIPELINE_ALERT_THRESHOLDS.items()
+        if counts.get(et, 0) >= threshold
+    ]
+
+    return {
+        "counts_1h": counts,
+        "last_event_ts": last_event_ts,
+        "thresholds": dict(PIPELINE_ALERT_THRESHOLDS),
+        "alerts_active": alerts_active,
+    }
+
+
+def _maybe_fire_pipeline_alert(event_type: str) -> None:
+    """Check whether `event_type` (and the aggregate reap_rate) crossed
+    threshold and post a deduplicated system alert if so.
+
+    Posts via logger.error + best-effort webhook so operators can wire alerts
+    without depending on the project-scoped Alert table.
+    """
+    candidates = [event_type]
+    if event_type in _REAP_REASON_EVENT_TYPES:
+        candidates.append("reap_rate_per_hour")
+
+    for category in candidates:
+        threshold = PIPELINE_ALERT_THRESHOLDS.get(category)
+        if threshold is None:
+            continue
+        count = count_pipeline_events(category)
+        if count < threshold:
+            continue
+        last_ts = deploy_monitoring["pipeline_alert_last_ts"].get(category)
+        now = _utcnow()
+        if last_ts and (now - last_ts).total_seconds() < PIPELINE_ALERT_DEDUP_SECONDS:
+            continue
+        deploy_monitoring["pipeline_alert_last_ts"][category] = now
+        _post_pipeline_alert(category, count, threshold)
+
+
+def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
+    """Emit the alert via structured log + webhook. Failures here must never
+    break the reaper, so all errors are swallowed with a warning."""
+    title = f"Pipeline health threshold crossed: {category}"
+    message = (
+        f"{count} {category} events in the last hour "
+        f"(threshold {threshold}). Inspect /api/health/detailed for context."
+    )
+    logger.error(
+        title,
+        extra={"alert": True, "type": "pipeline_health", "category": category,
+               "count": count, "threshold": threshold},
+    )
+    try:
+        from app.main import _send_webhook_notification  # noqa: PLC0415
+        # Detached task — webhook is fire-and-forget by design.
+        # asyncio.get_running_loop() raises RuntimeError outside an event loop;
+        # that's the correct signal to skip dispatch (e.g. sync tests).
+        loop = asyncio.get_running_loop()
+        loop.create_task(
+            _send_webhook_notification("PIPELINE_HEALTH_THRESHOLD", title, message)
+        )
+    except RuntimeError:
+        pass
+    except Exception as e:
+        logger.warning(f"[PIPELINE_HEALTH] webhook dispatch skipped: {e}")
 
 # --- Prometheus-compatible metrics counters ---
 # Gauges: updated by orchestrator each cycle

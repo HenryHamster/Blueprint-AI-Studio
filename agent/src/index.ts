@@ -1070,6 +1070,25 @@ async function main() {
   log(`Agent source: ${import.meta.url}`);
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
+  // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
+  // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
+  // so the backend heartbeat endpoint accepts this task_id before claim runs.
+  const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
+
+  // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
+  // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent
+  // startup deaths into explained ones. Uses sendHeartbeatSync so the request
+  // flushes before the process exits.
+  const reportPreClaimFailure = (reason: string) => {
+    if (!PRE_CLAIM_TASK_ID) {
+      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${reason}`);
+      return;
+    }
+    const truncated = reason.slice(0, 500);
+    log(`Reporting pre-claim failure for task ${PRE_CLAIM_TASK_ID}: ${truncated}`);
+    sendHeartbeatSync(PRE_CLAIM_TASK_ID, `PRE_CLAIM_FAILED: ${truncated}`);
+  };
+
   // Auth: CLAUDE_CODE_OAUTH_TOKEN env var is read directly by Claude Code CLI (no file needed)
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     log('Using OAuth token for Claude Code auth');
@@ -1099,6 +1118,9 @@ async function main() {
     });
     if (valResult.exitCode !== 0 && matchesRateLimit(valResult.stderr)) {
       log(`Token validation FAILED — account rate-limited: ${valResult.stderr.slice(0, 200)}`);
+      // Report the rate-limit before exiting so the reaper's status message has
+      // forensic evidence instead of a silent provision failure.
+      reportPreClaimFailure(`token validation rate-limited: ${valResult.stderr.slice(0, 200)}`);
       // Exit immediately — reaper will catch the task in PROVISIONING and requeue.
       // Don't waste 2+ minutes of setup only to discover the same thing.
       process.exit(1);
@@ -1129,8 +1151,17 @@ async function main() {
     log(`WARNING: Stale result scan failed: ${String(e)}`);
   }
 
-  // Claim task
-  const task = await apiPost('/api/agent/claim') as Record<string, unknown>;
+  // Claim task. Wrap in try/catch so a claim failure (network, 4xx, 5xx) is
+  // reported via pre-claim heartbeat rather than dying silently. Without this
+  // the task stays in PROVISIONING until the reaper times out with no evidence.
+  let task: Record<string, unknown>;
+  try {
+    task = await apiPost('/api/agent/claim') as Record<string, unknown>;
+  } catch (claimErr) {
+    const errMsg = claimErr instanceof Error ? `${claimErr.message}${claimErr.stack ? '\n' + claimErr.stack : ''}` : String(claimErr);
+    reportPreClaimFailure(`claim failed: ${errMsg}`);
+    throw claimErr;
+  }
   const taskId = strVal(task.task_id);
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
@@ -1220,20 +1251,19 @@ async function main() {
 // looks identical: heartbeats stop, task stays IN_PROGRESS, no evidence.
 function _crashReport(label: string, detail: string, exitCode: number) {
   console.error(`[FATAL] ${label}: ${detail}`);
-  // Fire-and-forget: try to send one last heartbeat with the error info.
-  // This updates latest_status_message so the reaper's "last heartbeat"
-  // carries the crash reason instead of the last tool name.
-  try {
-    const metrics = collectMetrics();
-    const msg = `[FATAL:${label}] ${detail.slice(0, 300)}`;
-    fetch(`${ORCHESTRATOR_URL}/api/agent/heartbeat`, {
-      method: 'POST', headers: apiHeaders,
-      body: JSON.stringify({ task_id: process.env.TASK_ID, status_message: `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, metrics }),
-      signal: AbortSignal.timeout(5000),
-    }).catch(() => {});
-  } catch { /* best effort */ }
-  // Give the fetch 1s to flush before exiting
-  setTimeout(() => process.exit(exitCode), 1000);
+  // Synchronous curl — fire-and-forget fetch() couldn't guarantee the write
+  // flushed before process.exit, so crashes would show up as silent heartbeat
+  // timeouts instead of explained failures. sendHeartbeatSync blocks on curl
+  // (5s max) so the request lands before we exit.
+  const taskId = process.env.TASK_ID;
+  if (taskId) {
+    try {
+      const metrics = collectMetrics();
+      const msg = `[FATAL:${label}] ${detail.slice(0, 300)}`;
+      sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`);
+    } catch { /* best effort — we're dying anyway */ }
+  }
+  process.exit(exitCode);
 }
 
 process.on('unhandledRejection', (reason) => {

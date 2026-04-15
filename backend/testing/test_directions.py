@@ -1933,3 +1933,165 @@ class TestCalibrateScope:
             {"xlarge": {"created": 10, "merged": 0}},
         ])
         assert _calibrate_scope("xlarge", d) == ("xlarge", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline awareness: stalled-cycle detection and research failure recording
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDirectionHealthRule4:
+    """Rule 4 pauses a direction after 3 consecutive failing cycles."""
+
+    def _make_entry(self, *, research_task_failed: bool = False,
+                    tasks_failed: int = 0, prs_merged: int = 0,
+                    tasks_created: int = 0) -> dict:
+        return {
+            "timestamp": "2026-04-15T00:00:00",
+            "tasks_created": tasks_created,
+            "tasks_failed": tasks_failed,
+            "prs_merged": prs_merged,
+            "research_task_failed": research_task_failed,
+        }
+
+    def test_rule4_three_research_task_failures_trips(self):
+        from app.strategic_completion import _check_direction_health
+        d = {"research_history": [self._make_entry(research_task_failed=True) for _ in range(3)]}
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Recent stall" in reason
+
+    def test_rule4_three_failed_children_trips(self):
+        """3 cycles each with ≥1 failed child and zero merges pauses the direction.
+
+        Keep the failure ratio under 70% so Rule 3 does not fire first — we are
+        specifically testing that Rule 4 catches the 'any failures, no merges'
+        pattern that Rule 3 would miss.
+        """
+        from app.strategic_completion import _check_direction_health
+        d = {"research_history": [
+            # 5 created, 1 failed = 20% — below Rule 3's 70% — but 0 merged triggers Rule 4
+            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0) for _ in range(3)
+        ]}
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Recent stall" in reason
+
+    def test_rule4_mixed_with_merge_does_not_trip(self):
+        """If any of the last 3 cycles has a merge, Rule 4 does not trip."""
+        from app.strategic_completion import _check_direction_health
+        d = {"research_history": [
+            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=1),  # has a merge
+            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+        ]}
+        reason = _check_direction_health(d)
+        # Rules 1-3 should not trip either on this short history
+        assert reason is None
+
+    def test_rule4_fewer_than_three_entries_does_not_trip(self):
+        from app.strategic_completion import _check_direction_health
+        d = {"research_history": [self._make_entry(research_task_failed=True) for _ in range(2)]}
+        assert _check_direction_health(d) is None
+
+    def test_rule4_mixed_failure_modes_trip(self):
+        """Mixed research-task failures and failed-children count as failing cycles.
+
+        Middle cycle keeps failure ratio under Rule 3's 70% threshold so Rule 4
+        is the check that actually catches the pattern.
+        """
+        from app.strategic_completion import _check_direction_health
+        d = {"research_history": [
+            self._make_entry(research_task_failed=True),
+            self._make_entry(tasks_created=5, tasks_failed=1, prs_merged=0),
+            self._make_entry(research_task_failed=True),
+        ]}
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Recent stall" in reason
+
+
+@pytest.mark.asyncio
+async def test_record_research_task_failure_appends_history(db_session):
+    """FAILED research task records a research_task_failed entry on its direction."""
+    from app.research_completion import _record_research_task_failure
+
+    direction = {
+        "id": "d-failrec1",
+        "text": "Failure recording test",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="Failure Recording Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Failed research",
+        description="research failed at provisioning",
+        payloads=[{"type": "research", "prompt": "find things"}],
+        context={"direction_id": "d-failrec1"},
+        status=TaskStatus.FAILED,
+        latest_status_message="provisioning failed: zone exhausted",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _record_research_task_failure(task, db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    d = next(x for x in project.directions if x["id"] == "d-failrec1")
+    history = d.get("research_history", [])
+    assert len(history) == 1
+    entry = history[0]
+    assert entry.get("research_task_failed") is True
+    assert entry.get("tasks_created") == 0
+    assert entry.get("task_id") == str(task.id)
+    assert "failure_category" in entry
+    assert d.get("last_researched_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_record_research_task_failure_no_direction_is_noop(db_session):
+    """Task without direction_id does not crash _record_research_task_failure."""
+    from app.research_completion import _record_research_task_failure
+
+    project = Project(
+        name="No Direction Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Failed research",
+        description="no direction attached",
+        payloads=[{"type": "research", "prompt": "find things"}],
+        context={},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Should be a silent no-op, no exception
+    await _record_research_task_failure(task, db_session)

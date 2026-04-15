@@ -51,6 +51,8 @@ class StuckTaskInfo(TypedDict):
 class CircuitBreakerInfo(TypedDict):
     state: str
     failure_count: int
+    infra_failure_count: int
+    open_reason: Optional[str]
     cooldown_seconds: int
     cooldown_remaining_seconds: Optional[int]
     opened_at: Optional[str]
@@ -95,7 +97,10 @@ async def _build_stuck_tasks(
     """Detect stuck tasks and build the diagnostics list."""
     from app.compute import get_zone_health  # noqa: PLC0415
     stuck: List[StuckTaskInfo] = []
-    provision_timeout_secs = 5 * 60
+    # Align with reaper's pre-claim threshold (6 min) so diagnostics don't flag a
+    # PROVISIONING task before the reaper would act on it. heartbeat threshold
+    # stays at 5 min to match reaper's IN_PROGRESS threshold.
+    provision_timeout_secs = 6 * 60
     no_heartbeat_secs = 5 * 60
     long_queued_secs = 30 * 60
     stuck_deps_secs = 10 * 60
@@ -139,8 +144,12 @@ async def _build_stuck_tasks(
         unresolvable_deps: List[str] = []
         remediation_hint = ""
 
-        if task.status == TaskStatus.PROVISIONING and task.last_heartbeat is None and task.started_at is not None:
-            age = (now - task.started_at).total_seconds()
+        if task.status == TaskStatus.PROVISIONING and task.last_heartbeat is None and task.vm_provisioned_at is not None:
+            # vm_provisioned_at is the orchestrator-side VM lifecycle clock (set
+            # at dispatch and refreshed when GCE confirms running). last_heartbeat
+            # is the agent-side clock and is None until claim. Using
+            # vm_provisioned_at here matches the reaper's pre-claim threshold.
+            age = (now - task.vm_provisioned_at).total_seconds()
             if age > provision_timeout_secs:
                 stuck_reason = "provision_timeout"
                 stuck_for_seconds = int(age - provision_timeout_secs)
@@ -249,6 +258,8 @@ def _format_circuit_breaker(cb: dict) -> CircuitBreakerInfo:
     return {
         "state": cb.get("state", "CLOSED"),
         "failure_count": cb.get("failure_count", 0),
+        "infra_failure_count": cb.get("infra_failure_count", 0),
+        "open_reason": cb.get("open_reason"),
         "cooldown_seconds": cb.get("cooldown_seconds", 1800),
         "cooldown_remaining_seconds": cooldown_remaining,
         "opened_at": opened_at.isoformat() if opened_at else None,

@@ -310,6 +310,11 @@ async def claim_task(
 
     task.status = TaskStatus.IN_PROGRESS
     task.last_heartbeat = _utcnow()  # Immediate heartbeat — don't wait 30s for agent interval
+    # Record time-to-claim so we can measure the real distribution of VM cold-boot
+    # + auth validation + claim and tighten the reaper's pre-claim threshold later.
+    if task.vm_provisioned_at:
+        claim_latency = (task.last_heartbeat - task.vm_provisioned_at).total_seconds()
+        task.context = {**(task.context or {}), "claim_latency_secs": round(claim_latency, 1)}
     session.add(task)
     await session.commit()
     await session.refresh(task)

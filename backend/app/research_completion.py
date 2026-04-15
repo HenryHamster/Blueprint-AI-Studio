@@ -892,7 +892,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         did = (ct.context or {}).get("direction_id")
         if did:
             direction_ids_with_findings.add(did)
-    # If all findings were deduped, still put the current direction on cooldown
+    # If all findings were deduped OR no findings at all, still put the current
+    # direction on cooldown and record a cycle entry. This closes a blind spot
+    # where research tasks that completed with zero actionable findings (agent
+    # subtask failure, malformed output, etc.) left no trace in research_history
+    # and _check_direction_health could not see the stalled cycle.
     current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
     skipped_duplicates = hash_dedup_count + word_overlap_count + file_overlap_count
     all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
@@ -909,7 +913,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if empty_prompt_count:
         _filter_parts.append(f"{empty_prompt_count} empty-prompt")
     _filter_str = f" ({', '.join(_filter_parts)} skipped)" if _filter_parts else ""
-    if all_deduped and current_direction_id:
+    no_findings_cycle = len(child_tasks) == 0 and skipped_duplicates == 0
+    if (all_deduped or no_findings_cycle) and current_direction_id:
         direction_ids_with_findings.add(current_direction_id)
     if direction_ids_with_findings:
         project = await session.get(Project, task.project_id)
@@ -959,6 +964,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "empty_prompt": empty_prompt_count,
                         },
                     }
+                    if no_findings_cycle and not titles:
+                        entry["no_findings"] = True
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
                     new_history = history + [entry]
                     if len(new_history) > 10:
@@ -1304,3 +1311,72 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     )
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
+
+
+async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
+    """Record a FAILED research task in the direction's research_history.
+
+    Closes a blind spot where research tasks that never reached _handle_research_completion
+    (VM crash, provision failure, agent timeout, etc.) left no trace on the direction,
+    so _check_direction_health could not observe the stalled cycle.
+
+    Appends a minimal history entry tagged research_task_failed=True to the direction
+    referenced in task.context.direction_id (falling back to the payload field).
+    """
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+
+    direction_id = (task.context or {}).get("direction_id") or task.first_payload.get("current_direction_id")
+    if not direction_id:
+        return
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return
+    directions = list(project.directions or [])
+    target = next((d for d in directions if d.get("id") == direction_id), None)
+    if not target:
+        return
+    now_iso = _utcnow().isoformat()
+    failure_category = classify_failure(task, task.latest_status_message or "")
+    entry = {
+        "timestamp": now_iso,
+        "task_id": str(task.id),
+        "tasks_created": 0,
+        "tasks_failed": 0,
+        "tasks_completed": 0,
+        "prs_merged": 0,
+        "summary": f"research task failed: {failure_category}",
+        "finding_titles": [],
+        "key_finding_descriptions": [],
+        "research_task_failed": True,
+        "failure_category": failure_category,
+    }
+    history = target.get("research_history", [])
+    new_history = history + [entry]
+    # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
+    if len(new_history) > 10:
+        evicted = new_history[:-10]
+        prev_agg = target.get("history_aggregate", {
+            "total_cycles": 0, "total_tasks_created": 0,
+            "total_prs_merged": 0, "total_prs_rejected": 0,
+            "total_tasks_failed": 0,
+            "total_tasks_cancelled": 0, "first_cycle_at": None,
+        })
+        for ev in evicted:
+            prev_agg["total_cycles"] += 1
+            prev_agg["total_tasks_created"] += ev.get("tasks_created", 0)
+            prev_agg["total_prs_merged"] += ev.get("prs_merged", 0)
+            prev_agg["total_prs_rejected"] = prev_agg.get("total_prs_rejected", 0) + ev.get("prs_rejected", 0)
+            prev_agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
+            prev_agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
+            if not prev_agg["first_cycle_at"] and ev.get("timestamp"):
+                prev_agg["first_cycle_at"] = ev["timestamp"]
+        target["history_aggregate"] = prev_agg
+    target["research_history"] = new_history[-10:]
+    target["last_researched_at"] = now_iso
+    project.directions = directions
+    flag_modified(project, "directions")
+    session.add(project)
+    logger.warning(
+        f"[RESEARCH] Recorded failed research task {task.id} on direction "
+        f"{direction_id} ({failure_category})"
+    )
