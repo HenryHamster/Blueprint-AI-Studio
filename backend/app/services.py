@@ -151,47 +151,52 @@ async def _run_stale_branch_cleanup():
             )
         )).scalars().all()
 
-        # Collect all branch names referenced by non-terminal tasks
         ACTIVE_STATUSES = [
             TaskStatus.QUEUED, TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
         ]
-        active_tasks = (await session.execute(
-            select(Task).where(Task.status.in_(ACTIVE_STATUSES))
-        )).scalars().all()
-
-        active_branches: set = set()
-        for task in active_tasks:
-            ctx = task.context or {}
-            # Review loop branch
-            rl_branch = ctx.get("review_loop", {}).get("branch")
-            if rl_branch:
-                active_branches.add(rl_branch)
-            # Staging branches
-            for key in ("plan_branch", "research_branch", "branch"):
-                b = ctx.get(key)
-                if b:
-                    active_branches.add(b)
-            # Payload branches
-            for payload in (task.payloads or []):
-                pb = payload.get("branch")
-                if pb:
-                    active_branches.add(pb)
-            # Computed branch name from task ID (covers cases not in context)
-            task_type = task.first_payload.get("type", "task")
-            type_prefix = {
-                "create": "task", "fix": "fix", "refactor": "refactor",
-                "docs": "docs", "deps": "deps", "migrate": "migrate",
-            }.get(task_type, "task")
-            short_id = str(task.id).replace("-", "")[:8]
-            active_branches.add(f"blueprint/{type_prefix}-{short_id}")
-
         now = _utcnow()
 
         for project in projects:
             if total_deleted >= _MAX_DELETES_TOTAL:
                 logger.info(f"[BRANCH CLEANUP] Global cap ({_MAX_DELETES_TOTAL}) reached, stopping")
                 break
+
+            # Collect branch names referenced by this project's active tasks only,
+            # selecting only the columns needed to avoid loading large JSONB payloads.
+            active_task_rows = (await session.execute(
+                select(Task.id, Task.context, Task.payloads).where(
+                    Task.status.in_(ACTIVE_STATUSES),
+                    Task.project_id == project.id,
+                )
+            )).all()
+
+            active_branches: set = set()
+            for row in active_task_rows:
+                ctx = row.context or {}
+                # Review loop branch
+                rl_branch = ctx.get("review_loop", {}).get("branch")
+                if rl_branch:
+                    active_branches.add(rl_branch)
+                # Staging branches
+                for key in ("plan_branch", "research_branch", "branch"):
+                    b = ctx.get(key)
+                    if b:
+                        active_branches.add(b)
+                # Payload branches
+                for payload in (row.payloads or []):
+                    pb = payload.get("branch")
+                    if pb:
+                        active_branches.add(pb)
+                # Computed branch name from task ID (covers cases not in context)
+                first_payload = (row.payloads or [{}])[0]
+                task_type = first_payload.get("type", "task")
+                type_prefix = {
+                    "create": "task", "fix": "fix", "refactor": "refactor",
+                    "docs": "docs", "deps": "deps", "migrate": "migrate",
+                }.get(task_type, "task")
+                short_id = str(row.id).replace("-", "")[:8]
+                active_branches.add(f"blueprint/{type_prefix}-{short_id}")
 
             try:
                 token = await _get_project_github_token(project, session)

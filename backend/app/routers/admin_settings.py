@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm import aliased
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
@@ -1089,18 +1090,23 @@ async def repair_state(
             repairs.append(f"Re-triggered rollup for {parent.id}")
 
     # 3. Tasks with parent_task_id pointing to non-existent tasks
-    all_task_ids = {str(t.id) for t in (await session.execute(select(Task.id))).scalars().all()}
+    ParentTask = aliased(Task)
     orphan_children = (await session.execute(
-        select(Task).where(Task.parent_task_id.isnot(None))
+        select(Task).where(
+            Task.parent_task_id.isnot(None),
+            ~select(ParentTask.id)
+            .where(ParentTask.id == Task.parent_task_id)
+            .correlate(Task)
+            .exists()
+        )
     )).scalars().all()
 
     for t in orphan_children:
-        if str(t.parent_task_id) not in all_task_ids:
-            t.parent_task_id = None
-            t.latest_status_message = "Repaired: cleared orphaned parent reference"
-            session.add(t)
-            session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
-            repairs.append(f"Cleared orphaned parent ref on {t.id}")
+        t.parent_task_id = None
+        t.latest_status_message = "Repaired: cleared orphaned parent reference"
+        session.add(t)
+        session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "orphaned_parent_ref"}))
+        repairs.append(f"Cleared orphaned parent ref on {t.id}")
 
     # 4. Circuit breakers stuck in HALF_OPEN with a deleted/non-existent test task
     from app.main import _maybe_create_circuit_breaker_alert, _utcnow as _main_utcnow
