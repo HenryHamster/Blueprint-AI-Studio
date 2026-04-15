@@ -45,6 +45,7 @@ import {
   discoverRelatedTests,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
+  buildSelfReviewPrompt,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -595,5 +596,76 @@ describe('buildRetryContext', () => {
     const task = { context: { _attempt_number: 2, _previous_failure_class: 'CODE_ERROR', _previous_error: 'err' } };
     const result = buildRetryContext(task);
     expect(result.endsWith('\n')).toBe(true);
+  });
+});
+
+describe('buildSelfReviewPrompt', () => {
+  const baseOpts = {
+    rawPrompt: 'Implement feature X',
+    taskTitle: 'feat: add X',
+    diff: 'diff --git a/foo.ts b/foo.ts',
+    reviewPlaybook: {},
+    claudeMd: '',
+  };
+
+  it('includes default build commands when buildConfig is absent', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    expect(result).toContain('## Build Verification');
+    expect(result).toContain('npm run build');
+    expect(result).toContain('tsc --noEmit');
+    expect(result).toContain('py_compile');
+  });
+
+  it('includes default build commands when buildConfig has empty directories', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, buildConfig: { directories: [] } });
+    expect(result).toContain('## Build Verification');
+    expect(result).toContain('npm run build');
+  });
+
+  it('uses buildConfig commands when directories have build_cmd', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      buildConfig: {
+        directories: [{ path: 'frontend', type: 'node', build_cmd: 'npm run build', lint_cmd: '' }],
+      },
+    });
+    expect(result).toContain('## Build Verification');
+    expect(result).toContain('`npm run build`');
+    expect(result).toContain('frontend/');
+    // should NOT contain default fallback text
+    expect(result).not.toContain('admin-ui');
+  });
+
+  it('uses lint_cmd when build_cmd is absent', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      buildConfig: {
+        directories: [{ path: 'backend', type: 'python', build_cmd: '', lint_cmd: 'flake8 .' }],
+      },
+    });
+    expect(result).toContain('`flake8 .`');
+  });
+
+  it('omits build verification section when all directories lack both build_cmd and lint_cmd', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      buildConfig: {
+        directories: [{ path: 'docs', type: 'node', build_cmd: '', lint_cmd: '' }],
+      },
+    });
+    expect(result).not.toContain('## Build Verification');
+  });
+
+  it('positions Build Verification before the Self-Review Instructions checklist', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    const buildPos = result.indexOf('## Build Verification');
+    const checklistPos = result.indexOf('## Self-Review Instructions');
+    expect(buildPos).toBeGreaterThan(-1);
+    expect(buildPos).toBeLessThan(checklistPos);
+  });
+
+  it('instructs agent to run commands before the checklist', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    expect(result).toContain('fix the errors before proceeding with the review checklist');
   });
 });

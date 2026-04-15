@@ -380,6 +380,17 @@ describe('self-review phase', () => {
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
   });
 
+  it('runs self-review for handleQA when there are changes', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')       // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file') // status --porcelain → hasChanges = true
+      .mockReturnValue('');          // all remaining git calls
+    const task = { title: 'QA task', description: '' };
+    await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // runClaudeCode should be called twice: once for main task, once for self-review
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+  });
+
   it('includes self-review result in PR body when fixes were applied', async () => {
     // Simulate: main task diff, then self-review changes something (HEAD changes)
     vi.mocked(git)

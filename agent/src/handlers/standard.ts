@@ -143,11 +143,27 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       statusRef.value = 'Running self-review...';
 
       // Gather diff: committed changes since base + any uncommitted changes
-      const committedDiff = currentHead !== baseCommit
-        ? git(['diff', `${baseCommit}..HEAD`]).slice(0, 5000)
+      const committedDiffFull = currentHead !== baseCommit
+        ? git(['diff', `${baseCommit}..HEAD`])
         : '';
-      const uncommittedDiff = git(['diff', 'HEAD']).slice(0, 3000);
+      const uncommittedDiffFull = git(['diff', 'HEAD']);
+      const COMMITTED_LIMIT = 8000;
+      const UNCOMMITTED_LIMIT = 3000;
+      const committedDiff = committedDiffFull.slice(0, COMMITTED_LIMIT);
+      const uncommittedDiff = uncommittedDiffFull.slice(0, UNCOMMITTED_LIMIT);
       const reviewDiff = (committedDiff + (uncommittedDiff ? '\n' + uncommittedDiff : '')).trim();
+
+      const diffTruncated = committedDiffFull.length > COMMITTED_LIMIT || uncommittedDiffFull.length > UNCOMMITTED_LIMIT;
+      let changedFiles: string[] | undefined;
+      if (diffTruncated) {
+        const nameOnly = git(['diff', '--name-only', `${baseCommit}..HEAD`]);
+        const uncommittedNames = git(['diff', '--name-only', 'HEAD']);
+        const allNames = new Set([
+          ...nameOnly.split('\n'),
+          ...uncommittedNames.split('\n'),
+        ].filter(f => f.trim()));
+        changedFiles = [...allNames];
+      }
 
       // Filter playbook to review-related entries
       const playbook = task.playbook as Record<string, string> | undefined;
@@ -164,6 +180,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         diff: reviewDiff,
         reviewPlaybook,
         claudeMd,
+        buildConfig,
+        changedFiles,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -440,8 +458,9 @@ IMPORTANT RULES:
     commitPrefix: 'test',
     prTitlePrefix: 'test: add test coverage for',
     noChangesMessage: 'No test files added.',
-    runLintFix: false,
+    runLintFix: true,
     runTestFix: false,
+    runSelfReview: true,
   });
 }
 

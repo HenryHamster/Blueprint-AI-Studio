@@ -780,6 +780,8 @@ export function buildSelfReviewPrompt(opts: {
   diff: string;
   reviewPlaybook: Record<string, string>;
   claudeMd: string;
+  buildConfig?: BuildConfig;
+  changedFiles?: string[];
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -793,15 +795,33 @@ export function buildSelfReviewPrompt(opts: {
       }\n`
     : '';
 
+  const truncationNotice = opts.changedFiles && opts.changedFiles.length > 0
+    ? `\n\n⚠️ WARNING: The diff above was truncated. The following files were changed but may not be fully shown:\n${opts.changedFiles.map(f => `- ${f}`).join('\n')}\nRead any truncated files directly with cat/head before declaring SELF-REVIEW PASSED.`
+    : '';
   const diffSection = opts.diff
-    ? `\n## Diff (changes since base branch)\n\`\`\`diff\n${opts.diff}\n\`\`\`\n`
+    ? `\n## Diff (changes since base branch)\n\`\`\`diff\n${opts.diff}\n\`\`\`${truncationNotice}\n`
     : '\n## Diff\nNo diff available — review the changed files directly.\n';
+
+  const buildConfig = opts.buildConfig;
+  let buildVerificationSection: string;
+  if (buildConfig && buildConfig.directories && buildConfig.directories.length > 0) {
+    const checks = buildConfig.directories
+      .filter(d => d.build_cmd || d.lint_cmd)
+      .map(d => `- \`${d.build_cmd || d.lint_cmd}\` (in \`${d.path}/\`)`);
+    if (checks.length > 0) {
+      buildVerificationSection = `\n## Build Verification\nRun these build commands. If any fail, fix the errors before proceeding with the review checklist.\n\n${checks.join('\n')}\n`;
+    } else {
+      buildVerificationSection = '';
+    }
+  } else {
+    buildVerificationSection = `\n## Build Verification\nRun these build commands. If any fail, fix the errors before proceeding with the review checklist.\n\n- For frontend changes (admin-ui/): \`cd admin-ui && npm run build\`\n- For agent changes (agent/): \`cd agent && npx tsc --noEmit\`\n- For backend changes (backend/): \`cd backend && python -m py_compile app/main.py\`\n`;
+  }
 
   return `You are performing a self-review of the changes you just made for this task.
 
 ## Task Requirements
 ${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
-${restrictionsSection}${playbookSection}${diffSection}
+${restrictionsSection}${playbookSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
