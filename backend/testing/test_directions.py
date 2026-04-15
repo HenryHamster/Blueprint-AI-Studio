@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate
+from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1804,3 +1804,132 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone tests for _calibrate_scope (no DB required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCalibrateScope:
+    """Unit tests for _calibrate_scope — pure function, no DB."""
+
+    def _direction(self, scope_breakdown_per_entry: list[dict]) -> dict:
+        """Build a minimal direction dict with research_history entries."""
+        return {
+            "id": "d-test",
+            "title": "Test direction",
+            "research_history": [
+                {"scope_breakdown": bd} for bd in scope_breakdown_per_entry
+            ],
+        }
+
+    def test_no_history_returns_unchanged(self):
+        """Direction with no research_history → scope unchanged, calibrated_from None."""
+        d = {"id": "d1"}
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_empty_history_returns_unchanged(self):
+        """Explicit empty research_history → scope unchanged."""
+        d = {"id": "d1", "research_history": []}
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_insufficient_data_points_returns_unchanged(self):
+        """Less than 3 total tasks across history → no calibration (insufficient signal)."""
+        d = self._direction([
+            {"small": {"created": 1, "merged": 0}},
+            {"small": {"created": 1, "merged": 0}},
+        ])
+        # total_data_points = 2 < 3
+        assert _calibrate_scope("small", d) == ("small", None)
+
+    def test_acceptable_rate_returns_unchanged(self):
+        """Proposed scope at >= 40% merge rate → no downgrade."""
+        d = self._direction([
+            {"medium": {"created": 5, "merged": 2}},  # 40%
+        ])
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_exactly_40_percent_returns_unchanged(self):
+        """Exactly 40% merge rate → not downgraded (rate >= 0.4 threshold)."""
+        d = self._direction([
+            {"medium": {"created": 5, "merged": 2}},  # 40% exactly
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_below_threshold_downgrades_to_smaller_scope(self):
+        """Proposed scope below 40% → downgraded to next smaller scope with acceptable rate."""
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 3}},  # 30% < 40%
+            {"small": {"created": 5, "merged": 3}},    # 60% >= 40%
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
+    def test_smaller_scope_also_bad_returns_unchanged(self):
+        """Proposed scope below 40% but no smaller scope has acceptable rate → no downgrade."""
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2}},  # 20%
+            {"small": {"created": 5, "merged": 1}},    # 20%
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_smaller_scope_with_no_data_is_acceptable(self):
+        """Smaller scope with no historical data (rate=None) is treated as acceptable."""
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2}},  # 20% < 40%
+            # no "small" data
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
+    def test_boundary_40_percent_smaller_scope_is_accepted(self):
+        """Smaller scope at exactly 40% merge rate should be accepted as downgrade target."""
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 3}},  # 30% — triggers downgrade search
+            {"small": {"created": 5, "merged": 2}},    # 40% — should be accepted (>= 0.4)
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
+    def test_large_scope_downgrades_through_medium_to_small(self):
+        """Large scope below threshold downgrades: picks first smaller scope with acceptable rate."""
+        d = self._direction([
+            {"large": {"created": 10, "merged": 2}},   # 20%
+            {"medium": {"created": 10, "merged": 2}},  # 20%
+            {"small": {"created": 5, "merged": 3}},    # 60%
+        ])
+        result_scope, calibrated_from = _calibrate_scope("large", d)
+        assert result_scope == "small"
+        assert calibrated_from == "large"
+
+    def test_small_scope_cannot_be_downgraded(self):
+        """Small is the smallest scope — even with low rate, no downgrade possible."""
+        d = self._direction([
+            {"small": {"created": 10, "merged": 1}},  # 10%
+        ])
+        result_scope, calibrated_from = _calibrate_scope("small", d)
+        assert result_scope == "small"
+        assert calibrated_from is None
+
+    def test_uses_only_last_3_history_entries(self):
+        """Only the last 3 history entries are considered; older entries are ignored."""
+        # Older entries show bad rate for small, recent entries show good rate for medium
+        older_bad = {"small": {"created": 100, "merged": 0}}   # very bad
+        recent_good = {"medium": {"created": 5, "merged": 4}}  # 80% good
+        d = self._direction([older_bad, older_bad, older_bad, older_bad, recent_good, recent_good, recent_good])
+        # Only last 3 (recent_good x3) used → medium rate 80%, no downgrade
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_unknown_scope_returns_unchanged(self):
+        """Unrecognized scope string → no downgrade (not in SCOPE_ORDER)."""
+        d = self._direction([
+            {"xlarge": {"created": 10, "merged": 0}},
+        ])
+        assert _calibrate_scope("xlarge", d) == ("xlarge", None)

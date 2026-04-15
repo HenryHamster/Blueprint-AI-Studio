@@ -529,6 +529,33 @@ async def claim_task(
         except Exception:
             pass  # non-critical — don't fail the request
 
+        # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
+        review_issue_distribution = None
+        if task_type in ("create", "fix", "refactor"):
+            try:
+                from app.playbook_learning import _categorize_review_issues
+                cutoff_14d = _utcnow() - timedelta(days=14)
+                combined_review_history = []
+                for ht in high_iter_rows:
+                    if ht.created_at and ht.created_at < cutoff_14d:
+                        continue
+                    review_loop = (ht.context or {}).get("review_loop", {})
+                    rev_hist = review_loop.get("review_history", []) if review_loop else []
+                    if rev_hist:
+                        combined_review_history.extend(rev_hist)
+                if combined_review_history:
+                    buckets = _categorize_review_issues(combined_review_history)
+                    total_issues = sum(len(v) for v in buckets.values())
+                    if total_issues >= 5:
+                        sorted_cats = sorted(buckets.items(), key=lambda x: -len(x[1]))
+                        top3 = sorted_cats[:3]
+                        review_issue_distribution = {
+                            cat: round(len(issues) / total_issues, 2)
+                            for cat, issues in top3
+                        }
+            except Exception:
+                pass  # non-critical — don't fail the request
+
         response["project_context"] = {
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
@@ -537,6 +564,7 @@ async def claim_task(
             "sibling_tasks": sibling_tasks,
             "lessons": lessons,
             "pipeline_health": pipeline_health,
+            "review_issue_distribution": review_issue_distribution,
         }
     else:
         # Lightweight pipeline health for all other task types

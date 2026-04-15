@@ -292,4 +292,113 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy"}
+
+
+# ── Review accuracy ───────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_review_accuracy_none_when_fewer_than_5_reviews():
+    """review_accuracy is None when fewer than 5 review tasks exist."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=1),
+        )
+        for _ in range(4)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    assert result["review_accuracy"] is None
+
+
+@pytest.mark.asyncio
+async def test_review_accuracy_computes_precision_and_recall():
+    """review_accuracy computes precision and recall when >= 5 review tasks exist."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    # 6 reviews: 5 APPROVE (1 overridden, 1 dismissed), 1 REQUEST_CHANGES (1 miss)
+    tasks = [
+        # Plain approve — correct
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE"},
+                  created_at=now - timedelta(hours=1)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE"},
+                  created_at=now - timedelta(hours=1)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE"},
+                  created_at=now - timedelta(hours=1)),
+        # Approve overridden by user (too lenient)
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE", "user_overrode_review": True},
+                  created_at=now - timedelta(hours=1)),
+        # Review dismissed
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "REQUEST_CHANGES", "review_dismissed": True},
+                  created_at=now - timedelta(hours=1)),
+        # Approve but user caught an issue Blueprint missed (recall hit)
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE", "user_caught_issues": True},
+                  created_at=now - timedelta(hours=1)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    ra = result["review_accuracy"]
+    assert ra is not None
+    assert ra["total_reviews"] == 6
+    assert ra["overrides"] == 1
+    assert ra["dismissals"] == 1
+    assert ra["misses"] == 1
+    assert ra["total_approvals"] == 5  # 3 plain + 1 overridden + 1 user_caught (all APPROVE verdicts)
+    # precision = 1 - (1 override + 1 dismissal) / 6 = 1 - 2/6 = 0.67
+    assert ra["precision"] == round(1 - 2 / 6, 2)
+    # recall = 1 - 1 miss / 5 approvals = 0.8
+    assert ra["recall"] == round(1 - 1 / 5, 2)
+
+
+@pytest.mark.asyncio
+async def test_review_accuracy_skips_tasks_without_verdict():
+    """Tasks without blueprint_review_verdict are excluded from accuracy computation."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    # 5 tasks with verdict + 2 without — only 5 should count
+    tasks_with_verdict = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"blueprint_review_verdict": "APPROVE"},
+                  created_at=now - timedelta(hours=1))
+        for _ in range(5)
+    ]
+    tasks_without_verdict = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={},
+                  created_at=now - timedelta(hours=1))
+        for _ in range(2)
+    ]
+    session = _make_mock_session(
+        tasks=tasks_with_verdict + tasks_without_verdict,
+        project=make_project(directions=[]),
+    )
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    ra = result["review_accuracy"]
+    assert ra is not None
+    assert ra["total_reviews"] == 5

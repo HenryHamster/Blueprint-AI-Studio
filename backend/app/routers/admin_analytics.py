@@ -491,6 +491,34 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "by_scope": first_attempt_by_scope,
     }
 
+    # Review accuracy: precision and recall from user feedback signals on completed review tasks
+    review_tasks = [
+        t for t in terminal_tasks_24h
+        if (t.first_payload or {}).get("type") == "review"
+        and (t.context or {}).get("blueprint_review_verdict") is not None
+    ]
+    review_accuracy: Optional[Dict[str, Any]] = None
+    if len(review_tasks) >= 5:
+        total_reviews = len(review_tasks)
+        overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
+        dismissals = sum(1 for t in review_tasks if (t.context or {}).get("review_dismissed"))
+        misses = sum(1 for t in review_tasks if (t.context or {}).get("user_caught_issues"))
+        total_approvals = sum(
+            1 for t in review_tasks
+            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
+        precision = round(1 - (overrides + dismissals) / total_reviews, 2)
+        recall = round(1 - misses / total_approvals, 2) if total_approvals > 0 else None
+        review_accuracy = {
+            "total_reviews": total_reviews,
+            "overrides": overrides,
+            "dismissals": dismissals,
+            "misses": misses,
+            "total_approvals": total_approvals,
+            "precision": precision,
+            "recall": recall,
+        }
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -498,6 +526,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
+        "review_accuracy": review_accuracy,
     }
 
 

@@ -43,6 +43,62 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+_SCOPE_ORDER = ["small", "medium", "large"]
+
+
+def _calibrate_scope(proposed_scope: str, direction: dict) -> tuple[str, str | None]:
+    """Downgrade scope if historical merge rate at that scope is below threshold.
+
+    Returns (final_scope, calibrated_from) where calibrated_from is the original
+    scope if a downgrade occurred, else None.
+    """
+    history = direction.get("research_history", [])[-3:]
+    if not history:
+        return proposed_scope, None
+
+    # Aggregate scope_breakdown across last 3 history entries
+    aggregated: dict[str, dict] = {}
+    for entry in history:
+        for scope, stats in (entry.get("scope_breakdown") or {}).items():
+            if scope not in aggregated:
+                aggregated[scope] = {"created": 0, "merged": 0}
+            aggregated[scope]["created"] += stats.get("created", 0)
+            aggregated[scope]["merged"] += stats.get("merged", 0)
+
+    total_data_points = sum(v["created"] for v in aggregated.values())
+    if total_data_points < 3:
+        return proposed_scope, None
+
+    def _merge_rate(scope: str) -> float | None:
+        stats = aggregated.get(scope)
+        if not stats or stats["created"] < 3:
+            return None
+        return stats["merged"] / stats["created"]
+
+    rate = _merge_rate(proposed_scope)
+    if rate is None or rate >= 0.4:
+        return proposed_scope, None
+
+    # Downgrade to next smaller scope with acceptable rate
+    try:
+        idx = _SCOPE_ORDER.index(proposed_scope)
+    except ValueError:
+        return proposed_scope, None
+
+    for smaller_scope in reversed(_SCOPE_ORDER[:idx]):
+        smaller_rate = _merge_rate(smaller_scope)
+        if smaller_rate is None or smaller_rate >= 0.4:
+            logger.info(
+                "[RESEARCH] Downgrading scope %s→%s for direction '%s' "
+                "(merge rate %.0f%% < 40%%)",
+                proposed_scope, smaller_scope,
+                direction.get("title", direction.get("id", "?")),
+                rate * 100,
+            )
+            return smaller_scope, proposed_scope
+
+    return proposed_scope, None
+
 
 def _compute_momentum_factor(d: dict) -> float:
     """Return a momentum multiplier based on recent research history productivity."""
@@ -577,6 +633,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     child_tasks = []
     finding_indices = []  # Maps child_tasks index → findings array index
 
+    # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
+    _scope_cal_project = await session.get(Project, task.project_id)
+    _directions_by_id: dict = {}
+    if _scope_cal_project:
+        for _d in (_scope_cal_project.directions or []):
+            if _d.get("id"):
+                _directions_by_id[_d["id"]] = _d
+    # Also index by parent_direction_id in task context as fallback
+    _parent_direction_id = (task.context or {}).get("direction_id")
+
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", "small")
         risk = finding.get("risk", "low")
@@ -638,6 +704,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if not prompt:
             empty_prompt_count += 1
             continue
+
+        # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
+        scope_calibrated_from: str | None = None
+        if not (finding.get("scope_calibrated_from") or (task.context or {}).get("scope_calibrated_from")):
+            _dir_id = finding.get("direction_id") or _parent_direction_id
+            _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
+            if _direction:
+                scope, scope_calibrated_from = _calibrate_scope(scope, _direction)
+
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
         elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
@@ -719,6 +794,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "finding_hash": fhash,
                 **({"direction_id": direction_id} if direction_id else ({"direction_id": parent_direction_id} if parent_direction_id else {})),
                 **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
+                **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

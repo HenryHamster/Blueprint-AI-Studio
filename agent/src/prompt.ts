@@ -669,6 +669,24 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       parts.push(`Direction ROI: ${dirStr}.`);
     }
 
+    if (taskType === 'review') {
+      const reviewAccuracy = pipelineHealth.review_accuracy as Record<string, unknown> | null | undefined;
+      if (reviewAccuracy) {
+        const precision = reviewAccuracy.precision as number;
+        const overrides = reviewAccuracy.overrides as number;
+        const precPct = Math.round(precision * 100);
+        const recall = reviewAccuracy.recall as number | null | undefined;
+        const misses = reviewAccuracy.misses as number;
+        let accuracyStr = `Review accuracy: ${precPct}% precision (${overrides} overrides)`;
+        if (recall !== null && recall !== undefined) {
+          const recPct = Math.round(recall * 100);
+          accuracyStr += `, ${recPct}% recall (${misses} user-caught issues)`;
+        }
+        accuracyStr += '.';
+        parts.push(accuracyStr);
+      }
+    }
+
     if (parts.length > 0) {
       const body = parts.join(' ');
       const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
@@ -676,6 +694,26 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         healthLines = ['### Pipeline Health (last 24h)', body, ''];
         budget -= candidate.length;
       }
+    }
+  }
+
+  // Build review issue distribution section — only if budget allows
+  const reviewIssueDist = ctx.review_issue_distribution as Record<string, number> | null | undefined;
+  let reviewIssueLines: string[] = [];
+  if (reviewIssueDist && Object.keys(reviewIssueDist).length > 0) {
+    const candidateLines = [
+      '### Common Review Issues',
+      'Issues flagged most often in this project\'s review cycles (prioritize these before submitting):',
+    ];
+    const entries = Object.entries(reviewIssueDist).sort((a, b) => b[1] - a[1]);
+    for (const [cat, pct] of entries) {
+      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback`);
+    }
+    candidateLines.push('');
+    const candidate = candidateLines.join('\n');
+    if (candidate.length <= budget) {
+      reviewIssueLines = candidateLines;
+      budget -= candidate.length;
     }
   }
 
@@ -719,7 +757,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
   return allLines.join('\n');
 }
 
