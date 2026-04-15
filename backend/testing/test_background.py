@@ -611,6 +611,64 @@ async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
     assert clone_ctx.get("_previous_failure_class") == "CODE_ERROR"
 
 
+@pytest.mark.asyncio
+async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mocker):
+    """clone_ctx contains _previous_pr_url and _previous_changed_files from the failed child's context."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    pr_url = "https://github.com/org/repo/pull/42"
+    changed_files = ["src/foo.py", "src/bar.py"]
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "fix", "prompt": "fix the bug", "pr_number": 42, "branch": "fix/bug"}],
+        child_context={
+            "_attempt_number": 1,
+            "_pr_url": pr_url,
+            "_pr_changed_files": changed_files,
+        },
+        child_status_message="pytest test_foo failed with AssertionError: expected 1 got 2",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    # PR URL from failed attempt must propagate to retry clone
+    assert clone_ctx.get("_previous_pr_url") == pr_url
+    # Changed files from failed attempt must propagate to retry clone
+    assert clone_ctx.get("_previous_changed_files") == changed_files
+
+
+@pytest.mark.asyncio
+async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
+    """If child context has no _pr_url/_pr_changed_files, retry clone omits the _previous_* fields."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "fresh task"}],
+        child_context={"_attempt_number": 1},
+        child_status_message="pytest test_foo failed with AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    # No PR artifacts on child → _previous_* keys must be absent
+    assert "_previous_pr_url" not in clone_ctx
+    assert "_previous_changed_files" not in clone_ctx
+
+
 async def _make_parent_with_children(session, children_specs, parent_context=None):
     """Helper: create a parent with multiple children.
 

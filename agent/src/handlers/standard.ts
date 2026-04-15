@@ -258,6 +258,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
+      changed_files: changedPaths.slice(0, 50),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });

@@ -736,19 +736,36 @@ export function buildRetryContext(task: Record<string, unknown>): string {
 
   const previousError = strVal(ctx._previous_error as unknown);
   const previousFailureClass = strVal(ctx._previous_failure_class as unknown);
+  const previousPrUrl = strVal(ctx._previous_pr_url as unknown);
+  const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
+    ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
+    : [];
   const prevAttempt = attemptNumber - 1;
 
   const lines: string[] = [
     `## Previous Attempt (attempt #${prevAttempt} failed)`,
     `Failure type: ${previousFailureClass || 'UNKNOWN'}`,
   ];
+  if (previousPrUrl) {
+    lines.push(`PR from previous attempt: ${previousPrUrl}`);
+  }
+  if (previousChangedFiles.length > 0) {
+    lines.push(`Files changed in previous attempt:\n${previousChangedFiles.map(f => `  - ${f}`).join('\n')}`);
+  }
   if (previousError) {
     lines.push(`Error: ${previousError}`);
   }
-  lines.push(
-    'Analyze the error above and avoid the same mistake. If it was a test failure, check the specific test first. If it was a lint error, run the linter before committing.',
-    '',
-  );
+
+  if (previousChangedFiles.length > 0) {
+    lines.push(
+      'Review the files listed above — your previous attempt modified them. Check whether those changes were correct or need to be reworked. Do not blindly repeat the same approach if it failed.',
+    );
+  } else {
+    lines.push(
+      'Analyze the error above and avoid the same mistake. If it was a test failure, check the specific test first. If it was a lint error, run the linter before committing.',
+    );
+  }
+  lines.push('');
   return lines.join('\n');
 }
 

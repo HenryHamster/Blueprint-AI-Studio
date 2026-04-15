@@ -51,6 +51,18 @@ def _make_project(**kwargs) -> Project:
     return Project(**defaults)
 
 
+def _patch_spawning_deps(mocker):
+    """Patch external dependencies required by the spawning functions."""
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_analysis._build_outcome_evaluation",
+        return_value={},
+    )
+
+
 # ── Type selection: arch_frequency / strategic_cycle_count ────────────────────
 
 @pytest.mark.asyncio
@@ -489,3 +501,129 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert len(tasks) == 1
     assert tasks[0].payloads[0]["type"] == "strategic_review"
     assert tasks[0].status == TaskStatus.QUEUED
+
+
+# ── Additional _spawn_design_doc_update tests ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mocker):
+    """_spawn_design_doc_update writes a new entry to _strategic_cycle_history."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_design_doc_update(project, db_session)
+
+    cycle_history = (project.vision or {}).get("_strategic_cycle_history", [])
+    assert len(cycle_history) == 1
+    entry = cycle_history[0]
+    assert entry.get("outcome") == "in_progress"
+    assert entry.get("phase1_task_id") is not None
+    assert entry.get("cycle_id", "").startswith("sc-")
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_cycle_history_capped_at_10(db_session, mocker):
+    """_spawn_design_doc_update caps _strategic_cycle_history at 10 entries."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    existing = [{"cycle_id": f"sc-{i:08x}", "outcome": "done"} for i in range(10)]
+    project = _make_project(vision={
+        "purpose": "test purpose",
+        "_strategic_cycle_history": existing,
+    })
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_design_doc_update(project, db_session)
+
+    cycle_history = (project.vision or {}).get("_strategic_cycle_history", [])
+    assert len(cycle_history) == 10
+    assert cycle_history[-1].get("outcome") == "in_progress"
+
+
+# ── Additional _spawn_strategic_review tests ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker):
+    """When called with cycle_id, _spawn_strategic_review records phase2_task_id in history."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    cycle_id = "sc-abc12345"
+    project = _make_project(vision={
+        "purpose": "test purpose",
+        "_strategic_cycle_history": [
+            {"cycle_id": cycle_id, "phase1_task_id": "old-id", "phase1_completed_at": None}
+        ],
+    })
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session, cycle_id=cycle_id)
+
+    history = (project.vision or {}).get("_strategic_cycle_history", [])
+    entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
+    assert entry is not None
+    assert entry.get("phase2_task_id") is not None
+    assert entry.get("phase1_completed_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_no_cycle_id_does_not_modify_history(db_session, mocker):
+    """When called without cycle_id, _spawn_strategic_review leaves cycle history unchanged."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(vision={
+        "purpose": "test purpose",
+        "_strategic_cycle_history": [{"cycle_id": "existing", "outcome": "ok"}],
+    })
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session, cycle_id=None)
+
+    history = (project.vision or {}).get("_strategic_cycle_history", [])
+    assert len(history) == 1
+    assert history[0].get("outcome") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session, mocker):
+    """Task created by _spawn_strategic_review has strategic_cycle_id in context."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    cycle_id = "sc-testcycle"
+    project = _make_project(vision={
+        "purpose": "test purpose",
+        "_strategic_cycle_history": [{"cycle_id": cycle_id}],
+    })
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session, cycle_id=cycle_id)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert tasks[0].context.get("strategic_cycle_id") == cycle_id

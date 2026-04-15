@@ -5,9 +5,12 @@ Covers:
   1. _recover_orphaned_tasks — COMPLETED tasks with no PR artifact / no review child
   2. _persist_circuit_breakers — serialize in-memory breaker state to DeploymentState
   3. _persist_zone_health — serialize zone health snapshot to DeploymentState
+  4. gcp_cleanup_service — orphaned VM detection and deletion
+  5. _check_daily_cost_ceiling — daily compute budget enforcement (in agent_status.py)
 
 Uses isolated in-memory SQLite DB (same pattern as test_pipeline_reliability.py).
 """
+import asyncio
 import uuid
 import pytest
 import pytest_asyncio
@@ -23,7 +26,7 @@ import app.shared_state as _shared_state
 from app.services import _recover_orphaned_tasks, _persist_circuit_breakers, _persist_zone_health
 from app.models import (
     Project, Task, TaskStatus, Artifact, ArtifactType,
-    DeploymentState,
+    Alert, AlertSeverity, DeploymentState,
 )
 
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
@@ -482,3 +485,368 @@ async def test_persist_zone_health_handles_missing_deploy_state(mocker):
 
     await _persist_zone_health()
     # No exception == pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# gcp_cleanup_service
+# ══════════════════════════════════════════════════════════════════════════════
+
+from app.services import gcp_cleanup_service
+
+
+@pytest_asyncio.fixture()
+async def gcp_db(mocker):
+    """Isolated in-memory SQLite DB for gcp_cleanup_service tests."""
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+    mocker.patch("app.services.AsyncSessionLocal", _Session)
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+async def _make_task_with_vm(session, project_id, status, vm_instance_id=None) -> Task:
+    task = Task(
+        project_id=project_id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=status,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=vm_instance_id,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
+    """Active (PROVISIONING/IN_PROGRESS) VM IDs should be passed to cleanup_orphaned_vms.
+    Completed/failed task VMs should NOT be included."""
+    project = await _make_project(gcp_db)
+
+    prov_task = await _make_task_with_vm(gcp_db, project.id, TaskStatus.PROVISIONING, "agent-vm-prov-1")
+    ip_task = await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-ip-1")
+    # These should NOT be included
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.COMPLETED, "agent-vm-done-1")
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.FAILED, "agent-vm-fail-1")
+    # Task with no vm_instance_id
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, None)
+
+    mock_cleanup = AsyncMock(return_value=MagicMock(deleted=[], failed=[], total_gcp_vms=2))
+    mocker.patch("app.compute.cleanup_orphaned_vms", mock_cleanup)
+
+    # Exit after first cleanup iteration by raising CancelledError on sleep
+    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+
+    await gcp_cleanup_service()
+
+    mock_cleanup.assert_called_once()
+    called_vm_ids = mock_cleanup.call_args[0][0]
+    assert "agent-vm-prov-1" in called_vm_ids
+    assert "agent-vm-ip-1" in called_vm_ids
+    assert "agent-vm-done-1" not in called_vm_ids
+    assert "agent-vm-fail-1" not in called_vm_ids
+    assert None not in called_vm_ids
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_handles_api_failure_gracefully(gcp_db, mocker):
+    """If cleanup_orphaned_vms raises an exception, gcp_cleanup_service should log and continue."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    mocker.patch("app.compute.cleanup_orphaned_vms", side_effect=RuntimeError("GCP API down"))
+    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+
+    # Should not raise
+    await gcp_cleanup_service()
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_handles_timeout_gracefully(gcp_db, mocker):
+    """If cleanup_orphaned_vms times out, the service should log and continue without crashing."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    async def _slow_cleanup(_ids):
+        raise asyncio.TimeoutError()
+
+    mocker.patch("app.compute.cleanup_orphaned_vms", side_effect=_slow_cleanup)
+    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+
+    # Should not raise
+    await gcp_cleanup_service()
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
+    """When cleanup returns total_gcp_vms, the global VM count cache should be updated."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    mock_result = MagicMock()
+    mock_result.deleted = ["agent-vm-orphan"]
+    mock_result.failed = []
+    mock_result.total_gcp_vms = 5
+    mocker.patch("app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result))
+    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+
+    import app.main as _app_main
+    original_count = getattr(_app_main, "_last_gcp_vm_count", None)
+
+    await gcp_cleanup_service()
+
+    assert _app_main._last_gcp_vm_count == 5
+    assert hasattr(_app_main, "_last_gcp_vm_check")
+
+
+@pytest.mark.asyncio
+async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
+    """If cleanup_result.failed is non-empty, the service should still run without crashing."""
+    project = await _make_project(gcp_db)
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-1")
+
+    mock_result = MagicMock()
+    mock_result.deleted = []
+    mock_result.failed = ["agent-vm-bad-1", "agent-vm-bad-2"]
+    mock_result.total_gcp_vms = 3
+    mocker.patch("app.compute.cleanup_orphaned_vms", AsyncMock(return_value=mock_result))
+    mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
+
+    # Should not raise despite partial failures
+    await gcp_cleanup_service()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _check_daily_cost_ceiling (agent_status.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from app.routers.agent_status import _check_daily_cost_ceiling
+from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+
+@pytest_asyncio.fixture()
+async def cost_db(mocker):
+    """Isolated in-memory SQLite DB for _check_daily_cost_ceiling tests."""
+    _engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    _Session = sessionmaker(
+        bind=_engine, class_=AsyncSession,
+        autocommit=False, autoflush=False, expire_on_commit=False,
+    )
+
+    # Suppress broadcasts
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    # Suppress external notification dispatch (patching where defined so ensure_future gets a real coroutine)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+
+    async with _Session() as session:
+        yield session
+
+    async with _engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await _engine.dispose()
+
+
+def _make_cost_task(project_id, vm_secs=3600, is_spot=False, stopped_today=True) -> Task:
+    """Build a completed Task with cost data (not yet committed)."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    stop_at = now if stopped_today else today_start - timedelta(seconds=1)
+    prov_at = stop_at - timedelta(seconds=vm_secs)
+    return Task(
+        project_id=project_id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=is_spot,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_no_alert_when_disabled(cost_db, mocker):
+    """When daily_cost_ceiling_usd == 0 (disabled), no alert should be created."""
+    project = await _make_project(cost_db)
+
+    task = _make_cost_task(project.id, vm_secs=36000)  # 10 hours, very expensive
+    cost_db.add(task)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    alert_count = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alert_count) == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_no_alert_when_under_ceiling(cost_db, mocker):
+    """When cost < ceiling, no alert should be created."""
+    project = await _make_project(cost_db)
+
+    # 1 hour on-demand: cost = 3600 * ON_DEMAND_RATE ≈ $0.067
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    # Set ceiling above actual cost ($1 >> $0.067)
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 1.0}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_alert_created_when_over_ceiling(cost_db, mocker):
+    """When total daily cost > ceiling, a WARNING alert should be created."""
+    project = await _make_project(cost_db)
+
+    # 1 hour on-demand: cost ≈ $0.067
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    # Set ceiling below actual cost ($0.01 < $0.067)
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    # Function adds alert with session.add() but doesn't commit; flush to make it visible.
+    await cost_db.flush()
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].title == "Daily cost ceiling exceeded"
+    # task_id must be NULL (project-level alert, not task-specific)
+    assert alerts[0].task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_deduplicates_alert(cost_db, mocker):
+    """If an undismissed cost ceiling alert already exists, no second alert should be created."""
+    project = await _make_project(cost_db)
+
+    # Pre-existing undismissed alert
+    existing_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="Daily cost ceiling exceeded",
+        message="Pre-existing alert.",
+    )
+    cost_db.add(existing_alert)
+    await cost_db.commit()
+
+    # Task that pushes cost over ceiling
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    cost_db.add(task)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    # Still only the one pre-existing alert, no duplicate
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_excludes_other_day_tasks(cost_db, mocker):
+    """Tasks whose vm_stopped_at is before today should not count toward the daily total."""
+    project = await _make_project(cost_db)
+
+    # Yesterday's task — very expensive but outside today's window
+    yesterday_task = _make_cost_task(project.id, vm_secs=86400, stopped_today=False)
+    cost_db.add(yesterday_task)
+    await cost_db.commit()
+
+    # Today's task — cheap (10 min on-demand)
+    today_task = _make_cost_task(project.id, vm_secs=600, is_spot=False)
+    cost_db.add(today_task)
+    await cost_db.commit()
+    await cost_db.refresh(today_task)
+
+    # Ceiling is $0.05 — above today-only cost ($0.011) but below yesterday+today ($1.67)
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.05}):
+        await _check_daily_cost_ceiling(today_task, cost_db)
+
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_spot_rate_used_for_spot_vms(cost_db, mocker):
+    """Spot VMs should be costed at SPOT_RATE (cheaper than ON_DEMAND_RATE)."""
+    project = await _make_project(cost_db)
+
+    # 1 hour spot: cost = 3600 * SPOT_RATE ≈ $0.020
+    spot_task = _make_cost_task(project.id, vm_secs=3600, is_spot=True)
+    cost_db.add(spot_task)
+    await cost_db.commit()
+    await cost_db.refresh(spot_task)
+
+    # Ceiling between spot and on-demand cost ($0.04 > spot $0.020, < on-demand $0.067)
+    # If on-demand rate were used, alert would fire. It should NOT fire here.
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.04}):
+        await _check_daily_cost_ceiling(spot_task, cost_db)
+
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_ceiling_includes_current_task_cost(cost_db, mocker):
+    """The in-memory current task's own cost must be included even if not yet in DB."""
+    project = await _make_project(cost_db)
+
+    # Create a task but do NOT commit it to DB — simulates in-memory state
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        # In-memory cost data only (not yet in DB)
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    cost_db.add(task)
+    # Flush to get an ID but keep out of the query (the function excludes Task.id != task.id)
+    await cost_db.flush()
+
+    # Ceiling below 1-hour on-demand cost
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    # Function adds alert with session.add() but doesn't commit; flush to make it visible.
+    await cost_db.flush()
+    alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
+    assert len(alerts) == 1
+    assert "Daily cost ceiling exceeded" in alerts[0].title

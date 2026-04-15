@@ -390,6 +390,13 @@ async def update_agent_status(
                     logs=payload.logs
                 )
                 session.add(artifact)
+                # Store changed files in task context for retry artifact enrichment
+                if payload.changed_files:
+                    ctx = dict(task.context or {})
+                    ctx['_pr_changed_files'] = payload.changed_files[:50]
+                    ctx['_pr_url'] = payload.pr_url or ''
+                    task.context = ctx
+                    flag_modified(task, 'context')
         else:
             artifact = Artifact(
                 task_id=task.id,

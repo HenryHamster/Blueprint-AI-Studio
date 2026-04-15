@@ -39,6 +39,7 @@ vi.mock('child_process', () => ({
 import {
   formatPlaybook,
   buildContextPrefix,
+  buildRetryContext,
   formatProjectContext,
   configureAgentPermissions,
   discoverRelatedTests,
@@ -506,5 +507,93 @@ describe('discoverRelatedTests', () => {
     });
     // No directory matches 'other/' so no test entries are added
     expect(result).toBe('');
+  });
+});
+
+// ── buildRetryContext ─────────────────────────────────────────────────────────
+describe('buildRetryContext', () => {
+  it('returns empty string for first-attempt tasks (no _attempt_number)', () => {
+    expect(buildRetryContext({})).toBe('');
+  });
+
+  it('returns empty string when _attempt_number is 1', () => {
+    expect(buildRetryContext({ context: { _attempt_number: 1 } })).toBe('');
+  });
+
+  it('renders failure type and error for a basic retry', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'Test suite failed: assertion error on line 42',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('## Previous Attempt (attempt #1 failed)');
+    expect(result).toContain('Failure type: CODE_ERROR');
+    expect(result).toContain('Test suite failed: assertion error on line 42');
+  });
+
+  it('renders PR URL and changed files when present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'lint error',
+        _previous_pr_url: 'https://github.com/org/repo/pull/99',
+        _previous_changed_files: ['backend/app/models.py', 'backend/testing/test_models.py'],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('PR from previous attempt: https://github.com/org/repo/pull/99');
+    expect(result).toContain('Files changed in previous attempt:');
+    expect(result).toContain('  - backend/app/models.py');
+    expect(result).toContain('  - backend/testing/test_models.py');
+  });
+
+  it('uses file-specific guidance when changed files are provided', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_changed_files: ['src/foo.ts'],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Review the files listed above');
+    expect(result).not.toContain('run the linter before committing');
+  });
+
+  it('uses generic guidance when no changed files are provided', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Analyze the error above and avoid the same mistake');
+    expect(result).not.toContain('Review the files listed above');
+  });
+
+  it('omits PR URL section when _previous_pr_url is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_changed_files: ['src/foo.ts'],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('PR from previous attempt');
+  });
+
+  it('ends with a blank line', () => {
+    const task = { context: { _attempt_number: 2, _previous_failure_class: 'CODE_ERROR', _previous_error: 'err' } };
+    const result = buildRetryContext(task);
+    expect(result.endsWith('\n')).toBe(true);
   });
 });
