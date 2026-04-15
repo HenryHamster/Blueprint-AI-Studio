@@ -246,7 +246,7 @@ async def _process_post_commit(
     from app.security import scan_pr_for_injection  # noqa: PLC0415
     from app.github import (  # noqa: PLC0415
         create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs, submit_pr_review,
+        get_pr_files, get_check_runs, submit_pr_review, update_check_run,
     )
     from app.task_completion import (  # noqa: PLC0415
         _handle_plan_completion, _handle_design_doc_completion,
@@ -579,7 +579,7 @@ async def _process_post_commit(
                         logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
 
                 if not verdict_parsed:
-                    # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words (quoted or unquoted)
+                    # Fallback: look for APPROVE/REQUEST_CHANGES/COMMENT as standalone words (quoted or unquoted)
                     upper_text = verdict_text.upper()
                     approve_idx = max(
                         upper_text.rfind('"APPROVE"'),
@@ -591,20 +591,23 @@ async def _process_post_commit(
                         upper_text.rfind("REQUEST_CHANGES"),
                         upper_text.rfind("REQUEST CHANGES"),
                     )
-                    if approve_idx == -1 and rc_idx == -1:
+                    comment_idx = max(
+                        upper_text.rfind('"COMMENT"'),
+                        upper_text.rfind("COMMENT"),
+                    )
+                    if approve_idx == -1 and rc_idx == -1 and comment_idx == -1:
                         verdict = "REQUEST_CHANGES"
                         feedback = "Review agent did not produce a verdict — manual review required"
                         logger.warning(f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
                         verdict_unparseable = True
-                    elif approve_idx > rc_idx:
-                        verdict = "APPROVE"
-                    elif rc_idx > approve_idx:
-                        verdict = "REQUEST_CHANGES"
                     else:
-                        verdict = "REQUEST_CHANGES"
-                        feedback = "Review agent did not produce a verdict — manual review required"
-                        logger.warning(f"[REVIEW PIPELINE] Ambiguous verdict for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
-                        verdict_unparseable = True
+                        best_idx = max(approve_idx, rc_idx, comment_idx)
+                        if best_idx == approve_idx:
+                            verdict = "APPROVE"
+                        elif best_idx == comment_idx and comment_idx > rc_idx:
+                            verdict = "COMMENT"
+                        else:
+                            verdict = "REQUEST_CHANGES"
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -624,7 +627,7 @@ async def _process_post_commit(
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
+                    event = "APPROVE" if verdict == "APPROVE" else ("COMMENT" if verdict == "COMMENT" else "REQUEST_CHANGES")
                     inline_comments = []
                     body_issues = []
                     for issue in issues:
@@ -657,6 +660,55 @@ async def _process_post_commit(
                         await create_pr_comment(gh_token, owner, repo, pr_number, review_comment)
                     except Exception as e2:
                         logger.warning(f"[REVIEW PIPELINE] Fallback comment also failed: {e2}", exc_info=True)
+
+                # Update Check Run with verdict conclusion (best-effort — errors are swallowed)
+                check_run_id = (task.context or {}).get("check_run_id")
+                if check_run_id:
+                    try:
+                        _cr_token, _cr_owner, _cr_repo = await get_github_token_for_task(task.id, session)
+                        _severity_map = {"critical": "failure", "major": "warning", "minor": "notice"}
+                        _conclusion = (
+                            "success" if verdict == "APPROVE"
+                            else ("neutral" if verdict == "COMMENT" else "action_required")
+                        )
+                        _annotations = []
+                        for _issue in issues:
+                            if _issue.get("file") and _issue.get("line"):
+                                _lvl = _severity_map.get(_issue.get("severity", "minor"), "notice")
+                                _ln = int(_issue["line"])
+                                _annotations.append({
+                                    "path": _issue["file"],
+                                    "start_line": _ln,
+                                    "end_line": _ln,
+                                    "annotation_level": _lvl,
+                                    "message": _issue.get("description", ""),
+                                })
+                        _issue_counts = {}
+                        for _issue in issues:
+                            _sev = _issue.get("severity", "minor")
+                            _issue_counts[_sev] = _issue_counts.get(_sev, 0) + 1
+                        _counts_line = ", ".join(
+                            f"{v} {k}" for k, v in sorted(_issue_counts.items())
+                        ) if _issue_counts else "no issues"
+                        _cr_summary = f"**Blueprint Code Review**: {verdict}\n\n{feedback[:3000]}"
+                        if _issue_counts:
+                            _cr_summary += f"\n\n**Issue summary**: {_counts_line}"
+                        await update_check_run(
+                            _cr_token, _cr_owner, _cr_repo,
+                            check_run_id,
+                            conclusion=_conclusion,
+                            title=f"Blueprint Code Review: {verdict}",
+                            summary=_cr_summary,
+                            annotations=_annotations or None,
+                        )
+                        logger.info(f"[CHECK RUN] Updated check run {check_run_id} → {_conclusion} for task {task.id}")
+                    except Exception as _cr_exc:
+                        logger.warning(f"[CHECK RUN] Failed to update check run {check_run_id} for task {task.id}: {_cr_exc}")
+
+                # Store Blueprint's verdict on the review task context so the
+                # pull_request_review webhook handler can correlate quality signals.
+                task.context = {**(task.context or {}), "blueprint_review_verdict": verdict}
+                session.add(task)
 
                 action_taken = False
                 head_sha = ""
@@ -952,6 +1004,13 @@ async def _process_post_commit(
                         session.add(task)
                         await session.commit()
                         action_taken = True
+                elif verdict == "COMMENT":
+                    # COMMENT — informational review posted, no fix task spawned, no merge
+                    logger.info(f"[REVIEW PIPELINE] COMMENT verdict for PR #{pr_number} — informational review posted, no action taken")
+                    task.latest_status_message = f"Informational review posted for PR #{pr_number} — no changes required"
+                    session.add(task)
+                    await session.commit()
+                    action_taken = True
                 else:
                     # REQUEST_CHANGES — include CI errors if available (don't wait)
                     ci_errors_text = ""

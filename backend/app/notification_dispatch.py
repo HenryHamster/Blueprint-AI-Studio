@@ -271,6 +271,33 @@ async def post_issue_implementation_spawned_message(
     )
 
 
+async def post_review_feedback_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    pr_number: int,
+    signal: str,  # 'review_dismissed', 'user_overrode_review', 'user_caught_issues'
+    detail: Optional[str] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when a review quality signal is received from GitHub."""
+    if signal == "review_dismissed":
+        summary = f"Blueprint review dismissed on PR #{pr_number}" + (f": {detail}" if detail else "")
+    elif signal == "user_overrode_review":
+        summary = f"User approved PR #{pr_number} after Blueprint requested changes"
+    elif signal == "user_caught_issues":
+        summary = f"User requested changes on PR #{pr_number} that Blueprint had approved"
+    else:
+        summary = f"Review feedback on PR #{pr_number}: {signal}"
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="review_feedback",
+        summary=summary,
+        context={"pr_number": pr_number, "signal": signal, "detail": detail},
+        task_id=task_id,
+    )
+
+
 async def post_feedback_acknowledgment(
     session: AsyncSession,
     project_id: uuid.UUID,

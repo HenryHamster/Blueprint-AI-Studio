@@ -40,12 +40,45 @@ from app.github import (
     create_branch,
     create_pull_request,
     get_pull_request,
+    create_check_run,
 )
 from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+
+async def _create_review_check_run_bg(
+    task_id: uuid.UUID,
+    pr_number: int,
+    check_run_name: str,
+) -> None:
+    """Background helper: create an in_progress Check Run when a review task claims work.
+
+    Opens its own DB session so it can run after the claim response is returned.
+    Stores the check_run_id in task.context so the verdict handler can update it later.
+    Errors are swallowed — check run creation is best-effort and must not affect the pipeline.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            gh_token, owner, repo = await get_github_token_for_task(task_id, session)
+            pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            head_sha = pr_data.get("head", {}).get("sha", "")
+            if not head_sha:
+                logger.warning(f"[CHECK RUN] No head_sha for PR #{pr_number} task {task_id}")
+                return
+            result = await create_check_run(gh_token, owner, repo, head_sha, name=check_run_name)
+            if result and result.get("id"):
+                task = await session.get(Task, task_id)
+                if task:
+                    task.context = {**(task.context or {}), "check_run_id": result["id"]}
+                    session.add(task)
+                    await session.commit()
+                    logger.info(f"[CHECK RUN] Created check run {result['id']} for review task {task_id} PR #{pr_number}")
+    except Exception as e:
+        logger.warning(f"[CHECK RUN] Failed to create check run for task {task_id}: {e}")
+
 
 # ---------------------------------------------------------------------------
 # JWT revocation state (moved from main.py)
@@ -619,6 +652,18 @@ async def claim_task(
         response["build_config"] = project_for_playbook.build_config
     else:
         response["build_config"] = {}
+
+    # Fire-and-forget: create an in_progress Check Run for review tasks so the
+    # Checks tab shows the review is underway.  Must not block the claim response.
+    if task_type == "review":
+        _pr_number = task.first_payload.get("pr_number")
+        if _pr_number and project_for_playbook:
+            _check_run_name = (project_for_playbook.build_config or {}).get(
+                "check_run_name", "Blueprint Code Review"
+            )
+            asyncio.ensure_future(
+                _create_review_check_run_bg(task.id, _pr_number, _check_run_name)
+            )
 
     return response
 
