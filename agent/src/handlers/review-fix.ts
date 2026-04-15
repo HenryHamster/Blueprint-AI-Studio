@@ -161,6 +161,11 @@ If the changes look good and should be merged:
 If changes are needed before merging:
 {"verdict": "REQUEST_CHANGES", "feedback": "...", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
 
+If the code is functionally correct but you have purely observational or stylistic notes (no blockers, no required changes):
+{"verdict": "COMMENT", "feedback": "...", "issues": [{"severity": "minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
+
+Use COMMENT when: all issues are minor/stylistic and the code is functionally correct, the review is purely observational with no actionable changes needed, or you want to leave informational feedback without blocking the author. COMMENT does not spawn a fix task and does not merge the PR — the author decides what to do.
+
 For each issue in the \`issues\` array:
 - \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)
 - \`line\`: line number in the file (optional — omit if not applicable)

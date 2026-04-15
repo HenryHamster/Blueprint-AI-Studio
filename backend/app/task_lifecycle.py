@@ -579,7 +579,7 @@ async def _process_post_commit(
                         logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
 
                 if not verdict_parsed:
-                    # Fallback: look for APPROVE/REQUEST_CHANGES as standalone words (quoted or unquoted)
+                    # Fallback: look for APPROVE/REQUEST_CHANGES/COMMENT as standalone words (quoted or unquoted)
                     upper_text = verdict_text.upper()
                     approve_idx = max(
                         upper_text.rfind('"APPROVE"'),
@@ -591,20 +591,23 @@ async def _process_post_commit(
                         upper_text.rfind("REQUEST_CHANGES"),
                         upper_text.rfind("REQUEST CHANGES"),
                     )
-                    if approve_idx == -1 and rc_idx == -1:
+                    comment_idx = max(
+                        upper_text.rfind('"COMMENT"'),
+                        upper_text.rfind("COMMENT"),
+                    )
+                    if approve_idx == -1 and rc_idx == -1 and comment_idx == -1:
                         verdict = "REQUEST_CHANGES"
                         feedback = "Review agent did not produce a verdict — manual review required"
                         logger.warning(f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
                         verdict_unparseable = True
-                    elif approve_idx > rc_idx:
-                        verdict = "APPROVE"
-                    elif rc_idx > approve_idx:
-                        verdict = "REQUEST_CHANGES"
                     else:
-                        verdict = "REQUEST_CHANGES"
-                        feedback = "Review agent did not produce a verdict — manual review required"
-                        logger.warning(f"[REVIEW PIPELINE] Ambiguous verdict for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
-                        verdict_unparseable = True
+                        best_idx = max(approve_idx, rc_idx, comment_idx)
+                        if best_idx == approve_idx:
+                            verdict = "APPROVE"
+                        elif best_idx == comment_idx and comment_idx > rc_idx:
+                            verdict = "COMMENT"
+                        else:
+                            verdict = "REQUEST_CHANGES"
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -624,7 +627,7 @@ async def _process_post_commit(
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
+                    event = "APPROVE" if verdict == "APPROVE" else ("COMMENT" if verdict == "COMMENT" else "REQUEST_CHANGES")
                     inline_comments = []
                     body_issues = []
                     for issue in issues:
@@ -952,6 +955,13 @@ async def _process_post_commit(
                         session.add(task)
                         await session.commit()
                         action_taken = True
+                elif verdict == "COMMENT":
+                    # COMMENT — informational review posted, no fix task spawned, no merge
+                    logger.info(f"[REVIEW PIPELINE] COMMENT verdict for PR #{pr_number} — informational review posted, no action taken")
+                    task.latest_status_message = f"Informational review posted for PR #{pr_number} — no changes required"
+                    session.add(task)
+                    await session.commit()
+                    action_taken = True
                 else:
                     # REQUEST_CHANGES — include CI errors if available (don't wait)
                     ci_errors_text = ""
