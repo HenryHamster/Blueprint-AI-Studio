@@ -46,6 +46,63 @@ async def reaper_db(mocker):
     await reaper_engine.dispose()
 
 @pytest.mark.asyncio
+async def test_reaper_evaluating_sweep_queries_started_at(reaper_db, mocker):
+    """Regression: the EVALUATING stale-parent sweep queried Task.updated_at,
+    which does not exist on the Task SQLModel and raised AttributeError every
+    reaper cycle — making the sweep entirely non-functional in production.
+
+    The sweep must build the query against started_at, find stale EVALUATING
+    parents (> 15 min old), and invoke _check_and_trigger_rollup on a completed
+    child so the stale-PR recovery path can respawn a review.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_rollup = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Evaluating Sweep Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Stale EVALUATING parent: started 20 minutes ago, well past the 15-min cutoff.
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck evaluating"}],
+        status=TaskStatus.EVALUATING,
+        started_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "finished subtask"}],
+        status=TaskStatus.COMPLETED,
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    mock_rollup.assert_called_once()
+    swept_child = mock_rollup.call_args.args[0]
+    assert swept_child.parent_task_id == parent.id, (
+        f"Expected sweep to pass the completed child of the stale parent, got {swept_child.id}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_service(reaper_db, mocker):
     """
     Tests the background worker that terminates orphaned VMs.

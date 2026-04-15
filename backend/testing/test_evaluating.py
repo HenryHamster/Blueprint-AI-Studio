@@ -468,6 +468,97 @@ async def test_evaluating_unmerged_pr_verification(eval_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_recent_rollup_query_builds_against_started_at(eval_db):
+    """Regression: the concurrent-rollup observability query in
+    _check_and_trigger_rollup's merge-conflict branch referenced
+    Task.updated_at, which raised AttributeError at query-build time. The
+    AttributeError was caught by the surrounding try/except and logged as a
+    warning, but the query result was always 0 — silently hiding the
+    concurrent-rollup signal.
+
+    Build the same `Task.started_at >= now - 1h` filter used at that site and
+    execute it to confirm the attribute resolves and SQLModel compiles the
+    query without raising."""
+    from sqlalchemy import func as _func
+
+    project = Project(name="Recent Rollup Query", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    recent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "recent rollup"}],
+        status=TaskStatus.COMPLETED,
+        started_at=_naive_utc_ago(minutes=30),
+        context={"rollup_pr_url": "https://github.com/o/r/pull/1"},
+    )
+    eval_db.add(recent)
+    await eval_db.commit()
+    await eval_db.refresh(recent)
+
+    result = await eval_db.execute(
+        select(_func.count()).select_from(Task).where(
+            Task.status == TaskStatus.COMPLETED,
+            Task.started_at >= _naive_utc_ago(hours=1),
+        )
+    )
+    count = result.scalar() or 0
+    assert count >= 1, (
+        f"Expected at least the recent rollup task (started 30min ago) to match, got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_and_trigger_rollup_computes_age_from_started_at(eval_db, mocker):
+    """Regression: _check_and_trigger_rollup computed `age` from c.updated_at,
+    which does not exist on the Task SQLModel and raised AttributeError on
+    every call that reached the unmerged-children branch.
+
+    A COMPLETED child with no pr_merged flag and _verify_pr_merged returning
+    False must now have its age computed via started_at without crashing, and
+    a fresh child (started within the stale threshold) must be skipped by the
+    respawn loop (respawn count stays at 0)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._verify_pr_merged", new=AsyncMock(return_value=False))
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    project = Project(name="Age From Started At", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        started_at=_naive_utc_ago(minutes=2),
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    await eval_db.refresh(child)
+
+    await _check_and_trigger_rollup(child, eval_db)
+
+    # Fresh child (2 min old, stale threshold is 10 min) → must not be respawned.
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
     """When _verify_pr_merged sees a closed-but-not-merged PR, it must set
     latest_status_message on the in-memory task — not just inside the separate
