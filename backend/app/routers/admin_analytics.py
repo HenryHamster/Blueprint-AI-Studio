@@ -481,6 +481,25 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         else:
             first_attempt_trend = "stable"
 
+    # First-attempt failures by review category: which categories caused the most
+    # first-attempt rejections, as a fraction of tasks that had their first review rejected.
+    first_attempt_by_review_category: Optional[Dict[str, float]] = None
+    first_attempt_failed_with_cats = [
+        t for t in terminal_tasks_24h
+        if "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    if first_attempt_failed_with_cats:
+        total_with_cats = len(first_attempt_failed_with_cats)
+        cat_counts: Dict[str, int] = {}
+        for t in first_attempt_failed_with_cats:
+            cats = (t.context or {}).get("_first_attempt_rejection_categories", {})
+            for cat in cats:
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        first_attempt_by_review_category = {
+            cat: round(count / total_with_cats, 2)
+            for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
+        }
+
     first_attempt_success_rate = {
         "overall": current_first_attempt_rate,
         "trend": first_attempt_trend,
@@ -489,6 +508,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),
         "by_type": first_attempt_by_type,
         "by_scope": first_attempt_by_scope,
+        "first_attempt_by_review_category": first_attempt_by_review_category,
     }
 
     # Review accuracy: precision and recall from user feedback signals on completed review tasks

@@ -699,15 +699,22 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
 
   // Build review issue distribution section — only if budget allows
   const reviewIssueDist = ctx.review_issue_distribution as Record<string, number> | null | undefined;
+  // First-attempt-specific breakdown from pipeline health (more actionable than all-iterations data)
+  const fasrForReview = pipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
+  const firstAttemptByCat = fasrForReview?.first_attempt_by_review_category as Record<string, number> | null | undefined;
   let reviewIssueLines: string[] = [];
   if (reviewIssueDist && Object.keys(reviewIssueDist).length > 0) {
-    const candidateLines = [
-      '### Common Review Issues',
-      'Issues flagged most often in this project\'s review cycles (prioritize these before submitting):',
-    ];
+    const hasFirstAttemptCats = firstAttemptByCat && Object.keys(firstAttemptByCat).length > 0;
+    const descLine = hasFirstAttemptCats
+      ? 'Issues flagged in this project\'s review cycles — first-attempt rejection rate shown in parentheses (prioritize these before submitting):'
+      : 'Issues flagged most often in this project\'s review cycles (prioritize these before submitting):';
+    const candidateLines = ['### Common Review Issues', descLine];
     const entries = Object.entries(reviewIssueDist).sort((a, b) => b[1] - a[1]);
     for (const [cat, pct] of entries) {
-      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback`);
+      const faPct = hasFirstAttemptCats && firstAttemptByCat![cat] !== undefined
+        ? ` (${Math.round(firstAttemptByCat![cat] * 100)}% of first-attempt rejections)`
+        : '';
+      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}`);
     }
     // Append specific recurring patterns if available
     type FirstReviewIssue = { description: string; count: number; category: string };

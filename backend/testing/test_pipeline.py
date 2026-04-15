@@ -1772,10 +1772,13 @@ async def test_compute_pipeline_health_includes_first_attempt_rate(metrics_db):
     assert "without_playbook" in fasr
     assert "sample_size" in fasr
     assert "by_type" in fasr
+    assert "first_attempt_by_review_category" in fasr
     assert fasr["sample_size"] == 2
     assert fasr["overall"] == 0.5  # 1 success out of 2 measured
     assert fasr["with_playbook"] == 1.0  # task_ok succeeded
     assert fasr["without_playbook"] == 0.0  # task_fail failed
+    # No tasks with rejection categories → None
+    assert fasr["first_attempt_by_review_category"] is None
 
 
 @pytest.mark.asyncio
@@ -1802,6 +1805,51 @@ async def test_compute_pipeline_health_no_metrics_returns_none(metrics_db):
     fasr = result["first_attempt_success_rate"]
     assert fasr["overall"] is None
     assert fasr["sample_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_by_review_category_populated(metrics_db):
+    """first_attempt_by_review_category counts categories from first-rejection tasks."""
+    from app.routers.admin_analytics import compute_pipeline_health_summary
+
+    project = Project(name="Test3", user_id="u3")
+    metrics_db.add(project)
+    await metrics_db.commit()
+    await metrics_db.refresh(project)
+
+    # Two tasks that had their first review rejected with categories
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        context={"_first_attempt_rejection_categories": {"test-coverage": 2, "style-conventions": 1}},
+    )
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.FAILED,
+        context={"_first_attempt_rejection_categories": {"test-coverage": 1}},
+    )
+    # Task without rejection categories
+    task_c = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    metrics_db.add(task_a)
+    metrics_db.add(task_b)
+    metrics_db.add(task_c)
+    await metrics_db.commit()
+
+    result = await compute_pipeline_health_summary(metrics_db, project.id)
+    fasr = result["first_attempt_success_rate"]
+    cats = fasr["first_attempt_by_review_category"]
+    assert cats is not None
+    # 2 tasks with rejection categories; both have test-coverage → 2/2 = 1.0
+    assert cats["test-coverage"] == 1.0
+    # Only task_a has style-conventions → 1/2 = 0.5
+    assert cats["style-conventions"] == 0.5
 
 
 # ── Priority Inheritance ──────────────────────────────────────────────────────
