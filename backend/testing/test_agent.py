@@ -675,6 +675,65 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, db_session):
+    """Entries with reference_count>=10 and confirmed_count==0 are sorted after effective entries."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Playbook Demotion Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        # Ineffective: high reference count, zero confirmations — should be demoted
+        "playbook/zzz-ineffective": {
+            "content": "ineffective guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 15,
+        },
+        # Effective: has confirmations — should sort before the ineffective one
+        "playbook/aaa-effective": {
+            "content": "effective guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 3,
+            "reference_count": 10,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-demotion-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-demotion-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    playbook = data["playbook"]
+    assert "zzz-ineffective" in playbook
+    assert "aaa-effective" in playbook
+
+    # The effective entry must appear before the ineffective one in insertion order
+    keys = list(playbook.keys())
+    assert keys.index("aaa-effective") < keys.index("zzz-ineffective"), (
+        f"Expected effective entry before ineffective, got order: {keys}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_injects_direction_context_for_create_task(client: AsyncClient, db_session):
     """Claim endpoint injects direction_context for create/fix/refactor tasks when direction_id is set."""
     from sqlalchemy.orm.attributes import flag_modified

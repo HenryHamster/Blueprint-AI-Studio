@@ -57,6 +57,11 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
         "refactor", "separation of concerns", "coupling", "dependency",
         "abstraction", "pattern", "interface", "modularity", "cohesion",
     ],
+    "correctness": [
+        "logic", "bug", "incorrect", "wrong", "off-by-one", "return value",
+        "edge case", "boundary", "race condition", "deadlock", "missing import",
+        "undefined", "null reference", "assertion", "invariant", "constraint",
+    ],
 }
 
 logger = logging.getLogger(__name__)
@@ -288,6 +293,7 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
             if not desc or severity not in ("CRITICAL", "MAJOR", "MINOR"):
                 continue
             desc_lower = desc.lower()
+            matched = False
             for cat_name, keywords in _REVIEW_CATEGORIES.items():
                 if any(kw in desc_lower for kw in keywords):
                     buckets.setdefault(cat_name, []).append({
@@ -295,7 +301,14 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
                         "severity": severity,
                         "iteration": entry.get("iteration", 0),
                     })
+                    matched = True
                     break  # first matching category wins
+            if not matched:
+                buckets.setdefault("other", []).append({
+                    "desc": desc,
+                    "severity": severity,
+                    "iteration": entry.get("iteration", 0),
+                })
 
     return buckets
 

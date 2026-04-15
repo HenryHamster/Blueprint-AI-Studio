@@ -531,6 +531,7 @@ async def claim_task(
 
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
+        top_first_review_issues = None
         if task_type in ("create", "fix", "refactor"):
             try:
                 from app.playbook_learning import _categorize_review_issues
@@ -553,6 +554,37 @@ async def claim_task(
                             cat: round(len(issues) / total_issues, 2)
                             for cat, issues in top3
                         }
+
+                # Extract top recurring specific issue descriptions from first reviews (iteration 0)
+                try:
+                    from collections import Counter
+                    desc_counter: Counter = Counter()
+                    desc_to_cat: dict = {}
+                    for ht in high_iter_rows:
+                        if ht.created_at and ht.created_at < cutoff_14d:
+                            continue
+                        review_loop = (ht.context or {}).get("review_loop", {})
+                        rev_hist = review_loop.get("review_history", []) if review_loop else []
+                        for entry in rev_hist:
+                            if entry.get("iteration") != 0:
+                                continue
+                            desc = entry.get("description") or entry.get("issue") or ""
+                            cat = entry.get("category", "other")
+                            if not desc:
+                                continue
+                            normalized = desc.lower().strip()[:120]
+                            desc_counter[normalized] += 1
+                            if normalized not in desc_to_cat:
+                                desc_to_cat[normalized] = cat
+                    recurring = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
+                    if recurring:
+                        recurring.sort(key=lambda x: -x[1])
+                        top_first_review_issues = [
+                            {"description": desc, "count": cnt, "category": desc_to_cat.get(desc, "other")}
+                            for desc, cnt in recurring[:3]
+                        ]
+                except Exception:
+                    pass  # non-critical
             except Exception:
                 pass  # non-critical — don't fail the request
 
@@ -565,6 +597,7 @@ async def claim_task(
             "lessons": lessons,
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
+            "top_first_review_issues": top_first_review_issues,
         }
     else:
         # Lightweight pipeline health for all other task types
@@ -598,14 +631,24 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
+                confirmed = v.get("confirmed_count", 0)
+                referenced = v.get("reference_count", 0)
+                # Demote entries with high reference count but zero confirmations
+                ineffective = 1 if (referenced >= 10 and confirmed == 0) else 0
+                if ineffective:
+                    logger.info(
+                        "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
+                        short_key, referenced,
+                    )
                 _playbook_candidates.append((
-                    -v.get("confirmed_count", 0),
-                    -v.get("reference_count", 0),
+                    ineffective,
+                    -confirmed,
+                    -referenced,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, _, short_key, content in _playbook_candidates:
+        for _, _, _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")

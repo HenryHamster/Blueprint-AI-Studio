@@ -1205,6 +1205,33 @@ async def _process_post_commit(
                         else:
                             await session.commit()
                         logger.warning(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
+                    # On the first review rejection, store which issue categories caused it
+                    # on the original task so analytics can track first-attempt failure patterns.
+                    review_iteration = review_loop.get("iteration", 1)
+                    if review_iteration == 1 and issues and original_task_id:
+                        try:
+                            from app.playbook_learning import _categorize_review_issues
+                            rh_items = [
+                                {"description": i.get("description", ""),
+                                 "severity": i.get("severity", "minor"),
+                                 "iteration": 1}
+                                for i in issues if i.get("description")
+                            ]
+                            if rh_items:
+                                buckets = _categorize_review_issues(rh_items)
+                                rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
+                                if rejection_cats:
+                                    orig_task = await session.get(Task, uuid.UUID(original_task_id))
+                                    if orig_task:
+                                        orig_task.context = {
+                                            **(orig_task.context or {}),
+                                            "_first_attempt_rejection_categories": rejection_cats,
+                                        }
+                                        flag_modified(orig_task, "context")
+                                        session.add(orig_task)
+                                        await session.commit()
+                        except Exception as _cat_e:
+                            logger.warning(f"[REVIEW PIPELINE] Failed to record first-attempt rejection categories: {_cat_e}")
                     action_taken = True
 
                 if not action_taken:
