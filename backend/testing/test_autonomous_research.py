@@ -2582,3 +2582,176 @@ async def test_code_error_still_blocks_dedup(db_session, mocker):
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 0, "CODE_ERROR failure must still block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
+    """A CODE_ERROR failure older than 48 hours must NOT block re-proposal."""
+    direction = _active_direction("d-ceold01", "Code error cooldown test")
+    project = Project(
+        name="Code Error Cooldown Allow", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_title = "Add input validation to user registration"
+    old_desc = "Registration endpoint missing email format validation"
+    fhash = hashlib.sha256((old_title + old_desc).encode()).hexdigest()[:16]
+
+    # CODE_ERROR failure older than 48h — should be excluded from dedup set
+    old_code_failed = Task(
+        project_id=project.id,
+        title=old_title,
+        payloads=[{"type": "create", "prompt": "add validation", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Tests failed: AssertionError in test_registration.py line 15",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=72),
+    )
+    db_session.add(old_code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": old_title,
+            "description": old_desc,
+            "prompt": "Add input validation",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "CODE_ERROR failure older than 48h must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
+    """A CODE_ERROR failure within the 48-hour cooldown must still block re-proposal."""
+    direction = _active_direction("d-cewarm01", "Code error within cooldown test")
+    project = Project(
+        name="Code Error Cooldown Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_title = "Fix null pointer in order processing"
+    recent_desc = "Order processor crashes on missing customer_id field"
+    fhash = hashlib.sha256((recent_title + recent_desc).encode()).hexdigest()[:16]
+
+    # CODE_ERROR failure within 48h — must remain in dedup set
+    recent_code_failed = Task(
+        project_id=project.id,
+        title=recent_title,
+        payloads=[{"type": "create", "prompt": "fix null pointer", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Build failed: NullPointerException in OrderProcessor.java:88",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=24),
+    )
+    db_session.add(recent_code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": recent_title,
+            "description": recent_desc,
+            "prompt": "Fix null pointer error",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "CODE_ERROR failure within 48h cooldown must still block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
+    """A successfully merged PR must block re-proposal even after the cooldown period."""
+    direction = _active_direction("d-mergedold01", "Merged PR permanent block test")
+    project = Project(
+        name="Merged PR Permanent Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_title = "Migrate legacy auth to OAuth2"
+    merged_desc = "Replace custom auth with OAuth2 provider integration"
+    fhash = hashlib.sha256((merged_title + merged_desc).encode()).hexdigest()[:16]
+
+    # COMPLETED+pr_merged task that is very old — must still block
+    old_merged = Task(
+        project_id=project.id,
+        title=merged_title,
+        payloads=[{"type": "create", "prompt": "migrate auth", "base_branch": "main"}],
+        context={"finding_hash": fhash, "pr_merged": True},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(days=30),
+    )
+    db_session.add(old_merged)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": merged_title,
+            "description": merged_desc,
+            "prompt": "Migrate auth to OAuth2",
+            "priority": "high",
+            "scope": "medium",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "Successfully merged PR must block re-proposal permanently"
