@@ -1,10 +1,13 @@
 """Activity, digest, and pipeline analytics endpoints."""
+import os
+import re
+import time
 import uuid
 import json
 import logging
 from collections import defaultdict
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1454,3 +1457,187 @@ async def get_task_duration_stats(
             sd = sorted(durs); mid = len(sd) // 2
             stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
     return {"stats": stats}
+
+
+ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
+ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
+_orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
+
+_EXCEPTION_LINE_RE = re.compile(
+    r"^(?P<cls>(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|Timeout|NotFound|Denied|Conflict))(?::|\b)",
+    re.MULTILINE,
+)
+_TRACEBACK_FRAME_RE = re.compile(
+    r'File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<func>[^\n]+)',
+)
+
+
+def _extract_error_message(entry: Any) -> str:
+    """Return the textual payload from a Cloud Logging entry, regardless of shape."""
+    payload = getattr(entry, "payload", None)
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("message", "msg", "exception", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return json.dumps(payload, default=str)[:4000]
+    if payload is None:
+        return ""
+    return str(payload)[:4000]
+
+
+def _parse_exception_class(message: str) -> str:
+    """Scan a log payload for the last exception class name in a traceback."""
+    if not message:
+        return "UnknownError"
+    matches = _EXCEPTION_LINE_RE.findall(message)
+    if matches:
+        return matches[-1].rstrip(":")
+    for line in reversed(message.strip().splitlines()):
+        stripped = line.strip()
+        if stripped and stripped[0].isupper() and ("Error" in stripped or "Exception" in stripped):
+            head = stripped.split(":", 1)[0].strip()
+            if head:
+                return head
+    return "UnknownError"
+
+
+def _parse_source_location(message: str) -> Tuple[str, Optional[int]]:
+    """Return the first traceback frame inside the app source tree."""
+    app_frame: Optional[Tuple[str, int]] = None
+    last_frame: Optional[Tuple[str, int]] = None
+    for match in _TRACEBACK_FRAME_RE.finditer(message):
+        path = match.group("path")
+        try:
+            line_no = int(match.group("line"))
+        except ValueError:
+            continue
+        last_frame = (path, line_no)
+        if "/app/app/" in path or path.startswith("app/") or "\\app\\app\\" in path:
+            app_frame = (path, line_no)
+    chosen = app_frame or last_frame
+    if chosen is None:
+        return ("unknown", None)
+    path, line_no = chosen
+    marker = "/app/app/"
+    idx = path.find(marker)
+    if idx != -1:
+        return (path[idx + len("/app/"):], line_no)
+    return (path, line_no)
+
+
+def _parse_entry_timestamp(entry: Any) -> datetime:
+    ts = getattr(entry, "timestamp", None)
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    if isinstance(ts, str):
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
+    """Group log entries by (exception_class, source_file, source_line)."""
+    buckets: Dict[Tuple[str, str, Optional[int]], Dict[str, Any]] = {}
+    for entry in entries:
+        message = _extract_error_message(entry)
+        exception_class = _parse_exception_class(message)
+        source_file, source_line = _parse_source_location(message)
+        key = (exception_class, source_file, source_line)
+        ts = _parse_entry_timestamp(entry)
+        bucket = buckets.get(key)
+        if bucket is None:
+            sample = message.strip()
+            if len(sample) > 600:
+                sample = sample[:600] + "..."
+            buckets[key] = {
+                "exception_class": exception_class,
+                "source": f"{source_file}:{source_line}" if source_line else source_file,
+                "count": 1,
+                "first_seen_iso": ts.isoformat(),
+                "last_seen_iso": ts.isoformat(),
+                "sample_message": sample,
+            }
+            continue
+        bucket["count"] += 1
+        if ts.isoformat() < bucket["first_seen_iso"]:
+            bucket["first_seen_iso"] = ts.isoformat()
+        if ts.isoformat() > bucket["last_seen_iso"]:
+            bucket["last_seen_iso"] = ts.isoformat()
+    ranked = sorted(
+        buckets.values(),
+        key=lambda b: (b["count"], b["last_seen_iso"]),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
+    """Query Cloud Logging for ERROR-severity entries from the orchestrator service."""
+    from google.cloud import logging_v2
+
+    gcp_project_id = os.getenv("GCP_PROJECT_ID", "")
+    if not gcp_project_id or gcp_project_id == "your-gcp-project-id":
+        raise RuntimeError("GCP_PROJECT_ID not configured")
+
+    client = logging_v2.Client(project=gcp_project_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    filter_str = (
+        'resource.type="cloud_run_revision" '
+        f'resource.labels.service_name="{ORCHESTRATOR_SERVICE_NAME}" '
+        'severity>=ERROR '
+        f'timestamp>="{cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
+    )
+    entries_iter = client.list_entries(
+        filter_=filter_str,
+        order_by=logging_v2.DESCENDING,
+        page_size=500,
+    )
+    collected: List[Any] = []
+    for entry in entries_iter:
+        collected.append(entry)
+        if len(collected) >= 500:
+            break
+    return collected
+
+
+@router.get("/recent-orchestrator-errors")
+async def get_recent_orchestrator_errors(
+    hours: int = Query(default=1, ge=1, le=24),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: dict = Depends(require_admin),
+):
+    """Aggregate ERROR-severity logs from Cloud Logging for the orchestrator service."""
+    cache_key = (hours, limit)
+    now = time.time()
+    cached = _orchestrator_errors_cache.get(cache_key)
+    if cached is not None and (now - cached[0]) < ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        entries = _fetch_orchestrator_error_entries(hours)
+    except Exception as exc:
+        logger.exception("Failed to fetch orchestrator error logs from Cloud Logging")
+        payload: Dict[str, Any] = {
+            "buckets": [],
+            "hours": hours,
+            "error": f"{type(exc).__name__}: {exc}",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _orchestrator_errors_cache[cache_key] = (now, payload)
+        return payload
+
+    buckets = _bucket_log_entries(entries, limit)
+    payload = {
+        "buckets": buckets,
+        "hours": hours,
+        "total_entries_scanned": len(entries),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _orchestrator_errors_cache[cache_key] = (now, payload)
+    return payload
