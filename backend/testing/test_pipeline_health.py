@@ -283,6 +283,130 @@ async def test_direction_with_zero_cycles_excluded():
     assert result["direction_stats"] == []
 
 
+# ── Dominant dropout stage ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_dominant_dropout_stage_surfaces_highest_count():
+    """dominant_dropout_stage picks the stage_dropout key with the highest total."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "Stage dropout direction",
+        "possibly_saturated": False,
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 1,
+                "tasks_created": 4,
+                "stage_dropout": {
+                    "tasks_failed_code_error": 2,
+                    "tasks_failed_infra": 1,
+                    "tasks_required_approval": 0,
+                    "tasks_merged_staging_only": 0,
+                },
+            }
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    assert stats[0]["dominant_dropout_stage"] == "tasks_failed_code_error"
+
+
+@pytest.mark.asyncio
+async def test_dominant_dropout_stage_none_when_no_stage_dropout_data():
+    """dominant_dropout_stage is None when research_history has no stage_dropout entries."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "No dropout data direction",
+        "possibly_saturated": False,
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 1,
+                "tasks_created": 2,
+            }
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    assert stats[0]["dominant_dropout_stage"] is None
+
+
+@pytest.mark.asyncio
+async def test_dominant_dropout_stage_none_when_all_zeros():
+    """dominant_dropout_stage is None when stage_dropout is present but all counts are 0."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "Perfect cycle direction",
+        "possibly_saturated": False,
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 2,
+                "tasks_created": 2,
+                "stage_dropout": {
+                    "tasks_failed_code_error": 0,
+                    "tasks_failed_infra": 0,
+                    "tasks_required_approval": 0,
+                    "tasks_merged_staging_only": 0,
+                },
+            }
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1
+    assert stats[0]["dominant_dropout_stage"] is None, (
+        f"Expected None for all-zero stage_dropout, got {stats[0]['dominant_dropout_stage']}"
+    )
+
+
 # ── Return structure ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

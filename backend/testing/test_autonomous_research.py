@@ -19,7 +19,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
@@ -2280,6 +2280,109 @@ async def test_type_distribution_and_product_ratio(db_session):
     assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
 
 
+@pytest.mark.asyncio
+async def test_stage_dropout_breakdown(db_session):
+    """stage_dropout is populated with per-category failure counts."""
+    direction_id = "d-stagedrop01"
+    direction = _active_direction(direction_id, "Stage dropout test")
+
+    project = Project(
+        name="Stage Dropout Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # code_error_task: FAILED with CODE_ERROR message
+    code_error_task = Task(
+        project_id=project.id,
+        title="Fix broken parser",
+        payloads=[{"type": "fix", "prompt": "fix parser"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Build failed: syntax error in main.py",
+        created_by="ORCHESTRATOR",
+    )
+    # review_capped_task: requires_approval=True (hit iteration cap)
+    review_capped_task = Task(
+        project_id=project.id,
+        title="Add feature flag",
+        payloads=[{"type": "create", "prompt": "add flag"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Review-fix cap reached for PR #42 (10 total iterations)",
+        requires_approval=True,
+        created_by="ORCHESTRATOR",
+    )
+    # merged_task: COMPLETED with pr_merged=True
+    merged_task = Task(
+        project_id=project.id,
+        title="Add caching layer",
+        payloads=[{"type": "create", "prompt": "add cache"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        created_by="ORCHESTRATOR",
+    )
+    for t in (code_error_task, review_capped_task, merged_task):
+        db_session.add(t)
+    await db_session.commit()
+    for t in (code_error_task, review_capped_task, merged_task):
+        await db_session.refresh(t)
+
+    # Research task (parent) in COMPLETED state — rollup succeeded
+    research_task = Task(
+        project_id=project.id,
+        title="Research: Stage dropout test",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+    await db_session.refresh(research_task)
+
+    for t in (code_error_task, review_capped_task, merged_task):
+        t.parent_task_id = research_task.id
+        db_session.add(t)
+    await db_session.commit()
+
+    dirs = list(project.directions or [])
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [{
+                "timestamp": "2026-04-07T00:00:00",
+                "task_id": str(research_task.id),
+                "tasks_created": 3,
+                "finding_titles": [],
+            }]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+    dropout = entry.get("stage_dropout", {})
+
+    assert dropout.get("tasks_failed_code_error") == 1, f"Expected 1 code error, got {dropout}"
+    assert dropout.get("tasks_required_approval") == 1, f"Expected 1 required approval, got {dropout}"
+    # rollup succeeded (research task COMPLETED) — no staging-only merges
+    assert dropout.get("tasks_merged_staging_only") == 0, f"Expected 0 staging-only, got {dropout}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _strategic_failures auto-decay
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2582,3 +2685,297 @@ async def test_code_error_still_blocks_dedup(db_session, mocker):
     )
     child_tasks = result.scalars().all()
     assert len(child_tasks) == 0, "CODE_ERROR failure must still block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
+    """A CODE_ERROR failure older than 48 hours must NOT block re-proposal."""
+    direction = _active_direction("d-ceold01", "Code error cooldown test")
+    project = Project(
+        name="Code Error Cooldown Allow", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_title = "Add input validation to user registration"
+    old_desc = "Registration endpoint missing email format validation"
+    fhash = hashlib.sha256((old_title + old_desc).encode()).hexdigest()[:16]
+
+    # CODE_ERROR failure older than 48h — should be excluded from dedup set
+    old_code_failed = Task(
+        project_id=project.id,
+        title=old_title,
+        payloads=[{"type": "create", "prompt": "add validation", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Tests failed: AssertionError in test_registration.py line 15",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=72),
+    )
+    db_session.add(old_code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": old_title,
+            "description": old_desc,
+            "prompt": "Add input validation",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, "CODE_ERROR failure older than 48h must NOT block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
+    """A CODE_ERROR failure within the 48-hour cooldown must still block re-proposal."""
+    direction = _active_direction("d-cewarm01", "Code error within cooldown test")
+    project = Project(
+        name="Code Error Cooldown Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    recent_title = "Fix null pointer in order processing"
+    recent_desc = "Order processor crashes on missing customer_id field"
+    fhash = hashlib.sha256((recent_title + recent_desc).encode()).hexdigest()[:16]
+
+    # CODE_ERROR failure within 48h — must remain in dedup set
+    recent_code_failed = Task(
+        project_id=project.id,
+        title=recent_title,
+        payloads=[{"type": "create", "prompt": "fix null pointer", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="Build failed: NullPointerException in OrderProcessor.java:88",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=24),
+    )
+    db_session.add(recent_code_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": recent_title,
+            "description": recent_desc,
+            "prompt": "Fix null pointer error",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "CODE_ERROR failure within 48h cooldown must still block re-proposal"
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
+    """A successfully merged PR must block re-proposal even after the cooldown period."""
+    direction = _active_direction("d-mergedold01", "Merged PR permanent block test")
+    project = Project(
+        name="Merged PR Permanent Block", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_title = "Migrate legacy auth to OAuth2"
+    merged_desc = "Replace custom auth with OAuth2 provider integration"
+    fhash = hashlib.sha256((merged_title + merged_desc).encode()).hexdigest()[:16]
+
+    # COMPLETED+pr_merged task that is very old — must still block
+    old_merged = Task(
+        project_id=project.id,
+        title=merged_title,
+        payloads=[{"type": "create", "prompt": "migrate auth", "base_branch": "main"}],
+        context={"finding_hash": fhash, "pr_merged": True},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(days=30),
+    )
+    db_session.add(old_merged)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": merged_title,
+            "description": merged_desc,
+            "prompt": "Migrate auth to OAuth2",
+            "priority": "high",
+            "scope": "medium",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 0, "Successfully merged PR must block re-proposal permanently"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deadlock Detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db_session, mocker):
+    """3 consecutive 0-task cycles driven by hash dedup creates a WARNING Alert and BUG_REPORT message."""
+    direction_id = "d-deadlk01"
+    direction = {
+        **_active_direction(direction_id, "Fix performance bottlenecks"),
+        # Pre-populate 2 prior empty cycles with non-zero hash_dedup counts
+        "research_history": [
+            {
+                "timestamp": "2026-01-10T00:00:00",
+                "task_id": "00000000-0000-0000-0000-000000000001",
+                "tasks_created": 0,
+                "summary": "no findings",
+                "finding_titles": [],
+                "key_finding_descriptions": [],
+                "filter_breakdown": {
+                    "hash_dedup": 3,
+                    "word_overlap_dedup": 0,
+                    "file_overlap_dedup": 0,
+                    "type_filtered": 0,
+                    "empty_prompt": 0,
+                },
+            },
+            {
+                "timestamp": "2026-01-11T00:00:00",
+                "task_id": "00000000-0000-0000-0000-000000000002",
+                "tasks_created": 0,
+                "summary": "no findings",
+                "finding_titles": [],
+                "key_finding_descriptions": [],
+                "filter_breakdown": {
+                    "hash_dedup": 2,
+                    "word_overlap_dedup": 0,
+                    "file_overlap_dedup": 0,
+                    "type_filtered": 0,
+                    "empty_prompt": 0,
+                },
+            },
+        ],
+    }
+    project = Project(
+        name="Deadlock Detection Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Existing task whose hash will block the new finding (causes hash_dedup in 3rd cycle)
+    dup_title = "Fix database connection leak in worker pool"
+    dup_desc = "Connection leak causes OOM after sustained load"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Fix performance bottlenecks",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "Fix the connection leak",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    # A WARNING-severity Alert should have been created for the deadlock
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    deadlock_alerts = [
+        a for a in alerts
+        if a.severity == AlertSeverity.WARNING and "deadlock" in a.title.lower()
+    ]
+    assert len(deadlock_alerts) >= 1, "Expected a WARNING Alert for dedup deadlock"
+    assert direction_id in deadlock_alerts[0].message
+
+    # A BUG_REPORT ProjectMessage should also have been created
+    messages = (await db_session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+    )).scalars().all()
+    bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
+    assert len(bug_reports) >= 1, "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
+    assert bug_reports[0].context.get("source") == "dedup_deadlock"
+    assert bug_reports[0].context.get("consecutive_empty_cycles") == 3

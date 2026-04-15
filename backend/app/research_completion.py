@@ -187,6 +187,39 @@ def _compute_saturation(history: list) -> bool:
     return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
 
 
+def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
+    """Detect dedup deadlock: last `window` entries all have tasks_created==0 with dedup blocks.
+
+    A direction is considered deadlocked when research cycles keep producing findings that are
+    immediately rejected by hash or word-overlap deduplication, wasting VM compute. Detection
+    requires that the last `window` entries all have tasks_created==0 AND at least 2 of those
+    entries show non-zero hash_dedup or word_overlap_dedup counts.
+
+    Returns (is_deadlocked, consecutive_empty_count).
+    """
+    if len(history) < window:
+        return False, 0
+    recent = history[-window:]
+    if not all(e.get("tasks_created", 0) == 0 for e in recent):
+        return False, 0
+    # At least 2 of the last `window` entries must show dedup activity
+    dedup_active_count = sum(
+        1 for e in recent
+        if (e.get("filter_breakdown", {}).get("hash_dedup", 0) or 0)
+        + (e.get("filter_breakdown", {}).get("word_overlap_dedup", 0) or 0) > 0
+    )
+    if dedup_active_count < 2:
+        return False, 0
+    # Count consecutive empty cycles from the end
+    consecutive = 0
+    for e in reversed(history):
+        if e.get("tasks_created", 0) == 0:
+            consecutive += 1
+        else:
+            break
+    return True, consecutive
+
+
 def _parse_research_context(text: str) -> dict:
     """Parse a research_context string into its 3 sections and optional eviction summary."""
     result: dict = {"established": [], "failed": [], "open_questions": [], "eviction_summary": None}
@@ -515,6 +548,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     from app.failure_classification import classify_failure  # noqa: PLC0415
     _infra_classes = frozenset({"PROVISION_FAILURE", "AGENT_TIMEOUT", "RATE_LIMIT"})
+    _code_error_cooldown = timedelta(hours=48)
+    _dedup_now = _utcnow()
 
     recent_finding_hashes = {
         t.context["finding_hash"] for t in recent_tasks_for_dedup
@@ -531,6 +566,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         and not (
             t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
             and classify_failure(t) in _infra_classes
+        )
+        # Exclude CODE_ERROR failures older than cooldown — codebase may have changed,
+        # or improved context may allow a different implementation approach.
+        # Tasks within the cooldown window still block to prevent rapid re-spin loops.
+        and not (
+            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            and classify_failure(t) == "CODE_ERROR"
+            and t.created_at < _dedup_now - _code_error_cooldown
         )
     }
     # Build a map of finding_hash -> outcome for failed/cancelled tasks for better logging
@@ -939,6 +982,75 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         d["history_aggregate"] = prev_agg
                     d["research_history"] = new_history[-10:]
                     d["possibly_saturated"] = _compute_saturation(d["research_history"])
+
+                    # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
+                    _deadlocked, _consec = _detect_dedup_deadlock(d["research_history"])
+                    if _deadlocked and d.get("status") == "active":
+                        _blocked_titles = [
+                            f.get("title", "")[:60]
+                            for f in (task.plan_output or [])
+                            if f.get("type") not in (
+                                "direction_proposal", "direction_note",
+                                "design_doc_observation", "direction_update",
+                            )
+                            and f.get("title")
+                        ][:3]
+                        # Guard: only create alert if no undismissed alert exists for this direction
+                        _existing_deadlock_alert = (await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == task.project_id,
+                                Alert.title == "Dedup deadlock detected",
+                                Alert.dismissed_at.is_(None),
+                                Alert.message.contains(did),
+                            )
+                        )).scalars().first()
+                        if not _existing_deadlock_alert:
+                            _deadlock_alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title="Dedup deadlock detected",
+                                message=(
+                                    f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
+                                    f"{_consec} consecutive research cycles with 0 tasks created "
+                                    f"due to deduplication. "
+                                    + (
+                                        f"Top blocked findings: {'; '.join(_blocked_titles)}."
+                                        if _blocked_titles else ""
+                                    )
+                                ),
+                                task_id=task.id,
+                            )
+                            session.add(_deadlock_alert)
+                            _deadlock_msg = ProjectMessage(
+                                project_id=task.project_id,
+                                message_type=MessageType.BUG_REPORT,
+                                from_type="agent",
+                                from_task_id=task.id,
+                                content=(
+                                    f"Dedup deadlock detected for direction "
+                                    f"'{d.get('text', did)[:80]}' (id: {did}): "
+                                    f"{_consec} consecutive research cycles produced 0 tasks "
+                                    f"because findings keep matching existing hashes or "
+                                    f"word-overlapping active tasks. "
+                                    + (
+                                        f"Blocked: {'; '.join(_blocked_titles)}. "
+                                        if _blocked_titles else ""
+                                    )
+                                    + "Consider resetting the direction or waiting for "
+                                    "blocked tasks to complete."
+                                ),
+                                context={
+                                    "source": "dedup_deadlock",
+                                    "direction_id": did,
+                                    "consecutive_empty_cycles": _consec,
+                                },
+                            )
+                            session.add(_deadlock_msg)
+                            logger.warning(
+                                f"[RESEARCH] Dedup deadlock: direction {did}, "
+                                f"{_consec} consecutive empty cycles (task {task.id})"
+                            )
+
                     d["research_context"] = _build_research_context(
                         prior_context=d.get("research_context"),
                         finding_titles=finding_titles_by_dir.get(did, [])[:5],

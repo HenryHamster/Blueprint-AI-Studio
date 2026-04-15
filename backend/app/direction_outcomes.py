@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.failure_classification import classify_failure as _classify_failure
 from app.models import Project, Task, TaskStatus
 
 
@@ -96,6 +97,44 @@ async def _update_direction_research_outcomes(
                         infra_failures += 1
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
             entry["tasks_failed_infra"] = infra_failures
+
+            # Stage dropout: per-cycle breakdown of why tasks didn't reach main
+            sd_code_error = 0
+            sd_infra = 0
+            sd_code_error_ids: set = set()
+            for ct in child_tasks_rows:
+                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    fc = _classify_failure(ct)
+                    if fc == "CODE_ERROR":
+                        sd_code_error += 1
+                        sd_code_error_ids.add(ct.id)
+                    elif fc in INFRA_CATEGORIES:
+                        sd_infra += 1
+            # tasks_required_approval: non-completed tasks that required manual approval
+            # Exclude tasks already counted as CODE_ERROR to avoid double-counting
+            sd_required_approval = sum(
+                1 for ct in child_tasks_rows
+                if ct.requires_approval
+                and ct.status not in (TaskStatus.COMPLETED,)
+                and ct.id not in sd_code_error_ids
+            )
+            research_task_obj = await session.get(Task, research_task_uuid)
+            rollup_failed = (
+                research_task_obj is not None
+                and research_task_obj.status == TaskStatus.FAILED
+            )
+            sd_staging_only = sum(
+                1 for ct in child_tasks_rows
+                if ct.status == TaskStatus.COMPLETED
+                and (ct.context or {}).get("pr_merged")
+                and rollup_failed
+            )
+            entry["stage_dropout"] = {
+                "tasks_failed_code_error": sd_code_error,
+                "tasks_failed_infra": sd_infra,
+                "tasks_required_approval": sd_required_approval,
+                "tasks_merged_staging_only": sd_staging_only,
+            }
 
             # Classify child tasks as product vs structural
             PRODUCT_TYPES = {"create", "feature", "improvement"}
