@@ -833,6 +833,34 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
     )
 
 
+@pytest.mark.asyncio
+async def test_safe_ws_close_swallows_double_close_runtime_error():
+    """Production cascade: receive_json raised WebSocketDisconnect (already
+    sent a close frame), then our explicit close tries to send a second one
+    and starlette raises RuntimeError. _safe_ws_close must swallow that
+    specific race without breaking."""
+    from unittest.mock import AsyncMock
+    from app.routers.projects import _safe_ws_close
+    ws = AsyncMock()
+    ws.close.side_effect = RuntimeError(
+        'Unexpected ASGI message "websocket.close", after sending "websocket.close".'
+    )
+    await _safe_ws_close(ws, code=1008, reason="Authentication failed")
+    ws.close.assert_awaited_once_with(code=1008, reason="Authentication failed")
+
+
+@pytest.mark.asyncio
+async def test_safe_ws_close_reraises_other_runtime_errors():
+    """Only the double-close race is swallowed; other RuntimeErrors propagate
+    so real bugs don't get hidden."""
+    from unittest.mock import AsyncMock
+    from app.routers.projects import _safe_ws_close
+    ws = AsyncMock()
+    ws.close.side_effect = RuntimeError("connection closed during handshake")
+    with pytest.raises(RuntimeError, match="handshake"):
+        await _safe_ws_close(ws, code=1008, reason="boom")
+
+
 def test_agent_ws_invalid_token_closes_with_1008(mocker):
     """
     Tests that connecting to the agent WebSocket without a valid token causes
