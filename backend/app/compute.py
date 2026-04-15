@@ -420,14 +420,44 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
         }
     )
 
-    # Grant the agent service account secretAccessor on this specific secret only
-    policy = client.get_iam_policy(request={"resource": secret.name})
-    binding = policy_pb2.Binding(
-        role="roles/secretmanager.secretAccessor",
-        members=[f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"],
-    )
-    policy.bindings.append(binding)
-    client.set_iam_policy(request={"resource": secret.name, "policy": policy})
+    # Grant the agent service account secretAccessor on this specific secret only.
+    # Wrapped in exponential-backoff retry because concurrent provisions race on
+    # IAM policy ETags and produce Aborted/409, which previously crashed VM
+    # provisioning. Also short-circuits when the SA is already bound so reused
+    # secrets don't accumulate duplicate bindings.
+    from google.api_core.exceptions import Aborted  # noqa: PLC0415
+    agent_sa_member = f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            policy = client.get_iam_policy(request={"resource": secret.name})
+            already_bound = any(
+                b.role == "roles/secretmanager.secretAccessor"
+                and agent_sa_member in b.members
+                for b in policy.bindings
+            )
+            if already_bound:
+                break
+            binding = policy_pb2.Binding(
+                role="roles/secretmanager.secretAccessor",
+                members=[agent_sa_member],
+            )
+            policy.bindings.append(binding)
+            client.set_iam_policy(request={"resource": secret.name, "policy": policy})
+            break
+        except Aborted:
+            if attempt == max_retries - 1:
+                logger.error(
+                    "[COMPUTE] IAM policy ETag retry exhausted for %s after %d attempts",
+                    secret.name, max_retries,
+                )
+                raise
+            backoff_seconds = min(0.1 * (2 ** attempt), 2.0)
+            logger.warning(
+                "[COMPUTE] IAM policy ETag conflict on %s (attempt %d/%d), retrying in %.2fs",
+                secret.name, attempt + 1, max_retries, backoff_seconds,
+            )
+            time.sleep(backoff_seconds)
 
     logger.info(f"Stored agent credentials in Secret Manager: {secret_id}")
     return version.name
