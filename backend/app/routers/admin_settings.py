@@ -648,9 +648,9 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
     except Exception as e:
         # Restore in-memory config to pre-change state on DB failure
         _runtime_config.update(_config_snapshot)
-        logger.error(f"[SETTINGS] DB persist failed, rolling back in-memory config: {e}")
+        logger.exception("[SETTINGS] DB persist failed, rolling back in-memory config")
         await session.rollback()
-        raise HTTPException(status_code=500, detail="Failed to persist settings")
+        raise HTTPException(status_code=500, detail=f"Failed to persist settings: {e}")
 
     return _runtime_config
 
@@ -1144,7 +1144,7 @@ async def repair_state(
                     f"HALF_OPEN test task deleted/reaped (admin repair) — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)"
                 )
             except Exception:
-                pass
+                logger.exception(f"[ADMIN REPAIR] Failed to create circuit breaker alert for {proj_id}")
             repairs.append(f"Reset HALF_OPEN circuit breaker for project {proj_id} (test task {test_id} not found)")
 
     await session.commit()

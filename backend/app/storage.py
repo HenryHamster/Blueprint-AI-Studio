@@ -31,9 +31,9 @@ async def upload_json_payload(task_id: str, payload_data: list | dict) -> str:
     try:
         uri = await asyncio.to_thread(_upload)
         return uri
-    except Exception as e:
-        logger.error(f"Failed to upload payload to GCS: {e}")
-        raise e
+    except Exception:
+        logger.exception("Failed to upload payload to GCS")
+        raise
 
 async def generate_upload_signed_url(task_id: str, filename: str, expiration_minutes: int = 15) -> str:
     """
@@ -60,6 +60,6 @@ async def generate_upload_signed_url(task_id: str, filename: str, expiration_min
     try:
         url = await asyncio.to_thread(_generate)
         return url
-    except Exception as e:
-        logger.error(f"Failed to generate upload signed URL: {e}")
-        raise e
+    except Exception:
+        logger.exception("Failed to generate upload signed URL")
+        raise

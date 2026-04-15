@@ -486,7 +486,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent.id}")
                         staging_branch_missing = True
                     elif http_err.status_code in (401, 403):
-                        logger.error(f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring")
+                        logger.exception(f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring")
                         return
                     else:
                         logger.warning(f"[ROLLUP] GitHub {http_err.status_code} checking staging branch — deferring")

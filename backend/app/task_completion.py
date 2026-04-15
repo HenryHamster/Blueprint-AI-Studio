@@ -240,16 +240,16 @@ async def _ensure_branch(
                         # conclude the branch is missing; continue retrying.
                         logger.warning(f"[{label}] Transient error verifying branch {branch_name} ({verify_exc.status_code}), will retry")
                 except Exception:
-                    pass
+                    logger.exception(f"[{label}] Non-HTTP error verifying branch {branch_name}")
             if _attempt < max_retries - 1:
                 backoff = 10 * (2 ** _attempt) * (0.75 + 0.5 * random.random())  # jitter: 10-20s, 20-40s, …
                 logger.warning(f"[{label}] Branch creation attempt {_attempt + 1} failed, retrying in {backoff:.1f}s: {e!r}")
                 await asyncio.sleep(backoff)
             else:
                 if gh_token:
-                    logger.error(f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts: {last_err!r}")
+                    logger.exception(f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts")
                 else:
-                    logger.error(f"[{label}] Cannot create branch — GitHub token unavailable: {last_err!r}")
+                    logger.exception(f"[{label}] Cannot create branch — GitHub token unavailable")
     e = last_err
     task.status = TaskStatus.FAILED
     task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]

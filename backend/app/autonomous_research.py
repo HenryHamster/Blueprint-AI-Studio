@@ -273,8 +273,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 logger.info(f'[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get("failed_at")})')
             else:
                 logger.warning(f'[STRATEGIC] Pending SR retry skipped (active strategic task) for project {project.id}')
-        except Exception as retry_exc:
-            logger.error(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}: {retry_exc}')
+        except Exception:
+            logger.exception(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}')
         return  # Don't spawn tactical research this cycle
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's

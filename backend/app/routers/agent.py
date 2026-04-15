@@ -532,7 +532,7 @@ async def claim_task(
             from app.routers.admin_analytics import compute_pipeline_health_summary
             pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
         except Exception:
-            pass  # non-critical — don't fail the request
+            logger.exception("[AGENT] Failed to compute pipeline health summary (non-critical)")
 
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
@@ -589,9 +589,9 @@ async def claim_task(
                             for desc, cnt in recurring[:3]
                         ]
                 except Exception:
-                    pass  # non-critical
+                    logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
             except Exception:
-                pass  # non-critical — don't fail the request
+                logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
         response["project_context"] = {
             "active_tasks": active_tasks,
@@ -612,7 +612,7 @@ async def claim_task(
             if pipeline_health:
                 response["project_context"] = {"pipeline_health": pipeline_health}
         except Exception:
-            pass
+            logger.exception("[AGENT] Failed to compute lightweight pipeline health (non-critical)")
 
     # Task types that benefit from untagged operational playbook entries.
     # Types not in this set only receive entries with explicit applicable_types matching them.
@@ -677,7 +677,7 @@ async def claim_task(
                 session.add(project_for_playbook)
                 await session.commit()
             except Exception:
-                pass
+                logger.exception("[AGENT] Failed to update playbook reference counts (non-critical)")
 
     # Inject direction quality signal when total PRs >= 3 (reuse project already loaded above)
     direction_id = (task.context or {}).get("direction_id")

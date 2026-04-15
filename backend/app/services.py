@@ -56,7 +56,7 @@ async def gcp_cleanup_service():
                         _app_main._last_gcp_vm_count = cleanup_result.total_gcp_vms
                         _app_main._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
-                    logger.error("[GCP CLEANUP] Cycle timed out after 120s")
+                    logger.exception("[GCP CLEANUP] Cycle timed out after 120s")
 
         except asyncio.CancelledError:
             logger.info("[GCP CLEANUP] Service shutting down.")

@@ -611,7 +611,7 @@ async def _process_post_commit(
                             verdict_parsed = True
                             logger.info(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
                     except (json.JSONDecodeError, TypeError):
-                        logger.error(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
+                        logger.exception(f"[REVIEW PIPELINE] verdict_json field present but invalid for task {task.id}")
 
                 # Method 2: Parse JSON from log output (string-aware bracket counting)
                 if not verdict_parsed:
@@ -1109,7 +1109,7 @@ async def _process_post_commit(
                                     if orig_t:
                                         orig_goal = (orig_t.description or orig_t.title or "")[:500]
                                 except Exception:
-                                    pass
+                                    logger.exception(f"[REVIEW PIPELINE] Failed to fetch original task {original_task_id} for fix prompt")
                             fix_prompt = (
                                 f"This PR (#{pr_number}) was approved but could not be merged.\n"
                                 f"Error: {merge_msg}\n"

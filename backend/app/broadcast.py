@@ -114,7 +114,7 @@ class ConnectionManager:
             try:
                 await ws.close(code=1001, reason="Idle timeout")
             except Exception:
-                pass
+                logger.exception(f"[WS] Failed to close idle connection for project {pid}")
             await self.disconnect(ws, pid)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):

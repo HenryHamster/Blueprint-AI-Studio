@@ -123,7 +123,7 @@ async def reset_deploy_health(
         _dh._pause_failure_streak = 0
         _dh._health_recovery_streak = 0
     except Exception:
-        pass
+        logger.exception("[DEPLOY] Failed to reset deploy_health streak counters")
 
     # Reset zone health — clear cooldowns so all zones are available
     try:
@@ -131,7 +131,7 @@ async def reset_deploy_health(
         _zone_failures.clear()
         _zone_health.clear()
     except Exception:
-        pass
+        logger.exception("[DEPLOY] Failed to reset zone health counters")
 
     # Clear failure history so failure_rate resets to 0
     from app.shared_state import deploy_monitoring

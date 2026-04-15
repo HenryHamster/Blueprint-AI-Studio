@@ -394,7 +394,7 @@ async def orchestrator_worker():
                                 "recovery_seconds": None,
                             })
                         except Exception:
-                            pass
+                            logger.exception("[ORCHESTRATOR] Failed to broadcast concurrency_limit throttle")
                     logger.info('orchestrator_slots_full', extra={
                         'slots_in_use': effective_count,
                         'total_slots': _runtime_config['max_concurrent_vms'],
@@ -427,7 +427,7 @@ async def orchestrator_worker():
                                 "recovery_seconds": ORCHESTRATOR_THROTTLE_SECONDS,
                             })
                         except Exception:
-                            pass
+                            logger.exception("[ORCHESTRATOR] Failed to broadcast high_failure_rate throttle")
                         # Run account re-enablement before sleeping so rate-limited accounts
                         # can recover even while dispatch is throttled
                         await recheck_disabled_accounts()
@@ -566,7 +566,7 @@ async def orchestrator_worker():
                                         _dep_session.add(_dep_task)
                                         await _dep_session.commit()
                             except Exception:
-                                pass
+                                logger.exception(f"[ORCHESTRATOR] Failed to update dep wait message for task {task.id}")
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
                 global _last_deadlock_check
@@ -753,7 +753,7 @@ async def orchestrator_worker():
                                 "recovery_seconds": int(wait_sec) if wait_sec is not None else None,
                             })
                         except Exception:
-                            pass
+                            logger.exception("[ORCHESTRATOR] Failed to broadcast zone_exhaustion throttle")
                     queued_tasks = []  # Clear so the loop below is skipped
 
                 for task in queued_tasks:
@@ -975,7 +975,7 @@ async def orchestrator_worker():
                                         if serial_log:
                                             logger.error(f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log[-500:]}")
                                 except Exception:
-                                    pass
+                                    logger.exception(f"[ORCHESTRATOR] Failed to capture serial log for VM {vm_id}")
                                 # Requeue with retry tracking — zone exhaustion is transient
                                 try:
                                     async with AsyncSessionLocal() as inner_session:
@@ -1162,7 +1162,7 @@ async def orchestrator_worker():
                             except HTTPException as exc:
                                 if exc.status_code in (404, 410):
                                     _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
-                                    logger.error(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
+                                    logger.exception(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
                                     ci_task.status = TaskStatus.FAILED
                                     ci_task.latest_status_message = _pr_gone_msg
                                     session.add(ci_task)
@@ -1348,23 +1348,23 @@ async def orchestrator_worker():
                         logger.info(f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing")
                         await handle_ci_completion(ci_task, ci_result, ci_gh_token, ci_owner, ci_repo, session, source="poll")
                     except Exception as e:
-                        logger.error(f"[CI] Error checking CI for task {ci_task.id}: {e}", exc_info=True)
+                        logger.exception(f"[CI] Error checking CI for task {ci_task.id}")
                         try:
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
-                                logger.error(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
+                                logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
                             else:
                                 ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
                             session.add(ci_task)
                             await session.commit()
-                        except Exception as e:
-                            logger.error(f"[CI] Failed to update ci_task status after error for task {ci_task.id}: {e}", exc_info=True)
+                        except Exception:
+                            logger.exception(f"[CI] Failed to update ci_task status after error for task {ci_task.id}")
                             try:
                                 await session.rollback()
                             except Exception:
-                                pass
+                                logger.exception(f"[CI] Rollback also failed for task {ci_task.id}")
 
             _orchestrator_consecutive_errors = 0
             logger.info('orchestrator_cycle_complete', extra={
@@ -1392,15 +1392,15 @@ async def orchestrator_worker():
                 if session:
                     await session.rollback()
             except Exception:
-                pass
+                logger.exception("[ORCHESTRATOR] Rollback after cycle error failed")
             # After 3 consecutive errors, alert all projects (deduplicated)
             if _orchestrator_consecutive_errors >= 3:
                 try:
                     async with AsyncSessionLocal() as alert_session:
                         await _create_orchestrator_error_alerts(alert_session, _orchestrator_consecutive_errors)
                         await alert_session.commit()
-                except Exception as alert_err:
-                    logger.error(f"[ORCHESTRATOR] Failed to create error alerts: {alert_err}")
+                except Exception:
+                    logger.exception("[ORCHESTRATOR] Failed to create error alerts")
 
         # Monitoring checks run every cycle (not just when idle)
         try:

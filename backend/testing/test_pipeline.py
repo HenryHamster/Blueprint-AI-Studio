@@ -59,7 +59,7 @@ class TestVerdictParsing:
                             except json.JSONDecodeError:
                                 pass
                             break
-        except Exception:
+        except Exception:  # noqa: S110 — test helper replicates production parser's safety net
             pass
 
         if not verdict_parsed:

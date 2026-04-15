@@ -41,9 +41,9 @@ async def store_user_secret(user_id: str, secret_name: str, secret_value: str) -
     try:
         version_name = await asyncio.to_thread(_store)
         return version_name
-    except Exception as e:
-        logger.error(f"Failed to store secret {full_secret_id}: {e}")
-        raise e
+    except Exception:
+        logger.exception(f"Failed to store secret {full_secret_id}")
+        raise
 
 async def delete_user_secret(secret_resource_name: str) -> None:
     """
@@ -80,6 +80,6 @@ async def get_user_secret(secret_resource_name: str) -> str:
     try:
         secret_value = await asyncio.to_thread(_get)
         return secret_value
-    except Exception as e:
-        logger.error(f"Failed to retrieve secret {secret_resource_name}: {e}")
-        raise e
+    except Exception:
+        logger.exception(f"Failed to retrieve secret {secret_resource_name}")
+        raise

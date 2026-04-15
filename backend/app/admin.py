@@ -512,7 +512,7 @@ async def bulk_action_tasks(
                                         try:
                                             await delete_branch(gh_token, owner, repo, branch)
                                         except Exception:
-                                            pass
+                                            logger.exception(f"[ADMIN] Failed to delete branch {branch} after merge")
                                         logger.info(f"[ADMIN] Bulk-approved merge of PR #{pr_number} (critical files)")
                                     else:
                                         task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
@@ -1163,7 +1163,7 @@ async def modify_task(
                                 try:
                                     await delete_branch(gh_token, owner, repo, branch)
                                 except Exception:
-                                    pass
+                                    logger.exception(f"[ADMIN] Failed to delete branch {branch} after merge")
                                 changes["merged_pr"] = pr_number
                                 logger.info(f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)")
                             else:
