@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig } from './types/project';
+import type { Project, AutoRemediationConfig, IssueImplementationConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -914,6 +914,40 @@ export function useAppState() {
     }
   };
 
+  // ── Issue implementation config (project-scoped) ────────────────────────
+  const [issueImplementationConfig, setIssueImplementationConfig] = useState<IssueImplementationConfig | null>(null);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setIssueImplementationConfig(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data?.config) setIssueImplementationConfig(data.config); })
+      .catch(() => {});
+  }, [selectedProjectId]);
+
+  const handleUpdateIssueImplementationConfig = async (config: IssueImplementationConfig) => {
+    if (!selectedProjectId) return;
+    const prev = issueImplementationConfig;
+    setIssueImplementationConfig(config);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify(config),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setIssueImplementationConfig(data.config);
+      addToast('Issue implementation config saved', 'success');
+    } catch {
+      setIssueImplementationConfig(prev);
+      addToast('Failed to save issue implementation config', 'error');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -974,6 +1008,7 @@ export function useAppState() {
     notificationConfig, updateNotificationConfig,
     buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
     autoRemediationConfig, handleUpdateAutoRemediationConfig,
+    issueImplementationConfig, handleUpdateIssueImplementationConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
