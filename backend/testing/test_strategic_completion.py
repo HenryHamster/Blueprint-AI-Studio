@@ -177,10 +177,12 @@ class TestCheckDirectionHealth:
         assert result is None
 
     def test_high_failure_rate_infra_excluded(self):
-        # 10 tasks: 8 failed but 6 are infra → only 2 code failures (20%) — no fire
+        # 10 tasks: 6 failed, all 6 are infra (0 code failures).
+        # Rule 3: 0% code failure — doesn't fire. Rule 4: code_failed=0 — doesn't fire.
+        # Pins the infra-exclusion principle for both rules.
         d = _direction(
             research_history=[
-                {"tasks_created": 10, "tasks_completed": 2, "tasks_failed": 8,
+                {"tasks_created": 10, "tasks_completed": 4, "tasks_failed": 6,
                  "tasks_failed_infra": 6, "prs_merged": 0},
             ] * 3,
         )
