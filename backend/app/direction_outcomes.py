@@ -58,6 +58,19 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if (ct.context or {}).get("pr_rejected")
             )
+            # Review quality signals: track how users respond to Blueprint's reviews
+            entry["reviews_dismissed"] = sum(
+                1 for ct in child_tasks_rows
+                if (ct.context or {}).get("review_dismissed")
+            )
+            entry["reviews_overridden"] = sum(
+                1 for ct in child_tasks_rows
+                if (ct.context or {}).get("user_overrode_review")
+            )
+            entry["user_issues_caught"] = sum(
+                1 for ct in child_tasks_rows
+                if (ct.context or {}).get("user_caught_issues")
+            )
             # avg_time_to_merge_hours: mean of (vm_stopped_at - created_at) for merged tasks
             merge_durations = [
                 (ct.vm_stopped_at - ct.created_at).total_seconds() / 3600

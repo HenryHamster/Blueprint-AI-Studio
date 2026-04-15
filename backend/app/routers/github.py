@@ -495,6 +495,135 @@ async def github_webhook(
                 session.add(task)
                 await session.commit()
 
+    elif event_type == 'pull_request_review':
+        action = data.get('action')
+        # Only process submitted and dismissed actions; ignore edits
+        if action not in ('submitted', 'dismissed'):
+            return {'status': 'ignored'}
+
+        review = data.get('review', {})
+        review_state = review.get('state', '')
+        pull_request_data = data.get('pull_request', {})
+        pr_number = pull_request_data.get('number')
+        repo_full = data.get('repository', {}).get('full_name', '')
+
+        if not pr_number or '/' not in repo_full:
+            return {'status': 'ignored'}
+
+        owner, repo_name = repo_full.split('/', 1)
+        project = (await session.execute(
+            select(Project).where(
+                Project.github_owner == owner,
+                Project.github_repo == repo_name,
+            )
+        )).scalars().first()
+        if not project:
+            logger.info(f'[WEBHOOK] pull_request_review for unregistered repo {repo_full}')
+            return {'status': 'ignored'}
+
+        # Find original create task via the PR artifact
+        pr_url_suffix = f'/{owner}/{repo_name}/pull/{pr_number}'
+        art_result = await session.execute(
+            select(Artifact).join(Task, Artifact.task_id == Task.id).where(
+                Task.project_id == project.id,
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                Artifact.pr_url.ilike(f'%{pr_url_suffix}'),
+            )
+        )
+        pr_artifacts = art_result.scalars().all()
+        if not pr_artifacts:
+            logger.info(f'[WEBHOOK] pull_request_review for PR {pr_url_suffix}: no matching artifact')
+            return {'status': 'ignored'}
+
+        review_user = review.get('user', {})
+        is_bot_review = (
+            review_user.get('type') == 'Bot'
+            or str(review_user.get('login', '')).endswith('[bot]')
+        )
+
+        signals_recorded = []
+        for art in pr_artifacts:
+            pr_task = await session.get(Task, art.task_id)
+            if not pr_task:
+                continue
+
+            blueprint_verdict = (pr_task.context or {}).get('blueprint_review_verdict')
+            update: dict = {}
+            signal: str | None = None
+            detail: str | None = None
+
+            if action == 'dismissed' and is_bot_review:
+                # A Blueprint review was dismissed by a user
+                dismissed_info = review.get('dismissed_review', {})
+                dismissal_message = (dismissed_info.get('dismissal_message') or '')[:500]
+                update['review_dismissed'] = True
+                if dismissal_message:
+                    update['review_dismissal_message'] = dismissal_message
+                signal = 'review_dismissed'
+                detail = dismissal_message or None
+                logger.info(
+                    f'[REVIEW QUALITY] PR #{pr_number}: Blueprint review dismissed '
+                    f'on task {pr_task.id}'
+                )
+
+            elif action == 'submitted' and review_state == 'approved' and blueprint_verdict == 'REQUEST_CHANGES':
+                # User approved after Blueprint requested changes — disagreement signal
+                if not (pr_task.context or {}).get('user_overrode_review'):
+                    update['user_overrode_review'] = True
+                    signal = 'user_overrode_review'
+                    logger.info(
+                        f'[REVIEW QUALITY] PR #{pr_number}: User approved after Blueprint '
+                        f'REQUEST_CHANGES on task {pr_task.id}'
+                    )
+
+            elif action == 'submitted' and review_state == 'changes_requested' and blueprint_verdict == 'APPROVE':
+                # User caught issues on a PR that Blueprint approved
+                if not (pr_task.context or {}).get('user_caught_issues'):
+                    update['user_caught_issues'] = True
+                    signal = 'user_caught_issues'
+                    logger.info(
+                        f'[REVIEW QUALITY] PR #{pr_number}: User caught issues after Blueprint '
+                        f'APPROVE on task {pr_task.id}'
+                    )
+
+            if update:
+                pr_task.context = {**(pr_task.context or {}), **update}
+                session.add(pr_task)
+                signals_recorded.append(signal)
+
+        if signals_recorded:
+            # Post in-app message for the first signal before committing
+            try:
+                from app.notification_dispatch import post_review_feedback_message  # noqa: PLC0415
+                first_task_id = pr_artifacts[0].task_id
+                await post_review_feedback_message(
+                    session,
+                    project.id,
+                    pr_number=pr_number,
+                    signal=signals_recorded[0],
+                    detail=detail,
+                    task_id=first_task_id,
+                )
+            except Exception as _ne:
+                logger.warning(f'[REVIEW QUALITY] In-app message failed: {_ne}')
+            await session.commit()
+            # Fire-and-forget external notification for each signal
+            try:
+                from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                for sig in signals_recorded:
+                    asyncio.ensure_future(dispatch_external_notification(
+                        project.id,
+                        'REVIEW_FEEDBACK',
+                        {
+                            'pr_number': pr_number,
+                            'repo': f'{owner}/{repo_name}',
+                            'signal': sig,
+                            'task_id': str(pr_artifacts[0].task_id),
+                        },
+                    ))
+            except Exception as _ne:
+                logger.warning(f'[REVIEW QUALITY] External notification failed: {_ne}')
+
     # NOTE: The 'issues' event must be enabled in the GitHub App's webhook settings.
     elif event_type == 'issues':
         action = data.get('action')

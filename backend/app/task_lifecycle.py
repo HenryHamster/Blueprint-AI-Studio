@@ -661,6 +661,11 @@ async def _process_post_commit(
                     except Exception as e2:
                         logger.warning(f"[REVIEW PIPELINE] Fallback comment also failed: {e2}", exc_info=True)
 
+                # Store Blueprint's verdict on the review task context so the
+                # pull_request_review webhook handler can correlate quality signals.
+                task.context = {**(task.context or {}), "blueprint_review_verdict": verdict}
+                session.add(task)
+
                 action_taken = False
                 head_sha = ""
                 if verdict == "APPROVE":
