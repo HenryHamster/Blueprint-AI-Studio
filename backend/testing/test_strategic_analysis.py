@@ -1,0 +1,354 @@
+"""Tests for _build_outcome_evaluation in app.strategic_analysis."""
+import pytest
+from unittest.mock import patch
+from app.strategic_analysis import _build_outcome_evaluation
+
+
+def _make_project(directions=None, vision=None):
+    """Build a minimal project-like object."""
+    class Project:
+        pass
+    p = Project()
+    p.directions = directions or []
+    p.vision = vision or {}
+    return p
+
+
+# ---------------------------------------------------------------------------
+# 1. Empty directions
+# ---------------------------------------------------------------------------
+
+def test_empty_directions_returns_defaults():
+    project = _make_project()
+    result = _build_outcome_evaluation(project)
+
+    assert result["overall"]["cycles"] == 0
+    assert result["overall"]["merged"] == 0
+    assert result["overall"]["failed"] == 0
+    assert result["overall"]["success_rate"] == 0.0
+    assert result["overall"]["trend"] == "stable"
+    assert result["window"]["from"] == "all_time"
+    assert result["window"]["vision_revision"] == 0
+    assert "directions" not in result
+    assert "systems" not in result
+
+
+# ---------------------------------------------------------------------------
+# 2. History entries — basic aggregation
+# ---------------------------------------------------------------------------
+
+def test_history_aggregation():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 3, "prs_rejected": 1,
+                 "tasks_failed": 0, "tasks_created": 5},
+                {"timestamp": "2026-01-02T00:00:00", "prs_merged": 2, "prs_rejected": 0,
+                 "tasks_failed": 1, "tasks_created": 4},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+
+    assert result["overall"]["merged"] == 5
+    assert result["overall"]["failed"] == 1
+    assert result["overall"]["cycles"] == 2
+
+    d = result["directions"][0]
+    assert d["merged"] == 5
+    assert d["failed"] == 1
+    assert d["cycles"] == 2
+    assert d["acceptance_rate"] == round(5 / 6, 3)  # merged=5, rejected=1, total=6
+
+
+def test_history_acceptance_rate():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 2, "prs_rejected": 2},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert d["acceptance_rate"] == 0.5
+
+
+def test_no_prs_omits_acceptance_rate():
+    directions = [
+        {"id": "dir-1", "status": "active", "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 0, "prs_rejected": 0},
+        ]}
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert "acceptance_rate" not in result["directions"][0]
+
+
+# ---------------------------------------------------------------------------
+# 3. failed_approaches in research_context
+# ---------------------------------------------------------------------------
+
+def test_failed_approaches_appear_in_output():
+    research_ctx = (
+        "## Established Findings\n"
+        "- Finding A\n"
+        "## Failed Approaches\n"
+        "- Approach X\n"
+        "- Approach Y\n"
+    )
+    directions = [
+        {"id": "dir-1", "status": "active", "research_context": research_ctx, "research_history": []}
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert "failed_approaches" in d
+    assert "Approach X" in d["failed_approaches"]
+    assert "Approach Y" in d["failed_approaches"]
+
+
+# ---------------------------------------------------------------------------
+# 4. scope_breakdown / type_distribution
+# ---------------------------------------------------------------------------
+
+def test_type_distribution_and_product_ratio():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 1,
+                    "tasks_created": 4,
+                    "type_distribution": {"create": 3, "fix": 1},
+                    "product_ratio": 0.8,
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert d["type_distribution"] == {"create": 3, "fix": 1}
+    assert d["product_ratio"] == 0.8
+
+
+# ---------------------------------------------------------------------------
+# 5. Multiple directions — aggregate metrics
+# ---------------------------------------------------------------------------
+
+def test_multiple_directions_aggregate():
+    directions = [
+        {
+            "id": "dir-A",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 3, "tasks_failed": 1},
+            ],
+        },
+        {
+            "id": "dir-B",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1, "tasks_failed": 3},
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+
+    assert result["overall"]["merged"] == 4
+    assert result["overall"]["failed"] == 4
+    assert result["overall"]["success_rate"] == round(4 / 8, 2)
+    assert len(result["directions"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# 6. operator_rejection_rate — only when rejected > 0
+# ---------------------------------------------------------------------------
+
+def test_operator_rejection_rate_computed_when_rejections():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 3, "prs_rejected": 1},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert "operator_rejection_rate" in d
+    assert d["operator_rejection_rate"] == round(1 / (3 + 1), 2)
+
+
+def test_operator_rejection_rate_absent_when_no_rejections():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 3, "prs_rejected": 0},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert "operator_rejection_rate" not in d
+
+
+# ---------------------------------------------------------------------------
+# 7. Trend calculation
+# ---------------------------------------------------------------------------
+
+def test_trend_improving():
+    # second half has much higher merge rate than first half
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 0},
+                {"timestamp": "2026-01-02T00:00:00", "prs_merged": 0},
+                {"timestamp": "2026-01-03T00:00:00", "prs_merged": 5},
+                {"timestamp": "2026-01-04T00:00:00", "prs_merged": 5},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert result["overall"]["trend"] == "improving"
+
+
+def test_trend_declining():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 5},
+                {"timestamp": "2026-01-02T00:00:00", "prs_merged": 5},
+                {"timestamp": "2026-01-03T00:00:00", "prs_merged": 0},
+                {"timestamp": "2026-01-04T00:00:00", "prs_merged": 0},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert result["overall"]["trend"] == "declining"
+
+
+def test_trend_stable_fewer_than_4_entries():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+                {"timestamp": "2026-01-02T00:00:00", "prs_merged": 100},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert result["overall"]["trend"] == "stable"
+
+
+# ---------------------------------------------------------------------------
+# 8. Window filter respects vision last_updated
+# ---------------------------------------------------------------------------
+
+def test_window_filter_excludes_old_history():
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {"timestamp": "2025-01-01T00:00:00", "prs_merged": 10},  # before window
+                {"timestamp": "2026-03-01T00:00:00", "prs_merged": 2},   # in window
+            ],
+        }
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"last_updated": "2026-01-01T00:00:00", "revision": 3},
+    )
+    result = _build_outcome_evaluation(project)
+    assert result["overall"]["merged"] == 2
+    assert result["window"]["from"] == "2026-01-01T00:00:00"
+    assert result["window"]["vision_revision"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 9. Systems cross-reference
+# ---------------------------------------------------------------------------
+
+def test_systems_cross_reference():
+    directions = [
+        {"id": "dir-1", "status": "active", "system_id": "sys-A",
+         "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 2, "tasks_failed": 1}]},
+    ]
+    vision = {"systems": [{"id": "sys-A", "name": "Auth", "status": "in_progress"}]}
+    project = _make_project(directions=directions, vision=vision)
+    result = _build_outcome_evaluation(project)
+
+    assert "systems" in result
+    sys_entry = result["systems"][0]
+    assert sys_entry["id"] == "sys-A"
+    assert sys_entry["name"] == "Auth"
+    assert sys_entry["merged"] == 2
+    assert sys_entry["failed"] == 1
+    assert sys_entry["directions_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 10. Directions with inactive statuses are skipped
+# ---------------------------------------------------------------------------
+
+def test_inactive_directions_skipped():
+    directions = [
+        {"id": "dir-active", "status": "active",
+         "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}]},
+        {"id": "dir-archived", "status": "archived",
+         "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 99}]},
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert result["overall"]["merged"] == 1
+    assert len(result["directions"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 11. confirmed / proposed findings from research_context
+# ---------------------------------------------------------------------------
+
+def test_confirmed_and_proposed_findings():
+    research_ctx = (
+        "## Established Findings\n"
+        "- Finding plain\n"
+        "- Finding confirmed (confirmed)\n"
+        "- Finding proposed (proposed)\n"
+    )
+    directions = [
+        {"id": "dir-1", "status": "active", "research_context": research_ctx, "research_history": []}
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert "confirmed" in d
+    assert "proposed" in d
+    # "Finding plain" and "Finding confirmed" should be in confirmed
+    assert any("Finding plain" in c for c in d["confirmed"])
+    assert any("Finding confirmed" in c for c in d["confirmed"])
+    assert any("Finding proposed" in c for c in d["proposed"])
