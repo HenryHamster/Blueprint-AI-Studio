@@ -224,11 +224,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if not child_task.parent_task_id:
         return
 
-    # Lock parent row to serialize concurrent rollup checks from sibling completions
+    # Lock parent row to serialize concurrent rollup checks from sibling completions.
+    # skip_locked: if a sibling child is already running this check, defer — the
+    # reaper's EVALUATING stale-parent sweep retries within 15 min as safety net.
     parent = (await session.execute(
-        select(Task).where(Task.id == child_task.parent_task_id).with_for_update()
+        select(Task).where(Task.id == child_task.parent_task_id).with_for_update(skip_locked=True)
     )).scalars().first()
-    if not parent or parent.status != TaskStatus.EVALUATING:
+    if parent is None:
+        logger.info(
+            f"[ROLLUP] Skipped rollup check for task {child_task.id} — parent lock held, "
+            "reaper sweep will retry"
+        )
+        return
+    if parent.status != TaskStatus.EVALUATING:
         return
 
     all_children = (await session.execute(
@@ -600,10 +608,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     session.add(parent)
                     await session.commit()
 
-                # Re-acquire lock on parent for merge phase (marker commit released it)
+                # Re-acquire lock on parent for merge phase (marker commit released it).
+                # skip_locked: rollup PR marker is already persisted, so if a concurrent
+                # sibling holds the lock we defer safely — reaper sweep will retry within 15 min.
+                parent_id = parent.id
                 parent = (await session.execute(
-                    select(Task).where(Task.id == parent.id).with_for_update()
+                    select(Task).where(Task.id == parent_id).with_for_update(skip_locked=True)
                 )).scalars().first()
+                if parent is None:
+                    logger.info(
+                        f"[ROLLUP] Skipped merge phase for parent {parent_id} — lock held, "
+                        "reaper sweep will retry"
+                    )
+                    return
                 parent_ctx = parent.context or {}
 
                 # Guard: concurrent sibling may have created a different rollup PR in the gap
