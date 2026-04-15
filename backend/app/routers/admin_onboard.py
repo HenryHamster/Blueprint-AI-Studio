@@ -233,6 +233,11 @@ async def onboard_project(
         'base_branch': default_branch or 'main',
         'default_effort': 'high',
     }
+    design_doc['_auto_review'] = {
+        'enabled': False,
+        'max_per_hour': 5,
+        'max_concurrent': 3,
+    }
     project.design_doc = design_doc
     flag_modified(project, 'design_doc')
 
