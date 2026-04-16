@@ -4,12 +4,13 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
+  runProjectLintChecks,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, extractModuleInterfaces, getMandatoryChecks,
+  buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
@@ -83,6 +84,7 @@ export interface StandardHandlerOpts {
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
+  relatedFiles?: string[];
 }
 
 /**
@@ -118,6 +120,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
+    relatedFiles,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -169,7 +172,43 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const fileTree = buildFileTree(ws);
-  const finalPromptWithTree = fileTree + finalPrompt;
+
+  // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
+  // Runs a read-only pass to map module interfaces and dependencies before coding.
+  let analysisContext = '';
+  const taskScope = strVal(ctx.scope);
+  if (taskScope === 'medium') {
+    sendLog(ws, '\n[Analysis Phase] Mapping module interfaces and dependencies...\n');
+    statusRef.value = 'Analyzing module interfaces...';
+
+    const analysisRelatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    ) as string[];
+
+    const analysisPrompt = buildAnalysisPrompt({
+      rawPrompt,
+      taskTitle,
+      relatedFiles: analysisRelatedFiles,
+      fileTree,
+    });
+
+    const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
+      analysisPrompt,
+      ws, statusRef, model, effort,
+      ['Write', 'Edit', 'NotebookEdit'],
+    );
+
+    if (analysisExitCode === 0 && analysisResult.trim()) {
+      analysisContext = `## Pre-Implementation Analysis\n\n${analysisResult.trim()}\n\n`;
+      sendLog(ws, '[Analysis Phase] Complete.\n');
+    } else {
+      sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
+    }
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
 
   statusRef.value = 'Running Claude Code...';
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
@@ -180,6 +219,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const currentHead = git(['rev-parse', 'HEAD']);
   // Detect changes from BOTH uncommitted files AND commits Claude may have created
   const hasChanges = diff.length > 0 || currentHead !== baseCommit;
+
+  // Compute per-file diff stats (lines added/removed) for retry context enrichment
+  const fileChangeDetails: { file: string; additions: number; deletions: number }[] = [];
+  if (currentHead !== baseCommit) {
+    try {
+      const numstatOut = git(['diff', '--numstat', `${baseCommit}..HEAD`]);
+      for (const line of numstatOut.split('\n').filter(Boolean)) {
+        const parts = line.split('\t');
+        if (parts.length >= 3 && parts[2]) {
+          fileChangeDetails.push({
+            file: parts[2],
+            additions: parseInt(parts[0]) || 0,
+            deletions: parseInt(parts[1]) || 0,
+          });
+        }
+      }
+    } catch { /* ignore diff errors */ }
+  }
 
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
@@ -223,7 +280,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -309,9 +366,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
+      const taskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+      const maxSelfReviewAttempts = (taskScope === 'medium' || taskScope === 'large') ? 2 : MAX_SELF_REVIEW_ATTEMPTS;
       let selfReviewFailed = false;
       let lastReviewOutput = '';
-      for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
+      for (let attempt = 0; attempt < maxSelfReviewAttempts; attempt++) {
         const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
         if (reviewExitCode !== 0) {
           if (matchesRateLimit(reviewOutput)) {
@@ -380,6 +439,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           ...(parseFailed ? { parse_failed: true } : {}),
         };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+        if (fixesApplied) {
+          try {
+            runProjectLintChecks(changedPaths, ws, buildConfig);
+          } catch (lintErr: unknown) {
+            const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+            sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+        }
       }
     }
 
@@ -422,7 +489,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         if (conflictFiles) {
           sendLog(ws, `WARNING: Conflict markers detected in staged files:\n${conflictFiles}\nAsking Claude to resolve...\n`);
           await runClaudeCode(
-            `CRITICAL: These staged files contain git conflict markers (<<<<<<<, =======, >>>>>>>):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
+            `CRITICAL: These staged files contain git conflict markers (${'<'.repeat(7)}, ${'='.repeat(7)}, ${'>'.repeat(7)}):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
             ws, statusRef, model, effort
           );
           git(['add', '-A']);
@@ -477,6 +544,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
       failure_category: 'claude_code_failed',
+      ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
     });
   }
 }
@@ -520,7 +588,6 @@ export async function handleCreate(
   );
   const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
-
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
   const moduleInterfaceContext = isMediumOrLargeScope
@@ -545,6 +612,7 @@ export async function handleCreate(
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
+    relatedFiles,
   });
 }
 
@@ -571,7 +639,6 @@ export async function handleRefactor(
   );
   const refactorBuildConfig = resolveBuildConfig(task);
   const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
-
   const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
   const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
     ? extractModuleInterfaces(ws, refactorRelatedFiles)

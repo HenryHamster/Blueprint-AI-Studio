@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -639,6 +639,19 @@ async def claim_task(
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
+        # Compute review effectiveness trends (stores in project.design_doc as side effect)
+        review_effectiveness = None
+        if task_type in ("create", "fix", "refactor"):
+            try:
+                from app.playbook_learning import compute_review_effectiveness
+                review_effectiveness = await compute_review_effectiveness(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
+
         response["project_context"] = {
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
@@ -649,6 +662,7 @@ async def claim_task(
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
             "top_first_review_issues": top_first_review_issues,
+            "review_effectiveness": review_effectiveness,
         }
     else:
         # Lightweight pipeline health for all other task types
@@ -682,28 +696,48 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
-                # Skip entries auto-archived due to persistently low effectiveness
-                if v.get("stale"):
+                confirmed = v.get("confirmed_count", 0)
+                referenced = v.get("reference_count", 0)
+                # Demote entries with high reference count but zero confirmations
+                ineffective = 1 if (referenced >= 10 and confirmed == 0) else 0
+                if ineffective:
                     logger.info(
-                        "Playbook entry '%s' skipped (auto-archived, effectiveness_score=%.2f)",
-                        short_key, v.get("effectiveness_score", 0.0),
+                        "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
+                        short_key, referenced,
                     )
-                    continue
-                recent_outcomes = v.get("recent_outcomes", [])
-                if len(recent_outcomes) >= 3:
-                    score = sum(recent_outcomes) / len(recent_outcomes)
-                else:
-                    # Not enough recent data: fallback to lifetime ratio; 0.5 for new entries
-                    ref = v.get("reference_count", 0)
-                    conf = v.get("confirmed_count", 0)
-                    score = (conf / ref) if ref > 0 else 0.5
+                # Age penalty: deprioritise entries older than 30 days with < 3 confirmations
+                age_penalty = 0
+                updated_at_str = v.get("updated_at", "")
+                if updated_at_str and confirmed < 3:
+                    try:
+                        updated_dt = datetime.fromisoformat(
+                            updated_at_str.replace("Z", "+00:00")
+                        )
+                        # _utcnow() returns naive UTC; strip tzinfo so comparison is always naive
+                        if updated_dt.tzinfo is not None:
+                            updated_dt = updated_dt.replace(tzinfo=None)
+                        if (_utcnow() - updated_dt).days > 30:
+                            age_penalty = 1
+                    except (ValueError, TypeError):
+                        pass
+                # Stale file-reference penalty
+                stale_penalty = 1 if v.get("stale_file_refs") else 0
+                if age_penalty or stale_penalty:
+                    logger.debug(
+                        "Playbook entry '%s' penalty: age=%d stale=%d",
+                        short_key, age_penalty, stale_penalty,
+                    )
                 _playbook_candidates.append((
-                    -score,
+                    ineffective,
+                    stale_penalty,
+                    age_penalty,
+                    -confirmed,
+                    -referenced,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, short_key, content in _playbook_candidates:
+        for _, _, _, _, _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
@@ -711,7 +745,7 @@ async def claim_task(
         response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
             response["playbook"] = playbook_entries
-            # Track reference counts and shown keys — fire-and-forget, must not fail claim response
+            # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response
             try:
                 now_iso = _utcnow().isoformat()
                 doc = dict(project_for_playbook.design_doc)
@@ -721,32 +755,18 @@ async def claim_task(
                         entry = dict(doc[full_key])
                         entry["reference_count"] = entry.get("reference_count", 0) + 1
                         entry["last_referenced_at"] = now_iso
-                        # Append False to recent_outcomes rolling window (pending confirmation)
-                        recent = list(entry.get("recent_outcomes", []))
-                        recent.append(False)
-                        if len(recent) > 10:
-                            recent = recent[-10:]
-                        entry["recent_outcomes"] = recent
-                        # Compute and store effectiveness_score; auto-archive if persistently ineffective
-                        score = sum(recent) / len(recent) if recent else 0.0
-                        entry["effectiveness_score"] = round(score, 4)
-                        if len(recent) >= 10 and score < 0.1 and not entry.get("stale"):
-                            entry["stale"] = True
-                            logger.info(
-                                "Playbook entry '%s' auto-archived (effectiveness_score=%.2f, "
-                                "%d recent outcomes with no confirmations)",
-                                short_key, score, len(recent),
-                            )
                         doc[full_key] = entry
+                # Check file-path references against the repo root (config-driven; skipped when unset)
+                try:
+                    from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415
+                    repo_root: str = _shared_state.runtime_config.get("playbook_repo_root", "") or ""
+                    if repo_root:
+                        doc = check_and_flag_stale_refs(doc, repo_root)
+                except Exception:
+                    logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
-                # Store shown playbook keys in task context for outcome tracking at completion
-                task_ctx = dict(task.context or {})
-                task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
-                task.context = task_ctx
-                flag_modified(task, "context")
-                session.add(task)
                 await session.commit()
             except Exception:
                 logger.exception("[AGENT] Failed to update playbook reference counts (non-critical)")
