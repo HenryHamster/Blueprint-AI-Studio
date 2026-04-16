@@ -1183,6 +1183,54 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
     )
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_saturation_signals_for_research_task(client: AsyncClient, db_session):
+    """Claim endpoint injects possibly_saturated + deadlock_detected for research tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Research Saturation Test", user_id="test-user-123")
+    # 3 consecutive 0-task cycles with dedup activity → deadlock_detected True
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Saturated direction",
+            "priority": "low",
+            "possibly_saturated": True,
+            "research_history": [
+                {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 2}},
+                {"tasks_created": 0, "filter_breakdown": {"hash_dedup": 1}},
+                {"tasks_created": 0, "filter_breakdown": {"word_overlap_dedup": 3}},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Research this direction"}],
+        vm_instance_id="agent-vm-research-sat",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-research-sat")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json().get("direction_context")
+    assert dc is not None
+    assert dc["possibly_saturated"] is True
+    assert dc["deadlock_detected"] is True
+    # Research tasks should not get implementer-specific fields
+    assert "failed_approaches" not in dc
+
+
 @pytest.mark.asyncio
 async def test_compute_failure_stage_pattern_code_error_dominant():
     """Returns code_error pattern when 60%+ of non-infra failures are code errors."""

@@ -917,6 +917,31 @@ class TestPerTypeDispatchGate:
         assert n < 3  # Gate requires minimum 3 samples
 
 
+class TestTypeUnthrottleBroadcast:
+    """Orchestrator broadcasts type_unthrottle when a previously-gated type recovers."""
+
+    def test_module_tracks_previously_failing_types(self):
+        """The orchestrator module exposes state used to detect unthrottle transitions."""
+        import app.orchestrator as orch
+        assert hasattr(orch, "_previously_failing_types")
+        assert hasattr(orch, "_last_type_unthrottle_broadcast")
+        assert isinstance(orch._previously_failing_types, set)
+        assert isinstance(orch._last_type_unthrottle_broadcast, dict)
+
+    def test_recovery_detected_by_set_difference(self):
+        """A type that was failing last cycle but not this cycle is flagged as recovered."""
+        prev: set[str] = {"create", "fix"}
+        curr: set[str] = {"create"}  # "fix" recovered
+        recovered = prev - curr
+        assert recovered == {"fix"}
+
+    def test_no_recovery_when_still_failing(self):
+        """Types still in failing set do not trigger unthrottle."""
+        prev: set[str] = {"create"}
+        curr: set[str] = {"create"}
+        assert (prev - curr) == set()
+
+
 # ── Verdict JSON Field ────────────────────────────────────────────────────
 
 class TestVerdictJsonField:

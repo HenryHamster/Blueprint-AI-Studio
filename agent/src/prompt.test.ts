@@ -453,6 +453,33 @@ describe('formatProjectContext', () => {
     expect(result).toContain('Completed feature');
   });
 
+  it('includes enriched fields (direction_id, related_files, prompt, changed_files) on completed tasks', () => {
+    const ctx = {
+      recently_completed_tasks: [
+        {
+          task_type: 'create',
+          title: 'Succeeded task',
+          pr_url: 'https://github.com/org/repo/pull/1',
+          direction_id: 'd-123',
+          related_files: ['a.py', 'b.py', 'c.py', 'd.py'],
+          prompt: 'Add caching to the user lookup endpoint to reduce DB load.',
+        },
+        {
+          task_type: 'create',
+          title: 'Failed task',
+          failure_reason: 'tests failed',
+          failure_class: 'CODE_ERROR',
+          changed_files: ['x.py', 'y.py'],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    expect(result).toContain('dir=d-123');
+    expect(result).toContain('files: a.py, b.py, c.py +1');
+    expect(result).toContain('prompt: Add caching');
+    expect(result).toContain('changed: x.py, y.py');
+  });
+
   it('exercises parseResearchSummary via research_findings_summary on completed tasks', () => {
     const findings = JSON.stringify([
       { title: 'Perf finding', description: 'The query is slow because of N+1 joins.' },

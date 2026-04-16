@@ -952,36 +952,63 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
               <p className="text-[10px] text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
             </div>
             {/* Pre/Post comparison */}
-            {(data.pre_investment || data.post_investment) && (
-              <div className="flex gap-4 ml-4">
-                {data.pre_investment && (
-                  <div className="text-center">
-                    <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>
-                    <p className="text-lg font-bold font-mono text-neutral-300">
-                      {data.pre_investment.merge_rate != null ? `${Math.round(data.pre_investment.merge_rate * 100)}%` : '--'}
-                    </p>
-                    <p className="text-[9px] text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
-                  </div>
-                )}
-                {data.pre_investment && data.post_investment && (
-                  <div className="flex items-center text-neutral-600 text-xs">→</div>
-                )}
-                {data.post_investment && (
-                  <div className="text-center">
-                    <p className="text-[10px] text-neutral-500 mb-0.5">Post-investment</p>
-                    <p className={`text-lg font-bold font-mono ${
-                      data.post_investment.merge_rate != null && data.pre_investment?.merge_rate != null
-                        ? data.post_investment.merge_rate > data.pre_investment.merge_rate ? 'text-emerald-400' : 'text-red-400'
-                        : 'text-neutral-300'
-                    }`}>
-                      {data.post_investment.merge_rate != null ? `${Math.round(data.post_investment.merge_rate * 100)}%` : '--'}
-                    </p>
-                    <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
-                  </div>
-                )}
-              </div>
-            )}
+            {(data.pre_investment || data.post_investment) && (() => {
+              const preRate = data.pre_investment?.merge_rate;
+              const postRate = data.post_investment?.merge_rate;
+              const deltaPp = preRate != null && postRate != null ? Math.round((postRate - preRate) * 100) : null;
+              const deltaColor = deltaPp == null
+                ? 'text-neutral-400'
+                : Math.abs(deltaPp) <= 3 ? 'text-neutral-400' : deltaPp > 0 ? 'text-emerald-400' : 'text-red-400';
+              return (
+                <div className="flex gap-4 ml-4 items-center">
+                  {data.pre_investment && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>
+                      <p className="text-lg font-bold font-mono text-neutral-300">
+                        {preRate != null ? `${Math.round(preRate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
+                    </div>
+                  )}
+                  {data.pre_investment && data.post_investment && (
+                    <div className="flex items-center text-neutral-600 text-xs">→</div>
+                  )}
+                  {data.post_investment && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Post-investment</p>
+                      <p className={`text-lg font-bold font-mono ${
+                        postRate != null && preRate != null
+                          ? postRate > preRate ? 'text-emerald-400' : 'text-red-400'
+                          : 'text-neutral-300'
+                      }`}>
+                        {postRate != null ? `${Math.round(postRate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
+                    </div>
+                  )}
+                  {deltaPp != null && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Delta</p>
+                      <p className={`text-lg font-bold font-mono ${deltaColor}`}>
+                        {deltaPp > 0 ? '+' : ''}{deltaPp}pp
+                      </p>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
+          {data.pre_investment?.merge_rate != null && data.post_investment?.merge_rate != null && (() => {
+            const deltaPp = Math.round((data.post_investment.merge_rate - data.pre_investment.merge_rate) * 100);
+            const within = Math.abs(deltaPp) <= 3;
+            const color = within ? 'text-neutral-400' : deltaPp > 0 ? 'text-emerald-400' : 'text-red-400';
+            const text = within
+              ? `No significant change detected (within 3pp, ${deltaPp > 0 ? '+' : ''}${deltaPp}pp)`
+              : deltaPp > 0
+                ? `Medium-scope merge rate improved by ${deltaPp} percentage points since investment began`
+                : `Medium-scope merge rate declined by ${Math.abs(deltaPp)} percentage points since investment began`;
+            return <p className={`text-[11px] ${color}`}>{text}</p>;
+          })()}
 
           {/* Weekly trend chart */}
           {data.weekly_series.length >= 2 && (

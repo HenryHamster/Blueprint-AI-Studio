@@ -385,7 +385,15 @@ async def _check_pause_mode():
         _pause_failure_streak += 1
         # Require 3 consecutive failures before pausing (avoid flaky single checks)
         if _pause_failure_streak < 3:
-            logger.info(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
+            logger.warning(f"[PAUSE] Health check failure {_pause_failure_streak}/3: {', '.join(critical_failures)} — not pausing yet")
+            try:
+                await manager.broadcast_to_all("health_degrading", {
+                    "streak": _pause_failure_streak,
+                    "threshold": 3,
+                    "failed_deps": critical_failures,
+                })
+            except Exception as _be:
+                logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
             return
         # Should we pause?
         if _runtime_config["max_concurrent_vms"] > 0:

@@ -912,6 +912,16 @@ async def claim_task(
                     "failure_stage_pattern": failure_stage_pattern,
                 }
 
+            # Surface saturation / deadlock signals to research agents so they can
+            # pivot to direction_update/direction_note findings on stuck directions.
+            if task_type == "research":
+                from app.research_completion import _detect_dedup_deadlock
+                deadlocked, _ = _detect_dedup_deadlock(history)
+                response["direction_context"] = {
+                    "possibly_saturated": bool(direction.get("possibly_saturated", False)),
+                    "deadlock_detected": bool(deadlocked),
+                }
+
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         related_files = (task.context or {}).get("related_files", [])

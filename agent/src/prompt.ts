@@ -871,7 +871,29 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const failureClass = t.failure_class ? ` [${strVal(t.failure_class)}]` : '';
       const failureSuffix = t.failure_reason ? ` (FAILED${failureClass}: ${strVal(t.failure_reason)})` : '';
       const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
-      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}`);
+      const extras: string[] = [];
+      if (t.direction_id) extras.push(`dir=${strVal(t.direction_id)}`);
+      const relatedFiles = t.related_files as unknown;
+      if (Array.isArray(relatedFiles) && relatedFiles.length > 0) {
+        const files = relatedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
+        extras.push(`files: ${files}${relatedFiles.length > 3 ? ` +${relatedFiles.length - 3}` : ''}`);
+      }
+      const changedFiles = t.changed_files as unknown;
+      if (t.failure_reason && Array.isArray(changedFiles) && changedFiles.length > 0) {
+        const files = changedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
+        extras.push(`changed: ${files}${changedFiles.length > 3 ? ` +${changedFiles.length - 3}` : ''}`);
+      }
+      let metaSuffix = extras.length > 0 ? ` [${extras.join('; ')}]` : '';
+      if (metaSuffix.length > 100) metaSuffix = metaSuffix.slice(0, 97) + '...]';
+      let promptSuffix = '';
+      if (t.prompt) {
+        const p = strVal(t.prompt).replace(/\s+/g, ' ').trim();
+        if (p.length > 0) {
+          const excerpt = p.length > 80 ? p.slice(0, 77) + '...' : p;
+          promptSuffix = `\n  prompt: ${excerpt}`;
+        }
+      }
+      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}${metaSuffix}${promptSuffix}`);
     }
 
     // Keep most recent entries that fit within budget

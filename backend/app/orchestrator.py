@@ -56,6 +56,8 @@ _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
 _last_type_throttle_broadcast: dict[str, float] = {}
+_last_type_unthrottle_broadcast: dict[str, float] = {}
+_previously_failing_types: set[str] = set()
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: datetime | None = None
@@ -578,9 +580,9 @@ async def orchestrator_worker():
                                 )
 
                 # Broadcast type_throttle events for each newly-blocked type (debounced 60s per type)
+                global _last_type_throttle_broadcast, _last_type_unthrottle_broadcast, _previously_failing_types
+                _now_mono = time.monotonic()
                 if _failing_types:
-                    global _last_type_throttle_broadcast
-                    _now_mono = time.monotonic()
                     for _ftype in _failing_types:
                         if (_now_mono - _last_type_throttle_broadcast.get(_ftype, 0.0)) > 60:
                             _last_type_throttle_broadcast[_ftype] = _now_mono
@@ -594,6 +596,25 @@ async def orchestrator_worker():
                                 })
                             except Exception:
                                 logger.exception(f"[ORCHESTRATOR] Failed to broadcast type_throttle for '{_ftype}'")
+
+                # Broadcast type_unthrottle for types that were gated on the prior cycle but have
+                # now recovered (aged out of _failing_types). Debounced 60s per type like throttle.
+                _recovered_types = _previously_failing_types - _failing_types
+                for _rtype in _recovered_types:
+                    if (_now_mono - _last_type_unthrottle_broadcast.get(_rtype, 0.0)) > 60:
+                        _last_type_unthrottle_broadcast[_rtype] = _now_mono
+                        _rrate, _rsample = _shared_state.get_task_type_failure_rate(_rtype, window_minutes=15)
+                        logger.info(f"[ORCHESTRATOR] Per-type failure gate cleared: '{_rtype}' recovered ({_rrate:.0%} failure rate, n={_rsample})")
+                        try:
+                            await ws_manager.broadcast_to_all("type_unthrottle", {
+                                "type": _rtype,
+                                "failure_rate": round(_rrate, 3),
+                                "sample_size": _rsample,
+                                "detail": f"Task type '{_rtype}' recovered: {_rrate:.0%} failure rate (n={_rsample})",
+                            })
+                        except Exception:
+                            logger.exception(f"[ORCHESTRATOR] Failed to broadcast type_unthrottle for '{_rtype}'")
+                _previously_failing_types = set(_failing_types)
 
                 # External health gate — skip dispatch when a critical dependency has been
                 # confirmed down for 2+ consecutive health checks (avoids flapping on transient probes).

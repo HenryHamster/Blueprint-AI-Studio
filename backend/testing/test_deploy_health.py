@@ -153,6 +153,38 @@ async def test_second_consecutive_failure_does_not_pause(dh_db):
 
 
 @pytest.mark.asyncio
+async def test_streak_buildup_broadcasts_health_degrading(dh_db, mocker):
+    """Sub-threshold failures broadcast health_degrading with streak/threshold/failed_deps."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _set_critical_failures("db", "gcp")
+
+    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    await _dh._check_pause_mode()
+
+    bcast.assert_awaited_once()
+    event, payload = bcast.await_args.args
+    assert event == "health_degrading"
+    assert payload["streak"] == 1
+    assert payload["threshold"] == 3
+    assert payload["failed_deps"] == ["db", "gcp"]
+
+
+@pytest.mark.asyncio
+async def test_pause_threshold_does_not_broadcast_health_degrading(dh_db, mocker):
+    """Once the streak reaches the pause threshold, no health_degrading event is sent."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _set_critical_failures("db")
+    _dh._pause_failure_streak = 2
+
+    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    await _dh._check_pause_mode()
+
+    bcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_third_consecutive_failure_triggers_pause(dh_db):
     """Three consecutive critical failures must pause the pipeline."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
