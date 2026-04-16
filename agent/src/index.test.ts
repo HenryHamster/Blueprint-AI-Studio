@@ -52,7 +52,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, RateLimitError, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -430,5 +430,25 @@ describe('testFixLoop failureSummary', () => {
     expect(result.testFailuresDetected).toBe(true);
     expect(result.failureSummary).toBeDefined();
     expect(result.failureSummary).toContain(errorMessage);
+  });
+});
+
+// ── RateLimitError ───────────────────────────────────────────────────────────
+// Pins the class identity so the outer catch in main() (which uses
+// `error instanceof RateLimitError` for classification) can't regress into
+// the old cast-and-rematch pattern that silently reclassified rate-limits
+// as CODE_ERROR when stderrBuffer was empty.
+describe('RateLimitError', () => {
+  it('is an instance of RateLimitError and Error', () => {
+    const err = new RateLimitError('Claude API usage exhausted — banner');
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe('RateLimitError');
+    expect(err.message).toBe('Claude API usage exhausted — banner');
+  });
+
+  it('plain Error is not a RateLimitError', () => {
+    const err = new Error('Claude API usage exhausted — banner');
+    expect(err).not.toBeInstanceOf(RateLimitError);
   });
 });

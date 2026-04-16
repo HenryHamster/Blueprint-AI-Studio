@@ -17,7 +17,7 @@ import {
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited';
 
 // Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 // Must stay in sync with backend/app/max_plan_pool.py:RATE_LIMIT_PATTERNS.
@@ -36,6 +36,17 @@ const RATE_LIMIT_PATTERNS: readonly string[] = [
 export function matchesRateLimit(text: string): boolean {
   const lower = text.toLowerCase();
   return RATE_LIMIT_PATTERNS.some(p => lower.includes(p));
+}
+
+// Thrown when Claude CLI output matches a rate-limit pattern. Carries the
+// classification via the type system so the outer catch doesn't have to
+// re-match an invented error message (which dropped the signal when
+// stderrBuffer was empty and the banner came through stdout).
+export class RateLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RateLimitError';
+  }
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
@@ -1056,7 +1067,8 @@ echo ""
   if (exitCode !== 0) {
     const combined = stderrBuffer + allOutput.slice(-5000);
     if (matchesRateLimit(combined)) {
-      throw new Error(`Claude API usage exhausted — ${stderrBuffer.slice(0, 500)}`);
+      const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+      throw new RateLimitError(`Claude API usage exhausted — ${snippet}`);
     }
   }
 
@@ -1205,9 +1217,13 @@ async function main() {
     log(`Fatal error: ${safeErr}`);
     sendLog(ws, `\nFatal error: ${safeErr}\n`);
     // Classify the failure — rate limit / usage exhaustion should NOT burn retry budget.
-    // Uses exact Claude-specific substrings only (see RATE_LIMIT_PATTERNS).
-    const isRateLimit = matchesRateLimit(errMsg);
-    const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' as FailureCategory : 'fatal' as FailureCategory;
+    // Detection is carried via RateLimitError (thrown from runClaudeCode). An
+    // earlier version re-ran matchesRateLimit on the outer error message, but
+    // that message was agent-invented wording ("Claude API usage exhausted —")
+    // which doesn't contain any RATE_LIMIT_PATTERNS substring, silently
+    // reclassifying rate-limits as CODE_ERROR.
+    const isRateLimit = error instanceof RateLimitError;
+    const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' : 'fatal';
     // Surface the error through the heartbeat so it's visible even if the
     // status POST fails — the heartbeat updates latest_status_message on the
     // backend, giving us forensic evidence instead of silent death.
