@@ -65,6 +65,17 @@ runtime_config: Dict = {
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # Per-failure-class retry budgets: max attempt_count before permanent failure.
+    # Overrides max_retries for specific failure classes. Operator-adjustable.
+    #   CODE_ERROR:    2 — code won't self-correct; 3rd attempt wastes compute
+    #   EXTERNAL_API:  4 — transient outages (GitHub 502, DNS) can last 15-60 min
+    #   AGENT_TIMEOUT: 3 — keep current behavior with scope-reduction on 2nd timeout
+    "retry_budgets_by_class": {
+        "CODE_ERROR": 2,
+        "EXTERNAL_API": 4,
+        "AGENT_TIMEOUT": 3,
+    },
 }
 
 # --- Autonomous Loop State ---

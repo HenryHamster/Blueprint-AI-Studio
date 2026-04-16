@@ -1284,6 +1284,7 @@ export function buildRetryContext(task: Record<string, unknown>): string {
     lines.push(`Self-review outcome: ${selfReviewStatus}`);
   }
 
+
   // For CODE_ERROR failures, show the focused error summary; otherwise show the full error.
   if (previousErrorSummary) {
     lines.push(`Error summary: ${previousErrorSummary}`);
