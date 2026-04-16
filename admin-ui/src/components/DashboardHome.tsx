@@ -10,7 +10,7 @@ import {
   Minus,
   ChevronRight,
 } from 'lucide-react';
-import { ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -106,6 +106,40 @@ interface SparkPoint {
   active: number;
   queued: number;
   failed: number;
+}
+
+interface WindowStats {
+  merge_rate: number | null;
+  created: number;
+  merged: number;
+  window_start: string | null;
+  window_end: string | null;
+}
+
+interface WeeklySeries {
+  week: string;
+  created: number;
+  merged: number;
+  merge_rate: number | null;
+  direction_merges: number;
+  merge_rate_delta: number | null;
+}
+
+interface CorrelatedChange {
+  title: string;
+  week: string;
+  merge_rate_delta: number | null;
+}
+
+interface MediumScopeMeasurement {
+  medium_scope_merge_rate: number | null;
+  total_created: number;
+  total_merged: number;
+  investment_start: string | null;
+  pre_investment: WindowStats | null;
+  post_investment: WindowStats | null;
+  weekly_series: WeeklySeries[];
+  correlated_changes: CorrelatedChange[];
 }
 
 // ---------- props ----------
@@ -230,6 +264,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
+  const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [loading, setLoading] = useState(true);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
@@ -269,6 +304,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               const data = await res.json();
               setOpenPRs(data.open_prs ?? []);
             }
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/medium-scope-measurement?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=90`);
+            if (res.ok) setMeasurementData(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -422,6 +463,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </>
             )}
           </section>
+
+          {/* Section 2b: Medium Scope Measurement */}
+          {!!selectedProjectId && (
+            <MediumScopeWidget data={measurementData} loading={loading} />
+          )}
 
           {/* Section 3: Top Actionable Issues */}
           <section>
@@ -784,6 +830,132 @@ function CostCard({ totalCost, trendHistory, loading }: {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------- medium scope widget ----------
+
+const TOOLTIP_STYLE = {
+  contentStyle: { background: '#171717', border: '1px solid #404040', borderRadius: 4 },
+  itemStyle: { color: '#f5f5f5' },
+  labelStyle: { color: '#a3a3a3' },
+};
+
+function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | null; loading: boolean }) {
+  const rate = data?.medium_scope_merge_rate;
+  const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.6 ? 'text-emerald-400' : rate >= 0.3 ? 'text-amber-400' : 'text-red-400';
+
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Medium Scope Merge Rate</h2>
+      {loading ? (
+        <Skeleton className="h-40 w-full" />
+      ) : data == null || rate == null ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+          No medium-scope task data yet
+        </div>
+      ) : (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 space-y-4">
+          {/* Headline rate */}
+          <div className="flex items-center gap-4">
+            <div>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-0.5">Overall Rate</p>
+              <p className={`text-3xl font-bold font-mono ${rateColor}`}>{Math.round(rate * 100)}%</p>
+              <p className="text-[10px] text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
+            </div>
+            {/* Pre/Post comparison */}
+            {(data.pre_investment || data.post_investment) && (
+              <div className="flex gap-4 ml-4">
+                {data.pre_investment && (
+                  <div className="text-center">
+                    <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>
+                    <p className="text-lg font-bold font-mono text-neutral-300">
+                      {data.pre_investment.merge_rate != null ? `${Math.round(data.pre_investment.merge_rate * 100)}%` : '--'}
+                    </p>
+                    <p className="text-[9px] text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
+                  </div>
+                )}
+                {data.pre_investment && data.post_investment && (
+                  <div className="flex items-center text-neutral-600 text-xs">→</div>
+                )}
+                {data.post_investment && (
+                  <div className="text-center">
+                    <p className="text-[10px] text-neutral-500 mb-0.5">Post-investment</p>
+                    <p className={`text-lg font-bold font-mono ${
+                      data.post_investment.merge_rate != null && data.pre_investment?.merge_rate != null
+                        ? data.post_investment.merge_rate > data.pre_investment.merge_rate ? 'text-emerald-400' : 'text-red-400'
+                        : 'text-neutral-300'
+                    }`}>
+                      {data.post_investment.merge_rate != null ? `${Math.round(data.post_investment.merge_rate * 100)}%` : '--'}
+                    </p>
+                    <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Weekly trend chart */}
+          {data.weekly_series.length >= 2 && (
+            <div className="h-32">
+              <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
+                <LineChart data={data.weekly_series} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                  <XAxis
+                    dataKey="week"
+                    tick={{ fill: '#737373', fontSize: 9 }}
+                    tickFormatter={(v: string) => v.slice(5)}
+                  />
+                  <YAxis
+                    tick={{ fill: '#737373', fontSize: 9 }}
+                    tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
+                    domain={[0, 1]}
+                  />
+                  <Tooltip
+                    {...TOOLTIP_STYLE}
+                    formatter={(v: unknown) => [typeof v === 'number' ? `${Math.round(v * 100)}%` : '--', 'Merge rate']}
+                    labelFormatter={(label: unknown) => `Week of ${label}`}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="merge_rate"
+                    stroke="#34d399"
+                    strokeWidth={1.5}
+                    dot={false}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* Correlated changes */}
+          {data.correlated_changes.length > 0 && (
+            <div>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Correlated Changes</p>
+              <div className="space-y-1">
+                {data.correlated_changes.slice(0, 5).map((c, i) => {
+                  const delta = c.merge_rate_delta;
+                  const deltaColor = delta == null ? 'text-neutral-500' : delta > 0 ? 'text-emerald-400' : 'text-red-400';
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-[10px]">
+                      <span className="text-neutral-500 font-mono shrink-0">{c.week.slice(5)}</span>
+                      <span className="text-neutral-300 truncate flex-1">{c.title}</span>
+                      {delta != null && (
+                        <span className={`font-mono shrink-0 ${deltaColor}`}>
+                          {delta > 0 ? '+' : ''}{Math.round(delta * 100)}pp
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
