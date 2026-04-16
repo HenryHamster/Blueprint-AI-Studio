@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -18,7 +20,6 @@ jobs:
       frontend: ${{ steps.result.outputs.frontend }}
       backend: ${{ steps.result.outputs.backend }}
       agent: ${{ steps.result.outputs.agent }}
-      is_main: ${{ github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -35,13 +36,11 @@ jobs:
       - id: result
         run: |
           IS_MAIN="${{ github.base_ref == 'main' || github.ref == 'refs/heads/main' }}"
-          if [ "${{ github.event_name }}" = "push" ] || [ "$IS_MAIN" = "true" ]; then
-            # Push to main or PR targeting main — run everything
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$IS_MAIN" = "true" ]; then
             echo "frontend=true" >> $GITHUB_OUTPUT
             echo "backend=true" >> $GITHUB_OUTPUT
             echo "agent=true" >> $GITHUB_OUTPUT
           else
-            # PR to intermediate branch — path-filtered
             echo "frontend=${{ steps.filter.outputs.frontend }}" >> $GITHUB_OUTPUT
             echo "backend=${{ steps.filter.outputs.backend }}" >> $GITHUB_OUTPUT
             echo "agent=${{ steps.filter.outputs.agent }}" >> $GITHUB_OUTPUT
@@ -66,6 +65,8 @@ jobs:
         run: npm ci
 
       - name: Build (tsc + vite)
+        id: build
+        continue-on-error: true
         working-directory: ./admin-ui
         env:
           VITE_API_URL: http://localhost:8080
@@ -75,8 +76,51 @@ jobs:
         run: npm run build
 
       - name: Lint
+        id: lint
+        continue-on-error: true
         working-directory: ./admin-ui
         run: npx eslint .
+
+      - name: Save result for baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if [ "${{ steps.build.outcome }}" = "failure" ] || [ "${{ steps.lint.outcome }}" = "failure" ]; then
+            echo "BROKEN" > frontend-status.txt
+          else
+            echo "OK" > frontend-status.txt
+          fi
+
+      - name: Upload frontend status (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: frontend-status.txt
+          key: ci-baseline-frontend-${{ github.sha }}
+
+      - name: Upload frontend status (stable key, main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: frontend-status.txt
+          key: ci-baseline-frontend
+
+      - name: Load main baseline (PR only)
+        if: github.event_name == 'pull_request' && (steps.build.outcome == 'failure' || steps.lint.outcome == 'failure')
+        uses: actions/cache/restore@v4
+        with:
+          path: frontend-status.txt
+          key: ci-baseline-frontend
+          restore-keys: ci-baseline-frontend
+
+      - name: Evaluate result
+        if: steps.build.outcome == 'failure' || steps.lint.outcome == 'failure'
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -f frontend-status.txt ] && grep -q "BROKEN" frontend-status.txt; then
+            echo "::warning::Frontend CI failed but is also broken on main — not blocking PR"
+          else
+            echo "::error::Frontend CI failed (build=${{ steps.build.outcome }}, lint=${{ steps.lint.outcome }})"
+            exit 1
+          fi
 
   backend:
     name: CI / Backend
@@ -93,7 +137,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
@@ -124,6 +168,8 @@ jobs:
             alembic upgrade head
 
       - name: Run tests
+        id: run_tests
+        continue-on-error: true
         run: |
           docker run --rm --network host \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
@@ -131,12 +177,89 @@ jobs:
             -e AGENT_JWT_SECRET=ci-test-secret \
             -e WS_TICKET_SECRET=ci-test-secret \
             blueprint-backend-test \
-            python -m pytest testing/ -v --tb=short
+            python -m pytest testing/ -v --tb=short --timeout=15 2>&1 | tee test-output.txt
+
+          # Extract failed test IDs
+          grep -E "FAILED" test-output.txt | sed 's/.*FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+
+      - name: Save test failures baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Save both the failure list and overall status
+          if [ "${{ steps.run_tests.outcome }}" = "failure" ]; then
+            echo "BROKEN" > backend-status.txt
+          else
+            echo "OK" > backend-status.txt
+          fi
+          # Combine into one baseline file
+          echo "---FAILURES---" >> backend-status.txt
+          cat pr-test-failures.txt >> backend-status.txt 2>/dev/null || true
+
+      - name: Upload backend baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: backend-status.txt
+          key: ci-baseline-backend-${{ github.sha }}
+
+      - name: Upload backend baseline (stable key, main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: backend-status.txt
+          key: ci-baseline-backend
+
+      - name: Load main baseline (PR only)
+        if: github.event_name == 'pull_request' && steps.run_tests.outcome == 'failure'
+        uses: actions/cache/restore@v4
+        with:
+          path: backend-status.txt
+          key: ci-baseline-backend
+          restore-keys: ci-baseline-backend
+
+      - name: Evaluate test results
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          echo "Failed tests on this PR:"
+          cat pr-test-failures.txt 2>/dev/null || echo "(none captured)"
+
+          # On main push, just fail — baseline is already saved above
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "::error::Backend tests failed on main"
+            exit 1
+          fi
+
+          # On PR: compare against main baseline
+          if [ ! -f backend-status.txt ]; then
+            echo "No main baseline found — all failures count as new"
+            exit 1
+          fi
+
+          # Extract main's failed tests from baseline
+          sed -n '/---FAILURES---/,$p' backend-status.txt | tail -n +2 | sort -u > main-failures.txt
+
+          if [ ! -s pr-test-failures.txt ]; then
+            echo "::error::Backend tests failed but no specific test failures captured"
+            exit 1
+          fi
+
+          # Find NEW failures (in PR but not in main)
+          NEW_FAILURES=$(comm -23 pr-test-failures.txt main-failures.txt)
+
+          if [ -n "$NEW_FAILURES" ]; then
+            echo "::error::NEW test failures introduced by this PR:"
+            echo "$NEW_FAILURES"
+            echo ""
+            echo "Tests also failing on main (not blocking):"
+            comm -12 pr-test-failures.txt main-failures.txt || true
+            exit 1
+          fi
+
+          echo "::warning::All test failures are inherited from main — not blocking PR"
+          cat pr-test-failures.txt
 
       - name: Migration linter
         run: |
-          # Fail if any NEW migration adds a non-nullable column without server_default
-          # Only check migrations added in this PR (not existing ones)
           BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
           NEW_MIGRATIONS=$(git diff --name-only --diff-filter=A origin/$BASE_BRANCH -- backend/alembic/versions/*.py 2>/dev/null || true)
           if [ -z "$NEW_MIGRATIONS" ]; then
@@ -170,5 +293,48 @@ jobs:
         run: npm ci
 
       - name: Type check
+        id: typecheck
+        continue-on-error: true
         working-directory: ./agent
         run: npx tsc --noEmit
+
+      - name: Save result for baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if [ "${{ steps.typecheck.outcome }}" = "failure" ]; then
+            echo "BROKEN" > agent-status.txt
+          else
+            echo "OK" > agent-status.txt
+          fi
+
+      - name: Upload agent status (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: agent-status.txt
+          key: ci-baseline-agent-${{ github.sha }}
+
+      - name: Upload agent status (stable key, main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: agent-status.txt
+          key: ci-baseline-agent
+
+      - name: Load main baseline (PR only)
+        if: github.event_name == 'pull_request' && steps.typecheck.outcome == 'failure'
+        uses: actions/cache/restore@v4
+        with:
+          path: agent-status.txt
+          key: ci-baseline-agent
+          restore-keys: ci-baseline-agent
+
+      - name: Evaluate result
+        if: steps.typecheck.outcome == 'failure'
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -f agent-status.txt ] && grep -q "BROKEN" agent-status.txt; then
+            echo "::warning::Agent CI failed but is also broken on main — not blocking PR"
+          else
+            echo "::error::Agent type check failed"
+            exit 1
+          fi

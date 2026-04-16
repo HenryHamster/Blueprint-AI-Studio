@@ -424,25 +424,29 @@ async def _process_post_commit(
         if not task:
             return {"status": "accepted"}
 
-        # Immediately unblock dependents when task terminally fails (retries exhausted)
+        # Immediately unblock dependents when task terminally fails (retries exhausted).
+        # Uses the same session (not a separate one) to avoid self-deadlock: a second
+        # session scanning the task table would block on the FOR UPDATE lock held by
+        # this session, causing a hang in Postgres (asyncio is single-threaded).
         if payload.status == TaskStatus.FAILED:
             try:
-                async with factory() as dep_session:
-                    dep_stmt = select(Task).where(
-                        Task.project_id == task.project_id,
-                        Task.status == TaskStatus.QUEUED,
-                        Task.depends_on.contains([str(task.id)]),
-                    )
-                    dep_result = await dep_session.execute(dep_stmt)
-                    waiting_tasks = dep_result.scalars().all()
-                    count = 0
-                    for wt in waiting_tasks:
-                        wt.depends_on = [d for d in (wt.depends_on or []) if d != str(task.id)]
-                        dep_session.add(wt)
-                        count += 1
-                    if count:
-                        await dep_session.commit()
-                        logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
+                dep_stmt = select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status == TaskStatus.QUEUED,
+                    Task.depends_on.contains([str(task.id)]),
+                )
+                dep_result = await session.execute(dep_stmt)
+                waiting_tasks = dep_result.scalars().all()
+                count = 0
+                for wt in waiting_tasks:
+                    wt.depends_on = [d for d in (wt.depends_on or []) if d != str(task.id)]
+                    session.add(wt)
+                    count += 1
+                if count:
+                    # Don't commit here — let the session's final commit handle it.
+                    # An intermediate commit would release the FOR UPDATE lock while
+                    # failure-handling code below still needs the task.
+                    logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
             except Exception as e:
                 logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
