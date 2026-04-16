@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import fs from 'fs';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ./index.js entirely so that importing prompt.ts does NOT trigger main().
@@ -36,7 +37,6 @@ vi.mock('child_process', () => ({
 }));
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
-import fs from 'fs';
 import { execFileSync } from 'child_process';
 import {
   formatPlaybook,
@@ -465,6 +465,73 @@ describe('formatProjectContext', () => {
     const result = formatProjectContext(ctx, 'create', 'medium');
     expect(result).toContain('Your scope (medium): 75%');
   });
+
+  it('shows trend indicators in Common Review Issues when review_effectiveness is provided', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+        'error-handling': 0.25,
+        'type-safety': 0.15,
+      },
+      review_effectiveness: {
+        categories: {
+          'test-coverage': { trend: 'decreasing' },
+          'error-handling': { trend: 'stable' },
+          'type-safety': { trend: 'increasing' },
+        },
+        persistent_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain(', trending down');
+    expect(result).toContain(', persistent');
+    expect(result).toContain(', trending up');
+  });
+
+  it('omits trend indicators when review_effectiveness is absent', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).not.toContain('trending');
+    expect(result).not.toContain('persistent');
+  });
+
+  it('surfaces persistent review issues in pipeline health', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: ['test-coverage', 'error-handling'],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Persistent review issues');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('error-handling');
+  });
+
+  it('omits persistent review issues line when list is empty or absent', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Persistent review issues');
+  });
 });
 
 // ── configureAgentPermissions ─────────────────────────────────────────────────
@@ -596,6 +663,52 @@ describe('discoverRelatedTests', () => {
     });
     // No directory matches 'other/' so no test entries are added
     expect(result).toBe('');
+  });
+
+  it('import-based: issues Python import grep with correct dotted module path', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/orchestrator.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.orchestrator'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: constructs correct Python module path from nested file', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/services/auth.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.services.auth'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: issues TypeScript import grep with stem-based pattern', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import-based grep pattern should reference the stem 'prompt'
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('/prompt'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: skips TypeScript test files themselves (contains .test.)', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.test.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import grep uses a pattern with "from ['" — should not appear for test files
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes("from ['"))
+    );
+    expect(importCall).toBeUndefined();
   });
 });
 
@@ -1232,6 +1345,56 @@ describe('extractModuleInterfaces', () => {
       '// just a comment\nconst x = 1; // non-exported\n'
     );
     expect(extractModuleInterfaces(null, ['agent/src/utils.ts'])).toBe('');
+  });
+
+  it('appends Suggested Change Order when one related file imports from another', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // models callers include services (in related set); services has no related callers
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('imports from models.py');
+  });
+
+  it('omits Suggested Change Order when no related files import each other', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // Both files' callers are outside the related set
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('other/caller.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).not.toContain('## Suggested Change Order');
+  });
+
+  it('appends Suggested Change Order for three-file dependency chain', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def fn(x: int):\n    pass\n'
+    );
+    // models callers: [services, admin]; services callers: [admin]; admin callers: []
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('backend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, [
+      'backend/app/models.py',
+      'backend/app/services.py',
+      'backend/app/admin.py',
+    ]);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('3. admin.py');
   });
 });
 

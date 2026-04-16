@@ -19,7 +19,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
-    Task, Project, TaskHistory, TaskStatus,
+    Task, Project, TaskHistory, TaskStatus, Alert, AlertSeverity,
 )
 from app.database import AsyncSessionLocal
 from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES
@@ -410,11 +410,59 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     anomaly_action = await check_anomaly_actions()
     if anomaly_action["action"] != "none":
         from app.broadcast import broadcast_to_project  # noqa: PLC0415
+        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
         await broadcast_to_project(
             str(project.id),
             "anomaly_adjustment",
             anomaly_action,
         )
+        if anomaly_action["action"] == "adjusted" and anomaly_action.get("is_new"):
+            pre_vms = anomaly_action.get("pre_adjustment_max_vms") or "?"
+            new_vms = anomaly_action["max_concurrent_vms"]
+            gate = anomaly_action["failure_gate_threshold"]
+            triggers = ", ".join(anomaly_action.get("trigger_anomalies") or [])
+            alert = Alert(
+                project_id=project.id,
+                severity=AlertSeverity.WARNING,
+                title="Pipeline auto-adjusted: anomaly threshold exceeded",
+                message=(
+                    f"max_concurrent_vms reduced from {pre_vms} to {new_vms}, "
+                    f"failure_gate_threshold tightened to {gate}. "
+                    f"Triggered by: {triggers}."
+                ),
+            )
+            session.add(alert)
+            asyncio.ensure_future(dispatch_external_notification(
+                str(project.id),
+                "ANOMALY_ADJUSTMENT",
+                {
+                    "max_concurrent_vms": new_vms,
+                    "failure_gate_threshold": gate,
+                    "trigger_anomalies": anomaly_action.get("trigger_anomalies") or [],
+                    "pre_adjustment_max_vms": pre_vms,
+                },
+            ))
+        elif anomaly_action["action"] == "restored":
+            new_vms = anomaly_action["max_concurrent_vms"]
+            gate = anomaly_action["failure_gate_threshold"]
+            alert = Alert(
+                project_id=project.id,
+                severity=AlertSeverity.INFO,
+                title="Pipeline restored: anomaly conditions cleared",
+                message=(
+                    f"max_concurrent_vms restored to {new_vms}, "
+                    f"failure_gate_threshold restored to {gate}."
+                ),
+            )
+            session.add(alert)
+            asyncio.ensure_future(dispatch_external_notification(
+                str(project.id),
+                "ANOMALY_RESTORED",
+                {
+                    "max_concurrent_vms": new_vms,
+                    "failure_gate_threshold": gate,
+                },
+            ))
 
     # Build and spawn research tasks — one per chosen direction (or one undirected)
     directions_to_spawn = chosen_directions if chosen_directions else [None]  # None = undirected

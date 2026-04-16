@@ -429,6 +429,62 @@ describe('testFixLoop failureSummary', () => {
   });
 });
 
+// ── testFixLoop directory scoping ─────────────────────────────────────────────
+describe('testFixLoop directory scoping', () => {
+  const multiRunnerConfig = {
+    directories: [
+      { path: 'agent', type: 'node', test_cmd: 'npm test' },
+      { path: 'backend', type: 'python', test_cmd: 'python3 -m pytest' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  function cwdsCalledWith(): (string | undefined)[] {
+    return vi.mocked(execFileSync).mock.calls.map(
+      (args) => (args[2] as { cwd?: string } | undefined)?.cwd,
+    );
+  }
+
+  it('runs all runners when relatedFiles is not provided', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('filters to agent runner when relatedFiles contains only agent/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(false);
+  });
+
+  it('filters to backend runner when relatedFiles contains only backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(false);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs all runners when relatedFiles contains only non-agent/backend files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['admin-ui/src/App.tsx']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs both runners when relatedFiles contains both agent/ and backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts', 'backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+});
+
 // ── RateLimitError ───────────────────────────────────────────────────────────
 // Pins the class identity so the outer catch in main() (which uses
 // `error instanceof RateLimitError` for classification) can't regress into

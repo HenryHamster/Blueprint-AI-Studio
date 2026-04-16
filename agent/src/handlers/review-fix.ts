@@ -512,7 +512,7 @@ export async function handleFix(
       if (remainingMarkers) {
         sendLog(ws, `Conflict markers still present in:\n${remainingMarkers}\nAsking Claude to resolve...\n`);
         await runClaudeCode(
-          `CRITICAL: These files still have git conflict markers (<<<<<<<, =======, >>>>>>>):\n${remainingMarkers}\n\nResolve ALL conflict markers in every file listed. The base branch is the source of truth — keep its code structure and only re-apply this PR's specific additions. After resolving, stage with git add.`,
+          `CRITICAL: These files still have git conflict markers (${'<'.repeat(7)}, ${'='.repeat(7)}, ${'>'.repeat(7)}):\n${remainingMarkers}\n\nResolve ALL conflict markers in every file listed. The base branch is the source of truth — keep its code structure and only re-apply this PR's specific additions. After resolving, stage with git add.`,
           ws, statusRef, model, effort
         );
         git(['add', '-A']);

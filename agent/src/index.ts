@@ -959,8 +959,25 @@ export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig,
   baselineFailures?: Set<string>,
+  relatedFiles?: string[],
 ): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
-  const runners = detectTestRunners(buildConfig);
+  let runners = detectTestRunners(buildConfig);
+
+  // Scope-limit to runners relevant to the files being changed. Same logic as
+  // captureTestBaseline — avoids running the full backend Docker test suite
+  // when only agent files changed.
+  if (relatedFiles && relatedFiles.length > 0) {
+    const touchesAgent = relatedFiles.some(f => f.startsWith('agent/'));
+    const touchesBackend = relatedFiles.some(f => f.startsWith('backend/'));
+    if (touchesAgent || touchesBackend) {
+      const filtered = runners.filter(r => {
+        if (touchesAgent && (r.label.includes('agent') || r.cwd.includes('/agent'))) return true;
+        if (touchesBackend && (r.label.includes('backend') || r.label.includes('pytest') || r.cwd.includes('/backend'))) return true;
+        return false;
+      });
+      if (filtered.length > 0) runners = filtered;
+    }
+  }
 
   if (runners.length === 0) {
     sendLog(ws, 'No test runner detected — skipping test step.\n');
