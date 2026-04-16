@@ -359,15 +359,43 @@ async def update_agent_status(
     # overwriting status after a task was requeued with a new VM.
     # FOR UPDATE prevents race with reaper: without it, a stale agent's
     # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
+    # SKIP LOCKED: _process_post_commit re-acquires FOR UPDATE on a separate
+    # session and holds it while making GitHub API calls (15–120s).  A duplicate
+    # status POST arriving in that window would block on FOR UPDATE, hit the 30s
+    # lock_timeout, and return 500.  skip_locked returns None instead so we can
+    # signal the agent to retry via a 503.
     stmt = select(Task).where(
         Task.id == payload.task_id,
         Task.vm_instance_id == token.get("vm_instance_id")
-    ).with_for_update()
+    ).with_for_update(skip_locked=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
 
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found for this VM")
+        # Distinguish "row locked" from "row missing / wrong VM" with a
+        # non-locking read, mirroring the heartbeat endpoint (agent.py:1077).
+        check_stmt = select(Task).where(Task.id == payload.task_id)
+        check_task = (await session.execute(check_stmt)).scalars().first()
+        if not check_task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if check_task.vm_instance_id != token.get("vm_instance_id"):
+            raise HTTPException(status_code=404, detail="Task not found for this VM")
+        # Row exists but is locked. If the task is already terminal, the
+        # in-flight lock holder is post-commit processing for a prior POST —
+        # this retry would just hit the idempotency guard, so short-circuit
+        # without waiting for the lock.
+        if check_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            return {"status": "already_terminal", "task_id": str(check_task.id)}
+        if check_task.status == TaskStatus.EVALUATING:
+            return {"status": "already_evaluating", "task_id": str(check_task.id)}
+        # Non-terminal + locked: tell the agent to retry. 503 engages the
+        # agent's 5xx retry path (apiPost in agent/src/index.ts); a 4xx
+        # would be treated as a permanent failure.
+        raise HTTPException(
+            status_code=503,
+            detail="Task row locked, retry",
+            headers={"Retry-After": "5"},
+        )
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
