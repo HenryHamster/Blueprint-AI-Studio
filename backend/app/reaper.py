@@ -723,6 +723,11 @@ async def reaper_service():
                         _new_ctx.pop("_slot_released", None)
                         _new_ctx.pop("retry_after", None)
                         _new_ctx.pop("failure_category", None)
+                        # Clear EXTERNAL_API retry counter: a resurrected task that hits another
+                        # API error would otherwise see stale _api_failure_retries > 5 and
+                        # bypass the EXTERNAL_API-specific backoff, falling through to the
+                        # general retry path with a depleted budget.
+                        _new_ctx.pop("_api_failure_retries", None)
                         _t.context = _new_ctx
                         _t.attempt_count = 0
                         _t.status = TaskStatus.QUEUED

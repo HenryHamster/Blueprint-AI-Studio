@@ -2414,6 +2414,58 @@ async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_d
 
 
 @pytest.mark.asyncio
+async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurrection(reaper_db, mocker):
+    """
+    When the reaper resurrects an EXTERNAL_API task, it must clear _api_failure_retries.
+    Without this, a task that exhausted its retry budget before failing would have
+    stale _api_failure_retries > 5 after resurrection, causing any subsequent API error
+    to bypass the EXTERNAL_API-specific backoff and fall through to the general retry
+    path with a depleted budget.
+    """
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"github_api": True, "claude_api": True},
+    )
+
+    project = Project(name="API Retry Clear Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={
+            "failure_category": "EXTERNAL_API",
+            # Simulate a task that exhausted its retry budget before failing permanently
+            "_api_failure_retries": 6,
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_resurrection_count") == 1
+    assert "_api_failure_retries" not in ctx, (
+        "_api_failure_retries must be cleared on resurrection so the task "
+        "gets a fresh retry budget if it hits another EXTERNAL_API failure"
+    )
+
+
+@pytest.mark.asyncio
 async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealthy(reaper_db, mocker):
     """An EXTERNAL_API task stays FAILED when dependencies are not yet healthy."""
     _common_infra_recovery_mocks(mocker)

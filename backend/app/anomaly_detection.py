@@ -376,14 +376,19 @@ async def check_anomaly_actions() -> dict:
 
     Called after _compute_research_anomalies in the autonomous research loop.
     Returns a dict describing what happened for broadcast purposes.
+    'is_new' is True only on the first activation (not on repeat cycles while
+    already active), so callers can avoid creating duplicate alerts.
     """
+    was_active = _shared_state.anomaly_adjustments["active"]
     applied = _apply_anomaly_adjustments()
     if applied:
         return {
             "action": "adjusted",
+            "is_new": not was_active,
             "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
             "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
             "trigger_anomalies": _shared_state.anomaly_adjustments["trigger_anomalies"],
+            "pre_adjustment_max_vms": _shared_state.anomaly_adjustments["pre_adjustment_max_vms"],
         }
 
     restored = _check_anomaly_restoration()

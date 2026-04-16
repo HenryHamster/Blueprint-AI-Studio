@@ -616,6 +616,10 @@ async def orchestrator_worker():
                                         await release_max_plan_account(child_acct)
                                         child.context = {**(child.context or {}), "_slot_released": True}
                                     cancel_session.add(child)
+                                await _maybe_create_failure_alert(
+                                    cancel_task, cancel_session,
+                                    "Cascade cancelled: dependency task failed"
+                                )
                                 await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
