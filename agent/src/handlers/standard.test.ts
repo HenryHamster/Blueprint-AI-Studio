@@ -282,6 +282,33 @@ describe('handleRefactor configuration', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('REFACTOR TASK \u2014 STRICT CONSTRAINTS');
   });
+
+  it('marks task FAILED when test failures persist (failOnTestFailure gate)', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+    vi.mocked(testFixLoop).mockResolvedValueOnce({ testFailuresDetected: true, passed: false, failureSummary: 'some test failed' });
+    const task = { title: 'Refactor task', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'test_failed' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('captures test baseline for medium-scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not capture test baseline for small-scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
 });
 
 // ── Module interface extraction (scope-conditional) ───────────────────────────
