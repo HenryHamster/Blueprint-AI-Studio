@@ -11,6 +11,7 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
+  discoverAffectedConsumers,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
@@ -593,6 +594,9 @@ export async function handleCreate(
   const moduleInterfaceContext = isMediumOrLargeScope
     ? extractModuleInterfaces(ws, relatedFiles)
     : '';
+  const affectedConsumersContext = isMediumOrLargeScope
+    ? discoverAffectedConsumers(ws, relatedFiles)
+    : '';
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
@@ -600,7 +604,7 @@ export async function handleCreate(
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${affectedConsumersContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -643,13 +647,16 @@ export async function handleRefactor(
   const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
     ? extractModuleInterfaces(ws, refactorRelatedFiles)
     : '';
+  const refactorAffectedConsumersContext = (refactorScope === 'medium' || refactorScope === 'large')
+    ? discoverAffectedConsumers(ws, refactorRelatedFiles)
+    : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

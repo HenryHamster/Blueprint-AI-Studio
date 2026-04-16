@@ -44,6 +44,7 @@ vi.mock('../prompt.js', () => ({
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
+  discoverAffectedConsumers: vi.fn().mockReturnValue(''),
   getMandatoryChecks: vi.fn().mockReturnValue([]),
 }));
 
@@ -87,7 +88,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
-import { extractModuleInterfaces } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -330,6 +331,56 @@ describe('module interface extraction', () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+});
+
+// ── Affected consumer discovery (scope-conditional) ───────────────────────────
+describe('affected consumer discovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('## Affected Consumers\nbar\n\n');
+  });
+
+  it('calls discoverAffectedConsumers for handleCreate with scope=medium', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Affected Consumers');
+  });
+
+  it('calls discoverAffectedConsumers for handleCreate with scope=large', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'large' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/bar.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/bar.ts']);
+  });
+
+  it('does not call discoverAffectedConsumers for handleCreate with scope=small', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+  });
+
+  it('does not call discoverAffectedConsumers for handleCreate with no scope', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
+  });
+
+  it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Affected Consumers');
+  });
+
+  it('does not call discoverAffectedConsumers for handleRefactor with scope=small', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
   });
 });
 
