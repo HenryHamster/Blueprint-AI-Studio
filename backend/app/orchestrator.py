@@ -53,6 +53,7 @@ _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
+_last_type_throttle_broadcast: dict[str, float] = {}
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: datetime | None = None
@@ -468,6 +469,24 @@ async def orchestrator_worker():
                                     f"({rate:.0%} failure rate, n={sample_size}) — skipping this type"
                                 )
 
+                # Broadcast type_throttle events for each newly-blocked type (debounced 60s per type)
+                if _failing_types:
+                    global _last_type_throttle_broadcast
+                    _now_mono = time.monotonic()
+                    for _ftype in _failing_types:
+                        if (_now_mono - _last_type_throttle_broadcast.get(_ftype, 0.0)) > 60:
+                            _last_type_throttle_broadcast[_ftype] = _now_mono
+                            _frate, _fsample = _shared_state.get_task_type_failure_rate(_ftype, window_minutes=15)
+                            try:
+                                await ws_manager.broadcast_to_all("type_throttle", {
+                                    "type": _ftype,
+                                    "failure_rate": round(_frate, 3),
+                                    "sample_size": _fsample,
+                                    "detail": f"Task type '{_ftype}' throttled: {_frate:.0%} failure rate (n={_fsample})",
+                                })
+                            except Exception:
+                                logger.exception(f"[ORCHESTRATOR] Failed to broadcast type_throttle for '{_ftype}'")
+
                 # External health gate — skip dispatch when a critical dependency has been
                 # confirmed down for 2+ consecutive health checks (avoids flapping on transient probes).
                 # DB is excluded: if DB is down the orchestrator itself cannot function.
@@ -811,6 +830,53 @@ async def orchestrator_worker():
                         except Exception:
                             logger.exception("[ORCHESTRATOR] Failed to broadcast zone_exhaustion throttle")
                     queued_tasks = []  # Clear so the loop below is skipped
+
+                # All-types-blocked detection: if every queued task's type is in _failing_types,
+                # the pipeline is silently stalled — create an operator alert.
+                if _failing_types and queued_tasks:
+                    _queued_types = {
+                        t.first_payload.get("type", "") for t in queued_tasks
+                        if t.first_payload.get("type", "")
+                    }
+                    if _queued_types and _queued_types.issubset(_failing_types):
+                        _blocked_summary = ", ".join(sorted(_queued_types))
+                        logger.warning(
+                            f"[ORCHESTRATOR] All queued task types blocked by per-type failure gate: {_blocked_summary}"
+                        )
+                        try:
+                            from app.models import Alert, AlertSeverity
+                            _all_blocked_title = "Pipeline stalled — all task types throttled"
+                            _all_blocked_msg = (
+                                f"All queued task types are blocked by the per-type failure gate: {_blocked_summary}. "
+                                "Each type has >70% failure rate in the last 15 minutes. The pipeline will not dispatch "
+                                "new tasks until failure rates drop."
+                            )
+                            _projects = (await session.execute(select(Project))).scalars().all()
+                            for _proj in _projects:
+                                _existing_alert = (await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == _proj.id,
+                                        Alert.task_id.is_(None),
+                                        Alert.severity == AlertSeverity.ERROR,
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.title == _all_blocked_title,
+                                    )
+                                )).scalars().first()
+                                if _existing_alert is None:
+                                    _alert = Alert(
+                                        project_id=_proj.id,
+                                        severity=AlertSeverity.ERROR,
+                                        title=_all_blocked_title,
+                                        message=_all_blocked_msg,
+                                    )
+                                    session.add(_alert)
+                                    await broadcast_to_project(
+                                        str(_proj.id),
+                                        "alert_created",
+                                        {"alert_id": str(_alert.id), "severity": "ERROR", "title": _all_blocked_title},
+                                    )
+                        except Exception:
+                            logger.exception("[ORCHESTRATOR] Failed to create all-types-blocked project alerts")
 
                 for task in queued_tasks:
                     # Per-type failure gate: skip tasks whose type is currently failing
