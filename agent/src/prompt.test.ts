@@ -1046,8 +1046,6 @@ describe('buildRetryContext', () => {
 
 describe('buildSelfReviewPrompt', () => {
   const baseOpts = {
-    rawPrompt: 'Implement feature X',
-    taskTitle: 'feat: add X',
     diff: 'diff --git a/foo.ts b/foo.ts',
     reviewPlaybook: {},
     claudeMd: '',
@@ -1153,8 +1151,6 @@ describe('buildSelfReviewPrompt', () => {
 // ── buildSelfReviewChecklist (via buildSelfReviewPrompt) ─────────────────────
 describe('buildSelfReviewChecklist', () => {
   const baseOpts = {
-    rawPrompt: 'Implement feature X',
-    taskTitle: 'feat: add X',
     diff: 'diff --git a/foo.ts b/foo.ts',
     reviewPlaybook: {},
     claudeMd: '',

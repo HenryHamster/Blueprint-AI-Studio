@@ -674,6 +674,7 @@ describe('self-review phase', () => {
   it('parses structured JSON from self-review output and includes it in the status payload', async () => {
     const reviewJson = JSON.stringify({
       verdict: 'PASS',
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: true } },
       checks_performed: ['test_coverage', 'type_safety'],
       issues_found: 0,
       files_reviewed: 2,
@@ -695,8 +696,41 @@ describe('self-review phase', () => {
     const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.verdict).toBe('PASS');
+    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: true } });
     expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
     expect(outcome.files_reviewed).toBe(2);
+    expect(outcome.parse_failed).toBeUndefined();
+  });
+
+  it('derives checks_performed from check_results keys when checks_performed is absent', async () => {
+    const { getMandatoryChecks } = await import('../prompt.js');
+    vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } },
+      issues_found: 1,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    const reviewOutput = `\`\`\`json\n${reviewJson}\n\`\`\``;
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: reviewOutput, lastResultText: '' }) // self-review pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: reviewOutput, lastResultText: '' }); // self-review pass 2
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
+    expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
     expect(outcome.parse_failed).toBeUndefined();
   });
 

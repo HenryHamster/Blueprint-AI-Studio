@@ -1530,8 +1530,6 @@ Check for:
  * before committing.  Concentrates only on CRITICAL and MAJOR issues.
  */
 export function buildSelfReviewPrompt(opts: {
-  rawPrompt: string;
-  taskTitle: string;
   diff: string;
   reviewPlaybook: Record<string, string>;
   claudeMd: string;
@@ -1594,9 +1592,6 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-
-## Task Requirements
-${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
 ${restrictionsSection}${issueDistSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
@@ -1608,12 +1603,13 @@ If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git 
 
 When done (whether or not you found issues), output a JSON block exactly like this:
 \`\`\`json
-{"verdict":"PASS","checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
+{"verdict":"PASS","check_results":{"test_coverage":{"passed":true},"type_safety":{"passed":false,"issue":"Missing return type on exportFoo"}},"checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
 \`\`\`
 
 Fields:
-- \`verdict\`: "PASS" if no blocking issues remain, "FAIL" if unresolvable issues were found
-- \`checks_performed\`: IDs of every checklist item you examined — ${checkIdsNote}
+- \`verdict\`: "PASS" if no blocking issues remain, "FAIL" if unresolvable issues were found — derive this from check_results (FAIL if any check has passed:false)
+- \`check_results\`: object mapping each mandatory check ID to \`{passed: boolean, issue?: string}\` — ${checkIdsNote}. Set \`issue\` to a short description of what was found (omit if passed).
+- \`checks_performed\`: IDs of every checklist item you examined (same keys as check_results, kept for backwards compatibility)
 - \`issues_found\`: number of issues found (0 if none)
 - \`files_reviewed\`: number of files you read or examined
 - \`truncated_files_read\`: paths of files you read directly to compensate for a truncated diff (empty array if diff was not truncated)`;

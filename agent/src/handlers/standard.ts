@@ -310,6 +310,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       categories: string[];
       fixes_applied: boolean;
       verdict?: string;
+      check_results?: Record<string, { passed: boolean; issue?: string }>;
       checks_performed?: string[];
       files_reviewed?: number;
       truncated_files_read?: string[];
@@ -352,8 +353,6 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
-        rawPrompt,
-        taskTitle,
         diff: reviewDiff,
         reviewPlaybook,
         claudeMd,
@@ -401,6 +400,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         let parseFailed = false;
 
         const parsed = extractSelfReviewJson(lastReviewOutput);
+        let parsedCheckResults: Record<string, { passed: boolean; issue?: string }> | undefined;
         if (!parsed) {
           reviewCategories.push('self_review_failed', 'json_parse_failed');
           parseFailed = true;
@@ -409,6 +409,15 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           parsedChecks = Array.isArray(parsed.checks_performed) ? parsed.checks_performed as string[] : undefined;
           parsedFilesReviewed = typeof parsed.files_reviewed === 'number' ? parsed.files_reviewed : undefined;
           parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
+
+          // Extract check_results if present
+          if (parsed.check_results && typeof parsed.check_results === 'object' && !Array.isArray(parsed.check_results)) {
+            parsedCheckResults = parsed.check_results as Record<string, { passed: boolean; issue?: string }>;
+            // Derive checks_performed from check_results keys if not already set
+            if (!parsedChecks) {
+              parsedChecks = Object.keys(parsedCheckResults);
+            }
+          }
 
           // Validate checks_performed contains all mandatory items
           const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
@@ -434,6 +443,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           categories: reviewCategories,
           fixes_applied: fixesApplied,
           ...(parsedVerdict !== undefined ? { verdict: parsedVerdict } : {}),
+          ...(parsedCheckResults !== undefined ? { check_results: parsedCheckResults } : {}),
           ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
           ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
           ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
