@@ -1840,6 +1840,7 @@ async def get_open_prs(
             if not existing or existing.status not in _ACTIVE_STATUSES:
                 pr_task_map[pr_num] = t
 
+
     result = []
     for gh_pr in github_prs:
         pr_number = gh_pr.get("number")

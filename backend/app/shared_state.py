@@ -65,6 +65,17 @@ runtime_config: Dict = {
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # Per-failure-class retry budgets: max attempt_count before permanent failure.
+    # Overrides max_retries for specific failure classes. Operator-adjustable.
+    #   CODE_ERROR:    2 — code won't self-correct; 3rd attempt wastes compute
+    #   EXTERNAL_API:  4 — transient outages (GitHub 502, DNS) can last 15-60 min
+    #   AGENT_TIMEOUT: 3 — keep current behavior with scope-reduction on 2nd timeout
+    "retry_budgets_by_class": {
+        "CODE_ERROR": 2,
+        "EXTERNAL_API": 4,
+        "AGENT_TIMEOUT": 3,
+    },
 }
 
 # --- Autonomous Loop State ---
@@ -108,6 +119,31 @@ def get_circuit_breaker(project_id: str) -> Dict:
             "open_reason": None,         # "code" or "infra" — why the breaker opened
         }
     return circuit_breakers[project_id]
+
+# --- User-submitted Auto-Debug Rate Limiting ---
+# Tracks timestamps of user-submitted debug spawns per project to enforce hourly cap.
+# Structure: project_id -> deque of datetime (UTC) of recent spawns
+user_debug_spawn_times: Dict[str, deque] = {}
+
+USER_DEBUG_MAX_PER_HOUR = 3  # max debug tasks spawned for user/admin tasks per project per hour
+
+def record_user_debug_spawn(project_id: str, now: datetime) -> None:
+    """Record a user-submitted debug spawn and prune old entries."""
+    if project_id not in user_debug_spawn_times:
+        user_debug_spawn_times[project_id] = deque()
+    dq = user_debug_spawn_times[project_id]
+    dq.append(now)
+    cutoff = now - timedelta(hours=1)
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
+    """Count user-submitted debug spawns in the last hour for a project."""
+    dq = user_debug_spawn_times.get(project_id)
+    if not dq:
+        return 0
+    cutoff = now - timedelta(hours=1)
+    return sum(1 for t in dq if t >= cutoff)
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task

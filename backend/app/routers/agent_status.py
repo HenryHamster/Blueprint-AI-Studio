@@ -910,6 +910,15 @@ async def update_agent_status(
                         + existing_msg[:300]
                     ).strip()
                     session.add(task)
+                try:
+                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    await _maybe_create_failure_alert(
+                        task,
+                        session,
+                        task.latest_status_message or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
+                    )
+                except Exception as _alert_err:
+                    logger.warning(f"[AGENT_STATUS] Failed to create failure alert for task {task.id}: {_alert_err}")
 
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -934,7 +943,7 @@ async def update_agent_status(
                         f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
                         f"type={task.first_payload.get('type', 'unknown')}"
                     )
-                # Increment confirmed_count on applicable playbook entries for successful first attempts
+                # Increment confirmed_count and update effectiveness scoring for successful first attempts
                 if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
                     try:
                         _task_type = task.first_payload.get("type", "create")
@@ -944,6 +953,11 @@ async def update_agent_status(
                         }
                         _doc = dict(_proj.design_doc or {})
                         _confirmed_changed = False
+                        _now_iso = _utcnow().isoformat()
+                        # Keys shown to this task (stored at claim time for accurate outcome tracking)
+                        _shown_keys = {
+                            f"playbook/{k}" for k in (_ctx.get("_shown_playbook_keys") or [])
+                        }
                         for _pk, _pv in list(_doc.items()):
                             if _pk.startswith("playbook/") and isinstance(_pv, dict):
                                 _applicable = _pv.get("applicable_types")
@@ -954,6 +968,26 @@ async def update_agent_status(
                                     continue
                                 _entry = dict(_pv)
                                 _entry["confirmed_count"] = _entry.get("confirmed_count", 0) + 1
+                                _entry["last_confirmed_at"] = _now_iso
+                                # Update rolling recent_outcomes only for entries shown to this task
+                                if _pk in _shown_keys:
+                                    _recent = list(_entry.get("recent_outcomes", []))
+                                    # Flip the most recent unconfirmed (False) outcome to True
+                                    _flipped = False
+                                    for _i in range(len(_recent) - 1, -1, -1):
+                                        if _recent[_i] is False:
+                                            _recent[_i] = True
+                                            _flipped = True
+                                            break
+                                    if not _flipped:
+                                        # No pending False; append True directly
+                                        _recent.append(True)
+                                        if len(_recent) > 10:
+                                            _recent = _recent[-10:]
+                                    _entry["recent_outcomes"] = _recent
+                                    # Compute and persist effectiveness_score
+                                    _score = sum(_recent) / len(_recent) if _recent else 0.5
+                                    _entry["effectiveness_score"] = round(_score, 4)
                                 _doc[_pk] = _entry
                                 _confirmed_changed = True
                         if _confirmed_changed:
@@ -982,16 +1016,22 @@ async def update_agent_status(
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload
         failed_task_type = failed_task_payload.get("type", "")
+        _is_user_submitted = task.created_by in ("USER", "ADMIN")
+        _user_debug_allowed = (
+            not _is_user_submitted or
+            _shared_state.count_recent_user_debug_spawns(str(task.project_id), _utcnow()) < _shared_state.USER_DEBUG_MAX_PER_HOUR
+        )
         should_auto_debug = (
             payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
             failed_task_type != "debug" and  # Don't recursively debug debug tasks
             (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
             payload.logs and
             failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
+            _user_debug_allowed and
             (
                 (task.context or {}).get("auto_debug") is True or
                 task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
-                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
+                task.created_by in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
             )
         )
         if should_auto_debug:
@@ -1023,6 +1063,8 @@ async def update_agent_status(
             )
             session.add(debug_task)
             await session.flush()
+            if _is_user_submitted:
+                _shared_state.record_user_debug_spawn(str(task.project_id), _utcnow())
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",

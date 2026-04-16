@@ -994,6 +994,13 @@ export async function testFixLoop(
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
       try {
+        // Ensure node_modules are present for npm-based runners; runProjectLintChecks
+        // installs them in the normal agent flow but testFixLoop may be called
+        // standalone (e.g. from the Blueprint harness) without that step having run.
+        if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
+          sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
+          execFileSync('npm', ['ci'], { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
+        }
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
         execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
@@ -1441,7 +1448,11 @@ function _crashReport(label: string, detail: string, exitCode: number) {
       sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`);
     } catch { /* best effort — we're dying anyway */ }
   }
-  process.exit(exitCode);
+  // process.exit normally never returns; if it throws (e.g. when intercepted
+  // by a test harness like vitest), swallow the throw so the caller — often
+  // an uncaughtException handler — doesn't re-throw and crash the process
+  // with a confusing secondary error instead of the original one.
+  try { process.exit(exitCode); } catch { /* intercepted, best effort */ }
 }
 
 // Only register global handlers and call main() when this file is the entry

@@ -44,7 +44,7 @@ vi.mock('../prompt.js', () => ({
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
-  discoverAffectedConsumers: vi.fn().mockReturnValue(''),
+  getMandatoryChecks: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {
@@ -87,7 +87,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers } from '../prompt.js';
+import { extractModuleInterfaces } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -281,36 +281,6 @@ describe('handleRefactor configuration', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('REFACTOR TASK \u2014 STRICT CONSTRAINTS');
   });
-
-  it('passes captureBaseline=true for medium scope refactor', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
-  });
-
-  it('passes captureBaseline=true for large scope refactor', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'large' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
-  });
-
-  it('does not capture baseline for small scope refactor', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
-  });
-
-  it('includes planning note in prompt for medium scope refactor', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(capturedPrompt()).toContain('Pre-Refactor Planning');
-  });
-
-  it('does not include planning note for small scope refactor', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(capturedPrompt()).not.toContain('Pre-Refactor Planning');
-  });
 });
 
 // ── Module interface extraction (scope-conditional) ───────────────────────────
@@ -360,20 +330,6 @@ describe('module interface extraction', () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
-  });
-
-  it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
-    vi.mocked(discoverAffectedConsumers).mockReturnValue('## Affected Consumers\nbar\n\n');
-    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
-    expect(capturedPrompt()).toContain('## Affected Consumers');
-  });
-
-  it('does not call discoverAffectedConsumers for handleRefactor with scope=small', async () => {
-    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
-    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
   });
 });
 
@@ -561,6 +517,85 @@ describe('self-review phase', () => {
     const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { categories: string[] };
     expect(outcome).toBeDefined();
     expect(outcome.categories).toContain('self_review_failed');
+  });
+
+  it('parses structured JSON from self-review output and includes it in the status payload', async () => {
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['test_coverage', 'type_safety'],
+      issues_found: 0,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining (headAfterReview === headBeforeReview → no fixes)
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.verdict).toBe('PASS');
+    expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
+    expect(outcome.files_reviewed).toBe(2);
+    expect(outcome.parse_failed).toBeUndefined();
+  });
+
+  it('marks self_review_failed when self-review output contains no JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Looks good to me!', lastResultText: '' }); // no JSON
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.categories).toContain('self_review_failed');
+    expect(outcome.parse_failed).toBe(true);
+  });
+
+  it('marks self_review_failed with validation_failed when checks_performed is missing mandatory items', async () => {
+    const { getMandatoryChecks } = await import('../prompt.js');
+    vi.mocked(getMandatoryChecks).mockReturnValueOnce(['test_coverage', 'type_safety', 'security']);
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['test_coverage'],  // missing type_safety and security
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.categories).toContain('self_review_failed');
+    expect(outcome.categories).toContain('validation_failed');
+    expect(outcome.parse_failed).toBe(true);
   });
 
   it('runs runProjectLintChecks after self-review applies fixes', async () => {

@@ -103,6 +103,66 @@ class TestMaxReviewIterations:
         assert STUCK_CYCLE_THRESHOLD_DEFAULT == 0.5
         assert STUCK_CYCLE_THRESHOLD_REFACTOR == 0.75
 
+    # ── Direction-aware reduction ─────────────────────────────────────────────
+
+    def _direction_data(self, history: list[dict], agg: dict | None = None) -> dict:
+        return {"research_history": history, "history_aggregate": agg or {}}
+
+    def test_low_acceptance_rate_reduces_small_cap(self):
+        """acceptance_rate < 0.3 reduces cap by ~30% (10 → 7)."""
+        # 1 merged, 9 rejected → acceptance_rate = 0.1 < 0.3
+        history = [{"prs_merged": 1, "prs_rejected": 9}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 7
+
+    def test_low_acceptance_rate_reduces_medium_cap(self):
+        """acceptance_rate < 0.3 reduces cap by ~30% (12 → 8)."""
+        history = [{"prs_merged": 1, "prs_rejected": 9}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="medium"), direction_data=d) == 8
+
+    def test_low_acceptance_rate_reduces_large_cap(self):
+        """acceptance_rate < 0.3 reduces cap by ~30% (16 → 11)."""
+        history = [{"prs_merged": 1, "prs_rejected": 9}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="large"), direction_data=d) == 11
+
+    def test_high_rejection_ratio_reduces_cap(self):
+        """prs_rejected / prs_merged > 2.0 in recent history reduces cap."""
+        # 1 merged, 3 rejected → ratio = 3.0 > 2.0
+        history = [{"prs_merged": 1, "prs_rejected": 3}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 7
+
+    def test_high_rejection_no_merges_reduces_cap(self):
+        """0 merged but ≥3 rejected also triggers the reduction."""
+        history = [{"prs_merged": 0, "prs_rejected": 3}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 7
+
+    def test_good_acceptance_rate_no_reduction(self):
+        """Healthy direction (acceptance_rate ≥ 0.3, low rejection) keeps full cap."""
+        history = [{"prs_merged": 5, "prs_rejected": 1}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 10
+
+    def test_no_direction_data_uses_scope_cap(self):
+        """direction_data=None falls back to scope-based caps unchanged."""
+        assert _max_review_iterations(self._task(scope="small"), direction_data=None) == 10
+
+    def test_ci_failure_not_affected_by_direction_data(self):
+        """ci_failure cap (8) is not reduced even for a bad direction."""
+        history = [{"prs_merged": 0, "prs_rejected": 9}]
+        d = self._direction_data(history)
+        assert _max_review_iterations(
+            self._task(scope="small", fix_reason="ci_failure"), direction_data=d
+        ) == 8
+
+    def test_no_history_data_no_reduction(self):
+        """Empty history means acceptance_rate=None → no reduction."""
+        d = self._direction_data([])
+        assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 10
+
 
 # ── DB-backed helpers ─────────────────────────────────────────────────────────
 
