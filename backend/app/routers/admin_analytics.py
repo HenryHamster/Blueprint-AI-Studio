@@ -414,8 +414,8 @@ async def get_activity(
     return {"events": events[:limit], "total": total}
 
 
-async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID) -> Dict[str, Any]:
-    """Compute lightweight pipeline health metrics for the last 24 hours.
+async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID, lookback_hours: int = 24) -> Dict[str, Any]:
+    """Compute lightweight pipeline health metrics for the specified lookback window.
 
     Returns a dict with:
     - success_rate: float or None
@@ -426,8 +426,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     from app.failure_classification import classify_failure as _classify_failure
 
     _now = _utcnow()
-    window_start = _now - timedelta(hours=24)
-    prev_window_start = window_start - timedelta(hours=24)
+    window_start = _now - timedelta(hours=lookback_hours)
+    prev_window_start = window_start - timedelta(hours=lookback_hours)
 
     def _derive_completed_at(t: Task):
         if t.status_log:
@@ -1485,6 +1485,7 @@ async def get_digest(
 @router.get("/health-overview")
 async def get_health_overview(
     project_id: uuid.UUID | None = Query(None),
+    lookback_hours: int = Query(24, ge=1, le=8760),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -1498,12 +1499,12 @@ async def get_health_overview(
 
     # --- 1. Success rate ---
     if project_id:
-        health_summary = await compute_pipeline_health_summary(session, project_id)
+        health_summary = await compute_pipeline_health_summary(session, project_id, lookback_hours=lookback_hours)
         success_rate_value = health_summary.get("success_rate")
         sr_trend = health_summary.get("trend")
     else:
-        window_start = now - timedelta(hours=24)
-        prev_window_start = window_start - timedelta(hours=24)
+        window_start = now - timedelta(hours=lookback_hours)
+        prev_window_start = window_start - timedelta(hours=lookback_hours)
         xp_result = await session.execute(
             select(Task).where(
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -1543,7 +1544,7 @@ async def get_health_overview(
     success_rate_out = {
         "current": success_rate_value,
         "trend": sr_trend,
-        "window_hours": 24,
+        "window_hours": lookback_hours,
     }
 
     # --- 2. Active tasks for stuck-task detection and queue depth ---

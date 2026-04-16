@@ -1711,3 +1711,38 @@ async def test_measurements_split_null_when_sample_too_small():
     fa = result["first_attempt_success_rate"]
     assert fa["with_measurements"] is None
     assert fa["without_measurements"] is None
+
+
+# ── lookback_hours parameter ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_lookback_hours_excludes_tasks_outside_window():
+    """Tasks older than lookback_hours window are excluded from success_rate."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+
+    # One task completed 2 hours ago (inside 3h window, outside 1h window)
+    # One task completed 30 minutes ago (inside both windows)
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+            status_log=[{"t": (now - timedelta(hours=2)).isoformat(), "s": "COMPLETED"}],
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(minutes=30),
+            status_log=[{"t": (now - timedelta(minutes=30)).isoformat(), "s": "FAILED"}],
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    # With 1h lookback: only the 30-min-old FAILED task is in window → success_rate = 0.0
+    result_1h = await compute_pipeline_health_summary(session, project_id, lookback_hours=1)
+    assert result_1h["success_rate"] == 0.0
+
+    # With 3h lookback: both tasks in window → 1 completed, 1 failed → success_rate = 0.5
+    result_3h = await compute_pipeline_health_summary(session, project_id, lookback_hours=3)
+    assert result_3h["success_rate"] == 0.5
