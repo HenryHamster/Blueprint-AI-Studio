@@ -88,7 +88,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -524,6 +524,7 @@ describe('handleDeps configuration', () => {
 describe('self-review phase', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getMandatoryChecks).mockReturnValue([]);
   });
 
   it('runs self-review for handleCreate when there are changes', async () => {
@@ -841,6 +842,64 @@ describe('self-review phase', () => {
       expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('records feedback_categories_injected from review_issue_distribution in self-review outcome', async () => {
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      check_results: { test_coverage: { passed: true } },
+      checks_performed: ['test_coverage'],
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining (no fixes)
+    const task = {
+      title: 'Task', description: '', context: {},
+      project_context: { review_issue_distribution: { type_safety: 0.4, test_coverage: 0.3 } },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.feedback_categories_injected).toEqual(expect.arrayContaining(['type_safety', 'test_coverage']));
+    expect((outcome.feedback_categories_injected as string[]).length).toBe(2);
+  });
+
+  it('omits feedback_categories_injected when review_issue_distribution is absent', async () => {
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      check_results: { test_coverage: { passed: true } },
+      checks_performed: ['test_coverage'],
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' });
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.feedback_categories_injected).toBeUndefined();
   });
 
   it('runs runProjectLintChecks after self-review applies fixes', async () => {

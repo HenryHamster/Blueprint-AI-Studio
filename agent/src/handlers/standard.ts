@@ -337,6 +337,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       files_reviewed?: number;
       truncated_files_read?: string[];
       parse_failed?: boolean;
+      feedback_categories_injected?: string[];
     } | undefined;
     if (runSelfReview) {
       sendLog(ws, '\nRunning self-review...\n');
@@ -375,6 +376,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
+      const feedbackCategoriesInjected: string[] | undefined = reviewIssueDist && Object.keys(reviewIssueDist).length > 0
+        ? Object.keys(reviewIssueDist)
+        : undefined;
       const selfReviewPipelineHealth = selfReviewProjectCtx?.pipeline_health as Record<string, unknown> | undefined;
       const selfReviewFasr = selfReviewPipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
       const firstAttemptByCat = selfReviewFasr?.first_attempt_by_review_category as Record<string, number> | undefined;
@@ -434,7 +438,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       }
 
       if (selfReviewFailed) {
-        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false, passes, total_fixes: totalFixes };
+        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false, passes, total_fixes: totalFixes, ...(feedbackCategoriesInjected !== undefined ? { feedback_categories_injected: feedbackCategoriesInjected } : {}) };
       } else {
         const fixesApplied = totalFixes > 0;
 
@@ -497,6 +501,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
           ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
           ...(parseFailed ? { parse_failed: true } : {}),
+          ...(feedbackCategoriesInjected !== undefined ? { feedback_categories_injected: feedbackCategoriesInjected } : {}),
         };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
         if (fixesApplied) {

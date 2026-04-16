@@ -485,8 +485,43 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations", "direction_first_attempt_feedback"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_review_measurements_split():
+    """with_review_measurements and without_review_measurements split tasks correctly."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        # With review measurements — succeeded
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  created_at=now - timedelta(hours=1),
+                  context={"_had_review_measurements": True, "_first_attempt_succeeded": True}),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  created_at=now - timedelta(hours=2),
+                  context={"_had_review_measurements": True, "_first_attempt_succeeded": False}),
+        # Without review measurements — all failed
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  created_at=now - timedelta(hours=3),
+                  context={"_had_review_measurements": False, "_first_attempt_succeeded": False}),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    fa = result["first_attempt_success_rate"]
+    assert fa["with_review_measurements"] == 0.5
+    assert fa["without_review_measurements"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_review_measurements_none_when_no_data():
+    """with_review_measurements and without_review_measurements are None when no tasks have the flag."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+    fa = result["first_attempt_success_rate"]
+    assert fa["with_review_measurements"] is None
+    assert fa["without_review_measurements"] is None
 
 
 # ── Review accuracy ───────────────────────────────────────────────────────────
@@ -673,6 +708,40 @@ async def test_return_structure_includes_review_effectiveness_trends():
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
     assert "review_effectiveness_trends" in result
+
+
+# ── Direction first-attempt feedback ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_direction_first_attempt_feedback_absent_when_no_design_doc():
+    """direction_first_attempt_feedback is None when design_doc has no entry."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert "direction_first_attempt_feedback" in result
+    assert result["direction_first_attempt_feedback"] is None
+
+
+@pytest.mark.asyncio
+async def test_direction_first_attempt_feedback_returned_when_present():
+    """direction_first_attempt_feedback exposes per-direction rejection tallies."""
+    dfa = {
+        "dir-abc": {"style": 3, "logic": 1, "total": 4, "last_updated": "2026-04-01T00:00:00"},
+        "dir-xyz": {"tests": 2, "total": 2, "last_updated": "2026-04-02T00:00:00"},
+    }
+    project = make_project(directions=[], design_doc={"direction_first_attempt_feedback": dfa})
+    session = _make_mock_session(tasks=[], project=project)
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    feedback = result["direction_first_attempt_feedback"]
+    assert feedback is not None
+    assert "dir-abc" in feedback
+    assert feedback["dir-abc"]["style"] == 3
+    assert feedback["dir-abc"]["total"] == 4
+    assert "dir-xyz" in feedback
+    assert feedback["dir-xyz"]["tests"] == 2
 
 
 # ── Scope merge rates ────────────────────────────────────────────────────────

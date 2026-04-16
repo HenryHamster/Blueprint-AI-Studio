@@ -562,9 +562,15 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         and "_first_attempt_succeeded" in (t.context or {})
     ]
 
-    tasks_with_measurements = [
+    tasks_with_review_measurements = [
         t for t in terminal_tasks_24h
         if (t.context or {}).get("_had_review_measurements") is True
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+    tasks_with_measurements = tasks_with_review_measurements
+    tasks_without_review_measurements = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("_had_review_measurements") is False
         and "_first_attempt_succeeded" in (t.context or {})
     ]
     tasks_without_measurements = [
@@ -692,6 +698,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "trend": first_attempt_trend,
         "with_playbook": _first_attempt_rate(tasks_with_playbook) if tasks_with_playbook else None,
         "without_playbook": _first_attempt_rate(tasks_without_playbook) if tasks_without_playbook else None,
+        "with_review_measurements": _first_attempt_rate(tasks_with_review_measurements) if tasks_with_review_measurements else None,
+        "without_review_measurements": _first_attempt_rate(tasks_without_review_measurements) if tasks_without_review_measurements else None,
         "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),
         "by_type": first_attempt_by_type,
         "by_scope": first_attempt_by_scope,
@@ -840,6 +848,12 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if recurrence:
             review_recurrence_by_category = recurrence
 
+    direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
+    if project and project.design_doc:
+        dfa = project.design_doc.get("direction_first_attempt_feedback")
+        if dfa:
+            direction_first_attempt_feedback = dfa
+
     # Self-review prediction accuracy: compare self-review check_results against human rejection categories
     self_review_prediction_accuracy: Dict[str, Any] | None = None
     tasks_with_both = [
@@ -889,6 +903,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "review_recurrence_by_category": review_recurrence_by_category,
         "scope_merge_rates": scope_merge_rates,
         "medium_scope_review_iterations": medium_scope_review_iterations,
+        "direction_first_attempt_feedback": direction_first_attempt_feedback,
     }
 
 
@@ -2196,6 +2211,7 @@ async def get_first_attempt_measurement(
             parsed_split_date = datetime.fromisoformat(split_date)
         except (ValueError, TypeError):
             pass
+
 
     return _compute_first_attempt_measurement(list(all_tasks), parsed_split_date, lookback_days)
 
