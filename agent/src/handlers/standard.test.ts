@@ -542,7 +542,7 @@ describe('testFixLoop buildConfig propagation', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, buildConfig, undefined,
+      WS, expect.any(Object), undefined, undefined, buildConfig, undefined, [],
     );
   });
 
@@ -554,7 +554,7 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
     );
   });
 });
@@ -599,7 +599,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, baseline,
+      WS, expect.any(Object), undefined, undefined, undefined, baseline, [],
     );
   });
 
@@ -608,7 +608,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
     );
   });
 
@@ -622,6 +622,19 @@ describe('test baseline capture', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
       WS, expect.any(Object), undefined, relatedFiles,
+    );
+  });
+
+  it('passes related_files from payload to testFixLoop', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const relatedFiles = ['agent/src/index.ts'];
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, relatedFiles,
     );
   });
 });

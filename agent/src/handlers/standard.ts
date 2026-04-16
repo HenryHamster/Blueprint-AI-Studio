@@ -83,6 +83,7 @@ export interface StandardHandlerOpts {
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
+  relatedFiles?: string[];
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -98,6 +99,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
+    relatedFiles,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -203,7 +205,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -466,6 +468,7 @@ export async function handleCreate(
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
+    relatedFiles,
   });
 }
 
