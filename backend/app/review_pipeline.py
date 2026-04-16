@@ -27,8 +27,14 @@ STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
 
 
-def _max_review_iterations(task: Task) -> int:
-    """Scope-aware review-fix iteration limit."""
+def _max_review_iterations(task: Task, direction_data: Optional[dict] = None) -> int:
+    """Scope-aware review-fix iteration limit, optionally reduced for low-quality directions.
+
+    If direction_data is provided and the direction has a poor operator acceptance rate
+    (acceptance_rate < 0.3) or a high rejection ratio (prs_rejected / prs_merged > 2.0
+    in recent history), the scope-based cap is reduced by ~30% to avoid wasting compute
+    on directions the operator consistently rejects.
+    """
     ctx = task.context or {}
     scope = ctx.get('scope', 'medium')
     fix_reason = ctx.get('review_loop', {}).get('fix_reason', 'code_review')
@@ -45,6 +51,24 @@ def _max_review_iterations(task: Task) -> int:
     # Large scope or unknown: full budget
     else:
         limit = 16
+
+    # Direction-aware reduction: cut cap by ~30% for consistently-rejected directions.
+    # Only applies when direction_data is available and we're not already at the ci_failure cap.
+    if direction_data is not None and fix_reason != 'ci_failure':
+        from app.research_completion import _compute_acceptance_rate  # noqa: PLC0415
+        acceptance_rate = _compute_acceptance_rate(direction_data)
+        # Check recent rejection ratio from last few history entries
+        recent_history = (direction_data.get("research_history") or [])[-3:]
+        recent_merged = sum(e.get("prs_merged", 0) for e in recent_history)
+        recent_rejected = sum(e.get("prs_rejected", 0) for e in recent_history)
+        high_rejection_ratio = (
+            recent_merged > 0 and (recent_rejected / recent_merged) > 2.0
+        ) or (
+            recent_merged == 0 and recent_rejected >= 3
+        )
+        if (acceptance_rate is not None and acceptance_rate < 0.3) or high_rejection_ratio:
+            limit = max(1, round(limit * 0.7))
+
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
 
@@ -131,7 +155,19 @@ async def _spawn_pipeline_task(
         if t.first_payload.get("pr_number") == pr_number
         and t.first_payload.get("type") in ("review", "fix")
     )
-    global_cap = _max_review_iterations(source_task)
+    # Load direction data for direction-aware cap adjustment.
+    direction_data: Optional[dict] = None
+    direction_id = (source_task.context or {}).get("direction_id")
+    if direction_id:
+        from app.models import Project  # noqa: PLC0415
+        project = await session.get(Project, source_task.project_id)
+        if project:
+            for d in (project.directions or []):
+                if d.get("id") == direction_id:
+                    direction_data = d
+                    break
+
+    global_cap = _max_review_iterations(source_task, direction_data)
     # Rollup reviews accumulate iterations across retry attempts — always use the max cap
     # so transient review failures don't permanently block rollup merges.
     # Two detection paths: (1) _rollup_retries set when PR creation fails transiently,
