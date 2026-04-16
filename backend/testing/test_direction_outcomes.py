@@ -555,25 +555,25 @@ async def test_scope_breakdown_per_scope_counters(db_session: AsyncSession):
     # small: 2 created, 1 merged, 0 failed
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.COMPLETED,
-                              context={"pr_merged": True},
-                              payloads=[{"type": "create", "scope": "small"}],
+                              context={"pr_merged": True, "scope": "small"},
+                              payloads=[{"type": "create"}],
                               title="s1")
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.COMPLETED,
-                              context={},
-                              payloads=[{"type": "create", "scope": "small"}],
+                              context={"scope": "small"},
+                              payloads=[{"type": "create"}],
                               title="s2")
     # medium: 1 created, 0 merged, 1 failed
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.FAILED,
-                              context={},
-                              payloads=[{"type": "create", "scope": "medium"}],
+                              context={"scope": "medium"},
+                              payloads=[{"type": "create"}],
                               title="m1")
     # no scope → unknown
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.COMPLETED,
-                              context={},
-                              payloads=[{"type": "create"}],  # no scope key
+                              context={},  # no scope key
+                              payloads=[{"type": "create"}],
                               title="u1")
     await db_session.flush()
 
@@ -753,19 +753,26 @@ async def test_cochange_index_not_updated_when_no_changed_files(db_session: Asyn
 
 @pytest.mark.asyncio
 async def test_scope_breakdown_unknown_default(db_session: AsyncSession):
-    """Tasks with no scope field in first_payload default to 'unknown' scope."""
+    """Tasks with scope in context are categorized correctly; tasks missing scope default to 'unknown'."""
     direction_id = "d-unknown-scope"
     project = await _create_project(db_session, directions=[])
     research_task = await _make_research_task(db_session, project.id)
     research_task_id = str(research_task.id)
 
-    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
     await db_session.flush()
 
+    # Task with scope in context — should be categorized as "small"
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.COMPLETED,
+                              context={"scope": "small"},
+                              payloads=[{"type": "fix"}],
+                              title="with-scope")
+    # Task with no scope in context — should default to "unknown"
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.COMPLETED,
                               context={},
-                              payloads=[{"type": "fix"}],  # no scope
+                              payloads=[{"type": "fix"}],
                               title="no-scope")
     await db_session.flush()
 
@@ -778,5 +785,7 @@ async def test_scope_breakdown_unknown_default(db_session: AsyncSession):
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
+    assert "small" in entry["scope_breakdown"]
+    assert entry["scope_breakdown"]["small"]["created"] == 1
     assert "unknown" in entry["scope_breakdown"]
     assert entry["scope_breakdown"]["unknown"]["created"] == 1

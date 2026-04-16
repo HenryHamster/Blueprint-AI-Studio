@@ -641,7 +641,7 @@ def _make_merged_task(project_id, title="Fix bug", direction_id="d-001", changed
         project_id=project_id,
         title=title,
         description="test",
-        payloads=[{"type": "create", "scope": scope}],
+        payloads=[{"type": "create"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
@@ -649,6 +649,7 @@ def _make_merged_task(project_id, title="Fix bug", direction_id="d-001", changed
             "pr_merged": True,
             "direction_id": direction_id,
             "_pr_changed_files": changed_files or ["backend/app/foo.py"],
+            "scope": scope,
         },
     )
 
@@ -747,11 +748,11 @@ async def test_build_shipped_manifest_unassigned_direction(db_session):
         project_id=project.id,
         title="Orphan task",
         description="test",
-        payloads=[{"type": "create", "scope": "medium"}],
+        payloads=[{"type": "create"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        context={"pr_merged": True, "_pr_changed_files": ["x.py"]},
+        context={"pr_merged": True, "_pr_changed_files": ["x.py"], "scope": "medium"},
     )
     db_session.add(task)
     await db_session.commit()

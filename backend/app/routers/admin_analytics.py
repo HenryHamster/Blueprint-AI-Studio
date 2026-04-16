@@ -33,6 +33,78 @@ router = APIRouter(
 )
 
 
+def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
+    """Compute per-scope merge rate baselines from a pre-fetched list of terminal tasks.
+
+    Groups tasks by ISO-week (Monday-keyed) and scope (from context['scope']),
+    computing merge_rate = COMPLETED / total terminal per bucket.  Also returns
+    an overall summary per scope with trend derived from first-to-last week delta.
+    """
+    bucket: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
+
+    for t in tasks:
+        scope = (t.context or {}).get("scope", "unknown")
+        task_date = t.created_at.date() if t.created_at else None
+        if task_date is None:
+            continue
+        week_monday = task_date - timedelta(days=task_date.weekday())
+        week_key = week_monday.isoformat()
+        bucket[(week_key, scope)]["created"] += 1
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            bucket[(week_key, scope)]["merged"] += 1
+
+    # Build time-series sorted by week then scope
+    series = []
+    for (week, scope), counts in sorted(bucket.items()):
+        created = counts["created"]
+        merged = counts["merged"]
+        merge_rate = round(merged / created, 3) if created > 0 else None
+        series.append({
+            "week": week,
+            "scope": scope,
+            "created": created,
+            "merged": merged,
+            "merge_rate": merge_rate,
+        })
+
+    # Build per-scope summary: overall rate + trend from first-to-last week
+    all_scopes: set = {scope for (_, scope) in bucket}
+    summary: Dict[str, Any] = {}
+    for scope in sorted(all_scopes):
+        total_created = sum(c["created"] for (_, sc), c in bucket.items() if sc == scope)
+        total_merged = sum(c["merged"] for (_, sc), c in bucket.items() if sc == scope)
+        overall_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+
+        scope_weeks = sorted((wk, c) for (wk, sc), c in bucket.items() if sc == scope)
+        scope_trend: str | None = None
+        if len(scope_weeks) >= 2:
+            first_c = scope_weeks[0][1]
+            last_c = scope_weeks[-1][1]
+            first_rate = first_c["merged"] / first_c["created"] if first_c["created"] > 0 else None
+            last_rate = last_c["merged"] / last_c["created"] if last_c["created"] > 0 else None
+            if first_rate is not None and last_rate is not None:
+                delta = last_rate - first_rate
+                if delta > 0.05:
+                    scope_trend = "improving"
+                elif delta < -0.05:
+                    scope_trend = "declining"
+                else:
+                    scope_trend = "stable"
+
+        summary[scope] = {
+            "merge_rate": overall_rate,
+            "created": total_created,
+            "merged": total_merged,
+            "trend": scope_trend,
+        }
+
+    return {
+        "series": series,
+        "summary": summary,
+        "lookback_days": lookback_days,
+    }
+
+
 def _count_research_findings(logs: str | None) -> int:
     """Parse research findings artifact logs and return finding count."""
     if not logs:
@@ -1550,6 +1622,33 @@ async def get_task_duration_stats(
             sd = sorted(durs); mid = len(sd) // 2
             stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
     return {"stats": stats}
+
+
+@router.get("/scope-baselines")
+async def get_scope_baselines(
+    project_id: uuid.UUID | None = Query(None),
+    lookback_days: int = Query(30, ge=1, le=365),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return per-scope merge rate baselines from historical terminal tasks.
+
+    Queries COMPLETED/FAILED/CANCELLED tasks over the lookback window, groups
+    them by ISO week and scope (context['scope']), and returns weekly time-series
+    plus overall summary stats per scope with trend direction.
+    """
+    cutoff = _utcnow() - timedelta(days=lookback_days)
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        Task.created_at >= cutoff,
+    ]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+
+    result = await session.execute(select(Task).where(*filters))
+    tasks = result.scalars().all()
+
+    return _compute_scope_baselines(list(tasks), lookback_days)
 
 
 ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60

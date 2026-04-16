@@ -76,7 +76,7 @@ async def _build_shipped_changes_manifest(
             "title": t.title,
             "direction_id": ctx.get("direction_id"),
             "changed_files": ctx.get("_pr_changed_files") or [],
-            "scope": t.first_payload.get("scope"),
+            "scope": ctx.get("scope"),
         }
         manifest_entries.append(entry)
         if len(manifest_entries) >= 50:

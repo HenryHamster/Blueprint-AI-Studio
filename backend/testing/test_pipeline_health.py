@@ -11,7 +11,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.routers.admin_analytics import compute_pipeline_health_summary
+from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
@@ -788,6 +788,199 @@ async def test_medium_scope_review_iterations_none_when_no_medium_tasks():
     result = await compute_pipeline_health_summary(session, project_id)
 
     assert result["medium_scope_review_iterations"] is None
+
+
+# ── _compute_scope_baselines ─────────────────────────────────────────────────
+
+def test_scope_baselines_empty_tasks_returns_empty():
+    """No tasks → empty series and summary."""
+    result = _compute_scope_baselines([], 30)
+    assert result["series"] == []
+    assert result["summary"] == {}
+    assert result["lookback_days"] == 30
+
+
+def test_scope_baselines_single_scope_bucketed_correctly():
+    """Tasks in a single week/scope produce one series entry with correct counts."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    # All tasks fall in the same calendar week
+    base = now.replace(hour=12)
+    # Create 3 terminal tasks: 2 COMPLETED+pr_merged (merged) + 1 FAILED
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small", "pr_merged": True}, created_at=base),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small", "pr_merged": True}, created_at=base),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "small"}, created_at=base,
+                  latest_status_message="error"),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert len(result["series"]) == 1
+    entry = result["series"][0]
+    assert entry["scope"] == "small"
+    assert entry["created"] == 3
+    assert entry["merged"] == 2
+    assert entry["merge_rate"] == round(2 / 3, 3)
+
+    assert "small" in result["summary"]
+    assert result["summary"]["small"]["merge_rate"] == round(2 / 3, 3)
+    assert result["summary"]["small"]["created"] == 3
+    assert result["summary"]["small"]["merged"] == 2
+
+
+def test_scope_baselines_multiple_scopes_bucketed_independently():
+    """Tasks with different scopes in the same week produce separate series entries."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small", "pr_merged": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=now,
+                  latest_status_message="error"),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    scopes_in_series = {e["scope"] for e in result["series"]}
+    assert scopes_in_series == {"small", "medium"}
+
+    assert result["summary"]["small"]["merge_rate"] == 1.0
+    assert result["summary"]["medium"]["merge_rate"] == round(1 / 2, 3)
+
+
+def test_scope_baselines_unknown_scope_for_tasks_without_scope():
+    """Tasks with no scope key in context are bucketed under 'unknown'."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={}, created_at=now,
+                  latest_status_message="error"),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert "unknown" in result["summary"]
+    assert result["summary"]["unknown"]["created"] == 2
+
+
+def test_scope_baselines_weekly_bucketing_splits_across_weeks():
+    """Tasks in different ISO weeks produce separate series entries for the same scope."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    # Place tasks in different weeks (15 days apart guarantees a different ISO week)
+    week1_task = make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                           context={"scope": "medium"}, created_at=now - timedelta(days=15))
+    week2_task = make_task(project_id=project_id, status=TaskStatus.FAILED,
+                           context={"scope": "medium"}, created_at=now - timedelta(days=1),
+                           latest_status_message="error")
+    result = _compute_scope_baselines([week1_task, week2_task], 30)
+
+    medium_series = [e for e in result["series"] if e["scope"] == "medium"]
+    assert len(medium_series) == 2, "Expected two distinct weekly buckets for medium scope"
+    assert medium_series[0]["created"] == 1
+    assert medium_series[1]["created"] == 1
+
+
+def test_scope_baselines_trend_improving_from_first_to_last_week():
+    """Trend is 'improving' when the last week's merge rate exceeds the first by > 0.05."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    # First week: 1/4 = 0.25
+    week_a = now - timedelta(days=21)
+    tasks_week_a = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=week_a),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=week_a,
+                  latest_status_message="e"),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=week_a,
+                  latest_status_message="e"),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=week_a,
+                  latest_status_message="e"),
+    ]
+    # Last week: 3/4 = 0.75 (delta +0.5 > 0.05)
+    week_b = now - timedelta(days=1)
+    tasks_week_b = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=week_b,
+                  latest_status_message="e"),
+    ]
+    result = _compute_scope_baselines(tasks_week_a + tasks_week_b, 30)
+
+    assert result["summary"]["medium"]["trend"] == "improving"
+
+
+def test_scope_baselines_trend_none_when_only_one_week():
+    """Trend is None when all tasks fall in the same week (no comparison possible)."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small"}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "small"}, created_at=now,
+                  latest_status_message="e"),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert result["summary"]["small"]["trend"] is None
+
+
+def test_scope_baselines_cancelled_counts_as_created_not_merged():
+    """CANCELLED tasks increment 'created' but not 'merged'."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "large", "pr_merged": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.CANCELLED,
+                  context={"scope": "large"}, created_at=now),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert result["summary"]["large"]["created"] == 2
+    assert result["summary"]["large"]["merged"] == 1
+    assert result["summary"]["large"]["merge_rate"] == 0.5
+
+
+def test_scope_baselines_lookback_days_preserved_in_response():
+    """lookback_days in the response matches the parameter passed in."""
+    result = _compute_scope_baselines([], 60)
+    assert result["lookback_days"] == 60
+
+
+def test_scope_baselines_week_key_is_monday():
+    """The 'week' key in each series entry corresponds to the Monday of that ISO week."""
+    from datetime import date as _date
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    # Use a known date: find the Monday of the current week
+    today = now.date()
+    monday = today - timedelta(days=today.weekday())
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small"}, created_at=now),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert len(result["series"]) == 1
+    assert result["series"][0]["week"] == monday.isoformat()
 
 
 # ── Pipeline-health rolling event monitor ────────────────────────────────────

@@ -225,7 +225,7 @@ async def _update_direction_research_outcomes(
             # Track per-scope merge rates so research agents can calibrate scope assignments
             scope_breakdown: dict = {}
             for ct in child_tasks_rows:
-                scope = (ct.first_payload or {}).get("scope", "unknown")
+                scope = (ct.context or {}).get("scope", "unknown")
                 if scope not in scope_breakdown:
                     scope_breakdown[scope] = {"created": 0, "merged": 0, "failed": 0}
                 scope_breakdown[scope]["created"] += 1
