@@ -41,6 +41,7 @@ vi.mock('../prompt.js', () => ({
   buildRetryContext: vi.fn().mockReturnValue(''),
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
+  discoverAffectedConsumers: vi.fn().mockReturnValue(''),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {

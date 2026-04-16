@@ -50,6 +50,7 @@ import {
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
   extractModuleInterfaces,
+  discoverAffectedConsumers,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -1231,5 +1232,139 @@ describe('extractModuleInterfaces', () => {
       '// just a comment\nconst x = 1; // non-exported\n'
     );
     expect(extractModuleInterfaces(null, ['agent/src/utils.ts'])).toBe('');
+  });
+});
+
+// ── discoverAffectedConsumers ─────────────────────────────────────────────────
+describe('discoverAffectedConsumers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('returns empty string when relatedFiles is empty', () => {
+    expect(discoverAffectedConsumers(null, [])).toBe('');
+  });
+
+  it('skips test files in relatedFiles', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py']);
+    expect(result).toBe('');
+  });
+
+  it('skips non-source files (.json, .md)', () => {
+    const result = discoverAffectedConsumers(null, ['package.json', 'README.md']);
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when git grep finds no consumers', () => {
+    // execFileSync throws (exit 1) when git grep finds no matches
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when consumer files do not exist on disk', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    // existsSync returns false by default — consumer file cannot be read
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('filters out test files returned by git grep', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('extracts named TypeScript imports from consumer files', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { buildContextPrefix, discoverRelatedTests, extractModuleInterfaces } from \'../prompt.js\';\n'
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('agent/src/prompt.ts');
+    expect(result).toContain('agent/src/handlers/standard.ts');
+    expect(result).toContain('buildContextPrefix');
+    expect(result).toContain('discoverRelatedTests');
+    expect(result).toContain('extractModuleInterfaces');
+  });
+
+  it('extracts Python imports from consumer files', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'backend/app/orchestrator.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'from app.services import get_task, create_task\n'
+    );
+    const result = discoverAffectedConsumers(null, ['backend/app/services.py']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('backend/app/services.py');
+    expect(result).toContain('backend/app/orchestrator.py');
+    expect(result).toContain('get_task');
+    expect(result).toContain('create_task');
+  });
+
+  it('shows consumer without imports when no import line matches', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'backend/app/main.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    // File mentions module name but no parseable import line
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      '# uses services module indirectly\nsome_var = services_helper()\n'
+    );
+    const result = discoverAffectedConsumers(null, ['backend/app/services.py']);
+    expect(result).toContain('backend/app/main.py');
+    // No imports listed — just the consumer path
+    expect(result).not.toContain('imports:');
+  });
+
+  it('includes the Affected Consumers header and description', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { buildFileTree } from \'./prompt.js\';\n'
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('Verify they remain compatible');
+  });
+
+  it('caps output at approximately 2KB', () => {
+    const manyConsumers = Array.from({ length: 20 }, (_, i) =>
+      `agent/src/consumers/module${i}.ts`
+    ).join('\n') + '\n';
+    vi.mocked(execFileSync).mockReturnValue(
+      manyConsumers as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { funcA, funcB, funcC, funcD, funcE, funcF, funcG, funcH } from \'../prompt.js\';\n'
+    );
+    const manyFiles = Array.from({ length: 10 }, (_, i) => `agent/src/module${i}.ts`);
+    const result = discoverAffectedConsumers(null, manyFiles);
+    expect(result.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('handles git grep throwing gracefully and returns empty string', () => {
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git grep failed'); });
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
   });
 });
