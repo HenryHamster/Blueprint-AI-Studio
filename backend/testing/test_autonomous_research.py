@@ -3248,3 +3248,126 @@ async def test_no_history_spawn_has_no_low_confidence_flag(db_session, mocker):
     ctx = child_tasks[0].context or {}
     # Default threshold is 0.25, neutral rate is 0.5 → no flag
     assert "low_confidence_spawn" not in ctx, "Neutral confidence (0.5) should not set low_confidence flag"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capacity-aware batch cap
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_capacity_batch_cap_queue_depth(db_session, mocker):
+    """High queue depth reduces the effective batch cap, limiting spawned tasks."""
+    direction_id = "d-capqueue1"
+    direction = _active_direction(direction_id, "Queue depth cap test")
+    project = Project(
+        name="Capacity Cap Queue Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 6 unique findings — more than the effective cap under constrained conditions
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(f"Unique task {i}", direction_id) for i in range(6)],
+    )
+    # Simulate high queue depth: cap_by_queue = max(3, 15 - 12) = 3
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    mocker.patch.object(_shared_state, "tasks_active_gauge", 0)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    # With queue_depth=12: cap_by_queue=3, 1 healthy account: cap_by_accounts=3
+    # effective_cap = min(15, 16, 3, 3) = 3 — only 3 of 6 findings spawned
+    assert len(child_tasks) == 3, f"Expected 3 tasks (capacity-capped), got {len(child_tasks)}"
+
+
+@pytest.mark.asyncio
+async def test_capacity_batch_cap_healthy_system_no_reduction(db_session, mocker):
+    """With a healthy system (many accounts, low queue), cap stays at 15."""
+    direction_id = "d-caphlth1"
+    direction = _active_direction(direction_id, "Healthy system cap test")
+    project = Project(
+        name="Capacity Cap Healthy Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 5 unique findings — below 15 so no cap expected
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(f"Healthy task {i}", direction_id) for i in range(5)],
+    )
+    # Healthy system: large pool, low queue, low active
+    healthy_accounts = [
+        {"id": f"acct-{i}", "name": f"acct-{i}", "enabled": True,
+         "oauth_token": "sk-ant-test", "active_tasks": 0}
+        for i in range(5)
+    ]
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=healthy_accounts)
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 0)
+    mocker.patch.object(_shared_state, "tasks_active_gauge", 0)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    # healthy_accounts=5: cap_by_accounts=15, queue=0: cap_by_queue=15, slots=8: cap_by_slots=16
+    # effective_cap = min(15, 16, 15, 15) = 15 → all 5 findings spawn
+    assert len(child_tasks) == 5, f"Expected all 5 tasks (no cap), got {len(child_tasks)}"
+
+
+@pytest.mark.asyncio
+async def test_capacity_batch_cap_saturated_vms_still_spawns(db_session, mocker):
+    """When all VM slots are occupied (active == max_vms), cap floors at 1, not 0."""
+    direction_id = "d-capsat01"
+    direction = _active_direction(direction_id, "VM saturation cap test")
+    project = Project(
+        name="Capacity Cap Saturation Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(f"Saturated task {i}", direction_id) for i in range(4)],
+    )
+    # All 8 VMs occupied: available_slots=0 → cap_by_slots=0; queue low; no pool
+    mocker.patch.object(_shared_state, "tasks_active_gauge", 8)
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 0)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    # cap_by_slots=0 → floored to 1; cap_by_queue=15; cap_by_accounts=15 (no pool)
+    # effective_cap = min(15, max(1,0), 15, 15) = 1 → at least 1 finding spawns
+    assert len(child_tasks) >= 1, f"Expected at least 1 task despite full VMs, got {len(child_tasks)}"

@@ -558,9 +558,45 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
 
-    # Cap findings to prevent runaway task creation
-    if len(findings) > 15:
-        findings = findings[:15]
+    # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
+    from app import shared_state as _ss  # noqa: PLC0415
+    from app import max_plan_pool as _pool_mod  # noqa: PLC0415
+    _max_vms = _runtime_config.get("max_concurrent_vms", 8)
+    _available_slots = max(0, _max_vms - _ss.tasks_active_gauge)
+    _queued_count = _ss.tasks_queued_gauge
+    _all_pool_accounts = _pool_mod._all_accounts()
+    if _all_pool_accounts:
+        _healthy_accounts = sum(
+            1 for a in _all_pool_accounts
+            if _pool_mod._account_available_for_model(a, "claude-sonnet-4-6")
+        )
+        _cap_by_accounts = _healthy_accounts * 3
+    else:
+        _healthy_accounts = -1  # sentinel: pool unconfigured, don't constrain
+        _cap_by_accounts = 15
+    _cap_by_slots = _available_slots * 2
+    _cap_by_queue = max(3, 15 - _queued_count)
+    # Floor slots and accounts at 1 so a saturated-but-recovering system (all VMs
+    # busy, or all accounts temporarily rate-limited) doesn't zero out the cap and
+    # permanently discard this research cycle's findings.  Queue depth already has
+    # its own max(3, …) floor; consistent treatment here prevents _effective_cap=0.
+    _effective_cap = min(15, max(1, _cap_by_slots), max(1, _cap_by_accounts), _cap_by_queue)
+    _cap_factors = {
+        "max_findings": 15,
+        "vm_slots": _cap_by_slots,
+        "healthy_accounts": _cap_by_accounts,
+        "queue_depth": _cap_by_queue,
+    }
+    _limiting_factor = min(_cap_factors, key=lambda k: _cap_factors[k])
+    logger.info(
+        "[RESEARCH] Batch cap: %d (limited_by=%s, available_slots=%d, healthy_accounts=%s, queue_depth=%d)",
+        _effective_cap, _limiting_factor, _available_slots,
+        _healthy_accounts if _healthy_accounts >= 0 else "n/a",
+        _queued_count,
+    )
+    # Cap findings to prevent runaway task creation and backlog build-up
+    if len(findings) > _effective_cap:
+        findings = findings[:_effective_cap]
 
     original_base = (task.first_payload).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
