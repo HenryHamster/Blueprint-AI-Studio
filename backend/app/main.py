@@ -356,7 +356,22 @@ async def _init_deployment_state():
                             elif k == "recent_outcomes" and isinstance(v, list):
                                 from collections import deque as _deque
                                 from app.compute import ZONE_HISTORY_WINDOW
-                                restored[k] = _deque(v[-ZONE_HISTORY_WINDOW:], maxlen=ZONE_HISTORY_WINDOW)
+                                valid = [e for e in v if isinstance(e, bool)]
+                                if len(valid) < len(v):
+                                    logger.warning(f"[DEPLOY] Filtered {len(v) - len(valid)} non-boolean element(s) from recent_outcomes for zone {zone}")
+                                restored[k] = _deque(valid[-ZONE_HISTORY_WINDOW:], maxlen=ZONE_HISTORY_WINDOW)
+                            elif k == "consecutive_failures":
+                                if isinstance(v, int):
+                                    restored[k] = v
+                                else:
+                                    logger.warning(f"[DEPLOY] consecutive_failures for zone {zone} is not an int ({v!r}), defaulting to 0")
+                                    restored[k] = 0
+                            elif k == "last_failure_reason":
+                                if v is None or isinstance(v, str):
+                                    restored[k] = v
+                                else:
+                                    logger.warning(f"[DEPLOY] last_failure_reason for zone {zone} is not a string ({v!r}), defaulting to None")
+                                    restored[k] = None
                             else:
                                 restored[k] = v
                         _zone_health[zone] = restored

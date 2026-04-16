@@ -1449,3 +1449,47 @@ class TestNotificationConfigStartupRestore:
             async with _engine.begin() as conn:
                 await conn.run_sync(SQLModel.metadata.drop_all)
             await _engine.dispose()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_settings.py — repair-state stuck task persists failure_category
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRepairStateFailureCategory:
+    """Ensure that the /repair-state stuck-task path sets failure_category=AGENT_TIMEOUT
+    on repaired tasks so downstream analytics can bucket them correctly."""
+
+    @pytest.mark.asyncio
+    async def test_repair_state_stuck_task_persists_agent_timeout_category(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A task stuck in IN_PROGRESS with no heartbeat for 15+ min must be marked
+        FAILED with failure_category=AGENT_TIMEOUT in its context."""
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock
+        mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+
+        project = Project(name="Repair Test", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Task stuck in IN_PROGRESS with a heartbeat 20 minutes ago
+        stale_heartbeat = datetime.utcnow() - timedelta(minutes=20)
+        stuck_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "test"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="stuck-vm-001",
+            last_heartbeat=stale_heartbeat,
+        )
+        db_session.add(stuck_task)
+        await db_session.commit()
+        await db_session.refresh(stuck_task)
+
+        resp = await client.post("/api/admin/repair-state")
+        assert resp.status_code == 200
+
+        await db_session.refresh(stuck_task)
+        assert stuck_task.status == TaskStatus.FAILED
+        assert (stuck_task.context or {}).get("failure_category") == "AGENT_TIMEOUT"

@@ -1070,6 +1070,8 @@ async def repair_state(
             original_status = t.status  # Capture before overwriting
             t.status = TaskStatus.FAILED
             t.latest_status_message = f"Repaired: stuck in {original_status} with no heartbeat since {cutoff.isoformat()}"
+            from app.failure_classification import persist_failure_category  # noqa: PLC0415
+            persist_failure_category(t, "AGENT_TIMEOUT")
             session.add(t)
             session.add(TaskHistory(task_id=t.id, action="REPAIR", details={"reason": "stuck_no_heartbeat", "original_status": str(original_status)}))
             repairs.append(f"Failed stuck task {t.id}")
@@ -1576,11 +1578,54 @@ async def get_auto_remediation_config(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return the current auto-remediation config for a project, merged with defaults."""
+    """Return the current auto-remediation config and activity stats for a project."""
     project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
     stored = (project.design_doc or {}).get("_auto_remediation", {})
     config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
-    return {"project_id": str(project_id), "config": config}
+
+    # Compute activity stats from tasks spawned by auto-remediation
+    now = _utcnow()
+    seven_days_ago = now - timedelta(days=7)
+    twenty_four_hours_ago = now - timedelta(hours=24)
+
+    recent_rows = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_at >= seven_days_ago,
+        ).order_by(Task.created_at.desc())
+    )).scalars().all()
+
+    auto_tasks = [t for t in recent_rows if (t.context or {}).get("auto_remediation") is True]
+    spawned_24h = sum(1 for t in auto_tasks if t.created_at and t.created_at >= twenty_four_hours_ago)
+    spawned_7d = len(auto_tasks)
+
+    terminal = [t for t in auto_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)]
+    success_rate = (
+        round(sum(1 for t in terminal if t.status == TaskStatus.COMPLETED) / len(terminal) * 100)
+        if terminal else None
+    )
+
+    recent_tasks_data = [
+        {
+            "id": str(t.id),
+            "title": t.title or "",
+            "status": t.status,
+            "branch": (t.context or {}).get("ci_failure_branch", ""),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
+        for t in auto_tasks[:5]
+    ]
+
+    return {
+        "project_id": str(project_id),
+        "config": config,
+        "stats": {
+            "spawned_24h": spawned_24h,
+            "spawned_7d": spawned_7d,
+            "success_rate": success_rate,
+            "recent_tasks": recent_tasks_data,
+        },
+    }
 
 
 @router.patch("/projects/{project_id}/auto-remediation")

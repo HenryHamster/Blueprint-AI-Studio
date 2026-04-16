@@ -5,7 +5,7 @@ import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { DeployState } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig, AutoRemediationConfig, IssueImplementationConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -114,6 +114,7 @@ export interface HeaderBarProps {
   onDetectBuildConfig: () => Promise<void>;
   // Auto-remediation config (project-scoped)
   autoRemediationConfig: AutoRemediationConfig | null;
+  autoRemediationStats: AutoRemediationStats | null;
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
@@ -387,6 +388,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateBuildConfig={props.onUpdateBuildConfig}
           onDetectBuildConfig={props.onDetectBuildConfig}
           autoRemediationConfig={props.autoRemediationConfig}
+          autoRemediationStats={props.autoRemediationStats}
           onUpdateAutoRemediationConfig={props.onUpdateAutoRemediationConfig}
           issueImplementationConfig={props.issueImplementationConfig}
           onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}

@@ -732,3 +732,102 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     assert task.context.get("pr_closed_unmerged") is True
     assert "55" in task.latest_status_message
     mock_alert.assert_called_once()
+
+
+# ── Tests for persist_failure_category at rollup parent-failure paths ─────────
+
+@pytest.mark.asyncio
+async def test_all_children_failed_parent_persists_failure_category(cleanup_db, mocker):
+    """When all children fail and the rollup parent marks itself FAILED,
+    failure_category must be set on parent.context (path 5 — all-children-failed).
+
+    Children's categories are aggregated via worst_child_failure_category:
+    CODE_ERROR > AGENT_TIMEOUT > infra classes.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    # Prevent GitHub token fetch (not needed for this path)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+
+    # Parent task with research plan_output so it's treated as a rollup parent
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_requeue_count": 3,  # exhaust retry limit
+            "plan_branch": "blueprint/plan-xyz",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+
+    # Two FAILED children — one CODE_ERROR, one AGENT_TIMEOUT
+    child1 = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "AGENT_TIMEOUT"},
+    )
+    child2 = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    # CODE_ERROR should win over AGENT_TIMEOUT
+    assert parent.context.get("failure_category") == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
+    """When all failed children have infra categories, the parent keeps that category."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_requeue_count": 3,
+            "plan_branch": "blueprint/plan-abc",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "PROVISION_FAILURE"

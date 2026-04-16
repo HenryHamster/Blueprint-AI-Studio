@@ -398,6 +398,7 @@ export default function App() {
         onUpdateBuildConfig={s.handleUpdateBuildConfig}
         onDetectBuildConfig={s.handleDetectBuildConfig}
         autoRemediationConfig={s.autoRemediationConfig}
+        autoRemediationStats={s.autoRemediationStats}
         onUpdateAutoRemediationConfig={s.handleUpdateAutoRemediationConfig}
         issueImplementationConfig={s.issueImplementationConfig}
         onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}

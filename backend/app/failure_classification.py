@@ -61,6 +61,34 @@ _PROVISION_PHRASE_RE = re.compile(
 )
 
 
+_SEVERITY: dict[str, int] = {
+    CODE_ERROR: 3,
+    AGENT_TIMEOUT: 2,
+    PROVISION_FAILURE: 1,
+    EXTERNAL_API: 1,
+    RATE_LIMIT: 1,
+}
+
+
+def worst_child_failure_category(children: list["Task"]) -> str:
+    """Return the most severe failure category among a list of failed child tasks.
+
+    Severity ranking: CODE_ERROR (3) > AGENT_TIMEOUT (2) > infra classes (1).
+    Unclassified children and unknown categories are treated as CODE_ERROR.
+    Falls back to CODE_ERROR if the list is empty.
+    """
+    best_rank = 0
+    best_cat = CODE_ERROR
+    for child in children:
+        raw_cat = (child.context or {}).get("failure_category") or CODE_ERROR
+        cat = raw_cat if raw_cat in _SEVERITY else CODE_ERROR
+        rank = _SEVERITY[cat]
+        if rank > best_rank:
+            best_rank = rank
+            best_cat = cat
+    return best_cat
+
+
 def persist_failure_category(task: "Task", failure_class: str) -> None:
     """Write ``failure_class`` onto ``task.context['failure_category']`` in place.
 

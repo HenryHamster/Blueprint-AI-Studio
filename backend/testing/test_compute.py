@@ -304,7 +304,12 @@ class TestZoneHealthRestoreDeque:
                     except ValueError:
                         continue
                 elif k == "recent_outcomes" and isinstance(v, list):
-                    restored[k] = _deque(v[-compute.ZONE_HISTORY_WINDOW:], maxlen=compute.ZONE_HISTORY_WINDOW)
+                    valid = [e for e in v if isinstance(e, bool)]
+                    restored[k] = _deque(valid[-compute.ZONE_HISTORY_WINDOW:], maxlen=compute.ZONE_HISTORY_WINDOW)
+                elif k == "consecutive_failures":
+                    restored[k] = v if isinstance(v, int) else 0
+                elif k == "last_failure_reason":
+                    restored[k] = v if (v is None or isinstance(v, str)) else None
                 else:
                     restored[k] = v
             compute._zone_health[zone] = restored
@@ -348,3 +353,40 @@ class TestZoneHealthRestoreDeque:
         self._restore_zone_health({zone: {"consecutive_failures": 2}})
         assert "recent_outcomes" not in compute._zone_health[zone]
         assert compute._zone_health[zone]["consecutive_failures"] == 2
+
+    def test_recent_outcomes_corrupted_elements_filtered(self):
+        """Non-boolean elements in recent_outcomes are dropped; valid booleans kept."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"recent_outcomes": [True, "bad", None, False, 1]}})
+        outcomes = compute._zone_health[zone]["recent_outcomes"]
+        assert isinstance(outcomes, deque)
+        # Only the two actual booleans should survive
+        assert list(outcomes) == [True, False]
+
+    def test_recent_outcomes_fully_corrupt_yields_empty_deque(self):
+        """Entirely non-boolean recent_outcomes list yields an empty deque (neutral rate)."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"recent_outcomes": ["bad", None, 0, 1]}})
+        outcomes = compute._zone_health[zone]["recent_outcomes"]
+        assert isinstance(outcomes, deque)
+        assert len(outcomes) == 0
+        # _zone_success_rate should return the neutral rate for empty deque
+        assert compute._zone_success_rate(zone) == compute._ZONE_NEUTRAL_RATE
+
+    def test_consecutive_failures_corrupted_defaults_to_zero(self):
+        """Non-integer consecutive_failures falls back to 0."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"consecutive_failures": "bad"}})
+        assert compute._zone_health[zone]["consecutive_failures"] == 0
+
+    def test_last_failure_reason_corrupted_defaults_to_none(self):
+        """Non-string last_failure_reason falls back to None."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"last_failure_reason": 42}})
+        assert compute._zone_health[zone]["last_failure_reason"] is None
+
+    def test_last_failure_reason_none_is_valid(self):
+        """None is a valid value for last_failure_reason and is preserved."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"last_failure_reason": None}})
+        assert compute._zone_health[zone]["last_failure_reason"] is None

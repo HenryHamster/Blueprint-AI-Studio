@@ -5,7 +5,7 @@ import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
-import type { BuildConfig, AutoRemediationConfig, IssueImplementationConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
@@ -102,6 +102,7 @@ interface SettingsDropdownProps {
   onDetectBuildConfig: () => Promise<void>;
   // Auto-remediation config (project-scoped)
   autoRemediationConfig: AutoRemediationConfig | null;
+  autoRemediationStats: AutoRemediationStats | null;
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
@@ -233,6 +234,7 @@ export function SettingsDropdown({
   onUpdateBuildConfig,
   onDetectBuildConfig,
   autoRemediationConfig,
+  autoRemediationStats,
   onUpdateAutoRemediationConfig,
   issueImplementationConfig,
   onUpdateIssueImplementationConfig,
@@ -959,6 +961,7 @@ export function SettingsDropdown({
         githubOwner={selectedProjectOwner}
         githubRepo={selectedProjectRepo}
         config={autoRemediationConfig}
+        stats={autoRemediationStats}
         onSave={onUpdateAutoRemediationConfig}
       />
     );

@@ -19,6 +19,7 @@ from app.failure_classification import (
     INFRA_CLASSES,
     classify_failure,
     normalize_agent_failure_category,
+    worst_child_failure_category,
 )
 from app.max_plan_pool import RATE_LIMIT_PATTERNS
 from app.models import Task
@@ -212,3 +213,78 @@ def test_cascade_parent_evaluation_timeout_is_agent_timeout():
 def test_cancelled_prefix_broad_match():
     """Any message starting with 'cancelled:' is treated as AGENT_TIMEOUT."""
     assert classify_failure(_task("Cancelled: some new orchestrator reason")) == "AGENT_TIMEOUT"
+
+
+# ── worst_child_failure_category ───────────────────────────────────────────────
+
+def _child(failure_category=None):
+    """Make a minimal Task-like mock with optional failure_category in context."""
+    t = MagicMock(spec=Task)
+    t.context = {"failure_category": failure_category} if failure_category else {}
+    return t
+
+
+def test_worst_child_failure_category_empty_list_returns_code_error():
+    """Empty child list falls back to CODE_ERROR (safest default)."""
+    assert worst_child_failure_category([]) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_single_code_error():
+    assert worst_child_failure_category([_child("CODE_ERROR")]) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_single_agent_timeout():
+    assert worst_child_failure_category([_child("AGENT_TIMEOUT")]) == "AGENT_TIMEOUT"
+
+
+def test_worst_child_failure_category_single_provision_failure():
+    assert worst_child_failure_category([_child("PROVISION_FAILURE")]) == "PROVISION_FAILURE"
+
+
+def test_worst_child_failure_category_code_error_wins_over_agent_timeout():
+    """CODE_ERROR severity (3) > AGENT_TIMEOUT (2) — CODE_ERROR must win."""
+    children = [_child("AGENT_TIMEOUT"), _child("CODE_ERROR")]
+    assert worst_child_failure_category(children) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_agent_timeout_wins_over_provision_failure():
+    """AGENT_TIMEOUT severity (2) > PROVISION_FAILURE (1) — AGENT_TIMEOUT must win."""
+    children = [_child("PROVISION_FAILURE"), _child("AGENT_TIMEOUT")]
+    assert worst_child_failure_category(children) == "AGENT_TIMEOUT"
+
+
+def test_worst_child_failure_category_agent_timeout_wins_over_external_api():
+    """AGENT_TIMEOUT severity (2) > EXTERNAL_API (1) — AGENT_TIMEOUT must win."""
+    children = [_child("EXTERNAL_API"), _child("AGENT_TIMEOUT")]
+    assert worst_child_failure_category(children) == "AGENT_TIMEOUT"
+
+
+def test_worst_child_failure_category_code_error_wins_over_all_infra():
+    """CODE_ERROR beats all infra classes."""
+    children = [
+        _child("PROVISION_FAILURE"),
+        _child("RATE_LIMIT"),
+        _child("EXTERNAL_API"),
+        _child("AGENT_TIMEOUT"),
+        _child("CODE_ERROR"),
+    ]
+    assert worst_child_failure_category(children) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_unclassified_child_treated_as_code_error():
+    """A child with no failure_category is treated as CODE_ERROR — worst case."""
+    children = [_child("AGENT_TIMEOUT"), _child(None)]  # None → treated as CODE_ERROR
+    assert worst_child_failure_category(children) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_unknown_category_treated_as_code_error():
+    """An unrecognised category string is treated as CODE_ERROR to be safe."""
+    children = [_child("AGENT_TIMEOUT"), _child("SOME_FUTURE_CATEGORY")]
+    assert worst_child_failure_category(children) == "CODE_ERROR"
+
+
+def test_worst_child_failure_category_all_infra_returns_infra():
+    """When all children are infra failures, any infra class may be returned."""
+    children = [_child("PROVISION_FAILURE"), _child("RATE_LIMIT")]
+    result = worst_child_failure_category(children)
+    assert result in ("PROVISION_FAILURE", "RATE_LIMIT")

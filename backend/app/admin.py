@@ -531,6 +531,8 @@ async def bulk_action_tasks(
                                     task.requires_approval = True
                                     task.status = TaskStatus.FAILED
                                     task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
+                                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                                    persist_failure_category(task, "AGENT_TIMEOUT")
                                     session.add(task)
                                     await session.commit()
                                     results.append({"task_id": raw_id, "status": "error", "error": "Iteration cap reached"})
@@ -1189,6 +1191,8 @@ async def modify_task(
                             task.requires_approval = True
                             task.status = TaskStatus.FAILED
                             task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
+                            from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                            persist_failure_category(task, "AGENT_TIMEOUT")
                             session.add(task)
                             await session.commit()
                             raise HTTPException(
@@ -1380,6 +1384,8 @@ async def trigger_rollup(
         else:
             task.status = TaskStatus.FAILED
             task.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
+            from app.failure_classification import persist_failure_category  # noqa: PLC0415
+            persist_failure_category(task, "AGENT_TIMEOUT")
 
     session.add(task)
     await session.commit()

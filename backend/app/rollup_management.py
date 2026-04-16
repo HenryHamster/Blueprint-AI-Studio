@@ -402,6 +402,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             # Nothing succeeded — fail the parent immediately
             parent.status = TaskStatus.FAILED
             parent.latest_status_message = f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
+            from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+            persist_failure_category(parent, worst_child_failure_category(failed))
             session.add(parent)
             await _maybe_create_failure_alert(parent, session, f"{len(failed)} subtasks failed, none succeeded")
             await session.commit()
@@ -901,6 +903,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         parent.status = TaskStatus.FAILED
         failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
         parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
+        from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+        _failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+        persist_failure_category(parent, worst_child_failure_category(_failed_children))
         session.add(parent)
         await session.commit()
         await broadcast_to_project(str(parent.project_id), "task_updated",

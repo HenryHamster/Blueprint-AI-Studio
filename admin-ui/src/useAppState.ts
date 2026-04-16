@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig, IssueImplementationConfig } from './types/project';
+import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -882,15 +882,20 @@ export function useAppState() {
 
   // ── Auto-remediation config (project-scoped) ────────────────────────────
   const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
+  const [autoRemediationStats, setAutoRemediationStats] = useState<AutoRemediationStats | null>(null);
 
   useEffect(() => {
     if (!selectedProjectId) {
       setAutoRemediationConfig(null);
+      setAutoRemediationStats(null);
       return;
     }
     authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-remediation`)
       .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data?.config) setAutoRemediationConfig(data.config); })
+      .then(data => {
+        if (data?.config) setAutoRemediationConfig(data.config);
+        if (data?.stats) setAutoRemediationStats(data.stats);
+      })
       .catch(() => {});
   }, [selectedProjectId]);
 
@@ -1007,7 +1012,7 @@ export function useAppState() {
     healthCheckUrls, updateHealthCheckUrls,
     notificationConfig, updateNotificationConfig,
     buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
-    autoRemediationConfig, handleUpdateAutoRemediationConfig,
+    autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,

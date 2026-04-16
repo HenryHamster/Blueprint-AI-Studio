@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import type { AutoRemediationConfig } from '../types/project';
+import type { AutoRemediationConfig, AutoRemediationStats } from '../types/project';
 
 interface ProjectAutoRemediationSectionProps {
   githubOwner: string | null;
   githubRepo: string | null;
   config: AutoRemediationConfig | null;
+  stats: AutoRemediationStats | null;
   onSave: (config: AutoRemediationConfig) => Promise<void>;
 }
 
@@ -17,10 +18,21 @@ const DEFAULT_CONFIG: AutoRemediationConfig = {
   require_review: true,
 };
 
+const STATUS_BADGE: Record<string, string> = {
+  COMPLETED: 'bg-emerald-900/50 text-emerald-400',
+  FAILED: 'bg-red-900/50 text-red-400',
+  IN_PROGRESS: 'bg-blue-900/50 text-blue-400',
+  EVALUATING: 'bg-blue-900/50 text-blue-400',
+  QUEUED: 'bg-yellow-900/50 text-yellow-400',
+  PROVISIONING: 'bg-yellow-900/50 text-yellow-400',
+  CANCELLED: 'bg-neutral-800 text-neutral-500',
+};
+
 export function ProjectAutoRemediationSection({
   githubOwner,
   githubRepo,
   config,
+  stats,
   onSave,
 }: ProjectAutoRemediationSectionProps) {
   const effective = config ?? DEFAULT_CONFIG;
@@ -184,6 +196,44 @@ export function ProjectAutoRemediationSection({
           </button>
         </div>
       </div>
+
+      {/* Activity stats */}
+      {stats && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Activity</h3>
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
+              <div className="text-lg font-semibold text-neutral-100">{stats.spawned_24h}</div>
+              <div className="text-[10px] text-neutral-500">spawned 24h</div>
+            </div>
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
+              <div className="text-lg font-semibold text-neutral-100">{stats.spawned_7d}</div>
+              <div className="text-[10px] text-neutral-500">spawned 7d</div>
+            </div>
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-center">
+              <div className="text-lg font-semibold text-neutral-100">
+                {stats.success_rate !== null ? `${stats.success_rate}%` : '—'}
+              </div>
+              <div className="text-[10px] text-neutral-500">success rate</div>
+            </div>
+          </div>
+          {stats.recent_tasks.length > 0 && (
+            <div className="space-y-1">
+              {stats.recent_tasks.map(t => (
+                <div key={t.id} className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 rounded px-3 py-1.5">
+                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[t.status] ?? 'bg-neutral-800 text-neutral-400'}`}>
+                    {t.status}
+                  </span>
+                  <span className="text-xs font-mono text-neutral-400 truncate flex-1">{t.branch || t.title}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {stats.spawned_7d === 0 && (
+            <p className="text-[11px] text-neutral-600">No auto-remediation tasks in the last 7 days.</p>
+          )}
+        </div>
+      )}
 
       {/* Save button */}
       <div className="flex justify-end pt-2">

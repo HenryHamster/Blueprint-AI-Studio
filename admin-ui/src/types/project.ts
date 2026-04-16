@@ -58,6 +58,21 @@ export interface AutoRemediationConfig {
   require_review: boolean;
 }
 
+export interface AutoRemediationRecentTask {
+  id: string;
+  title: string;
+  status: string;
+  branch: string;
+  created_at: string | null;
+}
+
+export interface AutoRemediationStats {
+  spawned_24h: number;
+  spawned_7d: number;
+  success_rate: number | null;
+  recent_tasks: AutoRemediationRecentTask[];
+}
+
 export interface IssueImplementationConfig {
   enabled: boolean;
   trigger_label: string;
