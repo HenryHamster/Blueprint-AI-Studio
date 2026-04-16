@@ -573,6 +573,108 @@ async def test_extract_review_feedback_updates_module_profiles(db_session: Async
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for _extract_failure_signature module-aware signatures
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_failure_signature_includes_module_from_traceback():
+    """Python exception with a File traceback frame includes the module name in the signature."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/auth.py", line 42, in <module>\n'
+        "ImportError: cannot import name 'oauth_client'\n"
+    )
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    # Format: "importerror: auth: cannot import name 'oauth_client'"
+    assert sig.startswith("importerror: auth:")
+    assert "oauth_client" in sig
+
+
+def test_extract_failure_signature_no_traceback_no_module():
+    """Python exception without a File frame does not inject a module prefix."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = "ImportError: cannot import name 'foo'"
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    assert "importerror" in sig
+    # No module injected — "auth:" or similar should not appear
+    assert ": auth:" not in sig
+    assert sig.startswith("importerror:")
+
+
+def test_extract_failure_signature_innermost_frame_wins():
+    """When multiple File frames exist, the innermost (last) provides the module name."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/main.py", line 10, in startup\n'
+        '  File "backend/app/compute.py", line 55, in init\n'
+        "AttributeError: 'NoneType' object has no attribute 'zone'\n"
+    )
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    assert "compute" in sig       # innermost frame
+    assert "main" not in sig      # outer frame should not appear
+
+
+def test_extract_failure_module_returns_none_when_no_frame():
+    """_extract_failure_module returns None for text without a File "..." line."""
+    from app.playbook_learning import _extract_failure_module
+
+    assert _extract_failure_module("some error without a traceback") is None
+    assert _extract_failure_module("") is None
+
+
+def test_extract_failure_module_strips_path_and_extension():
+    """_extract_failure_module extracts just the base module name."""
+    from app.playbook_learning import _extract_failure_module
+
+    text = 'file "backend/app/github.py", line 7, in handler'
+    assert _extract_failure_module(text) == "github"
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_stores_failure_module_and_references_in_content(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook stores _failure_module on task context and names the module
+    explicitly in the auto-generated playbook entry content."""
+    from app.playbook_learning import _maybe_auto_playbook, _extract_failure_signature
+
+    project = await _make_project(db_session)
+    error_with_traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/auth.py", line 10, in <module>\n'
+        "ImportError: cannot import name 'oauth_client'\n"
+    )
+
+    # Pre-seed t1 and t2 with the matching signature so the count reaches 3
+    sig = _extract_failure_signature("CODE_ERROR", error_with_traceback)
+    t1 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t1.context = {"_failure_signature": sig}
+    t2 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t2.context = {"_failure_signature": sig}
+    await db_session.flush()
+
+    t3 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    await _maybe_auto_playbook(t3, "CODE_ERROR", error_with_traceback, db_session)
+    await db_session.flush()
+
+    # Module stored on task context
+    assert t3.context.get("_failure_module") == "auth"
+
+    # Playbook entry references the module explicitly
+    doc = project.design_doc or {}
+    playbook_keys = [k for k in doc if k.startswith("playbook/")]
+    assert len(playbook_keys) == 1
+    entry = doc[playbook_keys[0]]
+    assert "auth" in entry["content"]
+    assert "module" in entry["content"].lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for _accumulate_direction_first_attempt
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -72,6 +72,20 @@ logger = logging.getLogger(__name__)
 # Signature extraction
 # ---------------------------------------------------------------------------
 
+def _extract_failure_module(error_lower: str) -> Optional[str]:
+    """Return the base module name from the innermost traceback frame, if present.
+
+    For example, given a traceback containing ``File "backend/app/auth.py"``,
+    returns ``"auth"``.  Returns ``None`` when no ``File "..."`` pattern is found.
+    """
+    frame_matches = re.findall(r'file "([^"]+\.py)"', error_lower)
+    if not frame_matches:
+        return None
+    innermost = frame_matches[-1]
+    base = re.sub(r'.*/', '', innermost)       # strip directory prefix
+    return re.sub(r'\.py$', '', base) or None  # strip .py extension
+
+
 def _extract_failure_signature(
     failure_class: str,
     error_summary: str,
@@ -83,6 +97,11 @@ def _extract_failure_signature(
     The goal is reproducibility: the same root cause should produce the same
     signature across different tasks so the counter in ``_maybe_auto_playbook``
     accumulates correctly.
+
+    For Python exceptions with a traceback, the module name from the innermost
+    frame is embedded in the signature to distinguish per-module failures:
+    e.g. ``"importerror: auth: cannot import name foo"`` rather than
+    ``"importerror: cannot import name foo"``.
     """
     error_lower = (error_summary or "").lower()
 
@@ -91,6 +110,9 @@ def _extract_failure_signature(
         return f"timeout-{task_type or 'unknown'}-{scope or 'medium'}"
 
     if failure_class == "CODE_ERROR":
+        # Extract module from innermost traceback frame for module-aware signatures
+        module_name = _extract_failure_module(error_lower)
+
         # Well-known Python exception names give stable signatures
         python_exc = re.search(
             r'(modulenotfounderror|importerror|typeerror|attributeerror|'
@@ -103,7 +125,15 @@ def _extract_failure_signature(
             # Drop file-path tokens (contain /) and line-number suffixes
             raw = re.sub(r'\S*/\S+', '', raw)
             raw = re.sub(r':\d+', ':', raw)
-            return re.sub(r'\s+', ' ', raw).strip()[:80]
+            clean = re.sub(r'\s+', ' ', raw).strip()
+            if module_name:
+                # Inject module context: "importerror: auth: cannot import name foo"
+                colon_idx = clean.find(':')
+                if colon_idx >= 0:
+                    exc_type = clean[:colon_idx].strip()
+                    rest = clean[colon_idx + 1:].strip()
+                    clean = f"{exc_type}: {module_name}: {rest}"
+            return clean[:80]
 
         # Test-runner failure lines: "FAILED backend/testing/test_foo.py"
         fail_match = re.search(r'fail(?:ed)?[\s:]+[\w/_.-]+\.py', error_lower)
@@ -191,9 +221,16 @@ async def _maybe_auto_playbook(
     signature = _extract_failure_signature(
         failure_class, error_summary, task_type, task_scope
     )
+    # Store module context for cross-referencing with module_feedback_profiles
+    module_name = (
+        _extract_failure_module((error_summary or "").lower())
+        if failure_class == "CODE_ERROR" else None
+    )
 
     ctx = dict(task.context or {})
     ctx["_failure_signature"] = signature
+    if module_name:
+        ctx["_failure_module"] = module_name
     task.context = ctx
     flag_modified(task, "context")
     session.add(task)
@@ -242,10 +279,12 @@ async def _maybe_auto_playbook(
     # ── 4. Create auto-generated playbook entry ─────────────────────────────
     recent_ids = [str(t.id) for t in matching[-2:]] + [str(task.id)]
     hint = _hint_for_failure_class(failure_class)
+    module_note = f" Repeated failures in module '{module_name}'." if module_name else ""
     content = (
         f"Repeated failure pattern ({total_count}x in {window_days}d): {signature}. "
         f"Recent tasks: {', '.join(recent_ids)}. "
         f"Common fix: {hint}"
+        f"{module_note}"
     )
 
     doc[playbook_full_key] = {
