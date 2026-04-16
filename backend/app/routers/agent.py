@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -645,15 +645,39 @@ async def claim_task(
                         "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
                         short_key, referenced,
                     )
+                # Age penalty: deprioritise entries older than 30 days with < 3 confirmations
+                age_penalty = 0
+                updated_at_str = v.get("updated_at", "")
+                if updated_at_str and confirmed < 3:
+                    try:
+                        updated_dt = datetime.fromisoformat(
+                            updated_at_str.replace("Z", "+00:00")
+                        )
+                        # _utcnow() returns naive UTC; strip tzinfo so comparison is always naive
+                        if updated_dt.tzinfo is not None:
+                            updated_dt = updated_dt.replace(tzinfo=None)
+                        if (_utcnow() - updated_dt).days > 30:
+                            age_penalty = 1
+                    except (ValueError, TypeError):
+                        pass
+                # Stale file-reference penalty
+                stale_penalty = 1 if v.get("stale_file_refs") else 0
+                if age_penalty or stale_penalty:
+                    logger.debug(
+                        "Playbook entry '%s' penalty: age=%d stale=%d",
+                        short_key, age_penalty, stale_penalty,
+                    )
                 _playbook_candidates.append((
                     ineffective,
+                    stale_penalty,
+                    age_penalty,
                     -confirmed,
                     -referenced,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, _, _, short_key, content in _playbook_candidates:
+        for _, _, _, _, _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
@@ -661,7 +685,7 @@ async def claim_task(
         response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
             response["playbook"] = playbook_entries
-            # Track reference counts — fire-and-forget, must not fail claim response
+            # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response
             try:
                 now_iso = _utcnow().isoformat()
                 doc = dict(project_for_playbook.design_doc)
@@ -672,6 +696,14 @@ async def claim_task(
                         entry["reference_count"] = entry.get("reference_count", 0) + 1
                         entry["last_referenced_at"] = now_iso
                         doc[full_key] = entry
+                # Check file-path references against the repo root (config-driven; skipped when unset)
+                try:
+                    from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415
+                    repo_root: str = _shared_state.runtime_config.get("playbook_repo_root", "") or ""
+                    if repo_root:
+                        doc = check_and_flag_stale_refs(doc, repo_root)
+                except Exception:
+                    logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)

@@ -9,8 +9,11 @@ Threshold and window are configurable via runtime_config:
   auto_playbook_threshold  (default 3)
   auto_playbook_window_days (default 7)
 """
+import json
 import logging
+import os
 import re
+from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Optional
 
@@ -19,6 +22,26 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Task, Project, TaskStatus, _utcnow
+
+# ---------------------------------------------------------------------------
+# Lifecycle constants
+# ---------------------------------------------------------------------------
+
+# Total playbook size (JSON-serialised) above which the least-useful entry is
+# archived before a new one is added.  Leaves ~5 KB headroom below the 30 KB
+# total limit.
+_PLAYBOOK_CAPACITY_BYTES = 25 * 1024
+
+# Entries older than this (in days) with fewer than _STALE_CONFIRM_THRESHOLD
+# confirmed uses are deprioritised during the claim sort.
+_STALE_AGE_DAYS = 30
+_STALE_CONFIRM_THRESHOLD = 3
+
+# Regex patterns that match source-file paths embedded in playbook entry content.
+# Used to detect references to files that may have been renamed or removed.
+_FILE_PATH_RE = re.compile(
+    r'\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b'
+)
 
 # ---------------------------------------------------------------------------
 # Review feedback category keywords
@@ -65,6 +88,146 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle helpers
+# ---------------------------------------------------------------------------
+
+def _extract_file_paths(content: str) -> list[str]:
+    """Return unique source-file paths found in *content*.
+
+    Matches paths of the form ``backend/app/...``, ``agent/src/...``,
+    ``admin-ui/src/...``, etc.
+    """
+    return list(dict.fromkeys(_FILE_PATH_RE.findall(content)))
+
+
+def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
+    """Scan each playbook entry in *doc* for file-path references and set
+    ``stale_file_refs: True`` on entries that reference files which no longer
+    exist under *repo_root*.
+
+    Only marks an entry stale when at least one referenced path is confirmed
+    missing.  Entries with no file-path references are left untouched.
+    The check is conservative: if *repo_root* is not a valid directory the
+    function returns *doc* unchanged.
+
+    Returns the (possibly mutated) doc dict.
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return doc
+
+    updated = False
+    for k, v in doc.items():
+        if not k.startswith("playbook/") or not isinstance(v, dict):
+            continue
+        content = v.get("content", "")
+        paths = _extract_file_paths(content)
+        if not paths:
+            continue
+        any_missing = any(
+            not os.path.isfile(os.path.join(repo_root, p)) for p in paths
+        )
+        if any_missing and not v.get("stale_file_refs"):
+            entry = dict(v)
+            entry["stale_file_refs"] = True
+            doc[k] = entry
+            updated = True
+            logger.debug(
+                "[PLAYBOOK] Flagged '%s' as stale_file_refs (missing paths: %s)",
+                k, [p for p in paths if not os.path.isfile(os.path.join(repo_root, p))],
+            )
+        elif not any_missing and v.get("stale_file_refs"):
+            # All referenced files now exist — clear the flag
+            entry = dict(v)
+            entry["stale_file_refs"] = False
+            doc[k] = entry
+            updated = True
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "stale-ref-check"
+        doc["_meta"] = meta
+
+    return doc
+
+
+def _playbook_size_bytes(doc: dict) -> int:
+    """Return the JSON-serialised byte size of all playbook entries in *doc*."""
+    playbook_subset = {k: v for k, v in doc.items() if k.startswith("playbook/")}
+    return len(json.dumps(playbook_subset).encode())
+
+
+def _archive_least_useful_entry(doc: dict) -> dict:
+    """Move the least-useful playbook entry to ``playbook_archive`` in *doc*.
+
+    "Least useful" is determined by a sort over:
+    1. ``stale_file_refs`` flag (stale first)
+    2. Inverse ``confirmed_count`` (least confirmed first)
+    3. Entry age (oldest first, using ``updated_at``)
+    4. Key name (tie-break)
+
+    The archived entry is removed from the ``playbook/`` namespace and appended
+    to the ``playbook_archive`` list (preserving it for operator review).
+
+    Returns the mutated doc.  If there are no archiveable entries, returns doc
+    unchanged.
+    """
+    now = _utcnow()
+    candidates: list[tuple] = []
+    for k, v in doc.items():
+        if not k.startswith("playbook/") or not isinstance(v, dict):
+            continue
+        confirmed = v.get("confirmed_count", 0)
+        stale = 1 if v.get("stale_file_refs") else 0
+        updated_at_str = v.get("updated_at", "")
+        age_days = 0
+        if updated_at_str:
+            try:
+                updated = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+                # _utcnow() returns naive UTC; strip tzinfo so comparison is always naive
+                if updated.tzinfo is not None:
+                    updated = updated.replace(tzinfo=None)
+                age_days = (now - updated).days
+            except (ValueError, TypeError):
+                pass
+        # Sort: stale first, then least-confirmed, then oldest, then key
+        candidates.append((stale, -confirmed, age_days, k))
+
+    if not candidates:
+        return doc
+
+    candidates.sort(reverse=True)  # highest (stale, -confirmed, age) first — oldest first within same tier
+    _, _, _, victim_key = candidates[0]
+    victim_entry = dict(doc.pop(victim_key))
+    victim_entry["_archived_key"] = victim_key
+    victim_entry["_archived_at"] = now.isoformat()
+
+    archive = list(doc.get("playbook_archive") or [])
+    archive.append(victim_entry)
+    doc["playbook_archive"] = archive
+
+    logger.info(
+        "[PLAYBOOK] Archived entry '%s' to playbook_archive (capacity cleanup)",
+        victim_key,
+    )
+    return doc
+
+
+def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
+    """Archive the least-useful playbook entry if total size would exceed capacity.
+
+    Call this *before* adding a new entry.  *new_entry_estimate* is the
+    approximate byte size of the entry that is about to be added.
+
+    Returns the (possibly mutated) doc.
+    """
+    if _playbook_size_bytes(doc) + new_entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+        doc = _archive_least_useful_entry(doc)
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +410,14 @@ async def _maybe_auto_playbook(
         f"Common fix: {hint}"
     )
 
+    new_entry = {
+        "content": content,
+        "source_task_id": str(task.id),
+        "updated_at": _utcnow().isoformat(),
+        "confirmed_count": 0,
+        "source": "auto-generated",
+    }
+    doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
     doc[playbook_full_key] = {
         "content": content,
         "source_task_id": str(task.id),
@@ -410,7 +581,7 @@ async def capture_success_pattern(
             f"This task completed cleanly without review iterations despite "
             f"this task type having prior failures in this project."
         )
-        doc[playbook_full_key] = {
+        new_entry = {
             "content": content,
             "source_task_id": str(task.id),
             "updated_at": _utcnow().isoformat(),
@@ -419,6 +590,8 @@ async def capture_success_pattern(
             "source": "success-pattern",
             "applicable_types": [task_type],
         }
+        doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
+        doc[playbook_full_key] = new_entry
         action = "created"
 
     meta = dict(doc.get("_meta", {"revision": 0}))
@@ -504,7 +677,7 @@ async def extract_review_feedback_to_playbook(
             f"Applicable to: {original_task_type} tasks."
         )
 
-        doc[playbook_full_key] = {
+        new_entry = {
             "content": content,
             "source_task_id": str(task.id),
             "updated_at": _utcnow().isoformat(),
@@ -514,6 +687,8 @@ async def extract_review_feedback_to_playbook(
             "pr_number": pr_number,
             "iteration_count": iteration,
         }
+        doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
+        doc[playbook_full_key] = new_entry
         created_keys.append(f"review-{cat_name}")
 
     if created_keys:

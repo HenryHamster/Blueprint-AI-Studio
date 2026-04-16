@@ -1295,6 +1295,157 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: AsyncClient, db_session):
+    """
+    Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.
+    A recent unconfirmed entry should appear before an older unconfirmed entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Age Penalty Test", user_id="test-user-age-penalty")
+    project.design_doc = {
+        "playbook/old-unconfirmed": {
+            "content": "old tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": old_date,
+        },
+        "playbook/recent-unconfirmed": {
+            "content": "recent tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-age-penalty-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-age-penalty-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Recent entry should appear before the age-penalised old entry
+    assert keys.index("recent-unconfirmed") < keys.index("old-unconfirmed"), (
+        f"Expected recent-unconfirmed before old-unconfirmed, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_stale_file_refs_deprioritised(client: AsyncClient, db_session):
+    """
+    Entries with stale_file_refs=True are deprioritised — a clean entry with the same
+    confirmed_count should come before a stale entry.
+    """
+    now = datetime.utcnow().isoformat()
+
+    project = Project(name="Stale Refs Test", user_id="test-user-stale-refs")
+    project.design_doc = {
+        "playbook/stale-entry": {
+            "content": "tip referencing a deleted file",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": True,
+        },
+        "playbook/clean-entry": {
+            "content": "tip with valid file refs",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": False,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-stale-refs-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-refs-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Clean entry should come before stale entry
+    assert keys.index("clean-entry") < keys.index("stale-entry"), (
+        f"Expected clean-entry before stale-entry, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_old_confirmed_entry_not_penalised(client: AsyncClient, db_session):
+    """
+    An old entry with confirmed_count >= 3 should NOT receive the age penalty.
+    It should still be ordered before a less-confirmed recent entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Confirmed Old Entry Test", user_id="test-user-conf-old")
+    project.design_doc = {
+        "playbook/old-confirmed": {
+            "content": "old but well-confirmed tip",
+            "confirmed_count": 5,
+            "reference_count": 10,
+            "updated_at": old_date,
+        },
+        "playbook/recent-low-confirmed": {
+            "content": "recent tip with low confirmations",
+            "confirmed_count": 1,
+            "reference_count": 1,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-conf-old-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-conf-old-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Old but confirmed entry (no age penalty) should come before less-confirmed recent entry
+    assert keys.index("old-confirmed") < keys.index("recent-low-confirmed"), (
+        f"Expected old-confirmed before recent-low-confirmed, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
     client: AsyncClient, db_session, mocker
 ):
