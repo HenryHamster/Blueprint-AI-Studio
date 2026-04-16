@@ -50,6 +50,12 @@ def _error_fingerprint(msg: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:12]
 
 
+def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
+    """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
+    entry = proj_anomalies.get(failure_class)
+    return bool(entry and entry.get("occurrence_count", 0) >= 3)
+
+
 async def _compute_research_anomalies(project_id, session: AsyncSession) -> list:
     """Analyze recent task data to identify pipeline anomalies for undirected research focus.
 
@@ -229,6 +235,166 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             del proj_anomalies[key]
 
     return anomalies
+
+
+# ---------------------------------------------------------------------------
+# Anomaly-driven pipeline adjustments
+# ---------------------------------------------------------------------------
+
+# Failure classes that trigger automatic pipeline adjustments when surging
+_ACTIONABLE_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API"})
+
+# Minimum occurrence_count in persistent_anomalies to trigger adjustments
+_ANOMALY_ACTION_THRESHOLD = 3
+
+
+def _apply_anomaly_adjustments() -> bool:
+    """Check persistent anomalies across all projects and apply runtime adjustments.
+
+    When PROVISION_FAILURE or EXTERNAL_API anomalies reach high severity with
+    occurrence_count >= 3, automatically:
+    - Reduce max_concurrent_vms by 50% (floor of 2)
+    - Lower failure-rate dispatch gate from 0.8 to 0.6
+
+    Returns True if adjustments were applied (or were already active).
+    """
+    adjustments = _shared_state.anomaly_adjustments
+    rc = _shared_state.runtime_config
+
+    # Find high-severity actionable anomalies across all projects
+    triggered_keys: list[str] = []
+    for proj_anomalies in _shared_state.persistent_anomalies.values():
+        for anomaly_key, info in proj_anomalies.items():
+            if (
+                anomaly_key in _ACTIONABLE_FAILURE_CLASSES
+                and info.get("severity") == "high"
+                and info.get("occurrence_count", 0) >= _ANOMALY_ACTION_THRESHOLD
+            ):
+                triggered_keys.append(anomaly_key)
+
+    if not triggered_keys:
+        return False
+
+    if adjustments["active"]:
+        # Already adjusted — update trigger list but don't re-adjust
+        adjustments["trigger_anomalies"] = sorted(set(triggered_keys))
+        return True
+
+    # Store pre-adjustment values for restoration
+    adjustments["pre_adjustment_max_vms"] = rc["max_concurrent_vms"]
+    adjustments["pre_adjustment_failure_gate"] = adjustments["failure_gate_threshold"]
+
+    # Apply adjustments: reduce VMs by 50% (floor 2), tighten failure gate
+    new_max_vms = max(2, rc["max_concurrent_vms"] // 2)
+    rc["max_concurrent_vms"] = new_max_vms
+    adjustments["failure_gate_threshold"] = 0.6
+
+    adjustments["active"] = True
+    adjustments["adjusted_at"] = _utcnow().isoformat()
+    adjustments["trigger_anomalies"] = sorted(set(triggered_keys))
+
+    logger.info(
+        f"[ANOMALY_ACTION] Applied pipeline adjustments: "
+        f"max_vms={new_max_vms}, failure_gate=0.6 "
+        f"(triggers: {', '.join(triggered_keys)})"
+    )
+    return True
+
+
+def _check_anomaly_restoration() -> bool:
+    """Restore pre-adjustment values when all triggering anomalies have cleared.
+
+    An anomaly is considered cleared when its occurrence_count drops below the
+    threshold or it has been expired (removed from persistent_anomalies by the
+    48h staleness check in _compute_research_anomalies).
+
+    Does NOT restore if pre_adjustment_max_vms is None (manual admin override
+    occurred while adjustments were active — the admin's setting takes priority).
+
+    Returns True if adjustments were restored.
+    """
+    adjustments = _shared_state.anomaly_adjustments
+    rc = _shared_state.runtime_config
+
+    if not adjustments["active"]:
+        return False
+
+    # Check if any actionable anomaly still qualifies
+    still_active = False
+    for proj_anomalies in _shared_state.persistent_anomalies.values():
+        for anomaly_key, info in proj_anomalies.items():
+            if (
+                anomaly_key in _ACTIONABLE_FAILURE_CLASSES
+                and info.get("severity") == "high"
+                and info.get("occurrence_count", 0) >= _ANOMALY_ACTION_THRESHOLD
+            ):
+                still_active = True
+                break
+        if still_active:
+            break
+
+    if still_active:
+        return False
+
+    # Anomalies cleared — restore previous values
+    pre_max_vms = adjustments["pre_adjustment_max_vms"]
+    pre_gate = adjustments["pre_adjustment_failure_gate"]
+
+    if pre_max_vms is not None:
+        # Only restore if the current value matches what we set — if an admin
+        # changed it manually while adjustments were active, respect that.
+        current_max_vms = rc["max_concurrent_vms"]
+        expected_adjusted_vms = max(2, pre_max_vms // 2)
+        if current_max_vms == expected_adjusted_vms:
+            rc["max_concurrent_vms"] = pre_max_vms
+        else:
+            logger.info(
+                f"[ANOMALY_ACTION] max_concurrent_vms was manually changed "
+                f"({expected_adjusted_vms} → {current_max_vms}) during anomaly adjustment — "
+                f"keeping current value"
+            )
+
+    if pre_gate is not None:
+        adjustments["failure_gate_threshold"] = pre_gate
+
+    adjustments["active"] = False
+    adjustments["adjusted_at"] = None
+    adjustments["trigger_anomalies"] = []
+    adjustments["pre_adjustment_max_vms"] = None
+    adjustments["pre_adjustment_failure_gate"] = None
+
+    logger.info(
+        f"[ANOMALY_ACTION] Restored pipeline settings: "
+        f"max_vms={rc['max_concurrent_vms']}, "
+        f"failure_gate={adjustments['failure_gate_threshold']}"
+    )
+    return True
+
+
+async def check_anomaly_actions() -> dict:
+    """Top-level entry point: apply or restore anomaly-driven adjustments.
+
+    Called after _compute_research_anomalies in the autonomous research loop.
+    Returns a dict describing what happened for broadcast purposes.
+    """
+    applied = _apply_anomaly_adjustments()
+    if applied:
+        return {
+            "action": "adjusted",
+            "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
+            "trigger_anomalies": _shared_state.anomaly_adjustments["trigger_anomalies"],
+        }
+
+    restored = _check_anomaly_restoration()
+    if restored:
+        return {
+            "action": "restored",
+            "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
+        }
+
+    return {"action": "none"}
 
 
 async def _check_anomaly_proposals(project, session):

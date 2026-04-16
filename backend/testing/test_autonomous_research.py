@@ -28,12 +28,15 @@ from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 @pytest.fixture(autouse=True)
 def _ensure_test_account_pool():
-    """Ensure _spawn_research_task finds an available account for the test user."""
+    """Ensure _spawn_research_task finds an available account for the test user.
+    Also clears the task_results ring buffer so the _assess_spawn_health failure-rate
+    gate doesn't trigger from results left by other test modules."""
     uid = "test-user-123"
     entry = {"id": "test-acct", "user_id": uid, "name": "test", "enabled": True, "active_tasks": 0,
              "oauth_token": "sk-ant-test", "total_tasks": 0, "token_created_at": None, "claude_config_json": None}
     _max_plan_pools.setdefault(uid, []).append(entry)
     _account_by_id["test-acct"] = entry
+    _shared_state.deploy_monitoring["task_results"].clear()
     yield
     _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"]
     _account_by_id.pop("test-acct", None)
@@ -2978,6 +2981,7 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
     bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
     assert len(bug_reports) >= 1, "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
     assert bug_reports[0].context.get("source") == "dedup_deadlock"
+    assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────

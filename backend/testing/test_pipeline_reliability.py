@@ -890,3 +890,98 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
         f"Message should NOT say 'missing or corrupt' when ci_wait_started is valid, "
         f"got: {task.latest_status_message!r}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests — External health gate (get_confirmed_down_critical_deps)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExternalHealthGate:
+    """Unit tests for the pre-flight external health gate in the dispatch path.
+
+    The gate reads shared_state.external_health["consecutive_failures"] and
+    blocks dispatch when a *critical* dependency (github_api, claude_api, gcp)
+    has been confirmed down for 2+ consecutive health checks.
+    """
+
+    from app.orchestrator import get_confirmed_down_critical_deps
+
+    def _set_consec(self, **kwargs):
+        """Set consecutive_failures entries; reset all others to 0."""
+        _shared_state.external_health["consecutive_failures"] = {
+            "github_api": kwargs.get("github_api", 0),
+            "claude_api": kwargs.get("claude_api", 0),
+            "gcp": kwargs.get("gcp", 0),
+            "db": kwargs.get("db", 0),
+        }
+
+    def setup_method(self):
+        """Save and clear consecutive_failures before each test."""
+        self._orig = dict(_shared_state.external_health.get("consecutive_failures", {}))
+        _shared_state.external_health["consecutive_failures"] = {}
+
+    def teardown_method(self):
+        """Restore original consecutive_failures after each test."""
+        _shared_state.external_health["consecutive_failures"] = self._orig
+
+    def test_dispatch_skipped_when_github_api_confirmed_down(self):
+        """Gate returns github_api when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=2)
+        result = get_confirmed_down_critical_deps()
+        assert "github_api" in result
+
+    def test_dispatch_skipped_when_claude_api_confirmed_down(self):
+        """Gate returns claude_api when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(claude_api=3)
+        result = get_confirmed_down_critical_deps()
+        assert "claude_api" in result
+
+    def test_dispatch_skipped_when_gcp_confirmed_down(self):
+        """Gate returns gcp when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(gcp=5)
+        result = get_confirmed_down_critical_deps()
+        assert "gcp" in result
+
+    def test_single_failure_does_not_gate(self):
+        """One failure is transient — gate does NOT block dispatch."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=1)
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_proceeds_when_only_db_is_down(self):
+        """DB is not a critical dep for the gate — dispatch still proceeds."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(db=10)
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_proceeds_when_all_deps_healthy(self):
+        """All zeros — nothing is blocked."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec()
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_resumes_after_recovery(self):
+        """Consecutive_failures reset to 0 after recovery — gate clears."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=3)
+        assert get_confirmed_down_critical_deps() == ["github_api"]
+
+        # Recovery: reset to 0
+        self._set_consec(github_api=0)
+        assert get_confirmed_down_critical_deps() == []
+
+    def test_multiple_deps_down_all_returned(self):
+        """If multiple critical deps are confirmed down, all are returned."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=2, claude_api=2)
+        result = get_confirmed_down_critical_deps()
+        assert "github_api" in result
+        assert "claude_api" in result
+        assert "gcp" not in result
+        assert "db" not in result

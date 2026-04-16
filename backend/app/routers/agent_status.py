@@ -38,6 +38,7 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     disable_account_model,
+    record_completion_event,
 )
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
@@ -54,7 +55,7 @@ router = APIRouter()
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 
-def record_task_result(success: bool, failure_class: str = "", task_id: str = ""):
+def record_task_result(success: bool, failure_class: str = "", task_id: str = "", task_type: str = ""):
     """Record a task result for deployment monitoring. Deduplicates by task_id."""
     from app.shared_state import deploy_monitoring
     # Deduplicate: only record one result per task
@@ -66,7 +67,7 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
         if len(_recorded_task_ids) > 200:
             _recorded_task_ids.clear()
 
-    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class)
+    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class, task_type)
     deploy_monitoring["task_results"].append(entry)  # deque(maxlen=100) handles cap automatically
 
     if success:
@@ -350,7 +351,27 @@ async def update_agent_status(
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
+    # Exception: if _post_commit_pending is set, the early-commit succeeded but
+    # _process_post_commit raised before spawning review/fix tasks. Let the retry
+    # re-run post-commit processing so the PR doesn't get orphaned.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        pending_info = (task.context or {}).get("_post_commit_pending")
+        if pending_info and isinstance(pending_info, dict):
+            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (_post_commit_pending set)")
+            _bind = session.bind
+            _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+            try:
+                result = await _process_post_commit(task.id, payload, _session_factory=_factory)
+                await session.refresh(task)
+                ctx = dict(task.context or {})
+                ctx.pop("_post_commit_pending", None)
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+                return result
+            except Exception as e:
+                logger.error(f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}", exc_info=True)
+                raise
         return {"status": "already_terminal", "task_id": str(task.id)}
     if task.status == TaskStatus.EVALUATING:
         return {"status": "already_evaluating", "task_id": str(task.id)}
@@ -607,9 +628,15 @@ async def update_agent_status(
         # Wrapped in try-except so slot release (below) always runs even if
         # classify_failure() or record_task_result() throw.
         try:
+            _direction_id = str((task.context or {}).get("direction_id") or "")
+            _project_id = str(task.project_id) if task.project_id else ""
             if payload.status == TaskStatus.COMPLETED:
-                record_task_result(success=True, task_id=str(task.id))
+                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 _shared_state.tasks_completed_total += 1
+                if _direction_id:
+                    _shared_state.record_direction_result(
+                        _direction_id, success=True, project_id=_project_id
+                    )
                 # Probe success: clear cascade-scoped disabled_models entries.
                 # No-op if the account wasn't probing anything for this model.
                 acct_id_clear = (task.context or {}).get("max_plan_account_id")
@@ -619,12 +646,22 @@ async def update_agent_status(
                         await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
                     except Exception as e:
                         logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
+                if acct_id_clear and task.vm_provisioned_at:
+                    try:
+                        duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()
+                        await record_completion_event(acct_id_clear, duration_secs)
+                    except Exception as e:
+                        logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
                 from app.failure_classification import persist_failure_category  # noqa: PLC0415
                 persist_failure_category(task, failure_class)
-                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
+                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 _shared_state.tasks_failed_total += 1
+                if _direction_id:
+                    _shared_state.record_direction_result(
+                        _direction_id, success=False, failure_class=failure_class, project_id=_project_id
+                    )
 
                 # Rate-limited or transient API failures: requeue instead of permanently failing
                 if failure_class in ("RATE_LIMIT", "EXTERNAL_API"):
@@ -1102,12 +1139,37 @@ async def update_agent_status(
         # stale and the reaper to kill the task.
         # At this point the status change, artifact, and retry logic are all
         # persisted.  expire_on_commit=False keeps the task object usable.
-        if session.dirty or session.new:
-            await session.commit()
+        try:
+            if session.dirty or session.new:
+                await session.commit()
+        except Exception as early_exc:
+            logger.error(f"[PIPELINE] Early commit failed for {task.id}: {early_exc}", exc_info=True)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
 
         # Pass a session factory bound to the SAME engine the request used.
         # In production this is AsyncSessionLocal; in tests it's the test engine.
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
-        return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        try:
+            return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        except Exception as e:
+            # Early-commit already persisted the task status. If post-commit
+            # (review pipeline, rollup, etc.) fails, the idempotency guard
+            # would block agent retries — permanently orphaning any PR that
+            # needed a review/fix spawn. Set a flag so the guard lets the
+            # retry re-run post-commit processing.
+            logger.error(f"[PIPELINE] Post-commit processing failed for task {task.id}: {e}", exc_info=True)
+            try:
+                await session.rollback()
+                await session.refresh(task)
+                task.context = {**(task.context or {}), "_post_commit_pending": {"at": _utcnow().isoformat()}}
+                session.add(task)
+                await session.commit()
+            except Exception as ctx_err:
+                logger.exception(f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}")
+            raise

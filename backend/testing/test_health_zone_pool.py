@@ -26,6 +26,10 @@ from app.max_plan_pool import (
     cascade_disabled_models,
     clear_rate_limit_state_on_success,
     disable_account_model,
+    record_completion_event,
+    _compute_health_score,
+    get_account_health_stats,
+    _HEALTH_WINDOW_SECONDS,
 )
 from app.compute import (
     get_zone_health,
@@ -365,9 +369,10 @@ class TestZoneHealth:
     def test_get_zone_health_summary_shape(self, clean_zone_state):
         """get_zone_health_summary() returns exactly the expected keys."""
         summary = get_zone_health_summary()
-        assert set(summary.keys()) == {"total_zones", "available", "exhausted", "cooldown_recovery"}
+        assert set(summary.keys()) == {"total_zones", "available", "exhausted", "cooldown_recovery", "zone_success_rates"}
         assert isinstance(summary["exhausted"], list)
         assert isinstance(summary["cooldown_recovery"], dict)
+        assert isinstance(summary["zone_success_rates"], dict)
 
     def test_get_zone_health_summary_total_zones_matches_fallback_list(self, clean_zone_state):
         """total_zones equals the length of FALLBACK_ZONES."""
@@ -1118,6 +1123,299 @@ class TestCircuitBreaker:
 async def _async_noop(*args, **kwargs):
     """Test helper: a no-op async function for monkeypatching DB persistence."""
     return None
+
+
+# ─── Account Health Tracking ─────────────────────────────────────────────────
+
+
+def _make_acct(acct_id: str, **extra) -> dict:
+    """Build a minimal account dict with sane defaults for health tests."""
+    return {
+        "id": acct_id,
+        "name": f"acct-{acct_id}",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "sk-ant-test",
+        **extra,
+    }
+
+
+class TestHealthScoreComputation:
+    """Unit tests for _compute_health_score and get_account_health_stats."""
+
+    def test_empty_account_scores_zero(self):
+        """An account with no event history has a neutral score of 0."""
+        acct = _make_acct("a1")
+        assert _compute_health_score(acct) == 0.0
+
+    def test_completions_increase_score(self):
+        """Each completion adds +1 to the health score."""
+        now = datetime.utcnow()
+        acct = _make_acct("a1", completion_events=[
+            {"at": now - timedelta(hours=1), "duration_seconds": 120.0},
+            {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
+        ])
+        assert _compute_health_score(acct, now=now) == 2.0
+
+    def test_rate_limit_events_decrease_score(self):
+        """Each rate-limit event subtracts 2 from the health score."""
+        now = datetime.utcnow()
+        acct = _make_acct("a1", rl_events=[
+            now - timedelta(hours=1),
+            now - timedelta(hours=3),
+        ])
+        assert _compute_health_score(acct, now=now) == -4.0
+
+    def test_mixed_events_combined_correctly(self):
+        """Health score = completions - 2 * rl_events."""
+        now = datetime.utcnow()
+        acct = _make_acct("a1",
+            completion_events=[
+                {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
+                {"at": now - timedelta(hours=2), "duration_seconds": 80.0},
+                {"at": now - timedelta(hours=5), "duration_seconds": 100.0},
+            ],
+            rl_events=[now - timedelta(hours=6)],
+        )
+        # 3 completions - 2*1 rl = 3 - 2 = 1
+        assert _compute_health_score(acct, now=now) == 1.0
+
+    def test_events_outside_window_excluded(self):
+        """Events older than 24h are not counted in the health score."""
+        now = datetime.utcnow()
+        cutoff_plus_one = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 1)
+        acct = _make_acct("a1",
+            completion_events=[{"at": cutoff_plus_one, "duration_seconds": 60.0}],
+            rl_events=[cutoff_plus_one],
+        )
+        assert _compute_health_score(acct, now=now) == 0.0
+
+    def test_events_at_window_boundary_excluded(self):
+        """Events exactly at the 24h cutoff (not strictly greater) are excluded."""
+        now = datetime.utcnow()
+        exactly_at_cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
+        acct = _make_acct("a1",
+            completion_events=[{"at": exactly_at_cutoff, "duration_seconds": 30.0}],
+        )
+        assert _compute_health_score(acct, now=now) == 0.0
+
+    def test_get_account_health_stats_structure(self):
+        """get_account_health_stats returns the expected keys."""
+        acct = _make_acct("a1")
+        stats = get_account_health_stats(acct)
+        assert set(stats.keys()) == {"rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score"}
+
+    def test_get_account_health_stats_avg_duration(self):
+        """avg_duration_seconds is the mean of recent completion durations."""
+        now = datetime.utcnow()
+        acct = _make_acct("a1", completion_events=[
+            {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
+            {"at": now - timedelta(hours=2), "duration_seconds": 120.0},
+        ])
+        stats = get_account_health_stats(acct, now=now)
+        assert stats["avg_duration_seconds"] == 90.0
+        assert stats["completions_24h"] == 2
+
+    def test_get_account_health_stats_avg_duration_none_when_no_completions(self):
+        """avg_duration_seconds is None when there are no recent completions."""
+        acct = _make_acct("a1")
+        assert get_account_health_stats(acct)["avg_duration_seconds"] is None
+
+    def test_get_account_health_stats_rl_count(self):
+        """rl_events_24h counts rate-limit events within the window."""
+        now = datetime.utcnow()
+        acct = _make_acct("a1", rl_events=[
+            now - timedelta(hours=1),
+            now - timedelta(hours=23),
+            now - timedelta(hours=25),  # outside window
+        ])
+        stats = get_account_health_stats(acct, now=now)
+        assert stats["rl_events_24h"] == 2
+
+
+class TestAccountSelectionByHealthScore:
+    """Tests for health-score-aware account selection in select_max_plan_account."""
+
+    @pytest.mark.asyncio
+    async def test_select_prefers_higher_health_score(self, clean_max_plan_pool):
+        """Account with more completions and fewer rate limits is preferred over idle account."""
+        now = datetime.utcnow()
+        # Healthy account with good track record
+        _add_to_pool(_make_acct("good", active_tasks=1, completion_events=[
+            {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
+            {"at": now - timedelta(hours=2), "duration_seconds": 90.0},
+        ]))
+        # Idle account with recent rate limits (lower health score)
+        _add_to_pool(_make_acct("bad", active_tasks=0, rl_events=[
+            now - timedelta(hours=1),
+            now - timedelta(hours=3),
+        ]))
+        result = await select_max_plan_account(_TEST_USER)
+        assert result is not None
+        assert result["id"] == "good", "Account with better health score should be preferred"
+
+    @pytest.mark.asyncio
+    async def test_select_uses_active_tasks_as_tiebreaker(self, clean_max_plan_pool):
+        """Among accounts with equal health scores, fewest active_tasks wins."""
+        _add_to_pool(_make_acct("busy", active_tasks=5))
+        _add_to_pool(_make_acct("idle", active_tasks=1))
+        _add_to_pool(_make_acct("medium", active_tasks=3))
+        result = await select_max_plan_account(_TEST_USER)
+        assert result is not None
+        assert result["id"] == "idle"
+
+    @pytest.mark.asyncio
+    async def test_select_new_accounts_neutral_score_compete_by_load(self, clean_max_plan_pool):
+        """New accounts with no history all score 0 — load balancing takes over."""
+        _add_to_pool(_make_acct("a1", active_tasks=0))
+        _add_to_pool(_make_acct("a2", active_tasks=2))
+        _add_to_pool(_make_acct("a3", active_tasks=1))
+        result = await select_max_plan_account(_TEST_USER)
+        assert result is not None
+        assert result["id"] == "a1"  # fewest tasks among equal-score accounts
+
+    @pytest.mark.asyncio
+    async def test_disable_account_model_records_rl_event(self, clean_max_plan_pool, monkeypatch):
+        """disable_account_model records a rate-limit event for health tracking."""
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+        _add_to_pool(_make_acct("a1"))
+        await disable_account_model("a1", SONNET)
+        assert len(_account_by_id["a1"].get("rl_events", [])) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_rate_limits_accumulate_in_rl_events(self, clean_max_plan_pool, monkeypatch):
+        """Each disable call appends to rl_events, lowering the health score."""
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+        _add_to_pool(_make_acct("a1"))
+        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
+        assert len(_account_by_id["a1"].get("rl_events", [])) == 2
+        assert _compute_health_score(_account_by_id["a1"]) == -4.0
+
+    @pytest.mark.asyncio
+    async def test_record_completion_event_adds_to_events(self, clean_max_plan_pool):
+        """record_completion_event stores duration and timestamp for the account."""
+        _add_to_pool(_make_acct("a1"))
+        await record_completion_event("a1", duration_seconds=150.0)
+        events = _account_by_id["a1"].get("completion_events", [])
+        assert len(events) == 1
+        assert events[0]["duration_seconds"] == 150.0
+        assert isinstance(events[0]["at"], datetime)
+
+    @pytest.mark.asyncio
+    async def test_record_completion_event_unknown_account_noop(self, clean_max_plan_pool):
+        """record_completion_event for an unknown account silently does nothing."""
+        await record_completion_event("does-not-exist", duration_seconds=60.0)  # no raise
+
+    @pytest.mark.asyncio
+    async def test_health_score_improves_after_completion_event(self, clean_max_plan_pool, monkeypatch):
+        """After a successful task, health score increases and the account remains preferred."""
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+        # Account with one past rate limit
+        _add_to_pool(_make_acct("a1"))
+        await disable_account_model("a1", SONNET)
+        score_after_rl = _compute_health_score(_account_by_id["a1"])
+        assert score_after_rl == -2.0
+
+        # Now a successful completion
+        await record_completion_event("a1", duration_seconds=90.0)
+        score_after_completion = _compute_health_score(_account_by_id["a1"])
+        assert score_after_completion == -1.0  # -2 + 1 = -1
+
+    @pytest.mark.asyncio
+    async def test_select_deprefers_chronically_rate_limited_account(self, clean_max_plan_pool, monkeypatch):
+        """An account with multiple recent rate limits loses to a healthier alternative."""
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+        now = datetime.utcnow()
+
+        # Chronically rate-limited account (but currently healthy — models cleared)
+        _add_to_pool(_make_acct("chronic", active_tasks=0, rl_events=[
+            now - timedelta(hours=1),
+            now - timedelta(hours=3),
+            now - timedelta(hours=6),
+        ]))
+        # Clean account with modest load
+        _add_to_pool(_make_acct("clean", active_tasks=2))
+
+        result = await select_max_plan_account(_TEST_USER)
+        assert result is not None
+        assert result["id"] == "clean", "Healthier account should be chosen despite higher load"
+
+
+class TestDisabledStatePersistenceAndRestoration:
+    """Verify that disabled_models state persists to DB and is restored on startup.
+
+    The persistence mechanism was already present before this feature.
+    These tests document and regression-test the existing behavior.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disable_persists_to_db(self, clean_max_plan_pool, monkeypatch):
+        """disable_account_model calls _persist_rate_limit_state to save to DB."""
+        persist_calls = []
+
+        async def _capture_persist(acct_id):
+            persist_calls.append(acct_id)
+
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
+        _add_to_pool(_make_acct("a1"))
+        await disable_account_model("a1", SONNET)
+        assert "a1" in persist_calls, "_persist_rate_limit_state must be called on rate limit"
+
+    @pytest.mark.asyncio
+    async def test_clear_on_success_persists_to_db(self, clean_max_plan_pool, monkeypatch):
+        """clear_rate_limit_state_on_success calls _persist_rate_limit_state."""
+        persist_calls = []
+
+        async def _capture_persist(acct_id):
+            persist_calls.append(acct_id)
+
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
+        now = datetime.now(timezone.utc)
+        _add_to_pool(_acct_with_disables("a1", {SONNET: {"hits": 1, "at": now - timedelta(minutes=5)}}))
+        await clear_rate_limit_state_on_success("a1", SONNET)
+        assert "a1" in persist_calls
+
+    def test_load_max_plan_pool_restores_active_cooldown(self):
+        """Verifies that disabled_models within active cooldown are restored after restart.
+
+        This tests the in-memory restoration logic from load_max_plan_pool() directly
+        by simulating the state that would come from the DB.
+        """
+        from app.max_plan_pool import _account_state_for_model
+        # _utcnow() returns naive datetimes — use datetime.utcnow() to match
+        now = datetime.utcnow()
+        # Build an entry that simulates what load_max_plan_pool would restore
+        restored_entry = {
+            "id": "a1",
+            "name": "restored",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "disabled_models": {
+                SONNET: {"hits": 1, "at": now - timedelta(minutes=10)},  # 30min cooldown, only 10min elapsed
+            },
+        }
+        # The in-memory dict uses datetime objects for "at" (as load_max_plan_pool converts ISO strings)
+        assert _account_state_for_model(restored_entry, SONNET) == "unavailable"
+
+    def test_load_max_plan_pool_skips_expired_cooldown_on_restore(self):
+        """Cooldowns that elapsed while the service was down are not restored."""
+        from app.max_plan_pool import _account_state_for_model
+        now = datetime.utcnow()
+        # Cooldown elapsed (hits=1 → 30min, but 45min have passed)
+        expired_entry = {
+            "id": "a1",
+            "name": "expired",
+            "enabled": True,
+            "active_tasks": 0,
+            "oauth_token": "sk-ant-test",
+            "disabled_models": {
+                SONNET: {"hits": 1, "at": now - timedelta(minutes=45)},
+            },
+        }
+        # Should be probing (cooldown elapsed) rather than unavailable
+        assert _account_state_for_model(expired_entry, SONNET) == "probing"
 
 
 # ─── disable_account_model (shared rate-limit mark path) ────────────────────

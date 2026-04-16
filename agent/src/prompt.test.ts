@@ -43,6 +43,7 @@ import {
   formatProjectContext,
   configureAgentPermissions,
   discoverRelatedTests,
+  extractTestConventions,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
@@ -184,6 +185,55 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('## Direction Context');
   });
 
+  it('renders failure_stage_pattern message in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Fix test flakiness',
+        priority: 'high',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: {
+          stage: 'code_error',
+          rate: 0.86,
+          message: 'Recent tasks for this direction frequently fail at the code/test stage — pay extra attention to test coverage and run tests early.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Failure pattern:**');
+    expect(result).toContain('pay extra attention to test coverage');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is null', () => {
+    const task = {
+      direction_context: {
+        title: 'Optimize queries',
+        priority: 'low',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: null,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
   it('renders ## Task Scope section for create task with small scope', () => {
     const task = {
       payloads: [{ type: 'create' }],
@@ -240,6 +290,40 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Task Scope');
+  });
+
+  it('renders ## Module-Specific Review History when module_feedback_warnings is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        module_feedback_warnings: [
+          {
+            file: 'backend/app/orchestrator.py',
+            top_categories: { 'test-coverage': 0.6, 'error-handling': 0.25 },
+            sample_size: 8,
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('### Module-Specific Review History');
+    expect(result).toContain('backend/app/orchestrator.py');
+    expect(result).toContain('60% test-coverage');
+    expect(result).toContain('25% error-handling');
+    expect(result).toContain('(8 issues)');
+  });
+
+  it('does not render module feedback section when module_feedback_warnings is absent', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        active_tasks: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('Module-Specific Review History');
   });
 });
 
@@ -511,6 +595,76 @@ describe('discoverRelatedTests', () => {
   });
 });
 
+// ── extractTestConventions ────────────────────────────────────────────────────
+describe('extractTestConventions', () => {
+  let mockFs: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    const fs = await import('fs');
+    mockFs = fs.default as unknown as typeof mockFs;
+    // Clear the module-level cache between tests by using unique dirKeys
+  });
+
+  it('returns empty string when no test files exist', () => {
+    mockFs.existsSync.mockReturnValue(false);
+    const result = extractTestConventions('backend-empty', ['backend/testing/test_foo.py']);
+    expect(result).toBe('');
+  });
+
+  it('extracts pytest fixture names from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest_asyncio.fixture\nasync def db_session():\n    pass\n@pytest.fixture\ndef mock_client():\n    pass\n'
+    );
+    const result = extractTestConventions('backend-fixtures', ['backend/testing/test_services.py']);
+    expect(result).toContain('db_session');
+    expect(result).toContain('mock_client');
+    expect(result).toContain('Fixtures:');
+  });
+
+  it('extracts AsyncMock usage from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'from unittest.mock import AsyncMock, patch\n\nAsyncMock()\nMagicMock()\n'
+    );
+    const result = extractTestConventions('backend-mocks', ['backend/testing/test_agent.py']);
+    expect(result).toContain('AsyncMock');
+    expect(result).toContain('Mocks:');
+  });
+
+  it('extracts vitest patterns from TypeScript test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'import { vi, describe } from "vitest";\nbeforeEach(() => {});\nvi.fn();\nexpect(x).toBe(1);\n'
+    );
+    const result = extractTestConventions('agent-vitest', ['agent/src/prompt.test.ts']);
+    expect(result).toContain('vitest');
+    expect(result).toContain('beforeEach');
+  });
+
+  it('returns string under 500 chars', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest.fixture\ndef fixture_one(): pass\n@pytest.fixture\ndef fixture_two(): pass\n' +
+      'from unittest.mock import AsyncMock\nAsyncMock()\nbeforeEach(() => {})\nassert x == 1\npytest.raises(ValueError)\n'
+    );
+    const result = extractTestConventions('backend-size', ['backend/testing/test_x.py']);
+    expect(result.length).toBeLessThanOrEqual(500);
+  });
+
+  it('returns cached result on second call with same dirKey', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue('@pytest.fixture\ndef session(): pass\n');
+    const first = extractTestConventions('backend-cached', ['backend/testing/test_a.py']);
+    // Reset mock to return different content — cached result should be returned
+    mockFs.readFileSync.mockReturnValue('');
+    const second = extractTestConventions('backend-cached', ['backend/testing/test_b.py']);
+    expect(first).toBe(second);
+  });
+});
+
 // ── buildRetryContext ─────────────────────────────────────────────────────────
 describe('buildRetryContext', () => {
   it('returns empty string for first-attempt tasks (no _attempt_number)', () => {
@@ -596,6 +750,87 @@ describe('buildRetryContext', () => {
     const task = { context: { _attempt_number: 2, _previous_failure_class: 'CODE_ERROR', _previous_error: 'err' } };
     const result = buildRetryContext(task);
     expect(result.endsWith('\n')).toBe(true);
+  });
+
+  it('renders failure stage when _previous_failure_stage is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_failure_stage: 'test',
+        _previous_error: 'pytest: FAILED',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: CODE_ERROR (at test stage)');
+    expect(result).not.toContain('Failure type: CODE_ERROR\n');
+  });
+
+  it('omits stage qualifier when _previous_failure_stage is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: AGENT_TIMEOUT\n');
+    expect(result).not.toContain('at stage)');
+  });
+
+  it('renders recurring warning when _previous_is_recurring is true', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: true,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('recurring failure pattern');
+    expect(result).toContain('fundamentally different approach');
+  });
+
+  it('does not render recurring warning when _previous_is_recurring is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: false,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('recurring failure pattern');
+  });
+
+  it('renders error summary with "Error summary:" label when _previous_error_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'full long error message here',
+        _previous_error_summary: 'AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error summary: AssertionError: expected 1 got 2');
+    expect(result).not.toContain('Error: full long error message here');
+  });
+
+  it('falls back to "Error:" label when only _previous_error is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out after 600s',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error: timed out after 600s');
+    expect(result).not.toContain('Error summary:');
   });
 });
 

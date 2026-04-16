@@ -39,7 +39,7 @@ export const RUFF_TIMEOUT = 60_000;
 
 // Test fix loop
 export const MAX_TEST_FIX_ATTEMPTS = 2;
-export const TEST_RUNNER_TIMEOUT = 180_000;
+export const TEST_RUNNER_TIMEOUT = 600_000;
 
 // Self-review loop
 export const MAX_SELF_REVIEW_ATTEMPTS = 1;

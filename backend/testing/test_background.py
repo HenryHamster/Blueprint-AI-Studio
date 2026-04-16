@@ -1858,3 +1858,391 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     assert "skipping success heartbeat" in source, (
         "expected an explicit skip branch when the agent died in settle window"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for the all-children-failed EVALUATING parent rescue (Step 4 in reaper)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, mocker):
+    """EVALUATING parent whose children ALL failed gets rescued to FAILED with diagnostics."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="All-Failed Rescue Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child1 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+    child2 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c2"}],
+        status=TaskStatus.CANCELLED,
+    )
+    reaper_db.add_all([child1, child2])
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "1 failed" in parent.latest_status_message
+    assert "CODE_ERROR" in parent.latest_status_message
+    assert "1 cancelled" in parent.latest_status_message
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mocker):
+    """EVALUATING parent with at least one still-running child must NOT be rescued prematurely."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Running Child Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    failed_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+    )
+    running_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c2"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    reaper_db.add_all([failed_child, running_child])
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    # Parent should still be EVALUATING — one child is still running.
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker):
+    """Rescued parent failure message includes each child's failure_category."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Failure Class Msg Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "PROVISION_FAILURE" in parent.latest_status_message
+    assert parent.context.get("failure_category") is not None
+
+
+# ── Per-failure-class retry budgets ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reaper_code_error_retries_on_first_failure(reaper_db, mocker):
+    """CODE_ERROR budget=2: attempt_count=1 (one prior retry) still retries."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="Code Error Retry Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # last_error classifies as CODE_ERROR (no special keywords → default class)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="code-err-vm-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"last_error": "pytest AssertionError: expected True, got False"},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    # Budget=2 for CODE_ERROR; attempt_count=1 < 2 → should retry
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reaper_code_error_fails_after_budget_exhausted(reaper_db, mocker):
+    """CODE_ERROR budget=2: attempt_count=2 exhausts budget → permanent FAILED."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="Code Error Terminal Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add a feature"}],
+        vm_instance_id="code-err-vm-2",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"last_error": "pytest AssertionError: expected True, got False"},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    # Budget=2 for CODE_ERROR; attempt_count=2 is NOT < 2 → permanent FAILED
+    assert task.status == TaskStatus.FAILED
+    # fail_reason message must reference CODE_ERROR class and budget (case-insensitive)
+    msg = (task.latest_status_message or "").lower()
+    assert "code_error" in msg and "2 retries" in msg
+
+
+@pytest.mark.asyncio
+async def test_reaper_external_api_retries_up_to_budget(reaper_db, mocker):
+    """EXTERNAL_API budget=4: attempt_count=3 still retries (one more left)."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="External API Retry Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="ext-api-vm-3",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"last_error": "503 service unavailable: api.github.com timed out"},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    # Budget=4 for EXTERNAL_API; attempt_count=3 < 4 → should retry
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 4
+
+
+@pytest.mark.asyncio
+async def test_reaper_external_api_fails_after_budget_exhausted(reaper_db, mocker):
+    """EXTERNAL_API budget=4: attempt_count=4 exhausts budget → permanent FAILED."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="External API Terminal Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="ext-api-vm-4",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=4,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"last_error": "503 service unavailable: api.github.com timed out"},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    # Budget=4 for EXTERNAL_API; attempt_count=4 is NOT < 4 → permanent FAILED
+    assert task.status == TaskStatus.FAILED
+    msg = (task.latest_status_message or "").lower()
+    assert "external_api" in msg and "4 retries" in msg
+
+
+@pytest.mark.asyncio
+async def test_reaper_external_api_uses_longer_retry_delay(reaper_db, mocker):
+    """EXTERNAL_API first retry should use ~5 min delay (longer than default backoff)."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    from datetime import timezone as _tz
+    import app.shared_state as _ss
+
+    project = Project(name="External API Delay Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="ext-delay-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"last_error": "503 service unavailable: api.github.com timed out"},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    # retry_after must be set and should be at least 3 min from now
+    # (5 min * 0.75 jitter = 3.75 min minimum, vs default 2^0 * 0.75 = 0.75 min)
+    ctx = task.context or {}
+    retry_after_str = ctx.get("retry_after")
+    assert retry_after_str is not None, "retry_after must be set for EXTERNAL_API retry"
+    retry_after = datetime.fromisoformat(retry_after_str)
+    if retry_after.tzinfo is None:
+        retry_after = retry_after.replace(tzinfo=_tz.utc)
+    now = datetime.now(_tz.utc)
+    delay_seconds = (retry_after - now).total_seconds()
+    # Should be at least 3.75 min (5 * 0.75 jitter), more than default 1-min backoff
+    assert delay_seconds > 3 * 60, (
+        f"EXTERNAL_API retry delay should be >3 min, got {delay_seconds:.0f}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_agent_timeout_keeps_3_attempt_budget(reaper_db, mocker):
+    """AGENT_TIMEOUT budget=3: attempt_count=2 retries; attempt_count=3 fails."""
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="Agent Timeout Budget Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # attempt_count=2, heartbeat timeout → AGENT_TIMEOUT → budget=3 → retry
+    task_retry = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="timeout-vm-2",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(task_retry)
+    await reaper_db.commit()
+    await reaper_db.refresh(task_retry)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task_retry)
+    # Budget=3 for AGENT_TIMEOUT; attempt_count=2 < 3 → should retry
+    assert task_retry.status == TaskStatus.QUEUED
+    assert task_retry.attempt_count == 3

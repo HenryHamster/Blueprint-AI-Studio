@@ -32,8 +32,8 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
-from app.models import Project, Task, TaskStatus
-from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts
+from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts, filter_held_directions
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -188,6 +188,20 @@ async def _persist_zone_health():
                 await session.commit()
     except Exception as e:
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
+
+
+_CRITICAL_EXTERNAL_DEPS = ("github_api", "claude_api", "gcp")
+
+
+def get_confirmed_down_critical_deps() -> list:
+    """Return critical dependency names confirmed down for 2+ consecutive health checks.
+
+    DB is excluded — if DB is down the orchestrator itself cannot function, so
+    there's no meaningful gate to apply.  A dep needs >=2 consecutive failures to
+    avoid false-positives from transient probe errors.
+    """
+    consec = _shared_state.external_health.get("consecutive_failures", {})
+    return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
 
 
 async def _check_candidate_task_deps(
@@ -434,11 +448,16 @@ async def orchestrator_worker():
                 # Filter to last 15 min so the gate auto-clears when failures age out
                 _fr_cutoff = (_utcnow() - timedelta(minutes=15)).isoformat()
                 recent_results = [r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= _fr_cutoff]
+                # Types with >70% failure rate (min 3 samples) are skipped in the dispatch loop
+                # below without throttling healthy types.
+                _failing_types: set = set()
                 if len(recent_results) >= 5:
                     recent_window = recent_results[-10:]
                     recent_failures = sum(1 for r in recent_window if r[1] == "failure")
                     recent_rate = recent_failures / len(recent_window)
-                    if recent_rate >= 0.8:
+                    _failure_gate = _shared_state.anomaly_adjustments["failure_gate_threshold"]
+                    if recent_rate >= _failure_gate:
+                        # Global backstop: entire pipeline is degraded — sleep and retry
                         logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for {ORCHESTRATOR_THROTTLE_SECONDS}s")
                         try:
                             await ws_manager.broadcast_to_all("pipeline_throttle", {
@@ -453,6 +472,34 @@ async def orchestrator_worker():
                         await recheck_disabled_accounts()
                         await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
                         continue
+                    else:
+                        # Per-type gate: detect individual failing types and skip only them
+                        seen_types = {r[3] for r in recent_results if len(r) > 3 and r[3]}
+                        for ttype in seen_types:
+                            rate, sample_size = _shared_state.get_task_type_failure_rate(ttype, window_minutes=15)
+                            if sample_size >= 3 and rate >= 0.7:
+                                _failing_types.add(ttype)
+                                logger.warning(
+                                    f"[ORCHESTRATOR] Per-type failure gate: '{ttype}' "
+                                    f"({rate:.0%} failure rate, n={sample_size}) — skipping this type"
+                                )
+
+                # External health gate — skip dispatch when a critical dependency has been
+                # confirmed down for 2+ consecutive health checks (avoids flapping on transient probes).
+                # DB is excluded: if DB is down the orchestrator itself cannot function.
+                _confirmed_down = get_confirmed_down_critical_deps()
+                if _confirmed_down:
+                    _dep_str = ", ".join(_confirmed_down)
+                    logger.warning(f"[ORCHESTRATOR] External health gate: {_dep_str} confirmed down — skipping dispatch this cycle")
+                    try:
+                        await ws_manager.broadcast_to_all("health_gate_throttle", {
+                            "reason": "external_dependency_down",
+                            "detail": f"Critical dependencies down: {_dep_str}",
+                            "deps": _confirmed_down,
+                        })
+                    except Exception:
+                        logger.exception("[ORCHESTRATOR] Failed to broadcast health_gate_throttle")
+                    continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle
                 active_per_account: Dict[str, int] = {}
@@ -735,7 +782,12 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
-                # Step 2.7: Health-aware reordering — boost small/low-risk tasks when degraded.
+                # Step 2.7: Defer tasks whose direction is held due to consecutive code failures
+                eligible_ids = await filter_held_directions(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
+                # Step 2.8: Health-aware reordering — boost small/low-risk tasks when degraded.
                 # Only activates under degradation so normal priority ordering is preserved.
                 # Degradation signals: any zone in cooldown, failure rate > 30%, or slots < 50% of max.
                 if len(eligible_ids) > 1:
@@ -818,6 +870,16 @@ async def orchestrator_worker():
                     queued_tasks = []  # Clear so the loop below is skipped
 
                 for task in queued_tasks:
+                    # Per-type failure gate: skip tasks whose type is currently failing
+                    # (global 80% backstop already handled above; this skips only the bad type)
+                    _task_type_for_gate = task.first_payload.get("type", "")
+                    if _task_type_for_gate and _task_type_for_gate in _failing_types:
+                        logger.info(
+                            f"[ORCHESTRATOR] Skipping task {task.id} "
+                            f"(type={_task_type_for_gate}) — per-type failure gate active"
+                        )
+                        continue
+
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
                     if not task.vm_instance_id:
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -1024,7 +1086,7 @@ async def orchestrator_worker():
                             provision_err = get_provision_error(vm_id)
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}")
                             try:
-                                record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
+                                record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id), task_type=t_type)
                                 # Hoist zone lookup so it can be saved to context and used for zone failure recording
                                 prov_zone = get_vm_zone(vm_id)
                                 # Capture serial port logs before VM deletion (best-effort)
@@ -1426,6 +1488,87 @@ async def orchestrator_worker():
                                 await session.rollback()
                             except Exception:
                                 logger.exception(f"[CI] Rollback also failed for task {ci_task.id}")
+
+                # ── Post-commit recovery ──
+                # If _process_post_commit raised after the early-commit persisted
+                # the task status, the PR may be orphaned (no review/fix spawned).
+                # The agent retry handles most cases via the idempotency guard
+                # modification, but if all retries failed the flag persists here.
+                # Scan for these and directly spawn the missing review.
+                try:
+                    pending_tasks = (await session.execute(
+                        select(Task).where(
+                            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                        ).limit(50)
+                    )).scalars().all()
+                    for pt in pending_tasks:
+                        if not (pt.context or {}).get("_post_commit_pending"):
+                            continue
+                        if pt.status != TaskStatus.COMPLETED:
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pt_payload = pt.first_payload
+                        pt_type = pt_payload.get("type", "create")
+                        if pt_type not in ("create", "refactor", "docs", "qa", "deps", "migrate", ""):
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pr_artifact = (await session.execute(
+                            select(Artifact).where(
+                                Artifact.task_id == pt.id,
+                                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                            ).limit(1)
+                        )).scalars().first()
+                        if not pr_artifact or not pr_artifact.url:
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        try:
+                            pc_pr_number = int(pr_artifact.url.rstrip("/").split("/")[-1])
+                        except (ValueError, IndexError):
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pc_short_id = str(pt.id).replace('-', '')[:8]
+                        pc_branch = f"blueprint/task-{pc_short_id}"
+                        pc_base = pt_payload.get("base_branch", "main")
+                        pc_prompt = pt_payload.get("prompt", pt.description or "")
+                        logger.info(f"[RECOVERY] Post-commit pending for task {pt.id}, spawning review for PR #{pc_pr_number}")
+                        from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                        review_task, was_created = await _spawn_pipeline_task(
+                            pt, "review", session, pc_pr_number, pc_branch, pc_base,
+                            original_prompt=pc_prompt, original_task_id=str(pt.id)
+                        )
+                        ctx = dict(pt.context or {})
+                        ctx.pop("_post_commit_pending", None)
+                        pt.context = ctx
+                        if review_task and was_created:
+                            logger.info(f"[RECOVERY] Spawned review {review_task.id} for orphaned PR #{pc_pr_number} (task {pt.id})")
+                        elif review_task:
+                            logger.info(f"[RECOVERY] Review already active for PR #{pc_pr_number} (task {pt.id}): {review_task.id}")
+                        else:
+                            logger.warning(f"[RECOVERY] Review not spawned for orphaned PR #{pc_pr_number} (task {pt.id}) — cap/guard")
+                        session.add(pt)
+                        await session.commit()
+                except Exception as _pc_err:
+                    logger.error(f"[RECOVERY] Post-commit recovery scan failed: {_pc_err}", exc_info=True)
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
 
             _orchestrator_consecutive_errors = 0
             logger.info('orchestrator_cycle_complete', extra={
