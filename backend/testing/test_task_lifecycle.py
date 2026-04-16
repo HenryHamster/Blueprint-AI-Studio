@@ -19,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
-from app.models import Project, Task, TaskHistory, TaskStatus, ArtifactType
+from app.models import Project, Task, TaskStatus, ArtifactType
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
