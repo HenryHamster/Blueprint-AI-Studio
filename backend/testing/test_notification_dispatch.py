@@ -1,9 +1,18 @@
 """Tests for notification_dispatch.py message builder functions."""
+import time
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import app.notification_dispatch as nd
 from app.notification_dispatch import (
+    _PERMANENT_FAILURE_CODES,
+    _RETRY_DELAYS,
+    _RetryEntry,
+    _retry_queue,
+    dispatch_external_notification,
+    get_notification_stats,
     post_auto_fix_result_message,
     post_auto_fix_spawned_message,
     post_cycle_summary_message,
@@ -16,6 +25,223 @@ from app.notification_dispatch import (
     post_review_feedback_message,
 )
 from app.models import MessageType, ProjectMessage
+
+
+# ---------------------------------------------------------------------------
+# Helpers for dispatch_external_notification tests
+# ---------------------------------------------------------------------------
+
+def _make_runtime_config(webhook_url: str = "https://example.com/hook", enabled_events=None, throttle_seconds: int = 0):
+    return {
+        "notification_config": {
+            "webhook_url": webhook_url,
+            "enabled_events": enabled_events if enabled_events is not None else ["test_event"],
+            "throttle_seconds": throttle_seconds,
+        }
+    }
+
+
+def _reset_stats():
+    """Reset module-level counters and retry queue for test isolation."""
+    nd.total_dispatched = 0
+    nd.total_delivered = 0
+    nd.total_failed = 0
+    nd.last_failure_reason = ""
+    nd._retry_queue.clear()
+    nd._last_dispatch_time.clear()
+
+
+# ---------------------------------------------------------------------------
+# dispatch_external_notification — delivery stats
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_dispatch_increments_dispatched_and_delivered_on_success():
+    _reset_stats()
+    mock_resp = MagicMock(status_code=200)
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 1
+    assert stats["total_delivered"] == 1
+    assert stats["total_failed"] == 0
+    assert stats["retry_queue_depth"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_enqueues_retry_on_502():
+    _reset_stats()
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=502)), \
+         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 1
+    assert stats["total_delivered"] == 0
+    assert stats["retry_queue_depth"] == 1
+    entry = nd._retry_queue[0]
+    assert entry.attempts == 0
+    assert entry.event_type == "test_event"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_no_retry_on_404():
+    _reset_stats()
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=404)), \
+         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 1
+    assert stats["total_failed"] == 1
+    assert stats["retry_queue_depth"] == 0
+    assert "404" in stats["last_failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_no_retry_on_401():
+    _reset_stats()
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=401)), \
+         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+    stats = get_notification_stats()
+    assert stats["total_failed"] == 1
+    assert stats["retry_queue_depth"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_no_retry_on_403():
+    _reset_stats()
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=403)), \
+         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+    stats = get_notification_stats()
+    assert stats["total_failed"] == 1
+    assert stats["retry_queue_depth"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_enqueues_retry_on_network_error():
+    _reset_stats()
+    import httpx
+    with patch("app.shared_state.runtime_config", _make_runtime_config()), \
+         patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(side_effect=httpx.ConnectError("refused"))), \
+         patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {})
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 1
+    assert stats["retry_queue_depth"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Retry queue bounds
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_retry_queue_bounded_at_50():
+    _reset_stats()
+    # Fill queue past maxlen by injecting entries directly
+    for i in range(60):
+        nd._retry_queue.append(_RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={},
+            attempts=0,
+            next_retry_at=time.monotonic() + 9999,
+        ))
+    assert len(nd._retry_queue) == 50  # deque(maxlen=50) truncates oldest
+
+
+# ---------------------------------------------------------------------------
+# _drain_retry_queue — retry delivery
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_drain_retry_succeeds_and_updates_delivered():
+    _reset_stats()
+    nd._retry_queue.append(_RetryEntry(
+        project_id=uuid.uuid4(),
+        event_type="test_event",
+        payload={},
+        body={"event_type": "test_event"},
+        attempts=0,
+        next_retry_at=time.monotonic() - 1,  # due now
+    ))
+    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)):
+        await nd._drain_retry_queue("https://example.com/hook")
+    assert nd.total_delivered == 1
+    assert len(nd._retry_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_retry_re_enqueues_on_502():
+    _reset_stats()
+    nd._retry_queue.append(_RetryEntry(
+        project_id=uuid.uuid4(),
+        event_type="test_event",
+        payload={},
+        body={},
+        attempts=0,
+        next_retry_at=time.monotonic() - 1,
+    ))
+    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=502)):
+        await nd._drain_retry_queue("https://example.com/hook")
+    # Should be re-enqueued with attempts=1
+    assert len(nd._retry_queue) == 1
+    assert nd._retry_queue[0].attempts == 1
+    assert nd.total_failed == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_retry_exhausts_and_counts_failed():
+    _reset_stats()
+    nd._retry_queue.append(_RetryEntry(
+        project_id=uuid.uuid4(),
+        event_type="test_event",
+        payload={},
+        body={},
+        attempts=len(_RETRY_DELAYS) - 1,  # last attempt
+        next_retry_at=time.monotonic() - 1,
+    ))
+    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=503)):
+        await nd._drain_retry_queue("https://example.com/hook")
+    assert nd.total_failed == 1
+    assert len(nd._retry_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_skips_not_due_entries():
+    _reset_stats()
+    nd._retry_queue.append(_RetryEntry(
+        project_id=uuid.uuid4(),
+        event_type="test_event",
+        payload={},
+        body={},
+        attempts=0,
+        next_retry_at=time.monotonic() + 9999,  # not due
+    ))
+    with patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)) as mock_del:
+        await nd._drain_retry_queue("https://example.com/hook")
+    mock_del.assert_not_called()
+    assert len(nd._retry_queue) == 1  # still in queue
+
+
+# ---------------------------------------------------------------------------
+# get_notification_stats
+# ---------------------------------------------------------------------------
+
+def test_get_notification_stats_initial():
+    _reset_stats()
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 0
+    assert stats["total_delivered"] == 0
+    assert stats["total_failed"] == 0
+    assert stats["last_failure_reason"] == ""
+    assert stats["retry_queue_depth"] == 0
 
 
 @pytest.mark.asyncio

@@ -282,3 +282,69 @@ class TestZoneHealthOutput:
         """zone_success_rates is empty when no zone has any history."""
         summary = compute.get_zone_health_summary()
         assert summary["zone_success_rates"] == {}
+
+
+class TestZoneHealthRestoreDeque:
+    """Tests for the recent_outcomes deque restoration on startup."""
+
+    def _restore_zone_health(self, zone_health_state: dict) -> None:
+        """Simulate the startup restore logic from main.py lifespan."""
+        from collections import deque as _deque
+        from datetime import timezone as tz
+
+        compute._zone_health.clear()
+        for zone, data in zone_health_state.items():
+            if not isinstance(data, dict):
+                continue
+            restored = {}
+            for k, v in data.items():
+                if isinstance(v, str) and k in ("last_success", "last_failure", "cooldown_expires_at"):
+                    try:
+                        restored[k] = datetime.fromisoformat(v)
+                    except ValueError:
+                        continue
+                elif k == "recent_outcomes" and isinstance(v, list):
+                    restored[k] = _deque(v[-compute.ZONE_HISTORY_WINDOW:], maxlen=compute.ZONE_HISTORY_WINDOW)
+                else:
+                    restored[k] = v
+            compute._zone_health[zone] = restored
+
+    def test_recent_outcomes_restored_as_deque(self):
+        """recent_outcomes list from DB is converted to a deque with correct maxlen."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"consecutive_failures": 0, "recent_outcomes": [True, False, True]}})
+        outcomes = compute._zone_health[zone]["recent_outcomes"]
+        assert isinstance(outcomes, deque)
+        assert outcomes.maxlen == compute.ZONE_HISTORY_WINDOW
+        assert list(outcomes) == [True, False, True]
+
+    def test_recent_outcomes_capped_to_window(self):
+        """Persisted list longer than ZONE_HISTORY_WINDOW is truncated to the last N entries."""
+        zone = "us-central1-f"
+        oversized = [True] * 5 + [False] * (compute.ZONE_HISTORY_WINDOW + 5)
+        self._restore_zone_health({zone: {"recent_outcomes": oversized}})
+        outcomes = compute._zone_health[zone]["recent_outcomes"]
+        assert isinstance(outcomes, deque)
+        assert outcomes.maxlen == compute.ZONE_HISTORY_WINDOW
+        assert len(outcomes) == compute.ZONE_HISTORY_WINDOW
+        # Tail entries should all be False (the last ZONE_HISTORY_WINDOW elements)
+        assert all(v is False for v in outcomes)
+
+    def test_appending_beyond_window_evicts_old_entries(self):
+        """After restore, appending beyond maxlen still evicts the oldest entry."""
+        zone = "us-central1-f"
+        initial = [True] * compute.ZONE_HISTORY_WINDOW
+        self._restore_zone_health({zone: {"recent_outcomes": initial}})
+        outcomes = compute._zone_health[zone]["recent_outcomes"]
+        assert len(outcomes) == compute.ZONE_HISTORY_WINDOW
+        outcomes.append(False)  # Should evict oldest True
+        assert len(outcomes) == compute.ZONE_HISTORY_WINDOW
+        assert outcomes[-1] is False
+        assert outcomes[0] is True  # remaining entries still True
+
+    def test_missing_recent_outcomes_key_is_unaffected(self):
+        """Zones without recent_outcomes in persisted data are restored normally."""
+        zone = "us-central1-f"
+        self._restore_zone_health({zone: {"consecutive_failures": 2}})
+        assert "recent_outcomes" not in compute._zone_health[zone]
+        assert compute._zone_health[zone]["consecutive_failures"] == 2

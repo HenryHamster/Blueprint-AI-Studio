@@ -247,6 +247,10 @@ _ACTIONABLE_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API"})
 # Minimum occurrence_count in persistent_anomalies to trigger adjustments
 _ANOMALY_ACTION_THRESHOLD = 3
 
+# Fast-recovery: rolling window (hours) and minimum completions required
+_FAST_RECOVERY_WINDOW_HOURS = 2
+_FAST_RECOVERY_MIN_SAMPLE = 5
+
 
 def _apply_anomaly_adjustments() -> bool:
     """Check persistent anomalies across all projects and apply runtime adjustments.
@@ -334,9 +338,17 @@ def _check_anomaly_restoration() -> bool:
             break
 
     if still_active:
-        return False
+        # Fast-recovery path: restore proactively when recent outcomes are clean
+        # even though the anomaly occurrence_count hasn't dropped yet.
+        if not _check_fast_recovery():
+            return False
+        logger.info(
+            "[ANOMALY_ACTION] Fast recovery: no triggering failures in %dh window "
+            "with sufficient sample — restoring pipeline settings early",
+            _FAST_RECOVERY_WINDOW_HOURS,
+        )
 
-    # Anomalies cleared — restore previous values
+    # Anomalies cleared (normal path or fast recovery) — restore previous values
     pre_max_vms = adjustments["pre_adjustment_max_vms"]
     pre_gate = adjustments["pre_adjustment_failure_gate"]
 
@@ -368,6 +380,58 @@ def _check_anomaly_restoration() -> bool:
         f"max_vms={rc['max_concurrent_vms']}, "
         f"failure_gate={adjustments['failure_gate_threshold']}"
     )
+    return True
+
+
+def _check_fast_recovery() -> bool:
+    """Return True if recent task outcomes indicate the triggering issues have resolved.
+
+    Examines the rolling 2-hour task_results window.  Restoration is only allowed
+    when BOTH conditions hold:
+
+    1. At least ``_FAST_RECOVERY_MIN_SAMPLE`` completions (success or failure) exist
+       in the window — avoids false positives during idle periods.
+    2. Zero failures whose failure_class matches any trigger anomaly — a single
+       fresh failure of the triggering class keeps the throttle in place.
+
+    For PROVISION_FAILURE triggers an additional check is applied: zero
+    ``provision_timeout_pre_claim`` pipeline events in the same 2-hour window,
+    which confirms that the GCP zone layer is no longer rejecting VMs.
+
+    This is deliberately conservative: presence of *any* triggering failure in
+    the window blocks fast recovery, even if the overall failure rate is low.
+    """
+    adjustments = _shared_state.anomaly_adjustments
+    trigger_anomalies = set(adjustments.get("trigger_anomalies", []))
+    if not trigger_anomalies:
+        return False
+
+    cutoff = (_utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS)).isoformat()
+    recent_results = [
+        r for r in _shared_state.deploy_monitoring["task_results"]
+        if r[0] >= cutoff
+    ]
+
+    # Need a meaningful sample to avoid restoring during an idle lull
+    if len(recent_results) < _FAST_RECOVERY_MIN_SAMPLE:
+        return False
+
+    # Any failure of a triggering class blocks fast recovery
+    for r in recent_results:
+        if r[1] == "failure" and len(r) > 2 and r[2] in trigger_anomalies:
+            return False
+
+    # For PROVISION_FAILURE: also verify no recent provision timeout pipeline events
+    if "PROVISION_FAILURE" in trigger_anomalies:
+        window_cutoff_dt = _utcnow() - timedelta(hours=_FAST_RECOVERY_WINDOW_HOURS)
+        recent_provision_events = sum(
+            1 for e in _shared_state.deploy_monitoring["pipeline_events"]
+            if e.get("type") == "provision_timeout_pre_claim"
+            and e.get("ts") and e["ts"] >= window_cutoff_dt
+        )
+        if recent_provision_events > 0:
+            return False
+
     return True
 
 

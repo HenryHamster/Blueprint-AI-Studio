@@ -9,6 +9,8 @@ Also provides dispatch_external_notification() for fire-and-forget external webh
 from __future__ import annotations
 
 import asyncio
+import collections
+import dataclasses
 import logging
 import time
 import uuid
@@ -25,6 +27,125 @@ logger = logging.getLogger(__name__)
 # Module-level throttle tracking: event_type -> last dispatch monotonic time (seconds)
 _last_dispatch_time: dict[str, float] = {}
 
+# Delivery stats — module-level counters
+total_dispatched: int = 0
+total_delivered: int = 0
+total_failed: int = 0
+last_failure_reason: str = ""
+
+# HTTP status codes that indicate a permanent failure — don't retry these
+_PERMANENT_FAILURE_CODES: frozenset[int] = frozenset({401, 403, 404})
+
+# Retry delays in seconds: attempt 1 → 30s, attempt 2 → 120s, attempt 3 → 600s
+_RETRY_DELAYS: tuple[int, ...] = (30, 120, 600)
+
+
+@dataclasses.dataclass
+class _RetryEntry:
+    project_id: Any
+    event_type: str
+    payload: dict
+    body: dict  # pre-built JSON body
+    attempts: int  # number of attempts already made
+    next_retry_at: float  # monotonic time
+
+
+# Bounded in-memory retry queue (max 50 entries; oldest are dropped when full)
+_retry_queue: collections.deque[_RetryEntry] = collections.deque(maxlen=50)
+
+
+def get_notification_stats() -> dict:
+    """Return current delivery stats and retry queue depth."""
+    return {
+        "total_dispatched": total_dispatched,
+        "total_delivered": total_delivered,
+        "total_failed": total_failed,
+        "last_failure_reason": last_failure_reason,
+        "retry_queue_depth": len(_retry_queue),
+    }
+
+
+async def _attempt_delivery(webhook_url: str, body: dict) -> int:
+    """POST body to webhook_url. Returns HTTP status code, or 0 on network/timeout error."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(webhook_url, json=body)
+        return resp.status_code
+
+
+async def _drain_retry_queue(webhook_url: str) -> None:
+    """Process due retry entries, piggybacking on the next dispatch call."""
+    global total_delivered, total_failed, last_failure_reason
+
+    now = time.monotonic()
+    # Collect due entries (leave non-due entries in place)
+    due: list[_RetryEntry] = []
+    not_due: list[_RetryEntry] = []
+    for entry in _retry_queue:
+        if entry.next_retry_at <= now:
+            due.append(entry)
+        else:
+            not_due.append(entry)
+
+    if not due:
+        return
+
+    _retry_queue.clear()
+    for entry in not_due:
+        _retry_queue.append(entry)
+
+    for entry in due:
+        try:
+            status = await _attempt_delivery(webhook_url, entry.body)
+            if 200 <= status < 300:
+                total_delivered += 1
+                logger.info(
+                    f"[NOTIFY] Retry succeeded for {entry.event_type} "
+                    f"(attempt {entry.attempts + 1})"
+                )
+            elif status in _PERMANENT_FAILURE_CODES:
+                total_failed += 1
+                last_failure_reason = f"permanent {status}"
+                logger.warning(
+                    f"[NOTIFY] Retry permanently failed for {entry.event_type}: {status}"
+                )
+            elif entry.attempts + 1 < len(_RETRY_DELAYS):
+                # Schedule another retry
+                delay = _RETRY_DELAYS[entry.attempts + 1]
+                _retry_queue.append(dataclasses.replace(
+                    entry,
+                    attempts=entry.attempts + 1,
+                    next_retry_at=time.monotonic() + delay,
+                ))
+                logger.warning(
+                    f"[NOTIFY] Retry {entry.attempts + 1} failed for {entry.event_type} "
+                    f"({status}), next retry in {delay}s"
+                )
+            else:
+                total_failed += 1
+                last_failure_reason = f"max retries exceeded (last status: {status})"
+                logger.warning(
+                    f"[NOTIFY] Exhausted retries for {entry.event_type} after "
+                    f"{entry.attempts + 1} attempts"
+                )
+        except Exception as exc:
+            if entry.attempts + 1 < len(_RETRY_DELAYS):
+                delay = _RETRY_DELAYS[entry.attempts + 1]
+                _retry_queue.append(dataclasses.replace(
+                    entry,
+                    attempts=entry.attempts + 1,
+                    next_retry_at=time.monotonic() + delay,
+                ))
+                logger.warning(
+                    f"[NOTIFY] Retry {entry.attempts + 1} network error for "
+                    f"{entry.event_type}: {exc}"
+                )
+            else:
+                total_failed += 1
+                last_failure_reason = str(exc)
+                logger.warning(
+                    f"[NOTIFY] Exhausted retries for {entry.event_type}: {exc}"
+                )
+
 
 async def dispatch_external_notification(
     project_id: Any,
@@ -40,7 +161,14 @@ async def dispatch_external_notification(
     Never raises — callers must not fail because notification dispatch failed.
     Use asyncio.ensure_future() / asyncio.create_task() at call sites to make
     this truly non-blocking.
+
+    On 5xx or network/timeout failures, the notification is enqueued for retry
+    with exponential backoff (30s, 2min, 10min — 3 attempts max). 4xx permanent
+    errors (401, 403, 404) are not retried. The retry queue is bounded at 50
+    entries to cap memory use; oldest entries are dropped when full.
     """
+    global total_dispatched, total_delivered, total_failed, last_failure_reason
+
     try:
         from app.shared_state import runtime_config  # noqa: PLC0415
         nc = runtime_config.get("notification_config", {})
@@ -53,7 +181,7 @@ async def dispatch_external_notification(
         if event_type not in enabled_events:
             return
         # SSRF guard: only allow http(s) and block internal/metadata IPs
-        from urllib.parse import urlparse
+        from urllib.parse import urlparse  # noqa: PLC0415
         parsed_url = urlparse(webhook_url)
         if parsed_url.scheme not in ("http", "https"):
             logger.warning(f"[NOTIFY] Rejecting non-http(s) webhook URL: {parsed_url.scheme}")
@@ -71,18 +199,61 @@ async def dispatch_external_notification(
 
         _last_dispatch_time[event_type] = now
 
+        # Drain any due retries before making the new request
+        await _drain_retry_queue(webhook_url)
+
         body = {
             "event_type": event_type,
             "project_id": str(project_id),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
         }
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(webhook_url, json=body)
-            if resp.status_code >= 400:
+
+        total_dispatched += 1
+
+        try:
+            status = await _attempt_delivery(webhook_url, body)
+            if 200 <= status < 300:
+                total_delivered += 1
+            elif status in _PERMANENT_FAILURE_CODES:
+                total_failed += 1
+                last_failure_reason = f"permanent {status}"
                 logger.warning(
-                    f"[NOTIFY] External webhook {event_type} returned {resp.status_code}"
+                    f"[NOTIFY] External webhook {event_type} returned {status} (permanent)"
                 )
+            elif status >= 400:
+                # 5xx or unexpected 4xx — schedule first retry
+                delay = _RETRY_DELAYS[0]
+                _retry_queue.append(_RetryEntry(
+                    project_id=project_id,
+                    event_type=event_type,
+                    payload=payload,
+                    body=body,
+                    attempts=0,
+                    next_retry_at=time.monotonic() + delay,
+                ))
+                logger.warning(
+                    f"[NOTIFY] External webhook {event_type} returned {status}, "
+                    f"scheduled retry in {delay}s"
+                )
+            else:
+                # Unexpected status in 1xx/3xx range — treat as delivered
+                total_delivered += 1
+        except Exception as exc:
+            # Network/timeout error — schedule first retry
+            delay = _RETRY_DELAYS[0]
+            _retry_queue.append(_RetryEntry(
+                project_id=project_id,
+                event_type=event_type,
+                payload=payload,
+                body=body,
+                attempts=0,
+                next_retry_at=time.monotonic() + delay,
+            ))
+            logger.warning(
+                f"[NOTIFY] External webhook dispatch failed for {event_type}: {exc}, "
+                f"scheduled retry in {delay}s"
+            )
     except Exception as e:
         logger.warning(f"[NOTIFY] External webhook dispatch failed for {event_type}: {e}")
 

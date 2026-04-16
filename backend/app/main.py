@@ -353,6 +353,10 @@ async def _init_deployment_state():
                                 except ValueError:
                                     logger.warning(f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}")
                                     continue
+                            elif k == "recent_outcomes" and isinstance(v, list):
+                                from collections import deque as _deque
+                                from app.compute import ZONE_HISTORY_WINDOW
+                                restored[k] = _deque(v[-ZONE_HISTORY_WINDOW:], maxlen=ZONE_HISTORY_WINDOW)
                             else:
                                 restored[k] = v
                         _zone_health[zone] = restored
@@ -754,6 +758,16 @@ def _get_zone_health_summary() -> dict:
     except Exception:
         return {"total_zones": 0, "available": 0, "exhausted": []}
 
+
+def _get_notification_stats() -> dict:
+    """Return notification delivery stats from notification_dispatch module."""
+    try:
+        from app.notification_dispatch import get_notification_stats  # noqa: PLC0415
+        return get_notification_stats()
+    except Exception:
+        return {}
+
+
 @app.get("/api/debug/orchestrator")
 async def debug_orchestrator(session: AsyncSession = Depends(get_session), current_user: dict = Depends(get_current_user)):
     """Diagnostic endpoint: check if the orchestrator loop is alive."""
@@ -839,6 +853,7 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
             "external_health": _shared_state.external_health,
         },
         "zone_health": _get_zone_health_summary(),
+        "notification_stats": _get_notification_stats(),
     }
 
 @app.get("/api/health/detailed")
