@@ -988,6 +988,25 @@ def cmd_directions(args):
             print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
 
 
+def cmd_unhold_direction(args):
+    """Clear a direction's consecutive-failure hold.
+
+    Usage: tasks.py unhold-direction <direction_id>
+    """
+    from blueprint_api import api, get_project_id
+    if not args:
+        print("Usage: tasks.py unhold-direction <direction_id>")
+        return
+    did = args[0]
+    pid = get_project_id()
+    result = api("POST", f"/api/admin/projects/{pid}/directions/{did}/unhold")
+    was_held = result.get("was_held", False)
+    if was_held:
+        print(f"Unheld direction {did}")
+    else:
+        print(f"Direction {did} was not held (idempotent)")
+
+
 def cmd_add_direction(args):
     """Add a new research direction.
 
@@ -1451,6 +1470,7 @@ COMMANDS = {
     "directions": cmd_directions,
     "add-direction": cmd_add_direction,
     "update-direction": cmd_update_direction,
+    "unhold-direction": cmd_unhold_direction,
     "autonomy-debug": cmd_autonomy_debug,
     "archive": cmd_archive,
     "research": cmd_research,

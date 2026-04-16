@@ -114,6 +114,59 @@ async def test_get_directions_returns_created(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_unhold_direction_clears_hold(client: AsyncClient, mocker):
+    """POST /unhold clears an existing direction hold and reports was_held=True."""
+    import app.shared_state as _ss
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+    did = direction["id"]
+
+    # Drive the direction into a held state
+    _ss.direction_failure_streaks.clear()
+    for _ in range(_ss.DIRECTION_HOLD_THRESHOLD):
+        _ss.record_direction_result(did, success=False, failure_class="CODE_ERROR")
+    assert _ss.is_direction_held(did)[0]
+
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project_id}/directions/{did}/unhold",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "unheld"
+        assert body["direction_id"] == did
+        assert body["was_held"] is True
+        assert not _ss.is_direction_held(did)[0]
+    finally:
+        _ss.direction_failure_streaks.clear()
+
+
+@pytest.mark.asyncio
+async def test_unhold_direction_idempotent_when_not_held(client: AsyncClient, mocker):
+    """POST /unhold on a healthy direction returns 200 with was_held=False."""
+    import app.shared_state as _ss
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    _ss.direction_failure_streaks.clear()
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}/unhold",
+    )
+    assert resp.status_code == 200
+    assert resp.json()["was_held"] is False
+
+
+@pytest.mark.asyncio
+async def test_unhold_direction_not_found_returns_404(client: AsyncClient, mocker):
+    """POST /unhold on an unknown direction id returns 404."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-does-not-exist/unhold",
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_update_direction_priority(client: AsyncClient, mocker):
     """PATCH updates direction priority."""
     project_id = await _deploy_project(client, mocker)

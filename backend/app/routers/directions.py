@@ -437,6 +437,33 @@ async def create_direction_research_task(
     }
 
 
+@router.post("/projects/{project_id}/directions/{direction_id}/unhold")
+async def unhold_direction(
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Clear a direction's consecutive-failure hold so new tasks dispatch again.
+
+    Returns was_held=True if a hold was actually in place, False if the
+    direction was already healthy (idempotent).
+    """
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    direction = next((d for d in (project.directions or []) if d.get("id") == direction_id), None)
+    if not direction:
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    import app.shared_state as _ss  # noqa: PLC0415
+    was_held, _ = _ss.is_direction_held(direction_id)
+    _ss.clear_direction_hold(direction_id)
+    logger.info(
+        f"[DIRECTION] Hold cleared for {direction_id} by {current_user.get('email', current_user['user_id'])} "
+        f"(was_held={was_held})"
+    )
+    return {"status": "unheld", "direction_id": direction_id, "was_held": was_held}
+
+
 @router.post("/projects/{project_id}/strategic-cycle")
 async def trigger_strategic_cycle(
     project_id: uuid.UUID,
