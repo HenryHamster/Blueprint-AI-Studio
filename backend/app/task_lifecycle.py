@@ -149,7 +149,15 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child_ctx = child.context or {}
         task_scope = child_ctx.get("scope", "medium")
         attempt = child_ctx.get("_attempt_number", 1)
-        clone_ctx = {k: v for k, v in child_ctx.items() if k != "max_plan_account_id"}
+        _ctx_keys_to_strip = {
+            "max_plan_account_id",
+            "provision_failures",
+            "provision_failures_infra",
+            "_infra_wait",
+            "blacklisted_accounts",
+            "_slot_released",
+        }
+        clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
         clone_ctx["_attempt_number"] = attempt + 1
         clone_ctx["_previous_error"] = (original_status_message or "")[:1500]
         clone_ctx["_previous_failure_class"] = failure_class

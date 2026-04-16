@@ -13,9 +13,9 @@ from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
-from app.shared_state import record_pipeline_event
+from app.shared_state import record_pipeline_event, external_health as _external_health
+from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
 from app.time_utils import _utcnow
-from app.failure_classification import classify_failure, persist_failure_category
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,6 @@ async def reaper_service():
         _maybe_create_failure_alert,
     )
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
     from app.broadcast import broadcast_to_project  # noqa: PLC0415
     from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
     from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
@@ -623,7 +622,10 @@ async def reaper_service():
                         if any(c.status == TaskStatus.COMPLETED for c in children):
                             # Step 3 handles this; skip.
                             continue
-                        # All children are terminal and none completed — rescue the parent.
+                        # All children are terminal and none completed — attempt re-evaluation
+                        # via _requeue_parent_task which clones failed children with retry
+                        # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
+                        # exhausted it marks the parent FAILED and fires a failure alert.
                         failed_children = [c for c in children if c.status == TaskStatus.FAILED]
                         cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
                         # Build a diagnostic message including child failure classes.
@@ -641,10 +643,8 @@ async def reaper_service():
                         parent.latest_status_message = (
                             f"All child tasks terminated without success: {diag}"
                         )
-                        parent.status = TaskStatus.FAILED
-                        _fc = classify_failure(parent)
-                        persist_failure_category(parent, _fc)
                         session.add(parent)
+                        await _requeue_parent_task(parent, session)
                         rescued += 1
                         logger.warning(
                             f"[REAPER] Rescued stuck EVALUATING parent {parent.id}: {diag}"
@@ -654,6 +654,123 @@ async def reaper_service():
                         logger.info(f"[REAPER] Rescued {rescued} all-children-failed EVALUATING parents")
                 except Exception as e:
                     logger.error(f"[REAPER] All-children-failed rescue error: {e}", exc_info=True)
+
+                # Step 5: Infrastructure recovery sweep — resurrect recently-failed tasks
+                # that exhausted their retry budget due to transient infrastructure failures
+                # once the specific root cause has resolved.  Conservative: max 1 resurrection
+                # per task, only for confirmed infra failure classes, only when infra is healthy.
+                try:
+                    from app.max_plan_pool import _all_accounts, _account_available_for_model  # noqa: PLC0415
+                    _infra_lookback = now - timedelta(hours=2)
+                    _infra_failed = (await session.execute(
+                        select(Task).where(
+                            Task.status == TaskStatus.FAILED,
+                            Task.updated_at >= _infra_lookback,
+                        )
+                    )).scalars().all()
+
+                    _resurrected = 0
+                    for _t in _infra_failed:
+                        _ctx = _t.context or {}
+                        # Only resurrect infra-class failures, and only once per task.
+                        _fail_cat = _ctx.get("failure_category", "")
+                        if _fail_cat not in INFRA_CLASSES:
+                            continue
+                        if _ctx.get("_resurrection_count", 0) >= 1:
+                            continue
+
+                        # Check that the specific infrastructure issue has resolved.
+                        _infra_ready = False
+                        if _fail_cat == "PROVISION_FAILURE":
+                            _infra_ready = any_zone_available()
+                        elif _fail_cat == "RATE_LIMIT":
+                            # Need at least one available account for this task's model
+                            # that isn't already blacklisted by this task.
+                            _task_model = _extract_task_model(_t)
+                            _task_type = (_t.first_payload or {}).get("type", "create")
+                            if not _task_model:
+                                _task_model = _runtime_config.get("task_type_models", {}).get(_task_type)
+                            _blacklisted = set(_ctx.get("blacklisted_accounts") or [])
+                            _accounts = _all_accounts()
+                            _infra_ready = any(
+                                acct.get("id") not in _blacklisted
+                                and _account_available_for_model(acct, _task_model)
+                                for acct in _accounts
+                            )
+                        elif _fail_cat == "EXTERNAL_API":
+                            _infra_ready = (
+                                _external_health.get("github_api", False)
+                                and _external_health.get("claude_api", False)
+                            )
+
+                        if not _infra_ready:
+                            continue
+
+                        # Resurrect: reset to QUEUED with a clean slate.
+                        logger.info(
+                            f"[REAPER] Resurrecting infra-failed task {_t.id} "
+                            f"(failure_category={_fail_cat}) — infrastructure recovered"
+                        )
+                        _new_ctx = dict(_ctx)
+                        _new_ctx["_resurrection_count"] = _ctx.get("_resurrection_count", 0) + 1
+                        _new_ctx["_resurrected_from"] = _fail_cat
+                        # Clear all infra retry state so the task runs like a fresh dispatch.
+                        _new_ctx.pop("provision_failures", None)
+                        _new_ctx.pop("provision_failures_infra", None)
+                        _new_ctx.pop("_infra_wait", None)
+                        _new_ctx.pop("blacklisted_accounts", None)
+                        _new_ctx.pop("max_plan_account_id", None)
+                        _new_ctx.pop("_slot_released", None)
+                        _new_ctx.pop("retry_after", None)
+                        _new_ctx.pop("failure_category", None)
+                        _t.context = _new_ctx
+                        _t.attempt_count = 0
+                        _t.status = TaskStatus.QUEUED
+                        _t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                        _t.last_heartbeat = None
+                        _t.started_at = None
+                        _t.latest_status_message = (
+                            f"Auto-resurrected after infrastructure recovery "
+                            f"(was: {_fail_cat})"
+                        )
+                        session.add(_t)
+
+                        # INFO alert so the user knows recovery happened.
+                        try:
+                            from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                            _task_type_label = (_t.first_payload or {}).get("type", "unknown")
+                            _res_alert = Alert(
+                                project_id=_t.project_id,
+                                severity=AlertSeverity.INFO,
+                                title=f"Task auto-resurrected: {_t.title or str(_t.id)[:8]}",
+                                message=(
+                                    f"Task type: {_task_type_label}. "
+                                    f"Infrastructure failure ({_fail_cat}) resolved — "
+                                    f"task re-queued automatically."
+                                ),
+                                task_id=_t.id,
+                            )
+                            session.add(_res_alert)
+                            await broadcast_to_project(
+                                str(_t.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(_res_alert.id),
+                                    "severity": "INFO",
+                                    "title": _res_alert.title,
+                                },
+                            )
+                        except Exception as _alert_err:
+                            logger.warning(f"[REAPER] Resurrection alert failed for {_t.id}: {_alert_err}")
+
+                        _resurrected += 1
+
+                    if _resurrected:
+                        await session.commit()
+                        logger.info(f"[REAPER] Resurrected {_resurrected} infra-failed task(s)")
+
+                except Exception as e:
+                    logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
 
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")

@@ -342,11 +342,14 @@ async def orchestrator_worker():
                         if provision_failures >= _runtime_config.get("max_provision_retries", 3):
                             fresh_t.status = TaskStatus.FAILED
                             fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
+                            fresh_t.context = {**(fresh_t.context or {}), "failure_category": "PROVISION_FAILURE", "provision_failures": provision_failures}
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
                             acct_id = (fresh_t.context or {}).get("max_plan_account_id")
                             if acct_id:
                                 await release_max_plan_account(acct_id)
                             session.add(fresh_t)
+                            await _maybe_create_failure_alert(fresh_t, session, f"Provision failed {provision_failures} times — exceeded retry limit")
+                            record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(fresh_t.id), task_type=(fresh_t.first_payload).get("type", ""))
                             continue
                         stale_vm_ids.append(fresh_t.vm_instance_id)
                         # Release Max Plan account slot before requeueing
@@ -1339,6 +1342,8 @@ async def orchestrator_worker():
                                 ci_task.requires_approval = True
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                 logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
+                                await _maybe_create_failure_alert(ci_task, session, f"PR #{ci_pr_number} merge conflicts — fix iteration cap exhausted, manual intervention required")
+                                record_task_result(success=False, failure_class="CODE_ERROR", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -1417,6 +1422,8 @@ async def orchestrator_worker():
                                 ci_task.status = TaskStatus.FAILED
                                 ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
                                 logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
+                                await _maybe_create_failure_alert(ci_task, session, "CI polling failed: PR returned 404 — PR may have been deleted or archived")
+                                record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             else:
                                 ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
                             session.add(ci_task)

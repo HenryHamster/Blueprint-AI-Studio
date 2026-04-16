@@ -786,6 +786,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
                             record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                            await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
@@ -826,6 +827,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         _fc = classify_failure(parent)
                         persist_failure_category(parent, _fc)
                         record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                        await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.

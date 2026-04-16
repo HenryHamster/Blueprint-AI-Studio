@@ -106,7 +106,7 @@ async def orch_db(mocker):
     mocker.patch("app.main.select_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.release_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.record_task_result", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result")  # sync function, no AsyncMock needed
     mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
@@ -378,6 +378,41 @@ async def test_reaper_uses_fresh_task_for_modifications(orch_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_stale_provision_failure_creates_alert(orch_db, mocker):
+    """When a PROVISIONING task exceeds its provision retry limit, _maybe_create_failure_alert
+    must be called so the failure is visible to users (not a silent failure)."""
+    session, _Session = orch_db
+
+    project = Project(name="Alert Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "alert test"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id="agent-vm-alert-001",
+        started_at=_naive_utc_ago(minutes=15),
+        last_heartbeat=None,
+        context={"provision_failures": 2},
+    )
+    session.add(stale_task)
+    await session.commit()
+    await session.refresh(stale_task)
+
+    # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    await _run_one_cycle(mocker)
+
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args
+    assert "provision" in call_args[0][2].lower(), (
+        f"Alert error_snippet should mention provisioning, got: {call_args[0][2]!r}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 4 — CI polling fails task on deleted PR (404)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -442,6 +477,54 @@ async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
         f"A 404 on the PR means it was deleted and should not be polled forever."
     )
     assert updated.latest_status_message, "Expected a failure message to be set"
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
+    """When a PR returns 404 during CI polling, _maybe_create_failure_alert must be
+    called so the silent failure is visible to users."""
+    session, _Session = orch_db
+
+    project = Project(name="CI 404 Alert Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci alert test", "branch": "feat/alert"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 99,
+                "branch": "feat/alert",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+
+    class _NotFoundError(Exception):
+        status_code = 404
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 side_effect=_NotFoundError("PR not found"))
+
+    # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    await _run_one_cycle(mocker)
+
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args
+    assert "404" in call_args[0][2], (
+        f"Alert error_snippet should mention 404, got: {call_args[0][2]!r}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
