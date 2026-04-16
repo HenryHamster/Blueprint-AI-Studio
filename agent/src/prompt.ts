@@ -970,6 +970,8 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
   try {
     const CAP = 2000;
     const entries: string[] = [];
+    const processedFiles: string[] = [];
+    const fileCallers = new Map<string, string[]>();
 
     for (const relFile of relatedFiles) {
       // Skip test files — their exports are not caller-facing APIs
@@ -1010,11 +1012,54 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
         entry += `\n  Imported by: ${callers.join(', ')}`;
       }
       entries.push(entry);
+      processedFiles.push(relFile);
+      fileCallers.set(relFile, callers);
     }
 
     if (entries.length === 0) return '';
 
-    const body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+    let body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+
+    // ── Suggested Change Order ───────────────────────────────────────────────
+    // Analyze import dependencies between related files and topologically sort.
+    if (processedFiles.length > 1) {
+      try {
+        const pSet = new Set(processedFiles);
+        const dependsOn = new Map(processedFiles.map(f => [f, new Set<string>()]));
+        for (const [file, callers] of fileCallers)
+          for (const caller of callers)
+            if (pSet.has(caller)) dependsOn.get(caller)!.add(file);
+
+        if ([...dependsOn.values()].some(d => d.size > 0)) {
+          const consumers = new Map(processedFiles.map(f => [f, new Set<string>()]));
+          for (const [f, deps] of dependsOn)
+            for (const dep of deps) consumers.get(dep)!.add(f);
+
+          const inDeg = new Map(processedFiles.map(f => [f, dependsOn.get(f)!.size]));
+          const queue = processedFiles.filter(f => inDeg.get(f) === 0);
+          const order: string[] = [];
+          while (queue.length > 0) {
+            const f = queue.shift()!;
+            order.push(f);
+            for (const c of consumers.get(f)!) {
+              inDeg.set(c, inDeg.get(c)! - 1);
+              if (inDeg.get(c) === 0) queue.push(c);
+            }
+          }
+          if (order.length === processedFiles.length) {
+            const lines = order.map((f, i) => {
+              const deps = dependsOn.get(f)!;
+              const note = deps.size > 0
+                ? ` (imports from ${[...deps].map(d => d.split('/').pop() || d).join(', ')})`
+                : ' (no dependencies on other changed files)';
+              return `${i + 1}. ${f.split('/').pop() ?? f}${note}`;
+            });
+            body += `## Suggested Change Order\nBased on import dependencies between files you are modifying:\n${lines.join('\n')}\n\nModify foundational files first, then update their consumers.\n\n`;
+          }
+        }
+      } catch { /* dependency analysis failed — skip silently */ }
+    }
+
     return body.slice(0, CAP);
   } catch (e) {
     sendLog(ws, `Warning: module interface extraction failed: ${String(e)}\n`);
