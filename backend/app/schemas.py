@@ -29,6 +29,7 @@ class AgentStatusPayload(BaseModel):
     test_failure_summary: Optional[str] = Field(None, max_length=5000)
     self_review_outcome: Optional[Dict[str, Any]] = None
     diff_summary: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
+    file_change_details: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

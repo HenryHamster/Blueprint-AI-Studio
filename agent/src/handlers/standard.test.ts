@@ -35,12 +35,14 @@ vi.mock('../prompt.js', () => ({
   buildContextPrefix: vi.fn().mockReturnValue(''),
   buildFileTree: vi.fn().mockReturnValue(''),
   discoverRelatedTests: vi.fn().mockReturnValue(''),
+  discoverModuleInterfaces: vi.fn().mockReturnValue(''),
   configureAgentPermissions: vi.fn().mockReturnValue([]),
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   formatPlaybook: vi.fn().mockReturnValue(''),
   buildRetryContext: vi.fn().mockReturnValue(''),
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
+  buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
 }));
 
@@ -291,7 +293,9 @@ describe('module interface extraction', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
-    expect(capturedPrompt()).toContain('## Module Interfaces');
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Module Interfaces');
   });
 
   it('calls extractModuleInterfaces for handleCreate with scope=large', async () => {
@@ -316,7 +320,9 @@ describe('module interface extraction', () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
-    expect(capturedPrompt()).toContain('## Module Interfaces');
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Module Interfaces');
   });
 
   it('does not call extractModuleInterfaces for handleRefactor with scope=small', async () => {
@@ -697,6 +703,109 @@ describe('test baseline capture', () => {
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
       WS, expect.any(Object), undefined, undefined, undefined, undefined, relatedFiles,
     );
+  });
+});
+
+// ── Two-phase analysis for medium-scope tasks ────────────────────────────────
+describe('two-phase analysis for medium-scope tasks', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('runs analysis phase before main invocation for medium-scope create tasks', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // First call is the analysis (read-only), second is the main invocation
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const analysisCallArgs = vi.mocked(runClaudeCode).mock.calls[0];
+    // Analysis call passes disallowedTools including Write, Edit, NotebookEdit
+    expect(analysisCallArgs[5]).toEqual(expect.arrayContaining(['Write', 'Edit', 'NotebookEdit']));
+  });
+
+  it('skips analysis phase when scope is "small"', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'small' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips analysis phase when scope is not set', async () => {
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('prepends analysis result to main prompt when analysis succeeds', async () => {
+    const analysisOutput = 'Files to change: foo.ts\nInterfaces to preserve: Foo interface';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: analysisOutput })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('Pre-Implementation Analysis');
+    expect(mainPrompt).toContain(analysisOutput);
+  });
+
+  it('proceeds without analysis context when analysis exits non-zero', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 1, allOutput: 'error', lastResultText: '' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).not.toContain('Pre-Implementation Analysis');
+  });
+
+  it('proceeds without analysis context when analysis returns empty output', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '   ' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).not.toContain('Pre-Implementation Analysis');
+  });
+
+  it('runs analysis phase for medium-scope refactor tasks', async () => {
+    const task = {
+      title: 'Refactor task',
+      description: '',
+      context: { scope: 'medium' },
+    };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const analysisCallArgs = vi.mocked(runClaudeCode).mock.calls[0];
+    expect(analysisCallArgs[5]).toEqual(expect.arrayContaining(['Write', 'Edit', 'NotebookEdit']));
   });
 });
 

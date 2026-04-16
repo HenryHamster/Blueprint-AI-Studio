@@ -388,6 +388,11 @@ async def update_agent_status(
         ctx = dict(task.context or {})
         ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
         task.context = ctx
+    if payload.file_change_details:
+        ctx = dict(task.context or {})
+        ctx['_file_change_details'] = payload.file_change_details[:50]
+        task.context = ctx
+        flag_modified(task, 'context')
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
