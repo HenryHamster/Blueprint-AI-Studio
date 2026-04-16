@@ -189,3 +189,26 @@ def test_infra_classes_includes_external_api():
     assert "RATE_LIMIT" in INFRA_CLASSES
     assert "AGENT_TIMEOUT" in INFRA_CLASSES
     assert "CODE_ERROR" not in INFRA_CLASSES
+
+
+# ── Cascade cancellation classifier ───────────────────────────────────────────
+
+def test_cascade_dependency_task_failed_is_agent_timeout():
+    """'Cancelled: dependency task failed' (set on directly-cancelled parent task)
+    must classify as AGENT_TIMEOUT — it's an orchestrator decision, not a code defect."""
+    assert classify_failure(_task("Cancelled: dependency task failed")) == "AGENT_TIMEOUT"
+
+
+def test_cascade_parent_dependency_failed_is_agent_timeout():
+    """'Cancelled: parent dependency failed' (set on children) must classify as AGENT_TIMEOUT."""
+    assert classify_failure(_task("Cancelled: parent dependency failed")) == "AGENT_TIMEOUT"
+
+
+def test_cascade_parent_evaluation_timeout_is_agent_timeout():
+    """Existing 'cancelled: parent evaluation timeout' pattern still matches after broadening."""
+    assert classify_failure(_task("Cancelled: parent evaluation timeout")) == "AGENT_TIMEOUT"
+
+
+def test_cancelled_prefix_broad_match():
+    """Any message starting with 'cancelled:' is treated as AGENT_TIMEOUT."""
+    assert classify_failure(_task("Cancelled: some new orchestrator reason")) == "AGENT_TIMEOUT"
