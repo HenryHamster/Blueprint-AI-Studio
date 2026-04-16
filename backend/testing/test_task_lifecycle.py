@@ -27,6 +27,8 @@ from app.task_lifecycle import (
     _requeue_parent_task,
     _merge_with_retry,
     _process_post_commit,
+    _extract_failing_tests,
+    _extract_error_files,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -408,6 +410,257 @@ async def test_requeue_skips_non_failed_children(tl_db, mocker):
     await session.refresh(queued_child)
     assert completed_child.status == TaskStatus.COMPLETED
     assert queued_child.status == TaskStatus.QUEUED
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _extract_failing_tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_extract_failing_tests_pytest_pattern():
+    """Extracts pytest FAILED path::test_name identifiers."""
+    text = (
+        "short summary info\n"
+        "FAILED testing/test_foo.py::test_bar - AssertionError\n"
+        "FAILED testing/test_foo.py::test_baz[param1]\n"
+        "1 passed, 2 failed\n"
+    )
+    result = _extract_failing_tests(text)
+    assert result == [
+        "testing/test_foo.py::test_bar",
+        "testing/test_foo.py::test_baz[param1]",
+    ]
+
+
+def test_extract_failing_tests_jest_vitest_pattern():
+    """Extracts Jest/Vitest FAIL suite/test identifiers."""
+    text = "FAIL src/components/Foo.test.tsx\nFAIL src/utils/bar.test.ts\n✓ passes"
+    result = _extract_failing_tests(text)
+    assert "src/components/Foo.test.tsx" in result
+    assert "src/utils/bar.test.ts" in result
+
+
+def test_extract_failing_tests_error_lines():
+    """Extracts 'Error: ...' lines as test identifiers."""
+    text = "Error: Cannot find module './missing'\nError: Expected 1 but got 2\n"
+    result = _extract_failing_tests(text)
+    assert any("Cannot find module" in r for r in result)
+    assert any("Expected 1 but got 2" in r for r in result)
+
+
+def test_extract_failing_tests_dedup_and_limit():
+    """Deduplicates entries and caps result at 10."""
+    # 12 unique pytest failures
+    lines = "\n".join(f"FAILED testing/test_x.py::test_{i}" for i in range(12))
+    # Plus one duplicate
+    lines += "\nFAILED testing/test_x.py::test_0"
+    result = _extract_failing_tests(lines)
+    assert len(result) == 10
+    assert len(set(result)) == 10  # No duplicates
+
+
+def test_extract_failing_tests_empty_text():
+    """Returns empty list for text with no recognized patterns."""
+    assert _extract_failing_tests("all tests passed") == []
+    assert _extract_failing_tests("") == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _extract_error_files
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_extract_error_files_python_traceback():
+    """Extracts file paths from Python tracebacks."""
+    text = (
+        'Traceback (most recent call last):\n'
+        '  File "backend/app/task_lifecycle.py", line 132, in _requeue_parent_task\n'
+        '    result = do_something()\n'
+        '  File "backend/app/models.py", line 45, in some_method\n'
+        '    raise ValueError("oops")\n'
+    )
+    result = _extract_error_files(text)
+    assert "backend/app/task_lifecycle.py" in result
+    assert "backend/app/models.py" in result
+
+
+def test_extract_error_files_typescript_pattern():
+    """Extracts file paths from TypeScript/ESLint :line:col errors."""
+    text = (
+        "src/components/Foo.tsx:45:10 - error TS2304: Cannot find name 'Bar'\n"
+        "agent/src/index.ts:123:5 - error TS2345: Argument type mismatch\n"
+        "no-slash-file.ts:1:1 - this should not match (no path separator)\n"
+    )
+    result = _extract_error_files(text)
+    assert "src/components/Foo.tsx" in result
+    assert "agent/src/index.ts" in result
+    # File without path separator should be excluded
+    assert "no-slash-file.ts" not in result
+
+
+def test_extract_error_files_dedup_and_limit():
+    """Deduplicates file paths and caps result at 5."""
+    lines = "\n".join(
+        f'  File "backend/app/module_{i}.py", line {i}'
+        for i in range(7)
+    )
+    # Add a duplicate
+    lines += '\n  File "backend/app/module_0.py", line 99'
+    result = _extract_error_files(lines)
+    assert len(result) == 5
+    assert len(set(result)) == 5
+
+
+def test_extract_error_files_empty_text():
+    """Returns empty list for text with no recognized patterns."""
+    assert _extract_error_files("no errors here") == []
+    assert _extract_error_files("") == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _requeue_parent_task — enhanced error context
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_requeue_previous_error_allows_5000_chars(tl_db, mocker):
+    """_previous_error propagates up to 5000 characters (not truncated at 1500)."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    long_message = "x" * 4000  # 4000 chars — fits under 5000, was cut by old 1500 limit
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message=long_message,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    assert len(clone.context["_previous_error"]) == 4000
+
+
+@pytest.mark.asyncio
+async def test_requeue_sets_previous_failing_tests_from_status_message(tl_db, mocker):
+    """_previous_failing_tests is extracted from the child's status message."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    error_msg = (
+        "short\n"
+        "FAILED testing/test_foo.py::test_alpha - assert False\n"
+        "FAILED testing/test_foo.py::test_beta\n"
+    )
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message=error_msg,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    failing_tests = clone.context.get("_previous_failing_tests", [])
+    assert "testing/test_foo.py::test_alpha" in failing_tests
+    assert "testing/test_foo.py::test_beta" in failing_tests
+
+
+@pytest.mark.asyncio
+async def test_requeue_sets_previous_error_files_from_last_error_log(tl_db, mocker):
+    """_previous_error_files is extracted from context['last_error'] logs."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    last_error_log = (
+        'Traceback (most recent call last):\n'
+        '  File "backend/app/models.py", line 55, in _check\n'
+        '    raise AssertionError("bad")\n'
+    )
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1, "last_error": last_error_log},
+        latest_status_message="Tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    error_files = clone.context.get("_previous_error_files", [])
+    assert "backend/app/models.py" in error_files
+
+
+@pytest.mark.asyncio
+async def test_requeue_code_error_injects_failing_tests_into_prompt_suffix(tl_db, mocker):
+    """CODE_ERROR failure includes extracted test names in prompt_suffix."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    error_msg = (
+        "pytest failed\n"
+        "FAILED testing/test_task_lifecycle.py::test_requeue_skips_cancelled_parent\n"
+        "1 failed\n"
+    )
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message=error_msg,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "testing/test_task_lifecycle.py::test_requeue_skips_cancelled_parent" in prompt_suffix
+
+
+@pytest.mark.asyncio
+async def test_requeue_code_error_injects_error_files_into_prompt_suffix(tl_db, mocker):
+    """CODE_ERROR failure includes extracted file paths in prompt_suffix."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    error_msg = 'tsc error\nsrc/agent/index.ts:42:10 - error TS2304: Cannot find name'
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message=error_msg,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "src/agent/index.ts" in prompt_suffix
 
 
 # ══════════════════════════════════════════════════════════════════════════════
