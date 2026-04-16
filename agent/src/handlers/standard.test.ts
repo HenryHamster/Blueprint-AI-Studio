@@ -543,9 +543,73 @@ describe('self-review phase', () => {
       c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { categories: string[] };
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { categories: string[]; passes: number };
     expect(outcome).toBeDefined();
     expect(outcome.categories).toContain('self_review_failed');
+    expect(outcome.passes).toBe(1);
+  });
+
+  it('runs verification pass (pass 2) when pass 1 applied fixes', async () => {
+    // main task → pass 1 (fixes applied) → pass 2 (verification) = 3 runClaudeCode calls total
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD before Claude)
+      .mockReturnValueOnce('M file')   // hasChanges (status --porcelain)
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied → triggers pass 2
+      .mockReturnValueOnce('M fixed')  // statusAfterReview
+      .mockReturnValue('');            // headAfterVerify, statusAfterVerify, remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // 3 calls: main task, self-review pass 1, verification pass 2
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+  });
+
+  it('skips verification pass when pass 1 finds no issues', async () => {
+    // headBefore === headAfter → no fixes → no pass 2 → 2 runClaudeCode calls total
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterReview — SAME → no fixes → skip pass 2
+      .mockReturnValueOnce('')         // statusAfterReview
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Only 2 calls: main task + self-review pass 1 (no verification pass)
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+  });
+
+  it('tracks passes and total_fixes in selfReviewOutcome metadata', async () => {
+    // pass 1 applies fixes → triggers pass 2 verification
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes_applied
+      .mockReturnValueOnce('M fixed')  // statusAfterReview
+      .mockReturnValueOnce('def456')   // headAfterVerify — SAME as headAfterReview → no new fixes
+      .mockReturnValueOnce('M fixed')  // statusAfterVerify
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { fixes_applied: boolean; passes: number; total_fixes: number };
+    expect(outcome).toBeDefined();
+    expect(outcome.fixes_applied).toBe(true);
+    expect(outcome.passes).toBe(2);
+    expect(outcome.total_fixes).toBe(1);
   });
 });
 
