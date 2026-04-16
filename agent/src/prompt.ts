@@ -370,12 +370,85 @@ export function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
+// ── Test Convention Extraction ───────────────────────────────────────────────
+// Cache: dirKey → convention summary string. Populated once per task invocation.
+const _testConventionCache = new Map<string, string>();
+
+/**
+ * Scan test files in the given directory and extract conventions:
+ * fixtures, mock libraries, setup patterns, assertion style.
+ * Returns a compact summary (<=500 chars). Cached per dirKey.
+ */
+export function extractTestConventions(dirKey: string, testFiles: string[]): string {
+  if (_testConventionCache.has(dirKey)) return _testConventionCache.get(dirKey)!;
+
+  const fixtures = new Set<string>();
+  const mockImports = new Set<string>();
+  const setupPatterns = new Set<string>();
+  const assertionStyles = new Set<string>();
+
+  for (const tf of testFiles.slice(0, 6)) {
+    const full = `${WORKSPACE}/${tf}`;
+    if (!fs.existsSync(full)) continue;
+    try {
+      const lines = fs.readFileSync(full, 'utf-8').split('\n').slice(0, 120);
+      for (const line of lines) {
+        // Python fixture decorators (names extracted below via full-content regex)
+        // Python mock imports
+        if (line.match(/from\s+unittest\.mock\s+import/)) {
+          const imported = line.match(/import\s+(.+)/)?.[1].trim();
+          if (imported) mockImports.add(`unittest.mock: ${imported.slice(0, 50)}`);
+        }
+        if (line.match(/from\s+pytest_mock/)) mockImports.add('pytest_mock');
+        // JS/TS mock imports
+        if (line.match(/vi\.fn\(\)|vi\.mock\(|vitest/)) mockImports.add('vitest (vi.fn/vi.mock)');
+        if (line.match(/jest\.fn\(\)|jest\.mock\(/)) mockImports.add('jest');
+        // Setup patterns
+        if (line.match(/beforeEach\s*\(/)) setupPatterns.add('beforeEach');
+        if (line.match(/afterEach\s*\(/)) setupPatterns.add('afterEach');
+        if (line.match(/beforeAll\s*\(/)) setupPatterns.add('beforeAll');
+        if (line.match(/def\s+setup(?:_method)?\s*\(/)) setupPatterns.add('setUp');
+        if (line.match(/@pytest\.fixture/)) setupPatterns.add('@pytest.fixture');
+        if (line.match(/@pytest_asyncio\.fixture/)) setupPatterns.add('@pytest_asyncio.fixture');
+        // Assertion styles
+        if (line.match(/expect\s*\(.*\)\.(toBe|toEqual|toHaveBeenCalled)/)) assertionStyles.add('expect().toBe/toEqual');
+        if (line.match(/\bassert\s+/)) assertionStyles.add('assert');
+        if (line.match(/pytest\.raises\s*\(/)) assertionStyles.add('pytest.raises');
+        if (line.match(/assert_called(?:_once)?_with/)) assertionStyles.add('mock.assert_called_with');
+        if (line.match(/AsyncMock\s*\(/)) mockImports.add('AsyncMock');
+        if (line.match(/MagicMock\s*\(/)) mockImports.add('MagicMock');
+      }
+
+      // Fixture names: scan for @pytest.fixture + next def
+      const fullContent = lines.join('\n');
+      const fixturePattern = /@(?:pytest_asyncio\.fixture|pytest\.fixture)[^\n]*\n(?:async )?def\s+(\w+)/g;
+      let fm: RegExpExecArray | null;
+      while ((fm = fixturePattern.exec(fullContent)) !== null) {
+        fixtures.add(fm[1]);
+      }
+    } catch { /* skip */ }
+  }
+
+  const parts: string[] = [];
+  if (fixtures.size > 0) parts.push(`Fixtures: ${[...fixtures].slice(0, 6).join(', ')}`);
+  if (mockImports.size > 0) parts.push(`Mocks: ${[...mockImports].slice(0, 4).join(', ')}`);
+  if (setupPatterns.size > 0) parts.push(`Setup: ${[...setupPatterns].join(', ')}`);
+  if (assertionStyles.size > 0) parts.push(`Assertions: ${[...assertionStyles].join(', ')}`);
+
+  const summary = parts.length > 0 ? parts.join(' | ') : '';
+  const result = summary.slice(0, 500);
+  _testConventionCache.set(dirKey, result);
+  return result;
+}
+
 export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[], buildConfig?: BuildConfig): string {
   if (relatedFiles.length === 0) return '';
 
   try {
     const testEntries: string[] = [];
     const seen = new Set<string>();
+    // Track test files per directory key for convention extraction
+    const testFilesByDir = new Map<string, string[]>();
 
     const extractTestNames = (content: string): string[] => {
       const names: string[] = [];
@@ -398,6 +471,13 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
         } else {
           testEntries.push(`- ${testPath}`);
         }
+        // Track by directory key for convention extraction
+        const dirKey = testPath.startsWith('backend/') ? 'backend'
+          : testPath.startsWith('agent/') ? 'agent'
+          : testPath.startsWith('admin-ui/') ? 'admin-ui'
+          : testPath.split('/')[0];
+        if (!testFilesByDir.has(dirKey)) testFilesByDir.set(dirKey, []);
+        testFilesByDir.get(dirKey)!.push(testPath);
       } catch { /* skip unreadable */ }
     };
 
@@ -479,8 +559,18 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
 
     if (testEntries.length === 0) return '';
 
-    const output = `## Related Tests\nThese tests cover files you'll be modifying:\n${testEntries.join('\n')}\n\n`;
-    return output.slice(0, 2000);
+    // Extract test conventions per directory type
+    const conventionLines: string[] = [];
+    for (const [dirKey, files] of testFilesByDir) {
+      const conventions = extractTestConventions(dirKey, files);
+      if (conventions) conventionLines.push(`${dirKey}: ${conventions}`);
+    }
+    const conventionsSection = conventionLines.length > 0
+      ? `## Test Conventions\n${conventionLines.join('\n')}\n\n`
+      : '';
+
+    const output = `## Related Tests\nThese tests cover files you'll be modifying:\n${testEntries.join('\n')}\n\n${conventionsSection}`;
+    return output.slice(0, 3000);
   } catch (e) {
     sendLog(ws, `Warning: related test discovery failed: ${String(e)}\n`);
     return '';
@@ -547,7 +637,19 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     siblingLines.push('');
   }
 
-  const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines].join('\n');
+  // Build co-change affinity section — always included for create/fix/refactor (concise, actionable)
+  const cochangeFiles = ctx.cochange_files as string[] | undefined;
+  const cochangeLines: string[] = [];
+  if (cochangeFiles && cochangeFiles.length > 0) {
+    cochangeLines.push('## Frequently Co-Changed Files');
+    cochangeLines.push('Based on merged PRs in this project, these files are commonly modified together with your task\'s related files — review and update them if relevant:');
+    for (const f of cochangeFiles) {
+      cochangeLines.push(`- ${f}`);
+    }
+    cochangeLines.push('');
+  }
+
+  const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines, ...cochangeLines].join('\n');
   let budget = CONTEXT_BUDGET - fixedContent.length;
 
   // Build lessons section first — lessons directly prevent mistakes and take priority over informational sections
@@ -733,6 +835,27 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build per-module review feedback warnings — only if budget allows
+  type ModuleFeedbackWarning = { file: string; top_categories: Record<string, number>; sample_size: number };
+  const moduleFeedbackWarnings = ctx.module_feedback_warnings as ModuleFeedbackWarning[] | null | undefined;
+  let moduleFeedbackLines: string[] = [];
+  if (moduleFeedbackWarnings && moduleFeedbackWarnings.length > 0) {
+    const candidateLines: string[] = ['### Module-Specific Review History'];
+    for (const w of moduleFeedbackWarnings) {
+      const catParts = Object.entries(w.top_categories)
+        .sort((a, b) => b[1] - a[1])
+        .map(([cat, pct]) => `${Math.round(pct * 100)}% ${cat}`)
+        .join(', ');
+      candidateLines.push(`- When modifying \`${w.file}\`, review history shows: ${catParts} (${w.sample_size} issues)`);
+    }
+    candidateLines.push('');
+    const candidate = candidateLines.join('\n');
+    if (candidate.length <= budget) {
+      moduleFeedbackLines = candidateLines;
+      budget -= candidate.length;
+    }
+  }
+
   // Build direction quality warning — only if budget allows, placed after Pipeline Health
   const directionQuality = ctx.direction_quality as Record<string, unknown> | null | undefined;
   let dirQualityLines: string[] = [];
@@ -773,7 +896,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }
 

@@ -15,6 +15,67 @@ from app.failure_classification import INFRA_CLASSES, classify_failure as _class
 from app.models import Project, Task, TaskStatus
 
 
+def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]) -> None:
+    """Update the co-change affinity index in project.design_doc.
+
+    For each merged PR's file list, records which files changed together.
+    Scores decay on each call so stale associations fade over time.
+    Keeps top-5 affinities per file, capped at 200 files total.
+    """
+    if not merged_files_lists:
+        return
+
+    DECAY = 0.90
+    TOP_N = 5
+    MAX_FILES = 200
+    MIN_SCORE = 0.3
+
+    design_doc = dict(project.design_doc or {})
+    raw_index = design_doc.get("cochange_index") or {}
+    index: dict[str, dict[str, float]] = {k: dict(v) for k, v in raw_index.items()}
+
+    # Decay all existing scores
+    for file_key in list(index.keys()):
+        file_affinities = index[file_key]
+        for co_file in list(file_affinities.keys()):
+            file_affinities[co_file] = round(file_affinities[co_file] * DECAY, 3)
+            if file_affinities[co_file] < MIN_SCORE:
+                del file_affinities[co_file]
+        if not file_affinities:
+            del index[file_key]
+
+    # Accumulate new co-change pairs from each merged PR
+    for files in merged_files_lists:
+        unique_files = list(dict.fromkeys(files))
+        if len(unique_files) < 2:
+            continue
+        for i, file_a in enumerate(unique_files):
+            for file_b in unique_files[i + 1:]:
+                if file_a not in index:
+                    index[file_a] = {}
+                index[file_a][file_b] = round(index[file_a].get(file_b, 0.0) + 1.0, 3)
+                if file_b not in index:
+                    index[file_b] = {}
+                index[file_b][file_a] = round(index[file_b].get(file_a, 0.0) + 1.0, 3)
+
+    # Prune to top-N per file
+    for file_key in list(index.keys()):
+        affinities = index[file_key]
+        if len(affinities) > TOP_N:
+            sorted_pairs = sorted(affinities.items(), key=lambda x: x[1], reverse=True)
+            index[file_key] = dict(sorted_pairs[:TOP_N])
+
+    # Cap total tracked files
+    if len(index) > MAX_FILES:
+        file_scores = {f: sum(v.values()) for f, v in index.items()}
+        top_files = sorted(file_scores.keys(), key=lambda f: file_scores[f], reverse=True)[:MAX_FILES]
+        index = {f: index[f] for f in top_files}
+
+    design_doc["cochange_index"] = index
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+
+
 async def _update_direction_research_outcomes(
     project_id: uuid.UUID, direction_id: str, research_task_id: str, session: AsyncSession
 ) -> None:
@@ -30,6 +91,7 @@ async def _update_direction_research_outcomes(
         return
     directions = list(project.directions or [])
     updated = False
+    merged_files_lists: list[list[str]] = []
     for d in directions:
         if d.get("id") != direction_id:
             continue
@@ -59,6 +121,14 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if (ct.context or {}).get("pr_rejected")
             )
+            # Collect changed files from merged PRs for co-change index update
+            merged_files_lists = [
+                (ct.context or {}).get("_pr_changed_files", [])
+                for ct in child_tasks_rows
+                if ct.status == TaskStatus.COMPLETED
+                and (ct.context or {}).get("pr_merged")
+                and (ct.context or {}).get("_pr_changed_files")
+            ]
             _tasks_created = entry.get("tasks_created", 0)
             entry["conversion_rate"] = round(entry["prs_merged"] / _tasks_created, 3) if _tasks_created > 0 else None
             # Review quality signals: track how users respond to Blueprint's reviews
@@ -219,6 +289,8 @@ async def _update_direction_research_outcomes(
         if updated:
             break
     if updated:
+        if merged_files_lists:
+            _update_cochange_index(project, merged_files_lists)
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)

@@ -43,6 +43,7 @@ import {
   formatProjectContext,
   configureAgentPermissions,
   discoverRelatedTests,
+  extractTestConventions,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
@@ -240,6 +241,40 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Task Scope');
+  });
+
+  it('renders ## Module-Specific Review History when module_feedback_warnings is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        module_feedback_warnings: [
+          {
+            file: 'backend/app/orchestrator.py',
+            top_categories: { 'test-coverage': 0.6, 'error-handling': 0.25 },
+            sample_size: 8,
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('### Module-Specific Review History');
+    expect(result).toContain('backend/app/orchestrator.py');
+    expect(result).toContain('60% test-coverage');
+    expect(result).toContain('25% error-handling');
+    expect(result).toContain('(8 issues)');
+  });
+
+  it('does not render module feedback section when module_feedback_warnings is absent', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        active_tasks: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('Module-Specific Review History');
   });
 });
 
@@ -508,6 +543,76 @@ describe('discoverRelatedTests', () => {
     });
     // No directory matches 'other/' so no test entries are added
     expect(result).toBe('');
+  });
+});
+
+// ── extractTestConventions ────────────────────────────────────────────────────
+describe('extractTestConventions', () => {
+  let mockFs: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    const fs = await import('fs');
+    mockFs = fs.default as unknown as typeof mockFs;
+    // Clear the module-level cache between tests by using unique dirKeys
+  });
+
+  it('returns empty string when no test files exist', () => {
+    mockFs.existsSync.mockReturnValue(false);
+    const result = extractTestConventions('backend-empty', ['backend/testing/test_foo.py']);
+    expect(result).toBe('');
+  });
+
+  it('extracts pytest fixture names from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest_asyncio.fixture\nasync def db_session():\n    pass\n@pytest.fixture\ndef mock_client():\n    pass\n'
+    );
+    const result = extractTestConventions('backend-fixtures', ['backend/testing/test_services.py']);
+    expect(result).toContain('db_session');
+    expect(result).toContain('mock_client');
+    expect(result).toContain('Fixtures:');
+  });
+
+  it('extracts AsyncMock usage from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'from unittest.mock import AsyncMock, patch\n\nAsyncMock()\nMagicMock()\n'
+    );
+    const result = extractTestConventions('backend-mocks', ['backend/testing/test_agent.py']);
+    expect(result).toContain('AsyncMock');
+    expect(result).toContain('Mocks:');
+  });
+
+  it('extracts vitest patterns from TypeScript test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'import { vi, describe } from "vitest";\nbeforeEach(() => {});\nvi.fn();\nexpect(x).toBe(1);\n'
+    );
+    const result = extractTestConventions('agent-vitest', ['agent/src/prompt.test.ts']);
+    expect(result).toContain('vitest');
+    expect(result).toContain('beforeEach');
+  });
+
+  it('returns string under 500 chars', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest.fixture\ndef fixture_one(): pass\n@pytest.fixture\ndef fixture_two(): pass\n' +
+      'from unittest.mock import AsyncMock\nAsyncMock()\nbeforeEach(() => {})\nassert x == 1\npytest.raises(ValueError)\n'
+    );
+    const result = extractTestConventions('backend-size', ['backend/testing/test_x.py']);
+    expect(result.length).toBeLessThanOrEqual(500);
+  });
+
+  it('returns cached result on second call with same dirKey', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue('@pytest.fixture\ndef session(): pass\n');
+    const first = extractTestConventions('backend-cached', ['backend/testing/test_a.py']);
+    // Reset mock to return different content — cached result should be returned
+    mockFs.readFileSync.mockReturnValue('');
+    const second = extractTestConventions('backend-cached', ['backend/testing/test_b.py']);
+    expect(first).toBe(second);
   });
 });
 

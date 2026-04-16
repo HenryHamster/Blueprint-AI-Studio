@@ -760,6 +760,51 @@ async def claim_task(
                     "recent_outcomes": recent_outcomes,
                 }
 
+    # Inject co-change affinity context for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        related_files = (task.context or {}).get("related_files", [])
+        if related_files:
+            cochange_index = (project_for_playbook.design_doc or {}).get("cochange_index")
+            if cochange_index:
+                cochange_scores: dict[str, float] = {}
+                related_set = set(related_files)
+                for rf in related_files:
+                    for co_file, score in (cochange_index.get(rf) or {}).items():
+                        if co_file not in related_set:
+                            cochange_scores[co_file] = cochange_scores.get(co_file, 0.0) + score
+                if cochange_scores:
+                    top_cochange = sorted(cochange_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+                    if "project_context" not in response:
+                        response["project_context"] = {}
+                    response["project_context"]["cochange_files"] = [f for f, _ in top_cochange]
+
+    # Inject per-module review feedback warnings for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")
+        if module_feedback:
+            task_related_files = (task.context or {}).get("related_files", [])
+            module_warnings = []
+            for file_path in task_related_files:
+                profile = module_feedback.get(file_path)
+                if not profile or not isinstance(profile, dict):
+                    continue
+                total = profile.get("total", 0)
+                if total < 3:
+                    continue
+                cat_counts = {k: v for k, v in profile.items() if k not in ("total", "last_updated") and isinstance(v, int)}
+                sorted_cats = sorted(cat_counts.items(), key=lambda x: -x[1])
+                top_cats = {
+                    cat: round(count / total, 2)
+                    for cat, count in sorted_cats[:3]
+                    if count / total >= 0.15
+                }
+                if top_cats:
+                    module_warnings.append({"file": file_path, "top_categories": top_cats, "sample_size": total})
+            if module_warnings:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["module_feedback_warnings"] = module_warnings
+
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
         response["build_config"] = project_for_playbook.build_config

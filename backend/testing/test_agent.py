@@ -875,6 +875,181 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cochange_index = {
+        "backend/app/models.py": {"backend/app/schemas.py": 3.0, "backend/testing/test_models.py": 2.5},
+        "backend/app/schemas.py": {"backend/app/models.py": 3.0},
+    }
+    project = Project(name="Cochange Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add new model field"}],
+        vm_instance_id="agent-vm-cochange-create",
+        context={"related_files": ["backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cochange-create")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "cochange_files" in project_ctx, f"Expected cochange_files in project_context, got: {list(project_ctx.keys())}"
+    cochange_files = project_ctx["cochange_files"]
+    assert "backend/app/schemas.py" in cochange_files
+    assert "backend/testing/test_models.py" in cochange_files
+    # related_files themselves should not appear in cochange_files
+    assert "backend/app/models.py" not in cochange_files
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_cochange_files_for_review_task(client: AsyncClient, db_session):
+    """Claim endpoint does NOT inject cochange_files for review tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cochange_index = {
+        "backend/app/models.py": {"backend/app/schemas.py": 3.0},
+    }
+    project = Project(name="Cochange Review Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 99, "branch": "fix/something"}],
+        vm_instance_id="agent-vm-cochange-review",
+        context={"related_files": ["backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cochange-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "cochange_files" not in project_ctx, (
+        f"cochange_files should be absent for review tasks, got: {project_ctx.get('cochange_files')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_module_feedback_warnings_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint injects module_feedback_warnings for create tasks when related_files have profiles."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    module_feedback = {
+        "backend/app/orchestrator.py": {
+            "test-coverage": 6,
+            "error-handling": 2,
+            "total": 8,
+            "last_updated": "2026-01-01T00:00:00",
+        },
+        "backend/app/models.py": {
+            "type-safety": 1,
+            "total": 2,  # below threshold of 3 — should be excluded
+            "last_updated": "2026-01-01T00:00:00",
+        },
+    }
+    project = Project(
+        name="Module Feedback Test",
+        user_id="test-user-123",
+        design_doc={"module_feedback": module_feedback},
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add feature"}],
+        vm_instance_id="agent-vm-module-feedback",
+        context={"related_files": ["backend/app/orchestrator.py", "backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-module-feedback")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "module_feedback_warnings" in project_ctx, (
+        f"Expected module_feedback_warnings in project_context, got: {list(project_ctx.keys())}"
+    )
+    warnings = project_ctx["module_feedback_warnings"]
+    assert len(warnings) == 1, f"Expected 1 warning (models.py below threshold), got {len(warnings)}"
+    w = warnings[0]
+    assert w["file"] == "backend/app/orchestrator.py"
+    assert "test-coverage" in w["top_categories"]
+    assert w["sample_size"] == 8
+    # models.py should not appear — total < 3
+    files_in_warnings = [x["file"] for x in warnings]
+    assert "backend/app/models.py" not in files_in_warnings
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(client: AsyncClient, db_session):
+    """Claim endpoint does NOT inject module_feedback_warnings for review tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    module_feedback = {
+        "backend/app/orchestrator.py": {
+            "test-coverage": 5,
+            "total": 5,
+            "last_updated": "2026-01-01T00:00:00",
+        },
+    }
+    project = Project(
+        name="Module Feedback Review Test",
+        user_id="test-user-123",
+        design_doc={"module_feedback": module_feedback},
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 42, "branch": "fix/something"}],
+        vm_instance_id="agent-vm-module-feedback-review",
+        context={"related_files": ["backend/app/orchestrator.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-module-feedback-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "module_feedback_warnings" not in project_ctx, (
+        f"module_feedback_warnings should be absent for review tasks, got: {project_ctx.get('module_feedback_warnings')}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_safe_ws_close_swallows_double_close_runtime_error():
     """Production cascade: receive_json raised WebSocketDisconnect (already
     sent a close frame), then our explicit close tries to send a second one
