@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, RateLimitError, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -429,6 +429,62 @@ describe('testFixLoop failureSummary', () => {
   });
 });
 
+// ── testFixLoop directory scoping ─────────────────────────────────────────────
+describe('testFixLoop directory scoping', () => {
+  const multiRunnerConfig = {
+    directories: [
+      { path: 'agent', type: 'node', test_cmd: 'npm test' },
+      { path: 'backend', type: 'python', test_cmd: 'python3 -m pytest' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  function cwdsCalledWith(): (string | undefined)[] {
+    return vi.mocked(execFileSync).mock.calls.map(
+      (args) => (args[2] as { cwd?: string } | undefined)?.cwd,
+    );
+  }
+
+  it('runs all runners when relatedFiles is not provided', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('filters to agent runner when relatedFiles contains only agent/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(false);
+  });
+
+  it('filters to backend runner when relatedFiles contains only backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(false);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs all runners when relatedFiles contains only non-agent/backend files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['admin-ui/src/App.tsx']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs both runners when relatedFiles contains both agent/ and backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts', 'backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+});
+
 // ── RateLimitError ───────────────────────────────────────────────────────────
 // Pins the class identity so the outer catch in main() (which uses
 // `error instanceof RateLimitError` for classification) can't regress into
@@ -446,5 +502,43 @@ describe('RateLimitError', () => {
   it('plain Error is not a RateLimitError', () => {
     const err = new Error('Claude API usage exhausted — banner');
     expect(err).not.toBeInstanceOf(RateLimitError);
+  });
+});
+
+// ── captureTestBaseline timeout selection ─────────────────────────────────────
+describe('captureTestBaseline timeout selection', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners containing scripts/test-backend.sh', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const bashCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    expect((bashCall![2] as { timeout: number }).timeout).toBe(180_000);
+  });
+
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners with docker in args', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'docker run --rm myimage pytest' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const dockerCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'docker');
+    expect(dockerCall).toBeDefined();
+    expect((dockerCall![2] as { timeout: number }).timeout).toBe(180_000);
+  });
+
+  it('uses the passed timeoutMs (60s default) for non-Docker runners', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'node', test_cmd: 'npm test' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const npmCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'npm');
+    expect(npmCall).toBeDefined();
+    expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
   });
 });

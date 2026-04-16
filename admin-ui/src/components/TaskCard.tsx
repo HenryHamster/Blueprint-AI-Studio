@@ -198,7 +198,7 @@ export function useDurationStats(projectId?: string): DurationStats {
 export function getHeartbeatStatus(lastHeartbeat?: string) {
   if (!lastHeartbeat) return { color: 'bg-neutral-600', text: 'No heartbeat' };
 
-  const diffMinutes = (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000;
+  const diffMinutes = Math.max(0, (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000);
   if (diffMinutes < 2) return { color: 'bg-emerald-500', text: 'Healthy (< 2m)' };
   if (diffMinutes < 5) return { color: 'bg-amber-500', text: 'Delayed (2-5m)' };
   return { color: 'bg-red-500', text: 'Stale (> 5m)' };
@@ -356,7 +356,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
 
   const hbAgeSec = (task.status === 'IN_PROGRESS' || task.status === 'EVALUATING') && task.last_heartbeat
-    ? (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000
+    ? Math.max(0, (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000)
     : null;
   const hbAgeText = hbAgeSec !== null ? `HB ${formatCompact(hbAgeSec)}` : null;
   const hbAgeColor = hbAgeSec === null ? '' : hbAgeSec < 60 ? 'text-emerald-400' : hbAgeSec < 300 ? 'text-amber-400' : 'text-red-400';
@@ -381,8 +381,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     if (!typeStat || typeStat.sample_count < 3) return null;
     const elapsedSec = (now30 - parseTimestamp(task.started_at).getTime()) / 1000;
     const remaining = typeStat.p50_seconds - elapsedSec;
-    if (remaining > 0) return `~${Math.ceil(remaining / 60)}m left`;
-    return 'longer than usual';
+    if (remaining > 0) return null;
+    return 'slow';
   })();
 
   const handleRootKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -477,7 +477,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <CheckCircle className="w-3.5 h-3.5" />
               </button>
             )}
-            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED') && (
+            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED' || task.status === 'PROVISIONING') && (
               <button
                 title={confirmAction === 'cancel' ? `Confirm cancel (${confirmCountdown}s)` : 'Cancel'}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
@@ -524,11 +524,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <Shield className="w-3 h-3" />Approval
           </span>
         )}
-        {(task.attempt_count ?? 0) > 0 && (
-          <span className="bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded font-mono">
-            #{(task.attempt_count ?? 0) + 1}
-          </span>
-        )}
+        <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${(task.attempt_count ?? 0) > 0 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
+          #{(task.attempt_count ?? 0) + 1}
+        </span>
         {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
           <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />
@@ -674,7 +672,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             {queueWaitText ?? duration}
           </span>
           {etaLabel && (
-            <span className={`font-mono ${etaLabel === 'longer than usual' ? 'text-amber-400' : 'text-neutral-400'}`}>
+            <span className={`font-mono ${etaLabel === 'slow' ? 'text-amber-400' : 'text-neutral-400'}`}>
               · {etaLabel}
             </span>
           )}
@@ -683,7 +681,6 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         <div className="flex items-center gap-2">
           {isActive ? (
             <div className="flex items-center gap-1.5" title={heartbeat.text}>
-              <Activity className="w-3 h-3" />
               <div className={`w-1.5 h-1.5 rounded-full ${heartbeat.color}`} />
               {hbAgeText && <span className={`text-[10px] font-mono ${hbAgeColor}`}>{hbAgeText}</span>}
             </div>
@@ -700,15 +697,13 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             </button>
           ) : null}
 
-          {task.status !== 'QUEUED' ? (
-            <button
-              onClick={() => onViewLogs(task)}
-              className="flex items-center gap-1 text-neutral-400 hover:text-neutral-200 transition-colors"
-              title="View logs"
-            >
-              <Terminal className="w-3 h-3" />
-            </button>
-          ) : null}
+          <button
+            onClick={(e) => { e.stopPropagation(); onViewLogs(task); }}
+            className="flex items-center gap-1 text-neutral-400 hover:text-neutral-200 transition-colors"
+            title="View details"
+          >
+            <Terminal className="w-3 h-3" />
+          </button>
         </div>
       </div>
 

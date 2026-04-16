@@ -1040,22 +1040,25 @@ async def get_pull_request(
 
 
 async def get_open_pull_requests(
-    token: str, owner: str, repo: str, base: str
+    token: str, owner: str, repo: str, base: str | None = None
 ) -> list[dict]:
-    """Fetches open PRs targeting a specific base branch."""
+    """Fetches open PRs, optionally filtered to a specific base branch."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
+    params: dict[str, str | int] = {"state": "open", "per_page": 100}
+    if base is not None:
+        params["base"] = base
     response = await _github_request(
         "GET", f"https://api.github.com/repos/{owner}/{repo}/pulls",
-        headers, params={"state": "open", "base": base, "per_page": 100}
+        headers, params=params
     )
     if response.status_code == 401:
         raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
     if response.status_code != 200:
-        logger.error(f"Failed to list PRs for base={base}: {response.text}")
+        logger.error(f"Failed to list PRs (base={base}): {response.text}")
         return []
     return response.json()
 

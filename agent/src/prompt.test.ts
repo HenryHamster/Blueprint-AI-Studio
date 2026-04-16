@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import fs from 'fs';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ./index.js entirely so that importing prompt.ts does NOT trigger main().
@@ -36,6 +37,7 @@ vi.mock('child_process', () => ({
 }));
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
+import { execFileSync } from 'child_process';
 import {
   formatPlaybook,
   buildContextPrefix,
@@ -47,6 +49,8 @@ import {
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
+  extractModuleInterfaces,
+  discoverAffectedConsumers,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -183,6 +187,55 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Direction Context');
+  });
+
+  it('renders failure_stage_pattern message in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Fix test flakiness',
+        priority: 'high',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: {
+          stage: 'code_error',
+          rate: 0.86,
+          message: 'Recent tasks for this direction frequently fail at the code/test stage — pay extra attention to test coverage and run tests early.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Failure pattern:**');
+    expect(result).toContain('pay extra attention to test coverage');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is null', () => {
+    const task = {
+      direction_context: {
+        title: 'Optimize queries',
+        priority: 'low',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: null,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
   });
 
   it('renders ## Task Scope section for create task with small scope', () => {
@@ -412,6 +465,73 @@ describe('formatProjectContext', () => {
     const result = formatProjectContext(ctx, 'create', 'medium');
     expect(result).toContain('Your scope (medium): 75%');
   });
+
+  it('shows trend indicators in Common Review Issues when review_effectiveness is provided', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+        'error-handling': 0.25,
+        'type-safety': 0.15,
+      },
+      review_effectiveness: {
+        categories: {
+          'test-coverage': { trend: 'decreasing' },
+          'error-handling': { trend: 'stable' },
+          'type-safety': { trend: 'increasing' },
+        },
+        persistent_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain(', trending down');
+    expect(result).toContain(', persistent');
+    expect(result).toContain(', trending up');
+  });
+
+  it('omits trend indicators when review_effectiveness is absent', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).not.toContain('trending');
+    expect(result).not.toContain('persistent');
+  });
+
+  it('surfaces persistent review issues in pipeline health', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: ['test-coverage', 'error-handling'],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Persistent review issues');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('error-handling');
+  });
+
+  it('omits persistent review issues line when list is empty or absent', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Persistent review issues');
+  });
 });
 
 // ── configureAgentPermissions ─────────────────────────────────────────────────
@@ -543,6 +663,52 @@ describe('discoverRelatedTests', () => {
     });
     // No directory matches 'other/' so no test entries are added
     expect(result).toBe('');
+  });
+
+  it('import-based: issues Python import grep with correct dotted module path', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/orchestrator.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.orchestrator'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: constructs correct Python module path from nested file', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/services/auth.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.services.auth'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: issues TypeScript import grep with stem-based pattern', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import-based grep pattern should reference the stem 'prompt'
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('/prompt'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: skips TypeScript test files themselves (contains .test.)', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.test.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import grep uses a pattern with "from ['" — should not appear for test files
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes("from ['"))
+    );
+    expect(importCall).toBeUndefined();
   });
 });
 
@@ -702,6 +868,180 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result.endsWith('\n')).toBe(true);
   });
+
+  it('renders failure stage when _previous_failure_stage is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_failure_stage: 'test',
+        _previous_error: 'pytest: FAILED',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: CODE_ERROR (at test stage)');
+    expect(result).not.toContain('Failure type: CODE_ERROR\n');
+  });
+
+  it('omits stage qualifier when _previous_failure_stage is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: AGENT_TIMEOUT\n');
+    expect(result).not.toContain('at stage)');
+  });
+
+  it('renders recurring warning when _previous_is_recurring is true', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: true,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('recurring failure pattern');
+    expect(result).toContain('fundamentally different approach');
+  });
+
+  it('does not render recurring warning when _previous_is_recurring is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: false,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('recurring failure pattern');
+  });
+
+  it('renders error summary with "Error summary:" label when _previous_error_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'full long error message here',
+        _previous_error_summary: 'AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error summary: AssertionError: expected 1 got 2');
+    expect(result).not.toContain('Error: full long error message here');
+  });
+
+  it('falls back to "Error:" label when only _previous_error is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out after 600s',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error: timed out after 600s');
+    expect(result).not.toContain('Error summary:');
+  });
+
+  it('renders enriched diff summary with line counts when _previous_diff_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_diff_summary: [
+          { file: 'backend/app/models.py', additions: 45, deletions: 12, change_type: 'modified' },
+          { file: 'backend/testing/test_models.py', additions: 30, deletions: 0, change_type: 'added' },
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('backend/app/models.py (modified, +45/-12 lines)');
+    expect(result).toContain('backend/testing/test_models.py (added, +30/-0 lines)');
+    expect(result).toContain('Files changed in previous attempt:');
+  });
+
+  it('uses diff summary over plain file list when both are present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_changed_files: ['src/foo.ts'],
+        _previous_diff_summary: [
+          { file: 'src/foo.ts', additions: 10, deletions: 5, change_type: 'modified' },
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('src/foo.ts (modified, +10/-5 lines)');
+    // Should not show the plain format alongside the enriched format
+    expect(result).not.toMatch(/  - src\/foo\.ts\n/);
+  });
+
+  it('renders test failure summary when _previous_test_failure_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test_models.py::test_create FAILED',
+        _previous_changed_files: ['src/foo.ts'],
+        _previous_test_failure_summary: 'FAILED test_models.py::test_create - AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Test failures from previous attempt:');
+    expect(result).toContain('FAILED test_models.py::test_create');
+  });
+
+  it('uses focused test-failure guidance when test failures and changed files are both present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_changed_files: ['src/foo.ts'],
+        _previous_test_failure_summary: 'FAILED test_foo.py::test_bar',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Focus your retry on fixing the failing tests');
+    expect(result).not.toContain('Review the files listed above');
+  });
+
+  it('renders self-review outcome when _previous_self_review_outcome is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: { issues_found: true, fixes_applied: true, categories: [] },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review outcome:');
+    expect(result).toContain('found issues and applied fixes');
+  });
+
+  it('renders self-review outcome with no-issues message when fixes_applied is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: { issues_found: false, fixes_applied: false, categories: [] },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review ran and found no critical issues');
+  });
 });
 
 describe('buildSelfReviewPrompt', () => {
@@ -820,13 +1160,17 @@ describe('buildSelfReviewChecklist', () => {
     claudeMd: '',
   };
 
-  it('taskScope=small produces a 2-item correctness-focused checklist', () => {
+  it('taskScope=small produces a 5-item checklist with severity guide', () => {
     const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'small' });
     expect(result).toContain('Correctness');
     expect(result).toContain('Missing test coverage');
+    expect(result).toContain('Error handling');
+    expect(result).toContain('Security quick-check');
+    expect(result).toContain('Import and type verification');
+    expect(result).toContain('CRITICAL');
+    expect(result).toContain('MAJOR');
     expect(result).not.toContain('Type safety violations');
     expect(result).not.toContain('Scope violations');
-    expect(result).not.toContain('Security issues');
     expect(result).not.toContain('Pattern violations');
   });
 
@@ -843,21 +1187,21 @@ describe('buildSelfReviewChecklist', () => {
     expect(result).toContain('Import/dependency verification');
   });
 
-  it('taskScope=undefined produces the standard 5-item checklist', () => {
+  it('taskScope=undefined produces the standard 8-item checklist', () => {
     const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
     expect(result).toContain('Missing test coverage');
     expect(result).toContain('Type safety violations');
     expect(result).toContain('Scope violations');
     expect(result).toContain('Security issues');
     expect(result).toContain('Pattern violations');
-    expect(result).not.toContain('Cross-file consistency');
-    expect(result).not.toContain('Backwards compatibility');
+    expect(result).toContain('Cross-file consistency');
+    expect(result).toContain('Backwards compatibility');
+    expect(result).toContain('Import/dependency verification');
     expect(result).not.toContain('Data model safety');
-    expect(result).not.toContain('Import/dependency verification');
     expect(result).not.toContain('Correctness');
   });
 
-  it('taskScope=medium (explicit) produces the same 5-item checklist as undefined', () => {
+  it('taskScope=medium (explicit) produces the same 8-item checklist as undefined', () => {
     const resultUndefined = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
     const resultMedium = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'medium' });
     expect(resultMedium).toContain('Missing test coverage');
@@ -865,9 +1209,329 @@ describe('buildSelfReviewChecklist', () => {
     expect(resultMedium).toContain('Scope violations');
     expect(resultMedium).toContain('Security issues');
     expect(resultMedium).toContain('Pattern violations');
-    expect(resultMedium).not.toContain('Cross-file consistency');
+    expect(resultMedium).toContain('Cross-file consistency');
+    expect(resultMedium).toContain('Backwards compatibility');
+    expect(resultMedium).toContain('Import/dependency verification');
     expect(resultMedium).not.toContain('Correctness');
     // medium and undefined produce identical checklist output
     expect(resultMedium).toBe(resultUndefined);
+  });
+});
+
+// ── extractModuleInterfaces ───────────────────────────────────────────────────
+describe('extractModuleInterfaces', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Re-establish defaults so overrides from prior tests don't bleed through
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('returns empty string when relatedFiles is empty', () => {
+    expect(extractModuleInterfaces(null, [])).toBe('');
+  });
+
+  it('returns empty string when related files do not exist on disk', () => {
+    // existsSync returns false by default
+    expect(extractModuleInterfaces(null, ['backend/app/models.py'])).toBe('');
+  });
+
+  it('skips non-source files (.json, .md)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    expect(extractModuleInterfaces(null, ['package.json', 'README.md'])).toBe('');
+  });
+
+  it('skips test files (.test.ts, test_.py)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function testHelper(): void {}\n'
+    );
+    expect(extractModuleInterfaces(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py'])).toBe('');
+  });
+
+  it('extracts top-level Python function signatures and class names', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n\nclass UserModel:\n    pass\n\ndef create_task(name: str, owner: str):\n    pass\n'
+    );
+    const result = extractModuleInterfaces(null, ['backend/app/models.py']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('backend/app/models.py');
+    expect(result).toContain('def get_user(user_id: int)');
+    expect(result).toContain('class UserModel');
+    expect(result).toContain('def create_task(name: str, owner: str)');
+  });
+
+  it('uses __all__ as authoritative export list for Python files', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      "__all__ = ['get_user', 'create_task']\n\ndef get_user(x):\n    pass\n\ndef _private_helper(x):\n    pass\n"
+    );
+    const result = extractModuleInterfaces(null, ['backend/app/services.py']);
+    expect(result).toContain('get_user');
+    expect(result).toContain('create_task');
+    // __all__ used — private helper should not appear as a standalone entry
+    expect(result).not.toContain('_private_helper');
+  });
+
+  it('extracts TypeScript export declarations (function, class, interface, type, const)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(opts: Opts): string { return ""; }\n' +
+      'export async function runHandler(task: Task): Promise<void> {}\n' +
+      'export class TaskRunner {}\n' +
+      'export interface BuildOpts { foo: string; }\n' +
+      'export type TaskType = "create" | "fix";\n' +
+      'export const DEFAULT_MODEL = "claude-3";\n'
+    );
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('function buildPrompt');
+    expect(result).toContain('function runHandler');
+    expect(result).toContain('class TaskRunner');
+    expect(result).toContain('interface BuildOpts');
+    expect(result).toContain('type TaskType');
+    expect(result).toContain('const DEFAULT_MODEL');
+  });
+
+  it('includes caller files from git grep when found', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\nagent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('Imported by:');
+    expect(result).toContain('agent/src/handlers/standard.ts');
+    expect(result).toContain('agent/src/index.ts');
+  });
+
+  it('omits Imported by section when git grep finds no callers', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    // Default mock returns Buffer.from('') — .split() throws, caught by try/catch → no callers
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).not.toContain('Imported by:');
+  });
+
+  it('handles git grep throwing gracefully (no callers shown, exports still shown)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git grep failed'); });
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('function buildPrompt');
+    expect(result).not.toContain('Imported by:');
+  });
+
+  it('caps output at approximately 2KB', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    const manyExports = Array.from({ length: 80 }, (_, i) =>
+      `export function veryLongFunctionName${i}(paramA: string, paramB: number): void {}`
+    ).join('\n');
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(manyExports);
+    const manyFiles = Array.from({ length: 15 }, (_, i) => `agent/src/module${i}.ts`);
+    const result = extractModuleInterfaces(null, manyFiles);
+    expect(result.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('returns empty string when files have no exportable symbols', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      '// just a comment\nconst x = 1; // non-exported\n'
+    );
+    expect(extractModuleInterfaces(null, ['agent/src/utils.ts'])).toBe('');
+  });
+
+  it('appends Suggested Change Order when one related file imports from another', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // models callers include services (in related set); services has no related callers
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('imports from models.py');
+  });
+
+  it('omits Suggested Change Order when no related files import each other', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // Both files' callers are outside the related set
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('other/caller.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).not.toContain('## Suggested Change Order');
+  });
+
+  it('appends Suggested Change Order for three-file dependency chain', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def fn(x: int):\n    pass\n'
+    );
+    // models callers: [services, admin]; services callers: [admin]; admin callers: []
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('backend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, [
+      'backend/app/models.py',
+      'backend/app/services.py',
+      'backend/app/admin.py',
+    ]);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('3. admin.py');
+  });
+});
+
+// ── discoverAffectedConsumers ─────────────────────────────────────────────────
+describe('discoverAffectedConsumers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('returns empty string when relatedFiles is empty', () => {
+    expect(discoverAffectedConsumers(null, [])).toBe('');
+  });
+
+  it('skips test files in relatedFiles', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py']);
+    expect(result).toBe('');
+  });
+
+  it('skips non-source files (.json, .md)', () => {
+    const result = discoverAffectedConsumers(null, ['package.json', 'README.md']);
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when git grep finds no consumers', () => {
+    // execFileSync throws (exit 1) when git grep finds no matches
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when consumer files do not exist on disk', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    // existsSync returns false by default — consumer file cannot be read
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('filters out test files returned by git grep', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
+  });
+
+  it('extracts named TypeScript imports from consumer files', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { buildContextPrefix, discoverRelatedTests, extractModuleInterfaces } from \'../prompt.js\';\n'
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('agent/src/prompt.ts');
+    expect(result).toContain('agent/src/handlers/standard.ts');
+    expect(result).toContain('buildContextPrefix');
+    expect(result).toContain('discoverRelatedTests');
+    expect(result).toContain('extractModuleInterfaces');
+  });
+
+  it('extracts Python imports from consumer files', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'backend/app/orchestrator.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'from app.services import get_task, create_task\n'
+    );
+    const result = discoverAffectedConsumers(null, ['backend/app/services.py']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('backend/app/services.py');
+    expect(result).toContain('backend/app/orchestrator.py');
+    expect(result).toContain('get_task');
+    expect(result).toContain('create_task');
+  });
+
+  it('shows consumer without imports when no import line matches', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'backend/app/main.py\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    // File mentions module name but no parseable import line
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      '# uses services module indirectly\nsome_var = services_helper()\n'
+    );
+    const result = discoverAffectedConsumers(null, ['backend/app/services.py']);
+    expect(result).toContain('backend/app/main.py');
+    // No imports listed — just the consumer path
+    expect(result).not.toContain('imports:');
+  });
+
+  it('includes the Affected Consumers header and description', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { buildFileTree } from \'./prompt.js\';\n'
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Affected Consumers');
+    expect(result).toContain('Verify they remain compatible');
+  });
+
+  it('caps output at approximately 2KB', () => {
+    const manyConsumers = Array.from({ length: 20 }, (_, i) =>
+      `agent/src/consumers/module${i}.ts`
+    ).join('\n') + '\n';
+    vi.mocked(execFileSync).mockReturnValue(
+      manyConsumers as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'import { funcA, funcB, funcC, funcD, funcE, funcF, funcG, funcH } from \'../prompt.js\';\n'
+    );
+    const manyFiles = Array.from({ length: 10 }, (_, i) => `agent/src/module${i}.ts`);
+    const result = discoverAffectedConsumers(null, manyFiles);
+    expect(result.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('handles git grep throwing gracefully and returns empty string', () => {
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git grep failed'); });
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toBe('');
   });
 });

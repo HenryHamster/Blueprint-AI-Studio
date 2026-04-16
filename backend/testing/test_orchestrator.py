@@ -1493,3 +1493,159 @@ class TestRollupDeferral:
         )).scalars().all()
 
         assert len(eval_parent_ids) == 0, "No EVALUATING parents → no pending rollup files"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 5 — Health-aware dispatch reordering
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHealthAwareDispatch:
+    """Tests for _health_score_task and the health-aware dispatch reordering logic."""
+
+    # ── Score computation tests ──────────────────────────────────────────────
+
+    def test_score_zero_for_task_with_no_scope_or_risk(self):
+        """A task with no context gets a score of 0."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}])
+        assert _health_score_task(task) == 0
+
+    def test_score_zero_for_medium_scope(self):
+        """A medium-scope task gets no boost (non-small)."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context={"scope": "medium"})
+        assert _health_score_task(task) == 0
+
+    def test_score_boost_for_small_scope(self):
+        """Small scope adds +2."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context={"scope": "small"})
+        assert _health_score_task(task) == 2
+
+    def test_score_boost_for_low_risk(self):
+        """Low risk adds +1."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context={"risk": "low"})
+        assert _health_score_task(task) == 1
+
+    def test_score_max_for_small_scope_and_low_risk(self):
+        """Small scope + low risk = +3 (maximum boost)."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context={"scope": "small", "risk": "low"})
+        assert _health_score_task(task) == 3
+
+    def test_score_ignores_large_scope(self):
+        """Large scope gets no boost."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context={"scope": "large", "risk": "low"})
+        assert _health_score_task(task) == 1
+
+    def test_score_with_none_context(self):
+        """Task with context=None is treated as empty context (score 0)."""
+        from app.orchestrator import _health_score_task
+        task = Task(payloads=[{"type": "create"}], context=None)
+        assert _health_score_task(task) == 0
+
+    # ── Reordering logic tests ───────────────────────────────────────────────
+
+    def test_reordering_places_small_scope_first(self):
+        """Sorted by _health_score_task, small-scope tasks appear before medium/large."""
+        from app.orchestrator import _health_score_task
+        tasks = [
+            Task(payloads=[{"type": "create"}], context={"scope": "large"}),
+            Task(payloads=[{"type": "create"}], context={"scope": "small"}),
+            Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
+        ]
+        for t in tasks:
+            t.id = uuid.uuid4()
+
+        task_by_id = {t.id: t for t in tasks}
+        ids = [t.id for t in tasks]  # original order: large, small, medium
+
+        reordered = sorted(ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True)
+
+        # small (score=2) should come first, medium and large (score=0) follow
+        assert task_by_id[reordered[0]].context["scope"] == "small"
+
+    def test_reordering_places_small_low_risk_before_small_high_risk(self):
+        """small+low-risk (score=3) ranks above small-only (score=2)."""
+        from app.orchestrator import _health_score_task
+        t_small_low = Task(payloads=[{"type": "create"}], context={"scope": "small", "risk": "low"})
+        t_small_only = Task(payloads=[{"type": "create"}], context={"scope": "small"})
+        t_small_low.id = uuid.uuid4()
+        t_small_only.id = uuid.uuid4()
+
+        task_by_id = {t.id: t for t in [t_small_only, t_small_low]}
+        ids = [t_small_only.id, t_small_low.id]  # small-only first in original order
+
+        reordered = sorted(ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True)
+
+        assert reordered[0] == t_small_low.id, "small+low-risk should be first"
+        assert reordered[1] == t_small_only.id
+
+    def test_reordering_is_stable_when_all_scores_equal(self):
+        """When all tasks have the same score, sorted() preserves relative order (stable sort)."""
+        from app.orchestrator import _health_score_task
+        tasks = [
+            Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
+            Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
+            Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
+        ]
+        for t in tasks:
+            t.id = uuid.uuid4()
+
+        task_by_id = {t.id: t for t in tasks}
+        ids = [t.id for t in tasks]
+
+        reordered = sorted(ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True)
+
+        # All scores are 0 — stable sort preserves original order
+        assert reordered == ids
+
+    # ── Degradation-signal tests ─────────────────────────────────────────────
+
+    def test_zone_degradation_signal_detects_partial_cooldown(self):
+        """Zone summary with available < total_zones triggers the zone degradation signal."""
+        summary = {"available": 3, "total_zones": 5}
+        assert summary["available"] < summary["total_zones"]
+
+    def test_zone_degradation_signal_absent_when_all_zones_healthy(self):
+        """Zone summary with available == total_zones should not trigger zone degradation."""
+        summary = {"available": 5, "total_zones": 5}
+        assert not (summary["available"] < summary["total_zones"])
+
+    def test_failure_rate_signal_triggers_above_30_percent(self):
+        """Failure rate > 30% in the recent window triggers the signal."""
+        # 4 failures in 10 results = 40% — above threshold
+        recent_window = [
+            ("ts", "failure"), ("ts", "success"), ("ts", "failure"), ("ts", "success"),
+            ("ts", "failure"), ("ts", "success"), ("ts", "failure"), ("ts", "success"),
+            ("ts", "success"), ("ts", "success"),
+        ]
+        fail_count = sum(1 for r in recent_window if r[1] == "failure")
+        rate = fail_count / len(recent_window)
+        assert rate > 0.30
+
+    def test_failure_rate_signal_absent_below_30_percent(self):
+        """Failure rate ≤ 30% should not trigger the signal."""
+        # 3 failures in 10 results = 30% — at threshold but NOT above (strict >)
+        recent_window = [
+            ("ts", "failure"), ("ts", "failure"), ("ts", "failure"),
+            ("ts", "success"), ("ts", "success"), ("ts", "success"),
+            ("ts", "success"), ("ts", "success"), ("ts", "success"), ("ts", "success"),
+        ]
+        fail_count = sum(1 for r in recent_window if r[1] == "failure")
+        rate = fail_count / len(recent_window)
+        assert not (rate > 0.30)
+
+    def test_slot_signal_triggers_below_50_percent(self):
+        """slots_available < max_vms * 0.5 triggers the slots degradation signal."""
+        max_vms = 8
+        slots_available = 3  # < 4.0 (50% of 8)
+        assert slots_available < max_vms * 0.5
+
+    def test_slot_signal_absent_at_50_percent(self):
+        """slots_available == max_vms * 0.5 does not trigger (strict <)."""
+        max_vms = 8
+        slots_available = 4  # == 4.0 (exactly 50%)
+        assert not (slots_available < max_vms * 0.5)

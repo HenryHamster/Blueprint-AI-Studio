@@ -1421,7 +1421,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     results = deploy_monitoring["task_results"]
     failure_rate = 0.0
     if results:
-        failures = sum(1 for _, outcome, _ in results if outcome == "failure")
+        failures = sum(1 for r in results if r[1] == "failure")
         failure_rate = failures / len(results)
 
     return {

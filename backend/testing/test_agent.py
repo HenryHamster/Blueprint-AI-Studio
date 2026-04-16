@@ -717,7 +717,7 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, db_session):
-    """Entries with reference_count>=10 and confirmed_count==0 are sorted after effective entries."""
+    """Entries with low effectiveness score (confirmed/referenced ratio) sort after effective entries."""
     from sqlalchemy.orm.attributes import flag_modified
 
     project = Project(name="Playbook Demotion Test", user_id="test-user-123")
@@ -770,6 +770,167 @@ async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, d
     keys = list(playbook.keys())
     assert keys.index("aaa-effective") < keys.index("zzz-ineffective"), (
         f"Expected effective entry before ineffective, got order: {keys}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_skips_stale_playbook_entries(client: AsyncClient, db_session):
+    """Playbook entries with stale=True are not shown to agents (auto-archived)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Stale Playbook Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        "playbook/stale-entry": {
+            "content": "outdated guidance that no longer helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 15,
+            "stale": True,
+            "effectiveness_score": 0.0,
+        },
+        "playbook/active-entry": {
+            "content": "current helpful guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 5,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-stale-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    playbook = data.get("playbook", {})
+    assert "active-entry" in playbook, "Active entry should be shown"
+    assert "stale-entry" not in playbook, "Stale entry should be excluded"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, db_session):
+    """Claim appends False to recent_outcomes for each shown entry and stores _shown_playbook_keys."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Recent Outcomes Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        "playbook/my-entry": {
+            "content": "some guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 3,
+            "recent_outcomes": [True, False, True],
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-outcomes-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-outcomes-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # Verify recent_outcomes got a False appended
+    await db_session.refresh(project)
+    entry = project.design_doc["playbook/my-entry"]
+    outcomes = entry.get("recent_outcomes", [])
+    assert outcomes == [True, False, True, False], f"Expected [..., False] appended, got {outcomes}"
+
+    # Verify task context stores shown keys
+    await db_session.refresh(task)
+    shown_keys = (task.context or {}).get("_shown_playbook_keys", [])
+    assert "my-entry" in shown_keys, f"Expected 'my-entry' in _shown_playbook_keys, got {shown_keys}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_recent_outcomes_sorts_by_effectiveness(client: AsyncClient, db_session):
+    """Claim sorts entries by recent_outcomes effectiveness score (sum/len) descending."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Effectiveness Sort Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        # Low effectiveness: 1/5 = 0.2 score
+        "playbook/low-effectiveness": {
+            "content": "rarely helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 5,
+            "recent_outcomes": [False, False, False, True, False],  # score = 0.2
+        },
+        # High effectiveness: 4/5 = 0.8 score
+        "playbook/high-effectiveness": {
+            "content": "usually helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 4,
+            "reference_count": 5,
+            "recent_outcomes": [True, True, False, True, True],  # score = 0.8
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-effectiveness-sort",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-effectiveness-sort")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    playbook = data.get("playbook", {})
+    keys = list(playbook.keys())
+    assert keys.index("high-effectiveness") < keys.index("low-effectiveness"), (
+        f"Expected high-effectiveness before low-effectiveness, got: {keys}"
     )
 
 
@@ -872,6 +1033,114 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
     assert "direction_context" not in data, (
         f"direction_context should be absent for review tasks, got: {data.get('direction_context')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_code_error_dominant():
+    """Returns code_error pattern when 60%+ of non-infra failures are code errors."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    history = [
+        {"stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 1, "tasks_required_approval": 1, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 2, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+    ]
+    # Non-infra totals: code_error=6, approval=1, total=7 → rate=6/7≈0.857
+    result = _compute_failure_stage_pattern(history)
+    assert result is not None
+    assert result["stage"] == "code_error"
+    assert result["rate"] >= 0.6
+    assert "test" in result["message"].lower() or "code" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_approval_dominant():
+    """Returns approval pattern when 60%+ of non-infra failures are approval stalls."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    history = [
+        {"stage_dropout": {"tasks_failed_code_error": 0, "tasks_failed_infra": 1, "tasks_required_approval": 4, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 3, "tasks_merged_staging_only": 0}},
+    ]
+    # Non-infra totals: code_error=1, approval=7, total=8 → rate=7/8=0.875
+    result = _compute_failure_stage_pattern(history)
+    assert result is not None
+    assert result["stage"] == "approval"
+    assert result["rate"] >= 0.6
+    assert "approval" in result["message"].lower() or "review" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_no_pattern():
+    """Returns None when no dominant pattern or insufficient data."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    # Insufficient data (total < 3)
+    assert _compute_failure_stage_pattern([
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
+    ]) is None
+
+    # No clear pattern (roughly even split)
+    mixed_history = [
+        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 2}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
+    ]
+    # code_error=3, approval=3, total=6 → neither reaches 60%
+    assert _compute_failure_stage_pattern(mixed_history) is None
+
+    # Empty history
+    assert _compute_failure_stage_pattern([]) is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_failure_stage_pattern_in_direction_context(client: AsyncClient, db_session):
+    """Claim endpoint injects failure_stage_pattern into direction_context when pattern is clear."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Stage Dropout Pattern Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Fix test flakiness",
+            "priority": "high",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 4, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+                {"tasks_created": 3, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 1, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+                {"tasks_created": 5, "prs_merged": 2, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fix the flaky tests"}],
+        vm_instance_id="agent-vm-stage-dropout",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stage-dropout")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "direction_context" in data
+    dc = data["direction_context"]
+    assert "failure_stage_pattern" in dc
+    fsp = dc["failure_stage_pattern"]
+    assert fsp is not None
+    assert fsp["stage"] == "code_error"
+    assert "message" in fsp
+    assert fsp["rate"] >= 0.6
 
 
 @pytest.mark.asyncio
@@ -1120,8 +1389,8 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     Tests that EXTERNAL_API failures requeue with exponential backoff in retry_after.
     - 1st retry: ~2 min delay (2^1 * 120 = 240s)
     - 2nd retry: ~8 min delay (2^2 * 120 = 480s)
-    - 3rd retry: ~30 min delay (2^3 * 120 = 960s, but capped at 1800s — not capped here)
-    - After 3 retries, task is not requeued
+    - 3rd retry: ~16 min delay (2^3 * 120 = 960s)
+    - After 5 retries, task is not requeued (budget exhausted)
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -1140,7 +1409,7 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
             status=TaskStatus.IN_PROGRESS,
             # Pre-seed provision_failures to verify it gets cleared on graceful requeue —
             # otherwise a single provision hiccup on a previously-successful task would
-            # immediately exhaust the 3-retry budget on the next dispatch.
+            # immediately exhaust the retry budget on the next dispatch.
             context={"_api_failure_retries": retry_num - 1, "provision_failures": 2},
         )
         db_session.add(task)
@@ -1174,20 +1443,20 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         assert actual_delay >= expected_delay - 2, f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
         assert actual_delay <= expected_delay + 5, f"retry {retry_num}: delay {actual_delay} too large"
 
-    # 4th attempt: api_retries=3, increments to 4 > 3 → EXTERNAL_API early-requeue path is skipped
+    # 6th attempt: api_retries=5, increments to 6 > 5 → EXTERNAL_API requeue path is skipped
     # Falls through to general retry (task.attempt_count < max_retries), so no retry_after is set
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "test"}],
-        vm_instance_id="agent-vm-backoff-4",
+        vm_instance_id="agent-vm-backoff-6",
         status=TaskStatus.IN_PROGRESS,
-        context={"_api_failure_retries": 3},
+        context={"_api_failure_retries": 5},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-backoff-4")
+    token = create_agent_token(str(task.id), "agent-vm-backoff-6")
     headers = {"x-agent-token": token}
     payload = {
         "task_id": str(task.id),
@@ -1202,6 +1471,69 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
     ctx = task.context or {}
     assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+
+
+@pytest.mark.asyncio
+async def test_external_api_permanent_auth_failure_does_not_requeue(client: AsyncClient, db_session, mocker):
+    """
+    EXTERNAL_API failures with permanent auth indicators (token expired, 401, bad credentials)
+    must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
+    of exponential backoff before the task permanently fails with the same error.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Auth Failure Test", user_id="test-user-auth-fail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    permanent_auth_cases = [
+        "GitHub API returned 401 unauthorized",
+        "token expired: please re-authenticate",
+        "token revoked by organization admin",
+        "bad credentials — check your PAT",
+        "401 Unauthorized: access denied",
+    ]
+
+    for i, logs_msg in enumerate(permanent_auth_cases):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "do work"}],
+            vm_instance_id=f"agent-vm-auth-{i}",
+            status=TaskStatus.IN_PROGRESS,
+            context={"_api_failure_retries": 0},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-auth-{i}")
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_class": "EXTERNAL_API",
+            "logs": logs_msg,
+        }
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200, f"case {i}: unexpected status {resp.status_code}"
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED, (
+            f"case {i} ({logs_msg!r}): expected FAILED (immediate), got {task.status}"
+        )
+        # retry_after must not be set — permanent failures should not schedule a retry
+        ctx = task.context or {}
+        assert "retry_after" not in ctx, (
+            f"case {i}: retry_after should not be set for permanent auth failure"
+        )
+        # Operator-facing message must direct to re-authentication
+        assert task.latest_status_message is not None
+        assert "auth" in task.latest_status_message.lower() or "re-authenticate" in task.latest_status_message.lower(), (
+            f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -1417,31 +1749,32 @@ async def test_playbook_claim_increments_reference_count(client: AsyncClient, db
 @pytest.mark.asyncio
 async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_session):
     """
-    Playbook entries returned by claim are sorted by confirmed_count descending,
-    then reference_count descending as tiebreaker. Most-validated entries come first.
+    Playbook entries returned by claim are sorted by effectiveness_score descending.
+    For entries without recent_outcomes data, the score falls back to confirmed/referenced ratio.
+    Entries with higher confirmation rate per reference sort first.
     """
     project = Project(name="Playbook Order Test", user_id="test-user-order")
     project.design_doc = {
-        "playbook/low-count": {
-            "content": "low confirmed",
+        "playbook/low-ratio": {
+            "content": "low confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 1,
-            "reference_count": 10,
+            "reference_count": 10,  # ratio = 0.1
         },
-        "playbook/high-count": {
-            "content": "high confirmed",
+        "playbook/high-ratio": {
+            "content": "high confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 5,
-            "reference_count": 2,
+            "reference_count": 2,  # ratio = 2.5 (more confirmations than references — possible since all applicable tasks increment confirmed_count)
         },
-        "playbook/tiebreak": {
-            "content": "same confirmed, more references",
+        "playbook/mid-ratio": {
+            "content": "medium confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 5,
-            "reference_count": 8,
+            "reference_count": 8,  # ratio = 0.625
         },
     }
     db_session.add(project)
@@ -1464,9 +1797,160 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
 
     assert "playbook" in data
     keys = list(data["playbook"].keys())
-    # confirmed_count=5 entries first; among those, reference_count=8 before reference_count=2
-    assert keys.index("tiebreak") < keys.index("high-count")
-    assert keys.index("high-count") < keys.index("low-count")
+    # Sort by effectiveness score descending: high-ratio (2.5) → mid-ratio (0.625) → low-ratio (0.1)
+    assert keys.index("high-ratio") < keys.index("mid-ratio"), f"Order: {keys}"
+    assert keys.index("mid-ratio") < keys.index("low-ratio"), f"Order: {keys}"
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: AsyncClient, db_session):
+    """
+    Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.
+    A recent unconfirmed entry should appear before an older unconfirmed entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Age Penalty Test", user_id="test-user-age-penalty")
+    project.design_doc = {
+        "playbook/old-unconfirmed": {
+            "content": "old tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": old_date,
+        },
+        "playbook/recent-unconfirmed": {
+            "content": "recent tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-age-penalty-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-age-penalty-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Recent entry should appear before the age-penalised old entry
+    assert keys.index("recent-unconfirmed") < keys.index("old-unconfirmed"), (
+        f"Expected recent-unconfirmed before old-unconfirmed, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_stale_file_refs_deprioritised(client: AsyncClient, db_session):
+    """
+    Entries with stale_file_refs=True are deprioritised — a clean entry with the same
+    confirmed_count should come before a stale entry.
+    """
+    now = datetime.utcnow().isoformat()
+
+    project = Project(name="Stale Refs Test", user_id="test-user-stale-refs")
+    project.design_doc = {
+        "playbook/stale-entry": {
+            "content": "tip referencing a deleted file",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": True,
+        },
+        "playbook/clean-entry": {
+            "content": "tip with valid file refs",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": False,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-stale-refs-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-refs-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Clean entry should come before stale entry
+    assert keys.index("clean-entry") < keys.index("stale-entry"), (
+        f"Expected clean-entry before stale-entry, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_old_confirmed_entry_not_penalised(client: AsyncClient, db_session):
+    """
+    An old entry with confirmed_count >= 3 should NOT receive the age penalty.
+    It should still be ordered before a less-confirmed recent entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Confirmed Old Entry Test", user_id="test-user-conf-old")
+    project.design_doc = {
+        "playbook/old-confirmed": {
+            "content": "old but well-confirmed tip",
+            "confirmed_count": 5,
+            "reference_count": 10,
+            "updated_at": old_date,
+        },
+        "playbook/recent-low-confirmed": {
+            "content": "recent tip with low confirmations",
+            "confirmed_count": 1,
+            "reference_count": 1,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-conf-old-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-conf-old-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Old but confirmed entry (no age penalty) should come before less-confirmed recent entry
+    assert keys.index("old-confirmed") < keys.index("recent-low-confirmed"), (
+        f"Expected old-confirmed before recent-low-confirmed, got order: {keys}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1575,10 +2059,166 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
 
 
 @pytest.mark.asyncio
+async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a task with _shown_playbook_keys completes on first attempt, the most recent False
+    in recent_outcomes is flipped to True and effectiveness_score is computed.
+    Entries not shown to this task do not get their recent_outcomes updated.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    project = Project(name="Outcomes Flip Test", user_id="test-user-outcomes")
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "guidance shown to this task",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 3,
+            "recent_outcomes": [True, False, False],  # last False should be flipped
+        },
+        "playbook/not-shown-entry": {
+            "content": "guidance not shown to this task",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 2,
+            "recent_outcomes": [False, False],  # should NOT be changed
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-outcomes-flip",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # Simulate that only 'shown-entry' was shown at claim time
+        context={"_shown_playbook_keys": ["shown-entry"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-outcomes-flip")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    shown = project.design_doc["playbook/shown-entry"]
+    not_shown = project.design_doc["playbook/not-shown-entry"]
+
+    # Shown entry: last False flipped to True → [True, False, True]
+    assert shown["recent_outcomes"] == [True, False, True], (
+        f"Expected [True, False, True], got {shown['recent_outcomes']}"
+    )
+    # effectiveness_score computed: 2/3 ≈ 0.6667
+    assert shown.get("effectiveness_score") is not None
+    assert abs(shown["effectiveness_score"] - round(2/3, 4)) < 0.001
+    # last_confirmed_at set
+    assert shown.get("last_confirmed_at") is not None
+
+    # Not-shown entry: recent_outcomes unchanged
+    assert not_shown["recent_outcomes"] == [False, False], (
+        f"Not-shown entry should not be updated, got {not_shown['recent_outcomes']}"
+    )
+    assert not_shown.get("effectiveness_score") is None
+
+
+@pytest.mark.asyncio
+async def test_playbook_auto_archive_after_10_unconfirmed_references(client: AsyncClient, db_session):
+    """
+    After 10 references with no confirmations, an entry accumulates 10 Falses in recent_outcomes
+    (score=0.0 < 0.1 threshold) and is auto-archived (stale=True) during reference tracking.
+    Subsequent claims skip the stale entry.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Auto Archive Ref Test", user_id="test-user-autoarchive")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Entry pre-loaded with 9 Falses — one more reference will fill the window (10 Falses → stale)
+    project.design_doc = {
+        "playbook/zero-effectiveness": {
+            "content": "guidance that is never confirmed",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 9,
+            "recent_outcomes": [False] * 9,  # 9 unconfirmed references so far
+        },
+        "playbook/active-entry": {
+            "content": "currently active guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 3,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First claim: shows both entries, appends False to zero-effectiveness → 10 Falses → stale=True
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "First task"}],
+        vm_instance_id="agent-vm-autoarchive-1",
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    token1 = create_agent_token(str(task1.id), "agent-vm-autoarchive-1")
+    resp1 = await client.post("/api/agent/claim", headers={"x-agent-token": token1})
+    assert resp1.status_code == 200
+
+    # After first claim: zero-effectiveness should now have stale=True in DB
+    await db_session.refresh(project)
+    entry = project.design_doc["playbook/zero-effectiveness"]
+    assert entry.get("stale") is True, f"Expected stale=True after 10 Falses, got: {entry}"
+    assert entry.get("effectiveness_score") == 0.0
+
+    # Second claim: zero-effectiveness should be excluded (stale=True)
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Second task"}],
+        vm_instance_id="agent-vm-autoarchive-2",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    token2 = create_agent_token(str(task2.id), "agent-vm-autoarchive-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+
+    data2 = resp2.json()
+    playbook2 = data2.get("playbook", {})
+    assert "zero-effectiveness" not in playbook2, "Auto-archived entry should not appear in subsequent claims"
+    assert "active-entry" in playbook2, "Active entry should still appear"
+
+
+@pytest.mark.asyncio
 async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
-    Admin playbook list endpoint returns reference_count, last_referenced_at, and stale flag.
-    Stale is True if no reference in 30+ days; False if recently referenced.
+    Admin playbook list endpoint returns reference_count, last_referenced_at, stale flag,
+    effectiveness_score, and last_confirmed_at.
+    Stale is True if stored stale=True (auto-archived) OR no reference in 30+ days.
     Auth is mocked by conftest to test-user-123 (admin).
     """
     from app.models import ProjectMember
@@ -1588,9 +2228,11 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
         "playbook/fresh-entry": {
             "content": "fresh content",
             "updated_at": "2026-04-10T00:00:00",
-            "confirmed_count": 1,
+            "confirmed_count": 3,
             "reference_count": 5,
             "last_referenced_at": "2026-04-13T00:00:00",  # 1 day ago — not stale
+            "last_confirmed_at": "2026-04-12T00:00:00",
+            "effectiveness_score": 0.6,
         },
         "playbook/stale-entry": {
             "content": "old content",
@@ -1604,6 +2246,15 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
             "confirmed_count": 0,
             "reference_count": 3,
             "last_referenced_at": "2025-12-15T00:00:00",  # >30 days ago
+        },
+        "playbook/auto-archived-entry": {
+            "content": "persistently ineffective",
+            "updated_at": "2026-04-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 10,
+            "last_referenced_at": "2026-04-13T00:00:00",  # recent but stale=True stored
+            "stale": True,
+            "effectiveness_score": 0.0,
         },
     }
     db_session.add(project)
@@ -1623,20 +2274,25 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     fresh = entries["fresh-entry"]
     assert fresh["reference_count"] == 5
     assert fresh["last_referenced_at"] == "2026-04-13T00:00:00"
+    assert fresh["last_confirmed_at"] == "2026-04-12T00:00:00"
+    assert fresh["effectiveness_score"] == 0.6
     assert fresh["stale"] is False
 
     stale_entry = entries["stale-entry"]
     assert stale_entry["reference_count"] == 0
     assert stale_entry["last_referenced_at"] is None
+    assert stale_entry["last_confirmed_at"] is None
+    assert stale_entry["effectiveness_score"] is None
     assert stale_entry["stale"] is True
 
     stale_ref = entries["stale-ref-entry"]
     assert stale_ref["reference_count"] == 3
     assert stale_ref["stale"] is True
 
-    stale_ref = entries["stale-ref-entry"]
-    assert stale_ref["reference_count"] == 3
-    assert stale_ref["stale"] is True
+    # Auto-archived entry: stored stale=True takes precedence even though last_referenced_at is recent
+    auto_archived = entries["auto-archived-entry"]
+    assert auto_archived["stale"] is True
+    assert auto_archived["effectiveness_score"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -1968,254 +2624,226 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
         f"Got {hb_resp.status_code}: {hb_resp.text}. This is the 401 cascade bug."
     )
 
+
+@pytest.mark.asyncio
+async def test_file_change_details_stored_in_task_context(client: AsyncClient, db_session, mocker):
+    """When an agent reports status with file_change_details, the field is stored
+    in task.context['_file_change_details'] so _requeue_parent_task can propagate
+    it to the retry clone as _previous_file_change_details."""
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+
+    project = Project(name="File Change Details Test", user_id="test-user-fcd")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add feature"}],
+        vm_instance_id="agent-vm-fcd",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+    file_details = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
+        {"file": "backend/testing/test_models.py", "additions": 8, "deletions": 3},
+    ]
+    token = create_agent_token(str(task.id), "agent-vm-fcd")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Test suite failed",
+        "failure_category": "test_failed",
+        "file_change_details": file_details,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_file_change_details") == file_details, (
+        f"Expected _file_change_details in task.context, got: {ctx}"
+    )
+
     _terminated_task_ids.pop(task_id_str, None)
 
 
-# ---------------------------------------------------------------------------
-# Tests for playbook scope-based relevance filtering
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_playbook_scope_universal_always_included(client: AsyncClient, db_session):
-    """Universal-scoped entries are always included regardless of direction or files."""
-    from sqlalchemy.orm.attributes import flag_modified
+async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncClient, db_session, mocker):
+    """COMPLETED+PULL_REQUEST status with diff_summary, self_review_outcome, and
+    test_failure_summary stores them in task context as _pr_diff_summary,
+    _self_review_outcome, and _test_failure_summary respectively."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
-    direction_id = str(uuid.uuid4())
-    project = Project(name="Scope Universal Test", user_id="test-user-scope-u")
-    project.design_doc = {
-        "playbook/universal-tip": {
-            "content": "applies everywhere",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            "scope": "universal",
-        },
-    }
-    flag_modified(project, "design_doc")
+    project = Project(name="Enriched Context PR Test", user_id="test-user-enriched-pr")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-u-1",
-        context={"direction_id": direction_id},
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-enriched-pr",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    # Sibling stays IN_PROGRESS so project aggregation path is not triggered
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-enriched-pr-sibling",
+        status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
+    db_session.add(sibling)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-scope-u-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
+        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+    ]
+    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+    test_failure_summary = "FAILED backend/testing/test_models.py::test_create"
+
+    token = create_agent_token(str(task.id), "agent-vm-enriched-pr")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/foo/bar/pull/10",
+        "changed_files": ["backend/app/models.py", "backend/testing/test_models.py"],
+        "diff_summary": diff_summary,
+        "self_review_outcome": self_review_outcome,
+        "test_failure_summary": test_failure_summary,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
-    assert "universal-tip" in resp.json().get("playbook", {})
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_pr_diff_summary") == diff_summary
+    assert ctx.get("_self_review_outcome") == self_review_outcome
+    assert ctx.get("_test_failure_summary") == test_failure_summary
+    assert ctx.get("_pr_url") == "https://github.com/foo/bar/pull/10"
 
 
 @pytest.mark.asyncio
-async def test_playbook_scope_no_scope_field_treated_as_universal(client: AsyncClient, db_session):
-    """Entries without a scope field are backward-compatible and treated as universal."""
-    from sqlalchemy.orm.attributes import flag_modified
+async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure(client: AsyncClient, db_session, mocker):
+    """FAILED+ERROR_LOG status with diff_summary and test_failure_summary stores them
+    in task context as _pr_diff_summary and _test_failure_summary."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
-    project = Project(name="Scope Compat Test", user_id="test-user-scope-c")
-    project.design_doc = {
-        "playbook/legacy-tip": {
-            "content": "legacy entry without scope",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            # No "scope" field
-        },
-    }
-    flag_modified(project, "design_doc")
+    project = Project(name="Enriched Context Failed Test", user_id="test-user-enriched-failed")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-c-1",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-enriched-failed",
+        status=TaskStatus.IN_PROGRESS,
+        # Exhaust retries so the FAILED path terminates without requeueing
+        attempt_count=3,
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-scope-c-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 10, "deletions": 2, "change_type": "modified"},
+    ]
+    test_failure_summary = "FAILED backend/testing/test_models.py::test_create - AssertionError"
+
+    token = create_agent_token(str(task.id), "agent-vm-enriched-failed")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Test suite failed after max attempts",
+        "changed_files": ["backend/app/models.py"],
+        "diff_summary": diff_summary,
+        "test_failure_summary": test_failure_summary,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
-    assert "legacy-tip" in resp.json().get("playbook", {})
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_pr_diff_summary") == diff_summary
+    assert ctx.get("_test_failure_summary") == test_failure_summary
 
 
 @pytest.mark.asyncio
-async def test_playbook_scope_direction_included_when_direction_matches(client: AsyncClient, db_session):
-    """Direction-scoped entries are included when the task belongs to the same direction."""
+async def test_claim_top_first_review_issues_populated(client: AsyncClient, db_session):
+    """top_first_review_issues is populated when review_history contains issues with descriptions at iteration 0."""
     from sqlalchemy.orm.attributes import flag_modified
 
-    direction_id = str(uuid.uuid4())
-    project = Project(name="Scope Direction Match", user_id="test-user-scope-dm")
-    project.design_doc = {
-        "playbook/dir-tip": {
-            "content": "only for direction X",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            "scope": "direction",
-            "learned_from_direction": direction_id,
-        },
-    }
-    flag_modified(project, "design_doc")
+    project = Project(name="Top Review Issues Test", user_id="test-user-tri")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
+    # Create two completed tasks with review_history entries that have issues at iteration 0
+    common_issue = "Missing test coverage for the new function"
+    for i in range(2):
+        ht = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": f"Some task {i}"}],
+            vm_instance_id=f"agent-vm-tri-{i}",
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "iteration": 2,
+                    "review_history": [
+                        {
+                            "iteration": 0,
+                            "feedback": "Needs work",
+                            "issues": [
+                                {"severity": "high", "description": common_issue, "file": "app/foo.py", "line": 10},
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        flag_modified(ht, "context")
+        db_session.add(ht)
+    await db_session.commit()
+
+    # Create the task to claim
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-dm-1",
-        context={"direction_id": direction_id},
+        payloads=[{"type": "create", "prompt": "New feature"}],
+        vm_instance_id="agent-vm-tri-claim",
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-scope-dm-1")
+    token = create_agent_token(str(task.id), "agent-vm-tri-claim")
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
-    assert "dir-tip" in resp.json().get("playbook", {})
 
-
-@pytest.mark.asyncio
-async def test_playbook_scope_direction_excluded_when_direction_differs(client: AsyncClient, db_session):
-    """Direction-scoped entries are excluded when the task belongs to a different direction."""
-    from sqlalchemy.orm.attributes import flag_modified
-
-    direction_id = str(uuid.uuid4())
-    other_direction_id = str(uuid.uuid4())
-    project = Project(name="Scope Direction Mismatch", user_id="test-user-scope-dno")
-    project.design_doc = {
-        "playbook/dir-specific": {
-            "content": "only for direction X",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            "scope": "direction",
-            "learned_from_direction": direction_id,
-        },
-    }
-    flag_modified(project, "design_doc")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task_other = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-dno-1",
-        context={"direction_id": other_direction_id},
-    )
-    db_session.add(task_other)
-    await db_session.commit()
-    await db_session.refresh(task_other)
-
-    token = create_agent_token(str(task_other.id), "agent-vm-scope-dno-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-    assert resp.status_code == 200
-    assert "dir-specific" not in resp.json().get("playbook", {})
-
-    task_no_dir = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-dno-2",
-    )
-    db_session.add(task_no_dir)
-    await db_session.commit()
-    await db_session.refresh(task_no_dir)
-
-    token2 = create_agent_token(str(task_no_dir.id), "agent-vm-scope-dno-2")
-    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
-    assert resp2.status_code == 200
-    assert "dir-specific" not in resp2.json().get("playbook", {})
-
-
-@pytest.mark.asyncio
-async def test_playbook_scope_module_included_when_files_overlap(client: AsyncClient, db_session):
-    """Module-scoped entries are included when the task's related_files overlap."""
-    from sqlalchemy.orm.attributes import flag_modified
-
-    project = Project(name="Scope Module Match", user_id="test-user-scope-mm")
-    project.design_doc = {
-        "playbook/module-tip": {
-            "content": "watch out for auth.py changes",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            "scope": "module",
-            "related_files": ["backend/app/auth.py", "backend/app/security.py"],
-        },
-    }
-    flag_modified(project, "design_doc")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-mm-1",
-        context={"related_files": ["backend/app/auth.py", "backend/app/models.py"]},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-scope-mm-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-    assert resp.status_code == 200
-    assert "module-tip" in resp.json().get("playbook", {})
-
-
-@pytest.mark.asyncio
-async def test_playbook_scope_module_excluded_when_files_dont_overlap(client: AsyncClient, db_session):
-    """Module-scoped entries are excluded when the task's related_files do not overlap."""
-    from sqlalchemy.orm.attributes import flag_modified
-
-    project = Project(name="Scope Module Mismatch", user_id="test-user-scope-mno")
-    project.design_doc = {
-        "playbook/module-auth-tip": {
-            "content": "auth.py specific warning",
-            "confirmed_count": 0,
-            "updated_at": "2026-01-01T00:00:00",
-            "scope": "module",
-            "related_files": ["backend/app/auth.py"],
-        },
-    }
-    flag_modified(project, "design_doc")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task_unrelated = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-mno-1",
-        context={"related_files": ["backend/app/orchestrator.py"]},
-    )
-    db_session.add(task_unrelated)
-    await db_session.commit()
-    await db_session.refresh(task_unrelated)
-
-    token = create_agent_token(str(task_unrelated.id), "agent-vm-scope-mno-1")
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-    assert resp.status_code == 200
-    assert "module-auth-tip" not in resp.json().get("playbook", {})
-
-    task_no_files = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="agent-vm-scope-mno-2",
-    )
-    db_session.add(task_no_files)
-    await db_session.commit()
-    await db_session.refresh(task_no_files)
-
-    token2 = create_agent_token(str(task_no_files.id), "agent-vm-scope-mno-2")
-    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
-    assert resp2.status_code == 200
-    assert "module-auth-tip" not in resp2.json().get("playbook", {})
+    project_ctx = resp.json().get("project_context", {})
+    top_issues = project_ctx.get("top_first_review_issues")
+    assert top_issues is not None, "top_first_review_issues should be populated"
+    assert len(top_issues) >= 1
+    descriptions = [issue["description"] for issue in top_issues]
+    assert common_issue.lower()[:120] in descriptions

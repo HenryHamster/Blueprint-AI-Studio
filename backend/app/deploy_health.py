@@ -229,6 +229,14 @@ async def _check_external_health():
 
     ext["failed_deps"] = failed
 
+    # Track consecutive failure counts per dependency (used by dispatch gate)
+    consec = ext.setdefault("consecutive_failures", {})
+    for dep in ("github_api", "claude_api", "gcp", "db"):
+        if dep in failed:
+            consec[dep] = consec.get(dep, 0) + 1
+        else:
+            consec[dep] = 0
+
     # Re-enable rate-limited accounts after cooldown
     await recheck_disabled_accounts()
 

@@ -38,6 +38,7 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     disable_account_model,
+    record_completion_event,
 )
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
@@ -370,7 +371,27 @@ async def update_agent_status(
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
+    # Exception: if _post_commit_pending is set, the early-commit succeeded but
+    # _process_post_commit raised before spawning review/fix tasks. Let the retry
+    # re-run post-commit processing so the PR doesn't get orphaned.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        pending_info = (task.context or {}).get("_post_commit_pending")
+        if pending_info and isinstance(pending_info, dict):
+            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (_post_commit_pending set)")
+            _bind = session.bind
+            _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+            try:
+                result = await _process_post_commit(task.id, payload, _session_factory=_factory)
+                await session.refresh(task)
+                ctx = dict(task.context or {})
+                ctx.pop("_post_commit_pending", None)
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+                return result
+            except Exception as e:
+                logger.error(f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}", exc_info=True)
+                raise
         return {"status": "already_terminal", "task_id": str(task.id)}
     if task.status == TaskStatus.EVALUATING:
         return {"status": "already_evaluating", "task_id": str(task.id)}
@@ -387,6 +408,11 @@ async def update_agent_status(
         ctx = dict(task.context or {})
         ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
         task.context = ctx
+    if payload.file_change_details:
+        ctx = dict(task.context or {})
+        ctx['_file_change_details'] = payload.file_change_details[:50]
+        task.context = ctx
+        flag_modified(task, 'context')
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
@@ -411,11 +437,18 @@ async def update_agent_status(
                     logs=payload.logs
                 )
                 session.add(artifact)
-                # Store changed files in task context for retry artifact enrichment
-                if payload.changed_files:
+                # Store changed files and enriched retry info in task context
+                if payload.changed_files or payload.diff_summary or payload.self_review_outcome:
                     ctx = dict(task.context or {})
-                    ctx['_pr_changed_files'] = payload.changed_files[:50]
+                    if payload.changed_files:
+                        ctx['_pr_changed_files'] = payload.changed_files[:50]
                     ctx['_pr_url'] = payload.pr_url or ''
+                    if payload.diff_summary:
+                        ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                    if payload.self_review_outcome:
+                        ctx['_self_review_outcome'] = payload.self_review_outcome
+                    if payload.test_failure_summary:
+                        ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
                     task.context = ctx
                     flag_modified(task, 'context')
         else:
@@ -429,6 +462,17 @@ async def update_agent_status(
                 logs=payload.logs
             )
             session.add(artifact)
+            # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
+            if payload.changed_files or payload.diff_summary or payload.test_failure_summary:
+                ctx = dict(task.context or {})
+                if payload.changed_files:
+                    ctx['_pr_changed_files'] = payload.changed_files[:50]
+                if payload.diff_summary:
+                    ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                if payload.test_failure_summary:
+                    ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                task.context = ctx
+                flag_modified(task, 'context')
 
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(
@@ -645,6 +689,12 @@ async def update_agent_status(
                         await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
                     except Exception as e:
                         logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
+                if acct_id_clear and task.vm_provisioned_at:
+                    try:
+                        duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()
+                        await record_completion_event(acct_id_clear, duration_secs)
+                    except Exception as e:
+                        logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
                 from app.failure_classification import persist_failure_category  # noqa: PLC0415
@@ -682,15 +732,39 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
-                        api_retries = ctx.get("_api_failure_retries", 0) + 1
-                        ctx["_api_failure_retries"] = api_retries
-                        if api_retries > 3:
-                            logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                        # Permanent auth failures (bad/expired credentials) should never be
+                        # retried — they will keep failing until the operator re-authenticates.
+                        # Detect these by inspecting the failure message before burning retries.
+                        _logs_lower = (payload.logs or "").lower()
+                        _PERMANENT_AUTH_INDICATORS = (
+                            "token expired", "token revoked", "bad credentials",
+                            "unauthorized", "401",
+                        )
+                        if any(ind in _logs_lower for ind in _PERMANENT_AUTH_INDICATORS):
+                            logger.warning(
+                                f"[AGENT STATUS] Task {task.id} EXTERNAL_API permanent auth failure "
+                                f"— not requeuing (operator must re-authenticate)"
+                            )
+                            task.latest_status_message = (
+                                "External API auth failure — token expired or credentials invalid. "
+                                "Re-authenticate and retry."
+                            )
+                            # Exhaust the general retry budget so the fallback retry path
+                            # (attempt_count < max_retries) also skips this task.
+                            task.attempt_count = _runtime_config["max_retries"]
                             should_requeue = False
                         else:
-                            delay = min(2 ** api_retries * 120, 1800)
-                            ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
-                            logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
+                            # Transient infrastructure outage: retry with exponential backoff.
+                            # Budget is 5 retries (up from 3) to survive longer outages.
+                            api_retries = ctx.get("_api_failure_retries", 0) + 1
+                            ctx["_api_failure_retries"] = api_retries
+                            if api_retries > 5:
+                                logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                                should_requeue = False
+                            else:
+                                delay = min(2 ** api_retries * 120, 1800)
+                                ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
+                                logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
@@ -856,6 +930,15 @@ async def update_agent_status(
                         + existing_msg[:300]
                     ).strip()
                     session.add(task)
+                try:
+                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    await _maybe_create_failure_alert(
+                        task,
+                        session,
+                        task.latest_status_message or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
+                    )
+                except Exception as _alert_err:
+                    logger.warning(f"[AGENT_STATUS] Failed to create failure alert for task {task.id}: {_alert_err}")
 
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -880,7 +963,7 @@ async def update_agent_status(
                         f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
                         f"type={task.first_payload.get('type', 'unknown')}"
                     )
-                # Increment confirmed_count on applicable playbook entries for successful first attempts
+                # Increment confirmed_count and update effectiveness scoring for successful first attempts
                 if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
                     try:
                         _task_type = task.first_payload.get("type", "create")
@@ -890,6 +973,11 @@ async def update_agent_status(
                         }
                         _doc = dict(_proj.design_doc or {})
                         _confirmed_changed = False
+                        _now_iso = _utcnow().isoformat()
+                        # Keys shown to this task (stored at claim time for accurate outcome tracking)
+                        _shown_keys = {
+                            f"playbook/{k}" for k in (_ctx.get("_shown_playbook_keys") or [])
+                        }
                         for _pk, _pv in list(_doc.items()):
                             if _pk.startswith("playbook/") and isinstance(_pv, dict):
                                 _applicable = _pv.get("applicable_types")
@@ -900,6 +988,26 @@ async def update_agent_status(
                                     continue
                                 _entry = dict(_pv)
                                 _entry["confirmed_count"] = _entry.get("confirmed_count", 0) + 1
+                                _entry["last_confirmed_at"] = _now_iso
+                                # Update rolling recent_outcomes only for entries shown to this task
+                                if _pk in _shown_keys:
+                                    _recent = list(_entry.get("recent_outcomes", []))
+                                    # Flip the most recent unconfirmed (False) outcome to True
+                                    _flipped = False
+                                    for _i in range(len(_recent) - 1, -1, -1):
+                                        if _recent[_i] is False:
+                                            _recent[_i] = True
+                                            _flipped = True
+                                            break
+                                    if not _flipped:
+                                        # No pending False; append True directly
+                                        _recent.append(True)
+                                        if len(_recent) > 10:
+                                            _recent = _recent[-10:]
+                                    _entry["recent_outcomes"] = _recent
+                                    # Compute and persist effectiveness_score
+                                    _score = sum(_recent) / len(_recent) if _recent else 0.5
+                                    _entry["effectiveness_score"] = round(_score, 4)
                                 _doc[_pk] = _entry
                                 _confirmed_changed = True
                         if _confirmed_changed:
@@ -928,16 +1036,22 @@ async def update_agent_status(
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload
         failed_task_type = failed_task_payload.get("type", "")
+        _is_user_submitted = task.created_by in ("USER", "ADMIN")
+        _user_debug_allowed = (
+            not _is_user_submitted or
+            _shared_state.count_recent_user_debug_spawns(str(task.project_id), _utcnow()) < _shared_state.USER_DEBUG_MAX_PER_HOUR
+        )
         should_auto_debug = (
             payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
             failed_task_type != "debug" and  # Don't recursively debug debug tasks
             (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
             payload.logs and
             failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
+            _user_debug_allowed and
             (
                 (task.context or {}).get("auto_debug") is True or
                 task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
-                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
+                task.created_by in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
             )
         )
         if should_auto_debug:
@@ -969,6 +1083,8 @@ async def update_agent_status(
             )
             session.add(debug_task)
             await session.flush()
+            if _is_user_submitted:
+                _shared_state.record_user_debug_spawn(str(task.project_id), _utcnow())
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",
@@ -1132,12 +1248,37 @@ async def update_agent_status(
         # stale and the reaper to kill the task.
         # At this point the status change, artifact, and retry logic are all
         # persisted.  expire_on_commit=False keeps the task object usable.
-        if session.dirty or session.new:
-            await session.commit()
+        try:
+            if session.dirty or session.new:
+                await session.commit()
+        except Exception as early_exc:
+            logger.error(f"[PIPELINE] Early commit failed for {task.id}: {early_exc}", exc_info=True)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
 
         # Pass a session factory bound to the SAME engine the request used.
         # In production this is AsyncSessionLocal; in tests it's the test engine.
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
-        return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        try:
+            return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        except Exception as e:
+            # Early-commit already persisted the task status. If post-commit
+            # (review pipeline, rollup, etc.) fails, the idempotency guard
+            # would block agent retries — permanently orphaning any PR that
+            # needed a review/fix spawn. Set a flag so the guard lets the
+            # retry re-run post-commit processing.
+            logger.error(f"[PIPELINE] Post-commit processing failed for task {task.id}: {e}", exc_info=True)
+            try:
+                await session.rollback()
+                await session.refresh(task)
+                task.context = {**(task.context or {}), "_post_commit_pending": {"at": _utcnow().isoformat()}}
+                session.add(task)
+                await session.commit()
+            except Exception as ctx_err:
+                logger.exception(f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}")
+            raise

@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -266,6 +266,52 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
         color[n] = BLACK
         return False
     return any(color[n] == WHITE and dfs(n) for n in adj)
+
+
+# ---------------------------------------------------------------------------
+# Helper: failure stage pattern analysis
+# ---------------------------------------------------------------------------
+
+def _compute_failure_stage_pattern(history: list) -> "dict | None":
+    """
+    Analyze recent research_history stage_dropout data to identify dominant failure stages.
+
+    Returns a pattern dict if 60%+ of non-infra failures cluster at one stage, else None.
+    Only considers code_error and approval stages — agents can't address infra failures.
+    Uses the last 3 research cycles for recency.
+    """
+    recent = history[-3:]
+    code_error_total = 0
+    approval_total = 0
+    for entry in recent:
+        sd = entry.get("stage_dropout") or {}
+        code_error_total += sd.get("tasks_failed_code_error", 0)
+        approval_total += sd.get("tasks_required_approval", 0)
+    total_non_infra = code_error_total + approval_total
+    if total_non_infra < 3:
+        return None
+    code_error_rate = code_error_total / total_non_infra
+    approval_rate = approval_total / total_non_infra
+    threshold = 0.6
+    if code_error_rate >= threshold:
+        return {
+            "stage": "code_error",
+            "rate": round(code_error_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently fail at the code/test stage — "
+                "pay extra attention to test coverage and run tests early."
+            ),
+        }
+    if approval_rate >= threshold:
+        return {
+            "stage": "approval",
+            "rate": round(approval_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently stall waiting for approval — "
+                "consider smaller, more targeted changes that require less manual review."
+            ),
+        }
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +583,9 @@ async def claim_task(
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
         top_first_review_issues = None
-        first_attempt_issue_distribution = None
-        direction_first_attempt_feedback = None
         if task_type in ("create", "fix", "refactor"):
             try:
-                from app.playbook_learning import _categorize_review_issues, _DIRECTION_FIRST_ATTEMPT_KEY
+                from app.playbook_learning import _categorize_review_issues
                 cutoff_14d = _utcnow() - timedelta(days=14)
                 combined_review_history = []
                 for ht in high_iter_rows:
@@ -575,14 +619,15 @@ async def claim_task(
                         for entry in rev_hist:
                             if entry.get("iteration") != 0:
                                 continue
-                            desc = entry.get("description") or entry.get("issue") or ""
-                            cat = entry.get("category", "other")
-                            if not desc:
-                                continue
-                            normalized = desc.lower().strip()[:120]
-                            desc_counter[normalized] += 1
-                            if normalized not in desc_to_cat:
-                                desc_to_cat[normalized] = cat
+                            for issue in entry.get("issues", []):
+                                desc = issue.get("description") or ""
+                                cat = issue.get("category", "other")
+                                if not desc:
+                                    continue
+                                normalized = desc.lower().strip()[:120]
+                                desc_counter[normalized] += 1
+                                if normalized not in desc_to_cat:
+                                    desc_to_cat[normalized] = cat
                     recurring = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
                     if recurring:
                         recurring.sort(key=lambda x: -x[1])
@@ -592,50 +637,21 @@ async def claim_task(
                         ]
                 except Exception:
                     logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
-
-                # First-attempt issue distribution: aggregate _first_attempt_rejection_categories
-                # from all reviewed tasks (covers the common 1-iteration case missing from above)
-                try:
-                    fa_cat_counts: dict[str, int] = {}
-                    for ht in high_iter_rows:
-                        if ht.created_at and ht.created_at < cutoff_14d:
-                            continue
-                        cats = (ht.context or {}).get("_first_attempt_rejection_categories", {})
-                        for cat, cnt in cats.items():
-                            fa_cat_counts[cat] = fa_cat_counts.get(cat, 0) + (
-                                cnt if isinstance(cnt, int) else 1
-                            )
-                    if fa_cat_counts:
-                        total_fa = sum(fa_cat_counts.values())
-                        sorted_fa = sorted(fa_cat_counts.items(), key=lambda x: -x[1])[:3]
-                        first_attempt_issue_distribution = {
-                            cat: round(count / total_fa, 2) for cat, count in sorted_fa
-                        }
-                except Exception:
-                    logger.exception("[AGENT] Failed to compute first_attempt_issue_distribution (non-critical)")
-
-                # Direction-specific first-attempt feedback from accumulated tally
-                try:
-                    direction_id = str(
-                        (task.context or {}).get("direction_summary", {}).get("id") or ""
-                    )
-                    if direction_id:
-                        _proj_doc = await session.get(Project, task.project_id)
-                        if _proj_doc:
-                            d_tally = (_proj_doc.design_doc or {}).get(
-                                _DIRECTION_FIRST_ATTEMPT_KEY, {}
-                            ).get(direction_id)
-                            if d_tally:
-                                direction_first_attempt_feedback = {
-                                    k: v for k, v in d_tally.items()
-                                    if k not in ("total", "last_updated")
-                                    and isinstance(v, int) and v > 0
-                                }
-                except Exception:
-                    logger.exception("[AGENT] Failed to compute direction_first_attempt_feedback (non-critical)")
-
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
+
+        # Compute review effectiveness trends (stores in project.design_doc as side effect)
+        review_effectiveness = None
+        if task_type in ("create", "fix", "refactor"):
+            try:
+                from app.playbook_learning import compute_review_effectiveness
+                review_effectiveness = await compute_review_effectiveness(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
 
         response["project_context"] = {
             "active_tasks": active_tasks,
@@ -647,8 +663,7 @@ async def claim_task(
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
             "top_first_review_issues": top_first_review_issues,
-            "first_attempt_issue_distribution": first_attempt_issue_distribution,
-            "direction_first_attempt_feedback": direction_first_attempt_feedback,
+            "review_effectiveness": review_effectiveness,
         }
     else:
         # Lightweight pipeline health for all other task types
@@ -671,8 +686,6 @@ async def claim_task(
     project_for_playbook = await session.get(Project, task.project_id)
     if project_for_playbook and project_for_playbook.design_doc:
         task_type = (task.first_payload).get("type", "create")
-        task_direction_id = (task.context or {}).get("direction_id")
-        task_related_files: set[str] = set((task.context or {}).get("related_files") or [])
         playbook_entries = {}
         _playbook_candidates = []
         for k, v in (project_for_playbook.design_doc or {}).items():
@@ -683,19 +696,6 @@ async def claim_task(
                         continue
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
-                # Scope-based relevance filtering:
-                #   universal — always included
-                #   direction — only when the task belongs to the same direction
-                #   module    — only when the task's files overlap with the entry's files
-                entry_scope = v.get("scope", "universal")
-                if entry_scope == "direction":
-                    entry_direction = v.get("learned_from_direction")
-                    if not entry_direction or entry_direction != task_direction_id:
-                        continue
-                elif entry_scope == "module":
-                    entry_files: set[str] = set(v.get("related_files") or [])
-                    if not entry_files or not task_related_files or not (entry_files & task_related_files):
-                        continue
                 short_key = k[len("playbook/"):]
                 confirmed = v.get("confirmed_count", 0)
                 referenced = v.get("reference_count", 0)
@@ -706,15 +706,39 @@ async def claim_task(
                         "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
                         short_key, referenced,
                     )
+                # Age penalty: deprioritise entries older than 30 days with < 3 confirmations
+                age_penalty = 0
+                updated_at_str = v.get("updated_at", "")
+                if updated_at_str and confirmed < 3:
+                    try:
+                        updated_dt = datetime.fromisoformat(
+                            updated_at_str.replace("Z", "+00:00")
+                        )
+                        # _utcnow() returns naive UTC; strip tzinfo so comparison is always naive
+                        if updated_dt.tzinfo is not None:
+                            updated_dt = updated_dt.replace(tzinfo=None)
+                        if (_utcnow() - updated_dt).days > 30:
+                            age_penalty = 1
+                    except (ValueError, TypeError):
+                        pass
+                # Stale file-reference penalty
+                stale_penalty = 1 if v.get("stale_file_refs") else 0
+                if age_penalty or stale_penalty:
+                    logger.debug(
+                        "Playbook entry '%s' penalty: age=%d stale=%d",
+                        short_key, age_penalty, stale_penalty,
+                    )
                 _playbook_candidates.append((
                     ineffective,
+                    stale_penalty,
+                    age_penalty,
                     -confirmed,
                     -referenced,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, _, _, short_key, content in _playbook_candidates:
+        for _, _, _, _, _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
@@ -722,7 +746,7 @@ async def claim_task(
         response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
             response["playbook"] = playbook_entries
-            # Track reference counts — fire-and-forget, must not fail claim response
+            # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response
             try:
                 now_iso = _utcnow().isoformat()
                 doc = dict(project_for_playbook.design_doc)
@@ -733,6 +757,14 @@ async def claim_task(
                         entry["reference_count"] = entry.get("reference_count", 0) + 1
                         entry["last_referenced_at"] = now_iso
                         doc[full_key] = entry
+                # Check file-path references against the repo root (config-driven; skipped when unset)
+                try:
+                    from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415
+                    repo_root: str = _shared_state.runtime_config.get("playbook_repo_root", "") or ""
+                    if repo_root:
+                        doc = check_and_flag_stale_refs(doc, repo_root)
+                except Exception:
+                    logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
@@ -814,11 +846,13 @@ async def claim_task(
                     for h in history[-2:]
                     if h.get("tasks_created", 0) > 0
                 ]
+                failure_stage_pattern = _compute_failure_stage_pattern(history)
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
                     "failed_approaches": [a[:120] for a in failed_approaches[:5]],
                     "recent_outcomes": recent_outcomes,
+                    "failure_stage_pattern": failure_stage_pattern,
                 }
 
     # Inject co-change affinity context for create/fix/refactor tasks

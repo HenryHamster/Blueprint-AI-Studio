@@ -3,18 +3,63 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
-  runClaudeCode, lintFixLoop, testFixLoop, matchesRateLimit,
+  runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
+  runProjectLintChecks,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt,
+  buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { MAX_SELF_REVIEW_ATTEMPTS } from '../constants.js';
+import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
+
+/**
+ * Returns per-file diff statistics (additions, deletions, change type) for
+ * all files changed between baseCommit and HEAD.  Returns [] if the commits
+ * are identical or git commands fail.
+ */
+function computeFileDiffSummary(
+  baseCommit: string,
+  currentHead: string,
+): Array<{ file: string; additions: number; deletions: number; change_type: string }> {
+  if (baseCommit === currentHead) return [];
+  try {
+    const numstat = git(['diff', '--numstat', `${baseCommit}..HEAD`]);
+    const nameStatus = git(['diff', '--name-status', `${baseCommit}..HEAD`]);
+
+    const changeTypes: Record<string, string> = {};
+    for (const line of nameStatus.split('\n').filter(Boolean)) {
+      const parts = line.split('\t');
+      if (parts.length >= 2) {
+        const typeChar = parts[0][0];
+        const file = parts[parts.length - 1];
+        changeTypes[file] =
+          typeChar === 'A' ? 'added' :
+          typeChar === 'D' ? 'deleted' :
+          typeChar === 'R' ? 'renamed' : 'modified';
+      }
+    }
+
+    const result: Array<{ file: string; additions: number; deletions: number; change_type: string }> = [];
+    for (const line of numstat.split('\n').filter(Boolean)) {
+      const parts = line.split('\t');
+      if (parts.length === 3) {
+        const additions = parts[0] === '-' ? 0 : (parseInt(parts[0], 10) || 0);
+        const deletions = parts[1] === '-' ? 0 : (parseInt(parts[1], 10) || 0);
+        const file = parts[2];
+        result.push({ file, additions, deletions, change_type: changeTypes[file] || 'modified' });
+      }
+    }
+    return result.slice(0, 50);
+  } catch {
+    return [];
+  }
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -34,10 +79,32 @@ export interface StandardHandlerOpts {
   runLintFix?: boolean;
   runTestFix?: boolean;
   failOnTestFailure?: boolean;
+  captureBaseline?: boolean;
   runSelfReview?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
+  relatedFiles?: string[];
+}
+
+/**
+ * Extracts the structured self-review JSON object from the agent's output.
+ * Looks for a ```json ... ``` code fence first, then falls back to finding
+ * the first `{` that can be parsed as JSON.
+ */
+function extractSelfReviewJson(output: string): Record<string, unknown> | null {
+  const fenceMatch = output.match(/```json\s*\n?([\s\S]*?)\n?```/);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()) as Record<string, unknown>; } catch { /* fallthrough */ }
+  }
+  const start = output.indexOf('{');
+  if (start !== -1) {
+    const end = output.lastIndexOf('}');
+    if (end > start) {
+      try { return JSON.parse(output.slice(start, end + 1)) as Record<string, unknown>; } catch { /* ignore */ }
+    }
+  }
+  return null;
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -48,10 +115,12 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     runLintFix = true,
     runTestFix = false,
     failOnTestFailure = false,
+    captureBaseline = false,
     runSelfReview = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
+    relatedFiles,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -88,8 +157,58 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
+  // Capture test baseline for medium/large scope tasks on main branch.
+  // This lets the test fix loop distinguish pre-existing failures from newly-broken tests.
+  // We scope the baseline run to directories matching related_files to keep it fast.
+  let baselineFailures: Set<string> | undefined;
+  if (captureBaseline && runTestFix && baseBranch === 'main') {
+    const relatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+      []
+    );
+    const captured = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
+    baselineFailures = captured ?? undefined;
+  }
+
   const fileTree = buildFileTree(ws);
-  const finalPromptWithTree = fileTree + finalPrompt;
+
+  // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
+  // Runs a read-only pass to map module interfaces and dependencies before coding.
+  let analysisContext = '';
+  const taskScope = strVal(ctx.scope);
+  if (taskScope === 'medium') {
+    sendLog(ws, '\n[Analysis Phase] Mapping module interfaces and dependencies...\n');
+    statusRef.value = 'Analyzing module interfaces...';
+
+    const analysisRelatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    ) as string[];
+
+    const analysisPrompt = buildAnalysisPrompt({
+      rawPrompt,
+      taskTitle,
+      relatedFiles: analysisRelatedFiles,
+      fileTree,
+    });
+
+    const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
+      analysisPrompt,
+      ws, statusRef, model, effort,
+      ['Write', 'Edit', 'NotebookEdit'],
+    );
+
+    if (analysisExitCode === 0 && analysisResult.trim()) {
+      analysisContext = `## Pre-Implementation Analysis\n\n${analysisResult.trim()}\n\n`;
+      sendLog(ws, '[Analysis Phase] Complete.\n');
+    } else {
+      sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
+    }
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
 
   statusRef.value = 'Running Claude Code...';
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
@@ -100,6 +219,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const currentHead = git(['rev-parse', 'HEAD']);
   // Detect changes from BOTH uncommitted files AND commits Claude may have created
   const hasChanges = diff.length > 0 || currentHead !== baseCommit;
+
+  // Compute per-file diff stats (lines added/removed) for retry context enrichment
+  const fileChangeDetails: { file: string; additions: number; deletions: number }[] = [];
+  if (currentHead !== baseCommit) {
+    try {
+      const numstatOut = git(['diff', '--numstat', `${baseCommit}..HEAD`]);
+      for (const line of numstatOut.split('\n').filter(Boolean)) {
+        const parts = line.split('\t');
+        if (parts.length >= 3 && parts[2]) {
+          fileChangeDetails.push({
+            file: parts[2],
+            additions: parseInt(parts[0]) || 0,
+            deletions: parseInt(parts[1]) || 0,
+          });
+        }
+      }
+    } catch { /* ignore diff errors */ }
+  }
 
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
@@ -113,6 +250,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
+    const diffSummary = computeFileDiffSummary(baseCommit, currentHead);
+
+    // ── Scope overflow detection ───────────────────────────────────────────────
+    const taskScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
+    const overflowThreshold = taskScope ? SCOPE_OVERFLOW_THRESHOLDS[taskScope] : undefined;
+    const scopeOverflowWarning = overflowThreshold !== undefined && changedPaths.length > overflowThreshold
+      ? `This task has scope "${taskScope}" (expected few files) but ${changedPaths.length} files were changed, exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
+      : undefined;
+    if (scopeOverflowWarning) {
+      sendLog(ws, `\nWARNING: Scope overflow detected — ${changedPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n`);
+    }
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -121,6 +269,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
           failure_category: 'lint_failed',
+          changed_files: changedPaths.slice(0, 50),
+          ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
         });
         return;
       }
@@ -130,7 +280,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -145,13 +295,25 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: failedLogs,
         failure_category: 'test_failed',
+        changed_files: changedPaths.slice(0, 50),
+        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
       });
       return;
     }
 
     // ── Self-Review Phase ──────────────────────────────────────────────────────
     // Runs after lint/test validation, before committing, to catch critical issues.
-    let selfReviewOutcome: { issues_found: boolean; categories: string[]; fixes_applied: boolean } | undefined;
+    let selfReviewOutcome: {
+      issues_found: boolean;
+      categories: string[];
+      fixes_applied: boolean;
+      verdict?: string;
+      checks_performed?: string[];
+      files_reviewed?: number;
+      truncated_files_read?: string[];
+      parse_failed?: boolean;
+    } | undefined;
     if (runSelfReview) {
       sendLog(ws, '\nRunning self-review...\n');
       statusRef.value = 'Running self-review...';
@@ -187,6 +349,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
 
+      const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
         rawPrompt,
         taskTitle,
@@ -196,14 +359,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         buildConfig,
         changedFiles,
         reviewIssueDistribution: reviewIssueDist,
-        taskScope: (task.context as Record<string, unknown> | undefined)?.scope as string | undefined,
+        taskScope: selfReviewTaskScope,
+        scopeOverflowWarning,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
+      const taskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+      const maxSelfReviewAttempts = (taskScope === 'medium' || taskScope === 'large') ? 2 : MAX_SELF_REVIEW_ATTEMPTS;
       let selfReviewFailed = false;
-      for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
+      let lastReviewOutput = '';
+      for (let attempt = 0; attempt < maxSelfReviewAttempts; attempt++) {
         const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
         if (reviewExitCode !== 0) {
           if (matchesRateLimit(reviewOutput)) {
@@ -214,6 +381,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           selfReviewFailed = true;
           break;
         }
+        lastReviewOutput = reviewOutput;
       }
 
       if (selfReviewFailed) {
@@ -222,8 +390,63 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         const headAfterReview = git(['rev-parse', 'HEAD']);
         const statusAfterReview = git(['status', '--porcelain']);
         const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
-        selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
+
+        // Parse structured JSON output from self-review
+        const reviewCategories: string[] = [];
+        let parsedVerdict: string | undefined;
+        let parsedChecks: string[] | undefined;
+        let parsedFilesReviewed: number | undefined;
+        let parsedTruncatedFiles: string[] | undefined;
+        let parseFailed = false;
+
+        const parsed = extractSelfReviewJson(lastReviewOutput);
+        if (!parsed) {
+          reviewCategories.push('self_review_failed', 'json_parse_failed');
+          parseFailed = true;
+        } else {
+          parsedVerdict = typeof parsed.verdict === 'string' ? parsed.verdict : undefined;
+          parsedChecks = Array.isArray(parsed.checks_performed) ? parsed.checks_performed as string[] : undefined;
+          parsedFilesReviewed = typeof parsed.files_reviewed === 'number' ? parsed.files_reviewed : undefined;
+          parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
+
+          // Validate checks_performed contains all mandatory items
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+          if (!parsedChecks) {
+            reviewCategories.push('self_review_failed', 'validation_failed');
+            parseFailed = true;
+          } else {
+            const missing = mandatory.filter(m => !parsedChecks!.includes(m));
+            if (missing.length > 0) {
+              reviewCategories.push('self_review_failed', 'validation_failed');
+              parseFailed = true;
+            }
+          }
+
+          // When diff was truncated, validate that the agent actually read the files
+          if (diffTruncated && (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0)) {
+            reviewCategories.push('truncation_not_verified');
+          }
+        }
+
+        selfReviewOutcome = {
+          issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found as number) > 0),
+          categories: reviewCategories,
+          fixes_applied: fixesApplied,
+          ...(parsedVerdict !== undefined ? { verdict: parsedVerdict } : {}),
+          ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
+          ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
+          ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
+          ...(parseFailed ? { parse_failed: true } : {}),
+        };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+        if (fixesApplied) {
+          try {
+            runProjectLintChecks(changedPaths, ws, buildConfig);
+          } catch (lintErr: unknown) {
+            const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+            sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+        }
       }
     }
 
@@ -266,7 +489,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         if (conflictFiles) {
           sendLog(ws, `WARNING: Conflict markers detected in staged files:\n${conflictFiles}\nAsking Claude to resolve...\n`);
           await runClaudeCode(
-            `CRITICAL: These staged files contain git conflict markers (<<<<<<<, =======, >>>>>>>):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
+            `CRITICAL: These staged files contain git conflict markers (${'<'.repeat(7)}, ${'='.repeat(7)}, ${'>'.repeat(7)}):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
             ws, statusRef, model, effort
           );
           git(['add', '-A']);
@@ -290,6 +513,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
       prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
+    if (scopeOverflowWarning) {
+      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\nPlease verify that all changed files are necessary for this task.\n\n`;
+    }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
         ? '\u26a0\ufe0f Issues found and auto-fixed'
@@ -308,8 +534,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
-      ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
+      ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
@@ -317,6 +544,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
       failure_category: 'claude_code_failed',
+      ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
     });
   }
 }
@@ -360,21 +588,31 @@ export async function handleCreate(
   );
   const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
+  const createScope = taskCtx?.scope as string | undefined;
+  const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
+  const moduleInterfaceContext = isMediumOrLargeScope
+    ? extractModuleInterfaces(ws, relatedFiles)
+    : '';
+  const mediumScopePlanningNote = isMediumOrLargeScope
+    ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
+    : '';
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
     failOnTestFailure: true,
+    captureBaseline: isMediumOrLargeScope,
     runSelfReview: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
+    relatedFiles,
   });
 }
 
@@ -401,13 +639,17 @@ export async function handleRefactor(
   );
   const refactorBuildConfig = resolveBuildConfig(task);
   const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
+  const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
+  const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
+    ? extractModuleInterfaces(ws, refactorRelatedFiles)
+    : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

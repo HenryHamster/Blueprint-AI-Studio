@@ -9,10 +9,10 @@ const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
   IN_PROGRESS: 'bg-yellow-500',
-  PROVISIONING: 'bg-yellow-500',
-  EVALUATING: 'bg-yellow-500',
+  PROVISIONING: 'bg-blue-400',
+  EVALUATING: 'bg-violet-400',
   FAILED: 'bg-red-500',
-  CANCELLED: 'bg-red-500',
+  CANCELLED: 'bg-neutral-600',
   QUEUED: 'bg-neutral-500',
 };
 
@@ -424,12 +424,22 @@ function RootGroup({
   const completedInGroup = isSynthetic
     ? root.children.reduce((sum, c) => sum + countByStatus(c, 'COMPLETED'), 0)
     : countByStatus(root, 'COMPLETED');
-  const runningInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatuses(c, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']), 0)
-    : countByStatuses(root, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+  const inProgressInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'IN_PROGRESS'), 0)
+    : countByStatus(root, 'IN_PROGRESS');
+  const provisioningInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'PROVISIONING'), 0)
+    : countByStatus(root, 'PROVISIONING');
+  const evaluatingInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'EVALUATING'), 0)
+    : countByStatus(root, 'EVALUATING');
+  const runningInGroup = inProgressInGroup + provisioningInGroup + evaluatingInGroup;
   const failedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatuses(c, ['FAILED']), 0)
-    : countByStatuses(root, ['FAILED']);
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'FAILED'), 0)
+    : countByStatus(root, 'FAILED');
+  const cancelledInGroup = isSynthetic
+    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'CANCELLED'), 0)
+    : countByStatus(root, 'CANCELLED');
 
   return (
     <div
@@ -487,17 +497,19 @@ function RootGroup({
             </span>
           )}
           <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
-            {completedInGroup}/{totalInGroup} done
+            {completedInGroup}/{totalInGroup - cancelledInGroup} done
           </span>
         </div>
       </div>
 
       {/* Progress bar */}
       {(() => {
-        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup;
+        const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup - cancelledInGroup;
         const segments = [
           { count: queuedInGroup, color: 'bg-neutral-700' },
-          { count: runningInGroup, color: 'bg-yellow-500' },
+          { count: provisioningInGroup, color: 'bg-blue-400' },
+          { count: inProgressInGroup, color: 'bg-yellow-500' },
+          { count: evaluatingInGroup, color: 'bg-violet-400' },
           { count: failedInGroup, color: 'bg-red-500' },
           { count: completedInGroup, color: 'bg-emerald-500' },
         ].filter(s => s.count > 0);

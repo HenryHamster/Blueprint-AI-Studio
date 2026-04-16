@@ -34,8 +34,12 @@ LOCK_TRACEBACK = (
 @pytest.fixture(autouse=True)
 def _clear_errors_cache():
     admin_analytics._orchestrator_errors_cache.clear()
+    if hasattr(admin_analytics, '_acknowledged_errors'):
+        admin_analytics._acknowledged_errors.clear()
     yield
     admin_analytics._orchestrator_errors_cache.clear()
+    if hasattr(admin_analytics, '_acknowledged_errors'):
+        admin_analytics._acknowledged_errors.clear()
 
 
 class TestRecentOrchestratorErrors:

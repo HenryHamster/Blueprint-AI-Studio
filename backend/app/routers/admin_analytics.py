@@ -6,7 +6,7 @@ import uuid
 import json
 import logging
 from collections import defaultdict
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -33,7 +33,7 @@ router = APIRouter(
 )
 
 
-def _count_research_findings(logs: Optional[str]) -> int:
+def _count_research_findings(logs: str | None) -> int:
     """Parse research findings artifact logs and return finding count."""
     if not logs:
         return 0
@@ -52,10 +52,10 @@ def _count_research_findings(logs: Optional[str]) -> int:
 
 @router.get("/activity")
 async def get_activity(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    event_types: Optional[List[str]] = Query(None),
-    since: Optional[datetime] = Query(None),
+    event_types: List[str] | None = Query(None),
+    since: datetime | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -293,7 +293,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 pass
         return t.created_at
 
-    def _safe_ts_in_window(ts_str: Optional[str], cutoff: datetime) -> bool:
+    def _safe_ts_in_window(ts_str: str | None, cutoff: datetime) -> bool:
         try:
             return datetime.fromisoformat(ts_str or "") >= cutoff
         except (ValueError, TypeError):
@@ -335,7 +335,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     prev_total = len(prev_completed) + len(prev_failed)
     prev_success_rate = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
 
-    trend: Optional[str] = None
+    trend: str | None = None
     if success_rate is not None and prev_success_rate is not None:
         delta = success_rate - prev_success_rate
         if delta > 0.05:
@@ -483,7 +483,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     prev_terminal_tasks = prev_completed + prev_failed
     prev_first_attempt_rate = _first_attempt_rate(prev_terminal_tasks)
 
-    first_attempt_trend: Optional[str] = None
+    first_attempt_trend: str | None = None
     if current_first_attempt_rate is not None and prev_first_attempt_rate is not None:
         fa_delta = current_first_attempt_rate - prev_first_attempt_rate
         if fa_delta > 0.05:
@@ -495,7 +495,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # First-attempt failures by review category: which categories caused the most
     # first-attempt rejections, as a fraction of tasks that had their first review rejected.
-    first_attempt_by_review_category: Optional[Dict[str, float]] = None
+    first_attempt_by_review_category: Dict[str, float] | None = None
     first_attempt_failed_with_cats = [
         t for t in terminal_tasks_24h
         if "_first_attempt_rejection_categories" in (t.context or {})
@@ -529,7 +529,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if (t.first_payload or {}).get("type") == "review"
         and (t.context or {}).get("blueprint_review_verdict") is not None
     ]
-    review_accuracy: Optional[Dict[str, Any]] = None
+    review_accuracy: Dict[str, Any] | None = None
     if len(review_tasks) >= 5:
         total_reviews = len(review_tasks)
         overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
@@ -551,6 +551,16 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             "recall": recall,
         }
 
+    # Persistent review issues: categories that have remained above 20% in each of
+    # the last 3 consecutive 14-day windows, stored by compute_review_effectiveness.
+    persistent_review_issues: Optional[List[str]] = None
+    project = await session.get(Project, project_id)
+    if project and project.design_doc:
+        eff = project.design_doc.get("review_effectiveness") or {}
+        issues = eff.get("persistent_issues") or []
+        if issues:
+            persistent_review_issues = issues
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -559,13 +569,14 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "first_attempt_success_rate": first_attempt_success_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "review_accuracy": review_accuracy,
+        "persistent_review_issues": persistent_review_issues,
     }
 
 
 @router.get("/digest")
 async def get_digest(
     hours: int = Query(24, ge=1, le=168),
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin)
 ):
@@ -711,7 +722,7 @@ async def get_digest(
                         pass
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
-                dir_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
+                dir_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
@@ -774,7 +785,7 @@ async def get_digest(
     for t in failed_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -787,7 +798,7 @@ async def get_digest(
     for t in approval_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Pending approval",
@@ -808,7 +819,7 @@ async def get_digest(
         tid = str(t.id)
         ts = _derive_completed_at(t)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         recent_failures.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -832,7 +843,7 @@ async def get_digest(
         tid = str(t.id)
         cls = _classify_failure(t, error_log_map.get(tid))
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         _failure_class_groups.setdefault(cls, []).append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -920,14 +931,14 @@ async def get_digest(
 
     completed_delta = completed_count - prev_completed_count
     failed_delta = failed_count - prev_failed_count
-    success_rate_delta: Optional[float] = (
+    success_rate_delta: float | None = (
         round(success_rate - prev_success_rate, 2)
         if success_rate is not None and prev_success_rate is not None
         else None
     )
     if success_rate_delta is not None:
         if success_rate_delta > 0.05:
-            trend: Optional[str] = "improving"
+            trend: str | None = "improving"
         elif success_rate_delta < -0.05:
             trend = "declining"
         else:
@@ -957,7 +968,7 @@ async def get_digest(
             _cls = _classify_failure(_ft)
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
         _p_total = _p_completed + _p_failed
-        _p_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
+        _p_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
         trend_history.append({
             "period_end": _p_end.isoformat(),
             "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
@@ -1063,13 +1074,13 @@ async def get_digest(
 
     # Compute total estimated cost (directed + undirected tasks)
     directed_task_ids = {t.id for t in all_tasks if (t.context or {}).get("direction_id")}
-    undirected_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
+    undirected_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
     total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
 
     # Compute today's cost for cost ceiling warning
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     daily_cost_usd = round(sum(
-        (t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
         for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= today_start
     ), 2)
     daily_cost_ceiling_usd = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
@@ -1144,14 +1155,14 @@ async def get_digest(
 
 @router.get("/health-overview")
 async def get_health_overview(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Return a unified health overview with top actionable issues."""
     from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
     from app.compute import get_zone_health_summary
-    from app.routers.admin_settings import _build_stuck_tasks  # noqa: PLC0415
+    from app.routers.admin_settings import _build_stuck_tasks
 
     now = _utcnow()
     actionable_issues: List[Dict[str, Any]] = []
@@ -1190,7 +1201,7 @@ async def get_health_overview(
         prev_failed = [t for t in xp_tasks if t.status == TaskStatus.FAILED and prev_window_start <= _derive_at(t) < window_start]
         prev_total = len(prev_completed) + len(prev_failed)
         prev_sr = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
-        sr_trend: Optional[str] = None
+        sr_trend: str | None = None
         if success_rate_value is not None and prev_sr is not None:
             delta = success_rate_value - prev_sr
             if delta > 0.05:
@@ -1436,7 +1447,7 @@ async def get_health_overview(
 
 @router.get("/task-duration-stats")
 async def get_task_duration_stats(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -1463,6 +1474,10 @@ ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
 ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
 _orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
 
+# Acknowledged error buckets: "exception_class|source" -> ISO timestamp.
+# Buckets whose last_seen_iso <= acknowledged_at are filtered from responses.
+_acknowledged_errors: Dict[str, str] = {}
+
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<cls>(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|Timeout|NotFound|Denied|Conflict))(?::|\b)",
     re.MULTILINE,
@@ -1484,6 +1499,32 @@ def _extract_error_message(entry: Any) -> str:
                 return value
         return json.dumps(payload, default=str)[:4000]
     if payload is None:
+        # No text payload — extract container-level metadata from the entry
+        parts: list[str] = []
+        severity = getattr(entry, "severity", None)
+        if severity:
+            parts.append(f"severity={severity}")
+        resource = getattr(entry, "resource", None)
+        if resource:
+            labels = getattr(resource, "labels", None) or {}
+            if isinstance(labels, dict):
+                for k in ("revision_name", "configuration_name"):
+                    if labels.get(k):
+                        parts.append(f"{k}={labels[k]}")
+        http_req = getattr(entry, "http_request", None)
+        if http_req and isinstance(http_req, dict):
+            method = http_req.get("requestMethod", "")
+            url = http_req.get("requestUrl", "")
+            status = http_req.get("status", "")
+            if method or url:
+                parts.append(f"{method} {url} → {status}")
+        labels = getattr(entry, "labels", None)
+        if labels and isinstance(labels, dict):
+            for k in ("instanceId", "run.googleapis.com/execution_environment"):
+                if labels.get(k):
+                    parts.append(f"{k}={labels[k]}")
+        if parts:
+            return "[Cloud Run system] " + " | ".join(parts)
         return ""
     return str(payload)[:4000]
 
@@ -1492,6 +1533,8 @@ def _parse_exception_class(message: str) -> str:
     """Scan a log payload for the last exception class name in a traceback."""
     if not message:
         return "UnknownError"
+    if message.startswith("[Cloud Run system]"):
+        return "ContainerError"
     matches = _EXCEPTION_LINE_RE.findall(message)
     if matches:
         return matches[-1].rstrip(":")
@@ -1504,10 +1547,10 @@ def _parse_exception_class(message: str) -> str:
     return "UnknownError"
 
 
-def _parse_source_location(message: str) -> Tuple[str, Optional[int]]:
+def _parse_source_location(message: str) -> Tuple[str, int | None]:
     """Return the first traceback frame inside the app source tree."""
-    app_frame: Optional[Tuple[str, int]] = None
-    last_frame: Optional[Tuple[str, int]] = None
+    app_frame: Tuple[str, int] | None = None
+    last_frame: Tuple[str, int] | None = None
     for match in _TRACEBACK_FRAME_RE.finditer(message):
         path = match.group("path")
         try:
@@ -1543,7 +1586,7 @@ def _parse_entry_timestamp(entry: Any) -> datetime:
 
 def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
     """Group log entries by (exception_class, source_file, source_line)."""
-    buckets: Dict[Tuple[str, str, Optional[int]], Dict[str, Any]] = {}
+    buckets: Dict[Tuple[str, str, int | None], Dict[str, Any]] = {}
     for entry in entries:
         message = _extract_error_message(entry)
         exception_class = _parse_exception_class(message)
@@ -1553,8 +1596,8 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
         bucket = buckets.get(key)
         if bucket is None:
             sample = message.strip()
-            if len(sample) > 600:
-                sample = sample[:600] + "..."
+            if len(sample) > 3000:
+                sample = sample[:3000] + "..."
             buckets[key] = {
                 "exception_class": exception_class,
                 "source": f"{source_file}:{source_line}" if source_line else source_file,
@@ -1606,6 +1649,26 @@ def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
     return collected
 
 
+def _filter_acknowledged_buckets(buckets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove buckets whose last_seen_iso is at or before the acknowledged timestamp."""
+    if not _acknowledged_errors:
+        return buckets
+    global_ack = _acknowledged_errors.get("*")
+    filtered = []
+    for b in buckets:
+        last_seen = b["last_seen_iso"]
+        # Check per-bucket acknowledgment
+        key = f"{b['exception_class']}|{b['source']}"
+        ack_ts = _acknowledged_errors.get(key)
+        if ack_ts and last_seen <= ack_ts:
+            continue
+        # Check global acknowledgment
+        if global_ack and last_seen <= global_ack:
+            continue
+        filtered.append(b)
+    return filtered
+
+
 @router.get("/recent-orchestrator-errors")
 async def get_recent_orchestrator_errors(
     hours: int = Query(default=1, ge=1, le=24),
@@ -1617,7 +1680,10 @@ async def get_recent_orchestrator_errors(
     now = time.time()
     cached = _orchestrator_errors_cache.get(cache_key)
     if cached is not None and (now - cached[0]) < ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS:
-        return cached[1]
+        # Still apply acknowledgment filter on cached data
+        cached_payload = cached[1]
+        visible = _filter_acknowledged_buckets(cached_payload.get("buckets", []))
+        return {**cached_payload, "buckets": visible, "acknowledged_count": len(cached_payload.get("buckets", [])) - len(visible)}
 
     try:
         entries = _fetch_orchestrator_error_entries(hours)
@@ -1632,12 +1698,166 @@ async def get_recent_orchestrator_errors(
         _orchestrator_errors_cache[cache_key] = (now, payload)
         return payload
 
-    buckets = _bucket_log_entries(entries, limit)
-    payload = {
-        "buckets": buckets,
+    all_buckets = _bucket_log_entries(entries, limit)
+    # Cache the full (unfiltered) set; filter on read
+    _orchestrator_errors_cache[cache_key] = (now, {
+        "buckets": all_buckets,
         "hours": hours,
         "total_entries_scanned": len(entries),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    visible = _filter_acknowledged_buckets(all_buckets)
+    return {
+        "buckets": visible,
+        "hours": hours,
+        "total_entries_scanned": len(entries),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "acknowledged_count": len(all_buckets) - len(visible),
     }
-    _orchestrator_errors_cache[cache_key] = (now, payload)
-    return payload
+
+
+@router.post("/orchestrator-errors/acknowledge")
+async def acknowledge_orchestrator_error(
+    exception_class: str = Query(...),
+    source: str = Query(...),
+    current_user: dict = Depends(require_admin),
+):
+    """Acknowledge a specific orchestrator error bucket so it's hidden until new occurrences arrive."""
+    key = f"{exception_class}|{source}"
+    _acknowledged_errors[key] = datetime.now(timezone.utc).isoformat()
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(f"[ADMIN] Orchestrator error acknowledged: {key} by {user_email}")
+    return {"status": "acknowledged", "key": key}
+
+
+@router.post("/orchestrator-errors/acknowledge-all")
+async def acknowledge_all_orchestrator_errors(
+    current_user: dict = Depends(require_admin),
+):
+    """Acknowledge all current orchestrator error buckets."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    acknowledged_keys = []
+    for _cached_ts, cached_payload in _orchestrator_errors_cache.values():
+        for b in cached_payload.get("buckets", []):
+            key = f"{b['exception_class']}|{b['source']}"
+            _acknowledged_errors[key] = now_iso
+            acknowledged_keys.append(key)
+    # If cache is empty but caller wants to ack everything, set a global marker
+    if not acknowledged_keys:
+        _acknowledged_errors["*"] = now_iso
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}")
+    return {"status": "acknowledged", "count": len(acknowledged_keys)}
+
+
+@router.delete("/orchestrator-errors/acknowledged")
+async def clear_acknowledged_orchestrator_errors(
+    current_user: dict = Depends(require_admin),
+):
+    """Clear all acknowledgments so previously hidden errors reappear."""
+    count = len(_acknowledged_errors)
+    _acknowledged_errors.clear()
+    return {"status": "cleared", "count": count}
+
+
+# ---------------------------------------------------------------------------
+# Open PR monitor
+# ---------------------------------------------------------------------------
+
+_ACTIVE_STATUSES = {
+    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+}
+
+
+@router.get("/open-prs")
+async def get_open_prs(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return all open PRs from GitHub cross-referenced with linked tasks."""
+    from app.services import _get_project_github_token
+    from app.github import get_open_pull_requests
+
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalars().first()
+    if not project or not project.github_owner or not project.github_repo:
+        return {"open_prs": []}
+
+    try:
+        token = await _get_project_github_token(project, session)
+    except Exception:
+        logger.warning("Failed to get GitHub token for project %s", project_id)
+        return {"open_prs": []}
+    if not token:
+        return {"open_prs": []}
+
+    github_prs = await get_open_pull_requests(
+        token, project.github_owner, project.github_repo
+    )
+
+    # Build task lookup: pr_number -> most relevant active task
+    # Prefer active tasks (IN_PROGRESS > QUEUED > EVALUATING > COMPLETED)
+    pr_task_map: Dict[int, Task] = {}
+
+    # Source 1: PR artifacts (agent-created PRs — extract number from URL)
+    artifact_rows = (await session.execute(
+        select(Artifact, Task)
+        .join(Task, Artifact.task_id == Task.id)
+        .where(
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            Artifact.pr_url.isnot(None),
+            Task.project_id == project_id,
+        )
+    )).all()
+    for art, task in artifact_rows:
+        try:
+            pr_num = int(art.pr_url.rstrip("/").split("/")[-1])
+        except (ValueError, IndexError):
+            continue
+        existing = pr_task_map.get(pr_num)
+        if not existing or (task.status in _ACTIVE_STATUSES and existing.status not in _ACTIVE_STATUSES):
+            pr_task_map[pr_num] = task
+
+    # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
+    active_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_(list(_ACTIVE_STATUSES)),
+        )
+    )).scalars().all()
+    for t in active_tasks:
+        ctx = t.context or {}
+        pr_num = (
+            (ctx.get("review_loop") or {}).get("pr_number")
+            or ctx.get("rollup_pr_number")
+        )
+        if pr_num and isinstance(pr_num, int):
+            existing = pr_task_map.get(pr_num)
+            # Prefer active over non-active, then most recent
+            if not existing or existing.status not in _ACTIVE_STATUSES:
+                pr_task_map[pr_num] = t
+
+
+    result = []
+    for gh_pr in github_prs:
+        pr_number = gh_pr.get("number")
+        pr_url = gh_pr.get("html_url", "")
+        task = pr_task_map.get(pr_number)
+        is_orphaned = task is None or task.status not in _ACTIVE_STATUSES
+        result.append({
+            "pr_number": gh_pr.get("number"),
+            "pr_url": pr_url,
+            "pr_title": gh_pr.get("title", ""),
+            "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+            "pr_created_at": gh_pr.get("created_at"),
+            "task_id": str(task.id) if task else None,
+            "task_status": task.status if task else None,
+            "task_type": task.first_payload.get("type", "create") if task else None,
+            "task_title": task.title if task else None,
+            "is_orphaned": is_orphaned,
+        })
+
+    return {"open_prs": result}

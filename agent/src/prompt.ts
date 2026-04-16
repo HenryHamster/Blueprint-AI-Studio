@@ -308,6 +308,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const parts = recentOutcomes.map(o => `${o.prs_merged}/${o.tasks_created} merged`);
       dcLines.push(`Recent cycles: ${parts.join(', ')}`);
     }
+    const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
+    if (failureStagePattern) {
+      const msg = strVal(failureStagePattern.message);
+      if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }
@@ -317,7 +322,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   if (taskScope && scopeApplicable) {
     const scopeDescriptions: Record<string, string> = {
       small: 'expect <50 lines across 1-3 files. Keep changes minimal and focused.',
-      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes.',
+      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes. Plan your changes before executing — identify files, dependencies, and order.',
       large: 'cross-component, 200+ lines — plan before coding.',
     };
     const scopeDesc = scopeDescriptions[taskScope] ?? '';
@@ -554,6 +559,35 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
         }
       } catch { /* no matches */ }
 
+      // Import-based discovery: search test files for direct import statements referencing this module
+      try {
+        if (relFile.endsWith('.py')) {
+          // e.g. 'backend/app/orchestrator.py' → 'app.orchestrator'
+          const pyModulePath = relFile
+            .replace(/^backend\//, '')
+            .replace(/\.py$/, '')
+            .replace(/\//g, '.');
+          const importPattern = `(from ${pyModulePath} import|import ${pyModulePath})`;
+          const pyGrepResult = execFileSync('git', ['grep', '-lE', importPattern, '--', '*test*'],
+            { cwd: WORKSPACE, encoding: 'utf-8' });
+          for (const tf of pyGrepResult.split('\n').filter(Boolean)) {
+            processTestFile(tf);
+          }
+        } else if (relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+          // e.g. 'agent/src/prompt.ts' → stem 'prompt'
+          const stem = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') || '';
+          if (stem) {
+            // Match import ... from '*/prompt', '*/prompt.js', '*/prompt.ts' etc.
+            const tsImportPattern = `from ['"][^'"]*/${stem}(\\.js|\\.ts|\\.tsx)?['"]`;
+            const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
+              { cwd: WORKSPACE, encoding: 'utf-8' });
+            for (const tf of tsGrepResult.split('\n').filter(Boolean)) {
+              processTestFile(tf);
+            }
+          }
+        }
+      } catch { /* no matches */ }
+
       void discoveredByConvention; // used for control flow, not needed after loop
     }
 
@@ -573,6 +607,106 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
     return output.slice(0, 3000);
   } catch (e) {
     sendLog(ws, `Warning: related test discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
+// ── Module interface discovery ───────────────────────────────────────────────
+/**
+ * Discovers lightweight interface summaries for a list of related files and
+ * their direct importers. Only runs for medium and large scope tasks.
+ *
+ * For Python files: extracts module-level function/class signatures.
+ * For TypeScript files: extracts exported declarations.
+ * Also discovers files that import from the related modules via git grep.
+ *
+ * Output is capped at 3000 characters to avoid bloating the context window.
+ */
+export function discoverModuleInterfaces(ws: WebSocket | null, relatedFiles: string[], taskScope?: string): string {
+  if (taskScope !== 'medium' && taskScope !== 'large') return '';
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const interfaceSections: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      const fullPath = `${WORKSPACE}/${relFile}`;
+      if (!fs.existsSync(fullPath)) continue;
+
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch { continue; }
+
+      const signatures: string[] = [];
+
+      if (relFile.endsWith('.py')) {
+        // Extract module-level (non-indented) function and class definitions
+        for (const line of content.split('\n')) {
+          if (/^(?:async\s+)?def\s+\w+\(/.test(line) || /^class\s+\w+/.test(line)) {
+            // Strip trailing colon and body for clean signature line
+            signatures.push(line.replace(/:\s*$/, '').trim());
+          }
+        }
+      } else if (relFile.match(/\.(tsx?|jsx?)$/)) {
+        // Extract exported declarations — signature line without body
+        for (const line of content.split('\n')) {
+          if (/^export\s+(?:async\s+)?(?:function|class|interface|type|const)\b/.test(line)) {
+            signatures.push(line.replace(/\s*[{;].*$/, '').trim());
+          }
+        }
+      }
+
+      if (signatures.length > 0) {
+        interfaceSections.push(`### ${relFile}\n${signatures.map(s => `- ${s}`).join('\n')}`);
+      }
+    }
+
+    // Discover direct importers via git grep
+    const importerLines: string[] = [];
+    const seenModules = new Set<string>();
+    for (const relFile of relatedFiles) {
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      if (!moduleName || seenModules.has(moduleName)) continue;
+      seenModules.add(moduleName);
+
+      try {
+        const globArgs: string[] = relFile.endsWith('.py')
+          ? ['--', '*.py']
+          : ['--', '*.ts', '*.tsx'];
+        // Use a pattern that matches typical import statements
+        const grepPattern = relFile.endsWith('.py')
+          ? `from.*\\b${moduleName}\\b`
+          : `from.*['"].*${moduleName}['"]`;
+        const result = execFileSync(
+          'git', ['grep', '-El', grepPattern, ...globArgs],
+          { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 },
+        );
+        const importers = result.split('\n').filter(f => f && !relatedFiles.includes(f));
+        if (importers.length > 0) {
+          importerLines.push(`- \`${relFile}\` imported by: ${importers.slice(0, 5).map(f => `\`${f}\``).join(', ')}`);
+        }
+      } catch { /* no matches or grep exited non-zero */ }
+    }
+
+    if (interfaceSections.length === 0 && importerLines.length === 0) return '';
+
+    const parts: string[] = ['## Module Interfaces'];
+    if (interfaceSections.length > 0) {
+      parts.push('');
+      parts.push(interfaceSections.join('\n\n'));
+    }
+    if (importerLines.length > 0) {
+      parts.push('');
+      parts.push('### Direct Importers');
+      parts.push(importerLines.join('\n'));
+    }
+    parts.push('');
+
+    const output = parts.join('\n') + '\n';
+    return output.slice(0, 3000);
+  } catch (e) {
+    sendLog(ws, `Warning: module interface discovery failed: ${String(e)}\n`);
     return '';
   }
 }
@@ -789,10 +923,16 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       }
     }
 
+    // Persistent review issues: categories above 20% for 3+ consecutive 14-day windows
+    const persistentIssues = pipelineHealth.persistent_review_issues as string[] | null | undefined;
+    if (persistentIssues && persistentIssues.length > 0) {
+      parts.push(`Persistent review issues (structural fix needed): ${persistentIssues.join(', ')}.`);
+    }
+
     if (parts.length > 0) {
       const body = parts.join(' ');
       const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
-      if (candidate.length <= 400 && candidate.length <= budget) {
+      if (candidate.length <= 500 && candidate.length <= budget) {
         healthLines = ['### Pipeline Health (last 24h)', body, ''];
         budget -= candidate.length;
       }
@@ -804,6 +944,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   // First-attempt-specific breakdown from pipeline health (more actionable than all-iterations data)
   const fasrForReview = pipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
   const firstAttemptByCat = fasrForReview?.first_attempt_by_review_category as Record<string, number> | null | undefined;
+  // Review effectiveness: per-category trend data from two consecutive 14-day windows
+  type ReviewEffectivenessCategory = { trend?: string };
+  const reviewEffectiveness = ctx.review_effectiveness as { categories?: Record<string, ReviewEffectivenessCategory> } | null | undefined;
+  const reviewEffCats = reviewEffectiveness?.categories;
   let reviewIssueLines: string[] = [];
   if (reviewIssueDist && Object.keys(reviewIssueDist).length > 0) {
     const hasFirstAttemptCats = firstAttemptByCat && Object.keys(firstAttemptByCat).length > 0;
@@ -816,7 +960,12 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const faPct = hasFirstAttemptCats && firstAttemptByCat![cat] !== undefined
         ? ` (${Math.round(firstAttemptByCat![cat] * 100)}% of first-attempt rejections)`
         : '';
-      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}`);
+      const trend = reviewEffCats?.[cat]?.trend;
+      const trendIndicator = trend === 'decreasing' ? ', trending down'
+        : trend === 'increasing' ? ', trending up ⚠'
+        : trend === 'stable' ? ', persistent'
+        : '';
+      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}${trendIndicator}`);
     }
     // Append specific recurring patterns if available
     type FirstReviewIssue = { description: string; count: number; category: string };
@@ -900,6 +1049,282 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   return allLines.join('\n');
 }
 
+// ── Module interface extraction ──────────────────────────────────────────────
+
+/**
+ * Extracts top-level exported symbols from a Python source file.
+ * Prefers __all__ when present; otherwise scans for top-level def/class.
+ */
+function extractPythonExports(content: string): string[] {
+  // If __all__ is defined, use it as the authoritative public surface
+  const allMatch = content.match(/__all__\s*=\s*\[([\s\S]*?)\]/);
+  if (allMatch) {
+    return [...allMatch[1].matchAll(/['"](\w+)['"]/g)].map(m => m[1]).slice(0, 15);
+  }
+
+  const results: string[] = [];
+  for (const line of content.split('\n')) {
+    // Top-level functions (no leading indentation)
+    const funcMatch = line.match(/^def (\w+)\(([^)]*)\)/);
+    const classMatch = line.match(/^class (\w+)/);
+    if (funcMatch) {
+      const params = funcMatch[2].length > 50 ? funcMatch[2].slice(0, 47) + '...' : funcMatch[2];
+      results.push(`def ${funcMatch[1]}(${params})`);
+    } else if (classMatch) {
+      results.push(`class ${classMatch[1]}`);
+    }
+  }
+  return results;
+}
+
+/**
+ * Extracts export declarations from a TypeScript/JavaScript source file.
+ */
+function extractTypeScriptExports(content: string): string[] {
+  const results: string[] = [];
+  for (const line of content.split('\n')) {
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)/))) {
+      const params = m[2].length > 50 ? m[2].slice(0, 47) + '...' : m[2];
+      results.push(`function ${m[1]}(${params})`);
+    } else if ((m = line.match(/^export\s+(?:abstract\s+)?class\s+(\w+)/))) {
+      results.push(`class ${m[1]}`);
+    } else if ((m = line.match(/^export\s+interface\s+(\w+)/))) {
+      results.push(`interface ${m[1]}`);
+    } else if ((m = line.match(/^export\s+type\s+(\w+)/))) {
+      results.push(`type ${m[1]}`);
+    } else if ((m = line.match(/^export\s+(?:const|let)\s+(\w+)/))) {
+      results.push(`const ${m[1]}`);
+    }
+  }
+  return results;
+}
+
+/**
+ * Scans each file in relatedFiles to extract its public API surface (exported
+ * functions/classes/types) and which other files import from it.  Returns a
+ * concise markdown section for injection into the agent prompt, capped at ~2KB.
+ *
+ * Only runs for create/refactor tasks with scope=medium or scope=large so that
+ * small tasks are not burdened with irrelevant context.
+ */
+export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: string[]): string {
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const CAP = 2000;
+    const entries: string[] = [];
+    const processedFiles: string[] = [];
+    const fileCallers = new Map<string, string[]>();
+
+    for (const relFile of relatedFiles) {
+      // Skip test files — their exports are not caller-facing APIs
+      if (relFile.includes('.test.') || relFile.includes('/test_') || relFile.includes('/tests/')) continue;
+
+      const isPython = relFile.endsWith('.py');
+      const isTS = /\.(ts|tsx|js|jsx)$/.test(relFile);
+      if (!isPython && !isTS) continue;
+
+      let content: string;
+      try {
+        const fullPath = `${WORKSPACE}/${relFile}`;
+        if (!fs.existsSync(fullPath)) continue;
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch { continue; }
+
+      const exports = isPython ? extractPythonExports(content) : extractTypeScriptExports(content);
+      if (exports.length === 0) continue;
+
+      // Find files that import this module via git grep
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      let callers: string[] = [];
+      if (moduleName) {
+        try {
+          const grepOut = execFileSync(
+            'git', ['grep', '-rl', moduleName, '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx'],
+            { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 }
+          );
+          callers = grepOut.split('\n')
+            .filter(f => f && f !== relFile && !f.includes('.test.') && !f.includes('/test_'))
+            .slice(0, 5);
+        } catch { /* no matches — not an error */ }
+      }
+
+      const exportStr = exports.slice(0, 12).join(', ');
+      let entry = `**${relFile}** exports: ${exportStr}`;
+      if (callers.length > 0) {
+        entry += `\n  Imported by: ${callers.join(', ')}`;
+      }
+      entries.push(entry);
+      processedFiles.push(relFile);
+      fileCallers.set(relFile, callers);
+    }
+
+    if (entries.length === 0) return '';
+
+    let body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+
+    // ── Suggested Change Order ───────────────────────────────────────────────
+    // Analyze import dependencies between related files and topologically sort.
+    if (processedFiles.length > 1) {
+      try {
+        const pSet = new Set(processedFiles);
+        const dependsOn = new Map(processedFiles.map(f => [f, new Set<string>()]));
+        for (const [file, callers] of fileCallers)
+          for (const caller of callers)
+            if (pSet.has(caller)) dependsOn.get(caller)!.add(file);
+
+        if ([...dependsOn.values()].some(d => d.size > 0)) {
+          const consumers = new Map(processedFiles.map(f => [f, new Set<string>()]));
+          for (const [f, deps] of dependsOn)
+            for (const dep of deps) consumers.get(dep)!.add(f);
+
+          const inDeg = new Map(processedFiles.map(f => [f, dependsOn.get(f)!.size]));
+          const queue = processedFiles.filter(f => inDeg.get(f) === 0);
+          const order: string[] = [];
+          while (queue.length > 0) {
+            const f = queue.shift()!;
+            order.push(f);
+            for (const c of consumers.get(f)!) {
+              inDeg.set(c, inDeg.get(c)! - 1);
+              if (inDeg.get(c) === 0) queue.push(c);
+            }
+          }
+          if (order.length === processedFiles.length) {
+            const lines = order.map((f, i) => {
+              const deps = dependsOn.get(f)!;
+              const note = deps.size > 0
+                ? ` (imports from ${[...deps].map(d => d.split('/').pop() || d).join(', ')})`
+                : ' (no dependencies on other changed files)';
+              return `${i + 1}. ${f.split('/').pop() ?? f}${note}`;
+            });
+            body += `## Suggested Change Order\nBased on import dependencies between files you are modifying:\n${lines.join('\n')}\n\nModify foundational files first, then update their consumers.\n\n`;
+          }
+        }
+      } catch { /* dependency analysis failed — skip silently */ }
+    }
+
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: module interface extraction failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
+/**
+ * Finds production source files that import from the given related_files.
+ * Returns a compact markdown section listing each changed module alongside the
+ * consumers that import from it (with the specific symbols they import), capped
+ * at ~2000 chars.  Only production code is included — test files are excluded
+ * because those are already surfaced by discoverRelatedTests.
+ *
+ * Only meaningful for create/refactor tasks with scope=medium or scope=large.
+ */
+export function discoverAffectedConsumers(ws: WebSocket | null, relatedFiles: string[]): string {
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const CAP = 2000;
+    const entries: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      // Skip test files — test consumers are handled by discoverRelatedTests
+      if (relFile.includes('.test.') || relFile.includes('/test_') || relFile.includes('/tests/')) continue;
+
+      const isPython = relFile.endsWith('.py');
+      const isTS = /\.(ts|tsx|js|jsx)$/.test(relFile);
+      if (!isPython && !isTS) continue;
+
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      if (!moduleName) continue;
+
+      // Find production source files that mention this module name
+      let consumerFiles: string[] = [];
+      try {
+        const grepOut = execFileSync(
+          'git', ['grep', '-rl', moduleName, '--',
+            ...(isPython ? ['*.py'] : ['*.ts', '*.tsx', '*.js', '*.jsx']),
+          ],
+          { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 }
+        );
+        consumerFiles = grepOut.split('\n').filter(f =>
+          f &&
+          f !== relFile &&
+          !f.includes('.test.') &&
+          !f.includes('/test_') &&
+          !f.includes('/testing/') &&
+          !f.includes('/tests/')
+        ).slice(0, 6);
+      } catch { /* no matches — not an error */ }
+
+      if (consumerFiles.length === 0) continue;
+
+      // For each consumer, extract which symbols it imports from this module
+      const consumerDetails: Array<{ file: string; imports: string[] }> = [];
+      for (const consumerFile of consumerFiles) {
+        const fullPath = `${WORKSPACE}/${consumerFile}`;
+        if (!fs.existsSync(fullPath)) continue;
+
+        try {
+          const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').slice(0, 80);
+          const imports: string[] = [];
+
+          for (const line of lines) {
+            if (isPython) {
+              // from .module_name import X, Y  /  from app.module_name import X
+              const m = line.match(new RegExp(`from\\s+\\S*${moduleName}\\s+import\\s+(.+)`));
+              if (m) {
+                const names = m[1].split(',')
+                  .map(s => s.trim().replace(/[()#\\].*/g, '').trim())
+                  .filter(s => s && /^\w+$/.test(s));
+                imports.push(...names);
+              }
+            } else {
+              // import { X, Y } from './module-name' or './module-name.js'
+              const namedMatch = line.match(
+                new RegExp(`import\\s+\\{([^}]+)\\}\\s+from\\s+['"][^'"]*${moduleName}[^'"]*['"]`)
+              );
+              if (namedMatch) {
+                const names = namedMatch[1].split(',')
+                  .map(s => s.trim().split(/\s+as\s+/)[0].trim())
+                  .filter(s => s && /^\w+$/.test(s));
+                imports.push(...names);
+              }
+              // import DefaultExport from './module-name' or './module-name.js'
+              const defaultMatch = line.match(
+                new RegExp(`import\\s+(\\w+)\\s+from\\s+['"][^'"]*${moduleName}[^'"]*['"]`)
+              );
+              if (defaultMatch) {
+                imports.push(defaultMatch[1]);
+              }
+            }
+          }
+
+          consumerDetails.push({ file: consumerFile, imports: [...new Set(imports)].slice(0, 8) });
+        } catch {
+          consumerDetails.push({ file: consumerFile, imports: [] });
+        }
+      }
+
+      if (consumerDetails.length === 0) continue;
+
+      const consumerLines = consumerDetails.map(c => {
+        const importStr = c.imports.length > 0 ? ` (imports: ${c.imports.join(', ')})` : '';
+        return `  - ${c.file}${importStr}`;
+      });
+      entries.push(`**${relFile}** is imported by:\n${consumerLines.join('\n')}`);
+    }
+
+    if (entries.length === 0) return '';
+
+    const body = `## Affected Consumers\nProduction files that import from your changed modules. Verify they remain compatible after your changes.\n\n${entries.join('\n\n')}\n\n`;
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: affected consumer discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
 // ── Retry context injection ──────────────────────────────────────────────────
 /**
  * Builds a section describing the previous failed attempt, to be inserted
@@ -917,23 +1342,76 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
     ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
     : [];
+  const previousFailureStage = strVal(ctx._previous_failure_stage as unknown);
+  const previousErrorSummary = strVal(ctx._previous_error_summary as unknown);
+  const previousIsRecurring = ctx._previous_is_recurring === true;
+  const previousDiffSummary = Array.isArray(ctx._previous_diff_summary)
+    ? (ctx._previous_diff_summary as unknown[]).filter(
+        (e): e is Record<string, unknown> => typeof e === 'object' && e !== null,
+      )
+    : [];
+  const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary as unknown);
+  const previousSelfReviewOutcome = ctx._previous_self_review_outcome as Record<string, unknown> | undefined;
   const prevAttempt = attemptNumber - 1;
 
+  const failureTypeLabel = previousFailureClass || 'UNKNOWN';
   const lines: string[] = [
     `## Previous Attempt (attempt #${prevAttempt} failed)`,
-    `Failure type: ${previousFailureClass || 'UNKNOWN'}`,
+    previousFailureStage
+      ? `Failure type: ${failureTypeLabel} (at ${previousFailureStage} stage)`
+      : `Failure type: ${failureTypeLabel}`,
   ];
+
+  if (previousIsRecurring) {
+    lines.push(
+      '**This is a recurring failure pattern** — this same failure type has been seen multiple times. Consider a fundamentally different approach.',
+    );
+  }
+
   if (previousPrUrl) {
     lines.push(`PR from previous attempt: ${previousPrUrl}`);
   }
-  if (previousChangedFiles.length > 0) {
+
+  // Prefer enriched diff summary over plain file list when available
+  if (previousDiffSummary.length > 0) {
+    const fileLines = previousDiffSummary.map(e => {
+      const file = strVal(e.file as unknown);
+      const additions = typeof e.additions === 'number' ? e.additions : 0;
+      const deletions = typeof e.deletions === 'number' ? e.deletions : 0;
+      const changeType = strVal(e.change_type as unknown) || 'modified';
+      return `  - ${file} (${changeType}, +${additions}/-${deletions} lines)`;
+    });
+    lines.push(`Files changed in previous attempt:\n${fileLines.join('\n')}`);
+  } else if (previousChangedFiles.length > 0) {
     lines.push(`Files changed in previous attempt:\n${previousChangedFiles.map(f => `  - ${f}`).join('\n')}`);
   }
-  if (previousError) {
+
+  if (previousTestFailureSummary) {
+    lines.push(`Test failures from previous attempt:\n${previousTestFailureSummary}`);
+  }
+
+  if (previousSelfReviewOutcome) {
+    const fixesApplied = Boolean(previousSelfReviewOutcome.fixes_applied);
+    const selfReviewStatus = fixesApplied
+      ? 'Self-review found issues and applied fixes (but the task still failed after review)'
+      : 'Self-review ran and found no critical issues';
+    lines.push(`Self-review outcome: ${selfReviewStatus}`);
+  }
+
+
+  // For CODE_ERROR failures, show the focused error summary; otherwise show the full error.
+  if (previousErrorSummary) {
+    lines.push(`Error summary: ${previousErrorSummary}`);
+  } else if (previousError) {
     lines.push(`Error: ${previousError}`);
   }
 
-  if (previousChangedFiles.length > 0) {
+  const hasChangedFiles = previousDiffSummary.length > 0 || previousChangedFiles.length > 0;
+  if (hasChangedFiles && previousTestFailureSummary) {
+    lines.push(
+      'Focus your retry on fixing the failing tests shown above. Preserve the working changes in other files and avoid re-doing changes that were not related to the test failure.',
+    );
+  } else if (hasChangedFiles) {
     lines.push(
       'Review the files listed above — your previous attempt modified them. Check whether those changes were correct or need to be reworked. Do not blindly repeat the same approach if it failed.',
     );
@@ -946,12 +1424,79 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   return lines.join('\n');
 }
 
+// ── Pre-implementation analysis prompt builder ───────────────────────────────
+/**
+ * Builds a read-only analysis prompt for medium-scope tasks.
+ * The agent reads related files, maps module interfaces and dependencies,
+ * then outputs a compact implementation plan before any code is written.
+ */
+export function buildAnalysisPrompt(opts: {
+  rawPrompt: string;
+  taskTitle: string;
+  relatedFiles: string[];
+  fileTree: string;
+}): string {
+  const filesList = opts.relatedFiles.length > 0
+    ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
+    : '';
+  const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
+
+  return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
+
+## Task
+${titleLine}${opts.rawPrompt.slice(0, 1500)}
+
+## Instructions
+
+1. Read the files listed in "Files Relevant to This Task" above. If no files are listed, identify the relevant files from the file tree and read them.
+
+2. For each relevant file, identify:
+   - What it exports (functions, classes, types, constants)
+   - What it imports from other local files
+   - Key interfaces or type contracts it defines or depends on
+
+3. Map the dependencies between files: which files import from which others.
+
+4. Output a compact structured implementation plan using exactly these headings:
+
+**Files to change** (list in recommended change order, one per line with brief reason)
+
+**Interfaces to preserve** (function signatures, exported types, or API contracts that must not be broken)
+
+**Key dependencies** (which modules call into which — determines safe change order)
+
+**Implementation approach** (2-3 sentences describing the strategy to make changes correctly without breaking type contracts)
+
+Keep the total output under 600 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
+}
+
 // ── Self-review helpers ───────────────────────────────────────────────────────
+
+/**
+ * Returns the mandatory check IDs for the given task scope.
+ * These must appear in the `checks_performed` field of the structured self-review output.
+ */
+export function getMandatoryChecks(taskScope?: string): string[] {
+  if (taskScope === 'small') {
+    return ['correctness', 'test_coverage'];
+  }
+  if (taskScope === 'large') {
+    return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
+  }
+  // medium or unspecified
+  return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
+}
+
 function buildSelfReviewChecklist(taskScope?: string): string {
   if (taskScope === 'small') {
-    return `Check for:
-1. **Correctness** — Off-by-one errors, null/undefined handling, edge cases in the changed logic?
-2. **Missing test coverage** — Is there new behavior with no corresponding test?`;
+    return `Severity guide: CRITICAL = data loss / security breach / crash; MAJOR = incorrect behavior / missing coverage; MINOR = style / naming (skip).
+
+Check for:
+1. **Correctness** (MAJOR/CRITICAL) — Off-by-one errors, null/undefined handling, edge cases in the changed logic?
+2. **Missing test coverage** (MAJOR) — Is there new behavior with no corresponding test?
+3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
+4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
+5. **Import and type verification** (MAJOR) — Are new imports available and type annotations correct?`;
   }
   if (taskScope === 'large') {
     return `Check for:
@@ -965,13 +1510,18 @@ function buildSelfReviewChecklist(taskScope?: string): string {
 8. **Data model safety** — Are schema changes (DB, JSONB, API response shapes) backwards-compatible?
 9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
   }
-  // medium or unspecified: standard 5-item checklist
-  return `Check for:
+  // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
+  return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
+
+Check for:
 1. **Missing test coverage** — Is there new behavior with no corresponding test?
 2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
 3. **Scope violations** — Are there changes unrelated to the task requirements?
 4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
-5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?`;
+5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
+6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?
+7. **Backwards compatibility** — Are any existing callers broken by signature or behavior changes?
+8. **Import/dependency verification** — Are new imports available and correctly referenced?`;
 }
 
 // ── Self-review prompt builder ───────────────────────────────────────────────
@@ -989,6 +1539,7 @@ export function buildSelfReviewPrompt(opts: {
   changedFiles?: string[];
   reviewIssueDistribution?: Record<string, number>;
   taskScope?: string;
+  scopeOverflowWarning?: string;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -1014,7 +1565,7 @@ export function buildSelfReviewPrompt(opts: {
     : '';
 
   const truncationNotice = opts.changedFiles && opts.changedFiles.length > 0
-    ? `\n\n⚠️ WARNING: The diff above was truncated. The following files were changed but may not be fully shown:\n${opts.changedFiles.map(f => `- ${f}`).join('\n')}\nRead any truncated files directly with cat/head before declaring SELF-REVIEW PASSED.`
+    ? `\n\n⚠️ WARNING: The diff above was truncated. The following files were changed but may not be fully shown:\n${opts.changedFiles.map(f => `- ${f}`).join('\n')}\nRead these files directly with cat/head. List each file you read in the "truncated_files_read" field of your JSON output.`
     : '';
   const diffSection = opts.diff
     ? `\n## Diff (changes since base branch)\n\`\`\`diff\n${opts.diff}\n\`\`\`${truncationNotice}\n`
@@ -1035,11 +1586,18 @@ export function buildSelfReviewPrompt(opts: {
     buildVerificationSection = `\n## Build Verification\nRun these build commands. If any fail, fix the errors before proceeding with the review checklist.\n\n- For frontend changes (admin-ui/): \`cd admin-ui && npm run build\`\n- For agent changes (agent/): \`cd agent && npx tsc --noEmit\`\n- For backend changes (backend/): \`cd backend && python -m py_compile app/main.py\`\n`;
   }
 
+  const scopeOverflowSection = opts.scopeOverflowWarning
+    ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
+    : '';
+
+  const mandatoryChecks = getMandatoryChecks(opts.taskScope);
+  const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
+
   return `You are performing a self-review of the changes you just made for this task.
 
 ## Task Requirements
 ${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
-${restrictionsSection}${issueDistSection}${playbookSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
@@ -1047,5 +1605,16 @@ Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 ${buildSelfReviewChecklist(opts.taskScope)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
-If everything looks good, output exactly: SELF-REVIEW PASSED`;
+
+When done (whether or not you found issues), output a JSON block exactly like this:
+\`\`\`json
+{"verdict":"PASS","checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
+\`\`\`
+
+Fields:
+- \`verdict\`: "PASS" if no blocking issues remain, "FAIL" if unresolvable issues were found
+- \`checks_performed\`: IDs of every checklist item you examined — ${checkIdsNote}
+- \`issues_found\`: number of issues found (0 if none)
+- \`files_reviewed\`: number of files you read or examined
+- \`truncated_files_read\`: paths of files you read directly to compensate for a truncated diff (empty array if diff was not truncated)`;
 }

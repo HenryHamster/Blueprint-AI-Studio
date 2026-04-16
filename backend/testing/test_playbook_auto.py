@@ -1,6 +1,8 @@
 """Tests for automatic playbook entry creation from recurring failure patterns."""
+import json
+import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -431,6 +433,523 @@ async def test_capture_success_scope_distribution_accumulates(db_session: AsyncS
     entry = (project.design_doc or {}).get("playbook/success-fix-small", {})
     assert entry.get("success_count") == 2
     assert entry.get("scope_distribution") == {"small": 2}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for age-based flagging
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_old_unconfirmed_entry_gets_age_penalty():
+    """Entries older than 30 days with confirmed_count < 3 receive age_penalty=1 in the sort tuple."""
+    # Mirrors the same logic used in the claim endpoint (both use naive UTC datetimes).
+    old_date = (_utcnow() - timedelta(days=31)).isoformat()
+    recent_date = _utcnow().isoformat()
+
+    def _age_penalty(updated_at_str: str, confirmed: int) -> int:
+        if confirmed >= 3:
+            return 0
+        try:
+            updated_dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+            # Strip tzinfo so comparison stays naive (matches _utcnow() which is naive UTC)
+            if updated_dt.tzinfo is not None:
+                updated_dt = updated_dt.replace(tzinfo=None)
+            return 1 if (_utcnow() - updated_dt).days > 30 else 0
+        except (ValueError, TypeError):
+            return 0
+
+    assert _age_penalty(old_date, confirmed=0) == 1, "Old entry with no confirmations should get penalty"
+    assert _age_penalty(old_date, confirmed=2) == 1, "Old entry with 2 confirmations should get penalty"
+    assert _age_penalty(old_date, confirmed=3) == 0, "Old entry with 3+ confirmations should NOT get penalty"
+    assert _age_penalty(recent_date, confirmed=0) == 0, "Recent entry should NOT get penalty"
+
+
+def test_stale_file_refs_penalty():
+    """Entries with stale_file_refs=True receive stale_penalty=1 in the sort tuple."""
+    stale_entry = {"confirmed_count": 5, "stale_file_refs": True, "content": "x"}
+    clean_entry = {"confirmed_count": 5, "stale_file_refs": False, "content": "y"}
+    no_flag_entry = {"confirmed_count": 5, "content": "z"}
+
+    stale_penalty = lambda v: 1 if v.get("stale_file_refs") else 0
+    assert stale_penalty(stale_entry) == 1
+    assert stale_penalty(clean_entry) == 0
+    assert stale_penalty(no_flag_entry) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for file-reference validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_file_paths_basic():
+    """_extract_file_paths correctly extracts backend/agent/admin-ui paths from content."""
+    from app.playbook_learning import _extract_file_paths
+
+    content = (
+        "See backend/app/models.py and agent/src/index.ts. "
+        "Also admin-ui/src/App.tsx for the UI."
+    )
+    paths = _extract_file_paths(content)
+    assert "backend/app/models.py" in paths
+    assert "agent/src/index.ts" in paths
+    assert "admin-ui/src/App.tsx" in paths
+
+
+def test_extract_file_paths_no_matches():
+    """_extract_file_paths returns an empty list when no file paths are present."""
+    from app.playbook_learning import _extract_file_paths
+
+    assert _extract_file_paths("No file references here.") == []
+
+
+def test_check_and_flag_stale_refs_no_repo_root():
+    """check_and_flag_stale_refs is a no-op when repo_root is falsy or missing."""
+    from app.playbook_learning import check_and_flag_stale_refs
+
+    doc = {
+        "playbook/tip": {
+            "content": "see backend/app/missing_file.py",
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    result = check_and_flag_stale_refs(doc, "")
+    assert not result["playbook/tip"].get("stale_file_refs")
+
+
+def test_check_and_flag_stale_refs_marks_missing(tmp_path):
+    """check_and_flag_stale_refs sets stale_file_refs=True when referenced file is missing."""
+    from app.playbook_learning import check_and_flag_stale_refs
+
+    # Create a repo_root with one real file and reference a missing file
+    backend_dir = tmp_path / "backend" / "app"
+    backend_dir.mkdir(parents=True)
+    (backend_dir / "real_file.py").write_text("# exists")
+
+    doc = {
+        "playbook/tip": {
+            "content": "See backend/app/gone_file.py for the pattern.",
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    result = check_and_flag_stale_refs(doc, str(tmp_path))
+    assert result["playbook/tip"].get("stale_file_refs") is True
+
+
+def test_check_and_flag_stale_refs_clears_when_file_restored(tmp_path):
+    """check_and_flag_stale_refs clears stale_file_refs when all referenced files exist."""
+    from app.playbook_learning import check_and_flag_stale_refs
+
+    backend_dir = tmp_path / "backend" / "app"
+    backend_dir.mkdir(parents=True)
+    (backend_dir / "models.py").write_text("# exists")
+
+    doc = {
+        "playbook/tip": {
+            "content": "See backend/app/models.py.",
+            "confirmed_count": 0,
+            "stale_file_refs": True,
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    result = check_and_flag_stale_refs(doc, str(tmp_path))
+    assert result["playbook/tip"].get("stale_file_refs") is False
+
+
+def test_check_and_flag_stale_refs_no_file_paths_untouched(tmp_path):
+    """Entries with no file references are not modified by check_and_flag_stale_refs."""
+    from app.playbook_learning import check_and_flag_stale_refs
+
+    doc = {
+        "playbook/tip": {
+            "content": "General advice with no file references.",
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    result = check_and_flag_stale_refs(doc, str(tmp_path))
+    assert "stale_file_refs" not in result["playbook/tip"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for capacity-aware cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_doc_with_size(num_entries: int, confirmed_counts: list[int] | None = None) -> dict:
+    """Build a doc dict whose playbook entries collectively approach *num_entries* * ~500 bytes."""
+    confirmed_counts = confirmed_counts or [0] * num_entries
+    doc: dict = {}
+    for i in range(num_entries):
+        doc[f"playbook/entry-{i:03d}"] = {
+            "content": "x" * 480,  # ~480 bytes per entry to keep math simple
+            "confirmed_count": confirmed_counts[i],
+            "updated_at": _utcnow().isoformat(),
+        }
+    return doc
+
+
+def test_archive_least_useful_entry_removes_and_archives():
+    """_archive_least_useful_entry moves the entry with lowest confirmed_count to playbook_archive."""
+    from app.playbook_learning import _archive_least_useful_entry
+
+    doc = {
+        "playbook/a": {"content": "tip a", "confirmed_count": 5, "updated_at": _utcnow().isoformat()},
+        "playbook/b": {"content": "tip b", "confirmed_count": 0, "updated_at": _utcnow().isoformat()},
+        "playbook/c": {"content": "tip c", "confirmed_count": 3, "updated_at": _utcnow().isoformat()},
+    }
+    result = _archive_least_useful_entry(doc)
+
+    # 'b' has lowest confirmed_count — should be archived
+    assert "playbook/b" not in result
+    assert "playbook/a" in result
+    assert "playbook/c" in result
+    archive = result.get("playbook_archive", [])
+    assert len(archive) == 1
+    assert archive[0]["_archived_key"] == "playbook/b"
+
+
+def test_archive_prefers_stale_entries():
+    """_archive_least_useful_entry archives stale_file_refs entries first."""
+    from app.playbook_learning import _archive_least_useful_entry
+
+    doc = {
+        "playbook/a": {
+            "content": "tip a", "confirmed_count": 0,
+            "stale_file_refs": False, "updated_at": _utcnow().isoformat()
+        },
+        "playbook/b": {
+            "content": "tip b", "confirmed_count": 5,
+            "stale_file_refs": True, "updated_at": _utcnow().isoformat()
+        },
+    }
+    result = _archive_least_useful_entry(doc)
+    # Despite higher confirmed_count, b is stale so it should be archived first
+    assert "playbook/b" not in result
+    assert "playbook/a" in result
+
+
+def test_archive_prefers_older_entries_within_same_tier():
+    """_archive_least_useful_entry archives the oldest entry when stale and confirmed_count tie."""
+    from app.playbook_learning import _archive_least_useful_entry
+
+    old_date = (_utcnow() - timedelta(days=60)).isoformat()
+    recent_date = _utcnow().isoformat()
+
+    doc = {
+        "playbook/old": {
+            "content": "old tip", "confirmed_count": 0,
+            "updated_at": old_date,
+        },
+        "playbook/recent": {
+            "content": "recent tip", "confirmed_count": 0,
+            "updated_at": recent_date,
+        },
+    }
+    result = _archive_least_useful_entry(doc)
+    # Both entries have same stale flag and confirmed_count — oldest should be archived first
+    assert "playbook/old" not in result, "Oldest entry should have been archived"
+    assert "playbook/recent" in result
+
+
+def test_maybe_archive_for_capacity_triggers_at_threshold():
+    """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
+    from app.playbook_learning import maybe_archive_for_capacity, _PLAYBOOK_CAPACITY_BYTES
+
+    # Build a doc just below capacity, then add a large entry estimate
+    doc: dict = {}
+    # Fill doc to just below capacity
+    big_content = "x" * 500
+    entry_count = _PLAYBOOK_CAPACITY_BYTES // (len(big_content) + 50)  # rough estimate
+    for i in range(entry_count):
+        doc[f"playbook/entry-{i:03d}"] = {
+            "content": big_content,
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        }
+
+    import json as _json
+    from app.playbook_learning import _playbook_size_bytes
+    current_size = _playbook_size_bytes(doc)
+
+    # If already over capacity, archiving should trigger
+    if current_size >= _PLAYBOOK_CAPACITY_BYTES:
+        keys_before = {k for k in doc if k.startswith("playbook/")}
+        result = maybe_archive_for_capacity(doc, 0)
+        keys_after = {k for k in result if k.startswith("playbook/")}
+        assert len(keys_after) < len(keys_before), "An entry should have been archived"
+        assert len(result.get("playbook_archive", [])) == 1
+
+
+def test_maybe_archive_for_capacity_no_op_when_under_limit():
+    """maybe_archive_for_capacity is a no-op when total size is below threshold."""
+    from app.playbook_learning import maybe_archive_for_capacity
+
+    doc = {
+        "playbook/tiny": {
+            "content": "small entry",
+            "confirmed_count": 1,
+            "updated_at": _utcnow().isoformat(),
+        }
+    }
+    result = maybe_archive_for_capacity(doc, 0)
+    assert "playbook/tiny" in result
+    assert "playbook_archive" not in result
+
+
+@pytest.mark.asyncio
+async def test_capture_success_archives_when_over_capacity(db_session: AsyncSession):
+    """capture_success_pattern archives the least-useful entry when total size exceeds 25KB."""
+    from app.playbook_learning import capture_success_pattern, _PLAYBOOK_CAPACITY_BYTES
+
+    # Build a design_doc clearly over capacity: 28 entries × ~950 bytes ≈ 26.6 KB
+    big_content = "x" * 900
+    existing_doc: dict = {
+        # One failure-derived entry to satisfy the sampling gate
+        "playbook/review-test-coverage": {
+            "content": "test coverage issues",
+            "source": "review-extracted",
+            "applicable_types": ["create"],
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+    for i in range(27):
+        existing_doc[f"playbook/old-entry-{i:03d}"] = {
+            "content": big_content,
+            "confirmed_count": 0,
+            "source": "auto-generated",
+            "updated_at": (_utcnow() - timedelta(days=10)).isoformat(),
+        }
+
+    project = await _make_project(db_session, design_doc=dict(existing_doc))
+    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+
+    from app.playbook_learning import _playbook_size_bytes
+    size_before = _playbook_size_bytes(project.design_doc)
+    assert size_before > _PLAYBOOK_CAPACITY_BYTES, "Doc must be over capacity before the test"
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key == "success-create", "New entry should have been created"
+    doc = project.design_doc or {}
+    archive = doc.get("playbook_archive", [])
+    assert len(archive) >= 1, "At least one entry should have been archived for capacity"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_review_effectiveness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_review_issue(desc: str, severity: str = "MAJOR") -> dict:
+    return {"description": desc, "severity": severity}
+
+
+def _make_review_entry(iteration: int, issue_descs: list[str]) -> dict:
+    return {
+        "iteration": iteration,
+        "issues": [_make_review_issue(d) for d in issue_descs],
+    }
+
+
+async def _make_task_with_reviews(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    age_days: float,
+    issue_descs: list[str],
+    task_type: str = "create",
+) -> Task:
+    review_history = [_make_review_entry(0, issue_descs)]
+    task = Task(
+        project_id=project_id,
+        title="Task with reviews",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"iteration": 1, "review_history": review_history}},
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    session.add(task)
+    await session.flush()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_returns_none_below_sample_size(db_session: AsyncSession):
+    """Returns None when either window has fewer than 10 tasks with review history."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+    # Only 5 tasks in each window (below the minimum of 10)
+    tasks = []
+    for i in range(5):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=2, issue_descs=["missing test coverage"]
+        )
+        tasks.append(t)
+    for i in range(5):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=18, issue_descs=["missing test coverage"]
+        )
+        tasks.append(t)
+
+    result = await compute_review_effectiveness(project.id, db_session, tasks)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_detects_decreasing_trend(db_session: AsyncSession):
+    """Detects a decreasing trend when a category drops by >= 5pp between windows."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # Previous window (15-28 days ago): all 12 tasks have test-coverage issues
+    prev_tasks = []
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function", "no error handling"]
+        )
+        prev_tasks.append(t)
+
+    # Current window (last 14 days): only 2 out of 12 tasks have test-coverage issues
+    curr_tasks = []
+    for _ in range(2):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        curr_tasks.append(t)
+    for _ in range(10):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["no error handling"]
+        )
+        curr_tasks.append(t)
+
+    all_tasks = prev_tasks + curr_tasks
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+
+    assert result is not None
+    cats = result["categories"]
+    # test-coverage should be decreasing (fewer issues in current window vs previous)
+    assert "test-coverage" in cats
+    assert cats["test-coverage"]["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_stores_in_design_doc(db_session: AsyncSession):
+    """Result is persisted in project.design_doc['review_effectiveness']."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # Create 12 tasks in each window
+    all_tasks = []
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        )
+        all_tasks.append(t)
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        all_tasks.append(t)
+
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+
+    assert result is not None
+    assert "review_effectiveness" in (project.design_doc or {})
+    stored = project.design_doc["review_effectiveness"]
+    assert "categories" in stored
+    assert "computed_at" in stored
+    assert "persistent_issues" in stored
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_rate_history_grows(db_session: AsyncSession):
+    """rate_history accumulates a new entry on each new window computation."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    all_tasks = []
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        ))
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        ))
+
+    # First computation — creates the first history entry
+    result1 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result1 is not None
+    history1 = result1["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history1) == 1
+
+    # Simulate a new window by clearing computed_at to force is_new_window=True
+    doc = dict(project.design_doc or {})
+    doc["review_effectiveness"]["computed_at"] = (_utcnow() - timedelta(days=15)).isoformat()
+    project.design_doc = doc
+    await db_session.flush()
+
+    result2 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result2 is not None
+    history2 = result2["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history2) == 2
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncSession):
+    """Identifies persistent issues when a category stays above 20% for 3+ windows."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    # Pre-seed two historical high-rate windows
+    project = await _make_project(db_session, design_doc={
+        "review_effectiveness": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "categories": {
+                "test-coverage": {"rate_history": [0.35, 0.30]},
+            },
+            "persistent_issues": [],
+        },
+    })
+
+    # 12 tasks in each window, all with test-coverage issues (keeps rate high)
+    all_tasks = []
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        ))
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        ))
+
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+
+    assert result is not None
+    # rate_history now has 3 entries, all > 20%, so it should be flagged as persistent
+    history = result["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history) == 3
+    assert all(r > 0.20 for r in history)
+    assert "test-coverage" in result["persistent_issues"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

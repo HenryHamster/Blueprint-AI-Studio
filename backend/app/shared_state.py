@@ -39,6 +39,7 @@ runtime_config: Dict = {
     "max_retries": int(os.getenv("MAX_RETRIES", "3")),
     "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_rollup_retries": int(os.getenv("MAX_ROLLUP_RETRIES", "5")),
+    "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "max_autonomous_tasks_per_hour": 5,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
@@ -64,6 +65,17 @@ runtime_config: Dict = {
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # Per-failure-class retry budgets: max attempt_count before permanent failure.
+    # Overrides max_retries for specific failure classes. Operator-adjustable.
+    #   CODE_ERROR:    2 — code won't self-correct; 3rd attempt wastes compute
+    #   EXTERNAL_API:  4 — transient outages (GitHub 502, DNS) can last 15-60 min
+    #   AGENT_TIMEOUT: 3 — keep current behavior with scope-reduction on 2nd timeout
+    "retry_budgets_by_class": {
+        "CODE_ERROR": 2,
+        "EXTERNAL_API": 4,
+        "AGENT_TIMEOUT": 3,
+    },
 }
 
 # --- Autonomous Loop State ---
@@ -73,6 +85,19 @@ last_idle_check: Optional[datetime] = None
 # --- Persistent Anomaly Tracking ---
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
 persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
+
+# --- Anomaly-Driven Pipeline Adjustments ---
+# When high-severity anomalies (PROVISION_FAILURE, EXTERNAL_API) persist,
+# the system automatically reduces blast radius by lowering max_concurrent_vms
+# and tightening the failure-rate dispatch gate.
+anomaly_adjustments: Dict[str, Any] = {
+    "active": False,
+    "adjusted_at": None,             # ISO timestamp when adjustments were applied
+    "trigger_anomalies": [],         # anomaly keys that triggered the adjustment
+    "pre_adjustment_max_vms": None,  # stored to restore on clearing
+    "pre_adjustment_failure_gate": None,
+    "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
+}
 
 # --- Circuit Breaker (Hystrix-inspired) ---
 # Per-project circuit breaker state for autonomous task spawning
@@ -94,6 +119,31 @@ def get_circuit_breaker(project_id: str) -> Dict:
             "open_reason": None,         # "code" or "infra" — why the breaker opened
         }
     return circuit_breakers[project_id]
+
+# --- User-submitted Auto-Debug Rate Limiting ---
+# Tracks timestamps of user-submitted debug spawns per project to enforce hourly cap.
+# Structure: project_id -> deque of datetime (UTC) of recent spawns
+user_debug_spawn_times: Dict[str, deque] = {}
+
+USER_DEBUG_MAX_PER_HOUR = 3  # max debug tasks spawned for user/admin tasks per project per hour
+
+def record_user_debug_spawn(project_id: str, now: datetime) -> None:
+    """Record a user-submitted debug spawn and prune old entries."""
+    if project_id not in user_debug_spawn_times:
+        user_debug_spawn_times[project_id] = deque()
+    dq = user_debug_spawn_times[project_id]
+    dq.append(now)
+    cutoff = now - timedelta(hours=1)
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
+    """Count user-submitted debug spawns in the last hour for a project."""
+    dq = user_debug_spawn_times.get(project_id)
+    if not dq:
+        return 0
+    cutoff = now - timedelta(hours=1)
+    return sum(1 for t in dq if t >= cutoff)
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
@@ -428,6 +478,7 @@ external_health: Dict = {
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
     "errors": {},                   # dep_name -> last error message
+    "consecutive_failures": {},     # dep_name -> int count of consecutive failed health checks
 }
 
 # Track last successful GitHub API operation (tokens, PR comments, etc.)

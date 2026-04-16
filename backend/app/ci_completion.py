@@ -183,6 +183,22 @@ async def handle_ci_completion(
     from app.main import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
 
+    # Serialize concurrent callers (webhook + poller) by locking the task row.
+    # skip_locked: if another handler already holds the lock, exit — it will
+    # handle the CI result.
+    locked_task = (await session.execute(
+        select(Task).where(Task.id == task.id).with_for_update(skip_locked=True)
+    )).scalars().first()
+    if locked_task is None:
+        logger.info(f"[CI] Skipping CI completion for task {task.id} — lock held by concurrent handler ({source})")
+        return False
+    task = locked_task
+
+    # Re-check: task may have been completed by the concurrent handler that held the lock
+    if task.status != TaskStatus.EVALUATING:
+        logger.info(f"[CI] Task {task.id} no longer EVALUATING (now {task.status}) — skipping ({source})")
+        return False
+
     ci_loop = (task.context or {}).get("review_loop", {})
     ci_pr_number = ci_loop.get("pr_number")
     ci_payload = task.first_payload
@@ -226,7 +242,8 @@ async def handle_ci_completion(
         )).scalars().all()
         existing_fix = next(
             (t for t in active_tasks
-             if t.first_payload.get("type") == "fix"
+             if t.id != task.id
+             and t.first_payload.get("type") == "fix"
              and t.first_payload.get("pr_number") == ci_pr_number),
             None
         )

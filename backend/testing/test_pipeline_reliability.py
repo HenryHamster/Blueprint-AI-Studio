@@ -106,7 +106,7 @@ async def orch_db(mocker):
     mocker.patch("app.main.select_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.release_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.record_task_result", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result")  # sync function, no AsyncMock needed
     mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
@@ -378,6 +378,41 @@ async def test_reaper_uses_fresh_task_for_modifications(orch_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_stale_provision_failure_creates_alert(orch_db, mocker):
+    """When a PROVISIONING task exceeds its provision retry limit, _maybe_create_failure_alert
+    must be called so the failure is visible to users (not a silent failure)."""
+    session, _Session = orch_db
+
+    project = Project(name="Alert Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "alert test"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id="agent-vm-alert-001",
+        started_at=_naive_utc_ago(minutes=15),
+        last_heartbeat=None,
+        context={"provision_failures": 2},
+    )
+    session.add(stale_task)
+    await session.commit()
+    await session.refresh(stale_task)
+
+    # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    await _run_one_cycle(mocker)
+
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args
+    assert "provision" in call_args[0][2].lower(), (
+        f"Alert error_snippet should mention provisioning, got: {call_args[0][2]!r}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 4 — CI polling fails task on deleted PR (404)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -442,6 +477,54 @@ async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
         f"A 404 on the PR means it was deleted and should not be polled forever."
     )
     assert updated.latest_status_message, "Expected a failure message to be set"
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
+    """When a PR returns 404 during CI polling, _maybe_create_failure_alert must be
+    called so the silent failure is visible to users."""
+    session, _Session = orch_db
+
+    project = Project(name="CI 404 Alert Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci alert test", "branch": "feat/alert"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 99,
+                "branch": "feat/alert",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+
+    class _NotFoundError(Exception):
+        status_code = 404
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 side_effect=_NotFoundError("PR not found"))
+
+    # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    await _run_one_cycle(mocker)
+
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args
+    assert "404" in call_args[0][2], (
+        f"Alert error_snippet should mention 404, got: {call_args[0][2]!r}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -890,3 +973,98 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
         f"Message should NOT say 'missing or corrupt' when ci_wait_started is valid, "
         f"got: {task.latest_status_message!r}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests — External health gate (get_confirmed_down_critical_deps)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExternalHealthGate:
+    """Unit tests for the pre-flight external health gate in the dispatch path.
+
+    The gate reads shared_state.external_health["consecutive_failures"] and
+    blocks dispatch when a *critical* dependency (github_api, claude_api, gcp)
+    has been confirmed down for 2+ consecutive health checks.
+    """
+
+    from app.orchestrator import get_confirmed_down_critical_deps
+
+    def _set_consec(self, **kwargs):
+        """Set consecutive_failures entries; reset all others to 0."""
+        _shared_state.external_health["consecutive_failures"] = {
+            "github_api": kwargs.get("github_api", 0),
+            "claude_api": kwargs.get("claude_api", 0),
+            "gcp": kwargs.get("gcp", 0),
+            "db": kwargs.get("db", 0),
+        }
+
+    def setup_method(self):
+        """Save and clear consecutive_failures before each test."""
+        self._orig = dict(_shared_state.external_health.get("consecutive_failures", {}))
+        _shared_state.external_health["consecutive_failures"] = {}
+
+    def teardown_method(self):
+        """Restore original consecutive_failures after each test."""
+        _shared_state.external_health["consecutive_failures"] = self._orig
+
+    def test_dispatch_skipped_when_github_api_confirmed_down(self):
+        """Gate returns github_api when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=2)
+        result = get_confirmed_down_critical_deps()
+        assert "github_api" in result
+
+    def test_dispatch_skipped_when_claude_api_confirmed_down(self):
+        """Gate returns claude_api when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(claude_api=3)
+        result = get_confirmed_down_critical_deps()
+        assert "claude_api" in result
+
+    def test_dispatch_skipped_when_gcp_confirmed_down(self):
+        """Gate returns gcp when it has >=2 consecutive failures."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(gcp=5)
+        result = get_confirmed_down_critical_deps()
+        assert "gcp" in result
+
+    def test_single_failure_does_not_gate(self):
+        """One failure is transient — gate does NOT block dispatch."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=1)
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_proceeds_when_only_db_is_down(self):
+        """DB is not a critical dep for the gate — dispatch still proceeds."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(db=10)
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_proceeds_when_all_deps_healthy(self):
+        """All zeros — nothing is blocked."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec()
+        result = get_confirmed_down_critical_deps()
+        assert result == []
+
+    def test_dispatch_resumes_after_recovery(self):
+        """Consecutive_failures reset to 0 after recovery — gate clears."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=3)
+        assert get_confirmed_down_critical_deps() == ["github_api"]
+
+        # Recovery: reset to 0
+        self._set_consec(github_api=0)
+        assert get_confirmed_down_critical_deps() == []
+
+    def test_multiple_deps_down_all_returned(self):
+        """If multiple critical deps are confirmed down, all are returned."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(github_api=2, claude_api=2)
+        result = get_confirmed_down_critical_deps()
+        assert "github_api" in result
+        assert "claude_api" in result
+        assert "gcp" not in result
+        assert "db" not in result

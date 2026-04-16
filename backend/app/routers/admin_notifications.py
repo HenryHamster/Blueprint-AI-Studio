@@ -353,22 +353,23 @@ async def admin_playbook_list(
             short_key = k[len("playbook/"):]
             last_referenced_at = v.get("last_referenced_at")
             updated_at = v.get("updated_at", "")
-            # Compute stale: True if no reference in 30 days (or never referenced and updated 30+ days ago)
+            # Compute stale: stored flag (auto-archived for low effectiveness) OR no reference in 30 days
             now_utc = _utcnow()
             _STALE_DAYS = 30
-            stale = False
-            reference_ts = last_referenced_at or updated_at
-            if reference_ts:
-                try:
-                    from datetime import datetime
-                    ts = datetime.fromisoformat(reference_ts)
-                    if ts.tzinfo is not None:
-                        ts = ts.replace(tzinfo=None)
-                    stale = (now_utc - ts).days >= _STALE_DAYS
-                except Exception:
-                    logger.exception(f"[PLAYBOOK] Failed to parse reference_ts={reference_ts}")
-            else:
-                stale = True
+            stale = bool(v.get("stale"))  # Stored flag (auto-archived) takes precedence
+            if not stale:
+                reference_ts = last_referenced_at or updated_at
+                if reference_ts:
+                    try:
+                        from datetime import datetime
+                        ts = datetime.fromisoformat(reference_ts)
+                        if ts.tzinfo is not None:
+                            ts = ts.replace(tzinfo=None)
+                        stale = (now_utc - ts).days >= _STALE_DAYS
+                    except Exception:
+                        logger.exception(f"[PLAYBOOK] Failed to parse reference_ts={reference_ts}")
+                else:
+                    stale = True
             entries[short_key] = {
                 "content": v.get("content", ""),
                 "source_task_id": v.get("source_task_id"),
@@ -377,6 +378,8 @@ async def admin_playbook_list(
                 "applicable_types": v.get("applicable_types"),
                 "reference_count": v.get("reference_count", 0),
                 "last_referenced_at": last_referenced_at,
+                "last_confirmed_at": v.get("last_confirmed_at"),
+                "effectiveness_score": v.get("effectiveness_score"),
                 "stale": stale,
             }
     return {"entries": entries, "count": len(entries)}
