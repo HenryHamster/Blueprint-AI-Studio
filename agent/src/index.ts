@@ -13,7 +13,7 @@ import {
   FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT,
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
-  TEST_RUNNER_TIMEOUT,
+  TEST_RUNNER_TIMEOUT, TEST_BASELINE_TIMEOUT,
   CLAUDE_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 } from './constants.js';
 
@@ -754,23 +754,16 @@ export async function lintFixLoop(
   return false;
 }
 
-/**
- * Detect the project's test runner, run tests, and retry via Claude on failure.
- * Returns whether tests passed and whether failures were detected (for commit note).
- */
-export async function testFixLoop(
-  ws: WebSocket | null, statusRef: { value: string },
-  model?: string, effort?: string, buildConfig?: BuildConfig
-): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
+// ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───
+interface TestRunner {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  label: string;
+}
+
+function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync } = fs;
-
-  interface TestRunner {
-    cmd: string;
-    args: string[];
-    cwd: string;
-    label: string;
-  }
-
   const runners: TestRunner[] = [];
 
   // --- BuildConfig-based detection (takes precedence over auto-detection) ---
@@ -852,6 +845,116 @@ export async function testFixLoop(
     }
   }
 
+  return runners;
+}
+
+/**
+ * Parse failing test identifiers from test runner output.
+ * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
+ * "test description" for vitest) for baseline comparison.
+ */
+function parseFailingTests(output: string): Set<string> {
+  const failing = new Set<string>();
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    // pytest: "FAILED backend/testing/test_foo.py::test_bar - AssertionError: ..."
+    if (trimmed.startsWith('FAILED ')) {
+      const id = trimmed.slice('FAILED '.length).split(' - ')[0].trim();
+      if (id) failing.add(id);
+    }
+    // vitest: "✕ test description" or "× test description" or "✗ test description"
+    const vitestMatch = trimmed.match(/^[✕✗×]\s+(.+)$/u);
+    if (vitestMatch) failing.add(vitestMatch[1].trim());
+  }
+  return failing;
+}
+
+/**
+ * Run the test suite with a short timeout to capture which tests are already failing
+ * before any code changes are made. Used to distinguish pre-existing failures from
+ * newly-broken tests introduced by the agent.
+ *
+ * - Scope-limited to runners relevant to relatedFiles (avoids running full suite).
+ * - Time-bounded by timeoutMs (default 60s) — returns null on timeout/error.
+ * - Returns an empty Set if all tests pass (all future failures are new).
+ * - Returns null to signal "skip baseline" — fall back to current behavior.
+ */
+export async function captureTestBaseline(
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  buildConfig?: BuildConfig,
+  relatedFiles?: string[],
+  timeoutMs = TEST_BASELINE_TIMEOUT,
+): Promise<Set<string> | null> {
+  let runners = detectTestRunners(buildConfig);
+
+  if (runners.length === 0) return null;
+
+  // Scope-limit to runners relevant to the files being changed. This avoids
+  // running the full backend Docker test suite when only agent files changed.
+  if (relatedFiles && relatedFiles.length > 0) {
+    const touchesAgent = relatedFiles.some(f => f.startsWith('agent/'));
+    const touchesBackend = relatedFiles.some(f => f.startsWith('backend/'));
+    if (touchesAgent || touchesBackend) {
+      const filtered = runners.filter(r => {
+        if (touchesAgent && (r.label.includes('agent') || r.cwd.includes('/agent'))) return true;
+        if (touchesBackend && (r.label.includes('backend') || r.label.includes('pytest') || r.cwd.includes('/backend'))) return true;
+        return false;
+      });
+      // Only apply the filter if it produced at least one runner
+      if (filtered.length > 0) runners = filtered;
+    }
+  }
+
+  sendLog(ws, `Capturing test baseline for: ${runners.map(r => r.label).join(', ')}\n`);
+  statusRef.value = 'Capturing test baseline...';
+
+  const baselineFailures = new Set<string>();
+  const taskId = process.env.TASK_ID || '';
+
+  for (const runner of runners) {
+    try {
+      sendHeartbeatSync(taskId, `Baseline test run [${runner.label}]...`);
+      execFileSync(runner.cmd, runner.args, {
+        cwd: runner.cwd,
+        encoding: 'utf-8',
+        timeout: timeoutMs,
+      });
+      // Runner exited cleanly — no failures
+    } catch (err: unknown) {
+      // execFileSync sets killed=true when the process is terminated due to timeout
+      if (err instanceof Error && (err as Error & { killed?: boolean }).killed === true) {
+        sendLog(ws, `Test baseline timed out for [${runner.label}] — proceeding without baseline.\n`);
+        return null;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      const parsed = parseFailingTests(msg);
+      parsed.forEach(f => baselineFailures.add(f));
+    }
+  }
+
+  if (baselineFailures.size > 0) {
+    sendLog(ws, `Baseline: ${baselineFailures.size} pre-existing failure(s) found — these will be excluded from test fix analysis.\n`);
+  } else {
+    sendLog(ws, 'Baseline captured: all tests passing before changes.\n');
+  }
+
+  return baselineFailures;
+}
+
+/**
+ * Detect the project's test runner, run tests, and retry via Claude on failure.
+ * When baselineFailures is provided, distinguishes pre-existing failures from
+ * newly-broken tests and only counts new failures toward task FAILED status.
+ * Returns whether tests passed and whether failures were detected (for commit note).
+ */
+export async function testFixLoop(
+  ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string, buildConfig?: BuildConfig,
+  baselineFailures?: Set<string>,
+): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
+  const runners = detectTestRunners(buildConfig);
+
   if (runners.length === 0) {
     sendLog(ws, 'No test runner detected — skipping test step.\n');
     return { passed: true, testFailuresDetected: false };
@@ -888,13 +991,47 @@ export async function testFixLoop(
       return { passed: true, testFailuresDetected: false };
     }
 
-    const combinedFailures = failures.join('\n\n');
+    // When baseline is available, separate new failures from pre-existing ones.
+    // A failure block is pre-existing when all parsed test IDs within it appear
+    // in the baseline. Unparseable failures (size=0) are treated as new (safe default).
+    let fixableFailures = failures;
+    let preExistingNote = '';
+
+    if (baselineFailures) {
+      const newFailures: string[] = [];
+      const preExistingFailures: string[] = [];
+
+      for (const failure of failures) {
+        const failureIds = parseFailingTests(failure);
+        const isAllPreExisting = failureIds.size > 0 &&
+          Array.from(failureIds).every(id => baselineFailures.has(id));
+        if (isAllPreExisting) {
+          preExistingFailures.push(failure);
+        } else {
+          newFailures.push(failure);
+        }
+      }
+
+      if (newFailures.length === 0) {
+        // Every detected failure existed before our changes — task is not responsible
+        sendLog(ws, `All ${preExistingFailures.length} test failure(s) are pre-existing and were not caused by this task.\n`);
+        return { passed: true, testFailuresDetected: false };
+      }
+
+      fixableFailures = newFailures;
+      if (preExistingFailures.length > 0) {
+        preExistingNote = `\n\nNote: The following test failures existed BEFORE your changes — do not attempt to fix these:\n${preExistingFailures.join('\n\n').slice(0, 1500)}`;
+      }
+    }
+
+    const combinedFailures = fixableFailures.join('\n\n');
     if (attempt < MAX_TEST_FIX_ATTEMPTS) {
-      sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1}):\n${combinedFailures.slice(0, 3000)}\nClaude will attempt to fix...\n`);
-      await runClaudeCode(
-        `Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${combinedFailures.slice(0, 5000)}`,
-        ws, statusRef, model, effort
-      );
+      const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
+      sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      const fixPrompt = baselineFailures
+        ? `These tests broke because of your changes. Fix ONLY these newly-broken tests:\n\n${combinedFailures.slice(0, 4000)}${preExistingNote.slice(0, 1000)}`
+        : `Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${combinedFailures.slice(0, 5000)}`;
+      await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {
       sendLog(ws, `WARNING: Tests still failing after ${MAX_TEST_FIX_ATTEMPTS} fix attempts. Proceeding with commit.\n`);

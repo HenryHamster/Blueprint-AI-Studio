@@ -601,6 +601,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
 
+    # Recover findings that were deferred in the previous cycle due to pipeline degradation.
+    # These were already researched but couldn't be spawned; prepend them so they go through
+    # the full dedup + health gate pipeline alongside this cycle's new findings.
+    prior_deferred = (task.context or {}).get("prior_deferred_findings", [])
+    if prior_deferred:
+        # Filter out non-actionable types that would have been handled separately above
+        prior_actionable = [
+            f for f in prior_deferred
+            if isinstance(f, dict) and f.get("type") not in ("direction_proposal", "direction_note")
+        ]
+        if prior_actionable:
+            logger.info(
+                f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
+                f"to findings list for task {task.id}"
+            )
+            findings = prior_actionable + findings
+
     # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
     from app import shared_state as _ss  # noqa: PLC0415
     from app import max_plan_pool as _pool_mod  # noqa: PLC0415

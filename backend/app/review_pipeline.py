@@ -147,6 +147,11 @@ async def _spawn_pipeline_task(
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
         source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
         session.add(source_task)
+        try:
+            from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+            await _maybe_create_failure_alert(source_task, session, f"PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations) — manual intervention required")
+        except Exception as _alert_err:
+            logger.warning(f"[PIPELINE] Failed to create failure alert for global cap on PR #{pr_number}: {_alert_err}")
         return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain)
@@ -162,6 +167,11 @@ async def _spawn_pipeline_task(
                 orig.requires_approval = True
                 orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
                 session.add(orig)
+                try:
+                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    await _maybe_create_failure_alert(orig, session, f"PR #{pr_number} review-fix per-chain cap reached ({per_chain_cap} iterations) — manual review required")
+                except Exception as _alert_err:
+                    logger.warning(f"[PIPELINE] Failed to create failure alert for per-chain cap on PR #{pr_number}: {_alert_err}")
                 await session.commit()
         except Exception as e:
             logger.warning(f"[PIPELINE] Failed to mark iteration cap on {resolved_original_id}: {e}", exc_info=True)

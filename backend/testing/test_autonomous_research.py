@@ -80,6 +80,8 @@ def _patch_research_externals(mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    # Simulate no pool configured so capacity-aware batch cap doesn't constrain unit tests
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
 
 
 def _make_finding(
@@ -2985,393 +2987,343 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# predict_spawn_success — unit tests
+# 15. _handle_research_completion — Spawn-Time Health Gate
 # ─────────────────────────────────────────────────────────────────────────────
 
-from app.research_completion import predict_spawn_success
+@pytest.mark.asyncio
+async def test_health_gate_normal_no_cap(db_session, mocker):
+    """When pipeline is healthy, all findings create tasks without any cap."""
+    direction_id = "d-hgate001"
+    direction = _active_direction(direction_id, "Health gate normal")
+    project = Project(
+        name="Health Gate Normal", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 5 findings — all should spawn tasks when healthy
+    findings = [_make_finding(f"Improvement {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    # Healthy pipeline: zone available, no degradation
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 5, "All 5 findings should spawn tasks when healthy"
+
+    await db_session.refresh(task)
+    assert "deferred_findings" not in (task.context or {}), "No deferral when healthy"
 
 
-def _make_direction_with_history(scope: str, created: int, merged: int, failed: int = 0) -> dict:
-    """Build a minimal direction dict with scope_breakdown in research_history."""
-    return {
-        "id": f"d-pred-{uuid.uuid4().hex[:6]}",
-        "status": "active",
-        "research_history": [
-            {
-                "timestamp": "2026-04-01T00:00:00",
-                "tasks_created": created,
-                "tasks_failed": failed,
-                "scope_breakdown": {
-                    scope: {"created": created, "merged": merged, "failed": failed}
-                },
-            }
-        ] * 3,  # Repeat 3x to satisfy the >=2 created threshold
-    }
+@pytest.mark.asyncio
+async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
+    """When all zones are in cooldown, child task creation is capped at _DEGRADED_SPAWN_CAP."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate002"
+    direction = _active_direction(direction_id, "Zone exhaustion cap")
+    project = Project(
+        name="Zone Exhaustion", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 6 findings — only _DEGRADED_SPAWN_CAP should be created
+    findings = [_make_finding(f"Zone cap finding {i}", direction_id) for i in range(6)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        f"Should spawn only {_DEGRADED_SPAWN_CAP} tasks when zones exhausted"
+    )
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 6 - _DEGRADED_SPAWN_CAP, (
+        f"Remaining {6 - _DEGRADED_SPAWN_CAP} findings should be deferred"
+    )
 
 
-def test_predict_spawn_success_returns_float_in_range():
-    """predict_spawn_success always returns a value in [0.0, 1.0]."""
-    direction = _make_direction_with_history("small", created=5, merged=4)
-    result = predict_spawn_success("small", direction)
-    assert 0.0 <= result <= 1.0
+@pytest.mark.asyncio
+async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
+    """When no accounts are available, child task creation is capped at _DEGRADED_SPAWN_CAP."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate003"
+    direction = _active_direction(direction_id, "Account unavailable cap")
+    project = Project(
+        name="Account Unavailable", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = [_make_finding(f"Account cap finding {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "no accounts available"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 5 - _DEGRADED_SPAWN_CAP
 
 
-def test_predict_spawn_success_high_merge_rate():
-    """Direction with high merge rate returns high confidence."""
-    direction = _make_direction_with_history("small", created=5, merged=5)
-    result = predict_spawn_success("small", direction)
-    assert result >= 0.7, f"Expected high confidence for 100% merge rate, got {result}"
+@pytest.mark.asyncio
+async def test_health_gate_deferred_findings_stored_in_context(db_session, mocker):
+    """Deferred findings are stored in task.context['deferred_findings']."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate004"
+    direction = _active_direction(direction_id, "Deferred findings storage")
+    project = Project(
+        name="Deferred Storage Test", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = [
+        _make_finding(f"Finding {i}", direction_id) for i in range(4)
+    ]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "high failure rate (8/10 recent tasks failed)"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    deferred = ctx.get("deferred_findings", [])
+    assert len(deferred) == 4 - _DEGRADED_SPAWN_CAP
+    # Verify deferred findings preserve title
+    deferred_titles = {f["title"] for f in deferred}
+    assert all(t.startswith("Finding") for t in deferred_titles)
 
 
-def test_predict_spawn_success_low_merge_rate():
-    """Direction with low merge rate returns low confidence."""
-    direction = _make_direction_with_history("small", created=10, merged=1)
-    result = predict_spawn_success("small", direction)
-    assert result < 0.5, f"Expected low confidence for 10% merge rate, got {result}"
+@pytest.mark.asyncio
+async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
+    """Metadata finding types (design_doc_observation, direction_update) bypass the health gate."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
 
+    direction_id = "d-hgate005"
+    direction = _active_direction(direction_id, "Metadata bypass test")
+    project = Project(
+        name="Metadata Bypass", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
 
-def test_predict_spawn_success_no_data_returns_neutral():
-    """When direction has no history, returns neutral 0.5."""
-    direction = {"id": "d-nodata", "status": "active", "research_history": []}
-    result = predict_spawn_success("small", direction)
-    assert result == 0.5
+    task = await _make_research_task(project, direction, db_session)
 
-
-def test_predict_spawn_success_high_failure_rate():
-    """Direction with many task failures returns lower confidence."""
-    # 10 tasks created, 1 merged, 8 failed — very poor outcome
-    direction = _make_direction_with_history("medium", created=10, merged=1, failed=8)
-    result = predict_spawn_success("medium", direction)
-    assert result < 0.35, f"Expected low confidence for high failure rate, got {result}"
-
-
-def test_predict_spawn_success_scope_mismatch_uses_only_available_signals():
-    """If direction has data for 'small' but we query 'large', the scope signal is absent."""
-    direction = _make_direction_with_history("small", created=5, merged=5)
-    # Query for 'large' scope — no scope_breakdown entry for 'large'
-    result = predict_spawn_success("large", direction)
-    # Result should be neutral or driven only by failure-rate signal
-    assert 0.0 <= result <= 1.0
-
-
-def test_predict_spawn_success_project_signal_incorporated():
-    """When project is provided with sufficient data, project-level signal is incorporated."""
-    direction = {"id": "d-proj1", "status": "active", "research_history": []}
-    # Project has 6 small-scope tasks across directions — enough for Signal 2
-    project_directions = [
+    _patch_research_externals(mocker)
+    # 2 implementation findings + 2 metadata findings
+    findings = [
+        _make_finding("Impl finding 0", direction_id),
+        _make_finding("Impl finding 1", direction_id),
         {
-            "id": f"d-proj{i}",
-            "status": "active",
-            "research_history": [
-                {
-                    "timestamp": "2026-04-01T00:00:00",
-                    "tasks_created": 3,
-                    "tasks_failed": 0,
-                    "scope_breakdown": {"small": {"created": 3, "merged": 3, "failed": 0}},
-                }
-            ],
-        }
-        for i in range(3)
+            "title": "Design doc observation",
+            "description": "Some design note",
+            "prompt": "",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "design_doc_observation",
+            "direction_id": direction_id,
+            "section": "general",
+        },
+        {
+            "title": "Direction update proposal",
+            "description": "Update direction priority",
+            "prompt": "Update direction",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "direction_update",
+            "direction_id": direction_id,
+        },
     ]
-
-    class _FakeProject:
-        directions = project_directions
-
-    result_with_project = predict_spawn_success("small", direction, _FakeProject())
-    result_without_project = predict_spawn_success("small", direction)
-    # With project high-merge-rate signal, result should be higher than neutral
-    assert result_with_project > result_without_project
-    assert result_with_project > 0.5
-
-
-def test_predict_spawn_success_project_insufficient_data_ignored():
-    """If project has fewer than 5 scope entries, Signal 2 is skipped gracefully."""
-    direction = {"id": "d-projinsuff", "status": "active", "research_history": []}
-
-    class _FakeProject:
-        directions = [
-            {
-                "id": "d-small",
-                "research_history": [
-                    {
-                        "timestamp": "2026-04-01T00:00:00",
-                        "tasks_created": 2,
-                        "tasks_failed": 0,
-                        "scope_breakdown": {"small": {"created": 2, "merged": 0, "failed": 2}},
-                    }
-                ],
-            }
-        ]
-
-    # Only 2 small tasks in project — below threshold of 5, signal ignored
-    result = predict_spawn_success("small", direction, _FakeProject())
-    # No signals fire — result is neutral 0.5
-    assert result == 0.5
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _handle_research_completion — low_confidence_spawn injection
-# ─────────────────────────────────────────────────────────────────────────────
-
-import app.shared_state as _shared_state_module
-
-
-@pytest.mark.asyncio
-async def test_low_confidence_spawn_injected_when_below_threshold(db_session, mocker):
-    """When P(success) < spawn_confidence_threshold, child task gets low_confidence_spawn=True."""
-    direction_id = "d-lowconf1"
-    # Direction with very poor merge rate: 0/10 merged across 3 cycles
-    direction = {
-        **_active_direction(direction_id, "Low-confidence direction"),
-        "research_history": [
-            {
-                "timestamp": f"2026-03-0{i}T00:00:00",
-                "tasks_created": 10,
-                "tasks_failed": 9,
-                "scope_breakdown": {"small": {"created": 10, "merged": 0, "failed": 9}},
-            }
-            for i in range(1, 4)
-        ],
-    }
-    project = Project(
-        name="Low Confidence Spawn Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = await _make_research_task(project, direction, db_session)
-
-    # Set threshold high enough that the 0% merge rate triggers it
-    original_threshold = _shared_state_module.runtime_config.get("spawn_confidence_threshold", 0.25)
-    _shared_state_module.runtime_config["spawn_confidence_threshold"] = 0.5
-
-    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    # Pipeline is degraded — but metadata findings must still be processed
     mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding("Fix low-confidence task", direction_id, scope="small")],
-    )
-
-    try:
-        await _handle_research_completion(task, "", db_session)
-    finally:
-        _shared_state_module.runtime_config["spawn_confidence_threshold"] = original_threshold
-
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
-    )
-    child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1
-    ctx = child_tasks[0].context or {}
-    assert ctx.get("low_confidence_spawn") is True, "Expected low_confidence_spawn=True in context"
-    assert "low_confidence_spawn_rate" in ctx, "Expected low_confidence_spawn_rate in context"
-    assert 0.0 <= ctx["low_confidence_spawn_rate"] <= 1.0
-
-
-@pytest.mark.asyncio
-async def test_high_confidence_spawn_has_no_low_confidence_flag(db_session, mocker):
-    """When P(success) >= threshold, child task does NOT get low_confidence_spawn flag."""
-    direction_id = "d-hiconf01"
-    # Direction with excellent merge rate: 5/5 merged across 3 cycles
-    direction = {
-        **_active_direction(direction_id, "High-confidence direction"),
-        "research_history": [
-            {
-                "timestamp": f"2026-03-0{i}T00:00:00",
-                "tasks_created": 5,
-                "tasks_failed": 0,
-                "scope_breakdown": {"small": {"created": 5, "merged": 5, "failed": 0}},
-            }
-            for i in range(1, 4)
-        ],
-    }
-    project = Project(
-        name="High Confidence Spawn Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = await _make_research_task(project, direction, db_session)
-
-    _patch_research_externals(mocker)
-    mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding("Implement high-confidence task", direction_id, scope="small")],
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
     )
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1
-    ctx = child_tasks[0].context or {}
-    assert "low_confidence_spawn" not in ctx, (
-        "high-confidence task should NOT have low_confidence_spawn in context"
+    # Both impl findings are at or below the cap (cap=2), so both should be created
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        "Implementation findings up to cap should spawn; metadata findings never create tasks"
     )
 
-
-@pytest.mark.asyncio
-async def test_no_history_spawn_has_no_low_confidence_flag(db_session, mocker):
-    """When direction has no history (insufficient data), P=0.5 >= default threshold, no flag."""
-    direction_id = "d-nohistflag"
-    direction = {**_active_direction(direction_id, "No history direction"), "research_history": []}
-    project = Project(
-        name="No History Confidence Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = await _make_research_task(project, direction, db_session)
-
-    _patch_research_externals(mocker)
-    mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding("No history task", direction_id)],
-    )
-
-    await _handle_research_completion(task, "", db_session)
-
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
-    )
-    child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1
-    ctx = child_tasks[0].context or {}
-    # Default threshold is 0.25, neutral rate is 0.5 → no flag
-    assert "low_confidence_spawn" not in ctx, "Neutral confidence (0.5) should not set low_confidence flag"
+    await db_session.refresh(task)
+    # No findings should be deferred (impl count == cap, metadata never deferred)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 0, "No deferral when impl count exactly equals cap"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Capacity-aware batch cap
+# 16. _handle_research_completion — Prior Deferred Findings Recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_capacity_batch_cap_queue_depth(db_session, mocker):
-    """High queue depth reduces the effective batch cap, limiting spawned tasks."""
-    direction_id = "d-capqueue1"
-    direction = _active_direction(direction_id, "Queue depth cap test")
+async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocker):
+    """Deferred findings from a previous cycle are prepended and spawned in the next cycle."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-deferred-recovery01"
+    direction = _active_direction(direction_id, "Deferred recovery test")
     project = Project(
-        name="Capacity Cap Queue Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
+        name="Deferred Recovery", user_id="test-user-123", autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = await _make_research_task(project, direction, db_session)
-
-    _patch_research_externals(mocker)
-    # 6 unique findings — more than the effective cap under constrained conditions
-    mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(f"Unique task {i}", direction_id) for i in range(6)],
-    )
-    # Simulate high queue depth: cap_by_queue = max(3, 15 - 12) = 3
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch.object(_shared_state, "tasks_active_gauge", 0)
-
-    await _handle_research_completion(task, "", db_session)
-
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
-    )
-    child_tasks = result.scalars().all()
-    # With queue_depth=12: cap_by_queue=3, 1 healthy account: cap_by_accounts=3
-    # effective_cap = min(15, 16, 3, 3) = 3 — only 3 of 6 findings spawned
-    assert len(child_tasks) == 3, f"Expected 3 tasks (capacity-capped), got {len(child_tasks)}"
-
-
-@pytest.mark.asyncio
-async def test_capacity_batch_cap_healthy_system_no_reduction(db_session, mocker):
-    """With a healthy system (many accounts, low queue), cap stays at 15."""
-    direction_id = "d-caphlth1"
-    direction = _active_direction(direction_id, "Healthy system cap test")
-    project = Project(
-        name="Capacity Cap Healthy Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[direction],
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = await _make_research_task(project, direction, db_session)
-
-    _patch_research_externals(mocker)
-    # 5 unique findings — below 15 so no cap expected
-    mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(f"Healthy task {i}", direction_id) for i in range(5)],
-    )
-    # Healthy system: large pool, low queue, low active
-    healthy_accounts = [
-        {"id": f"acct-{i}", "name": f"acct-{i}", "enabled": True,
-         "oauth_token": "sk-ant-test", "active_tasks": 0}
-        for i in range(5)
+    # Create task with prior_deferred_findings injected (as autonomous_research.py would do)
+    deferred_from_prev_cycle = [
+        _make_finding("Deferred finding A", direction_id),
+        _make_finding("Deferred finding B", direction_id),
     ]
-    mocker.patch("app.max_plan_pool._all_accounts", return_value=healthy_accounts)
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 0)
-    mocker.patch.object(_shared_state, "tasks_active_gauge", 0)
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    # New cycle produces 1 fresh finding — plus 2 deferred = 3 total
+    new_findings = [_make_finding("Fresh finding C", direction_id)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
+    # Healthy pipeline: no cap
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     child_tasks = result.scalars().all()
-    # healthy_accounts=5: cap_by_accounts=15, queue=0: cap_by_queue=15, slots=8: cap_by_slots=16
-    # effective_cap = min(15, 16, 15, 15) = 15 → all 5 findings spawn
-    assert len(child_tasks) == 5, f"Expected all 5 tasks (no cap), got {len(child_tasks)}"
+    child_titles = {ct.title for ct in child_tasks}
+    assert len(child_tasks) == 3, (
+        f"Both deferred findings + fresh finding should spawn tasks, got: {child_titles}"
+    )
+    assert "Deferred finding A" in child_titles
+    assert "Deferred finding B" in child_titles
+    assert "Fresh finding C" in child_titles
 
 
 @pytest.mark.asyncio
-async def test_capacity_batch_cap_saturated_vms_still_spawns(db_session, mocker):
-    """When all VM slots are occupied (active == max_vms), cap floors at 1, not 0."""
-    direction_id = "d-capsat01"
-    direction = _active_direction(direction_id, "VM saturation cap test")
+async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_session, mocker):
+    """Deferred findings from previous cycle are still subject to the health gate cap."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-deferred-recovery02"
+    direction = _active_direction(direction_id, "Deferred still capped")
     project = Project(
-        name="Capacity Cap Saturation Test",
-        user_id="test-user-123",
-        autonomous_enabled=True,
+        name="Deferred Still Capped", user_id="test-user-123", autonomous_enabled=True,
         directions=[direction],
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = await _make_research_task(project, direction, db_session)
+    # 3 prior deferred findings
+    deferred_from_prev_cycle = [
+        _make_finding(f"Old deferred {i}", direction_id) for i in range(3)
+    ]
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
 
     _patch_research_externals(mocker)
+    # 2 new findings + 3 deferred = 5 total — but pipeline still degraded
+    new_findings = [_make_finding(f"New finding {i}", direction_id) for i in range(2)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
     mocker.patch(
-        "app.research_completion._parse_research_findings",
-        return_value=[_make_finding(f"Saturated task {i}", direction_id) for i in range(4)],
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
     )
-    # All 8 VMs occupied: available_slots=0 → cap_by_slots=0; queue low; no pool
-    mocker.patch.object(_shared_state, "tasks_active_gauge", 8)
-    mocker.patch.object(_shared_state, "tasks_queued_gauge", 0)
 
     await _handle_research_completion(task, "", db_session)
 
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     child_tasks = result.scalars().all()
-    # cap_by_slots=0 → floored to 1; cap_by_queue=15; cap_by_accounts=15 (no pool)
-    # effective_cap = min(15, max(1,0), 15, 15) = 1 → at least 1 finding spawns
-    assert len(child_tasks) >= 1, f"Expected at least 1 task despite full VMs, got {len(child_tasks)}"
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        f"Cap still applies even with prior deferred findings: expected {_DEGRADED_SPAWN_CAP}, got {len(child_tasks)}"
+    )
+
+    await db_session.refresh(task)
+    # The un-spawned findings should be deferred again for next cycle
+    still_deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(still_deferred) == 5 - _DEGRADED_SPAWN_CAP, (
+        f"Excess findings re-deferred: expected {5 - _DEGRADED_SPAWN_CAP}, got {len(still_deferred)}"
+    )

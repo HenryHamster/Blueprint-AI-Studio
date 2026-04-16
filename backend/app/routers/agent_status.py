@@ -412,11 +412,18 @@ async def update_agent_status(
                     logs=payload.logs
                 )
                 session.add(artifact)
-                # Store changed files in task context for retry artifact enrichment
-                if payload.changed_files:
+                # Store changed files and enriched retry info in task context
+                if payload.changed_files or payload.diff_summary or payload.self_review_outcome:
                     ctx = dict(task.context or {})
-                    ctx['_pr_changed_files'] = payload.changed_files[:50]
+                    if payload.changed_files:
+                        ctx['_pr_changed_files'] = payload.changed_files[:50]
                     ctx['_pr_url'] = payload.pr_url or ''
+                    if payload.diff_summary:
+                        ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                    if payload.self_review_outcome:
+                        ctx['_self_review_outcome'] = payload.self_review_outcome
+                    if payload.test_failure_summary:
+                        ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
                     task.context = ctx
                     flag_modified(task, 'context')
         else:
@@ -430,6 +437,17 @@ async def update_agent_status(
                 logs=payload.logs
             )
             session.add(artifact)
+            # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
+            if payload.changed_files or payload.diff_summary or payload.test_failure_summary:
+                ctx = dict(task.context or {})
+                if payload.changed_files:
+                    ctx['_pr_changed_files'] = payload.changed_files[:50]
+                if payload.diff_summary:
+                    ctx['_pr_diff_summary'] = payload.diff_summary[:50]
+                if payload.test_failure_summary:
+                    ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                task.context = ctx
+                flag_modified(task, 'context')
 
         # Broadcast artifact creation (e.g., new logs or screenshot available)
         await broadcast_to_project(

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Copy, Check } from 'lucide-react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Copy, Check, X, EyeOff } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
 
@@ -18,6 +18,7 @@ interface RecentErrorsResponse {
   total_entries_scanned?: number;
   generated_at: string;
   error?: string;
+  acknowledged_count?: number;
 }
 
 const POLL_INTERVAL_MS = 60_000;
@@ -88,6 +89,30 @@ export function RecentErrorsWidget() {
     });
   }, [buckets]);
 
+  const acknowledgeBucket = useCallback(async (bucket: ErrorBucket) => {
+    try {
+      const params = new URLSearchParams({
+        exception_class: bucket.exception_class,
+        source: bucket.source,
+      });
+      await apiFetch(`/api/admin/orchestrator-errors/acknowledge?${params}`, { method: 'POST' });
+      fetchErrors();
+    } catch {
+      // ignore — next poll will refresh
+    }
+  }, [fetchErrors]);
+
+  const acknowledgeAll = useCallback(async () => {
+    try {
+      await apiFetch('/api/admin/orchestrator-errors/acknowledge-all', { method: 'POST' });
+      fetchErrors();
+    } catch {
+      // ignore
+    }
+  }, [fetchErrors]);
+
+  const ackedCount = data?.acknowledged_count ?? 0;
+
   if (loading) {
     return (
       <section aria-label="Recent orchestrator errors">
@@ -125,6 +150,11 @@ export function RecentErrorsWidget() {
         >
           <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
           <span>No errors in last hour</span>
+          {ackedCount > 0 && (
+            <span className="text-[10px] text-neutral-600 ml-auto">
+              {ackedCount} acknowledged
+            </span>
+          )}
         </div>
       </section>
     );
@@ -152,14 +182,22 @@ export function RecentErrorsWidget() {
               {totalCount} error{totalCount !== 1 ? 's' : ''} in last hour
             </span>
             <span className="text-[10px] text-neutral-500 ml-auto">
-              {buckets.length} unique
+              {buckets.length} unique{ackedCount > 0 ? ` · ${ackedCount} acked` : ''}
             </span>
+          </button>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); acknowledgeAll(); }}
+            title="Acknowledge all errors"
+            className="px-2 py-2 text-neutral-400 hover:text-emerald-400 transition-colors focus:outline-none"
+          >
+            <EyeOff className="w-4 h-4" />
           </button>
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); copyAll(); }}
             title="Copy all errors to clipboard"
-            className="px-2.5 py-2 text-neutral-400 hover:text-neutral-100 transition-colors focus:outline-none"
+            className="px-2 py-2 text-neutral-400 hover:text-neutral-100 transition-colors focus:outline-none"
           >
             {copied
               ? <Check className="w-4 h-4 text-emerald-400" />
@@ -189,6 +227,14 @@ export function RecentErrorsWidget() {
                     role="button"
                     aria-label={`${bucket.exception_class} in ${bucket.source}, ${bucket.count} occurrences`}
                   >
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); acknowledgeBucket(bucket); }}
+                      title="Acknowledge this error"
+                      className="text-neutral-600 hover:text-emerald-400 transition-colors shrink-0"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
                     <span className="text-red-400 font-semibold truncate max-w-[40%]" title={bucket.exception_class}>
                       {bucket.exception_class}
                     </span>

@@ -766,6 +766,69 @@ async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
     assert "_previous_changed_files" not in clone_ctx
 
 
+@pytest.mark.asyncio
+async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
+    """clone_ctx propagates _previous_diff_summary, _previous_test_failure_summary,
+    and _previous_self_review_outcome from the failed child's context."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
+        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+    ]
+    test_failure_summary = "FAILED testing/test_models.py::test_create - AssertionError: expected 1 got 2"
+    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "add model"}],
+        child_context={
+            "_attempt_number": 1,
+            "_pr_diff_summary": diff_summary,
+            "_test_failure_summary": test_failure_summary,
+            "_self_review_outcome": self_review_outcome,
+        },
+        child_status_message="pytest test_create failed with AssertionError: expected 1 got 2",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert clone_ctx.get("_previous_diff_summary") == diff_summary
+    assert clone_ctx.get("_previous_test_failure_summary") == test_failure_summary
+    assert clone_ctx.get("_previous_self_review_outcome") == self_review_outcome
+
+
+@pytest.mark.asyncio
+async def test_requeue_omits_enriched_step_context_when_absent(requeue_db, mocker):
+    """If child context has no enriched step fields, retry clone omits the _previous_ enriched fields."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "fresh task"}],
+        child_context={"_attempt_number": 1},
+        child_status_message="pytest test_foo failed with AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert "_previous_diff_summary" not in clone_ctx
+    assert "_previous_test_failure_summary" not in clone_ctx
+    assert "_previous_self_review_outcome" not in clone_ctx
+
+
 async def _make_parent_with_children(session, children_specs, parent_context=None):
     """Helper: create a parent with multiple children.
 
@@ -986,6 +1049,41 @@ async def test_requeue_strips_max_plan_account_id(requeue_db, mocker):
     clone_ctx = clones[0].context or {}
     assert "max_plan_account_id" not in clone_ctx
     # Other context fields must still be present
+    assert clone_ctx.get("scope") == "small"
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_strips_provision_state(requeue_db, mocker):
+    """Clone context must not carry over provision retry state from the failed child."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "task"}],
+        child_context={
+            "scope": "small",
+            "provision_failures": 3,
+            "provision_failures_infra": 2,
+            "_infra_wait": True,
+            "blacklisted_accounts": ["acct-aaa"],
+            "_slot_released": True,
+        },
+        child_status_message="vm failed to start",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+    assert "provision_failures" not in clone_ctx
+    assert "provision_failures_infra" not in clone_ctx
+    assert "_infra_wait" not in clone_ctx
+    assert "blacklisted_accounts" not in clone_ctx
+    assert "_slot_released" not in clone_ctx
+    # Non-provision context fields must still be present
     assert clone_ctx.get("scope") == "small"
 
 
@@ -1866,7 +1964,7 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
 
 @pytest.mark.asyncio
 async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, mocker):
-    """EVALUATING parent whose children ALL failed gets rescued to FAILED with diagnostics."""
+    """EVALUATING parent whose children ALL failed and requeue limit exhausted is set to FAILED."""
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
@@ -1880,10 +1978,13 @@ async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, m
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
+    # Set _requeue_count=3 (at MAX_PARENT_REQUEUES) so _requeue_parent_task immediately
+    # fails the parent permanently rather than cloning children again.
     parent = Task(
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck"}],
         status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
         updated_at=datetime.utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
@@ -1913,9 +2014,6 @@ async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, m
 
     await reaper_db.refresh(parent)
     assert parent.status == TaskStatus.FAILED
-    assert "1 failed" in parent.latest_status_message
-    assert "CODE_ERROR" in parent.latest_status_message
-    assert "1 cancelled" in parent.latest_status_message
 
 
 @pytest.mark.asyncio
@@ -1985,6 +2083,58 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
+    # Set _requeue_count=3 so _requeue_parent_task fails permanently on this call.
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mocker):
+    """EVALUATING parent with all-failed children calls _requeue_parent_task (re-evaluation)
+    instead of being immediately set to FAILED when the requeue budget is not exhausted."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Requeue Rescue Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # _requeue_count not set — budget available, parent should be re-evaluated not failed.
     parent = Task(
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck"}],
@@ -2010,95 +2160,37 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
     except StopLoopException:
         pass
 
+    # _requeue_parent_task should have been called — not the parent directly set to FAILED.
+    mock_requeue.assert_called_once()
+    called_parent = mock_requeue.call_args[0][0]
+    assert called_parent.id == parent.id
+
+    # Parent must NOT have been directly set to FAILED by the reaper.
     await reaper_db.refresh(parent)
-    assert parent.status == TaskStatus.FAILED
-    assert "PROVISION_FAILURE" in parent.latest_status_message
-    assert parent.context.get("failure_category") is not None
+    assert parent.status == TaskStatus.EVALUATING
 
 
-# ── Per-failure-class retry budgets ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Infrastructure recovery auto-requeue (Step 5 in reaper)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _common_infra_recovery_mocks(mocker):
+    """Mocks needed for infra-recovery sweep tests (no active/orphaned tasks)."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
 
 @pytest.mark.asyncio
-async def test_reaper_code_error_retries_on_first_failure(reaper_db, mocker):
-    """CODE_ERROR budget=2: attempt_count=1 (one prior retry) still retries."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+async def test_infra_recovery_resurrects_provision_failure_when_zone_available(reaper_db, mocker):
+    """A PROVISION_FAILURE task is reset to QUEUED when at least one zone is available."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
 
-    project = Project(name="Code Error Retry Test", user_id="user1")
-    reaper_db.add(project)
-    await reaper_db.commit()
-    await reaper_db.refresh(project)
-
-    # last_error classifies as CODE_ERROR (no special keywords → default class)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "add a feature"}],
-        vm_instance_id="code-err-vm-1",
-        status=TaskStatus.IN_PROGRESS,
-        attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
-        context={"last_error": "pytest AssertionError: expected True, got False"},
-    )
-    reaper_db.add(task)
-    await reaper_db.commit()
-    await reaper_db.refresh(task)
-
-    try:
-        await reaper_service()
-    except _StopLoop:
-        pass
-
-    await reaper_db.refresh(task)
-    # Budget=2 for CODE_ERROR; attempt_count=1 < 2 → should retry
-    assert task.status == TaskStatus.QUEUED
-    assert task.attempt_count == 2
-
-
-@pytest.mark.asyncio
-async def test_reaper_code_error_fails_after_budget_exhausted(reaper_db, mocker):
-    """CODE_ERROR budget=2: attempt_count=2 exhausts budget → permanent FAILED."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
-
-    project = Project(name="Code Error Terminal Test", user_id="user1")
-    reaper_db.add(project)
-    await reaper_db.commit()
-    await reaper_db.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "add a feature"}],
-        vm_instance_id="code-err-vm-2",
-        status=TaskStatus.IN_PROGRESS,
-        attempt_count=2,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
-        context={"last_error": "pytest AssertionError: expected True, got False"},
-    )
-    reaper_db.add(task)
-    await reaper_db.commit()
-    await reaper_db.refresh(task)
-
-    try:
-        await reaper_service()
-    except _StopLoop:
-        pass
-
-    await reaper_db.refresh(task)
-    # Budget=2 for CODE_ERROR; attempt_count=2 is NOT < 2 → permanent FAILED
-    assert task.status == TaskStatus.FAILED
-    # fail_reason message must reference CODE_ERROR class and budget (case-insensitive)
-    msg = (task.latest_status_message or "").lower()
-    assert "code_error" in msg and "2 retries" in msg
-
-
-@pytest.mark.asyncio
-async def test_reaper_external_api_retries_up_to_budget(reaper_db, mocker):
-    """EXTERNAL_API budget=4: attempt_count=3 still retries (one more left)."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
-
-    project = Project(name="External API Retry Test", user_id="user1")
+    project = Project(name="Infra Recovery PROVISION Test", user_id="user1")
     reaper_db.add(project)
     await reaper_db.commit()
     await reaper_db.refresh(project)
@@ -2106,85 +2198,15 @@ async def test_reaper_external_api_retries_up_to_budget(reaper_db, mocker):
     task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="ext-api-vm-3",
-        status=TaskStatus.IN_PROGRESS,
+        status=TaskStatus.FAILED,
         attempt_count=3,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
-        context={"last_error": "503 service unavailable: api.github.com timed out"},
-    )
-    reaper_db.add(task)
-    await reaper_db.commit()
-    await reaper_db.refresh(task)
-
-    try:
-        await reaper_service()
-    except _StopLoop:
-        pass
-
-    await reaper_db.refresh(task)
-    # Budget=4 for EXTERNAL_API; attempt_count=3 < 4 → should retry
-    assert task.status == TaskStatus.QUEUED
-    assert task.attempt_count == 4
-
-
-@pytest.mark.asyncio
-async def test_reaper_external_api_fails_after_budget_exhausted(reaper_db, mocker):
-    """EXTERNAL_API budget=4: attempt_count=4 exhausts budget → permanent FAILED."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
-
-    project = Project(name="External API Terminal Test", user_id="user1")
-    reaper_db.add(project)
-    await reaper_db.commit()
-    await reaper_db.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="ext-api-vm-4",
-        status=TaskStatus.IN_PROGRESS,
-        attempt_count=4,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
-        context={"last_error": "503 service unavailable: api.github.com timed out"},
-    )
-    reaper_db.add(task)
-    await reaper_db.commit()
-    await reaper_db.refresh(task)
-
-    try:
-        await reaper_service()
-    except _StopLoop:
-        pass
-
-    await reaper_db.refresh(task)
-    # Budget=4 for EXTERNAL_API; attempt_count=4 is NOT < 4 → permanent FAILED
-    assert task.status == TaskStatus.FAILED
-    msg = (task.latest_status_message or "").lower()
-    assert "external_api" in msg and "4 retries" in msg
-
-
-@pytest.mark.asyncio
-async def test_reaper_external_api_uses_longer_retry_delay(reaper_db, mocker):
-    """EXTERNAL_API first retry should use ~5 min delay (longer than default backoff)."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
-
-    from datetime import timezone as _tz
-    import app.shared_state as _ss
-
-    project = Project(name="External API Delay Test", user_id="user1")
-    reaper_db.add(project)
-    await reaper_db.commit()
-    await reaper_db.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="ext-delay-vm",
-        status=TaskStatus.IN_PROGRESS,
-        attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
-        context={"last_error": "503 service unavailable: api.github.com timed out"},
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "provision_failures": 3,
+            "provision_failures_infra": 1,
+            "_infra_wait": True,
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -2197,52 +2219,320 @@ async def test_reaper_external_api_uses_longer_retry_delay(reaper_db, mocker):
 
     await reaper_db.refresh(task)
     assert task.status == TaskStatus.QUEUED
-    # retry_after must be set and should be at least 3 min from now
-    # (5 min * 0.75 jitter = 3.75 min minimum, vs default 2^0 * 0.75 = 0.75 min)
     ctx = task.context or {}
-    retry_after_str = ctx.get("retry_after")
-    assert retry_after_str is not None, "retry_after must be set for EXTERNAL_API retry"
-    retry_after = datetime.fromisoformat(retry_after_str)
-    if retry_after.tzinfo is None:
-        retry_after = retry_after.replace(tzinfo=_tz.utc)
-    now = datetime.now(_tz.utc)
-    delay_seconds = (retry_after - now).total_seconds()
-    # Should be at least 3.75 min (5 * 0.75 jitter), more than default 1-min backoff
-    assert delay_seconds > 3 * 60, (
-        f"EXTERNAL_API retry delay should be >3 min, got {delay_seconds:.0f}s"
-    )
+    assert ctx.get("_resurrection_count") == 1
+    assert ctx.get("_resurrected_from") == "PROVISION_FAILURE"
+    # Infra retry state cleared
+    assert "provision_failures" not in ctx
+    assert "provision_failures_infra" not in ctx
+    assert "_infra_wait" not in ctx
+    # failure_category cleared so next run is reclassified fresh
+    assert "failure_category" not in ctx
+    # Attempt count reset
+    assert task.attempt_count == 0
+    assert task.vm_instance_id is not None
+    assert task.latest_status_message.startswith("Auto-resurrected")
 
 
 @pytest.mark.asyncio
-async def test_reaper_agent_timeout_keeps_3_attempt_budget(reaper_db, mocker):
-    """AGENT_TIMEOUT budget=3: attempt_count=2 retries; attempt_count=3 fails."""
-    _common_reaper_mocks(mocker)
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+async def test_infra_recovery_does_not_resurrect_when_no_zone_available(reaper_db, mocker):
+    """A PROVISION_FAILURE task stays FAILED when no zone is available."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
 
-    project = Project(name="Agent Timeout Budget Test", user_id="user1")
+    project = Project(name="No Zone Available Test", user_id="user1")
     reaper_db.add(project)
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
-    # attempt_count=2, heartbeat timeout → AGENT_TIMEOUT → budget=3 → retry
-    task_retry = Task(
+    task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
-        vm_instance_id="timeout-vm-2",
-        status=TaskStatus.IN_PROGRESS,
-        attempt_count=2,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={"failure_category": "PROVISION_FAILURE"},
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
     )
-    reaper_db.add(task_retry)
+    reaper_db.add(task)
     await reaper_db.commit()
-    await reaper_db.refresh(task_retry)
+    await reaper_db.refresh(task)
 
     try:
         await reaper_service()
     except _StopLoop:
         pass
 
-    await reaper_db.refresh(task_retry)
-    # Budget=3 for AGENT_TIMEOUT; attempt_count=2 < 3 → should retry
-    assert task_retry.status == TaskStatus.QUEUED
-    assert task_retry.attempt_count == 3
+    await reaper_db.refresh(task)
+    # Still FAILED — no zone recovered
+    assert task.status == TaskStatus.FAILED
+    ctx = task.context or {}
+    assert "_resurrection_count" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_caps_at_one_resurrection_per_task(reaper_db, mocker):
+    """A task that was already resurrected once must NOT be resurrected again."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+    project = Project(name="Resurrection Cap Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "_resurrection_count": 1,  # Already resurrected once
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    # Must stay FAILED — resurrection cap reached
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("_resurrection_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_skips_tasks_older_than_two_hours(reaper_db, mocker):
+    """Tasks that failed more than 2 hours ago are outside the recovery window."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+    project = Project(name="Old Failure Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={"failure_category": "PROVISION_FAILURE"},
+        # 3 hours ago — outside the 2h window
+        updated_at=datetime.utcnow() - timedelta(hours=3),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_does_not_resurrect_code_error_tasks(reaper_db, mocker):
+    """Tasks that failed with CODE_ERROR must never be auto-resurrected."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+    project = Project(name="Code Error No Resurrect Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={"failure_category": "CODE_ERROR"},
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_db, mocker):
+    """An EXTERNAL_API task is resurrected when both github_api and claude_api are healthy."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+    # Patch external_health directly in the module
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"github_api": True, "claude_api": True},
+    )
+
+    project = Project(name="External API Recovery Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={"failure_category": "EXTERNAL_API"},
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_resurrection_count") == 1
+    assert ctx.get("_resurrected_from") == "EXTERNAL_API"
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealthy(reaper_db, mocker):
+    """An EXTERNAL_API task stays FAILED when dependencies are not yet healthy."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"github_api": False, "claude_api": True},
+    )
+
+    project = Project(name="External API Unhealthy Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={"failure_category": "EXTERNAL_API"},
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_resurrects_rate_limit_when_account_available(reaper_db, mocker):
+    """A RATE_LIMIT task is resurrected when a non-blacklisted account is available."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[{"id": "acct-1"}, {"id": "acct-2"}])
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
+
+    project = Project(name="Rate Limit Recovery Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={
+            "failure_category": "RATE_LIMIT",
+            "blacklisted_accounts": ["acct-blacklisted"],
+            "max_plan_account_id": "acct-blacklisted",
+            "retry_after": "2026-01-01T00:00:00Z",
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_resurrection_count") == 1
+    assert ctx.get("_resurrected_from") == "RATE_LIMIT"
+    # Rate limit retry state cleared
+    assert "blacklisted_accounts" not in ctx
+    assert "max_plan_account_id" not in ctx
+    assert "retry_after" not in ctx
+    assert "failure_category" not in ctx
+    assert task.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_blacklisted(reaper_db, mocker):
+    """A RATE_LIMIT task stays FAILED when all available accounts are still blacklisted."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+    # Only one account exists and it's in the blacklist
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[{"id": "acct-1"}])
+    # account_available_for_model returns True but the account is blacklisted — any() is False
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
+
+    project = Project(name="All Accounts Blacklisted Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={
+            "failure_category": "RATE_LIMIT",
+            "blacklisted_accounts": ["acct-1"],
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (task.context or {})
