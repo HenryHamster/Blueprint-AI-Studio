@@ -604,6 +604,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         and "_first_attempt_succeeded" in (t.context or {})
     ]
 
+    tasks_with_measurements = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("_had_review_measurements") is True
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+    tasks_without_measurements = [
+        t for t in terminal_tasks_24h
+        if not (t.context or {}).get("_had_review_measurements")
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+
     first_attempt_by_type = {}
     for task_type, tasks in by_type.items():
         rate = _first_attempt_rate(tasks)
@@ -727,6 +738,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "by_type": first_attempt_by_type,
         "by_scope": first_attempt_by_scope,
         "first_attempt_by_review_category": first_attempt_by_review_category,
+        "with_measurements": _first_attempt_rate(tasks_with_measurements) if tasks_with_measurements else None,
+        "without_measurements": _first_attempt_rate(tasks_without_measurements) if tasks_without_measurements else None,
     }
 
     # Self-review effectiveness: correlate self-review verdicts with first-attempt approval outcomes
@@ -838,6 +851,39 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if recurrence:
             review_recurrence_by_category = recurrence
 
+    # Self-review prediction accuracy: compare self-review check_results against human rejection categories
+    self_review_prediction_accuracy: Dict[str, Any] | None = None
+    tasks_with_both = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
+        and "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    if len(tasks_with_both) >= 5:
+        total_human_cats = 0
+        total_overlap = 0
+        total_missed = 0
+        total_false_alarms = 0
+        total_sr_failed_cats = 0
+        for t in tasks_with_both:
+            ctx = t.context or {}
+            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+            sr_failed = {cat for cat, res in check_results.items() if not res.get("passed", True)}
+            overlap = human_cats & sr_failed
+            missed = human_cats - sr_failed
+            false_alarms = sr_failed - human_cats
+            total_human_cats += len(human_cats)
+            total_overlap += len(overlap)
+            total_missed += len(missed)
+            total_false_alarms += len(false_alarms)
+            total_sr_failed_cats += len(sr_failed)
+        self_review_prediction_accuracy = {
+            "prediction_hit_rate": round(total_overlap / total_human_cats, 3) if total_human_cats > 0 else None,
+            "miss_rate": round(total_missed / total_human_cats, 3) if total_human_cats > 0 else None,
+            "false_alarm_rate": round(total_false_alarms / total_sr_failed_cats, 3) if total_sr_failed_cats > 0 else None,
+            "sample_size": len(tasks_with_both),
+        }
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -846,6 +892,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "first_attempt_success_rate": first_attempt_success_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "self_review_effectiveness": self_review_effectiveness,
+        "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
         "review_effectiveness_trends": review_effectiveness_trends,

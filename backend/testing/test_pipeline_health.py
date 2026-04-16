@@ -419,7 +419,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "self_review_effectiveness", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
 
 
@@ -979,6 +979,102 @@ async def test_self_review_effectiveness_none_when_no_first_attempt_data():
     assert sre["without_self_review_approval_rate"] is None
 
 
+# ── Self-review prediction accuracy ──────────────────────────────────────────
+
+def _make_sr_task(project_id, check_results, human_cats, hours_ago=1):
+    """Helper to build a task with both self-review and human rejection data."""
+    now = _utcnow()
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": human_cats,
+        },
+        created_at=now - timedelta(hours=hours_ago),
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_null_when_sample_too_small():
+    """Returns None when fewer than 5 tasks have both fields."""
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_sr_task(project_id, {"style": {"passed": False}}, {"style": 1}, hours_ago=i)
+        for i in range(1, 5)  # only 4 tasks
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    assert result["self_review_prediction_accuracy"] is None
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_perfect_overlap():
+    """Perfect overlap: every human category was flagged by self-review → hit_rate=1.0."""
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_sr_task(
+            project_id,
+            {"style": {"passed": False}, "tests": {"passed": False}},
+            {"style": 1, "tests": 1},
+            hours_ago=i,
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    assert acc["prediction_hit_rate"] == 1.0
+    assert acc["miss_rate"] == 0.0
+    assert acc["sample_size"] == 6
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_complete_miss():
+    """Complete miss: self-review passes everything but human rejects → hit_rate=0.0."""
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_sr_task(
+            project_id,
+            {"style": {"passed": True}},
+            {"style": 1},
+            hours_ago=i,
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    assert acc["prediction_hit_rate"] == 0.0
+    assert acc["miss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_partial_overlap():
+    """Partial overlap: self-review catches 1 of 2 human categories → hit_rate=0.5."""
+    project_id = uuid.uuid4()
+    # Each task: 2 human cats, self-review flags only 1
+    tasks = [
+        _make_sr_task(
+            project_id,
+            {"style": {"passed": False}, "tests": {"passed": True}},
+            {"style": 1, "tests": 1},
+            hours_ago=i,
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    assert acc["prediction_hit_rate"] == 0.5
+    assert acc["miss_rate"] == 0.5
+    # false_alarm_rate: self-review flagged 1 cat (style), human rejected style too → 0 false alarms
+    assert acc["false_alarm_rate"] == 0.0
+
+
 # ── _compute_scope_baselines ─────────────────────────────────────────────────
 
 def test_scope_baselines_empty_tasks_returns_empty():
@@ -1528,3 +1624,90 @@ async def test_health_detailed_endpoint_includes_pipeline_health(
 
     assert "pipeline_health" in data["components"]
     assert data["components"]["pipeline_health"]["status"] == "ok"
+
+
+# ── Review measurement attribution split ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_with_measurements_split_computes_approval_rate():
+    """Tasks with _had_review_measurements=True produce a with_measurements rate."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_had_review_measurements": True, "_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+            context={"_had_review_measurements": True, "_first_attempt_succeeded": False},
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fa = result["first_attempt_success_rate"]
+    assert fa["with_measurements"] == 0.5
+    assert fa["without_measurements"] is None
+
+
+@pytest.mark.asyncio
+async def test_without_measurements_includes_missing_field():
+    """Tasks without _had_review_measurements field are counted as 'without'."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+            context={"_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            context={"_had_review_measurements": False, "_first_attempt_succeeded": False},
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fa = result["first_attempt_success_rate"]
+    # All three tasks go to without_measurements (no field or False)
+    assert fa["with_measurements"] is None
+    assert fa["without_measurements"] == round(2 / 3, 2)
+
+
+@pytest.mark.asyncio
+async def test_measurements_split_null_when_sample_too_small():
+    """Null returned for a group when no tasks have _first_attempt_succeeded recorded."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_had_review_measurements": True},  # no _first_attempt_succeeded
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fa = result["first_attempt_success_rate"]
+    assert fa["with_measurements"] is None
+    assert fa["without_measurements"] is None
