@@ -56,7 +56,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
     from app.research_completion import _compute_momentum_factor, _compute_merge_rate, _compute_acceptance_rate  # noqa: PLC0415
-    from app.anomaly_detection import _compute_research_anomalies  # noqa: PLC0415
+    from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions  # noqa: PLC0415
     from app.direction_lifecycle import _process_direction_lifecycle  # noqa: PLC0415
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
@@ -405,6 +405,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     anomalies = None
     if is_undirected:
         anomalies = await _compute_research_anomalies(project.id, session)
+
+    # Check anomaly-driven pipeline adjustments (apply or restore) after anomaly tracking
+    anomaly_action = await check_anomaly_actions()
+    if anomaly_action["action"] != "none":
+        from app.broadcast import broadcast_to_project  # noqa: PLC0415
+        await broadcast_to_project(
+            str(project.id),
+            "anomaly_adjustment",
+            anomaly_action,
+        )
 
     # Build and spawn research tasks — one per chosen direction (or one undirected)
     directions_to_spawn = chosen_directions if chosen_directions else [None]  # None = undirected

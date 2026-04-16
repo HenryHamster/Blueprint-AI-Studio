@@ -8,7 +8,7 @@ import asyncio
 import subprocess
 import signal
 import threading
-from collections import OrderedDict as _OrderedDict
+from collections import OrderedDict as _OrderedDict, deque as _deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -101,13 +101,37 @@ ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '180'))  # 3
 ZONE_RECOVERY_WAIT_CAP_SECONDS = int(os.getenv('ZONE_RECOVERY_WAIT_CAP_SECONDS', '300'))  # Max wait when all zones in cooldown
 
 
+ZONE_HISTORY_WINDOW = int(os.getenv('ZONE_HISTORY_WINDOW', '20'))  # Rolling window size for success rate
+_ZONE_NEUTRAL_RATE = 0.5  # Default success rate for zones with no history
+
+
 def _zone_cooldown_seconds(consecutive_failures: int) -> int:
     """Exponential backoff: 3min → 6min → 12min → 24min → 30min cap."""
     return min(ZONE_COOLDOWN_SECONDS * (2 ** consecutive_failures), 1800)
 
 # Zone health tracking: populated by provisioning attempts
 _zone_health: dict[str, dict] = {}
-# Structure: { "us-central1-f": {"last_success": datetime, "last_failure": datetime, "consecutive_failures": 0, "last_failure_reason": str} }
+# Structure: {
+#   "us-central1-f": {
+#     "last_success": datetime, "last_failure": datetime,
+#     "consecutive_failures": 0, "last_failure_reason": str,
+#     "recent_outcomes": deque[bool],  # True=success, False=failure, maxlen=ZONE_HISTORY_WINDOW
+#   }
+# }
+
+def _zone_success_rate(zone: str) -> float:
+    """Return the recent success rate for a zone (0.0–1.0).
+
+    Reads the rolling ``recent_outcomes`` deque stored in ``_zone_health``.
+    Returns the neutral rate (0.5) when no history exists so unknown zones
+    sort in the middle, neither preferred nor penalised.
+    Caller is responsible for holding ``_zone_lock`` when thread safety matters.
+    """
+    outcomes = _zone_health.get(zone, {}).get("recent_outcomes")
+    if not outcomes:
+        return _ZONE_NEUTRAL_RATE
+    return sum(outcomes) / len(outcomes)
+
 
 # Thread lock for zone state dicts (modified from asyncio.to_thread workers, read from event loop)
 _zone_lock = threading.RLock()
@@ -748,7 +772,11 @@ STATICENV
         now_pre = datetime.now(timezone.utc)
         healthy_zones = [(z, s) for z, s in FALLBACK_ZONES if not (_zone_health.get(z, {}).get("cooldown_expires_at") and now_pre < _zone_health[z]["cooldown_expires_at"])]
         cooled_zones = [(z, s) for z, s in FALLBACK_ZONES if (z, s) not in healthy_zones]
-        random.shuffle(healthy_zones)
+        # Sort healthy zones by recent success rate (descending) so well-performing
+        # zones are preferred. Zones with no history get neutral rate 0.5.
+        # Use stable sort with a small random tiebreak to distribute load across
+        # equal-rate zones (e.g. all-new zones with 0.5 default).
+        healthy_zones.sort(key=lambda zs: (_zone_success_rate(zs[0]), random.random()), reverse=True)
         zones_to_try = healthy_zones + cooled_zones
 
         for zone, subnet_name in zones_to_try:
@@ -794,6 +822,8 @@ STATICENV
                     prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
                     health.pop("cooldown_expires_at", None)
+                    outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                    outcomes.append(True)
                     was_in_cooldown = zone in _zone_failures
                     cooldown_since = _zone_failures.pop(zone, None)
 
@@ -853,6 +883,8 @@ STATICENV
                         health["last_failure_reason"] = reason
                         cooldown_secs = _zone_cooldown_seconds(new_failure_count)
                         health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
+                        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                        outcomes.append(False)
 
                     if entering_cooldown:
                         logger.warning(
@@ -898,6 +930,8 @@ STATICENV
                         health["last_success"] = datetime.now(timezone.utc)
                         health["consecutive_failures"] = 0
                         health.pop("cooldown_expires_at", None)
+                        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                        outcomes.append(True)
                         _zone_failures.pop(wait_zone, None)
                     logger.info(f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)")
                     return operation.name
@@ -1164,6 +1198,10 @@ def get_zone_health() -> dict:
             else:
                 status = "recovering"
 
+            outcomes = data.get("recent_outcomes")
+            provision_count = len(outcomes) if outcomes else 0
+            success_rate = (sum(outcomes) / provision_count) if provision_count else None
+
             result[zone] = {
                 "status": status,
                 "last_success": data["last_success"].isoformat() if data.get("last_success") else None,
@@ -1172,6 +1210,8 @@ def get_zone_health() -> dict:
                 "consecutive_failures": consecutive,
                 "cooldown_active": cooldown_active,
                 "cooldown_expires_at": cooldown_expires.isoformat() if cooldown_active and cooldown_expires else None,
+                "success_rate": success_rate,
+                "provision_count": provision_count,
             }
     return result
 
@@ -1180,6 +1220,11 @@ def get_zone_health_summary() -> dict:
     """Return a compact summary for health endpoints."""
     health = get_zone_health()
     exhausted = [z for z, d in health.items() if d["status"] == "exhausted"]
+    zone_success_rates = {
+        z: d["success_rate"]
+        for z, d in health.items()
+        if d["success_rate"] is not None
+    }
     return {
         "total_zones": len(FALLBACK_ZONES),
         "available": len(FALLBACK_ZONES) - len(exhausted),
@@ -1189,6 +1234,7 @@ def get_zone_health_summary() -> dict:
             for z in exhausted
             if health[z].get("cooldown_expires_at")
         },
+        "zone_success_rates": zone_success_rates,
     }
 
 
@@ -1234,6 +1280,8 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
         health["last_failure_reason"] = reason
         cooldown_secs = _zone_cooldown_seconds(new_failure_count)
         health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
+        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+        outcomes.append(False)
 
     if entering_cooldown:
         logger.warning(

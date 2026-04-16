@@ -1858,3 +1858,159 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     assert "skipping success heartbeat" in source, (
         "expected an explicit skip branch when the agent died in settle window"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for the all-children-failed EVALUATING parent rescue (Step 4 in reaper)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, mocker):
+    """EVALUATING parent whose children ALL failed gets rescued to FAILED with diagnostics."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="All-Failed Rescue Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child1 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+    child2 = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c2"}],
+        status=TaskStatus.CANCELLED,
+    )
+    reaper_db.add_all([child1, child2])
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "1 failed" in parent.latest_status_message
+    assert "CODE_ERROR" in parent.latest_status_message
+    assert "1 cancelled" in parent.latest_status_message
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mocker):
+    """EVALUATING parent with at least one still-running child must NOT be rescued prematurely."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Running Child Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    failed_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+    )
+    running_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c2"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    reaper_db.add_all([failed_child, running_child])
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    # Parent should still be EVALUATING — one child is still running.
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker):
+    """Rescued parent failure message includes each child's failure_category."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Failure Class Msg Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "c1"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "PROVISION_FAILURE" in parent.latest_status_message
+    assert parent.context.get("failure_category") is not None

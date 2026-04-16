@@ -269,6 +269,52 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Helper: failure stage pattern analysis
+# ---------------------------------------------------------------------------
+
+def _compute_failure_stage_pattern(history: list) -> "dict | None":
+    """
+    Analyze recent research_history stage_dropout data to identify dominant failure stages.
+
+    Returns a pattern dict if 60%+ of non-infra failures cluster at one stage, else None.
+    Only considers code_error and approval stages — agents can't address infra failures.
+    Uses the last 3 research cycles for recency.
+    """
+    recent = history[-3:]
+    code_error_total = 0
+    approval_total = 0
+    for entry in recent:
+        sd = entry.get("stage_dropout") or {}
+        code_error_total += sd.get("tasks_failed_code_error", 0)
+        approval_total += sd.get("tasks_required_approval", 0)
+    total_non_infra = code_error_total + approval_total
+    if total_non_infra < 3:
+        return None
+    code_error_rate = code_error_total / total_non_infra
+    approval_rate = approval_total / total_non_infra
+    threshold = 0.6
+    if code_error_rate >= threshold:
+        return {
+            "stage": "code_error",
+            "rate": round(code_error_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently fail at the code/test stage — "
+                "pay extra attention to test coverage and run tests early."
+            ),
+        }
+    if approval_rate >= threshold:
+        return {
+            "stage": "approval",
+            "rate": round(approval_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently stall waiting for approval — "
+                "consider smaller, more targeted changes that require less manual review."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Agent lifecycle endpoints
 # ---------------------------------------------------------------------------
 
@@ -753,11 +799,13 @@ async def claim_task(
                     for h in history[-2:]
                     if h.get("tasks_created", 0) > 0
                 ]
+                failure_stage_pattern = _compute_failure_stage_pattern(history)
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
                     "failed_approaches": [a[:120] for a in failed_approaches[:5]],
                     "recent_outcomes": recent_outcomes,
+                    "failure_stage_pattern": failure_stage_pattern,
                 }
 
     # Inject co-change affinity context for create/fix/refactor tasks

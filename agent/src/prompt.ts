@@ -308,6 +308,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const parts = recentOutcomes.map(o => `${o.prs_merged}/${o.tasks_created} merged`);
       dcLines.push(`Recent cycles: ${parts.join(', ')}`);
     }
+    const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
+    if (failureStagePattern) {
+      const msg = strVal(failureStagePattern.message);
+      if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }
@@ -917,19 +922,36 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
     ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
     : [];
+  const previousFailureStage = strVal(ctx._previous_failure_stage as unknown);
+  const previousErrorSummary = strVal(ctx._previous_error_summary as unknown);
+  const previousIsRecurring = ctx._previous_is_recurring === true;
   const prevAttempt = attemptNumber - 1;
 
+  const failureTypeLabel = previousFailureClass || 'UNKNOWN';
   const lines: string[] = [
     `## Previous Attempt (attempt #${prevAttempt} failed)`,
-    `Failure type: ${previousFailureClass || 'UNKNOWN'}`,
+    previousFailureStage
+      ? `Failure type: ${failureTypeLabel} (at ${previousFailureStage} stage)`
+      : `Failure type: ${failureTypeLabel}`,
   ];
+
+  if (previousIsRecurring) {
+    lines.push(
+      '**This is a recurring failure pattern** — this same failure type has been seen multiple times. Consider a fundamentally different approach.',
+    );
+  }
+
   if (previousPrUrl) {
     lines.push(`PR from previous attempt: ${previousPrUrl}`);
   }
   if (previousChangedFiles.length > 0) {
     lines.push(`Files changed in previous attempt:\n${previousChangedFiles.map(f => `  - ${f}`).join('\n')}`);
   }
-  if (previousError) {
+
+  // For CODE_ERROR failures, show the focused error summary; otherwise show the full error.
+  if (previousErrorSummary) {
+    lines.push(`Error summary: ${previousErrorSummary}`);
+  } else if (previousError) {
     lines.push(`Error: ${previousError}`);
   }
 

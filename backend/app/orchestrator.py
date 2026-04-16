@@ -170,6 +170,20 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
+_CRITICAL_EXTERNAL_DEPS = ("github_api", "claude_api", "gcp")
+
+
+def get_confirmed_down_critical_deps() -> list:
+    """Return critical dependency names confirmed down for 2+ consecutive health checks.
+
+    DB is excluded — if DB is down the orchestrator itself cannot function, so
+    there's no meaningful gate to apply.  A dep needs >=2 consecutive failures to
+    avoid false-positives from transient probe errors.
+    """
+    consec = _shared_state.external_health.get("consecutive_failures", {})
+    return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
+
+
 async def _check_candidate_task_deps(
     task: Task,
     dep_tasks: list,
@@ -421,7 +435,8 @@ async def orchestrator_worker():
                     recent_window = recent_results[-10:]
                     recent_failures = sum(1 for r in recent_window if r[1] == "failure")
                     recent_rate = recent_failures / len(recent_window)
-                    if recent_rate >= 0.8:
+                    _failure_gate = _shared_state.anomaly_adjustments["failure_gate_threshold"]
+                    if recent_rate >= _failure_gate:
                         # Global backstop: entire pipeline is degraded — sleep and retry
                         logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for {ORCHESTRATOR_THROTTLE_SECONDS}s")
                         try:
@@ -448,6 +463,23 @@ async def orchestrator_worker():
                                     f"[ORCHESTRATOR] Per-type failure gate: '{ttype}' "
                                     f"({rate:.0%} failure rate, n={sample_size}) — skipping this type"
                                 )
+
+                # External health gate — skip dispatch when a critical dependency has been
+                # confirmed down for 2+ consecutive health checks (avoids flapping on transient probes).
+                # DB is excluded: if DB is down the orchestrator itself cannot function.
+                _confirmed_down = get_confirmed_down_critical_deps()
+                if _confirmed_down:
+                    _dep_str = ", ".join(_confirmed_down)
+                    logger.warning(f"[ORCHESTRATOR] External health gate: {_dep_str} confirmed down — skipping dispatch this cycle")
+                    try:
+                        await ws_manager.broadcast_to_all("health_gate_throttle", {
+                            "reason": "external_dependency_down",
+                            "detail": f"Critical dependencies down: {_dep_str}",
+                            "deps": _confirmed_down,
+                        })
+                    except Exception:
+                        logger.exception("[ORCHESTRATOR] Failed to broadcast health_gate_throttle")
+                    continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle
                 active_per_account: Dict[str, int] = {}

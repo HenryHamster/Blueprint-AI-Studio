@@ -74,6 +74,19 @@ last_idle_check: Optional[datetime] = None
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
 persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
 
+# --- Anomaly-Driven Pipeline Adjustments ---
+# When high-severity anomalies (PROVISION_FAILURE, EXTERNAL_API) persist,
+# the system automatically reduces blast radius by lowering max_concurrent_vms
+# and tightening the failure-rate dispatch gate.
+anomaly_adjustments: Dict[str, Any] = {
+    "active": False,
+    "adjusted_at": None,             # ISO timestamp when adjustments were applied
+    "trigger_anomalies": [],         # anomaly keys that triggered the adjustment
+    "pre_adjustment_max_vms": None,  # stored to restore on clearing
+    "pre_adjustment_failure_gate": None,
+    "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
+}
+
 # --- Circuit Breaker (Hystrix-inspired) ---
 # Per-project circuit breaker state for autonomous task spawning
 # States: CLOSED (normal), OPEN (tripped), HALF_OPEN (testing one task)
@@ -428,6 +441,7 @@ external_health: Dict = {
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
     "errors": {},                   # dep_name -> last error message
+    "consecutive_failures": {},     # dep_name -> int count of consecutive failed health checks
 }
 
 # Track last successful GitHub API operation (tokens, PR comments, etc.)

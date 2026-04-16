@@ -13,7 +13,7 @@ import asyncio
 import logging
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -83,6 +83,68 @@ def cascade_disabled_models(model: str) -> tuple:
     whole account."""
     normalized = _normalize_rl_model(model)
     return _MODEL_TIER_CASCADE.get(normalized, (normalized,) if normalized else (model,))
+
+
+# Rolling window for account health score computation
+_HEALTH_WINDOW_SECONDS = 24 * 3600  # 24-hour rolling window
+
+
+def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> float:
+    """Compute a rolling 24h health score. Higher is healthier.
+
+    Formula: completions_24h - 2 * rl_events_24h
+    Accounts with no history score 0 (neutral). A single rate-limit event
+    weighs twice as much as a completion to penalize chronically problematic
+    accounts even when they occasionally succeed.
+    """
+    now = now or _utcnow()
+    cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
+    rl_count = sum(1 for t in acct.get("rl_events", []) if t > cutoff)
+    completion_count = sum(1 for e in acct.get("completion_events", []) if e["at"] > cutoff)
+    return completion_count - 2.0 * rl_count
+
+
+def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) -> Dict[str, Any]:
+    """Return observable health stats for an account (used by admin endpoints)."""
+    now = now or _utcnow()
+    cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
+    rl_events = [t for t in acct.get("rl_events", []) if t > cutoff]
+    completion_events = [e for e in acct.get("completion_events", []) if e["at"] > cutoff]
+    durations = [e["duration_seconds"] for e in completion_events if e.get("duration_seconds") is not None]
+    return {
+        "rl_events_24h": len(rl_events),
+        "completions_24h": len(completion_events),
+        "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+        "health_score": _compute_health_score(acct, now=now),
+    }
+
+
+def _prune_health_events(acct: Dict[str, Any], now: datetime) -> None:
+    """Prune health event lists to the 24h window (call under lock)."""
+    cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
+    if "rl_events" in acct:
+        acct["rl_events"] = [t for t in acct["rl_events"] if t > cutoff]
+    if "completion_events" in acct:
+        acct["completion_events"] = [e for e in acct["completion_events"] if e["at"] > cutoff]
+
+
+async def record_completion_event(acct_id: str, duration_seconds: float) -> None:
+    """Record a successful task completion for account health tracking.
+
+    Should be called whenever a Max Plan task completes successfully.
+    Acquires _max_plan_pool_lock. Safe to call when acct_id is absent (no-op).
+    """
+    if not acct_id:
+        return
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None:
+            return
+        now = _utcnow()
+        _prune_health_events(acct, now)
+        acct.setdefault("completion_events", []).append(
+            {"at": now, "duration_seconds": duration_seconds}
+        )
 
 
 # Backward compat: flat view for code that needs all accounts
@@ -263,7 +325,9 @@ async def select_max_plan_account(user_id: str, model: str | None = None, blackl
                 probing.append(a)
 
         if healthy:
-            account = min(healthy, key=lambda a: a["active_tasks"])
+            # Prefer accounts with higher health scores (fewer rate limits, more completions).
+            # Among equal scores, prefer fewer active tasks for load balancing.
+            account = max(healthy, key=lambda a: (_compute_health_score(a), -a.get("active_tasks", 0)))
         elif probing:
             # Deterministic by id so concurrent selects under the same lock get
             # distinct probes when multiple accounts are eligible.
@@ -312,6 +376,9 @@ async def disable_account_model(acct_id: str, model: str) -> None:
             info = dm.setdefault(m, {"hits": 0})
             info["hits"] += 1
             info["at"] = now
+        # Record rate-limit event for rolling health score
+        _prune_health_events(acct, now)
+        acct.setdefault("rl_events", []).append(now)
         primary_hits = dm[model]["hits"]
         cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(0.85, 1.15)
         logger.warning(

@@ -35,6 +35,28 @@ from app.failure_classification import classify_failure
 
 logger = logging.getLogger(__name__)
 
+
+def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
+    """Derive the pipeline stage at which a task failure occurred.
+
+    Returns one of: 'provision', 'clone', 'test', 'lint', 'build', 'pr_creation', or None.
+    """
+    if failure_class == "PROVISION_FAILURE":
+        return "provision"
+    msg = (status_message or "").lower()
+    if any(kw in msg for kw in ("checkout", "git clone", "clone")):
+        return "clone"
+    if any(kw in msg for kw in ("test", "assert", "pytest", "jest", "vitest")):
+        return "test"
+    if any(kw in msg for kw in ("lint", "ruff", "eslint", "tsc", "type error")):
+        return "lint"
+    if any(kw in msg for kw in ("build", "compile", "webpack", "bundle")):
+        return "build"
+    if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
+        return "pr_creation"
+    return None
+
+
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review."""
     active = (await session.execute(
@@ -131,6 +153,22 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         clone_ctx["_attempt_number"] = attempt + 1
         clone_ctx["_previous_error"] = (original_status_message or "")[:1500]
         clone_ctx["_previous_failure_class"] = failure_class
+
+        # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
+        try:
+            from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class  # noqa: PLC0415
+            error_msg = original_status_message or ""
+            clone_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
+            failure_stage = _derive_failure_stage(failure_class, error_msg)
+            if failure_stage:
+                clone_ctx["_previous_failure_stage"] = failure_stage
+            if failure_class == "CODE_ERROR":
+                clone_ctx["_previous_error_summary"] = error_msg[:500]
+            proj_anomalies = _shared_state.persistent_anomalies.get(str(child.project_id), {})
+            if _is_recurring_failure_class(proj_anomalies, failure_class):
+                clone_ctx["_previous_is_recurring"] = True
+        except Exception:
+            logger.exception("[REQUEUE] Failed to enrich retry context for task %s", child.id)
 
         # Propagate PR artifacts from the failed attempt to the retry context
         prev_pr_url = child_ctx.get("_pr_url", "")

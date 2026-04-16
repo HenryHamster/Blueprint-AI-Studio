@@ -875,6 +875,114 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
 
 
 @pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_code_error_dominant():
+    """Returns code_error pattern when 60%+ of non-infra failures are code errors."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    history = [
+        {"stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 1, "tasks_required_approval": 1, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 2, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+    ]
+    # Non-infra totals: code_error=6, approval=1, total=7 → rate=6/7≈0.857
+    result = _compute_failure_stage_pattern(history)
+    assert result is not None
+    assert result["stage"] == "code_error"
+    assert result["rate"] >= 0.6
+    assert "test" in result["message"].lower() or "code" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_approval_dominant():
+    """Returns approval pattern when 60%+ of non-infra failures are approval stalls."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    history = [
+        {"stage_dropout": {"tasks_failed_code_error": 0, "tasks_failed_infra": 1, "tasks_required_approval": 4, "tasks_merged_staging_only": 0}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 3, "tasks_merged_staging_only": 0}},
+    ]
+    # Non-infra totals: code_error=1, approval=7, total=8 → rate=7/8=0.875
+    result = _compute_failure_stage_pattern(history)
+    assert result is not None
+    assert result["stage"] == "approval"
+    assert result["rate"] >= 0.6
+    assert "approval" in result["message"].lower() or "review" in result["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_no_pattern():
+    """Returns None when no dominant pattern or insufficient data."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    # Insufficient data (total < 3)
+    assert _compute_failure_stage_pattern([
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
+    ]) is None
+
+    # No clear pattern (roughly even split)
+    mixed_history = [
+        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 2}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
+    ]
+    # code_error=3, approval=3, total=6 → neither reaches 60%
+    assert _compute_failure_stage_pattern(mixed_history) is None
+
+    # Empty history
+    assert _compute_failure_stage_pattern([]) is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_failure_stage_pattern_in_direction_context(client: AsyncClient, db_session):
+    """Claim endpoint injects failure_stage_pattern into direction_context when pattern is clear."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Stage Dropout Pattern Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Fix test flakiness",
+            "priority": "high",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 4, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+                {"tasks_created": 3, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 1, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+                {"tasks_created": 5, "prs_merged": 2, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fix the flaky tests"}],
+        vm_instance_id="agent-vm-stage-dropout",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stage-dropout")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "direction_context" in data
+    dc = data["direction_context"]
+    assert "failure_stage_pattern" in dc
+    fsp = dc["failure_stage_pattern"]
+    assert fsp is not None
+    assert fsp["stage"] == "code_error"
+    assert "message" in fsp
+    assert fsp["rate"] >= 0.6
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient, db_session):
     """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""
     from sqlalchemy.orm.attributes import flag_modified

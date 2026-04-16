@@ -185,6 +185,55 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('## Direction Context');
   });
 
+  it('renders failure_stage_pattern message in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Fix test flakiness',
+        priority: 'high',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: {
+          stage: 'code_error',
+          rate: 0.86,
+          message: 'Recent tasks for this direction frequently fail at the code/test stage — pay extra attention to test coverage and run tests early.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Failure pattern:**');
+    expect(result).toContain('pay extra attention to test coverage');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is null', () => {
+    const task = {
+      direction_context: {
+        title: 'Optimize queries',
+        priority: 'low',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: null,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
   it('renders ## Task Scope section for create task with small scope', () => {
     const task = {
       payloads: [{ type: 'create' }],
@@ -701,6 +750,87 @@ describe('buildRetryContext', () => {
     const task = { context: { _attempt_number: 2, _previous_failure_class: 'CODE_ERROR', _previous_error: 'err' } };
     const result = buildRetryContext(task);
     expect(result.endsWith('\n')).toBe(true);
+  });
+
+  it('renders failure stage when _previous_failure_stage is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_failure_stage: 'test',
+        _previous_error: 'pytest: FAILED',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: CODE_ERROR (at test stage)');
+    expect(result).not.toContain('Failure type: CODE_ERROR\n');
+  });
+
+  it('omits stage qualifier when _previous_failure_stage is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: AGENT_TIMEOUT\n');
+    expect(result).not.toContain('at stage)');
+  });
+
+  it('renders recurring warning when _previous_is_recurring is true', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: true,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('recurring failure pattern');
+    expect(result).toContain('fundamentally different approach');
+  });
+
+  it('does not render recurring warning when _previous_is_recurring is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: false,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('recurring failure pattern');
+  });
+
+  it('renders error summary with "Error summary:" label when _previous_error_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'full long error message here',
+        _previous_error_summary: 'AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error summary: AssertionError: expected 1 got 2');
+    expect(result).not.toContain('Error: full long error message here');
+  });
+
+  it('falls back to "Error:" label when only _previous_error is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out after 600s',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error: timed out after 600s');
+    expect(result).not.toContain('Error summary:');
   });
 });
 

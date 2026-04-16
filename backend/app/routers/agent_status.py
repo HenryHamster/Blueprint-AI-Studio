@@ -38,6 +38,7 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     disable_account_model,
+    record_completion_event,
 )
 from app.task_lifecycle import _process_post_commit
 from app.rollup_management import _check_and_trigger_rollup
@@ -645,6 +646,12 @@ async def update_agent_status(
                         await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
                     except Exception as e:
                         logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
+                if acct_id_clear and task.vm_provisioned_at:
+                    try:
+                        duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()
+                        await record_completion_event(acct_id_clear, duration_secs)
+                    except Exception as e:
+                        logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
                 from app.failure_classification import persist_failure_category  # noqa: PLC0415
