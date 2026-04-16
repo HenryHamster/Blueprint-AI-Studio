@@ -412,9 +412,12 @@ async def orchestrator_worker():
                 # Light query: only load columns needed for the stale-provision scan
                 # and concurrency count. Heavy JSONB (payloads, context, status_log)
                 # is deferred — the few stale tasks are re-read with_for_update below.
+                # context + title are needed by filter_file_conflicts (Step 2.5).
+                # Without them, attribute access triggers a sync lazy-load from an
+                # async context and crashes the whole dispatch cycle.
                 _active_light_cols = load_only(
                     Task.id, Task.status, Task.last_heartbeat, Task.started_at,
-                    Task.vm_instance_id, Task.project_id,
+                    Task.vm_instance_id, Task.project_id, Task.context, Task.title,
                 )
                 active_tasks_result = (await session.execute(
                     select(Task)
