@@ -6,7 +6,7 @@ import uuid
 import json
 import logging
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -613,15 +613,31 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             "recall": recall,
         }
 
-    # Persistent review issues: categories that have remained above 20% in each of
-    # the last 3 consecutive 14-day windows, stored by compute_review_effectiveness.
+    # Persistent review issues and full review effectiveness trends from
+    # compute_review_effectiveness stored in project.design_doc.
     persistent_review_issues: Optional[List[str]] = None
+    review_effectiveness_trends: Optional[Dict[str, Any]] = None
+    review_recurrence_by_category: Optional[Dict[str, float]] = None
     project = await session.get(Project, project_id)
     if project and project.design_doc:
         eff = project.design_doc.get("review_effectiveness") or {}
         issues = eff.get("persistent_issues") or []
         if issues:
             persistent_review_issues = issues
+        if eff:
+            review_effectiveness_trends = {
+                "computed_at": eff.get("computed_at"),
+                "persistent_issues": eff.get("persistent_issues") or [],
+                "categories": eff.get("categories") or {},
+            }
+        cats = eff.get("categories") or {}
+        recurrence: Dict[str, float] = {}
+        for cat, cat_data in cats.items():
+            rate = cat_data.get("recurrence_rate")
+            if rate is not None:
+                recurrence[cat] = rate
+        if recurrence:
+            review_recurrence_by_category = recurrence
 
     return {
         "success_rate": success_rate,
@@ -632,6 +648,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
+        "review_effectiveness_trends": review_effectiveness_trends,
+        "review_recurrence_by_category": review_recurrence_by_category,
         "scope_merge_rates": scope_merge_rates,
         "medium_scope_review_iterations": medium_scope_review_iterations,
     }

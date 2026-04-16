@@ -712,6 +712,9 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
+                # Skip auto-archived (stale) entries
+                if v.get("stale"):
+                    continue
                 confirmed = v.get("confirmed_count", 0)
                 referenced = v.get("reference_count", 0)
                 # Demote entries with high reference count but zero confirmations
@@ -743,18 +746,43 @@ async def claim_task(
                         "Playbook entry '%s' penalty: age=%d stale=%d",
                         short_key, age_penalty, stale_penalty,
                     )
+                # Effectiveness score: confirmed / referenced ratio (higher = better)
+                effectiveness_score = confirmed / max(referenced, 1)
+                # Age in days for metadata (0 if updated_at unavailable)
+                age_days = 0
+                if updated_at_str:
+                    try:
+                        updated_dt2 = datetime.fromisoformat(
+                            updated_at_str.replace("Z", "+00:00")
+                        )
+                        if updated_dt2.tzinfo is not None:
+                            updated_dt2 = updated_dt2.replace(tzinfo=None)
+                        age_days = (_utcnow() - updated_dt2).days
+                    except (ValueError, TypeError):
+                        pass
                 _playbook_candidates.append((
                     ineffective,
                     stale_penalty,
                     age_penalty,
                     -confirmed,
-                    -referenced,
+                    -effectiveness_score,
                     short_key,
                     v.get("content", ""),
+                    effectiveness_score,
+                    confirmed,
+                    age_days,
+                    bool(age_penalty or stale_penalty),
                 ))
         _playbook_candidates.sort()
-        for _, _, _, _, _, short_key, content in _playbook_candidates:
-            playbook_entries[short_key] = content
+        for (_, _, _, _, _, short_key, content,
+             eff_score, conf_count, age_days_val, is_stale) in _playbook_candidates:
+            playbook_entries[short_key] = {
+                "content": content,
+                "effectiveness_score": round(eff_score, 3),
+                "confirmed_count": conf_count,
+                "age_days": age_days_val,
+                "stale": is_stale,
+            }
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
         )
@@ -771,7 +799,21 @@ async def claim_task(
                         entry = dict(doc[full_key])
                         entry["reference_count"] = entry.get("reference_count", 0) + 1
                         entry["last_referenced_at"] = now_iso
+                        outcomes = list(entry.get("recent_outcomes", []))
+                        outcomes.append(False)
+                        outcomes = outcomes[-10:]
+                        entry["recent_outcomes"] = outcomes
+                        # Auto-archive: if 10 entries and all False, mark stale
+                        if len(outcomes) >= 10 and not any(outcomes):
+                            entry["stale"] = True
+                            entry["effectiveness_score"] = 0.0
                         doc[full_key] = entry
+                # Store shown playbook keys on task context for completion handler
+                task_ctx = dict(task.context or {})
+                task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
+                task.context = task_ctx
+                flag_modified(task, "context")
+                session.add(task)
                 # Check file-path references against the repo root (config-driven; skipped when unset)
                 try:
                     from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415

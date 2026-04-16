@@ -11,7 +11,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -117,7 +117,7 @@ export async function handleReview(
   const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
 
   // Build review prompt — Claude has full repo access, not just a diff blob
-  const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
 ${iterationPreamble}
@@ -420,7 +420,7 @@ export async function handleFix(
 
   // Prepend CLAUDE.md instructions + playbook
   const fixClaudeMd = readClaudeMd();
-  const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const fixRetryContext = buildRetryContext(task);
   const fixFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   if (fixClaudeMd) {

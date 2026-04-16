@@ -706,7 +706,7 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
     # Build a design_doc clearly over capacity: 28 entries × ~950 bytes ≈ 26.6 KB
     big_content = "x" * 900
     existing_doc: dict = {
-        # One failure-derived entry to satisfy the sampling gate
+        # A failure-derived entry (pre-existing playbook content)
         "playbook/review-test-coverage": {
             "content": "test coverage issues",
             "source": "review-extracted",
@@ -724,6 +724,9 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
         }
 
     project = await _make_project(db_session, design_doc=dict(existing_doc))
+    # Create 3 completed tasks of the same type to satisfy the noise filter (>= 3 completions).
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
     task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
 
     from app.playbook_learning import _playbook_size_bytes
@@ -733,7 +736,7 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-create", "New entry should have been created"
+    assert key == "success-create-small", "New entry should have been created"
     doc = project.design_doc or {}
     archive = doc.get("playbook_archive", [])
     assert len(archive) >= 1, "At least one entry should have been archived for capacity"
@@ -950,6 +953,125 @@ async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncS
     assert len(history) == 3
     assert all(r > 0.20 for r in history)
     assert "test-coverage" in result["persistent_issues"]
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_recurrence_rate_basic(db_session: AsyncSession):
+    """recurrence_rate measures fraction of rejected tasks with each category."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # 12 tasks in each window so we pass the minimum sample threshold.
+    # Previous window (15-28 days ago): give all 12 tasks review history,
+    # and give 6 of them a test-coverage first-attempt rejection.
+    all_tasks = []
+    for i in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        )
+        if i < 6:
+            t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 2}}
+        all_tasks.append(t)
+
+    # Current window (last 14 days): 12 tasks with review history.
+    # Give 4 out of 12 a test-coverage rejection.
+    for i in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        if i < 4:
+            t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+        all_tasks.append(t)
+
+    await db_session.flush()
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+
+    assert result is not None
+    cats = result["categories"]
+    assert "test-coverage" in cats
+    tc = cats["test-coverage"]
+    # 4 tasks had test-coverage in current window; total tasks with any rejection = 4
+    assert tc["recurrence_rate"] == round(4 / 4, 3)
+    # 6 tasks had test-coverage in previous window; total with any rejection = 6
+    assert tc["previous_recurrence_rate"] == round(6 / 6, 3)
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_recurrence_history_grows(db_session: AsyncSession):
+    """recurrence_history accumulates a new entry on each new window, capped at 5."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    all_tasks = []
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        )
+        t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+        all_tasks.append(t)
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+        all_tasks.append(t)
+
+    await db_session.flush()
+
+    # First computation — creates first recurrence_history entry
+    result1 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result1 is not None
+    rh1 = result1["categories"].get("test-coverage", {}).get("recurrence_history", [])
+    assert len(rh1) == 1
+
+    # Simulate a new window by backdating computed_at
+    doc = dict(project.design_doc or {})
+    doc["review_effectiveness"]["computed_at"] = (_utcnow() - timedelta(days=15)).isoformat()
+    project.design_doc = doc
+    await db_session.flush()
+
+    result2 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result2 is not None
+    rh2 = result2["categories"].get("test-coverage", {}).get("recurrence_history", [])
+    assert len(rh2) == 2
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_recurrence_none_when_no_rejections(db_session: AsyncSession):
+    """recurrence_rate is None when no tasks have _first_attempt_rejection_categories."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # Tasks have review history (to pass sample threshold) but no rejection categories
+    all_tasks = []
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        ))
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        ))
+
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    assert result is not None
+    cats = result["categories"]
+    assert "test-coverage" in cats
+    # No _first_attempt_rejection_categories on any task → recurrence_rate is None
+    assert cats["test-coverage"]["recurrence_rate"] is None
+    assert cats["test-coverage"]["previous_recurrence_rate"] is None
+    assert cats["test-coverage"]["recurrence_history"] == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

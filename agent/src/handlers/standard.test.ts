@@ -715,8 +715,7 @@ describe('self-review phase', () => {
     const reviewOutput = `\`\`\`json\n${reviewJson}\n\`\`\``;
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: reviewOutput, lastResultText: '' }) // self-review pass 1
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: reviewOutput, lastResultText: '' }); // self-review pass 2
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: reviewOutput, lastResultText: '' }); // self-review pass 1 (no fixes → no pass 2)
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
@@ -756,7 +755,7 @@ describe('self-review phase', () => {
 
   it('marks self_review_failed with validation_failed when checks_performed is missing mandatory items', async () => {
     const { getMandatoryChecks } = await import('../prompt.js');
-    vi.mocked(getMandatoryChecks).mockReturnValueOnce(['test_coverage', 'type_safety', 'security']);
+    vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety', 'security']);
     const reviewJson = JSON.stringify({
       verdict: 'PASS',
       checks_performed: ['test_coverage'],  // missing type_safety and security

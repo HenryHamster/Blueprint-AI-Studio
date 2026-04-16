@@ -203,10 +203,32 @@ echo ""
   excludeAgentHelpers();
 }
 
-export function formatPlaybook(playbook: Record<string, string> | undefined): string {
+export interface PlaybookEntry {
+  content: string;
+  effectiveness_score: number;
+  confirmed_count: number;
+  age_days: number;
+  stale: boolean;
+}
+
+export function formatPlaybook(
+  playbook: Record<string, PlaybookEntry | string> | undefined
+): string {
   if (!playbook || Object.keys(playbook).length === 0) return '';
   const lines = Object.entries(playbook)
-    .map(([key, content]) => `### ${key}\n${content}`)
+    .map(([key, value]) => {
+      let content: string;
+      let caveat = '';
+      if (typeof value === 'string') {
+        content = value;
+      } else {
+        content = value.content;
+        if (value.stale || value.effectiveness_score < 0.3) {
+          caveat = '> ⚠ Possibly outdated or low confidence — verify before applying.\n\n';
+        }
+      }
+      return `### ${key}\n${caveat}${content}`;
+    })
     .join('\n\n');
   return `## Operational Playbook (knowledge from past agents)\n\nThese notes were left by previous agents working on this codebase. Trust and follow them — they represent hard-won operational knowledge.\n\n${lines}\n\n`;
 }

@@ -419,7 +419,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy", "persistent_review_issues", "scope_merge_rates", "medium_scope_review_iterations"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
 
 
@@ -530,6 +530,83 @@ async def test_review_accuracy_skips_tasks_without_verdict():
     ra = result["review_accuracy"]
     assert ra is not None
     assert ra["total_reviews"] == 5
+
+
+# ── Review effectiveness trends ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_review_effectiveness_trends_none_when_no_design_doc():
+    """review_effectiveness_trends is None when project has no design_doc."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert result["review_effectiveness_trends"] is None
+
+
+@pytest.mark.asyncio
+async def test_review_effectiveness_trends_none_when_no_review_effectiveness():
+    """review_effectiveness_trends is None when design_doc has no review_effectiveness key."""
+    project = make_project(directions=[], design_doc={"other_key": "value"})
+    session = _make_mock_session(tasks=[], project=project)
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert result["review_effectiveness_trends"] is None
+
+
+@pytest.mark.asyncio
+async def test_review_effectiveness_trends_returned_when_present():
+    """review_effectiveness_trends exposes per-category data from design_doc."""
+    review_effectiveness = {
+        "computed_at": "2026-04-01T00:00:00",
+        "persistent_issues": ["style"],
+        "categories": {
+            "style": {
+                "current_rate": 0.35,
+                "previous_rate": 0.30,
+                "trend": "increasing",
+                "current_sample_size": 20,
+                "previous_sample_size": 18,
+                "rate_history": [0.28, 0.30, 0.35],
+            },
+            "logic": {
+                "current_rate": 0.10,
+                "previous_rate": 0.15,
+                "trend": "decreasing",
+                "current_sample_size": 20,
+                "previous_sample_size": 18,
+                "rate_history": [0.20, 0.15, 0.10],
+            },
+        },
+    }
+    project = make_project(directions=[], design_doc={"review_effectiveness": review_effectiveness})
+    session = _make_mock_session(tasks=[], project=project)
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    trends = result["review_effectiveness_trends"]
+    assert trends is not None
+    assert trends["computed_at"] == "2026-04-01T00:00:00"
+    assert trends["persistent_issues"] == ["style"]
+    categories = trends["categories"]
+    assert "style" in categories
+    assert categories["style"]["current_rate"] == 0.35
+    assert categories["style"]["previous_rate"] == 0.30
+    assert categories["style"]["trend"] == "increasing"
+    assert categories["style"]["rate_history"] == [0.28, 0.30, 0.35]
+    assert "logic" in categories
+    assert categories["logic"]["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_return_structure_includes_review_effectiveness_trends():
+    """Result always contains review_effectiveness_trends key."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert "review_effectiveness_trends" in result
 
 
 # ── Scope merge rates ────────────────────────────────────────────────────────

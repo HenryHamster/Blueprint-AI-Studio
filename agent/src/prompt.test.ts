@@ -81,6 +81,38 @@ describe('formatPlaybook', () => {
     const result = formatPlaybook({ 'tip': 'do this' });
     expect(result).toContain('## Operational Playbook');
   });
+
+  it('formats entry objects with content field', () => {
+    const result = formatPlaybook({
+      'key1': { content: 'value1', effectiveness_score: 0.8, confirmed_count: 5, age_days: 10, stale: false },
+    });
+    expect(result).toContain('### key1');
+    expect(result).toContain('value1');
+  });
+
+  it('adds caveat for stale entries', () => {
+    const result = formatPlaybook({
+      'old-tip': { content: 'some advice', effectiveness_score: 0.5, confirmed_count: 2, age_days: 45, stale: true },
+    });
+    expect(result).toContain('Possibly outdated or low confidence');
+    expect(result).toContain('some advice');
+  });
+
+  it('adds caveat for low effectiveness entries (below 0.3)', () => {
+    const result = formatPlaybook({
+      'weak-tip': { content: 'uncertain advice', effectiveness_score: 0.2, confirmed_count: 0, age_days: 5, stale: false },
+    });
+    expect(result).toContain('Possibly outdated or low confidence');
+    expect(result).toContain('uncertain advice');
+  });
+
+  it('does not add caveat for high-confidence entries', () => {
+    const result = formatPlaybook({
+      'good-tip': { content: 'solid advice', effectiveness_score: 0.9, confirmed_count: 10, age_days: 5, stale: false },
+    });
+    expect(result).not.toContain('Possibly outdated');
+    expect(result).toContain('solid advice');
+  });
 });
 
 // ── buildContextPrefix ────────────────────────────────────────────────────────

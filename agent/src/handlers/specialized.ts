@@ -10,7 +10,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { extractJsonArray } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -40,7 +40,7 @@ export async function handleSecurityAudit(
     : '';
 
   const fileTreeSection = buildFileTree(ws);
-  const secPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const secPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const secRetryContext = buildRetryContext(task);
   const secFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
@@ -213,7 +213,7 @@ CRITICAL RULES:
 
   const migrateClaudeMd = readClaudeMd();
   const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
-  const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const migrateRetryContext = buildRetryContext(task);
   const migrateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';

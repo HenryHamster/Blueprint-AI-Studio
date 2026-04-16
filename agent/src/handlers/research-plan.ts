@@ -9,7 +9,7 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { extractJsonObject, extractJsonArray } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers, buildRetryContext,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 
 // ── Pure data transformation helpers (exported for testing) ─────────────────
@@ -208,7 +208,7 @@ export async function handlePlan(
 
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
-  const planPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const planPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const planRetryContext = buildRetryContext(task);
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
@@ -430,7 +430,7 @@ ${hotspotsSection}
   const codebaseSummary = claudeMd
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
-  const researchPlaybookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const researchPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
 
   const fileTreeSection = buildFileTree(ws);
 

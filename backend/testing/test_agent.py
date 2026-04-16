@@ -780,9 +780,15 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
     assert "playbook" in data, f"Expected 'playbook' in claim response, got keys: {list(data.keys())}"
     playbook = data["playbook"]
     assert "build-steps" in playbook
-    assert playbook["build-steps"] == "run npm run build"
+    entry = playbook["build-steps"]
+    assert isinstance(entry, dict), f"Expected playbook entry to be a dict, got: {type(entry)}"
+    assert entry["content"] == "run npm run build"
+    assert "effectiveness_score" in entry
+    assert "confirmed_count" in entry
+    assert "age_days" in entry
+    assert "stale" in entry
     assert "test-commands" in playbook
-    assert playbook["test-commands"] == "bash scripts/test-backend.sh"
+    assert playbook["test-commands"]["content"] == "bash scripts/test-backend.sh"
 
 
 @pytest.mark.smoketest
@@ -1947,7 +1953,7 @@ async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_sessi
     assert "write-only" in data2["playbook"]
     # untagged entry is included for fix (in _PLAYBOOK_DEFAULT_TYPES)
     assert "untagged" in data2["playbook"]
-    assert data2["playbook"]["untagged"] == "untagged operational entry"
+    assert data2["playbook"]["untagged"]["content"] == "untagged operational entry"
 
 
 @pytest.mark.asyncio
@@ -1985,7 +1991,7 @@ async def test_playbook_claim_includes_entry_when_type_matches(client: AsyncClie
 
     assert "playbook" in data
     assert "build-hint" in data["playbook"]
-    assert data["playbook"]["build-hint"] == "build instruction"
+    assert data["playbook"]["build-hint"]["content"] == "build instruction"
 
 
 @pytest.mark.asyncio

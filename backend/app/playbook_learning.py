@@ -990,6 +990,32 @@ async def compute_review_effectiveness(
                 history.extend(rev_hist)
         return tasks_with_rev, history
 
+    def _split_recurrence(
+        tasks: list, start: datetime, end: datetime
+    ) -> tuple[int, dict[str, int]]:
+        """Return (total_tasks_with_any_rejection, {cat: distinct_task_count}).
+
+        Counts distinct tasks that have each category in
+        ``_first_attempt_rejection_categories`` within the window.  Only tasks
+        whose ``created_at`` falls in [start, end) are considered.  Callers
+        must pass naive *start*/*end* values.
+        """
+        total_with_rejection = 0
+        cat_task_counts: dict[str, int] = {}
+        for t in tasks:
+            if not t.created_at:
+                continue
+            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+            if not (start <= ts < end):
+                continue
+            rejection_cats = (t.context or {}).get("_first_attempt_rejection_categories") or {}
+            if not rejection_cats:
+                continue
+            total_with_rejection += 1
+            for cat in rejection_cats:
+                cat_task_counts[cat] = cat_task_counts.get(cat, 0) + 1
+        return total_with_rejection, cat_task_counts
+
     # Use a far-future sentinel with no tzinfo to handle both naive and aware datetimes.
     # The cutoff datetimes from _utcnow() are tz-aware; strip tzinfo for comparison so
     # the function works with both naive (DB default) and aware created_at values.
@@ -1015,6 +1041,11 @@ async def compute_review_effectiveness(
     if current_total == 0 or previous_total == 0:
         return None
 
+    # Recurrence: fraction of tasks (with any first-attempt rejection) that had
+    # each category flagged.  Computed across the same two windows independently.
+    curr_rejection_total, curr_cat_counts = _split_recurrence(all_tasks, cutoff_14d_n, sentinel_n)
+    prev_rejection_total, prev_cat_counts = _split_recurrence(all_tasks, cutoff_28d_n, cutoff_14d_n)
+
     all_cats = set(current_buckets.keys()) | set(previous_buckets.keys())
     categories: dict[str, Any] = {}
     for cat in all_cats:
@@ -1029,12 +1060,23 @@ async def compute_review_effectiveness(
         else:
             trend = "stable"
 
+        recurrence_rate: Optional[float] = (
+            round(curr_cat_counts.get(cat, 0) / curr_rejection_total, 3)
+            if curr_rejection_total > 0 else None
+        )
+        previous_recurrence_rate: Optional[float] = (
+            round(prev_cat_counts.get(cat, 0) / prev_rejection_total, 3)
+            if prev_rejection_total > 0 else None
+        )
+
         categories[cat] = {
             "current_rate": current_rate,
             "previous_rate": previous_rate,
             "trend": trend,
             "current_sample_size": current_count,
             "previous_sample_size": previous_count,
+            "recurrence_rate": recurrence_rate,
+            "previous_recurrence_rate": previous_recurrence_rate,
         }
 
     # Update per-category window history for persistent-issue tracking.
@@ -1062,6 +1104,12 @@ async def compute_review_effectiveness(
             rate_history.append(data["current_rate"])
             rate_history = rate_history[-5:]
         data["rate_history"] = rate_history
+
+        recurrence_history: list = list(prev_cat.get("recurrence_history") or [])
+        if (is_new_window or not recurrence_history) and data["recurrence_rate"] is not None:
+            recurrence_history.append(data["recurrence_rate"])
+            recurrence_history = recurrence_history[-5:]
+        data["recurrence_history"] = recurrence_history
 
     # Categories above 20 % in each of their last 3 stored windows are flagged as
     # persistent — a signal that structural changes may be needed rather than

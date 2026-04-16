@@ -11,10 +11,10 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
-  discoverAffectedConsumers,
+  discoverAffectedConsumers, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
+import { SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -82,6 +82,7 @@ export interface StandardHandlerOpts {
   failOnTestFailure?: boolean;
   captureBaseline?: boolean;
   runSelfReview?: boolean;
+  runSmallScopeAnalysis?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
@@ -118,6 +119,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     failOnTestFailure = false,
     captureBaseline = false,
     runSelfReview = false,
+    runSmallScopeAnalysis = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
@@ -148,7 +150,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const claudeMd = readClaudeMd();
   const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
-  const playbookSection = formatPlaybook(task.playbook as Record<string, string> | undefined);
+  const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
@@ -207,6 +209,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     } else {
       sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
     }
+  } else if (taskScope === 'small' && runSmallScopeAnalysis) {
+    analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.\n\n`;
   }
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
@@ -309,6 +313,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       issues_found: boolean;
       categories: string[];
       fixes_applied: boolean;
+      passes: number;
+      total_fixes: number;
       verdict?: string;
       check_results?: Record<string, { passed: boolean; issue?: string }>;
       checks_performed?: string[];
@@ -345,8 +351,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
       // Pass all playbook entries — backend already filters by applicable_types,
       // so every entry is relevant to this task type.
-      const playbook = task.playbook as Record<string, string> | undefined;
-      const reviewPlaybook: Record<string, string> = playbook ? { ...playbook } : {};
+      const playbook = task.playbook as Record<string, PlaybookEntry | string> | undefined;
+      const reviewPlaybook: Record<string, string> = playbook
+        ? Object.fromEntries(Object.entries(playbook).map(([k, v]) =>
+            [k, typeof v === 'string' ? v : v.content]))
+        : {};
 
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
@@ -366,30 +375,46 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
-      const taskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
-      const maxSelfReviewAttempts = (taskScope === 'medium' || taskScope === 'large') ? 2 : MAX_SELF_REVIEW_ATTEMPTS;
       let selfReviewFailed = false;
       let lastReviewOutput = '';
-      for (let attempt = 0; attempt < maxSelfReviewAttempts; attempt++) {
-        const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
-        if (reviewExitCode !== 0) {
-          if (matchesRateLimit(reviewOutput)) {
-            sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
-          } else {
-            sendLog(ws, `\nWARNING: Self-review could not complete (exit code ${reviewExitCode}), proceeding without review.\n`);
-          }
-          selfReviewFailed = true;
-          break;
+      let passes = 0;
+      let totalFixes = 0;
+
+      // Pass 1: always run self-review once
+      passes++;
+      const { exitCode: pass1ExitCode, allOutput: pass1Output } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+      if (pass1ExitCode !== 0) {
+        if (matchesRateLimit(pass1Output)) {
+          sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
+        } else {
+          sendLog(ws, `\nWARNING: Self-review could not complete (exit code ${pass1ExitCode}), proceeding without review.\n`);
         }
-        lastReviewOutput = reviewOutput;
+        selfReviewFailed = true;
+      } else {
+        lastReviewOutput = pass1Output;
+        const headAfterPass1 = git(['rev-parse', 'HEAD']);
+        const statusAfterPass1 = git(['status', '--porcelain']);
+        const pass1FixesApplied = headAfterPass1 !== headBeforeReview || statusAfterPass1 !== statusBeforeReview;
+        if (pass1FixesApplied) {
+          totalFixes++;
+          // Pass 2: verification pass when pass 1 applied fixes
+          passes++;
+          const { exitCode: pass2ExitCode, allOutput: pass2Output } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+          if (pass2ExitCode === 0) {
+            lastReviewOutput = pass2Output;
+            const headAfterPass2 = git(['rev-parse', 'HEAD']);
+            const statusAfterPass2 = git(['status', '--porcelain']);
+            if (headAfterPass2 !== headAfterPass1 || statusAfterPass2 !== statusAfterPass1) {
+              totalFixes++;
+            }
+          }
+        }
       }
 
       if (selfReviewFailed) {
-        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false };
+        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false, passes, total_fixes: totalFixes };
       } else {
-        const headAfterReview = git(['rev-parse', 'HEAD']);
-        const statusAfterReview = git(['status', '--porcelain']);
-        const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
+        const fixesApplied = totalFixes > 0;
 
         // Parse structured JSON output from self-review
         const reviewCategories: string[] = [];
@@ -442,6 +467,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found as number) > 0),
           categories: reviewCategories,
           fixes_applied: fixesApplied,
+          passes,
+          total_fixes: totalFixes,
           ...(parsedVerdict !== undefined ? { verdict: parsedVerdict } : {}),
           ...(parsedCheckResults !== undefined ? { check_results: parsedCheckResults } : {}),
           ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
@@ -623,6 +650,7 @@ export async function handleCreate(
     failOnTestFailure: true,
     captureBaseline: isMediumOrLargeScope,
     runSelfReview: true,
+    runSmallScopeAnalysis: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
