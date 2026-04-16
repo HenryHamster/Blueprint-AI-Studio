@@ -987,16 +987,22 @@ async def update_agent_status(
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload
         failed_task_type = failed_task_payload.get("type", "")
+        _is_user_submitted = task.created_by in ("USER", "ADMIN")
+        _user_debug_allowed = (
+            not _is_user_submitted or
+            _shared_state.count_recent_user_debug_spawns(str(task.project_id), _utcnow()) < _shared_state.USER_DEBUG_MAX_PER_HOUR
+        )
         should_auto_debug = (
             payload.status == TaskStatus.FAILED and  # Only for failed tasks (failure_class is unset for COMPLETED)
             failed_task_type != "debug" and  # Don't recursively debug debug tasks
             (task.context or {}).get("debug_task_id") is None and  # Don't re-debug fix tasks spawned by debug
             payload.logs and
             failure_class == "CODE_ERROR" and  # Only debug actual code errors, not infra/timeout/rate-limit
+            _user_debug_allowed and
             (
                 (task.context or {}).get("auto_debug") is True or
                 task.parent_task_id is not None or  # Part of a pipeline (plan/research subtask)
-                task.created_by == "ORCHESTRATOR"  # Autonomous research/QA/security audit tasks
+                task.created_by in ("ORCHESTRATOR", "USER", "ADMIN")  # Include user-submitted tasks
             )
         )
         if should_auto_debug:
@@ -1028,6 +1034,8 @@ async def update_agent_status(
             )
             session.add(debug_task)
             await session.flush()
+            if _is_user_submitted:
+                _shared_state.record_user_debug_spawn(str(task.project_id), _utcnow())
             await broadcast_to_project(
                 str(task.project_id),
                 "task_updated",

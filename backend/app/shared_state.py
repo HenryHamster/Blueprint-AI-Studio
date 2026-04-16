@@ -108,6 +108,31 @@ def get_circuit_breaker(project_id: str) -> Dict:
         }
     return circuit_breakers[project_id]
 
+# --- User-submitted Auto-Debug Rate Limiting ---
+# Tracks timestamps of user-submitted debug spawns per project to enforce hourly cap.
+# Structure: project_id -> deque of datetime (UTC) of recent spawns
+user_debug_spawn_times: Dict[str, deque] = {}
+
+USER_DEBUG_MAX_PER_HOUR = 3  # max debug tasks spawned for user/admin tasks per project per hour
+
+def record_user_debug_spawn(project_id: str, now: datetime) -> None:
+    """Record a user-submitted debug spawn and prune old entries."""
+    if project_id not in user_debug_spawn_times:
+        user_debug_spawn_times[project_id] = deque()
+    dq = user_debug_spawn_times[project_id]
+    dq.append(now)
+    cutoff = now - timedelta(hours=1)
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
+    """Count user-submitted debug spawns in the last hour for a project."""
+    dq = user_debug_spawn_times.get(project_id)
+    if not dq:
+        return 0
+    cutoff = now - timedelta(hours=1)
+    return sum(1 for t in dq if t >= cutoff)
+
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
 
