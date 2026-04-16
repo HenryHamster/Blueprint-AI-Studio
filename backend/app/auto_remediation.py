@@ -86,7 +86,9 @@ async def _handle_main_branch_ci_failure_inner(
         )
         return
 
-    # ── Guard: duplicate detection (same SHA) ──
+    # ── Guard: duplicate detection (same branch, not SHA) ──
+    # A fix task for the same branch is already working on the problem.
+    # It clones latest, so it covers any new pushes to that branch.
     active_statuses = [
         TaskStatus.QUEUED, TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
@@ -99,10 +101,10 @@ async def _handle_main_branch_ci_failure_inner(
     )).scalars().all()
     for t in active_tasks:
         ctx = t.context or {}
-        if ctx.get("auto_remediation") is True and ctx.get("ci_failure_sha") == head_sha:
+        if ctx.get("auto_remediation") is True and ctx.get("ci_failure_branch") == head_branch:
             logger.info(
-                "[AUTO-REMEDIATION] Duplicate: active task %s already covers SHA %s",
-                t.id, head_sha[:8],
+                "[AUTO-REMEDIATION] Duplicate: active task %s already covers branch %s",
+                t.id, head_branch,
             )
             return
 
@@ -117,6 +119,32 @@ async def _handle_main_branch_ci_failure_inner(
             active_auto_count, max_concurrent, project_id,
         )
         return
+
+    # ── Guard: check if CI already passed on latest commit ──
+    # Between the webhook firing and this handler running, another push may
+    # have fixed the issue. Verify the branch tip is still failing.
+    try:
+        from app.github import get_branch_sha
+        latest_sha = await get_branch_sha(
+            await get_repo_installation_token(owner, repo),
+            owner, repo, head_branch,
+        )
+        if latest_sha != head_sha:
+            latest_ci = await get_check_runs(
+                await get_repo_installation_token(owner, repo),
+                owner, repo, latest_sha,
+            )
+            if latest_ci.get("status") == "completed" and latest_ci.get("conclusion") == "success":
+                logger.info(
+                    "[AUTO-REMEDIATION] CI already passing on latest %s@%s — skipping",
+                    head_branch, latest_sha[:8],
+                )
+                return
+            # Update to latest SHA so the fix task prompt shows the current failure
+            head_sha = latest_sha
+    except Exception as exc:
+        logger.warning("[AUTO-REMEDIATION] Could not verify latest CI status: %s", exc)
+        # Proceed anyway — better to spawn a potentially unnecessary task than miss a real failure
 
     # ── CI context extraction ──
     failed_checks, error_summary, failure_type = await _extract_ci_context(
