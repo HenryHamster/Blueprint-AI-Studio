@@ -77,6 +77,146 @@ class TestSchemaRevisionSync:
             f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
 
+    def test_migration_filenames_match_internal_revision(self):
+        """Each migration file's internal `revision = '...'` must match its
+        filename prefix. Alembic orders migrations by the internal revision,
+        so a mismatch means the filename is misleading about ordering.
+        """
+        import glob as globmod
+        import re
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
+        mismatches: list[str] = []
+        for path in files:
+            filename_rev = os.path.basename(path).split("_")[0]
+            with open(path) as f:
+                content = f.read()
+            match = rev_re.search(content)
+            if not match:
+                mismatches.append(f"{os.path.basename(path)}: no revision field found")
+                continue
+            internal_rev = match.group(1)
+            if internal_rev != filename_rev:
+                mismatches.append(
+                    f"{os.path.basename(path)}: filename says {filename_rev}, "
+                    f"internal revision says {internal_rev}"
+                )
+        assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(mismatches)
+
+    def test_migration_chain_is_linear(self):
+        """The alembic migration chain must be a single linear sequence —
+        no gaps, no branches, no dangling down_revision references.
+        """
+        import glob as globmod
+        import re
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
+        # Match either down_revision = '0033' or down_revision = None
+        down_re = re.compile(r"^down_revision\s*=\s*(?:['\"](\w+)['\"]|None)", re.MULTILINE)
+
+        chain: dict[str, str | None] = {}  # revision -> down_revision
+        for path in files:
+            with open(path) as f:
+                content = f.read()
+            rev_match = rev_re.search(content)
+            down_match = down_re.search(content)
+            if rev_match:
+                # group(1) is the quoted revision string or None if matched 'None' literal
+                down = down_match.group(1) if down_match and down_match.group(1) else None
+                chain[rev_match.group(1)] = down
+
+        # Every down_revision must point to a revision that exists (or None for the root)
+        missing_parents = [
+            f"{rev} → {down} (parent doesn't exist)"
+            for rev, down in chain.items()
+            if down is not None and down not in chain
+        ]
+        assert not missing_parents, "Broken migration chain:\n  " + "\n  ".join(missing_parents)
+
+        # Exactly one root (down_revision=None) and one head (no one points to it)
+        roots = [r for r, d in chain.items() if d is None]
+        assert len(roots) == 1, f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
+
+        pointed_to = {d for d in chain.values() if d is not None}
+        heads = [r for r in chain if r not in pointed_to]
+        assert len(heads) == 1, f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
+
+    def test_model_columns_covered_by_migrations(self):
+        """Every column defined on a SQLModel table must exist in the alembic
+        migration chain. If an agent adds a column to models.py but forgets
+        the migration, Cloud Run startup will crash with UndefinedColumnError.
+
+        Scans all migration files for add_column calls and column definitions
+        in create_table, and checks each model's columns against them.
+        """
+        import glob as globmod
+        import re
+        from sqlmodel import SQLModel
+
+        # Import models so SQLModel registers all tables
+        from app import models  # noqa: F401
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+
+        # Collect all (table, column) pairs present in migrations
+        migration_columns: set[tuple[str, str]] = set()
+        add_col_re = re.compile(r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]")
+        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        col_in_create_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
+        # Renames: alter_column('table', 'old', new_column_name='new') → new column exists
+        rename_re = re.compile(
+            r"alter_column\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"].*?new_column_name\s*=\s*['\"](\w+)['\"]",
+            re.DOTALL,
+        )
+
+        for path in files:
+            with open(path) as f:
+                content = f.read()
+
+            # add_column('table', sa.Column('name', ...))
+            for m in add_col_re.finditer(content):
+                migration_columns.add((m.group(1), m.group(2)))
+
+            # alter_column('table', 'old_name', new_column_name='new_name', ...)
+            for m in rename_re.finditer(content):
+                migration_columns.add((m.group(1), m.group(3)))
+
+            # create_table('table', sa.Column('name', ...), ...)
+            for ct in create_table_re.finditer(content):
+                table = ct.group(1)
+                # Find the matching closing paren for this create_table call
+                start = ct.end()
+                depth = 1
+                end = start
+                while end < len(content) and depth > 0:
+                    if content[end] == '(':
+                        depth += 1
+                    elif content[end] == ')':
+                        depth -= 1
+                    end += 1
+                block = content[start:end]
+                for col_m in col_in_create_re.finditer(block):
+                    migration_columns.add((table, col_m.group(1)))
+
+        # Check each SQLModel table's columns against migrations
+        missing: list[tuple[str, str]] = []
+        for table_name, table in SQLModel.metadata.tables.items():
+            for col in table.columns:
+                if (table_name, col.name) not in migration_columns:
+                    missing.append((table_name, col.name))
+
+        assert not missing, (
+            f"Columns defined on models but missing from alembic migrations:\n"
+            + "\n".join(f"  - {t}.{c}" for t, c in missing)
+            + "\n\nAdd a migration for each missing column, or the backend will "
+            "crash on startup with UndefinedColumnError."
+        )
+
 
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
