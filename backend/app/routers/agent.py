@@ -825,6 +825,12 @@ async def claim_task(
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
+                # Store shown playbook keys in task context for outcome tracking at completion
+                task_ctx = dict(task.context or {})
+                task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
+                task.context = task_ctx
+                flag_modified(task, "context")
+                session.add(task)
                 await session.commit()
             except Exception:
                 logger.exception("[AGENT] Failed to update playbook reference counts (non-critical)")

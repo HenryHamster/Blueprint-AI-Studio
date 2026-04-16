@@ -307,6 +307,22 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       return;
     }
 
+    // ── Scope overflow gate (small-scope tasks only) ─────────────────────────────
+    // Small tasks that touch too many files waste review cycles — fail fast so the
+    // retry can focus on fewer files. Medium tasks legitimately touch more files, so
+    // keep the existing warning-only behaviour for them.
+    if (taskScope === 'small' && scopeOverflowWarning) {
+      sendLog(ws, `\nScope overflow: failing small-scope task — ${changedPaths.length} files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: `Scope overflow: ${changedPaths.length} files changed for a small-scope task (threshold: ${overflowThreshold}). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
+        failure_category: 'scope_overflow',
+        changed_files: changedPaths.slice(0, 50),
+        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+      });
+      return;
+    }
+
     // ── Self-Review Phase ──────────────────────────────────────────────────────
     // Runs after lint/test validation, before committing, to catch critical issues.
     let selfReviewOutcome: {
@@ -488,7 +504,75 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
             runProjectLintChecks(changedPaths, ws, buildConfig);
           } catch (lintErr: unknown) {
             const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+            if (failOnTestFailure) {
+              sendLog(ws, `\nLint check after self-review fixes failed — marking task as FAILED.\n${msg.slice(0, 2000)}\n`);
+              await persistAndPostStatus(taskId, {
+                task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+                logs: `Lint/build checks failed after self-review fixes. See logs above for details.`,
+                failure_category: 'lint_failed_after_self_review',
+                changed_files: changedPaths.slice(0, 50),
+                ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+              });
+              return;
+            }
             sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+        }
+
+        // ── Self-Review Hard Gate (create tasks / failOnTestFailure=true only) ────────
+        // Blocks PR creation when verdict=FAIL or validation is unresolvable.
+        if (failOnTestFailure) {
+          // Validation failure: retry once with explicit guidance about what was missing
+          if (parseFailed) {
+            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+            const missingChecks = parsedChecks
+              ? mandatory.filter(m => !parsedChecks!.includes(m))
+              : mandatory;
+            const retryNote = missingChecks.length > 0
+              ? `The checks_performed field was missing these mandatory items: ${missingChecks.join(', ')}.`
+              : 'The JSON output could not be parsed as valid JSON.';
+            sendLog(ws, `\nSelf-review: validation failed — retrying with explicit guidance...\n`);
+            const { exitCode: retryExitCode, allOutput: retryOutput } = await runClaudeCode(
+              `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review response was invalid. ${retryNote} Return ONLY a valid JSON object with all mandatory checks_performed items.`,
+              ws, statusRef, model, effort,
+            );
+            let retryValid = false;
+            if (retryExitCode === 0) {
+              const retryParsed = extractSelfReviewJson(retryOutput);
+              if (retryParsed) {
+                const retryChecks = Array.isArray(retryParsed.checks_performed) ? retryParsed.checks_performed as string[] : undefined;
+                const retryMissing = mandatory.filter(m => !retryChecks?.includes(m));
+                if (retryChecks && retryMissing.length === 0) {
+                  retryValid = true;
+                  const retryVerdict = typeof retryParsed.verdict === 'string' ? retryParsed.verdict : undefined;
+                  if (retryVerdict !== undefined) selfReviewOutcome!.verdict = retryVerdict;
+                }
+              }
+            }
+            if (!retryValid) {
+              sendLog(ws, '\nSelf-review: validation still failed after retry — marking task as FAILED.\n');
+              await persistAndPostStatus(taskId, {
+                task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+                logs: `Self-review validation failed: did not produce valid JSON with all mandatory checks.\n\nLast output:\n${lastReviewOutput.slice(0, 5000)}`,
+                failure_category: 'self_review_rejected',
+                changed_files: changedPaths.slice(0, 50),
+                ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+              });
+              return;
+            }
+          }
+          // FAIL verdict gate: block PR when agent identifies unresolvable issues
+          if (selfReviewOutcome?.verdict === 'FAIL') {
+            sendLog(ws, '\nSelf-review FAIL verdict — blocking PR creation.\n');
+            await persistAndPostStatus(taskId, {
+              task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+              logs: `Self-review verdict: FAIL.\n\nSelf-review output:\n${lastReviewOutput.slice(0, 5000)}`,
+              failure_category: 'self_review_rejected',
+              changed_files: changedPaths.slice(0, 50),
+              ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+              self_review_outcome: selfReviewOutcome,
+            });
+            return;
           }
         }
       }
@@ -682,7 +766,6 @@ export async function handleCreate(
     failOnTestFailure: true,
     captureBaseline: isMediumOrLargeScope,
     runSelfReview: true,
-    runSmallScopeAnalysis: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,

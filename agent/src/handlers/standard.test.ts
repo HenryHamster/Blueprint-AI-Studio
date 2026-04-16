@@ -238,7 +238,11 @@ describe('handleCreate configuration', () => {
 
   it('includes Closes #N in PR body when task.context.issue_number is set', async () => {
     const { git } = await import('../index.js');
-    vi.mocked(git).mockReturnValueOnce('M src/foo.ts'); // diff has changes
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts'); // baseCommit (makes currentHead !== baseCommit → hasChanges)
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })    // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '', context: { issue_number: 42 } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
@@ -247,7 +251,11 @@ describe('handleCreate configuration', () => {
 
   it('uses issue_url over issue_number in PR body when both are set', async () => {
     const { git } = await import('../index.js');
-    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts'); // baseCommit (makes currentHead !== baseCommit → hasChanges)
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })    // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '', context: { issue_number: 42, issue_url: 'https://github.com/owner/repo/issues/42' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
@@ -256,7 +264,11 @@ describe('handleCreate configuration', () => {
 
   it('does not include Closes in PR body when no issue context', async () => {
     const { git } = await import('../index.js');
-    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts'); // baseCommit (makes currentHead !== baseCommit → hasChanges)
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })    // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
@@ -417,10 +429,10 @@ describe('pre-implementation analysis note', () => {
     vi.clearAllMocks();
   });
 
-  it('injects Pre-Implementation Analysis for handleCreate with scope=small', async () => {
+  it('does not inject Pre-Implementation Analysis for handleCreate with scope=small', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(capturedPrompt()).toContain('## Pre-Implementation Analysis');
+    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
   });
 
   it('does not inject Pre-Implementation Analysis for handleCreate with scope=medium', async () => {
@@ -515,23 +527,31 @@ describe('self-review phase', () => {
   });
 
   it('runs self-review for handleCreate when there are changes', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '{"verdict":"PASS","checks_performed":[],"issues_found":0}', lastResultText: '' }); // self-review pass 1 (no fixes → no pass 2)
     vi.mocked(git)
       .mockReturnValueOnce('')       // rev-parse HEAD → baseCommit
       .mockReturnValueOnce('M file') // status --porcelain → hasChanges = true
       .mockReturnValue('');          // all remaining git calls
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // runClaudeCode should be called twice: once for main task, once for self-review
+    // runClaudeCode should be called twice: once for main task, once for self-review pass 1
+    // pass 2 is skipped because pass 1 applied no fixes (headBefore === headAfterPass1)
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('runs self-review for handleRefactor when there are changes', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '{"verdict":"PASS","checks_performed":[],"issues_found":0}', lastResultText: '' }); // self-review pass 1
     vi.mocked(git)
       .mockReturnValueOnce('')
       .mockReturnValueOnce('M file')
       .mockReturnValue('');
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // refactor: failOnTestFailure=false so validation gate doesn't apply; pass 2 skipped (no fixes)
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
@@ -554,29 +574,37 @@ describe('self-review phase', () => {
   });
 
   it('runs self-review for handleQA when there are changes', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '{"verdict":"PASS","checks_performed":[],"issues_found":0}', lastResultText: '' }); // self-review pass 1
     vi.mocked(git)
       .mockReturnValueOnce('')       // rev-parse HEAD → baseCommit
       .mockReturnValueOnce('M file') // status --porcelain → hasChanges = true
       .mockReturnValue('');          // all remaining git calls
     const task = { title: 'QA task', description: '' };
     await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // runClaudeCode should be called twice: once for main task, once for self-review
+    // runClaudeCode should be called twice: once for main task, once for self-review pass 1
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
   });
 
   it('includes self-review result in PR body when fixes were applied', async () => {
-    // Simulate: main task diff, then self-review changes something (HEAD changes)
+    // Simulate: main task diff, then self-review pass 1 changes something (HEAD changes) → pass 2 runs
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' })  // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 2 (triggered by fixes)
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD before Claude)
       .mockReturnValueOnce('M file')   // diff (status --porcelain → hasChanges)
-      .mockReturnValueOnce('')         // currentHead (rev-parse HEAD after Claude, same as base)
-      .mockReturnValueOnce('')         // diff --name-only committed paths
-      .mockReturnValueOnce('')         // committedDiff for self-review (diff baseCommit..HEAD)
+      .mockReturnValueOnce('')         // currentHead (same as base)
       .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
       .mockReturnValueOnce('abc123')   // headBeforeReview (rev-parse HEAD)
-      .mockReturnValueOnce('')         // statusBeforeReview (status --porcelain)
-      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied
-      .mockReturnValueOnce('M fixed')  // statusAfterReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterPass1 — different → pass1FixesApplied=true → pass 2
+      .mockReturnValueOnce('M fixed')  // statusAfterPass1
+      .mockReturnValueOnce('def456')   // headAfterPass2 — same as pass1 → no additional fixes
+      .mockReturnValueOnce('M fixed')  // statusAfterPass2
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -586,25 +614,20 @@ describe('self-review phase', () => {
   });
 
   it('includes self-review result in PR body when no issues found', async () => {
-    // headBefore === headAfter and status unchanged → no fixes applied.
-    // Call sequence when currentHead === baseCommit (no committedDiff git call):
-    // 1: rev-parse HEAD → baseCommit
-    // 2: status --porcelain → 'M file' (hasChanges)
-    // 3: rev-parse HEAD → currentHead (same as base)
-    // 4: diff HEAD → uncommittedDiff (self-review, since no commits)
-    // 5: rev-parse HEAD → headBeforeReview
-    // 6: status --porcelain → statusBeforeReview
-    // 7: rev-parse HEAD → headAfterReview — SAME → no fixes
-    // 8: status --porcelain → statusAfterReview — SAME → no fixes
+    // headBeforeReview === headAfterPass1 → no fixes applied → no pass 2 → PASS verdict
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 1 (no fixes → no pass 2)
     vi.mocked(git)
-      .mockReturnValueOnce('')         // 1: baseCommit
-      .mockReturnValueOnce('M file')   // 2: hasChanges
-      .mockReturnValueOnce('')         // 3: currentHead (same as base)
-      .mockReturnValueOnce('')         // 4: uncommittedDiff
-      .mockReturnValueOnce('abc123')   // 5: headBeforeReview
-      .mockReturnValueOnce('')         // 6: statusBeforeReview
-      .mockReturnValueOnce('abc123')   // 7: headAfterReview — SAME → no fixes
-      .mockReturnValueOnce('')         // 8: statusAfterReview — SAME
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -637,6 +660,11 @@ describe('self-review phase', () => {
 
   it('runs verification pass (pass 2) when pass 1 applied fixes', async () => {
     // main task → pass 1 (fixes applied) → pass 2 (verification) = 3 runClaudeCode calls total
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' })  // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 2 (verification)
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD before Claude)
       .mockReturnValueOnce('M file')   // hasChanges (status --porcelain)
@@ -644,9 +672,9 @@ describe('self-review phase', () => {
       .mockReturnValueOnce('')         // uncommittedDiff (diff HEAD)
       .mockReturnValueOnce('abc123')   // headBeforeReview
       .mockReturnValueOnce('')         // statusBeforeReview
-      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied → triggers pass 2
-      .mockReturnValueOnce('M fixed')  // statusAfterReview
-      .mockReturnValue('');            // headAfterVerify, statusAfterVerify, remaining
+      .mockReturnValueOnce('def456')   // headAfterPass1 — different → fixes applied → triggers pass 2
+      .mockReturnValueOnce('M fixed')  // statusAfterPass1
+      .mockReturnValue('');            // headAfterPass2, statusAfterPass2, remaining
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // 3 calls: main task, self-review pass 1, verification pass 2
@@ -654,7 +682,11 @@ describe('self-review phase', () => {
   });
 
   it('skips verification pass when pass 1 finds no issues', async () => {
-    // headBefore === headAfter → no fixes → no pass 2 → 2 runClaudeCode calls total
+    // headBefore === headAfterPass1 → no fixes → no pass 2 → 2 runClaudeCode calls total
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 1 (no fixes → no pass 2)
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
@@ -662,8 +694,8 @@ describe('self-review phase', () => {
       .mockReturnValueOnce('')         // uncommittedDiff
       .mockReturnValueOnce('abc123')   // headBeforeReview
       .mockReturnValueOnce('')         // statusBeforeReview
-      .mockReturnValueOnce('abc123')   // headAfterReview — SAME → no fixes → skip pass 2
-      .mockReturnValueOnce('')         // statusAfterReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → skip pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -672,7 +704,12 @@ describe('self-review phase', () => {
   });
 
   it('tracks passes and total_fixes in selfReviewOutcome metadata', async () => {
-    // pass 1 applies fixes → triggers pass 2 verification
+    // pass 1 applies fixes → triggers pass 2 verification; pass 2 applies no new fixes
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' })  // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 2
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
@@ -680,10 +717,10 @@ describe('self-review phase', () => {
       .mockReturnValueOnce('')         // uncommittedDiff
       .mockReturnValueOnce('abc123')   // headBeforeReview
       .mockReturnValueOnce('')         // statusBeforeReview
-      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes_applied
-      .mockReturnValueOnce('M fixed')  // statusAfterReview
-      .mockReturnValueOnce('def456')   // headAfterVerify — SAME as headAfterReview → no new fixes
-      .mockReturnValueOnce('M fixed')  // statusAfterVerify
+      .mockReturnValueOnce('def456')   // headAfterPass1 — different → fixes applied (totalFixes=1)
+      .mockReturnValueOnce('M fixed')  // statusAfterPass1
+      .mockReturnValueOnce('def456')   // headAfterPass2 — SAME as pass1 → no new fixes
+      .mockReturnValueOnce('M fixed')  // statusAfterPass2
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -763,24 +800,23 @@ describe('self-review phase', () => {
   it('marks self_review_failed when self-review output contains no JSON', async () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Looks good to me!', lastResultText: '' }); // no JSON
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Looks good to me!', lastResultText: '' }) // pass 1: no JSON → parseFailed
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Still no JSON', lastResultText: '' }); // retry: still no JSON → FAILED
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
       .mockReturnValue('');            // remaining
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
     );
-    expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
-    expect(outcome).toBeDefined();
-    expect(outcome.categories).toContain('self_review_failed');
-    expect(outcome.parse_failed).toBe(true);
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
-  it('marks self_review_failed with validation_failed when checks_performed is missing mandatory items', async () => {
+  it('marks task as FAILED when self-review mandatory checks missing and retry fails', async () => {
+    // pass 1 has missing mandatory checks → parseFailed=true → retry → retry has no JSON → FAILED
     const { getMandatoryChecks } = await import('../prompt.js');
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety', 'security']);
     const reviewJson = JSON.stringify({
@@ -792,44 +828,50 @@ describe('self-review phase', () => {
     });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' })  // pass 1: missing checks → parseFailed
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Still bad output', lastResultText: '' }); // retry: no JSON → FAILED
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
       .mockReturnValue('');            // remaining
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
     );
-    expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
-    expect(outcome).toBeDefined();
-    expect(outcome.categories).toContain('self_review_failed');
-    expect(outcome.categories).toContain('validation_failed');
-    expect(outcome.parse_failed).toBe(true);
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
   it('runs runProjectLintChecks after self-review applies fixes', async () => {
-    // currentHead === baseCommit (both ''), diff has changes → changedPaths=['file']
-    // headBeforeReview !== headAfterReview → fixesApplied=true → runProjectLintChecks called
+    // headBeforeReview !== headAfterPass1 → pass1FixesApplied=true → runProjectLintChecks called
+    // pass 2 also runs with valid JSON to prevent the validation gate from blocking the task
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' })  // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 2
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD)
       .mockReturnValueOnce('M file')   // status --porcelain → hasChanges
       .mockReturnValueOnce('')         // currentHead (same as base)
       .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
       .mockReturnValueOnce('abc123')   // headBeforeReview (rev-parse HEAD)
-      .mockReturnValueOnce('')         // statusBeforeReview (status --porcelain)
-      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied
-      .mockReturnValueOnce('')         // statusAfterReview
-      .mockReturnValue('');
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterPass1 — different → fixes applied → pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1
+      .mockReturnValue('');            // headAfterPass2, statusAfterPass2, remaining
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(runProjectLintChecks)).toHaveBeenCalledTimes(1);
   });
 
   it('does not run runProjectLintChecks when self-review applies no fixes', async () => {
-    // headBeforeReview === headAfterReview → fixesApplied=false → runProjectLintChecks not called
+    // headBeforeReview === headAfterPass1 → no fixes → no pass 2 → runProjectLintChecks not called
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 1 (no fixes → no pass 2)
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
@@ -837,16 +879,47 @@ describe('self-review phase', () => {
       .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
       .mockReturnValueOnce('abc123')   // headBeforeReview
       .mockReturnValueOnce('')         // statusBeforeReview
-      .mockReturnValueOnce('abc123')   // headAfterReview — SAME → no fixes
-      .mockReturnValueOnce('')         // statusAfterReview — SAME
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(runProjectLintChecks)).not.toHaveBeenCalled();
   });
 
-  it('task completes even when runProjectLintChecks throws after self-review fixes', async () => {
+  it('task fails with lint_failed_after_self_review when runProjectLintChecks throws and failOnTestFailure is true', async () => {
     // Same fixesApplied=true sequence, but runProjectLintChecks throws a lint error
+    // handleCreate has failOnTestFailure=true → task should FAIL, not complete
+    vi.mocked(runProjectLintChecks).mockImplementationOnce(() => {
+      throw new Error('ESLint: 3 errors found');
+    });
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' })  // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // pass 2
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterPass1 — different → fixes applied → pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1
+      .mockReturnValue('');            // headAfterPass2, statusAfterPass2, remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+    );
+    expect(failedCall).toBeDefined();
+    expect((failedCall![1] as Record<string, unknown>).failure_category).toBe('lint_failed_after_self_review');
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('task completes even when runProjectLintChecks throws after self-review fixes when failOnTestFailure is false', async () => {
+    // handleQA has failOnTestFailure=false (default) → lint failure is only a warning, task completes
     vi.mocked(runProjectLintChecks).mockImplementationOnce(() => {
       throw new Error('ESLint: 3 errors found');
     });
@@ -861,13 +934,40 @@ describe('self-review phase', () => {
       .mockReturnValueOnce('')         // statusAfterReview
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // Task should complete (not fail) despite lint error
+    await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
       c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
     );
     expect(completedCall).toBeDefined();
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+  });
+
+  it('marks task as FAILED with self_review_rejected when self-review verdict is FAIL', async () => {
+    const reviewJson = JSON.stringify({
+      verdict: 'FAIL',
+      checks_performed: [],
+      issues_found: 2,
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review: FAIL verdict
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 });
 
@@ -949,6 +1049,24 @@ describe('test baseline capture', () => {
   it('does not call captureTestBaseline when scope is not set', async () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for medium scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for large scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'large' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline for small scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
   });
 
@@ -1131,6 +1249,54 @@ describe('lint failure handling', () => {
       expect.objectContaining({ status: 'FAILED', failure_category: 'lint_failed' }),
     );
   });
+
+  it('marks refactor task as FAILED when tests fail after max fix attempts', async () => {
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: true, passed: false });
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'test_failed' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+});
+
+// ── Scope overflow gate ───────────────────────────────────────────────────────
+describe('scope overflow gate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset testFixLoop to passing so a test from a prior describe block doesn't bleed over
+    // (vi.clearAllMocks keeps implementations — only call history is cleared).
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
+    // Git call order: rev-parse HEAD (baseCommit), status --porcelain (diff), rev-parse HEAD (currentHead).
+    // currentHead === baseCommit → no committed paths, only uncommitted ones from porcelain output.
+    vi.mocked(git)
+      .mockReturnValueOnce('')   // baseCommit (rev-parse HEAD)
+      .mockReturnValueOnce(      // status --porcelain → 7 changed files
+        'M file1.ts\nM file2.ts\nM file3.ts\nM file4.ts\nM file5.ts\nM file6.ts\nM file7.ts',
+      )
+      .mockReturnValue('');      // currentHead + all remaining
+  });
+
+  it('marks small-scope task as FAILED with scope_overflow when changed files exceed threshold', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('does not fail a medium-scope task when changed files exceed the small threshold', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
 });
 
 // ── Refactor blocking gates ───────────────────────────────────────────────────
@@ -1202,6 +1368,16 @@ describe('post-self-review scope overflow gate', () => {
     // Restore mocks that other test suites may have permanently overridden
     vi.mocked(lintFixLoop).mockResolvedValue(true);
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
+    // Return valid self-review JSON covering all mandatory checks (union across all scopes)
+    // so the self-review gate passes and the scope overflow check is reached.
+    const validSelfReviewOutput = '```json\n' + JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['correctness', 'test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'],
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    }) + '\n```';
+    vi.mocked(runClaudeCode).mockReset().mockResolvedValue({ exitCode: 0, allOutput: validSelfReviewOutput, lastResultText: '' });
     vi.mocked(git)
       .mockReset()
       .mockReturnValueOnce('')          // 1: baseCommit (rev-parse HEAD)
