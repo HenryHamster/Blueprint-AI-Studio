@@ -26,6 +26,7 @@ from app.compute import (
     any_zone_available,
     get_provision_error,
     get_vm_zone,
+    get_zone_health_summary,
     prepare_and_store_agent_secret,
     provision_agent_vm,
     record_zone_failure,
@@ -119,6 +120,25 @@ def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
         ):
             out.append((t.id, "dead_deps"))
     return out
+
+
+def _health_score_task(task: Task) -> int:
+    """Return a dispatch-priority boost for health-aware reordering during degradation.
+
+    Small scope and low risk are preferred because they are less likely to consume
+    a scarce VM slot and fail.  Higher score = dispatched first.
+
+    Scoring:
+        +2  scope == "small"
+        +1  risk  == "low"
+    """
+    ctx = task.context or {}
+    score = 0
+    if ctx.get("scope") == "small":
+        score += 2
+    if ctx.get("risk") == "low":
+        score += 1
+    return score
 
 
 async def _persist_circuit_breakers():
@@ -793,6 +813,48 @@ async def orchestrator_worker():
                 eligible_ids = await filter_held_directions(
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
+
+                # Step 2.8: Health-aware reordering — boost small/low-risk tasks when degraded.
+                # Only activates under degradation so normal priority ordering is preserved.
+                # Degradation signals: any zone in cooldown, failure rate > 30%, or slots < 50% of max.
+                if len(eligible_ids) > 1:
+                    _degradation_signals = []
+
+                    _zone_summary = get_zone_health_summary()
+                    if _zone_summary["available"] < _zone_summary["total_zones"]:
+                        _degradation_signals.append(
+                            f"zones {_zone_summary['available']}/{_zone_summary['total_zones']}"
+                        )
+
+                    if recent_results:
+                        _hw_window = recent_results[-10:]
+                        _hw_fail_count = sum(1 for r in _hw_window if r[1] == "failure")
+                        _hw_fail_rate = _hw_fail_count / len(_hw_window)
+                        if _hw_fail_rate > 0.30:
+                            _degradation_signals.append(
+                                f"failure rate {_hw_fail_count}/{len(_hw_window)}"
+                            )
+
+                    _max_vms = _runtime_config["max_concurrent_vms"]
+                    if slots_available < _max_vms * 0.5:
+                        _degradation_signals.append(f"slots {slots_available}/{_max_vms}")
+
+                    if _degradation_signals:
+                        _task_by_id = {t.id: t for t in candidate_tasks}
+                        _original_order = list(eligible_ids)
+                        eligible_ids = sorted(
+                            eligible_ids,
+                            key=lambda tid: _health_score_task(_task_by_id[tid]) if tid in _task_by_id else 0,
+                            reverse=True,
+                        )
+                        if eligible_ids != _original_order:
+                            logger.info(
+                                "[ORCHESTRATOR] Health-aware reordering applied (%s): "
+                                "%d eligible tasks reordered to prioritize small/low-risk scope",
+                                ", ".join(_degradation_signals),
+                                len(eligible_ids),
+                            )
+
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

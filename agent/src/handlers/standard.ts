@@ -10,10 +10,10 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces,
+  buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
+import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -85,6 +85,26 @@ export interface StandardHandlerOpts {
   includeTaskTypeHints?: boolean;
   issueReference?: string;
   relatedFiles?: string[];
+}
+
+/**
+ * Extracts the structured self-review JSON object from the agent's output.
+ * Looks for a ```json ... ``` code fence first, then falls back to finding
+ * the first `{` that can be parsed as JSON.
+ */
+function extractSelfReviewJson(output: string): Record<string, unknown> | null {
+  const fenceMatch = output.match(/```json\s*\n?([\s\S]*?)\n?```/);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()) as Record<string, unknown>; } catch { /* fallthrough */ }
+  }
+  const start = output.indexOf('{');
+  if (start !== -1) {
+    const end = output.lastIndexOf('}');
+    if (end > start) {
+      try { return JSON.parse(output.slice(start, end + 1)) as Record<string, unknown>; } catch { /* ignore */ }
+    }
+  }
+  return null;
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -284,7 +304,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     // ── Self-Review Phase ──────────────────────────────────────────────────────
     // Runs after lint/test validation, before committing, to catch critical issues.
-    let selfReviewOutcome: { issues_found: boolean; categories: string[]; fixes_applied: boolean; passes?: number; total_fixes?: number } | undefined;
+    let selfReviewOutcome: {
+      issues_found: boolean;
+      categories: string[];
+      fixes_applied: boolean;
+      verdict?: string;
+      checks_performed?: string[];
+      files_reviewed?: number;
+      truncated_files_read?: string[];
+      parse_failed?: boolean;
+    } | undefined;
     if (runSelfReview) {
       sendLog(ws, '\nRunning self-review...\n');
       statusRef.value = 'Running self-review...';
@@ -320,6 +349,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
 
+      const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
         rawPrompt,
         taskTitle,
@@ -329,7 +359,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         buildConfig,
         changedFiles,
         reviewIssueDistribution: reviewIssueDist,
-        taskScope: (task.context as Record<string, unknown> | undefined)?.scope as string | undefined,
+        taskScope: selfReviewTaskScope,
         scopeOverflowWarning,
       });
 
@@ -339,14 +369,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const taskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const maxSelfReviewAttempts = (taskScope === 'medium' || taskScope === 'large') ? 2 : MAX_SELF_REVIEW_ATTEMPTS;
       let selfReviewFailed = false;
-      let fixesApplied = false;
-      let totalPasses = 0;
-      let totalFixes = 0;
-
-      // Pass 1: initial self-review
-      {
+      let lastReviewOutput = '';
+      for (let attempt = 0; attempt < maxSelfReviewAttempts; attempt++) {
         const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
-        totalPasses++;
         if (reviewExitCode !== 0) {
           if (matchesRateLimit(reviewOutput)) {
             sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
@@ -354,41 +379,66 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
             sendLog(ws, `\nWARNING: Self-review could not complete (exit code ${reviewExitCode}), proceeding without review.\n`);
           }
           selfReviewFailed = true;
-        } else {
-          const headAfterReview = git(['rev-parse', 'HEAD']);
-          const statusAfterReview = git(['status', '--porcelain']);
-          fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
-          if (fixesApplied) {
-            totalFixes++;
-            sendLog(ws, '\nSelf-review pass 1: issues found and fixed. Running verification pass...\n');
-
-            // Pass 2: verify fixes didn't introduce new problems (only when pass 1 applied fixes)
-            const verifyPrompt = 'You just auto-fixed issues in the previous self-review. Verify that your fixes are correct and didn\'t introduce new problems. Check: (1) Do the fixes actually address the issues? (2) Did the fixes break anything else? (3) Are all imports and types still valid? If everything looks good, output SELF-REVIEW PASSED. If new issues found, fix them.';
-            const { exitCode: verifyExitCode, allOutput: verifyOutput } = await runClaudeCode(verifyPrompt, ws, statusRef, model, effort);
-            totalPasses++;
-            if (verifyExitCode !== 0) {
-              if (matchesRateLimit(verifyOutput)) {
-                sendLog(ws, '\nSelf-review verification: rate limit encountered, skipping verification.\n');
-              } else {
-                sendLog(ws, `\nWARNING: Self-review verification could not complete (exit code ${verifyExitCode}), proceeding.\n`);
-              }
-            } else {
-              const headAfterVerify = git(['rev-parse', 'HEAD']);
-              const statusAfterVerify = git(['status', '--porcelain']);
-              const verifyFixesApplied = headAfterVerify !== headAfterReview || statusAfterVerify !== statusAfterReview;
-              if (verifyFixesApplied) totalFixes++;
-              sendLog(ws, '\nSelf-review: verification complete.\n');
-            }
-          } else {
-            sendLog(ws, '\nSelf-review: no critical issues found.\n');
-          }
+          break;
         }
+        lastReviewOutput = reviewOutput;
       }
 
       if (selfReviewFailed) {
-        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false, passes: totalPasses, total_fixes: totalFixes };
+        selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false };
       } else {
-        selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied, passes: totalPasses, total_fixes: totalFixes };
+        const headAfterReview = git(['rev-parse', 'HEAD']);
+        const statusAfterReview = git(['status', '--porcelain']);
+        const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
+
+        // Parse structured JSON output from self-review
+        const reviewCategories: string[] = [];
+        let parsedVerdict: string | undefined;
+        let parsedChecks: string[] | undefined;
+        let parsedFilesReviewed: number | undefined;
+        let parsedTruncatedFiles: string[] | undefined;
+        let parseFailed = false;
+
+        const parsed = extractSelfReviewJson(lastReviewOutput);
+        if (!parsed) {
+          reviewCategories.push('self_review_failed', 'json_parse_failed');
+          parseFailed = true;
+        } else {
+          parsedVerdict = typeof parsed.verdict === 'string' ? parsed.verdict : undefined;
+          parsedChecks = Array.isArray(parsed.checks_performed) ? parsed.checks_performed as string[] : undefined;
+          parsedFilesReviewed = typeof parsed.files_reviewed === 'number' ? parsed.files_reviewed : undefined;
+          parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
+
+          // Validate checks_performed contains all mandatory items
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+          if (!parsedChecks) {
+            reviewCategories.push('self_review_failed', 'validation_failed');
+            parseFailed = true;
+          } else {
+            const missing = mandatory.filter(m => !parsedChecks!.includes(m));
+            if (missing.length > 0) {
+              reviewCategories.push('self_review_failed', 'validation_failed');
+              parseFailed = true;
+            }
+          }
+
+          // When diff was truncated, validate that the agent actually read the files
+          if (diffTruncated && (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0)) {
+            reviewCategories.push('truncation_not_verified');
+          }
+        }
+
+        selfReviewOutcome = {
+          issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found as number) > 0),
+          categories: reviewCategories,
+          fixes_applied: fixesApplied,
+          ...(parsedVerdict !== undefined ? { verdict: parsedVerdict } : {}),
+          ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
+          ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
+          ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
+          ...(parseFailed ? { parse_failed: true } : {}),
+        };
+        sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
         if (fixesApplied) {
           try {
             runProjectLintChecks(changedPaths, ws, buildConfig);
@@ -540,21 +590,17 @@ export async function handleCreate(
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
-  const isSmallScope = createScope === 'small';
   const moduleInterfaceContext = isMediumOrLargeScope
     ? extractModuleInterfaces(ws, relatedFiles)
     : '';
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
-  const smallScopeAnalysisNote = isSmallScope
-    ? '\n\n## Pre-Implementation Analysis\n\nBefore writing any code, complete this analysis: (1) Read the files most relevant to this change — understand the existing patterns, error handling, and test conventions. (2) Check if similar functionality already exists that you can follow or extend. (3) Identify all callers/importers of any function you plan to modify.\n'
-    : '';
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${smallScopeAnalysisNote}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -597,16 +643,13 @@ export async function handleRefactor(
   const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
     ? extractModuleInterfaces(ws, refactorRelatedFiles)
     : '';
-  const refactorSmallScopeAnalysisNote = refactorScope === 'small'
-    ? '\n\n## Pre-Implementation Analysis\n\nBefore writing any code, complete this analysis: (1) Read the files most relevant to this change — understand the existing patterns, error handling, and test conventions. (2) Check if similar functionality already exists that you can follow or extend. (3) Identify all callers/importers of any function you plan to modify.\n'
-    : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorSmallScopeAnalysisNote}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

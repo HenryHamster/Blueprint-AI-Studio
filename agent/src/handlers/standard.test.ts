@@ -44,6 +44,7 @@ vi.mock('../prompt.js', () => ({
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
+  getMandatoryChecks: vi.fn().mockReturnValue([]),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {
@@ -617,6 +618,85 @@ describe('self-review phase', () => {
     expect(outcome.fixes_applied).toBe(true);
     expect(outcome.passes).toBe(2);
     expect(outcome.total_fixes).toBe(1);
+  });
+
+  it('parses structured JSON from self-review output and includes it in the status payload', async () => {
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['test_coverage', 'type_safety'],
+      issues_found: 0,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining (headAfterReview === headBeforeReview → no fixes)
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.verdict).toBe('PASS');
+    expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
+    expect(outcome.files_reviewed).toBe(2);
+    expect(outcome.parse_failed).toBeUndefined();
+  });
+
+  it('marks self_review_failed when self-review output contains no JSON', async () => {
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'Looks good to me!', lastResultText: '' }); // no JSON
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.categories).toContain('self_review_failed');
+    expect(outcome.parse_failed).toBe(true);
+  });
+
+  it('marks self_review_failed with validation_failed when checks_performed is missing mandatory items', async () => {
+    const { getMandatoryChecks } = await import('../prompt.js');
+    vi.mocked(getMandatoryChecks).mockReturnValueOnce(['test_coverage', 'type_safety', 'security']);
+    const reviewJson = JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['test_coverage'],  // missing type_safety and security
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${reviewJson}\n\`\`\``, lastResultText: '' }); // self-review
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValue('');            // remaining
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.categories).toContain('self_review_failed');
+    expect(outcome.categories).toContain('validation_failed');
+    expect(outcome.parse_failed).toBe(true);
   });
 
   it('runs runProjectLintChecks after self-review applies fixes', async () => {

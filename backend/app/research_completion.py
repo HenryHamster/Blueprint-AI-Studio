@@ -143,6 +143,75 @@ def _calibrate_scope(proposed_scope: str, direction: dict) -> tuple[str, str | N
     return proposed_scope, None
 
 
+def predict_spawn_success(
+    scope: str,
+    direction: dict,
+    project: Any | None = None,
+) -> float:
+    """Predict P(success) for a spawned task using in-memory data only.
+
+    Combines three signals with weighted averaging:
+    1. Direction's scope-specific merge rate from last 3 history entries
+       (weight 2.0 — most relevant signal)
+    2. Project-wide scope merge rate across all directions
+       (weight 1.0 — proxy for project-level first_attempt_success_rate by task type)
+    3. Direction's recent overall failure rate from last 3 history entries
+       (weight 1.5 — captures transient regressions)
+
+    Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
+    No DB queries — uses only data already loaded during research_completion processing.
+    """
+    signals: list[float] = []
+    weights: list[float] = []
+
+    # Signal 1: direction scope-specific merge rate (same aggregation as _calibrate_scope)
+    history3 = direction.get("research_history", [])[-3:]
+    scope_agg: dict[str, dict] = {}
+    for entry in history3:
+        for s, stats in (entry.get("scope_breakdown") or {}).items():
+            if s not in scope_agg:
+                scope_agg[s] = {"created": 0, "merged": 0}
+            scope_agg[s]["created"] += stats.get("created", 0)
+            scope_agg[s]["merged"] += stats.get("merged", 0)
+    scope_stats = scope_agg.get(scope)
+    if scope_stats and scope_stats["created"] >= 2:
+        rate = scope_stats["merged"] / scope_stats["created"]
+        signals.append(rate)
+        weights.append(2.0)
+
+    # Signal 2: project-level scope merge rate across all directions
+    # (proxy for project-level first_attempt_success_rate for this task type, since
+    # create/plan/refactor tasks map to small/medium/large scopes respectively)
+    if project is not None:
+        proj_agg: dict[str, dict] = {}
+        for d in (project.directions or []):
+            for entry in (d.get("research_history") or []):
+                for s, stats in (entry.get("scope_breakdown") or {}).items():
+                    if s not in proj_agg:
+                        proj_agg[s] = {"created": 0, "merged": 0}
+                    proj_agg[s]["created"] += stats.get("created", 0)
+                    proj_agg[s]["merged"] += stats.get("merged", 0)
+        proj_scope_stats = proj_agg.get(scope)
+        if proj_scope_stats and proj_scope_stats["created"] >= 5:
+            proj_rate = proj_scope_stats["merged"] / proj_scope_stats["created"]
+            signals.append(proj_rate)
+            weights.append(1.0)
+
+    # Signal 3: direction's recent overall failure rate (last 3 history entries)
+    if history3:
+        total_created = sum(e.get("tasks_created", 0) for e in history3)
+        total_failed = sum(e.get("tasks_failed", 0) for e in history3)
+        if total_created >= 3:
+            failure_rate = total_failed / total_created
+            signals.append(max(0.0, 1.0 - failure_rate))
+            weights.append(1.5)
+
+    if not signals:
+        return 0.5  # insufficient data — neutral
+
+    return min(1.0, max(0.0, sum(s * w for s, w in zip(signals, weights)) / sum(weights)))
+
+
 def _compute_momentum_factor(d: dict) -> float:
     """Return a momentum multiplier based on recent research history productivity."""
     history = d.get("research_history", [])
@@ -549,9 +618,45 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             findings = prior_actionable + findings
 
-    # Cap findings to prevent runaway task creation
-    if len(findings) > 15:
-        findings = findings[:15]
+    # Compute capacity-aware batch cap — no DB queries, uses in-memory state only
+    from app import shared_state as _ss  # noqa: PLC0415
+    from app import max_plan_pool as _pool_mod  # noqa: PLC0415
+    _max_vms = _runtime_config.get("max_concurrent_vms", 8)
+    _available_slots = max(0, _max_vms - _ss.tasks_active_gauge)
+    _queued_count = _ss.tasks_queued_gauge
+    _all_pool_accounts = _pool_mod._all_accounts()
+    if _all_pool_accounts:
+        _healthy_accounts = sum(
+            1 for a in _all_pool_accounts
+            if _pool_mod._account_available_for_model(a, "claude-sonnet-4-6")
+        )
+        _cap_by_accounts = _healthy_accounts * 3
+    else:
+        _healthy_accounts = -1  # sentinel: pool unconfigured, don't constrain
+        _cap_by_accounts = 15
+    _cap_by_slots = _available_slots * 2
+    _cap_by_queue = max(3, 15 - _queued_count)
+    # Floor slots and accounts at 1 so a saturated-but-recovering system (all VMs
+    # busy, or all accounts temporarily rate-limited) doesn't zero out the cap and
+    # permanently discard this research cycle's findings.  Queue depth already has
+    # its own max(3, …) floor; consistent treatment here prevents _effective_cap=0.
+    _effective_cap = min(15, max(1, _cap_by_slots), max(1, _cap_by_accounts), _cap_by_queue)
+    _cap_factors = {
+        "max_findings": 15,
+        "vm_slots": _cap_by_slots,
+        "healthy_accounts": _cap_by_accounts,
+        "queue_depth": _cap_by_queue,
+    }
+    _limiting_factor = min(_cap_factors, key=lambda k: _cap_factors[k])
+    logger.info(
+        "[RESEARCH] Batch cap: %d (limited_by=%s, available_slots=%d, healthy_accounts=%s, queue_depth=%d)",
+        _effective_cap, _limiting_factor, _available_slots,
+        _healthy_accounts if _healthy_accounts >= 0 else "n/a",
+        _queued_count,
+    )
+    # Cap findings to prevent runaway task creation and backlog build-up
+    if len(findings) > _effective_cap:
+        findings = findings[:_effective_cap]
 
     original_base = (task.first_payload).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
@@ -885,6 +990,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
                 full_prompt = full_prompt + parent_summary
 
+        # Predict spawn success probability using in-memory direction + project data
+        _confidence_threshold = _runtime_config.get("spawn_confidence_threshold", 0.25)
+        _pred_dir_id = finding.get("direction_id") or _parent_direction_id
+        _pred_direction = _directions_by_id.get(str(_pred_dir_id)) if _pred_dir_id else {}
+        _pred_p = predict_spawn_success(scope, _pred_direction or {}, _scope_cal_project)
+        _low_confidence = _pred_p < _confidence_threshold
+        if _low_confidence:
+            logger.info(
+                "[RESEARCH] Low-confidence spawn '%s' (scope=%s, type=%s): P(success)=%.2f < threshold=%.2f",
+                title, scope, task_type, _pred_p, _confidence_threshold,
+            )
+
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
         # Inherit parent direction_id if the finding doesn't specify one
         parent_direction_id = (task.context or {}).get("direction_id")
@@ -916,6 +1033,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"direction_id": direction_id} if direction_id else ({"direction_id": parent_direction_id} if parent_direction_id else {})),
                 **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
                 **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
+                **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

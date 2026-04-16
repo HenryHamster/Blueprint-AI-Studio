@@ -11,6 +11,7 @@ imports (task_lifecycle is imported BY main) and preserve test-patchability
 import copy
 import json
 import logging
+import re
 import uuid
 import asyncio
 from typing import Dict
@@ -57,6 +58,7 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
     return None
 
 
+
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review."""
     active = (await session.execute(
@@ -77,6 +79,62 @@ async def _increment_research_spawn_count(project: Project, session: AsyncSessio
     flag_modified(project, "vision")
     session.add(project)
     return new_count
+
+def _extract_failing_tests(text: str) -> list[str]:
+    """Extract up to 10 failing test identifiers from error output.
+
+    Recognizes pytest FAILED path::test, Jest/Vitest FAIL suite/test,
+    and generic Error: lines.
+    """
+    results: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ident: str) -> None:
+        if ident not in seen and len(results) < 10:
+            seen.add(ident)
+            results.append(ident)
+
+    # pytest: FAILED path/to/test_file.py::test_name[param]
+    for m in re.finditer(r'FAILED\s+(\S+::\S+)', text):
+        _add(m.group(1))
+
+    # Jest/Vitest: FAIL TestSuite/TestName or FAIL path/to/test.ts
+    for m in re.finditer(r'\bFAIL\b\s+(\S+/\S+)', text):
+        _add(m.group(1))
+
+    # Generic "Error: message" lines (capped at 120 chars each)
+    for m in re.finditer(r'^Error:\s+.+$', text, re.MULTILINE):
+        _add(m.group(0).strip()[:120])
+
+    return results
+
+
+def _extract_error_files(text: str) -> list[str]:
+    """Extract up to 5 file paths from error output.
+
+    Recognizes Python tracebacks (File "path", line N) and
+    TypeScript/ESLint errors (path/to/file.ts:line:col).
+    """
+    results: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if path not in seen and len(results) < 5:
+            seen.add(path)
+            results.append(path)
+
+    # Python tracebacks: File "path/to/file.py", line N
+    for m in re.finditer(r'File "([^"]+)", line \d+', text):
+        _add(m.group(1))
+
+    # TypeScript/ESLint: path/to/file.ts:line:col (require path separator)
+    for m in re.finditer(r'([a-zA-Z0-9_.][a-zA-Z0-9_./\-]*\.[a-z]{2,4}):(\d+):(\d+)', text):
+        path = m.group(1)
+        if '/' in path:
+            _add(path)
+
+    return results
+
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
     """Re-evaluate a parent task by retrying its failed children.
@@ -159,7 +217,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
         clone_ctx["_attempt_number"] = attempt + 1
-        clone_ctx["_previous_error"] = (original_status_message or "")[:1500]
+        clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
 
         # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
@@ -227,6 +285,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     hints.append("Fix lint/type errors first — run the linter before committing.")
                 if hints:
                     extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+                failing_tests = clone_ctx.get("_previous_failing_tests", [])
+                error_files = clone_ctx.get("_previous_error_files", [])
+                if failing_tests:
+                    extra_guidance += "Failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
+                if error_files:
+                    extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
 
             if extra_guidance:
                 new_payloads[0]["prompt_suffix"] = extra_guidance + ("\n" + existing_suffix if existing_suffix else "")

@@ -16,6 +16,7 @@ from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
 from app.time_utils import _utcnow
+from app.failure_classification import classify_failure, persist_failure_category
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +313,11 @@ async def reaper_service():
                             {"task_id": str(task.id), "status": TaskStatus.QUEUED})
                         continue
 
+                    # Track per-class budget/failure-class for non-provision retries.
+                    # Initialized here so both retry and fail paths can reference them.
+                    reap_failure_class: str | None = None
+                    class_budget: int = _runtime_config["max_retries"]
+
                     if is_provision_failure:
                         provision_failures += 1
                         # Resolve zone with a fallback chain so serial log capture works
@@ -403,7 +409,17 @@ async def reaper_service():
                             if not can_retry:
                                 logger.error(f"[REAPER] Task {task.id} provision failed {provision_failures} times — giving up")
                     else:
-                        can_retry = task.attempt_count < _runtime_config["max_retries"]
+                        # Classify failure to select per-class retry budget.
+                        # Use agent-reported error logs as the primary signal. If the agent
+                        # left no error context (pure heartbeat timeout), fall back to
+                        # AGENT_TIMEOUT rather than the default CODE_ERROR — a silent death
+                        # is not a code defect.
+                        reap_failure_class = classify_failure(task, logs=combined_logs)
+                        if reap_failure_class == "CODE_ERROR" and not combined_logs.strip():
+                            reap_failure_class = "AGENT_TIMEOUT"
+                        retry_budgets = _runtime_config.get("retry_budgets_by_class", {})
+                        class_budget = retry_budgets.get(reap_failure_class, _runtime_config["max_retries"])
+                        can_retry = task.attempt_count < class_budget
 
                     if can_retry:
                         # Check if this is a research/plan parent with work children —
@@ -421,7 +437,10 @@ async def reaper_service():
                         else:
                             if not is_provision_failure:
                                 task.attempt_count += 1
-                            retry_label = f"provision {provision_failures}/{max_provision_retries}" if is_provision_failure else f"attempt {task.attempt_count}/{_runtime_config['max_retries']}"
+                            if is_provision_failure:
+                                retry_label = f"provision {provision_failures}/{max_provision_retries}"
+                            else:
+                                retry_label = f"attempt {task.attempt_count}/{class_budget} [{reap_failure_class}]"
                             logger.info(f"[REAPER] Retrying task {task.id} ({retry_label})")
                             reap_ctx = task.context or {}
                             reap_zone = reap_ctx.get("provision_zone", "?")
@@ -469,6 +488,13 @@ async def reaper_service():
                                     delay_minutes = 10 * random.uniform(0.75, 1.25)
                             elif is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
+                            elif reap_failure_class == "EXTERNAL_API":
+                                # Longer delays for transient API outages (GitHub 502, DNS flakes)
+                                # that typically resolve in 15-60 minutes.
+                                # Delays: 5, 15, 30, 60 min (one per attempt index)
+                                _ext_api_delays = [5, 15, 30, 60]
+                                _attempt_idx = min(task.attempt_count - 1, len(_ext_api_delays) - 1)
+                                delay_minutes = _ext_api_delays[_attempt_idx] * random.uniform(0.75, 1.25)
                             else:
                                 # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
                                 delay_minutes = min(2 ** (task.attempt_count - 1), 15) * random.uniform(0.75, 1.25)
@@ -482,7 +508,10 @@ async def reaper_service():
                             {"task_id": str(task.id), "status": task.status, "attempt_count": task.attempt_count}
                         )
                     else:
-                        fail_reason = f"provision failed {provision_failures} times" if is_provision_failure else f"failed after {_runtime_config['max_retries']} attempts"
+                        if is_provision_failure:
+                            fail_reason = f"provision failed {provision_failures} times"
+                        else:
+                            fail_reason = f"failed after {class_budget} retries ({reap_failure_class})"
                         logger.error(f"[REAPER] Task {task.id} {fail_reason}.")
                         task.status = TaskStatus.FAILED
                         if is_provision_failure:
@@ -777,6 +806,58 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
 
+                # Step 4: Rescue EVALUATING parents whose children ALL terminated without
+                # any completing successfully.  These parents have no COMPLETED child to
+                # trigger _check_and_trigger_rollup, so they stay EVALUATING forever.
+                try:
+                    _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                    rescued = 0
+                    _children_by_parent: Dict[uuid.UUID, list] = {}
+                    if evaluating_parents:
+                        _parent_ids = [p.id for p in evaluating_parents]
+                        _all_children = (await session.execute(
+                            select(Task).where(Task.parent_task_id.in_(_parent_ids))
+                        )).scalars().all()
+                        for _c in _all_children:
+                            _children_by_parent.setdefault(_c.parent_task_id, []).append(_c)
+                    for parent in evaluating_parents:
+                        children = _children_by_parent.get(parent.id, [])
+                        if not children:
+                            continue
+                        if any(c.status not in _terminal for c in children):
+                            continue
+                        if any(c.status == TaskStatus.COMPLETED for c in children):
+                            continue
+                        failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+                        cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
+                        parts = []
+                        if failed_children:
+                            classes = [
+                                (c.context or {}).get("failure_category") or "unknown"
+                                for c in failed_children
+                            ]
+                            class_summary = ", ".join(f"{cls}" for cls in classes)
+                            parts.append(f"{len(failed_children)} failed ({class_summary})")
+                        if cancelled_children:
+                            parts.append(f"{len(cancelled_children)} cancelled")
+                        diag = "; ".join(parts) if parts else f"{len(children)} terminal"
+                        parent.latest_status_message = (
+                            f"All child tasks terminated without success: {diag}"
+                        )
+                        parent.status = TaskStatus.FAILED
+                        _fc = classify_failure(parent)
+                        persist_failure_category(parent, _fc)
+                        session.add(parent)
+                        rescued += 1
+                        logger.warning(
+                            f"[REAPER] Rescued stuck EVALUATING parent {parent.id}: {diag}"
+                        )
+                    if rescued:
+                        await session.commit()
+                        logger.info(f"[REAPER] Rescued {rescued} all-children-failed EVALUATING parents")
+                except Exception as e:
+                    logger.error(f"[REAPER] All-children-failed rescue error: {e}", exc_info=True)
+
                 # Step 6: QUEUED task age alerts — notify operators when tasks have been
                 # waiting in QUEUED state beyond the configured threshold (default 2h).
                 # Fires once per task (tracked via task.context["queued_age_alert_fired"]).
@@ -800,7 +881,6 @@ async def reaper_service():
                         if _qctx.get("queued_age_alert_fired"):
                             continue
 
-                        # Determine likely cause
                         _qt_type = (_qt.first_payload or {}).get("type", "unknown")
                         _rate, _sample = _shared_state.get_task_type_failure_rate(_qt_type, window_minutes=15)
                         if _sample >= 3 and _rate >= 0.7:
@@ -854,7 +934,6 @@ async def reaper_service():
 
                 except Exception as e:
                     logger.error(f"[REAPER] Queued age alert sweep error: {e}", exc_info=True)
-
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break

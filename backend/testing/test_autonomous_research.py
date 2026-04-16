@@ -80,6 +80,8 @@ def _patch_research_externals(mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    # Simulate no pool configured so capacity-aware batch cap doesn't constrain unit tests
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
 
 
 def _make_finding(
