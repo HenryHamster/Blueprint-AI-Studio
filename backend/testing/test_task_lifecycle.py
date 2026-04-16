@@ -12,7 +12,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -318,6 +318,88 @@ async def test_requeue_sets_parent_to_evaluating_and_increments_requeue_count(tl
 
 
 @pytest.mark.asyncio
+async def test_requeue_noop_with_completed_child_does_not_burn_budget(tl_db):
+    """No FAILED children + has COMPLETED child → EVALUATING, budget untouched.
+
+    Regression: manual retry of a COMPLETED research parent (whose children
+    all merged but rollup PR is still open) used to burn a _requeue_count
+    slot per call, eventually failing the parent at MAX_PARENT_REQUEUES=3.
+    """
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 1},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    # Budget must NOT be consumed when nothing was retried
+    assert parent.context["_requeue_count"] == 1
+    assert parent.attempt_count == 0
+    assert "No failed subtasks to retry" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_requeue_noop_with_active_child_does_not_burn_budget(tl_db):
+    """No FAILED children + active child → EVALUATING, budget untouched."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent.id,
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context["_requeue_count"] == 2
+    assert parent.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_all_cancelled_children_marks_parent_failed(tl_db):
+    """All children CANCELLED (none FAILED/COMPLETED/active) → parent FAILED.
+
+    Prevents reaper Step 4 from looping on a parent whose children are all
+    cancelled — there is nothing to retry and nothing to roll up.
+    """
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "No failed subtasks to retry" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") == "UNKNOWN"
+
+
+@pytest.mark.asyncio
 async def test_requeue_strips_max_plan_account_id_from_clone(tl_db, mocker):
     """max_plan_account_id (blacklisted account) is excluded from clone context."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
@@ -446,7 +528,7 @@ async def test_requeue_enriches_clone_context_with_fingerprint_and_stage(tl_db, 
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
-    child = await _make_task(
+    await _make_task(
         session, project.id, task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
@@ -509,7 +591,7 @@ async def test_requeue_sets_recurring_flag_when_anomaly_exceeds_threshold(tl_db,
     session, _ = tl_db
     project = await _make_project(session)
     parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
-    child = await _make_task(
+    await _make_task(
         session, project.id, task_type="create",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,

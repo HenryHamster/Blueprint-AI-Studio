@@ -359,6 +359,57 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             for _, clone in cloned_pairs:
                 clone.depends_on = []
 
+    # No failed children to clone — this is a no-op.  Don't burn the requeue
+    # budget on callers that invoke us defensively (admin manual retry of a
+    # COMPLETED parent, reaper self-timeout rescue, Step 4 all-children-terminal
+    # sweep with no FAILED children).  Decide terminal state based on what
+    # children actually exist so the parent doesn't sit in EVALUATING forever.
+    if retried_count == 0:
+        has_completed = any(c.status == TaskStatus.COMPLETED for c in children)
+        has_active = any(
+            c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                         TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+            for c in children
+        )
+        if not has_completed and not has_active:
+            # All children terminal and none succeeded — they're all CANCELLED
+            # (if any were FAILED, retried_count would be > 0).  Nothing to
+            # recover from; mark parent FAILED so reaper Step 4 stops looping.
+            from app.failure_classification import persist_failure_category
+            parent.status = TaskStatus.FAILED
+            parent.latest_status_message = (
+                "No failed subtasks to retry and no successful subtasks to roll up"
+            )
+            persist_failure_category(parent, "UNKNOWN")
+            session.add(parent)
+            await session.commit()
+            await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
+            await broadcast_to_project(str(parent.project_id), "task_updated",
+                                       {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+            logger.warning(
+                f"[REQUEUE] Parent {parent.id} has no failed children to retry and "
+                f"no successful ones to roll up — marking FAILED"
+            )
+            return 0
+        # Has a COMPLETED child (reaper Step 3 + rollup will re-evaluate) or
+        # active children (wait for them).  Nudge to EVALUATING so the rollup
+        # sweep picks it up, but don't increment _requeue_count/attempt_count —
+        # we didn't actually retry anything.
+        parent.status = TaskStatus.EVALUATING
+        parent.latest_status_message = (
+            "No failed subtasks to retry — awaiting rollup re-evaluation"
+        )
+        session.add(parent)
+        await session.commit()
+        await broadcast_to_project(str(parent.project_id), "task_updated",
+                                   {"task_id": str(parent.id), "status": TaskStatus.EVALUATING})
+        logger.info(
+            f"[REQUEUE] Parent {parent.id} — no failed children to retry "
+            f"(has_completed={has_completed}, has_active={has_active}); "
+            f"kept at EVALUATING without burning requeue budget"
+        )
+        return 0
+
     parent.context = {**(parent.context or {}), "_requeue_count": requeue_count + 1}
     parent.status = TaskStatus.EVALUATING
     parent.latest_status_message = f"Requeued — retrying {retried_count} failed subtask(s)"
