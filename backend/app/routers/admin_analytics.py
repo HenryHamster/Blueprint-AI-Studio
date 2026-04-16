@@ -562,6 +562,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         and "_first_attempt_succeeded" in (t.context or {})
     ]
 
+    tasks_with_arch_context = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("_had_arch_context") is True
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+    tasks_without_arch_context = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("_had_arch_context") is False
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+
     tasks_with_review_measurements = [
         t for t in terminal_tasks_24h
         if (t.context or {}).get("_had_review_measurements") is True
@@ -693,11 +704,29 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
         }
 
+    def _arch_rejection_rate(tasks: list) -> float | None:
+        """Fraction of first-attempt failures in tasks that had 'architecture' as a rejection category."""
+        failed_with_cats = [
+            t for t in tasks
+            if "_first_attempt_rejection_categories" in (t.context or {})
+        ]
+        if not failed_with_cats:
+            return None
+        arch_count = sum(
+            1 for t in failed_with_cats
+            if "architecture" in (t.context or {}).get("_first_attempt_rejection_categories", {})
+        )
+        return round(arch_count / len(failed_with_cats), 2)
+
     first_attempt_success_rate = {
         "overall": current_first_attempt_rate,
         "trend": first_attempt_trend,
         "with_playbook": _first_attempt_rate(tasks_with_playbook) if tasks_with_playbook else None,
         "without_playbook": _first_attempt_rate(tasks_without_playbook) if tasks_without_playbook else None,
+        "with_arch_context": _first_attempt_rate(tasks_with_arch_context) if tasks_with_arch_context else None,
+        "without_arch_context": _first_attempt_rate(tasks_without_arch_context) if tasks_without_arch_context else None,
+        "arch_rejection_rate_with_context": _arch_rejection_rate(tasks_with_arch_context),
+        "arch_rejection_rate_without_context": _arch_rejection_rate(tasks_without_arch_context),
         "with_review_measurements": _first_attempt_rate(tasks_with_review_measurements) if tasks_with_review_measurements else None,
         "without_review_measurements": _first_attempt_rate(tasks_without_review_measurements) if tasks_without_review_measurements else None,
         "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),

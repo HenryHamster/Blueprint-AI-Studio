@@ -486,7 +486,77 @@ async def test_return_structure_has_all_required_keys():
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
     assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations", "direction_first_attempt_feedback"}
-    assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
+    fa = result["first_attempt_success_rate"]
+    assert "first_attempt_by_review_category" in fa
+    assert "with_arch_context" in fa
+    assert "without_arch_context" in fa
+    assert "arch_rejection_rate_with_context" in fa
+    assert "arch_rejection_rate_without_context" in fa
+
+
+@pytest.mark.asyncio
+async def test_arch_context_first_attempt_rate_computed_correctly():
+    """Tasks with _had_arch_context=True/False are split for separate success rate computation."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    tasks = [
+        # With arch context: 2 succeed, 1 fails → rate 0.67
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=1),
+                  context={"_had_arch_context": True, "_first_attempt_succeeded": True}),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=2),
+                  context={"_had_arch_context": True, "_first_attempt_succeeded": True}),
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
+                  context={"_had_arch_context": True, "_first_attempt_succeeded": False}),
+        # Without arch context: 1 succeeds, 1 fails → rate 0.5
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=4),
+                  context={"_had_arch_context": False, "_first_attempt_succeeded": True}),
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
+                  context={"_had_arch_context": False, "_first_attempt_succeeded": False}),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fa = result["first_attempt_success_rate"]
+    assert fa["with_arch_context"] == pytest.approx(0.67, abs=0.01)
+    assert fa["without_arch_context"] == pytest.approx(0.5, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_arch_rejection_rate_computed_correctly():
+    """arch_rejection_rate_with/without_context measures fraction of first-attempt failures
+    with 'architecture' in _first_attempt_rejection_categories."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    tasks = [
+        # With arch context: 2 failures with rejection categories; 1 has 'architecture'
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
+                  context={"_had_arch_context": True, "_first_attempt_succeeded": False,
+                           "_first_attempt_rejection_categories": {"architecture": 1, "style": 1}}),
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
+                  context={"_had_arch_context": True, "_first_attempt_succeeded": False,
+                           "_first_attempt_rejection_categories": {"style": 1}}),
+        # Without arch context: 2 failures; both have 'architecture'
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
+                  context={"_had_arch_context": False, "_first_attempt_succeeded": False,
+                           "_first_attempt_rejection_categories": {"architecture": 1}}),
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
+                  context={"_had_arch_context": False, "_first_attempt_succeeded": False,
+                           "_first_attempt_rejection_categories": {"architecture": 1, "tests": 1}}),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fa = result["first_attempt_success_rate"]
+    # With context: 1 of 2 failures had architecture → 0.5
+    assert fa["arch_rejection_rate_with_context"] == pytest.approx(0.5, abs=0.01)
+    # Without context: 2 of 2 failures had architecture → 1.0
+    assert fa["arch_rejection_rate_without_context"] == pytest.approx(1.0, abs=0.01)
 
 
 @pytest.mark.asyncio

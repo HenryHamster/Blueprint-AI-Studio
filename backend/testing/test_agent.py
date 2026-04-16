@@ -1568,6 +1568,64 @@ async def test_claim_does_not_inject_architecture_context_for_review_task(client
     )
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_tracks_arch_context_in_task_context(client: AsyncClient, db_session):
+    """When arch context is injected at claim time, _had_arch_context=True and
+    _shown_arch_system_names are persisted in task.context for effectiveness tracking."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "_file_to_system": {
+            "backend/app/auth.py": "auth",
+            "backend/app/models.py": "database",
+        },
+        "systems/auth": {
+            "name": "Auth",
+            "status": "functional",
+            "ready_for_features": True,
+            "description": "Handles authentication.",
+            "modules": ["backend/app/auth.py"],
+        },
+        "systems/database": {
+            "name": "Database",
+            "status": "mature",
+            "ready_for_features": True,
+            "description": "ORM layer.",
+            "modules": ["backend/app/models.py"],
+        },
+    }
+    project = Project(name="Arch Context Tracking Test", user_id="test-user-123", design_doc=design_doc)
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add new feature"}],
+        vm_instance_id="agent-vm-arch-track",
+        context={"related_files": ["backend/app/auth.py", "backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-arch-track")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_had_arch_context") is True, (
+        f"Expected _had_arch_context=True in task.context, got: {ctx.get('_had_arch_context')}"
+    )
+    shown = ctx.get("_shown_arch_system_names", [])
+    assert set(shown) == {"auth", "database"}, (
+        f"Expected system names auth, database in _shown_arch_system_names, got: {shown}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_safe_ws_close_swallows_double_close_runtime_error():
     """Production cascade: receive_json raised WebSocketDisconnect (already

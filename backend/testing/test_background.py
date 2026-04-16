@@ -107,6 +107,8 @@ async def test_reaper_service(reaper_db, mocker):
     We mock asyncio.sleep to break the infinite loop after one iteration.
     """
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    # Disable infra-recovery resurrection so the task stays FAILED for this assertion
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
 
     class StopLoopException(Exception):
         pass
@@ -185,6 +187,8 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
     when the reaper detects a heartbeat timeout.
     """
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    # Disable infra-recovery resurrection so the task stays FAILED for this assertion
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
 
     class StopLoopException(Exception):
         pass
@@ -226,6 +230,8 @@ async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mock
     the failure as infrastructure, not a code defect.
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
+    # Disable infra-recovery resurrection so failure_category survives in context
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
 
     class StopLoopException(Exception):
         pass
@@ -1559,6 +1565,8 @@ async def test_reaper_unblocks_dependent_tasks_on_terminal_failure(reaper_db, mo
     """When a task fails terminally, QUEUED tasks whose depends_on list contains
     its ID must have that ID removed so they can proceed."""
     _common_reaper_mocks(mocker)
+    # Disable infra-recovery resurrection so the task stays FAILED after the reap
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Dep Unblock Test", user_id="user1")
@@ -1620,6 +1628,8 @@ async def test_reaper_dep_unblocking_error_does_not_crash_reaper(reaper_db, mock
     """If the dep-unblocking session raises an exception, the reaper must log the
     error and continue (not propagate the exception or skip the main commit)."""
     _common_reaper_mocks(mocker)
+    # Disable infra-recovery resurrection so the task stays FAILED after the reap
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Dep Error Test", user_id="user1")

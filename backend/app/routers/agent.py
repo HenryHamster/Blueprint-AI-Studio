@@ -995,6 +995,17 @@ async def claim_task(
                     if "project_context" not in response:
                         response["project_context"] = {}
                     response["project_context"]["architecture_context"] = arch_ctx
+                    # Track arch context injection in task.context for effectiveness measurement
+                    try:
+                        _arch_task_ctx = dict(task.context or {})
+                        _arch_task_ctx["_had_arch_context"] = True
+                        _arch_task_ctx["_shown_arch_system_names"] = list(seen_systems.keys())
+                        task.context = _arch_task_ctx
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                    except Exception:
+                        logger.exception("[AGENT] Failed to track arch context injection (non-critical)")
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:

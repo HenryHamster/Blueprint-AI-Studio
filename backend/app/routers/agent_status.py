@@ -958,6 +958,7 @@ async def update_agent_status(
                 except Exception:
                     _playbook_count = 0
                 _ctx["_had_playbook"] = bool(_playbook_count)
+                _ctx["_had_arch_context"] = bool(_ctx.get("_had_arch_context"))
                 task.context = _ctx
                 session.add(task)
                 if payload.status == TaskStatus.COMPLETED and not bool(_playbook_count):
