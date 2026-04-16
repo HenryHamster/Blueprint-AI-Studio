@@ -382,11 +382,15 @@ async def disable_account_model(acct_id: str, model: str) -> None:
         # Record rate-limit event for rolling health score
         _prune_health_events(acct, now)
         acct.setdefault("rl_events", []).append(now)
-        primary_hits = dm[model]["hits"]
+        # Legacy model names (e.g. claude-sonnet-4-6) may not match any cascade
+        # entry directly, so key off the cascade primary we just wrote. Guaranteed
+        # non-empty: cascade_disabled_models always returns at least one entry.
+        primary_key = cascade[0]
+        primary_hits = dm[primary_key]["hits"]
         cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(0.85, 1.15)
         logger.warning(
             f"[POOL] Account {acct['name']} disabled models {list(cascade)} "
-            f"(primary {model} hit #{primary_hits}, cooldown {cooldown:.0f}min)"
+            f"(primary {primary_key} hit #{primary_hits}, cooldown {cooldown:.0f}min)"
         )
         try:
             await _persist_rate_limit_state(acct_id)

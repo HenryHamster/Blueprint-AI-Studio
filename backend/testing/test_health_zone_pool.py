@@ -831,58 +831,52 @@ class TestMaxPlanAccountPool:
         assert _account_by_id["a1"]["rl_hit_count"] == 2  # second hit → count=2 → 60 min cooldown
 
     # ── Model tier cascade tests ──────────────────────────────────────────────
-    # Claude Max plan: Opus 429 implies Sonnet is also rate-limited (shared
-    # session bucket), but Sonnet 429 does NOT block Opus (Opus has its own
-    # stricter sub-bucket). Haiku shares Opus's meter exactly — it has no
-    # separate bucket, so rate-limit tracking normalizes Haiku → Opus.
+    # Post-opus-4-7 migration: all new tasks use claude-opus-4-7. Haiku shares
+    # Opus's meter exactly — it has no separate bucket, so rate-limit tracking
+    # normalizes Haiku → Opus via _normalize_rl_model(). Legacy 4-6 model names
+    # (claude-opus-4-6, claude-sonnet-4-6) still cascade to the opus-4-7 bucket
+    # so prior-queued tasks resolve correctly against the current meter.
 
-    def test_cascade_disabled_models_opus_covers_opus_and_sonnet(self):
+    def test_cascade_opus_4_7_covers_opus_4_7(self):
+        """Primary model: opus-4-7 cascade is a single entry under the new single-tier
+        architecture (no separate sonnet bucket)."""
+        cascade = cascade_disabled_models("claude-opus-4-7")
+        assert cascade == ("claude-opus-4-7",)
+
+    def test_cascade_legacy_opus_4_6_maps_to_opus_4_7(self):
+        """Legacy opus-4-6 cascades to the current opus-4-7 meter so prior-queued
+        tasks still disable the shared bucket correctly."""
         cascade = cascade_disabled_models("claude-opus-4-6")
-        assert "claude-opus-4-6" in cascade
-        assert "claude-sonnet-4-6" in cascade
+        assert cascade == ("claude-opus-4-7",)
 
-    def test_cascade_disabled_models_sonnet_only_covers_sonnet(self):
+    def test_cascade_legacy_sonnet_4_6_maps_to_opus_4_7(self):
+        """Legacy sonnet-4-6 cascades to opus-4-7 (single shared meter) — there is no
+        longer a separate sonnet-only bucket under the post-migration architecture."""
         cascade = cascade_disabled_models("claude-sonnet-4-6")
-        assert cascade == ("claude-sonnet-4-6",)
-        assert "claude-opus-4-6" not in cascade
+        assert cascade == ("claude-opus-4-7",)
 
-    def test_cascade_disabled_models_haiku_normalizes_to_opus(self):
-        # Haiku shares Opus's meter — cascade must key off Opus's bucket.
+    def test_cascade_haiku_normalizes_to_opus_4_7(self):
+        """Haiku shares Opus's meter — cascade must key off Opus-4-7's bucket."""
         cascade = cascade_disabled_models("claude-haiku-4-5-20251001")
-        assert "claude-opus-4-6" in cascade
-        assert "claude-sonnet-4-6" in cascade
+        assert cascade == ("claude-opus-4-7",)
         assert "claude-haiku-4-5-20251001" not in cascade
 
     def test_cascade_disabled_models_unknown_falls_back_to_single(self):
         # Unknown variants must not silently cascade to the whole account.
         assert cascade_disabled_models("claude-some-future-model") == ("claude-some-future-model",)
 
-    def test_opus_rate_limit_blocks_all_tiers_via_mark_cascade(self, clean_max_plan_pool):
-        """After an Opus 429, the mark path writes cascade entries for opus+sonnet.
-        A Haiku lookup normalizes to Opus, so all three requests are blocked."""
+    def test_opus_rate_limit_blocks_opus_and_haiku_via_mark_cascade(self, clean_max_plan_pool):
+        """After an Opus-4-7 429, the mark path writes the opus-4-7 cascade entry.
+        A Haiku lookup normalizes to Opus-4-7, so haiku requests are also blocked."""
         now = datetime.utcnow()
         acct = {
             "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
             "oauth_token": "sk-ant-test",
-            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-6")},
+            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-7")},
         }
-        assert _account_available_for_model(acct, "claude-opus-4-6") is False
-        assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
-        # Haiku normalizes to Opus → also blocked (shared meter).
+        assert _account_available_for_model(acct, "claude-opus-4-7") is False
+        # Haiku normalizes to Opus-4-7 → also blocked (shared meter).
         assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
-
-    def test_sonnet_rate_limit_blocks_sonnet_only(self, clean_max_plan_pool):
-        """Sonnet 429 writes only {sonnet}. Opus and Haiku (shared Opus meter)
-        remain available because the cascade is one-way (opus → sonnet)."""
-        now = datetime.utcnow()
-        acct = {
-            "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
-            "oauth_token": "sk-ant-test",
-            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-sonnet-4-6")},
-        }
-        assert _account_available_for_model(acct, "claude-opus-4-6") is True
-        assert _account_available_for_model(acct, "claude-sonnet-4-6") is False
-        assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is True
 
     def test_account_available_unknown_model_skips_account_with_disables(self, clean_max_plan_pool):
         """model=None must NOT bypass the rate-limit check when disables exist.
@@ -891,7 +885,7 @@ class TestMaxPlanAccountPool:
         acct = {
             "id": "a1", "name": "evan", "enabled": True, "active_tasks": 0,
             "oauth_token": "sk-ant-test",
-            "disabled_models": {"claude-opus-4-6": {"hits": 1, "at": datetime.utcnow()}},
+            "disabled_models": {"claude-opus-4-7": {"hits": 1, "at": datetime.utcnow()}},
         }
         assert _account_available_for_model(acct, None) is False
 
@@ -905,26 +899,28 @@ class TestMaxPlanAccountPool:
 
     @pytest.mark.asyncio
     async def test_select_skips_account_after_opus_rate_limit_cascade(self, clean_max_plan_pool):
-        """After an Opus 429 marks (opus, sonnet), a Sonnet request must
+        """After an Opus-4-7 429 marks the opus-4-7 meter, another Opus-4-7 request must
         skip that account in favor of a healthy one — even if the healthy
         account has more active tasks."""
         now = datetime.utcnow()
         _add_to_pool({
             "id": "a1", "name": "rate_limited", "enabled": True, "active_tasks": 0,
-            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-6")},
+            "disabled_models": {m: {"hits": 1, "at": now} for m in cascade_disabled_models("claude-opus-4-7")},
         })
         _add_to_pool({
             "id": "a2", "name": "healthy", "enabled": True, "active_tasks": 5,
         })
-        result = await select_max_plan_account(_TEST_USER, model="claude-sonnet-4-6")
+        result = await select_max_plan_account(_TEST_USER, model="claude-opus-4-7")
         assert result is not None
         assert result["id"] == "a2"  # healthy account chosen despite higher active_tasks
 
 
 # ─── Circuit Breaker (healthy / probing / unavailable) ──────────────────────
 
-OPUS = "claude-opus-4-6"
-SONNET = "claude-sonnet-4-6"
+# Post-migration: all new tasks use opus-4-7, haiku shares opus-4-7's meter.
+# Legacy sonnet-4-6 and opus-4-6 still exist in cascade map for backward compat,
+# but tests exercise the current single-tier behavior against opus-4-7 directly.
+OPUS = "claude-opus-4-7"
 HAIKU = "claude-haiku-4-5-20251001"
 
 
@@ -954,36 +950,36 @@ class TestCircuitBreaker:
 
     def test_state_healthy_with_no_disables(self, clean_max_plan_pool):
         acct = {"id": "a1", "name": "clean", "enabled": True, "oauth_token": "sk-ant-test"}
-        assert _account_state_for_model(acct, SONNET) == "healthy"
+        assert _account_state_for_model(acct, OPUS) == "healthy"
 
     def test_state_unavailable_within_cooldown(self, clean_max_plan_pool):
         # hits=1 → 30min cooldown. 10 min ago → still cooling.
-        acct = _acct_with_disables("a1", {SONNET: _disabled_entry(minutes_ago=10)})
-        assert _account_state_for_model(acct, SONNET) == "unavailable"
+        acct = _acct_with_disables("a1", {OPUS: _disabled_entry(minutes_ago=10)})
+        assert _account_state_for_model(acct, OPUS) == "unavailable"
 
     def test_state_probing_past_cooldown(self, clean_max_plan_pool):
         # hits=1 → 30min cooldown. 35 min ago → elapsed → probing.
-        acct = _acct_with_disables("a1", {SONNET: _disabled_entry(minutes_ago=35)})
-        assert _account_state_for_model(acct, SONNET) == "probing"
+        acct = _acct_with_disables("a1", {OPUS: _disabled_entry(minutes_ago=35)})
+        assert _account_state_for_model(acct, OPUS) == "probing"
 
     # ── Two-tier selection ───────────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_select_prefers_healthy_over_probing(self, clean_max_plan_pool):
         """A healthy account with high load still wins over an idle probing account."""
-        _add_to_pool(_acct_with_disables("probe", {SONNET: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
         _add_to_pool({
             "id": "healthy", "name": "healthy", "enabled": True, "active_tasks": 5,
             "oauth_token": "sk-ant-test",
         })
-        result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is not None
         assert result["id"] == "healthy"
 
     @pytest.mark.asyncio
     async def test_select_falls_back_to_probing_when_no_healthy(self, clean_max_plan_pool):
-        _add_to_pool(_acct_with_disables("probe", {SONNET: _disabled_entry(minutes_ago=35)}))
-        result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
+        result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is not None
         assert result["id"] == "probe"
         assert result["active_tasks"] == 1  # pre-incremented
@@ -991,20 +987,20 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_select_serializes_probing_account(self, clean_max_plan_pool):
         """Single probing account, already mid-probe (active_tasks=1) → select returns None."""
-        acct = _acct_with_disables("probe", {SONNET: _disabled_entry(minutes_ago=35)}, active_tasks=1)
+        acct = _acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}, active_tasks=1)
         _add_to_pool(acct)
-        result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_select_parallel_probing_across_accounts(self, clean_max_plan_pool):
         """Two probing accounts both idle → two selects return distinct accounts,
         third returns None (each account serialized to one in-flight probe)."""
-        _add_to_pool(_acct_with_disables("probe1", {SONNET: _disabled_entry(minutes_ago=35)}))
-        _add_to_pool(_acct_with_disables("probe2", {SONNET: _disabled_entry(minutes_ago=35)}))
-        r1 = await select_max_plan_account(_TEST_USER, model=SONNET)
-        r2 = await select_max_plan_account(_TEST_USER, model=SONNET)
-        r3 = await select_max_plan_account(_TEST_USER, model=SONNET)
+        _add_to_pool(_acct_with_disables("probe1", {OPUS: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(_acct_with_disables("probe2", {OPUS: _disabled_entry(minutes_ago=35)}))
+        r1 = await select_max_plan_account(_TEST_USER, model=OPUS)
+        r2 = await select_max_plan_account(_TEST_USER, model=OPUS)
+        r3 = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert r1 is not None and r2 is not None
         assert {r1["id"], r2["id"]} == {"probe1", "probe2"}
         assert r3 is None
@@ -1015,51 +1011,37 @@ class TestCircuitBreaker:
     async def test_thundering_herd_prevented_on_single_probing_account(self, clean_max_plan_pool):
         """The core regression: when cooldown expires on the only account, only
         ONE task gets dispatched (the probe), not N tasks in parallel."""
-        _add_to_pool(_acct_with_disables("probe", {SONNET: _disabled_entry(minutes_ago=35)}))
-        r1 = await select_max_plan_account(_TEST_USER, model=SONNET)
-        r2 = await select_max_plan_account(_TEST_USER, model=SONNET)
-        r3 = await select_max_plan_account(_TEST_USER, model=SONNET)
+        _add_to_pool(_acct_with_disables("probe", {OPUS: _disabled_entry(minutes_ago=35)}))
+        r1 = await select_max_plan_account(_TEST_USER, model=OPUS)
+        r2 = await select_max_plan_account(_TEST_USER, model=OPUS)
+        r3 = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert r1 is not None and r1["id"] == "probe"
         assert r2 is None  # serialized: probe already in flight
         assert r3 is None
 
     # ── Clear-on-success path ────────────────────────────────────────────────
+    # Post-opus-4-7 migration: the cascade is single-tier (all new models share
+    # the opus-4-7 meter). The old "opus cascades to sonnet" semantics are gone,
+    # so success clears only the opus-4-7 bucket. Haiku still normalizes to opus-4-7.
 
     @pytest.mark.asyncio
-    async def test_clear_opus_success_clears_opus_and_sonnet(self, clean_max_plan_pool, monkeypatch):
-        # Haiku is never a separate key (normalized to opus), so opus clear
-        # leaves the account fully healthy.
+    async def test_clear_opus_success_clears_opus_bucket(self, clean_max_plan_pool, monkeypatch):
+        """Opus success clears the opus-4-7 bucket — the shared meter for all tasks."""
         now = datetime.utcnow()
         _add_to_pool(_acct_with_disables("a1", {
             OPUS: {"hits": 1, "at": now},
-            SONNET: {"hits": 1, "at": now},
         }))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", OPUS) is True
         assert "disabled_models" not in _account_by_id["a1"] or not _account_by_id["a1"]["disabled_models"]
 
     @pytest.mark.asyncio
-    async def test_clear_sonnet_success_clears_sonnet_only(self, clean_max_plan_pool, monkeypatch):
-        # Sonnet success proves only sonnet's bucket is fine — opus (and haiku,
-        # which shares opus's meter) stay disabled.
+    async def test_clear_haiku_success_clears_opus_bucket(self, clean_max_plan_pool, monkeypatch):
+        """Haiku success proves Opus-4-7's meter is fine (shared bucket) —
+        clearing Haiku normalizes to clearing the opus-4-7 entry."""
         now = datetime.utcnow()
         _add_to_pool(_acct_with_disables("a1", {
             OPUS: {"hits": 1, "at": now},
-            SONNET: {"hits": 1, "at": now},
-        }))
-        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
-        assert await clear_rate_limit_state_on_success("a1", SONNET) is True
-        dm = _account_by_id["a1"].get("disabled_models") or {}
-        assert set(dm.keys()) == {OPUS}
-
-    @pytest.mark.asyncio
-    async def test_clear_haiku_success_clears_opus_and_sonnet(self, clean_max_plan_pool, monkeypatch):
-        # Haiku success proves Opus's meter is fine (shared bucket). That also
-        # clears sonnet, since opus's cascade includes sonnet.
-        now = datetime.utcnow()
-        _add_to_pool(_acct_with_disables("a1", {
-            OPUS: {"hits": 1, "at": now},
-            SONNET: {"hits": 1, "at": now},
         }))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         assert await clear_rate_limit_state_on_success("a1", HAIKU) is True
@@ -1080,43 +1062,43 @@ class TestCircuitBreaker:
     @pytest.mark.asyncio
     async def test_probe_success_restores_healthy(self, clean_max_plan_pool, monkeypatch):
         """Mark → fast-forward → probing → select → simulate success (clear) → healthy."""
-        _add_to_pool(_acct_with_disables("a1", {SONNET: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(_acct_with_disables("a1", {OPUS: _disabled_entry(minutes_ago=35)}))
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
         # First select: probing, grabbed as probe
-        probe_result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        probe_result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert probe_result is not None
         assert probe_result["id"] == "a1"
 
         # Simulate task completion: release + clear
         await release_max_plan_account("a1")
-        cleared = await clear_rate_limit_state_on_success("a1", SONNET)
+        cleared = await clear_rate_limit_state_on_success("a1", OPUS)
         assert cleared is True
 
         # Next select sees it as healthy
-        assert _account_state_for_model(_account_by_id["a1"], SONNET) == "healthy"
-        result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        assert _account_state_for_model(_account_by_id["a1"], OPUS) == "healthy"
+        result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is not None
         assert result["id"] == "a1"
 
     @pytest.mark.asyncio
     async def test_probe_failure_extends_cooldown(self, clean_max_plan_pool):
         """A probe that 429s extends cooldown exponentially; next select returns None."""
-        _add_to_pool(_acct_with_disables("a1", {SONNET: _disabled_entry(minutes_ago=35)}))
+        _add_to_pool(_acct_with_disables("a1", {OPUS: _disabled_entry(minutes_ago=35)}))
 
         # Select the probe
-        probe = await select_max_plan_account(_TEST_USER, model=SONNET)
+        probe = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert probe is not None
         assert probe["id"] == "a1"
 
         # Simulate the mark path re-stamping on 429: hits=2, at=now → 60min cooldown
         async with _max_plan_pool_lock:
-            _account_by_id["a1"]["disabled_models"][SONNET] = {"hits": 2, "at": datetime.utcnow()}
+            _account_by_id["a1"]["disabled_models"][OPUS] = {"hits": 2, "at": datetime.utcnow()}
         await release_max_plan_account("a1")
 
         # Now unavailable (fresh 60min cooldown, 0 min elapsed)
-        assert _account_state_for_model(_account_by_id["a1"], SONNET) == "unavailable"
-        result = await select_max_plan_account(_TEST_USER, model=SONNET)
+        assert _account_state_for_model(_account_by_id["a1"], OPUS) == "unavailable"
+        result = await select_max_plan_account(_TEST_USER, model=OPUS)
         assert result is None
 
 
@@ -1279,7 +1261,7 @@ class TestAccountSelectionByHealthScore:
         """disable_account_model records a rate-limit event for health tracking."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         _add_to_pool(_make_acct("a1"))
-        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
         assert len(_account_by_id["a1"].get("rl_events", [])) == 1
 
     @pytest.mark.asyncio
@@ -1287,8 +1269,10 @@ class TestAccountSelectionByHealthScore:
         """Each disable call appends to rl_events, lowering the health score."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         _add_to_pool(_make_acct("a1"))
-        await disable_account_model("a1", SONNET)
+        # Opus and Haiku share the same meter (normalized) — each disable still
+        # appends a distinct rl_event, so two calls yield two events.
         await disable_account_model("a1", OPUS)
+        await disable_account_model("a1", HAIKU)
         assert len(_account_by_id["a1"].get("rl_events", [])) == 2
         assert _compute_health_score(_account_by_id["a1"]) == -4.0
 
@@ -1313,7 +1297,7 @@ class TestAccountSelectionByHealthScore:
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
         # Account with one past rate limit
         _add_to_pool(_make_acct("a1"))
-        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
         score_after_rl = _compute_health_score(_account_by_id["a1"])
         assert score_after_rl == -2.0
 
@@ -1359,7 +1343,7 @@ class TestDisabledStatePersistenceAndRestoration:
 
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
         _add_to_pool(_make_acct("a1"))
-        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
         assert "a1" in persist_calls, "_persist_rate_limit_state must be called on rate limit"
 
     @pytest.mark.asyncio
@@ -1372,8 +1356,8 @@ class TestDisabledStatePersistenceAndRestoration:
 
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _capture_persist)
         now = datetime.now(timezone.utc)
-        _add_to_pool(_acct_with_disables("a1", {SONNET: {"hits": 1, "at": now - timedelta(minutes=5)}}))
-        await clear_rate_limit_state_on_success("a1", SONNET)
+        _add_to_pool(_acct_with_disables("a1", {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}}))
+        await clear_rate_limit_state_on_success("a1", OPUS)
         assert "a1" in persist_calls
 
     def test_load_max_plan_pool_restores_active_cooldown(self):
@@ -1393,11 +1377,11 @@ class TestDisabledStatePersistenceAndRestoration:
             "active_tasks": 0,
             "oauth_token": "sk-ant-test",
             "disabled_models": {
-                SONNET: {"hits": 1, "at": now - timedelta(minutes=10)},  # 30min cooldown, only 10min elapsed
+                OPUS: {"hits": 1, "at": now - timedelta(minutes=10)},  # 30min cooldown, only 10min elapsed
             },
         }
         # The in-memory dict uses datetime objects for "at" (as load_max_plan_pool converts ISO strings)
-        assert _account_state_for_model(restored_entry, SONNET) == "unavailable"
+        assert _account_state_for_model(restored_entry, OPUS) == "unavailable"
 
     def test_load_max_plan_pool_skips_expired_cooldown_on_restore(self):
         """Cooldowns that elapsed while the service was down are not restored."""
@@ -1411,11 +1395,11 @@ class TestDisabledStatePersistenceAndRestoration:
             "active_tasks": 0,
             "oauth_token": "sk-ant-test",
             "disabled_models": {
-                SONNET: {"hits": 1, "at": now - timedelta(minutes=45)},
+                OPUS: {"hits": 1, "at": now - timedelta(minutes=45)},
             },
         }
         # Should be probing (cooldown elapsed) rather than unavailable
-        assert _account_state_for_model(expired_entry, SONNET) == "probing"
+        assert _account_state_for_model(expired_entry, OPUS) == "probing"
 
 
 # ─── disable_account_model (shared rate-limit mark path) ────────────────────
@@ -1427,49 +1411,53 @@ class TestDisableAccountModel:
     this being called from reaper.py, the orchestrator's blacklist pruning
     strips the entry on the next dispatch cycle and the same account is
     re-selected on every requeue (observed as hit #17 on one account while
-    three others sat idle)."""
+    three others sat idle).
+
+    Post-opus-4-7 migration: the cascade is single-tier. All new models
+    (opus-4-7 and haiku via normalization) share one bucket. Legacy sonnet-4-6
+    / opus-4-6 also cascade into opus-4-7."""
 
     @pytest.mark.asyncio
-    async def test_disables_sonnet_does_not_cascade_to_opus(self, clean_max_plan_pool, monkeypatch):
-        """Sonnet 429 writes only {sonnet}; Opus (and Haiku, which shares Opus's meter) untouched."""
-        _add_to_pool({"id": "a1", "name": "fresh", "active_tasks": 0})
-        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
-
-        await disable_account_model("a1", SONNET)
-
-        dm = _account_by_id["a1"]["disabled_models"]
-        assert SONNET in dm
-        assert OPUS not in dm, "Sonnet rate limit must not cascade upward to Opus"
-        assert HAIKU not in dm, "Haiku is tracked under Opus's key, never as its own entry"
-        assert dm[SONNET]["hits"] == 1
-        assert _account_state_for_model(_account_by_id["a1"], SONNET) == "unavailable"
-        # Haiku lookup normalizes to Opus → still available.
-        assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "healthy"
-
-    @pytest.mark.asyncio
-    async def test_opus_cascade_blocks_all_tiers(self, clean_max_plan_pool, monkeypatch):
-        """Opus 429 writes {opus, sonnet}. Haiku lookup normalizes to Opus, so all three are blocked."""
+    async def test_disables_opus_writes_single_bucket(self, clean_max_plan_pool, monkeypatch):
+        """Opus-4-7 429 writes the single opus-4-7 cascade entry — no sonnet key
+        under the post-migration single-tier architecture."""
         _add_to_pool({"id": "a1", "name": "opus_limited", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
         await disable_account_model("a1", OPUS)
 
         dm = _account_by_id["a1"]["disabled_models"]
-        assert OPUS in dm and SONNET in dm
+        assert OPUS in dm
+        assert HAIKU not in dm, "Haiku is never a separate key — it shares Opus's meter"
+        assert dm[OPUS]["hits"] == 1
+        assert _account_state_for_model(_account_by_id["a1"], OPUS) == "unavailable"
+        # Haiku lookup normalizes to Opus → also blocked.
+        assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_opus_disable_blocks_haiku_via_shared_meter(self, clean_max_plan_pool, monkeypatch):
+        """Opus-4-7 429 writes {opus-4-7}. Haiku lookup normalizes to Opus-4-7,
+        so haiku requests are also blocked (shared meter)."""
+        _add_to_pool({"id": "a1", "name": "opus_limited", "active_tasks": 0})
+        monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
+
+        await disable_account_model("a1", OPUS)
+
+        dm = _account_by_id["a1"]["disabled_models"]
+        assert OPUS in dm
         assert HAIKU not in dm, "Haiku is never a separate key — it shares Opus's meter"
         assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
 
     @pytest.mark.asyncio
     async def test_disable_haiku_marks_opus_shared_meter(self, clean_max_plan_pool, monkeypatch):
-        """Haiku 429 normalizes to Opus: writes {opus, sonnet}, blocks all three."""
+        """Haiku 429 normalizes to Opus-4-7: writes {opus-4-7}, blocks both haiku and opus-4-7."""
         _add_to_pool({"id": "a1", "name": "haiku_limited", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
         await disable_account_model("a1", HAIKU)
 
         dm = _account_by_id["a1"]["disabled_models"]
-        assert OPUS in dm, "Haiku 429 must disable Opus (shared meter)"
-        assert SONNET in dm, "Opus cascade still covers Sonnet"
+        assert OPUS in dm, "Haiku 429 must disable Opus-4-7 (shared meter)"
         assert HAIKU not in dm
         assert _account_state_for_model(_account_by_id["a1"], OPUS) == "unavailable"
         assert _account_state_for_model(_account_by_id["a1"], HAIKU) == "unavailable"
@@ -1480,20 +1468,20 @@ class TestDisableAccountModel:
         _add_to_pool({"id": "a1", "name": "repeat", "active_tasks": 0})
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
 
-        await disable_account_model("a1", SONNET)
-        assert _account_by_id["a1"]["disabled_models"][SONNET]["hits"] == 1
+        await disable_account_model("a1", OPUS)
+        assert _account_by_id["a1"]["disabled_models"][OPUS]["hits"] == 1
 
-        await disable_account_model("a1", SONNET)
-        assert _account_by_id["a1"]["disabled_models"][SONNET]["hits"] == 2
+        await disable_account_model("a1", OPUS)
+        assert _account_by_id["a1"]["disabled_models"][OPUS]["hits"] == 2
 
-        await disable_account_model("a1", SONNET)
-        assert _account_by_id["a1"]["disabled_models"][SONNET]["hits"] == 3
+        await disable_account_model("a1", OPUS)
+        assert _account_by_id["a1"]["disabled_models"][OPUS]["hits"] == 3
 
     @pytest.mark.asyncio
     async def test_missing_account_is_silent_noop(self, clean_max_plan_pool, monkeypatch):
         """Calling with an unknown account id is a silent no-op (doesn't raise)."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
-        await disable_account_model("does-not-exist", SONNET)  # should not raise
+        await disable_account_model("does-not-exist", OPUS)  # should not raise
 
     @pytest.mark.asyncio
     async def test_persist_failure_queues_retry(self, clean_max_plan_pool, monkeypatch):
@@ -1508,10 +1496,10 @@ class TestDisableAccountModel:
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _raising)
         _pending_rl_persists.clear()
 
-        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
 
         # In-memory state still updated
-        assert SONNET in _account_by_id["a1"]["disabled_models"]
+        assert OPUS in _account_by_id["a1"]["disabled_models"]
         # Retry queue has the account
         assert "a1" in _pending_rl_persists
         _pending_rl_persists.clear()
@@ -1533,13 +1521,13 @@ class TestDisableAccountModel:
         # Before disable: account is healthy → blacklist entry gets pruned.
         pre_blacklist = ["a1"]
         pre_pruned = [aid for aid in pre_blacklist
-                      if not _account_available_for_model(_account_by_id[aid], SONNET)]
+                      if not _account_available_for_model(_account_by_id[aid], OPUS)]
         assert pre_pruned == [], "healthy account should be pruned from task blacklist"
 
         # After disable: account is unavailable → blacklist entry is preserved.
-        await disable_account_model("a1", SONNET)
+        await disable_account_model("a1", OPUS)
         post_pruned = [aid for aid in pre_blacklist
-                       if not _account_available_for_model(_account_by_id[aid], SONNET)]
+                       if not _account_available_for_model(_account_by_id[aid], OPUS)]
         assert post_pruned == ["a1"], (
             "disabled account must stay in blacklist so it isn't re-selected — this is "
             "the fix for the hit #17 thundering-herd loop"

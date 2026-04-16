@@ -160,7 +160,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         failed_children = (await session.execute(
             select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.FAILED)
         )).scalars().all()
-        from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+        from app.failure_classification import worst_child_failure_category, persist_failure_category
         worst_cat = worst_child_failure_category(failed_children)
         persist_failure_category(parent, worst_cat)
         session.add(parent)
@@ -228,7 +228,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
         try:
-            from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class  # noqa: PLC0415
+            from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class
             error_msg = original_status_message or ""
             clone_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
             failure_stage = _derive_failure_stage(failure_class, error_msg)
@@ -468,7 +468,7 @@ async def _process_post_commit(
             # provision failure, agent timeout, etc.)
             if task.first_payload.get("type") == "research":
                 try:
-                    from app.research_completion import _record_research_task_failure  # noqa: PLC0415
+                    from app.research_completion import _record_research_task_failure
                     await _record_research_task_failure(task, session)
                 except Exception as _res_exc:
                     logger.error(f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}", exc_info=True)
@@ -568,7 +568,7 @@ async def _process_post_commit(
                             # conflict or out-of-date branch — the review/fix pipeline
                             # is the only thing that can resolve those).
                             try:
-                                from app.github import enable_auto_merge  # noqa: PLC0415
+                                from app.github import enable_auto_merge
                                 pr_detail = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
                                 if ms in ("blocked", "unstable"):
@@ -793,7 +793,10 @@ async def _process_post_commit(
                         logger.error(f"[REVIEW PIPELINE] Verdict parsing error for task {task.id}: {e}", exc_info=True)
 
                 if not verdict_parsed:
-                    # Fallback: look for APPROVE/REQUEST_CHANGES/COMMENT as standalone words (quoted or unquoted)
+                    # Fallback: look for APPROVE / REQUEST_CHANGES as standalone words
+                    # (quoted or unquoted). COMMENT is no longer a valid verdict — a
+                    # stray occurrence in prose is ignored so the text falls through
+                    # to REQUEST_CHANGES (the safe default).
                     upper_text = verdict_text.upper()
                     approve_idx = max(
                         upper_text.rfind('"APPROVE"'),
@@ -805,23 +808,25 @@ async def _process_post_commit(
                         upper_text.rfind("REQUEST_CHANGES"),
                         upper_text.rfind("REQUEST CHANGES"),
                     )
-                    comment_idx = max(
-                        upper_text.rfind('"COMMENT"'),
-                        upper_text.rfind("COMMENT"),
-                    )
-                    if approve_idx == -1 and rc_idx == -1 and comment_idx == -1:
+                    if approve_idx == -1 and rc_idx == -1:
                         verdict = "REQUEST_CHANGES"
                         feedback = "Review agent did not produce a verdict — manual review required"
                         logger.warning(f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review")
                         verdict_unparseable = True
+                    elif approve_idx > rc_idx:
+                        verdict = "APPROVE"
                     else:
-                        best_idx = max(approve_idx, rc_idx, comment_idx)
-                        if best_idx == approve_idx:
-                            verdict = "APPROVE"
-                        elif best_idx == comment_idx and comment_idx > rc_idx:
-                            verdict = "COMMENT"
-                        else:
-                            verdict = "REQUEST_CHANGES"
+                        verdict = "REQUEST_CHANGES"
+
+                # Invariant: pipeline accepts only APPROVE or REQUEST_CHANGES.
+                # Legacy COMMENT, typos, and other agent regressions normalize to
+                # REQUEST_CHANGES so the pipeline always has a well-defined next step.
+                if verdict not in ("APPROVE", "REQUEST_CHANGES"):
+                    logger.warning(
+                        f"[REVIEW PIPELINE] Task {task.id} produced unsupported verdict "
+                        f"{verdict!r} — normalizing to REQUEST_CHANGES"
+                    )
+                    verdict = "REQUEST_CHANGES"
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -841,7 +846,7 @@ async def _process_post_commit(
                 # Post the review to the PR via GitHub Reviews API (falls back to plain comment)
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                    event = "APPROVE" if verdict == "APPROVE" else ("COMMENT" if verdict == "COMMENT" else "REQUEST_CHANGES")
+                    event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
                     inline_comments = []
                     body_issues = []
                     for issue in issues:
@@ -881,10 +886,7 @@ async def _process_post_commit(
                     try:
                         _cr_token, _cr_owner, _cr_repo = await get_github_token_for_task(task.id, session)
                         _severity_map = {"critical": "failure", "major": "warning", "minor": "notice"}
-                        _conclusion = (
-                            "success" if verdict == "APPROVE"
-                            else ("neutral" if verdict == "COMMENT" else "action_required")
-                        )
+                        _conclusion = "success" if verdict == "APPROVE" else "action_required"
                         _annotations = []
                         for _issue in issues:
                             if _issue.get("file") and _issue.get("line"):
@@ -1311,15 +1313,11 @@ async def _process_post_commit(
                         session.add(task)
                         await session.commit()
                         action_taken = True
-                elif verdict == "COMMENT":
-                    # COMMENT — informational review posted, no fix task spawned, no merge
-                    logger.info(f"[REVIEW PIPELINE] COMMENT verdict for PR #{pr_number} — informational review posted, no action taken")
-                    task.latest_status_message = f"Informational review posted for PR #{pr_number} — no changes required"
-                    session.add(task)
-                    await session.commit()
-                    action_taken = True
                 else:
-                    # REQUEST_CHANGES — include CI errors if available (don't wait)
+                    # REQUEST_CHANGES — include CI errors if available (don't wait).
+                    # After verdict normalization above this is the only non-APPROVE branch;
+                    # any non-standard verdict (e.g., legacy COMMENT) has already been
+                    # rewritten to REQUEST_CHANGES and lands here.
                     ci_errors_text = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
@@ -1569,7 +1567,7 @@ async def _process_post_commit(
                     # event which added task.id to _terminated_task_ids, revoking the
                     # JWT. Since the completion handler hit a transient error and we're
                     # requeuing, drop the cache entry so the next VM can claim.
-                    from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                    from app.routers.agent import _terminated_task_ids
                     _terminated_task_ids.pop(str(task.id), None)
                     task.attempt_count += 1
                     task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -1587,8 +1585,8 @@ async def _process_post_commit(
                     task.latest_status_message = (
                         f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                     )
-                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
-                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    from app.failure_classification import persist_failure_category
+                    from app.routers.agent_status import record_task_result
                     _fc_handler = classify_failure(task)
                     persist_failure_category(task, _fc_handler)
                     record_task_result(success=False, failure_class=_fc_handler, task_id=str(task.id), task_type=(task.first_payload or {}).get("type", ""))

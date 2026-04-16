@@ -11,8 +11,13 @@ resource "google_cloud_run_v2_service" "orchestrator" {
     # Reaper + orchestrator background loops need min=1 to stay warm.
     scaling {
       min_instance_count = 1
-      max_instance_count = 3
+      max_instance_count = 5
     }
+    # Per-instance concurrency (default is 80). Bumped so the admin UI polling
+    # + background loops don't hit "no available instance" 429s during cold
+    # starts or scale-up lag. Cloud Run's 429 response bypasses our CORS
+    # middleware, so the frontend sees CORS errors instead of a retryable 429.
+    max_instance_request_concurrency = 120
 
     containers {
       # Placeholder image. CI/CD will overwrite this with the actual application image.

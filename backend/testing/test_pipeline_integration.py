@@ -11,12 +11,22 @@ broadcasts) are mocked so no real infrastructure is required.
 import json
 import uuid
 import pytest
+from datetime import datetime, timedelta, timezone
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
 from app.auth import create_agent_token
-from app.review_pipeline import _spawn_pipeline_task, MAX_REVIEW_FIX_ITERATIONS
+from app.review_pipeline import (
+    _spawn_pipeline_task,
+    MAX_REVIEW_FIX_ITERATIONS,
+    PIPELINE_TASK_STALE_MINUTES,
+)
+
+
+def _naive_utcnow() -> datetime:
+    """Naive UTC datetime matching what app.time_utils._utcnow() produces."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -2085,4 +2095,257 @@ async def test_auto_playbook_timeout_signature(db_session, mocker):
     doc = project.design_doc or {}
     assert any(k.startswith("playbook/auto-timeout") for k in doc), (
         "Expected a playbook key starting with 'auto-timeout'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dedup guard: type-awareness and liveness
+# ---------------------------------------------------------------------------
+#
+# Historic bug (#1710, #1683): _spawn_pipeline_task ignored task_type when
+# deduping against active pipeline tasks on the same PR/chain. Asking for a
+# "fix" while a "review" was in flight returned the review as if it were the
+# fix, so merge conflicts never got resolved — the PR sat forever with an
+# approved informational review. The tests below pin the corrected semantics.
+
+
+@pytest.mark.asyncio
+async def test_dedup_cross_type_fix_cancels_stale_review(
+    client: AsyncClient, db_session, mocker
+):
+    """Fix requested while review is in flight on the same chain → cancel the
+    review and permit the fresh fix. A review scoped to a pre-conflict /
+    pre-CI-failure snapshot produces stale verdicts; the fix must take over."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Cross-Type Dedup Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        vm_instance_id="agent-orig-xt",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    alive_review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 4277,
+            "branch": "blueprint/task-xt",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4277}},
+        vm_instance_id="agent-review-xt",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_naive_utcnow(),
+    )
+    db_session.add(alive_review)
+    await db_session.commit()
+    await db_session.refresh(alive_review)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "pr_number": 4277,
+            "branch": "blueprint/task-xt",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4277}},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(ci_task)
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    fix_task, was_created = await _spawn_pipeline_task(
+        ci_task, "fix", db_session, 4277, "blueprint/task-xt", "main",
+        fix_prompt="rebase and resolve",
+        original_task_id=str(original.id),
+    )
+    await db_session.commit()
+
+    assert was_created is True, (
+        "A fresh fix task must be created, not a return of the review corpse"
+    )
+    assert fix_task is not None
+    assert _task_type(fix_task) == "fix", (
+        f"Returned task must be a fix, got {_task_type(fix_task)!r}"
+    )
+
+    await db_session.refresh(alive_review)
+    assert alive_review.status == TaskStatus.CANCELLED, (
+        f"Stale review should be cancelled, got {alive_review.status}: "
+        f"{alive_review.latest_status_message!r}"
+    )
+    assert "superseded by fix" in (alive_review.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_dedup_same_type_stale_task_superseded(
+    client: AsyncClient, db_session, mocker
+):
+    """Same-type task with no heartbeat past the stale threshold → cancelled
+    and superseded by the new spawn. Prior behaviour returned the corpse as a
+    dedup hit, blocking the caller until the 30-min CI backstop timed out
+    (root cause of the FAILED-but-CI-passed tasks on PRs #1705/#1688/#1676)."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Stale Supersede Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        vm_instance_id="agent-orig-stale",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    stale_hb = _naive_utcnow() - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 10)
+    dying_review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 4288,
+            "branch": "blueprint/task-stale",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4288}},
+        vm_instance_id="agent-dying",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=stale_hb,
+        started_at=stale_hb,
+    )
+    db_session.add(dying_review)
+    await db_session.commit()
+    await db_session.refresh(dying_review)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "pr_number": 4288,
+            "branch": "blueprint/task-stale",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4288}},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(ci_task)
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    review_task, was_created = await _spawn_pipeline_task(
+        ci_task, "review", db_session, 4288, "blueprint/task-stale", "main",
+        original_prompt="review again",
+        original_task_id=str(original.id),
+    )
+    await db_session.commit()
+
+    assert was_created is True, "Stale review must be superseded, not returned"
+    assert review_task is not None
+    assert review_task.id != dying_review.id
+
+    await db_session.refresh(dying_review)
+    assert dying_review.status == TaskStatus.CANCELLED
+    assert "no heartbeat" in (dying_review.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_dedup_review_deferred_while_fix_active(
+    client: AsyncClient, db_session, mocker
+):
+    """Review requested while a fix is in flight on the same chain → defer
+    (return (None, False)). Reviewing pre-fix code is wasteful and the fix
+    will change the diff the reviewer looks at. Ensures no silent substitution
+    in the opposite direction from the cross-type fix test above."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Deferred Review Test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        vm_instance_id="agent-orig-def",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    alive_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 4299,
+            "branch": "blueprint/task-def",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4299}},
+        vm_instance_id="agent-fix-def",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_naive_utcnow(),
+    )
+    db_session.add(alive_fix)
+    await db_session.commit()
+    await db_session.refresh(alive_fix)
+
+    source = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "pr_number": 4299,
+            "branch": "blueprint/task-def",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 4299}},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+
+    review_task, was_created = await _spawn_pipeline_task(
+        source, "review", db_session, 4299, "blueprint/task-def", "main",
+        original_prompt="review",
+        original_task_id=str(original.id),
+    )
+    await db_session.commit()
+
+    assert review_task is None
+    assert was_created is False
+
+    await db_session.refresh(source)
+    assert "deferred" in (source.latest_status_message or "").lower()
+
+    await db_session.refresh(alive_fix)
+    assert alive_fix.status == TaskStatus.IN_PROGRESS, (
+        "The running fix must not be cancelled when a review is deferred"
     )

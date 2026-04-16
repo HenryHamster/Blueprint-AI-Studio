@@ -6,8 +6,8 @@ function slots in that module.
 """
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -105,6 +105,78 @@ async def _build_shipped_changes_manifest(
                 by_direction[dir_id]["all_changed_files"].append(f)
 
     return list(by_direction.values())
+
+
+async def _build_recent_interventions(
+    project: Project, session: AsyncSession, limit: int = 15, lookback_days: int = 21
+) -> dict[str, Any]:
+    """Build a time-series view of recent merged work + per-week merge-rate deltas.
+
+    Returns {merges: [...], weekly_rates: [...]} where:
+      - merges: last `limit` merged PRs, each with {pr_title, pr_number,
+        direction_id, direction_text, week, merged_at}
+      - weekly_rates: per-week create/merge counts + rate + delta vs prior week
+        (same shape as admin_analytics._weekly_merge_rate_deltas)
+
+    The strategic agent uses this to notice when recent features correlate
+    with metric movement — correlation, NOT causation. The prompt frames
+    the uncertainty explicitly.
+    """
+    cutoff = _utcnow() - timedelta(days=lookback_days)
+
+    # All tasks in the lookback window — needed for the weekly rate calc
+    tasks_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.created_at >= cutoff,
+        )
+    )
+    tasks_in_window = list(tasks_result.scalars().all())
+
+    # Compute weekly rates using the shared helper
+    from app.routers.admin_analytics import _weekly_merge_rate_deltas  # noqa: PLC0415
+    weekly_rates = _weekly_merge_rate_deltas(tasks_in_window)
+
+    # Build direction lookup for text enrichment
+    directions_by_id: dict[str, str] = {
+        d.get("id", ""): d.get("text", "")[:200]
+        for d in (project.directions or [])
+        if d.get("id")
+    }
+
+    # Extract the latest N merged tasks, newest first
+    merged = [
+        t for t in tasks_in_window
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+    ]
+    merged.sort(
+        key=lambda t: t.updated_at or t.created_at or datetime.min,
+        reverse=True,
+    )
+
+    merges_out: list[dict[str, Any]] = []
+    for t in merged[:limit]:
+        ctx = t.context or {}
+        merged_at = t.updated_at or t.created_at
+        week_key = None
+        if merged_at:
+            d = merged_at.date()
+            week_key = (d - timedelta(days=d.weekday())).isoformat()
+        direction_id = ctx.get("direction_id")
+        merges_out.append({
+            "pr_title": (t.title or "")[:200],
+            "pr_number": ctx.get("rollup_pr_number") or ctx.get("pr_number"),
+            "direction_id": direction_id,
+            "direction_text": directions_by_id.get(direction_id, "") if direction_id else "",
+            "week": week_key,
+            "merged_at": merged_at.isoformat() if merged_at else None,
+        })
+
+    return {
+        "merges": merges_out,
+        "weekly_rates": weekly_rates,
+        "lookback_days": lookback_days,
+    }
 
 
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
@@ -280,6 +352,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
     from app.strategic_analysis import _build_outcome_evaluation  # noqa: PLC0415
+    recent_interventions = await _build_recent_interventions(project, session)
     payload: dict = validate_internal_payload({
         "type": "strategic_review",
         "research_mode": "strategic",
@@ -287,6 +360,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "vision": project.vision or {},
         "directions_summary": direction_stats,
         "outcome_evaluation": _build_outcome_evaluation(project),
+        "recent_interventions": recent_interventions,
         "project_name": project.name,
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,

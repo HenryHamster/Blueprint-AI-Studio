@@ -2530,3 +2530,52 @@ class TestEnsureVmDeletedCountDecrement:
 
         assert result is False
         assert main_module._last_gcp_vm_count == 3
+
+
+# ── Review verdict: binary-only invariant ───────────────────────────────────
+#
+# Pipeline-level reviews must resolve to APPROVE or REQUEST_CHANGES. The
+# historic COMMENT "informational review" verdict created an orphaned-PR path
+# (#1710, #1683): a fix was expected but a pure review got spawned and exited
+# with an informational comment, leaving the conflict unresolved.
+
+class TestReviewVerdictBinaryOnly:
+    def test_submit_pr_review_schema_rejects_comment(self):
+        """The GitHub review submission schema must reject COMMENT so a
+        pipeline regression that re-enables COMMENT cannot silently ship an
+        informational review. Previously the regex ``^(APPROVE|REQUEST_CHANGES|COMMENT)$``
+        admitted the 'informational' path that stranded two rollup PRs."""
+        import uuid as _uuid
+        from pydantic import ValidationError
+        from app.schemas import GitHubSubmitPRReviewRequest
+
+        base = {
+            "task_id": _uuid.uuid4(),
+            "owner": "HenryHamster",
+            "repo": "BlueprintAIStudio",
+            "pr_number": 1,
+            "body": "review body",
+        }
+        GitHubSubmitPRReviewRequest(**base, event="APPROVE")
+        GitHubSubmitPRReviewRequest(**base, event="REQUEST_CHANGES")
+        with pytest.raises(ValidationError):
+            GitHubSubmitPRReviewRequest(**base, event="COMMENT")
+
+    def test_submit_pr_review_schema_rejects_unknown_verbs(self):
+        """Defense in depth: any non-{APPROVE, REQUEST_CHANGES} verb is rejected.
+        Prevents future regressions if someone adds a new "advisory" or
+        "NEUTRAL" mode without threading it through the pipeline properly."""
+        import uuid as _uuid
+        from pydantic import ValidationError
+        from app.schemas import GitHubSubmitPRReviewRequest
+
+        base = {
+            "task_id": _uuid.uuid4(),
+            "owner": "HenryHamster",
+            "repo": "BlueprintAIStudio",
+            "pr_number": 1,
+            "body": "review body",
+        }
+        for bad in ("NEUTRAL", "ADVISORY", "COMMENT_ONLY", "comment", "approve"):
+            with pytest.raises(ValidationError):
+                GitHubSubmitPRReviewRequest(**base, event=bad)

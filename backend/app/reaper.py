@@ -698,6 +698,23 @@ async def reaper_service():
                         )
                     )).scalars().all()
 
+                    # Parent tasks (those with children) must not be resurrected as leaf
+                    # dispatches — they only fail via _requeue_parent_task after exhausting
+                    # the re-evaluation budget, and resurrecting them back to QUEUED would
+                    # cause the orchestrator to dispatch a research/plan parent as if it
+                    # were a work task. Parents recover through Step 4 (which re-clones
+                    # failed children), not through Step 5. Batch-fetch parent IDs that
+                    # have any children to skip them here.
+                    _parent_ids_with_children: set[uuid.UUID] = set()
+                    if _infra_failed:
+                        _failed_ids = [_t.id for _t in _infra_failed]
+                        _child_rows = (await session.execute(
+                            select(Task.parent_task_id).where(
+                                Task.parent_task_id.in_(_failed_ids)
+                            ).distinct()
+                        )).scalars().all()
+                        _parent_ids_with_children = {pid for pid in _child_rows if pid is not None}
+
                     _resurrected = 0
                     for _t in _infra_failed:
                         _ctx = _t.context or {}
@@ -706,6 +723,10 @@ async def reaper_service():
                         if _fail_cat not in INFRA_CLASSES:
                             continue
                         if _ctx.get("_resurrection_count", 0) >= 1:
+                            continue
+                        # Skip parents — they must re-evaluate via _requeue_parent_task, not
+                        # resurrect as leaf dispatches.
+                        if _t.id in _parent_ids_with_children:
                             continue
 
                         # Check that the specific infrastructure issue has resolved.

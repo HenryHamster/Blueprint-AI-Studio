@@ -370,11 +370,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
+    tasks_spawned = (task.context or {}).get("_strategic_tasks_spawned", 0)
     api_was_used = (
         (task.context or {}).get("_strategic_vision_set", False)
         or vision_rev > spawned_vision_rev
         or (task.context or {}).get("_strategic_dirs_created", 0) > 0
         or (task.context or {}).get("_strategic_dirs_retired", 0) > 0
+        or tasks_spawned > 0
         or (task.context or {}).get("_strategic_api_called", False)
     )
 
@@ -384,18 +386,21 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         if cycle_id:
             _vision_updated = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
-            _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired"
+            _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
+            _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
                 "vision_updated": _vision_updated,
                 "directions_created": dirs_created,
                 "directions_retired": dirs_retired,
+                "tasks_spawned": tasks_spawned,
                 "outcome": "completed",
                 "summary_text": _summary,
             })
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
-        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired"
+        _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
+        task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired{_spawn_suffix_msg}"
         session.add(task)
         try:
             from app.notification_dispatch import post_cycle_summary_message  # noqa: PLC0415

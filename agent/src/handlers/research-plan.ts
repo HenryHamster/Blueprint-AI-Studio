@@ -633,6 +633,50 @@ ${hotspotsSection}
       }
     }
 
+    // Recent interventions — time-series view of what shipped + per-week rate deltas.
+    // Given with explicit non-causal framing so the agent doesn't over-attribute.
+    const recentInterventions = payload.recent_interventions as Record<string, unknown> | undefined;
+    let recentWorkSection = '';
+    if (recentInterventions && typeof recentInterventions === 'object') {
+      const merges = Array.isArray(recentInterventions.merges)
+        ? recentInterventions.merges as Array<Record<string, unknown>>
+        : [];
+      const weeklyRates = Array.isArray(recentInterventions.weekly_rates)
+        ? recentInterventions.weekly_rates as Array<Record<string, unknown>>
+        : [];
+      if (merges.length > 0 || weeklyRates.length > 0) {
+        const lines: string[] = ['\n# Recent Work & Weekly Outcomes'];
+        lines.push('IMPORTANT — read this carefully before acting:');
+        lines.push('- Correlation is NOT causation. Weekly rate swings can reflect shifts in task difficulty, external factors (account health, rate limits, CI outages), or random variance on small samples.');
+        lines.push('- Only act on patterns spanning 2+ consecutive weeks with a consistent direction.');
+        lines.push('- If one week looks anomalous, check the directions_summary before concluding anything.');
+        lines.push('- Prefer "investigate whether X helps" (via ./strategic spawn-task) over "revert X".');
+        if (weeklyRates.length > 0) {
+          lines.push('\nWeekly merge-rate trend:');
+          for (const w of weeklyRates) {
+            const week = strVal(w.week, '?');
+            const created = typeof w.created === 'number' ? w.created : 0;
+            const merged = typeof w.merged === 'number' ? w.merged : 0;
+            const rate = typeof w.merge_rate === 'number' ? `${Math.round((w.merge_rate as number) * 100)}%` : 'n/a';
+            const delta = typeof w.merge_rate_delta === 'number' ? ` (Δ ${(w.merge_rate_delta as number) >= 0 ? '+' : ''}${Math.round((w.merge_rate_delta as number) * 100)}pp)` : '';
+            lines.push(`  ${week}: ${merged}/${created} merged (${rate})${delta}`);
+          }
+        }
+        if (merges.length > 0) {
+          lines.push('\nRecent merges (newest first):');
+          for (const m of merges) {
+            const title = strVal(m.pr_title, '?').slice(0, 120);
+            const pr = m.pr_number ? `#${m.pr_number}` : '';
+            const week = strVal(m.week, '?');
+            const dirText = strVal(m.direction_text, '').slice(0, 80);
+            const dirTag = dirText ? ` [direction: ${dirText}]` : ' [no direction]';
+            lines.push(`  - ${title} ${pr} (week ${week})${dirTag}`);
+          }
+        }
+        recentWorkSection = lines.join('\n') + '\n';
+      }
+    }
+
     // Unified conversation thread — chronological, shows back-and-forth
     const conversationThread = Array.isArray(payload.conversation_thread)
       ? payload.conversation_thread as Array<Record<string, unknown>>
@@ -742,7 +786,7 @@ ${hotspotsSection}
     const strategicHelper = `#!/bin/bash
 # Strategic review tool — updates vision, directions, and messages via API
 # Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env
-OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message <json>}"
+OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task <json>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -787,6 +831,7 @@ case "\$OP" in
   retire-direction)  _call "retire_direction" ;;
   create-message)    _call "create_message" ;;
   resolve-message)   _call "resolve_message" ;;
+  spawn-task)        _call "spawn_task" ;;
   *) echo "Unknown op: \$OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -856,7 +901,7 @@ ${dirSummaryText}
 
 ## Direction Health
 ${dirHealthSummary}
-${feedbackSection}${threadSection}
+${recentWorkSection}${feedbackSection}${threadSection}
 # Your task
 
 Read the vision's purpose and context carefully. They tell you what kind of project this is and what the user values. Calibrate every recommendation to what the user actually needs, not to a generic "best practices" standard. Different projects have radically different priorities — don't assume yours.
@@ -927,6 +972,15 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 # Retire directions
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+
+# Spawn a targeted investigation task (research or plan only) when something from
+# the Recent Work section needs investigation NOW instead of waiting for the next
+# autonomous cycle. The spawned task runs at high priority (ahead of routine work).
+# USE THIS FOR: measuring whether a shipped feature correlates with a rate change,
+# auditing a suspicious pattern, investigating a user message that's blocking progress.
+# DO NOT USE AS: a way to skip direction review, or to directly spawn implementation
+# (create/fix/refactor are explicitly rejected — those must go through normal flow).
+./strategic spawn-task '{"type": "research", "title": "Measure whether X shipped in week Y correlates with the merge-rate drop", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 
 # Save notes
 ./design-doc set "notes/strategic-review" '"..."'

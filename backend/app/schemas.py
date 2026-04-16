@@ -1,6 +1,6 @@
 """Pydantic request/response schemas for Blueprint API endpoints."""
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -10,26 +10,26 @@ from app.models import TaskStatus, ArtifactType
 class DeployPayload(BaseModel):
     name: str
     payloads: List[Dict[str, Any]]
-    github_owner: Optional[str] = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
-    github_repo: Optional[str] = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
+    github_owner: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
+    github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
 
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     status: TaskStatus
-    artifact_type: Optional[ArtifactType] = None
-    commit_hash: Optional[str] = None
-    repo_url: Optional[str] = None
-    pr_url: Optional[str] = None
-    storage_uri: Optional[str] = None
-    logs: Optional[str] = Field(None, max_length=500000)
-    verdict_json: Optional[str] = Field(None, max_length=10000)
-    failure_category: Optional[str] = Field(None, max_length=50)
-    changed_files: Optional[List[str]] = Field(None, max_length=100)
-    test_failure_summary: Optional[str] = Field(None, max_length=5000)
-    self_review_outcome: Optional[Dict[str, Any]] = None
-    diff_summary: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
-    file_change_details: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
+    artifact_type: ArtifactType | None = None
+    commit_hash: str | None = None
+    repo_url: str | None = None
+    pr_url: str | None = None
+    storage_uri: str | None = None
+    logs: str | None = Field(None, max_length=500000)
+    verdict_json: str | None = Field(None, max_length=10000)
+    failure_category: str | None = Field(None, max_length=50)
+    changed_files: List[str] | None = Field(None, max_length=100)
+    test_failure_summary: str | None = Field(None, max_length=5000)
+    self_review_outcome: Dict[str, Any] | None = None
+    diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
+    file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -38,26 +38,26 @@ class UploadUrlRequest(BaseModel):
 
 class HeartbeatMetrics(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    rss_mb: Optional[float] = None
-    heap_used_mb: Optional[float] = None
-    disk_free_mb: Optional[float] = None
-    disk_total_mb: Optional[float] = None
-    cgroup_mb: Optional[float] = None
-    cgroup_limit_mb: Optional[float] = None
+    rss_mb: float | None = None
+    heap_used_mb: float | None = None
+    disk_free_mb: float | None = None
+    disk_total_mb: float | None = None
+    cgroup_mb: float | None = None
+    cgroup_limit_mb: float | None = None
 
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
-    status_message: Optional[str] = None
-    metrics: Optional[HeartbeatMetrics] = None
+    status_message: str | None = None
+    metrics: HeartbeatMetrics | None = None
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     payloads: List[Dict[str, Any]] = Field(max_length=20)
     requires_approval: bool = False
-    context: Optional[Dict[str, Any]] = None
-    priority: Optional[int] = Field(default=None, ge=0, le=100)
+    context: Dict[str, Any] | None = None
+    priority: int | None = Field(default=None, ge=0, le=100)
 
 class GitHubCommitStatusRequest(BaseModel):
     task_id: uuid.UUID
@@ -91,7 +91,7 @@ class GitHubSubmitPRReviewRequest(BaseModel):
     owner: str = Field(..., min_length=1)
     repo: str = Field(..., min_length=1)
     pr_number: int
-    event: str = Field(..., pattern="^(APPROVE|REQUEST_CHANGES|COMMENT)$")
+    event: str = Field(..., pattern="^(APPROVE|REQUEST_CHANGES)$")
     body: str = Field(..., min_length=1)
     comments: list[dict] = Field(default_factory=list)
 
@@ -101,7 +101,7 @@ class GitHubCreateIssueRequest(BaseModel):
     repo: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
     body: str = ""
-    assignees: Optional[List[str]] = None
+    assignees: List[str] | None = None
 
 class GitHubGetIssuesRequest(BaseModel):
     task_id: uuid.UUID
@@ -141,25 +141,25 @@ class BuildConfigDirectoryEntry(BaseModel):
     """A single directory entry within a project's build configuration."""
     path: str = Field(..., min_length=1)
     type: str = Field(..., pattern="^(python|node|go|rust|other)$")
-    lint_cmd: Optional[str] = None
-    build_cmd: Optional[str] = None
-    test_cmd: Optional[str] = None
-    install_cmd: Optional[str] = None
+    lint_cmd: str | None = None
+    build_cmd: str | None = None
+    test_cmd: str | None = None
+    install_cmd: str | None = None
 
 
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
-    language: Optional[str] = Field(None, pattern="^(python|typescript|go|rust|mixed)$")
+    language: str | None = Field(None, pattern="^(python|typescript|go|rust|mixed)$")
     directories: List[BuildConfigDirectoryEntry] = Field(default_factory=list)
     env_vars: Dict[str, str] = Field(default_factory=dict)
     git_user_name: str = "Blueprint Agent"
     git_user_email: str = "blueprint-agent@automated.dev"
-    detected_at: Optional[str] = None
+    detected_at: str | None = None
 
 
 class OnboardPayload(BaseModel):
     """Payload for the project onboarding endpoint."""
     github_owner: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
-    name: Optional[str] = None
-    build_config_override: Optional[Dict[str, Any]] = None
+    name: str | None = None
+    build_config_override: Dict[str, Any] | None = None

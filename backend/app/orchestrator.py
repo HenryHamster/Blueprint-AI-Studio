@@ -246,12 +246,10 @@ async def _persist_pipeline_events():
     """Snapshot pipeline events ring buffer to DB so alert windows survive restarts."""
     from app.deploy_health import _get_deploy_state_for_update
     try:
-        events_list = []
-        for e in _shared_state.deploy_monitoring["pipeline_events"]:
-            events_list.append({
-                k: v.isoformat() if isinstance(v, datetime) else v
-                for k, v in e.items()
-            })
+        events_list = [
+            {k: v.isoformat() if isinstance(v, datetime) else v for k, v in e.items()}
+            for e in _shared_state.deploy_monitoring["pipeline_events"]
+        ]
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:
@@ -1461,8 +1459,8 @@ async def orchestrator_worker():
                                     logger.exception(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
                                     ci_task.status = TaskStatus.FAILED
                                     ci_task.latest_status_message = _pr_gone_msg
-                                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
-                                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                                    from app.failure_classification import persist_failure_category
+                                    from app.routers.agent_status import record_task_result
                                     persist_failure_category(ci_task, "EXTERNAL_API")
                                     record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                                     session.add(ci_task)
@@ -1558,30 +1556,44 @@ async def orchestrator_worker():
                                 f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
                                 f"every fix — do not leave uncommitted changes."
                             )
-                            fix_task, _ = await _spawn_pipeline_task(
+                            fix_task, fix_was_created = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
                                 fix_prompt=fix_prompt, original_task_id=ci_orig_id
                             )
                             if fix_task:
                                 ci_task.status = TaskStatus.COMPLETED
-                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
-                                # Clear ci_waiting and mark as handled to prevent duplicate fix spawns
                                 ci_loop_ctx = dict(ci_loop)
                                 ci_loop_ctx["ci_waiting"] = False
                                 ci_loop_ctx["conflict_fix_spawned"] = str(fix_task.id)
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop_ctx}
-                                logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
+                                if fix_was_created:
+                                    ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
+                                    logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")
+                                else:
+                                    ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, existing fix continues → {fix_task.id}"
+                                    logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, existing fix continues → {fix_task.id}")
                             else:
-                                # Fix not spawned — likely duplicate guard (fix already running) or iteration cap
-                                ci_task.status = TaskStatus.FAILED
-                                ci_task.requires_approval = True
-                                ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
-                                logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
-                                await _maybe_create_failure_alert(ci_task, session, f"PR #{ci_pr_number} merge conflicts — fix iteration cap exhausted, manual intervention required")
-                                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                                _fc_mc = classify_failure(ci_task)
-                                persist_failure_category(ci_task, _fc_mc)
-                                record_task_result(success=False, failure_class=_fc_mc, task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
+                                # Fix not spawned — either iteration cap exhausted, or a
+                                # different-type task (e.g. a review) is still running on
+                                # the same chain and must finish first. In both cases the
+                                # CI-wait sweep on the next tick will re-evaluate; only
+                                # escalate to FAILED + requires_approval when we actually
+                                # know the cap is exhausted.
+                                msg = (ci_task.latest_status_message or "").lower()
+                                deferred = "deferred" in msg
+                                if deferred:
+                                    ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — waiting on in-flight pipeline task"
+                                    logger.info(f"[CI] PR #{ci_pr_number} conflict-fix deferred — a different-type pipeline task is still running, will retry on next sweep")
+                                else:
+                                    ci_task.status = TaskStatus.FAILED
+                                    ci_task.requires_approval = True
+                                    ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
+                                    logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
+                                    await _maybe_create_failure_alert(ci_task, session, f"PR #{ci_pr_number} merge conflicts — fix iteration cap exhausted, manual intervention required")
+                                    from app.failure_classification import classify_failure, persist_failure_category
+                                    _fc_mc = classify_failure(ci_task)
+                                    persist_failure_category(ci_task, _fc_mc)
+                                    record_task_result(success=False, failure_class=_fc_mc, task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -1661,7 +1673,7 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
                                 await _maybe_create_failure_alert(ci_task, session, "CI polling failed: PR returned 404 — PR may have been deleted or archived")
-                                from app.failure_classification import persist_failure_category as _pfc404  # noqa: PLC0415
+                                from app.failure_classification import persist_failure_category as _pfc404
                                 _pfc404(ci_task, "EXTERNAL_API")
                                 record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             else:

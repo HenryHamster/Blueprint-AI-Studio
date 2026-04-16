@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -906,11 +907,18 @@ async def get_digest(
     lookback_start = min(raw_lookback, prev_window_start)
 
     # --- Query tasks from extended lookback window ---
-    # Only load terminal tasks — QUEUED/PROVISIONING/IN_PROGRESS are not used by
-    # this endpoint and can represent significant memory with large JSONB payloads.
+    # Load terminal tasks (COMPLETED/FAILED) for digest stats, plus any task
+    # with requires_approval=True so we can surface pending-approval items in
+    # needs_attention even while they are still IN_PROGRESS/QUEUED/etc.
+    # QUEUED/PROVISIONING/IN_PROGRESS without approval flags are excluded here
+    # to keep JSONB payload memory bounded; active counts come from a separate
+    # lean query below.
     task_filters = [
         Task.created_at >= lookback_start,
-        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        or_(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.requires_approval.is_(True),
+        ),
     ]
     if project_id:
         task_filters.append(Task.project_id == project_id)
@@ -1831,6 +1839,49 @@ async def get_scope_baselines(
     tasks = result.scalars().all()
 
     return _compute_scope_baselines(list(tasks), lookback_days)
+
+
+def _weekly_merge_rate_deltas(tasks: list) -> List[Dict[str, Any]]:
+    """Bucket tasks by week and compute per-week merge rate + delta vs prior week.
+
+    Shared between medium-scope measurement and strategic payload enrichment
+    (backend/app/strategic_spawning.py::_build_recent_interventions).
+
+    Returns a list of per-week dicts sorted chronologically:
+        {week: ISO Monday date, created: int, merged: int,
+         merge_rate: float|None, merge_rate_delta: float|None}
+    """
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
+    for t in tasks:
+        if not t.created_at:
+            continue
+        task_date = t.created_at.date()
+        week_monday = task_date - timedelta(days=task_date.weekday())
+        week_key = week_monday.isoformat()
+        week_bucket[week_key]["created"] += 1
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            week_bucket[week_key]["merged"] += 1
+
+    sorted_weeks = sorted(week_bucket.keys())
+    out: List[Dict[str, Any]] = []
+    for i, week_key in enumerate(sorted_weeks):
+        counts = week_bucket[week_key]
+        created = counts["created"]
+        merged = counts["merged"]
+        merge_rate = round(merged / created, 3) if created > 0 else None
+        if i == 0:
+            delta = None
+        else:
+            prev_rate = out[i - 1]["merge_rate"]
+            delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
+        out.append({
+            "week": week_key,
+            "created": created,
+            "merged": merged,
+            "merge_rate": merge_rate,
+            "merge_rate_delta": delta,
+        })
+    return out
 
 
 def _compute_medium_scope_measurement(

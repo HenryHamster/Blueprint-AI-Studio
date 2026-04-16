@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sqlalchemy import or_
 from sqlmodel import select
@@ -369,6 +369,82 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
+async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | None:
+    """Return a small summary of the most recent review task on the same chain.
+
+    Used by the CI-wait backstop to build an honest diagnostic reason when the
+    review-approved gate never closed. Matches on project + pr_number + the
+    parent's chain id (original_task_id or parent.id).
+    """
+    rl = (parent.context or {}).get("review_loop", {})
+    pr_number = rl.get("pr_number")
+    original_id = rl.get("original_task_id") or str(parent.id)
+    if not pr_number:
+        return None
+    try:
+        candidates = (await session.execute(
+            select(Task).where(Task.project_id == parent.project_id)
+        )).scalars().all()
+        matches = [
+            t for t in candidates
+            if t.first_payload.get("type") == "review"
+            and t.first_payload.get("pr_number") == pr_number
+            and (t.first_payload.get("original_task_id") or "") == original_id
+        ]
+        if not matches:
+            return None
+        # datetime.min is a naive sentinel matching our naive-UTC column convention;
+        # only used when created_at is unset (should not happen — DB sets a default).
+        latest = max(matches, key=lambda t: t.created_at or datetime.min)  # noqa: DTZ901
+        status_val = latest.status.value if hasattr(latest.status, "value") else str(latest.status)
+        return {
+            "id": str(latest.id),
+            "short_id": str(latest.id)[:8],
+            "status": status_val,
+            "last_heartbeat": latest.last_heartbeat,
+        }
+    except Exception:
+        logger.debug(
+            f"[EVAL TIMEOUT] Failed to summarize review for task {str(parent.id)[:8]}",
+            exc_info=True,
+        )
+        return None
+
+
+async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict) -> bool:
+    """One-shot attempt to unstick a parent whose review gate never closed.
+
+    Used when CI has passed but review_approved is absent — typically because
+    the original review VM died (rate-limit, crash) before posting status.
+    Spawns a fresh review via the normal pipeline path; the new dedup guard
+    will supersede any stale corpse on the same chain.
+
+    Returns True iff a fresh review was spawned (parent should reset its CI
+    wait window and skip the hard kill for this tick).
+    """
+    from app.review_pipeline import _spawn_pipeline_task
+    pr_number = review_loop.get("pr_number")
+    branch = review_loop.get("branch")
+    base_branch = review_loop.get("base_branch", "main")
+    original_task_id = review_loop.get("original_task_id") or str(parent.id)
+    if not (pr_number and branch):
+        return False
+    try:
+        review_task, _ = await _spawn_pipeline_task(
+            parent, "review", session, pr_number, branch, base_branch,
+            original_prompt=(parent.description or parent.title or ""),
+            original_task_id=original_task_id,
+        )
+        return review_task is not None
+    except Exception as e:
+        logger.warning(
+            f"[EVAL TIMEOUT] Backstop review-recovery spawn failed for task "
+            f"{str(parent.id)[:8]}: {e}",
+            exc_info=True,
+        )
+        return False
+
+
 async def _check_evaluating_timeouts():
     """Detect EVALUATING tasks that are stuck and recover or fail them.
 
@@ -437,14 +513,68 @@ async def _check_evaluating_timeouts():
                     if elapsed <= CI_BACKSTOP_SECONDS:
                         # Under backstop threshold — let normal CI timeout handle it
                         continue
-                    # Over backstop threshold — diagnose why and hard-kill
                     hours = round(elapsed / 3600, 1)
+                    ci_passed = bool(rl.get("ci_passed"))
+                    review_approved = bool(rl.get("review_approved")) or rl.get("verdict") == "APPROVE"
+                    recovery_attempted = bool(rl.get("review_recovery_attempted"))
+                    review_summary = await _summarize_latest_review_for_chain(task, session)
+
+                    # Compose an honest reason. The historic "CI polling stalled after
+                    # escalation" was a lie when the actual blocker was a missing review
+                    # callback (review VM died silently) — name the gate that is open.
                     if ci_ws_val is None:
                         reason = "ci_wait_started missing from review_loop"
                     elif not ci_ws_valid:
                         reason = f"ci_wait_started corrupt: {ci_ws_val!r}"
+                    elif ci_passed and not review_approved:
+                        if review_summary:
+                            reason = (
+                                f"CI passed but review {review_summary['short_id']} is "
+                                f"{review_summary['status']} without verdict callback"
+                            )
+                        else:
+                            reason = "CI passed but no review task exists for this chain"
+                    elif review_approved and not ci_passed:
+                        reason = "review approved but CI never completed within backstop window"
+                    elif was_escalated:
+                        reason = "both gates unmet after 20-min escalation"
                     else:
-                        reason = "CI polling stalled after escalation" if was_escalated else "CI did not complete within backstop window"
+                        reason = "neither CI nor review completed within backstop window"
+
+                    # One-shot recovery: if CI passed but the review-approved gate never
+                    # closed (common when the review VM died before POSTing status),
+                    # spawn a fresh review and reset the CI-wait clock instead of hard
+                    # killing. The dedup guard will supersede any stale corpse.
+                    if (
+                        ci_passed and not review_approved
+                        and not recovery_attempted
+                    ):
+                        recovered = await _attempt_ci_backstop_recovery(task, session, rl)
+                        if recovered:
+                            from sqlalchemy.orm.attributes import flag_modified
+                            new_rl = dict(rl)
+                            new_rl["review_recovery_attempted"] = True
+                            new_rl["review_recovery_at"] = _utcnow().isoformat()
+                            new_rl["ci_wait_started"] = _utcnow().isoformat()
+                            task.context = {**(task.context or {}), "review_loop": new_rl}
+                            flag_modified(task, "context")
+                            task.latest_status_message = (
+                                f"CI passed on PR #{new_rl.get('pr_number')} but review never "
+                                f"completed ({reason}) — spawned fresh review, backstop reset"
+                            )
+                            session.add(task)
+                            await session.commit()
+                            await broadcast_to_project(
+                                str(task.project_id), "task_updated",
+                                {"task_id": str(task.id), "status": task.status},
+                            )
+                            logger.warning(
+                                f"[EVAL TIMEOUT] Backstop recovery for task "
+                                f"{str(task.id)[:8]}: spawned fresh review on "
+                                f"PR #{rl.get('pr_number')} ({reason})"
+                            )
+                            continue
+
                     logger.error(
                         f"[EVAL TIMEOUT] CI-waiting task {str(task.id)[:8]} has been "
                         f"EVALUATING for {hours}h — backstop timeout ({reason}), marking FAILED"
@@ -453,8 +583,8 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         f"CI wait backstop timeout after {hours}h ({reason})"
                     )
-                    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    from app.failure_classification import classify_failure, persist_failure_category
+                    from app.routers.agent_status import record_task_result
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
                     record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
@@ -540,8 +670,8 @@ async def _check_evaluating_timeouts():
                     task.latest_status_message = (
                         "Evaluation timeout — children did not complete within 6 hours"
                     )
-                    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    from app.failure_classification import classify_failure, persist_failure_category
+                    from app.routers.agent_status import record_task_result
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
                     record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))

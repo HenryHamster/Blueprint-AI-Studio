@@ -171,18 +171,15 @@ Use these definitions when assigning severity to issues. Severity affects how th
   - Missing docstring on a public function
   - Redundant else after a return statement
 
-After your thorough review, output EXACTLY one of these JSON blocks as the very last thing in your response:
+After your review, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.
 
-If the changes look good and should be merged:
-{"verdict": "APPROVE", "feedback": "Brief summary of why it's approved"}
+**APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
+{"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
 
-If changes are needed before merging:
-{"verdict": "REQUEST_CHANGES", "feedback": "...", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
+**REQUEST_CHANGES** — something actionable must change before this merges. Use this for any bug, missing test, broken invariant, merge conflict, failing CI signal, or behavior that would surprise a reader. If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES — another round is cheap; a missed regression is expensive.
+{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
 
-If the code is functionally correct but you have purely observational or stylistic notes (no blockers, no required changes):
-{"verdict": "COMMENT", "feedback": "...", "issues": [{"severity": "minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
-
-Use COMMENT when: all issues are minor/stylistic and the code is functionally correct, the review is purely observational with no actionable changes needed, or you want to leave informational feedback without blocking the author. COMMENT does not spawn a fix task and does not merge the PR — the author decides what to do.
+Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY", or any other verdict — they are not accepted and will be normalized to REQUEST_CHANGES. There is no informational-only path: if the change is acceptable → APPROVE (put observations in \`feedback\`); if anything needs changing → REQUEST_CHANGES.
 
 For each issue in the \`issues\` array:
 - \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)

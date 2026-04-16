@@ -1688,7 +1688,7 @@ async def agent_annotate(
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message", "spawn_task"
     data: dict = {}
 
 @app.post("/api/agent/strategic")
@@ -1921,6 +1921,96 @@ async def strategic_operation(
         session.add(msg)
         await session.commit()
         return _resp({"status": "ok", "op": "resolve_message", "message_id": str(msg.id)})
+
+    elif payload.op == "spawn_task":
+        # Allow strategic review to directly spawn a research or plan task for
+        # targeted investigation, jumping the normal autonomous research queue.
+        # Restricted to investigation types — implementation must go through
+        # normal direction → research → plan → create flow.
+        ALLOWED_SPAWN_TYPES = {"research", "plan"}
+        spawn_type = data.get("type")
+        if spawn_type not in ALLOWED_SPAWN_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"spawn_task type must be one of {sorted(ALLOWED_SPAWN_TYPES)}; got '{spawn_type}'",
+            )
+        raw_prompt = str(data.get("prompt", "")).strip()
+        if not raw_prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        raw_title = str(data.get("title", "")).strip()
+        if not raw_title:
+            raise HTTPException(status_code=400, detail="title is required")
+        # Cap to prevent runaway prompts consuming token budget
+        prompt = _cap_str(raw_prompt, 10_000, "prompt", warnings)
+        title = _cap_str(raw_title, 200, "title", warnings)
+        direction_id = data.get("direction_id")
+        if direction_id and not any(
+            d.get("id") == direction_id for d in (project.directions or [])
+        ):
+            raise HTTPException(status_code=400, detail=f"Unknown direction_id: {direction_id}")
+
+        # Build payload — use the same validator the research/plan spawners use
+        # so the new task is indistinguishable from normal autonomous spawns
+        # except for the context flags.
+        spawn_payload: dict = {
+            "type": spawn_type,
+            "prompt": prompt,
+            "title": title,
+            "base_branch": "main",
+        }
+        if direction_id:
+            spawn_payload["direction_id"] = direction_id
+        # Apply per-type model/effort defaults
+        type_model = _runtime_config.get("task_type_models", {}).get(spawn_type) or None
+        type_effort = _runtime_config.get("task_type_efforts", {}).get(spawn_type) or None
+        if type_model:
+            spawn_payload["model"] = type_model
+        if type_effort:
+            spawn_payload["effort"] = type_effort
+        spawn_payload = _validate_internal_payload(
+            spawn_payload, f"strategic_spawn_task:{spawn_type}"
+        )
+
+        new_task_ctx: dict = {
+            "spawned_by": "strategic_direct",
+            "parent_strategic_task_id": str(task.id),
+        }
+        if direction_id:
+            new_task_ctx["direction_id"] = direction_id
+
+        new_task = Task(
+            project_id=project.id,
+            title=title,
+            description=prompt[:500],
+            payloads=[spawn_payload],
+            context=new_task_ctx,
+            status=TaskStatus.QUEUED,
+            priority=100,  # ahead of default (50) — course-correction runs first
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            created_by="STRATEGIC_AGENT",
+        )
+        session.add(new_task)
+        await session.flush()
+
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_tasks_spawned": ctx.get("_strategic_tasks_spawned", 0) + 1,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
+            f"(priority=100) from strategic review {task.id} for project {project.id}"
+        )
+        return _resp({
+            "status": "ok",
+            "op": "spawn_task",
+            "task_id": str(new_task.id),
+            "type": spawn_type,
+            "priority": 100,
+        })
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

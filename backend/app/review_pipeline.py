@@ -8,7 +8,7 @@ or app.task_lifecycle.
 """
 import logging
 import uuid
-from typing import Optional, List
+from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -17,6 +17,7 @@ from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.broadcast import broadcast_to_project
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,32 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
 
+# A pipeline task is considered 'stale' (effectively dead, safe to supersede)
+# when it has not heartbeated for this long. Matches the orchestrator's own
+# reap threshold (see orchestrator.py stale-PROVISIONING recovery) so we don't
+# fight with it — whichever sweep reaches the task first cancels it.
+PIPELINE_TASK_STALE_MINUTES = 15
 
-def _max_review_iterations(task: Task, direction_data: Optional[dict] = None) -> int:
+
+def _is_pipeline_task_stale(task: Task) -> bool:
+    """True if a review/fix task has gone silent and can be superseded.
+
+    Only applies to tasks that have actually started running. A task still
+    waiting in QUEUED (never claimed) is NOT considered stale — long queue
+    waits typically mean rate-limit backoff, not a dead task, and the
+    orchestrator's reap loop owns that state. Once a task has either
+    heartbeated or reached ``started_at``, we measure silence from the
+    freshest of those timestamps.
+    """
+    threshold = _utcnow() - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES)
+    if task.last_heartbeat is not None:
+        return task.last_heartbeat < threshold
+    if task.started_at is None:
+        return False
+    return task.started_at < threshold
+
+
+def _max_review_iterations(task: Task, direction_data: dict | None = None) -> int:
     """Scope-aware review-fix iteration limit, optionally reduced for low-quality directions.
 
     If direction_data is provided and the direction has a poor operator acceptance rate
@@ -55,7 +80,7 @@ def _max_review_iterations(task: Task, direction_data: Optional[dict] = None) ->
     # Direction-aware reduction: cut cap by ~30% for consistently-rejected directions.
     # Only applies when direction_data is available and we're not already at the ci_failure cap.
     if direction_data is not None and fix_reason != 'ci_failure':
-        from app.research_completion import _compute_acceptance_rate  # noqa: PLC0415
+        from app.research_completion import _compute_acceptance_rate
         acceptance_rate = _compute_acceptance_rate(direction_data)
         # Check recent rejection ratio from last few history entries
         recent_history = (direction_data.get("research_history") or [])[-3:]
@@ -76,18 +101,29 @@ async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
-    current_feedback: str = "", fix_reason: str = "", current_issues: list = None
-) -> tuple[Optional[Task], bool]:
+    current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None
+) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
     Returns (task, was_created):
-    - (None, False)          → spawn suppressed (PR already merged, cap reached,
-                                stuck cycle detected — caller must decide follow-up)
-    - (existing_task, False) → dedup hit: a review/fix for the SAME chain is
-                                already in flight (matched on original_task_id).
-                                Caller can trust that the existing task will
-                                handle the work.
-    - (new_task, True)       → a fresh review/fix task was created.
+    - (None, False)          → spawn suppressed. Reasons:
+                                 * PR already merged
+                                 * iteration cap reached (per-chain or global)
+                                 * stuck-cycle detected
+                                 * a DIFFERENT-type task is in flight on the
+                                   same chain and must finish first (e.g. a fix
+                                   is running and the caller asked for a review)
+                                Caller must decide follow-up (retry later, mark
+                                for manual approval, etc.).
+    - (existing_task, False) → same-type dedup hit: a review/fix of the SAME
+                                task_type is already running on the same chain
+                                and is still alive (has heartbeated recently).
+                                Caller can trust it to finish the work.
+    - (new_task, True)       → a fresh review/fix task was created. This path
+                                also fires when we superseded a stale same-
+                                type task, or cancelled an in-flight review
+                                whose snapshot is now stale because the caller
+                                requested a fix.
     """
     # Resolve the chain identifier once, so the "already merged" guard, the
     # dedup guard, and the spawn path all agree on which chain this is.
@@ -116,12 +152,20 @@ async def _spawn_pipeline_task(
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
         return (None, False)
 
-    # Guard: don't spawn if there's already an ACTIVE review or fix for this PR
-    # IN THE SAME CHAIN. Matching on `original_task_id` prevents conflation with
-    # unrelated reviews/fixes that happen to share the pr_number (rollup retries,
-    # concurrent sources targeting the same branch). Same-chain in-flight review
-    # means the current spawn would duplicate work; unrelated pipeline tasks do
-    # not block us.
+    # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
+    # (pr_number, chain, task_type, liveness):
+    #
+    # - Different chain (original_task_id) ⇒ unrelated; ignore.
+    # - Same chain, same type, alive ⇒ real dedup hit; return the existing task.
+    # - Same chain, any type, stale (no heartbeat for PIPELINE_TASK_STALE_MINUTES)
+    #   ⇒ supersede: cancel the corpse and continue to a fresh spawn. This closes
+    #   the "dying VM never posts status, caller blocked forever" path.
+    # - Same chain, different type, alive:
+    #     * fix requested while review in flight ⇒ cancel the review; its verdict
+    #       would be against a pre-conflict / pre-CI-failure snapshot. A fresh
+    #       review auto-spawns once the fix pushes.
+    #     * any other cross-type combo ⇒ return (None, False) and let the caller
+    #       retry on the next tick; no silent substitution.
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -134,13 +178,60 @@ async def _spawn_pipeline_task(
         t_payload = t.first_payload
         t_type = t_payload.get("type")
         t_orig = t_payload.get("original_task_id") or ""
-        if (t_payload.get("pr_number") == pr_number
-                and t_type in ("review", "fix")
-                and t_orig == resolved_original_id):
-            logger.warning(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — same-chain {t_type} already active: {t.id}")
-            source_task.latest_status_message = f"{task_type.title()} skipped for PR #{pr_number} — {t_type} active → {str(t.id)[:8]}"
+        if (t_payload.get("pr_number") != pr_number
+                or t_type not in ("review", "fix")
+                or t_orig != resolved_original_id):
+            continue
+
+        if _is_pipeline_task_stale(t):
+            t.status = TaskStatus.CANCELLED
+            t.latest_status_message = (
+                f"Superseded by new {task_type} for PR #{pr_number}: "
+                f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
+            )
+            session.add(t)
+            logger.warning(
+                f"[PIPELINE] Superseding stale {t_type} task {t.id} "
+                f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
+                f"for PR #{pr_number}"
+            )
+            continue
+
+        if t_type == task_type:
+            logger.warning(
+                f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — "
+                f"same-chain {t_type} already active: {t.id}"
+            )
+            source_task.latest_status_message = (
+                f"{task_type.title()} skipped for PR #{pr_number} — "
+                f"{t_type} active → {str(t.id)[:8]}"
+            )
             session.add(source_task)
             return (t, False)
+
+        if task_type == "fix" and t_type == "review":
+            t.status = TaskStatus.CANCELLED
+            t.latest_status_message = (
+                f"Superseded by fix on PR #{pr_number}: review was scoped to "
+                f"a pre-conflict / pre-CI-failure snapshot"
+            )
+            session.add(t)
+            logger.warning(
+                f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
+                f"so fix can proceed (review snapshot is stale)"
+            )
+            continue
+
+        logger.info(
+            f"[PIPELINE] Deferring {task_type} spawn for PR #{pr_number} — "
+            f"in-flight {t_type} task {t.id} must finish first"
+        )
+        source_task.latest_status_message = (
+            f"{task_type.title()} deferred for PR #{pr_number} — "
+            f"waiting on active {t_type} task {str(t.id)[:8]}"
+        )
+        session.add(source_task)
+        return (None, False)
 
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
     # Filter to tasks matching this PR number (check payloads JSONB)
@@ -156,10 +247,10 @@ async def _spawn_pipeline_task(
         and t.first_payload.get("type") in ("review", "fix")
     )
     # Load direction data for direction-aware cap adjustment.
-    direction_data: Optional[dict] = None
+    direction_data: dict | None = None
     direction_id = (source_task.context or {}).get("direction_id")
     if direction_id:
-        from app.models import Project  # noqa: PLC0415
+        from app.models import Project
         project = await session.get(Project, source_task.project_id)
         if project:
             for d in (project.directions or []):
@@ -184,7 +275,7 @@ async def _spawn_pipeline_task(
         source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
         session.add(source_task)
         try:
-            from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+            from app.main import _maybe_create_failure_alert
             await _maybe_create_failure_alert(source_task, session, f"PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations) — manual intervention required")
         except Exception as _alert_err:
             logger.warning(f"[PIPELINE] Failed to create failure alert for global cap on PR #{pr_number}: {_alert_err}")
@@ -204,7 +295,7 @@ async def _spawn_pipeline_task(
                 orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
                 session.add(orig)
                 try:
-                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    from app.main import _maybe_create_failure_alert
                     await _maybe_create_failure_alert(orig, session, f"PR #{pr_number} review-fix per-chain cap reached ({per_chain_cap} iterations) — manual review required")
                 except Exception as _alert_err:
                     logger.warning(f"[PIPELINE] Failed to create failure alert for per-chain cap on PR #{pr_number}: {_alert_err}")
@@ -337,8 +428,8 @@ async def _spawn_pipeline_task(
                         session.add(stuck_orig)
                         await session.commit()
                         try:
-                            import asyncio as _asyncio  # noqa: PLC0415
-                            from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                            import asyncio as _asyncio
+                            from app.notification_dispatch import dispatch_external_notification
                             _asyncio.ensure_future(dispatch_external_notification(
                                 stuck_orig.project_id,
                                 "APPROVAL_NEEDED",

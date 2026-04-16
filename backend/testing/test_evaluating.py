@@ -9,6 +9,8 @@ Covers _check_evaluating_timeouts() and _check_and_trigger_rollup() edge cases:
   - Rollup guard: only review/fix children after ROLLUP_TYPES filter → COMPLETED
   - Unmerged-PR verification triggers rollup path
 """
+import uuid
+
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -743,3 +745,140 @@ async def test_rollup_proceeds_when_parent_lock_available(eval_db, mocker):
         f"Expected COMPLETED (happy path with available lock) but got "
         f"{parent.status}: {parent.latest_status_message!r}"
     )
+
+
+# ── Backstop diagnosis honesty + one-shot recovery ──────────────────────────
+#
+# Regression coverage for the PR #1705/#1688/#1676 incident: CI genuinely
+# passed but the review-approved gate never closed, and the backstop killed
+# the task with the message "CI polling stalled after escalation" — a lie.
+# These tests pin the honest-reason and one-shot recovery behaviours.
+
+
+@pytest.mark.asyncio
+async def test_backstop_reason_names_review_when_ci_passed(eval_db, mocker):
+    """When CI has passed but review_approved is absent AND recovery was
+    already attempted (so we proceed to kill), the backstop's failure message
+    must name the review gate, not claim CI stalled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Stop the recovery path from masking the kill — force recovery-already-attempted
+    # so we exercise the reason-build path end-to-end.
+
+    project = Project(name="Backstop Honest Reason", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck on review"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    ci_wait_started = _naive_utc_ago(minutes=60)  # well past the 30-min backstop
+    parent.status_log = [{
+        "t": _naive_utc_ago(minutes=75).isoformat(),
+        "msg": "Status changed: IN_PROGRESS → EVALUATING",
+    }]
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "ci_passed": True,
+            "review_approved": False,
+            "review_recovery_attempted": True,  # force the kill path, not recovery
+            "escalated": True,
+            "pr_number": 12345,
+            "branch": "blueprint/task-honest",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    msg = (parent.latest_status_message or "").lower()
+    assert "backstop" in msg
+    assert "review" in msg, (
+        f"Failure message must name the review gate, got: {parent.latest_status_message!r}"
+    )
+    assert "ci polling stalled" not in msg, (
+        f"The old misleading 'CI polling stalled' phrasing must not appear, got: "
+        f"{parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backstop_spawns_recovery_review_once(eval_db, mocker):
+    """When CI passed but review_approved is missing and no recovery has yet
+    been attempted, the backstop must spawn a fresh review, mark recovery
+    attempted, and reset the CI-wait clock — instead of hard-killing on the
+    first tick past the 30-minute threshold."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    # Return a fake "new review task" so recovery reports success.
+    fake_review = Task(
+        project_id=uuid.uuid4(),  # placeholder; not the target of any assertion
+        payloads=[{"type": "review", "pr_number": 77777}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn.return_value = (fake_review, True)
+
+    project = Project(name="Backstop Recovery", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck on review"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    ci_wait_started = _naive_utc_ago(minutes=45)
+    parent.status_log = [{
+        "t": _naive_utc_ago(minutes=60).isoformat(),
+        "msg": "Status changed: IN_PROGRESS → EVALUATING",
+    }]
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "ci_passed": True,
+            "review_approved": False,
+            "pr_number": 77777,
+            "branch": "blueprint/task-recover",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Backstop must NOT kill on the first recovery attempt, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    mock_spawn.assert_called_once()
+    # recovery flag set and CI-wait window reset
+    rl = (parent.context or {}).get("review_loop", {})
+    assert rl.get("review_recovery_attempted") is True
+    assert rl.get("review_recovery_at")
+    # ci_wait_started must be newer than the original stale timestamp
+    assert rl.get("ci_wait_started") != ci_wait_started.isoformat()
