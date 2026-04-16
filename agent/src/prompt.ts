@@ -1211,6 +1211,120 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
   }
 }
 
+/**
+ * Finds production source files that import from the given related_files.
+ * Returns a compact markdown section listing each changed module alongside the
+ * consumers that import from it (with the specific symbols they import), capped
+ * at ~2000 chars.  Only production code is included — test files are excluded
+ * because those are already surfaced by discoverRelatedTests.
+ *
+ * Only meaningful for create/refactor tasks with scope=medium or scope=large.
+ */
+export function discoverAffectedConsumers(ws: WebSocket | null, relatedFiles: string[]): string {
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const CAP = 2000;
+    const entries: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      // Skip test files — test consumers are handled by discoverRelatedTests
+      if (relFile.includes('.test.') || relFile.includes('/test_') || relFile.includes('/tests/')) continue;
+
+      const isPython = relFile.endsWith('.py');
+      const isTS = /\.(ts|tsx|js|jsx)$/.test(relFile);
+      if (!isPython && !isTS) continue;
+
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      if (!moduleName) continue;
+
+      // Find production source files that mention this module name
+      let consumerFiles: string[] = [];
+      try {
+        const grepOut = execFileSync(
+          'git', ['grep', '-rl', moduleName, '--',
+            ...(isPython ? ['*.py'] : ['*.ts', '*.tsx', '*.js', '*.jsx']),
+          ],
+          { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 }
+        );
+        consumerFiles = grepOut.split('\n').filter(f =>
+          f &&
+          f !== relFile &&
+          !f.includes('.test.') &&
+          !f.includes('/test_') &&
+          !f.includes('/testing/') &&
+          !f.includes('/tests/')
+        ).slice(0, 6);
+      } catch { /* no matches — not an error */ }
+
+      if (consumerFiles.length === 0) continue;
+
+      // For each consumer, extract which symbols it imports from this module
+      const consumerDetails: Array<{ file: string; imports: string[] }> = [];
+      for (const consumerFile of consumerFiles) {
+        const fullPath = `${WORKSPACE}/${consumerFile}`;
+        if (!fs.existsSync(fullPath)) continue;
+
+        try {
+          const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').slice(0, 80);
+          const imports: string[] = [];
+
+          for (const line of lines) {
+            if (isPython) {
+              // from .module_name import X, Y  /  from app.module_name import X
+              const m = line.match(new RegExp(`from\\s+\\S*${moduleName}\\s+import\\s+(.+)`));
+              if (m) {
+                const names = m[1].split(',')
+                  .map(s => s.trim().replace(/[()#\\].*/g, '').trim())
+                  .filter(s => s && /^\w+$/.test(s));
+                imports.push(...names);
+              }
+            } else {
+              // import { X, Y } from './module-name' or './module-name.js'
+              const namedMatch = line.match(
+                new RegExp(`import\\s+\\{([^}]+)\\}\\s+from\\s+['"][^'"]*${moduleName}[^'"]*['"]`)
+              );
+              if (namedMatch) {
+                const names = namedMatch[1].split(',')
+                  .map(s => s.trim().split(/\s+as\s+/)[0].trim())
+                  .filter(s => s && /^\w+$/.test(s));
+                imports.push(...names);
+              }
+              // import DefaultExport from './module-name' or './module-name.js'
+              const defaultMatch = line.match(
+                new RegExp(`import\\s+(\\w+)\\s+from\\s+['"][^'"]*${moduleName}[^'"]*['"]`)
+              );
+              if (defaultMatch) {
+                imports.push(defaultMatch[1]);
+              }
+            }
+          }
+
+          consumerDetails.push({ file: consumerFile, imports: [...new Set(imports)].slice(0, 8) });
+        } catch {
+          consumerDetails.push({ file: consumerFile, imports: [] });
+        }
+      }
+
+      if (consumerDetails.length === 0) continue;
+
+      const consumerLines = consumerDetails.map(c => {
+        const importStr = c.imports.length > 0 ? ` (imports: ${c.imports.join(', ')})` : '';
+        return `  - ${c.file}${importStr}`;
+      });
+      entries.push(`**${relFile}** is imported by:\n${consumerLines.join('\n')}`);
+    }
+
+    if (entries.length === 0) return '';
+
+    const body = `## Affected Consumers\nProduction files that import from your changed modules. Verify they remain compatible after your changes.\n\n${entries.join('\n\n')}\n\n`;
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: affected consumer discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
 // ── Retry context injection ──────────────────────────────────────────────────
 /**
  * Builds a section describing the previous failed attempt, to be inserted

@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, RateLimitError, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -502,5 +502,43 @@ describe('RateLimitError', () => {
   it('plain Error is not a RateLimitError', () => {
     const err = new Error('Claude API usage exhausted — banner');
     expect(err).not.toBeInstanceOf(RateLimitError);
+  });
+});
+
+// ── captureTestBaseline timeout selection ─────────────────────────────────────
+describe('captureTestBaseline timeout selection', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners containing scripts/test-backend.sh', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const bashCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    expect((bashCall![2] as { timeout: number }).timeout).toBe(180_000);
+  });
+
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners with docker in args', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'docker run --rm myimage pytest' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const dockerCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'docker');
+    expect(dockerCall).toBeDefined();
+    expect((dockerCall![2] as { timeout: number }).timeout).toBe(180_000);
+  });
+
+  it('uses the passed timeoutMs (60s default) for non-Docker runners', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'node', test_cmd: 'npm test' }],
+    };
+    await captureTestBaseline(null, { value: '' }, buildConfig);
+    const npmCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'npm');
+    expect(npmCall).toBeDefined();
+    expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
   });
 });

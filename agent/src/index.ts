@@ -13,7 +13,7 @@ import {
   FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT,
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
-  TEST_RUNNER_TIMEOUT, TEST_BASELINE_TIMEOUT,
+  TEST_RUNNER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
   CLAUDE_TIMEOUT_MS, MAX_OUTPUT_BYTES,
 } from './constants.js';
 
@@ -762,6 +762,12 @@ interface TestRunner {
   label: string;
 }
 
+/** Returns true if the runner invokes Docker or the backend test shell script. */
+function isDockerRunner(runner: TestRunner): boolean {
+  const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
+  return cmdAndArgs.includes('docker') || cmdAndArgs.includes('scripts/test-backend.sh');
+}
+
 function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync } = fs;
   const runners: TestRunner[] = [];
@@ -915,10 +921,11 @@ export async function captureTestBaseline(
   for (const runner of runners) {
     try {
       sendHeartbeatSync(taskId, `Baseline test run [${runner.label}]...`);
+      const runnerTimeout = isDockerRunner(runner) ? TEST_BASELINE_DOCKER_TIMEOUT : timeoutMs;
       execFileSync(runner.cmd, runner.args, {
         cwd: runner.cwd,
         encoding: 'utf-8',
-        timeout: timeoutMs,
+        timeout: runnerTimeout,
       });
       // Runner exited cleanly — no failures
     } catch (err: unknown) {

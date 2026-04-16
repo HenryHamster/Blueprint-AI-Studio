@@ -5,12 +5,12 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
-  sendHeartbeatSync,
+  captureTestBaseline, sendHeartbeatSync,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
-  TASK_TYPE_HINTS, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -430,10 +430,21 @@ export async function handleFix(
   }
 
   // Append fix-specific task type hint and playbook guidance
-  if (TASK_TYPE_HINTS['fix']) {
-    enrichedPrompt = `${enrichedPrompt}\n\n${TASK_TYPE_HINTS['fix']}`;
+  const fixTypeHints = getTaskTypeHints(fixBuildConfig);
+  if (fixTypeHints['fix']) {
+    enrichedPrompt = `${enrichedPrompt}\n\n${fixTypeHints['fix']}`;
   }
   enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n\n${DEFAULT_TOOL_GUIDANCE}`;
+
+  // Capture test baseline for medium/large scope fix tasks before running Claude.
+  // This lets testFixLoop distinguish pre-existing failures from newly-broken tests,
+  // matching the same logic used in the create handler.
+  const fixScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+  let fixBaselineFailures: Set<string> | undefined;
+  if (fixScope === 'medium' || fixScope === 'large') {
+    const captured = await captureTestBaseline(ws, statusRef, fixBuildConfig, fixRelatedFiles);
+    fixBaselineFailures = captured ?? undefined;
+  }
 
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
@@ -455,7 +466,7 @@ export async function handleFix(
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
     await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
 
-    const { testFailuresDetected: fixTestFailures, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig);
+    const { testFailuresDetected: fixTestFailures, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
 
     git(['add', '-A']);
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
