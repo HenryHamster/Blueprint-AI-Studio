@@ -31,7 +31,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
 from app.task_completion import (
     _extract_json_array,
     _ensure_branch,
@@ -858,7 +858,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _parent_direction_id = (task.context or {}).get("direction_id")
 
     for orig_i, finding, fhash in deduplicated:
-        scope = finding.get("scope", "small")
+        scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
         title = finding.get("title", f"Research finding #{orig_i+1}")
         prompt = finding.get("prompt", finding.get("description", ""))
@@ -1148,7 +1148,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         (finding.get("description", finding.get("prompt", "")))[:200]
                     )
                     finding_scopes_by_dir.setdefault(did, []).append(
-                        finding.get("scope", "small")
+                        finding.get("scope", DEFAULT_TASK_SCOPE)
                     )
             for d in directions:
                 did = d.get("id")

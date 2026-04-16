@@ -266,6 +266,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [loading, setLoading] = useState(true);
+  const [lastFetchError, setLastFetchError] = useState(false);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const sparkRef = useRef<SparkPoint[]>([]);
@@ -273,6 +274,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
   // Fetch data
   const fetchData = useCallback(async () => {
+    let digestOk = false;
     const fetches: Promise<void>[] = [];
 
     // Digest
@@ -283,18 +285,20 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
             : `/api/admin/digest?hours=${windowHours}`;
           const res = await apiFetch(url);
-          if (res.ok) setDigest(await res.json());
+          if (res.ok) { setDigest(await res.json()); digestOk = true; }
         } catch { /* silent */ }
       })(),
     );
 
     // Diagnostics + open PRs — only when a project is selected
+    let diagnosticsOk = false;
+    let openPRsOk = false;
     if (selectedProjectId) {
       fetches.push(
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-            if (res.ok) setDiagnostics(await res.json());
+            if (res.ok) { setDiagnostics(await res.json()); diagnosticsOk = true; }
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -303,6 +307,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             if (res.ok) {
               const data = await res.json();
               setOpenPRs(data.open_prs ?? []);
+              openPRsOk = true;
             }
           } catch { /* silent */ }
         })(),
@@ -317,6 +322,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
     await Promise.allSettled(fetches);
     setLoading(false);
+
+    // Show error banner only when all primary fetches fail (backend unreachable)
+    const allFailed = selectedProjectId
+      ? !digestOk && !diagnosticsOk && !openPRsOk
+      : !digestOk;
+    setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours]);
 
   // Initial + polling
@@ -358,6 +369,13 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
   return (
     <div className="flex-1 overflow-auto space-y-4">
+      {/* Backend unreachable banner */}
+      {lastFetchError && !loading && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+          <span>Backend unreachable — showing stale data</span>
+        </div>
+      )}
       {/* Header row with time window selector */}
       <div className="flex items-center justify-end px-1">
         <select

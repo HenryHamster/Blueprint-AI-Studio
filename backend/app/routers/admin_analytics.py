@@ -23,6 +23,17 @@ from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
+
+def _derive_completed_at(t: "Task") -> datetime:
+    """Return the completion timestamp from the last status_log entry, or task.created_at."""
+    if t.status_log:
+        try:
+            return datetime.fromisoformat(t.status_log[-1]["t"])
+        except (KeyError, ValueError):
+            pass
+    return t.created_at
+
+
 ON_DEMAND_RATE = 0.067 / 3600  # $/sec
 SPOT_RATE = 0.020 / 3600  # $/sec
 
@@ -356,14 +367,6 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     _now = _utcnow()
     window_start = _now - timedelta(hours=lookback_hours)
     prev_window_start = window_start - timedelta(hours=lookback_hours)
-
-    def _derive_completed_at(t: Task):
-        if t.status_log:
-            try:
-                return datetime.fromisoformat(t.status_log[-1]["t"])
-            except (KeyError, ValueError):
-                pass
-        return t.created_at
 
     def _safe_ts_in_window(ts_str: str | None, cutoff: datetime) -> bool:
         try:
@@ -898,14 +901,6 @@ async def get_digest(
     raw_lookback = _utcnow() - timedelta(hours=min(hours * 7, 24 * 14))
     lookback_start = min(raw_lookback, prev_window_start)
 
-    def _derive_completed_at(t: Task):
-        if t.status_log:
-            try:
-                return datetime.fromisoformat(t.status_log[-1]["t"])
-            except (KeyError, ValueError):
-                pass
-        return t.created_at
-
     # --- Query tasks from extended lookback window ---
     task_filters = [Task.created_at >= lookback_start]
     if project_id:
@@ -1280,6 +1275,13 @@ async def get_digest(
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
         _p_total = _p_completed + _p_failed
         _p_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
+        _p_terminal = [
+            t for t in all_tasks
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            and _p_start <= _derive_completed_at(t) < _p_end
+        ]
+        _p_measured = [t for t in _p_terminal if "_first_attempt_succeeded" in (t.context or {})]
+        _p_fa_rate = round(sum(1 for t in _p_measured if (t.context or {}).get("_first_attempt_succeeded")) / len(_p_measured), 2) if _p_measured else None
         trend_history.append({
             "period_end": _p_end.isoformat(),
             "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
@@ -1287,6 +1289,8 @@ async def get_digest(
             "failed": _p_failed,
             "failed_by_class": _p_by_class,
             "period_cost_usd": round(_p_cost, 4),
+            "first_attempt_success_rate": _p_fa_rate,
+            "first_attempt_sample_size": len(_p_measured),
         })
 
     # Action-first narrative: executives want "what do I need to do?" before "how did things go?"
@@ -1962,6 +1966,105 @@ def _compute_medium_scope_measurement(
     }
 
 
+def _compute_first_attempt_measurement(
+    tasks: list,
+    split_date: Optional[datetime],
+    lookback_days: int,
+) -> Dict[str, Any]:
+    """Compute historical first-attempt approval rate with optional pre/post split.
+
+    Returns headline rate, sample_size, optional pre/post split windows, weekly
+    time-series (using _derive_completed_at for timestamps), and by_category
+    breakdown of rejection reasons from _first_attempt_rejection_categories.
+    """
+    def _fa_rate(task_list: list) -> Optional[float]:
+        measured = [t for t in task_list if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        successes = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+        return round(successes / len(measured), 2)
+
+    measured_tasks = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+    headline_rate = _fa_rate(tasks)
+    sample_size = len(measured_tasks)
+
+    # --- Pre/post split using split_date and _derive_completed_at ---
+    pre_split: Optional[Dict[str, Any]] = None
+    post_split: Optional[Dict[str, Any]] = None
+    if split_date is not None:
+        split_naive = split_date.replace(tzinfo=None) if split_date.tzinfo else split_date
+        pre_tasks = [t for t in measured_tasks if _derive_completed_at(t).replace(tzinfo=None) < split_naive]
+        post_tasks = [t for t in measured_tasks if _derive_completed_at(t).replace(tzinfo=None) >= split_naive]
+
+        def _window_stats(task_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
+            return {
+                "rate": _fa_rate(task_subset),
+                "sample_size": len(task_subset),
+                "window_start": window_start.isoformat() if window_start else None,
+                "window_end": window_end.isoformat() if window_end else None,
+            }
+
+        pre_start = min((_derive_completed_at(t) for t in pre_tasks), default=None)
+        post_end = max((_derive_completed_at(t) for t in post_tasks), default=None)
+        pre_split = _window_stats(pre_tasks, pre_start, split_naive)
+        post_split = _window_stats(post_tasks, split_naive, post_end)
+
+    # --- Weekly time series using _derive_completed_at for timestamp bucketing ---
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"measured": 0, "succeeded": 0})
+    for t in measured_tasks:
+        completed = _derive_completed_at(t)
+        task_date = completed.date()
+        week_monday = task_date - timedelta(days=task_date.weekday())
+        week_key = week_monday.isoformat()
+        week_bucket[week_key]["measured"] += 1
+        if t.context["_first_attempt_succeeded"]:
+            week_bucket[week_key]["succeeded"] += 1
+
+    sorted_weeks = sorted(week_bucket.keys())
+    weekly_series: List[Dict[str, Any]] = []
+    for i, week_key in enumerate(sorted_weeks):
+        counts = week_bucket[week_key]
+        measured = counts["measured"]
+        succeeded = counts["succeeded"]
+        rate = round(succeeded / measured, 2) if measured > 0 else None
+        if i == 0:
+            delta = None
+        else:
+            prev_rate = weekly_series[i - 1]["rate"]
+            delta = round(rate - prev_rate, 2) if (rate is not None and prev_rate is not None) else None
+        weekly_series.append({
+            "week": week_key,
+            "rate": rate,
+            "sample_size": measured,
+            "delta_from_previous": delta,
+        })
+
+    # --- By-category breakdown from _first_attempt_rejection_categories ---
+    tasks_with_cats = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+    by_category: Optional[Dict[str, float]] = None
+    if tasks_with_cats:
+        total_with_cats = len(tasks_with_cats)
+        cat_counts: Dict[str, int] = {}
+        for t in tasks_with_cats:
+            cats = (t.context or {}).get("_first_attempt_rejection_categories", {})
+            for cat in cats:
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        by_category = {
+            cat: round(count / total_with_cats, 2)
+            for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
+        }
+
+    return {
+        "first_attempt_approval_rate": headline_rate,
+        "sample_size": sample_size,
+        "pre_split": pre_split,
+        "post_split": post_split,
+        "weekly_series": weekly_series,
+        "by_category": by_category,
+        "lookback_days": lookback_days,
+    }
+
+
 @router.get("/medium-scope-measurement")
 async def get_medium_scope_measurement(
     project_id: uuid.UUID = Query(...),
@@ -1990,6 +2093,40 @@ async def get_medium_scope_measurement(
     project = await session.get(Project, project_id)
 
     return _compute_medium_scope_measurement(medium_tasks, project, direction_id, lookback_days)
+
+
+@router.get("/first-attempt-measurement")
+async def get_first_attempt_measurement(
+    project_id: uuid.UUID = Query(...),
+    lookback_days: int = Query(90, ge=1, le=730),
+    split_date: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return historical first-attempt approval rate with optional pre/post split.
+
+    Queries all terminal tasks for the project within lookback_days and computes
+    headline first-attempt rate, optional pre/post split windows, weekly time-series,
+    and by_category breakdown of rejection reasons.
+    """
+    cutoff = _utcnow() - timedelta(days=lookback_days)
+    result = await session.execute(
+        select(Task).where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            Task.created_at >= cutoff,
+            Task.project_id == project_id,
+        )
+    )
+    all_tasks = result.scalars().all()
+
+    parsed_split_date: Optional[datetime] = None
+    if split_date:
+        try:
+            parsed_split_date = datetime.fromisoformat(split_date)
+        except (ValueError, TypeError):
+            pass
+
+    return _compute_first_attempt_measurement(list(all_tasks), parsed_split_date, lookback_days)
 
 
 ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60

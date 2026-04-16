@@ -27,7 +27,7 @@ from app.models import (
 )
 from app.schemas import AgentStatusPayload
 from app.routers.agent import _has_local_cycle
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
@@ -211,7 +211,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Inject retry guidance into prompt_suffix based on failure class
         child_ctx = child.context or {}
-        task_scope = child_ctx.get("scope", "medium")
+        task_scope = child_ctx.get("scope", DEFAULT_TASK_SCOPE)
         attempt = child_ctx.get("_attempt_number", 1)
         _ctx_keys_to_strip = {
             "max_plan_account_id",

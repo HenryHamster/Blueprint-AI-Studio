@@ -19,6 +19,11 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Canonical default for task scope when not explicitly set.
+# Operational modules (orchestrator, review pipeline, research completion) use this.
+# Analytics/tracking modules use "unknown" to distinguish missing data from a real scope.
+DEFAULT_TASK_SCOPE = "small"
+
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
 # Uses Redis for cross-instance coordination when REDIS_URL is set,

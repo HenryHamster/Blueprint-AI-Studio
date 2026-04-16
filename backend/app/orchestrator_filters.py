@@ -17,7 +17,7 @@ from typing import Callable, Coroutine, Any
 from sqlmodel import select
 
 from app.models import Task, TaskStatus
-from app.shared_state import is_direction_held
+from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 
 logger = logging.getLogger("blueprint")
 
@@ -70,7 +70,7 @@ async def filter_file_conflicts(
             continue
         # Large scope tasks defer on any overlap; refactors use standard threshold
         # (refactors are expected to touch decomposition targets — overlap is intentional)
-        scope = (candidate.context or {}).get("scope", "small")
+        scope = (candidate.context or {}).get("scope", DEFAULT_TASK_SCOPE)
         task_type = (candidate.first_payload).get("type", "")
         is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
@@ -133,7 +133,7 @@ async def filter_rollup_conflicts(
     # Build per-project rollup file sets (different repos can't conflict)
     pending_rollup_by_project: dict[uuid.UUID, dict[str, str]] = {}
     for pc in pending_children:
-        pc_scope = (pc.context or {}).get("scope", "small")
+        pc_scope = (pc.context or {}).get("scope", DEFAULT_TASK_SCOPE)
         pc_type = (pc.first_payload).get("type", "")
         if pc_scope == "large" or pc_type in ("refactor", "plan"):
             rollup_files = pending_rollup_by_project.setdefault(pc.project_id, {})

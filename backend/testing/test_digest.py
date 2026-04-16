@@ -1199,3 +1199,49 @@ async def test_narrative_all_clear_when_no_attention_needed(client: AsyncClient,
     assert "Good progress" not in narrative
     assert "Pipeline health declining" not in narrative
     assert "failed" not in narrative
+
+
+@pytest.mark.asyncio
+async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db_session):
+    """trend_history entries include first_attempt_success_rate and first_attempt_sample_size."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add two completed tasks in the current window with _first_attempt_succeeded context
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        context={"_first_attempt_succeeded": True},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        context={"_first_attempt_succeeded": False},
+    ))
+    # A task without the metric — should not count toward sample
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    trend_history = data["trend_history"]
+    assert isinstance(trend_history, list)
+    assert len(trend_history) == 7
+
+    # All entries must have the new fields
+    for entry in trend_history:
+        assert "first_attempt_success_rate" in entry
+        assert "first_attempt_sample_size" in entry
+
+    # The last entry (current period) should reflect our two measured tasks
+    last_entry = trend_history[-1]
+    assert last_entry["first_attempt_sample_size"] == 2
+    assert last_entry["first_attempt_success_rate"] == 0.5

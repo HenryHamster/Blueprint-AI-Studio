@@ -11,7 +11,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines, _compute_medium_scope_measurement
+from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines, _compute_medium_scope_measurement, _compute_first_attempt_measurement
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
@@ -1503,6 +1503,148 @@ def test_medium_scope_no_direction_returns_empty_correlated_changes():
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["correlated_changes"] == []
     assert result["investment_start"] is None
+
+
+# ── _compute_first_attempt_measurement tests ─────────────────────────────────
+
+
+def test_first_attempt_measurement_empty_returns_null_rate():
+    """No tasks → null rate, zero sample_size, empty series, null by_category."""
+    result = _compute_first_attempt_measurement([], None, 90)
+    assert result["first_attempt_approval_rate"] is None
+    assert result["sample_size"] == 0
+    assert result["pre_split"] is None
+    assert result["post_split"] is None
+    assert result["weekly_series"] == []
+    assert result["by_category"] is None
+    assert result["lookback_days"] == 90
+
+
+def test_first_attempt_measurement_basic_rate():
+    """Rate = succeeded / measured; tasks missing the key are excluded from sample."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": False}, created_at=now),
+        # No key — excluded from measurement
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={}, created_at=now),
+    ]
+    result = _compute_first_attempt_measurement(tasks, None, 90)
+    assert result["sample_size"] == 3
+    assert result["first_attempt_approval_rate"] == round(2 / 3, 2)
+    assert result["pre_split"] is None
+    assert result["post_split"] is None
+
+
+def test_first_attempt_measurement_pre_post_split():
+    """Tasks split correctly on split_date using _derive_completed_at."""
+    now = _utcnow()
+    split = now - timedelta(days=15)
+    project_id = uuid.uuid4()
+
+    # 2 pre-split tasks: 1 success, 1 failure
+    pre_tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True},
+                  created_at=split - timedelta(days=10)),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"_first_attempt_succeeded": False},
+                  created_at=split - timedelta(days=5), latest_status_message="e"),
+    ]
+    # 3 post-split tasks: 3 successes
+    post_tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True},
+                  created_at=split + timedelta(days=5)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True},
+                  created_at=split + timedelta(days=10)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True},
+                  created_at=split + timedelta(days=20)),
+    ]
+    result = _compute_first_attempt_measurement(pre_tasks + post_tasks, split, 90)
+
+    assert result["pre_split"] is not None
+    assert result["post_split"] is not None
+    assert result["pre_split"]["sample_size"] == 2
+    assert result["pre_split"]["rate"] == 0.5
+    assert result["post_split"]["sample_size"] == 3
+    assert result["post_split"]["rate"] == 1.0
+    # Window boundaries
+    assert result["pre_split"]["window_end"] == split.isoformat()
+    assert result["post_split"]["window_start"] == split.isoformat()
+
+
+def test_first_attempt_measurement_by_category_breakdown():
+    """by_category counts rejection categories from _first_attempt_rejection_categories."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_rejection_categories": {"test-coverage": 1, "style": 1}},
+                  created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_rejection_categories": {"test-coverage": 1}},
+                  created_at=now),
+        # No rejection category key — excluded from by_category
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=now),
+    ]
+    result = _compute_first_attempt_measurement(tasks, None, 90)
+    by_cat = result["by_category"]
+    assert by_cat is not None
+    # test-coverage appears in 2/2 tasks with cats → 1.0; style in 1/2 → 0.5
+    assert by_cat["test-coverage"] == 1.0
+    assert by_cat["style"] == 0.5
+
+
+def test_first_attempt_measurement_no_measured_tasks():
+    """Tasks without _first_attempt_succeeded key → null rate, zero sample, empty series."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={}, created_at=now, latest_status_message="e"),
+    ]
+    result = _compute_first_attempt_measurement(tasks, None, 90)
+    assert result["first_attempt_approval_rate"] is None
+    assert result["sample_size"] == 0
+    assert result["weekly_series"] == []
+
+
+def test_first_attempt_measurement_weekly_series_delta():
+    """weekly_series delta_from_previous is None for first week, computed for subsequent."""
+    project_id = uuid.uuid4()
+    # Week 1: 1/2 success (0.5); Week 2: 2/2 success (1.0)
+    week1_date = _utcnow() - timedelta(days=14)
+    week2_date = _utcnow() - timedelta(days=7)
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=week1_date),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"_first_attempt_succeeded": False},
+                  created_at=week1_date, latest_status_message="e"),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=week2_date),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"_first_attempt_succeeded": True}, created_at=week2_date),
+    ]
+    result = _compute_first_attempt_measurement(tasks, None, 90)
+    series = result["weekly_series"]
+    assert len(series) == 2
+    assert series[0]["delta_from_previous"] is None
+    assert series[0]["rate"] == 0.5
+    assert series[1]["rate"] == 1.0
+    assert series[1]["delta_from_previous"] == round(1.0 - 0.5, 2)
 
 
 # ── Pipeline-health rolling event monitor ────────────────────────────────────

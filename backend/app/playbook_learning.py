@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Any, Optional
 
+from app.shared_state import DEFAULT_TASK_SCOPE
+
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -381,7 +383,7 @@ async def _maybe_auto_playbook(
 
     # ── 1. Compute & persist failure signature ──────────────────────────────
     task_type = task.first_payload.get("type", "")
-    task_scope = (task.context or {}).get("scope", "medium")
+    task_scope = (task.context or {}).get("scope", DEFAULT_TASK_SCOPE)
     signature = _extract_failure_signature(
         failure_class, error_summary, task_type, task_scope
     )
