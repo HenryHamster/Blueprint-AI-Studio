@@ -444,17 +444,21 @@ export async function handleCreate(
 
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
+  const isSmallScope = createScope === 'small';
   const moduleInterfaceContext = isMediumOrLargeScope
     ? extractModuleInterfaces(ws, relatedFiles)
     : '';
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
+  const smallScopeAnalysisNote = isSmallScope
+    ? '\n\n## Pre-Implementation Analysis\n\nBefore writing any code, complete this analysis: (1) Read the files most relevant to this change — understand the existing patterns, error handling, and test conventions. (2) Check if similar functionality already exists that you can follow or extend. (3) Identify all callers/importers of any function you plan to modify.\n'
+    : '';
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${smallScopeAnalysisNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -497,13 +501,16 @@ export async function handleRefactor(
   const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
     ? extractModuleInterfaces(ws, refactorRelatedFiles)
     : '';
+  const refactorSmallScopeAnalysisNote = refactorScope === 'small'
+    ? '\n\n## Pre-Implementation Analysis\n\nBefore writing any code, complete this analysis: (1) Read the files most relevant to this change — understand the existing patterns, error handling, and test conventions. (2) Check if similar functionality already exists that you can follow or extend. (3) Identify all callers/importers of any function you plan to modify.\n'
+    : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorSmallScopeAnalysisNote}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

@@ -325,6 +325,43 @@ describe('module interface extraction', () => {
   });
 });
 
+// ── Pre-implementation analysis note (small scope only) ───────────────────────
+describe('pre-implementation analysis note', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('injects Pre-Implementation Analysis for handleCreate with scope=small', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).toContain('## Pre-Implementation Analysis');
+  });
+
+  it('does not inject Pre-Implementation Analysis for handleCreate with scope=medium', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
+  });
+
+  it('does not inject Pre-Implementation Analysis for handleCreate with no scope', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
+  });
+
+  it('does not inject Pre-Implementation Analysis for handleDocs', async () => {
+    const task = { title: 'Docs task', description: '', context: { scope: 'small' } };
+    await handleDocs(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
+  });
+
+  it('does not inject Pre-Implementation Analysis for handleQA', async () => {
+    const task = { title: 'QA task', description: '', context: { scope: 'small' } };
+    await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
+  });
+});
+
 describe('handleDocs configuration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
