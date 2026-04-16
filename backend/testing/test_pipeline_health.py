@@ -690,7 +690,7 @@ def test_snapshot_shape_matches_contract(clean_pipeline_events):
     """get_pipeline_health_snapshot returns the documented keys regardless
     of whether any events were recorded."""
     snapshot = get_pipeline_health_snapshot()
-    assert set(snapshot.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active"}
+    assert set(snapshot.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active", "held_directions"}
     for et in PIPELINE_ALERT_THRESHOLDS:
         assert et in snapshot["thresholds"]
     assert snapshot["alerts_active"] == []
@@ -711,7 +711,7 @@ async def test_health_detailed_endpoint_includes_pipeline_health(
 
     assert "pipeline_health" in data
     ph = data["pipeline_health"]
-    assert set(ph.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active"}
+    assert set(ph.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active", "held_directions"}
     assert ph["counts_1h"]["never_started"] == 1
     assert ph["counts_1h"]["heartbeat_timeout_post_claim"] == 1
 

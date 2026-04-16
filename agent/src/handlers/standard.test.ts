@@ -20,6 +20,7 @@ vi.mock('../index.js', () => ({
   matchesRateLimit: vi.fn().mockReturnValue(false),
   lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
+  captureTestBaseline: vi.fn().mockResolvedValue(null),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -41,6 +42,7 @@ vi.mock('../prompt.js', () => ({
   buildRetryContext: vi.fn().mockReturnValue(''),
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
+  extractModuleInterfaces: vi.fn().mockReturnValue(''),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {
@@ -82,7 +84,8 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, git, lintFixLoop, persistAndPostStatus } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus } from '../index.js';
+import { extractModuleInterfaces } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -275,6 +278,56 @@ describe('handleRefactor configuration', () => {
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('REFACTOR TASK \u2014 STRICT CONSTRAINTS');
+  });
+});
+
+// ── Module interface extraction (scope-conditional) ───────────────────────────
+describe('module interface extraction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(extractModuleInterfaces).mockReturnValue('## Module Interfaces\nfoo\n\n');
+  });
+
+  it('calls extractModuleInterfaces for handleCreate with scope=medium', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Module Interfaces');
+  });
+
+  it('calls extractModuleInterfaces for handleCreate with scope=large', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'large' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/bar.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/bar.ts']);
+  });
+
+  it('does not call extractModuleInterfaces for handleCreate with scope=small', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+
+  it('does not call extractModuleInterfaces for handleCreate with no scope', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+
+  it('calls extractModuleInterfaces for handleRefactor with scope=medium', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    expect(mainPrompt).toContain('## Module Interfaces');
+  });
+
+  it('does not call extractModuleInterfaces for handleRefactor with scope=small', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
   });
 });
 
@@ -493,9 +546,9 @@ describe('testFixLoop buildConfig propagation', () => {
       build_config: buildConfig,
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // testFixLoop should be called with the buildConfig from task.build_config
+    // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, buildConfig,
+      WS, expect.any(Object), undefined, undefined, buildConfig, undefined,
     );
   });
 
@@ -507,7 +560,74 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+    );
+  });
+});
+
+// ── Test baseline capture ─────────────────────────────────────────────────────
+describe('test baseline capture', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+  });
+
+  it('calls captureTestBaseline for medium scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for large scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'large' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline for small scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline when scope is not set', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('passes baseline result to testFixLoop when captureTestBaseline returns a Set', async () => {
+    const baseline = new Set(['backend/testing/test_foo.py::test_bar']);
+    vi.mocked(captureTestBaseline).mockResolvedValueOnce(baseline);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, baseline,
+    );
+  });
+
+  it('passes undefined baseline to testFixLoop when captureTestBaseline returns null (timed out)', async () => {
+    vi.mocked(captureTestBaseline).mockResolvedValueOnce(null);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+    );
+  });
+
+  it('passes related_files from payload to captureTestBaseline', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const relatedFiles = ['agent/src/index.ts', 'agent/src/handlers/standard.ts'];
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, relatedFiles,
     );
   });
 });

@@ -1495,6 +1495,32 @@ def _extract_error_message(entry: Any) -> str:
                 return value
         return json.dumps(payload, default=str)[:4000]
     if payload is None:
+        # No text payload — extract container-level metadata from the entry
+        parts: list[str] = []
+        severity = getattr(entry, "severity", None)
+        if severity:
+            parts.append(f"severity={severity}")
+        resource = getattr(entry, "resource", None)
+        if resource:
+            labels = getattr(resource, "labels", None) or {}
+            if isinstance(labels, dict):
+                for k in ("revision_name", "configuration_name"):
+                    if labels.get(k):
+                        parts.append(f"{k}={labels[k]}")
+        http_req = getattr(entry, "http_request", None)
+        if http_req and isinstance(http_req, dict):
+            method = http_req.get("requestMethod", "")
+            url = http_req.get("requestUrl", "")
+            status = http_req.get("status", "")
+            if method or url:
+                parts.append(f"{method} {url} → {status}")
+        labels = getattr(entry, "labels", None)
+        if labels and isinstance(labels, dict):
+            for k in ("instanceId", "run.googleapis.com/execution_environment"):
+                if labels.get(k):
+                    parts.append(f"{k}={labels[k]}")
+        if parts:
+            return "[Cloud Run system] " + " | ".join(parts)
         return ""
     return str(payload)[:4000]
 
@@ -1503,6 +1529,8 @@ def _parse_exception_class(message: str) -> str:
     """Scan a log payload for the last exception class name in a traceback."""
     if not message:
         return "UnknownError"
+    if message.startswith("[Cloud Run system]"):
+        return "ContainerError"
     matches = _EXCEPTION_LINE_RE.findall(message)
     if matches:
         return matches[-1].rstrip(":")
@@ -1564,8 +1592,8 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
         bucket = buckets.get(key)
         if bucket is None:
             sample = message.strip()
-            if len(sample) > 600:
-                sample = sample[:600] + "..."
+            if len(sample) > 3000:
+                sample = sample[:3000] + "..."
             buckets[key] = {
                 "exception_class": exception_class,
                 "source": f"{source_file}:{source_line}" if source_line else source_file,
@@ -1652,3 +1680,79 @@ async def get_recent_orchestrator_errors(
     }
     _orchestrator_errors_cache[cache_key] = (now, payload)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Open PR monitor
+# ---------------------------------------------------------------------------
+
+_ACTIVE_STATUSES = {
+    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+}
+
+
+@router.get("/open-prs")
+async def get_open_prs(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return all open PRs from GitHub cross-referenced with linked tasks."""
+    from app.services import _get_project_github_token
+    from app.github import get_open_pull_requests
+
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalars().first()
+    if not project or not project.github_owner or not project.github_repo:
+        return {"open_prs": []}
+
+    try:
+        token = await _get_project_github_token(project, session)
+    except Exception:
+        logger.warning("Failed to get GitHub token for project %s", project_id)
+        return {"open_prs": []}
+    if not token:
+        return {"open_prs": []}
+
+    github_prs = await get_open_pull_requests(
+        token, project.github_owner, project.github_repo
+    )
+
+    # Build task lookup: pr_url -> latest task
+    artifact_rows = (await session.execute(
+        select(Artifact, Task)
+        .join(Task, Artifact.task_id == Task.id)
+        .where(
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            Artifact.pr_url.isnot(None),
+            Task.project_id == project_id,
+        )
+    )).all()
+
+    pr_task_map: Dict[str, Task] = {}
+    for art, task in artifact_rows:
+        existing = pr_task_map.get(art.pr_url)
+        if not existing or task.created_at > existing.created_at:
+            pr_task_map[art.pr_url] = task
+
+    result = []
+    for gh_pr in github_prs:
+        pr_url = gh_pr.get("html_url", "")
+        task = pr_task_map.get(pr_url)
+        is_orphaned = task is None or task.status not in _ACTIVE_STATUSES
+        result.append({
+            "pr_number": gh_pr.get("number"),
+            "pr_url": pr_url,
+            "pr_title": gh_pr.get("title", ""),
+            "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+            "pr_created_at": gh_pr.get("created_at"),
+            "task_id": str(task.id) if task else None,
+            "task_status": task.status if task else None,
+            "task_type": task.task_type if task else None,
+            "task_title": task.title if task else None,
+            "is_orphaned": is_orphaned,
+        })
+
+    return {"open_prs": result}

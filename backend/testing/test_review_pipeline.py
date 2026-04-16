@@ -130,8 +130,11 @@ async def _persist(db_session, *tasks) -> None:
 @pytest.mark.asyncio
 async def test_global_cap_blocks_spawn(db_session, mocker):
     """When the global completed-task count for a PR reaches the cap,
-    _spawn_pipeline_task returns None without creating a new task."""
+    _spawn_pipeline_task returns None without creating a new task and fires
+    a failure alert so the user is notified."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
@@ -162,6 +165,11 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
     )
 
     assert result is None, "Global cap (10 iterations, small scope) should block spawn"
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args[0]
+    assert "cap" in call_args[2].lower() or "manual" in call_args[2].lower(), (
+        f"Alert should mention cap or manual intervention, got: {call_args[2]!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -204,8 +212,11 @@ async def test_global_cap_under_limit_allows_spawn(db_session, mocker):
 @pytest.mark.asyncio
 async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker):
     """When the per-chain iteration counter exceeds the cap, _spawn_pipeline_task
-    returns None and sets requires_approval=True on the original task."""
+    returns None, sets requires_approval=True on the original task, and fires
+    a failure alert so the user is notified."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
@@ -256,6 +267,11 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
     )
     assert "manual review" in (original_task.latest_status_message or "").lower(), (
         f"Status message should mention manual review: {original_task.latest_status_message!r}"
+    )
+    alert_mock.assert_called_once()
+    call_args = alert_mock.call_args[0]
+    assert "cap" in call_args[2].lower() or "manual" in call_args[2].lower(), (
+        f"Alert should mention cap or manual review, got: {call_args[2]!r}"
     )
 
 

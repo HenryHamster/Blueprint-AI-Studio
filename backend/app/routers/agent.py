@@ -269,6 +269,52 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Helper: failure stage pattern analysis
+# ---------------------------------------------------------------------------
+
+def _compute_failure_stage_pattern(history: list) -> "dict | None":
+    """
+    Analyze recent research_history stage_dropout data to identify dominant failure stages.
+
+    Returns a pattern dict if 60%+ of non-infra failures cluster at one stage, else None.
+    Only considers code_error and approval stages — agents can't address infra failures.
+    Uses the last 3 research cycles for recency.
+    """
+    recent = history[-3:]
+    code_error_total = 0
+    approval_total = 0
+    for entry in recent:
+        sd = entry.get("stage_dropout") or {}
+        code_error_total += sd.get("tasks_failed_code_error", 0)
+        approval_total += sd.get("tasks_required_approval", 0)
+    total_non_infra = code_error_total + approval_total
+    if total_non_infra < 3:
+        return None
+    code_error_rate = code_error_total / total_non_infra
+    approval_rate = approval_total / total_non_infra
+    threshold = 0.6
+    if code_error_rate >= threshold:
+        return {
+            "stage": "code_error",
+            "rate": round(code_error_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently fail at the code/test stage — "
+                "pay extra attention to test coverage and run tests early."
+            ),
+        }
+    if approval_rate >= threshold:
+        return {
+            "stage": "approval",
+            "rate": round(approval_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently stall waiting for approval — "
+                "consider smaller, more targeted changes that require less manual review."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Agent lifecycle endpoints
 # ---------------------------------------------------------------------------
 
@@ -799,12 +845,59 @@ async def claim_task(
                     for h in history[-2:]
                     if h.get("tasks_created", 0) > 0
                 ]
+                failure_stage_pattern = _compute_failure_stage_pattern(history)
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
                     "failed_approaches": [a[:120] for a in failed_approaches[:5]],
                     "recent_outcomes": recent_outcomes,
+                    "failure_stage_pattern": failure_stage_pattern,
                 }
+
+    # Inject co-change affinity context for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        related_files = (task.context or {}).get("related_files", [])
+        if related_files:
+            cochange_index = (project_for_playbook.design_doc or {}).get("cochange_index")
+            if cochange_index:
+                cochange_scores: dict[str, float] = {}
+                related_set = set(related_files)
+                for rf in related_files:
+                    for co_file, score in (cochange_index.get(rf) or {}).items():
+                        if co_file not in related_set:
+                            cochange_scores[co_file] = cochange_scores.get(co_file, 0.0) + score
+                if cochange_scores:
+                    top_cochange = sorted(cochange_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+                    if "project_context" not in response:
+                        response["project_context"] = {}
+                    response["project_context"]["cochange_files"] = [f for f, _ in top_cochange]
+
+    # Inject per-module review feedback warnings for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")
+        if module_feedback:
+            task_related_files = (task.context or {}).get("related_files", [])
+            module_warnings = []
+            for file_path in task_related_files:
+                profile = module_feedback.get(file_path)
+                if not profile or not isinstance(profile, dict):
+                    continue
+                total = profile.get("total", 0)
+                if total < 3:
+                    continue
+                cat_counts = {k: v for k, v in profile.items() if k not in ("total", "last_updated") and isinstance(v, int)}
+                sorted_cats = sorted(cat_counts.items(), key=lambda x: -x[1])
+                top_cats = {
+                    cat: round(count / total, 2)
+                    for cat, count in sorted_cats[:3]
+                    if count / total >= 0.15
+                }
+                if top_cats:
+                    module_warnings.append({"file": file_path, "top_categories": top_cats, "sample_size": total})
+            if module_warnings:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["module_feedback_warnings"] = module_warnings
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:

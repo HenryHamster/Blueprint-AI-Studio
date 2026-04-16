@@ -612,6 +612,55 @@ async def capture_success_pattern(
     return key
 
 
+_MODULE_FEEDBACK_KEY = "module_feedback"
+_MODULE_FEEDBACK_MAX_ENTRIES = 50
+
+
+def _update_module_feedback_profiles(
+    doc: dict,
+    related_files: list[str],
+    buckets: dict[str, list[dict]],
+) -> None:
+    """Update per-module feedback profiles in the design_doc dict (in-place).
+
+    For each file in *related_files*, accumulates the count of issues per
+    review category.  Caps the total number of tracked modules at
+    ``_MODULE_FEEDBACK_MAX_ENTRIES``; when the cap is exceeded the entry with
+    the oldest ``last_updated`` timestamp is evicted.
+    """
+    if not related_files or not buckets:
+        return
+
+    now_iso = _utcnow().isoformat()
+    profiles: dict = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
+
+    # Flatten bucket issue counts: {category: count}
+    cat_counts: dict[str, int] = {cat: len(issues) for cat, issues in buckets.items() if issues}
+    if not cat_counts:
+        return
+
+    for file_path in related_files:
+        if not file_path:
+            continue
+        entry = dict(profiles.get(file_path) or {})
+        for cat, count in cat_counts.items():
+            entry[cat] = entry.get(cat, 0) + count
+        entry["total"] = entry.get("total", 0) + sum(cat_counts.values())
+        entry["last_updated"] = now_iso
+        profiles[file_path] = entry
+
+    # Evict oldest entries if over cap
+    if len(profiles) > _MODULE_FEEDBACK_MAX_ENTRIES:
+        sorted_by_age = sorted(
+            profiles.items(),
+            key=lambda kv: kv[1].get("last_updated", ""),
+        )
+        for evict_key, _ in sorted_by_age[: len(profiles) - _MODULE_FEEDBACK_MAX_ENTRIES]:
+            del profiles[evict_key]
+
+    doc[_MODULE_FEEDBACK_KEY] = profiles
+
+
 async def extract_review_feedback_to_playbook(
     task: Task,
     review_loop: dict,
@@ -646,6 +695,11 @@ async def extract_review_feedback_to_playbook(
         return []
 
     doc = dict(project.design_doc or {})
+
+    # Update per-module feedback profiles with files from this task
+    related_files: list[str] = list((task.context or {}).get("related_files") or [])
+    module_profiles_updated = bool(related_files and buckets)
+    _update_module_feedback_profiles(doc, related_files, buckets)
 
     # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
     _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
@@ -692,7 +746,7 @@ async def extract_review_feedback_to_playbook(
         doc[playbook_full_key] = new_entry
         created_keys.append(f"review-{cat_name}")
 
-    if created_keys:
+    if created_keys or module_profiles_updated:
         meta = dict(doc.get("_meta", {"revision": 0}))
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()
@@ -703,10 +757,11 @@ async def extract_review_feedback_to_playbook(
         flag_modified(project, "design_doc")
         session.add(project)
 
-        logger.info(
-            "[REVIEW_PLAYBOOK] project=%s PR #%d iteration=%d created entries: %s",
-            task.project_id, pr_number, iteration, created_keys,
-        )
+        if created_keys:
+            logger.info(
+                "[REVIEW_PLAYBOOK] project=%s PR #%d iteration=%d created entries: %s",
+                task.project_id, pr_number, iteration, created_keys,
+            )
 
     return created_keys
 

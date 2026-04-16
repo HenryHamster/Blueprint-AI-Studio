@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from app.failure_classification import INFRA_CLASSES as _DIRECTION_INFRA_CLASSES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,19 @@ last_idle_check: Optional[datetime] = None
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
 persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
 
+# --- Anomaly-Driven Pipeline Adjustments ---
+# When high-severity anomalies (PROVISION_FAILURE, EXTERNAL_API) persist,
+# the system automatically reduces blast radius by lowering max_concurrent_vms
+# and tightening the failure-rate dispatch gate.
+anomaly_adjustments: Dict[str, Any] = {
+    "active": False,
+    "adjusted_at": None,             # ISO timestamp when adjustments were applied
+    "trigger_anomalies": [],         # anomaly keys that triggered the adjustment
+    "pre_adjustment_max_vms": None,  # stored to restore on clearing
+    "pre_adjustment_failure_gate": None,
+    "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
+}
+
 # --- Circuit Breaker (Hystrix-inspired) ---
 # Per-project circuit breaker state for autonomous task spawning
 # States: CLOSED (normal), OPEN (tripped), HALF_OPEN (testing one task)
@@ -103,7 +117,7 @@ deploy_monitoring: Dict = {
     "window_duration": 900,         # 15 minutes default
     "extended_window": 1800,        # 30 min for large/infra changes
     "is_extended": False,           # set True when infra files are touched
-    "task_results": deque(maxlen=100),  # (timestamp_iso, "success"|"failure", failure_class)
+    "task_results": deque(maxlen=100),  # (timestamp_iso, "success"|"failure", failure_class, task_type)
     "pre_deploy_failure_rate": 0.0, # baseline from before deploy
     "health_checks": {
         "dispatch_working": True,   # orchestrator picked up a task in last 5 min
@@ -216,6 +230,7 @@ def get_pipeline_health_snapshot() -> Dict[str, Any]:
         "last_event_ts": last_event_ts,
         "thresholds": dict(PIPELINE_ALERT_THRESHOLDS),
         "alerts_active": alerts_active,
+        "held_directions": get_held_directions(),
     }
 
 
@@ -272,6 +287,143 @@ def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
     except Exception as e:
         logger.warning(f"[PIPELINE_HEALTH] webhook dispatch skipped: {e}")
 
+# --- Direction-Level Failure Streak Tracking ---
+# direction_id -> {
+#   consecutive_failures: int,
+#   last_failure_class: str,
+#   last_failure_at: datetime,
+#   held: bool,
+#   held_at: Optional[datetime],
+#   project_id: str,
+# }
+direction_failure_streaks: Dict[str, Dict] = {}
+
+# Number of consecutive CODE_ERROR failures before a direction is held
+DIRECTION_HOLD_THRESHOLD = 3
+# Automatic hold expiry (safety valve so a direction doesn't stay blocked forever)
+DIRECTION_HOLD_TIMEOUT_HOURS = 4
+
+# _DIRECTION_INFRA_CLASSES: imported from failure_classification at module top-level.
+# Failure classes that are infrastructure-level and should NOT count toward
+# the direction streak (the direction is blameless for infra failures).
+
+
+def record_direction_result(
+    direction_id: str,
+    success: bool,
+    failure_class: str = "",
+    project_id: str = "",
+) -> None:
+    """Update the per-direction failure streak on task completion.
+
+    Infra failures (PROVISION_FAILURE, RATE_LIMIT, AGENT_TIMEOUT, EXTERNAL_API)
+    are ignored — they don't reflect direction health.  A success resets the
+    streak and clears any existing hold.
+    """
+    if not direction_id:
+        return
+
+    if failure_class in _DIRECTION_INFRA_CLASSES:
+        return
+
+    streak = direction_failure_streaks.setdefault(direction_id, {
+        "consecutive_failures": 0,
+        "last_failure_class": "",
+        "last_failure_at": None,
+        "held": False,
+        "held_at": None,
+        "project_id": project_id,
+    })
+    if project_id:
+        streak["project_id"] = project_id
+
+    if success:
+        streak["consecutive_failures"] = 0
+        streak["last_failure_class"] = ""
+        streak["held"] = False
+        streak["held_at"] = None
+    else:
+        streak["consecutive_failures"] += 1
+        streak["last_failure_class"] = failure_class
+        streak["last_failure_at"] = _utcnow()
+        if streak["consecutive_failures"] >= DIRECTION_HOLD_THRESHOLD and not streak["held"]:
+            streak["held"] = True
+            streak["held_at"] = _utcnow()
+            logger.warning(
+                f"[DIRECTION HEALTH] Direction {direction_id} HELD after "
+                f"{streak['consecutive_failures']} consecutive {failure_class} failures."
+            )
+
+
+def clear_direction_hold(direction_id: str) -> None:
+    """Explicitly clear a direction hold (e.g. after research_context update)."""
+    streak = direction_failure_streaks.get(direction_id)
+    if streak:
+        streak["consecutive_failures"] = 0
+        streak["held"] = False
+        streak["held_at"] = None
+
+
+def is_direction_held(direction_id: str) -> tuple[bool, str]:
+    """Return (held, reason) for the direction.
+
+    Checks timeout expiry: if the hold has been active for more than
+    DIRECTION_HOLD_TIMEOUT_HOURS the hold is auto-cleared and (False, '') is returned.
+    Returns (False, '') for unknown directions.
+    """
+    if not direction_id:
+        return False, ""
+    streak = direction_failure_streaks.get(direction_id)
+    if not streak or not streak.get("held"):
+        return False, ""
+    # Auto-clear after timeout
+    held_at = streak.get("held_at")
+    if held_at and (_utcnow() - held_at).total_seconds() > DIRECTION_HOLD_TIMEOUT_HOURS * 3600:
+        streak["held"] = False
+        streak["held_at"] = None
+        logger.info(f"[DIRECTION HEALTH] Direction {direction_id} hold expired (timeout).")
+        return False, ""
+    count = streak["consecutive_failures"]
+    fc = streak["last_failure_class"] or "CODE_ERROR"
+    return True, f"Held: direction has {count} consecutive {fc} failures — awaiting investigation"
+
+
+def get_held_directions() -> Dict[str, Dict]:
+    """Return snapshot of all currently held directions (after applying timeout logic)."""
+    result = {}
+    for did, streak in direction_failure_streaks.items():
+        held, reason = is_direction_held(did)
+        if held:
+            result[did] = {
+                "consecutive_failures": streak["consecutive_failures"],
+                "last_failure_class": streak["last_failure_class"],
+                "last_failure_at": streak["last_failure_at"].isoformat() if streak.get("last_failure_at") else None,
+                "held_at": streak["held_at"].isoformat() if streak.get("held_at") else None,
+                "project_id": streak.get("project_id", ""),
+                "reason": reason,
+            }
+    return result
+
+
+def get_task_type_failure_rate(task_type: str, window_minutes: int = 15) -> tuple[float, int]:
+    """Compute failure rate for a specific task_type within the trailing window.
+
+    Backward-compatible: entries without a task_type field (old format or empty
+    string) are treated as matching any type filter and included in the sample.
+
+    Returns (rate, sample_size).  Returns (0.0, 0) when no samples exist.
+    """
+    cutoff = (_utcnow() - timedelta(minutes=window_minutes)).isoformat()
+    relevant = [
+        r for r in deploy_monitoring["task_results"]
+        if r[0] >= cutoff and (len(r) < 4 or not r[3] or r[3] == task_type)
+    ]
+    if not relevant:
+        return 0.0, 0
+    failures = sum(1 for r in relevant if r[1] == "failure")
+    return failures / len(relevant), len(relevant)
+
+
 # --- Prometheus-compatible metrics counters ---
 # Gauges: updated by orchestrator each cycle
 tasks_queued_gauge: int = 0
@@ -289,6 +441,7 @@ external_health: Dict = {
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
     "errors": {},                   # dep_name -> last error message
+    "consecutive_failures": {},     # dep_name -> int count of consecutive failed health checks
 }
 
 # Track last successful GitHub API operation (tokens, PR comments, etc.)

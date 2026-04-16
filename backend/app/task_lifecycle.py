@@ -35,6 +35,28 @@ from app.failure_classification import classify_failure
 
 logger = logging.getLogger(__name__)
 
+
+def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
+    """Derive the pipeline stage at which a task failure occurred.
+
+    Returns one of: 'provision', 'clone', 'test', 'lint', 'build', 'pr_creation', or None.
+    """
+    if failure_class == "PROVISION_FAILURE":
+        return "provision"
+    msg = (status_message or "").lower()
+    if any(kw in msg for kw in ("checkout", "git clone", "clone")):
+        return "clone"
+    if any(kw in msg for kw in ("test", "assert", "pytest", "jest", "vitest")):
+        return "test"
+    if any(kw in msg for kw in ("lint", "ruff", "eslint", "tsc", "type error")):
+        return "lint"
+    if any(kw in msg for kw in ("build", "compile", "webpack", "bundle")):
+        return "build"
+    if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
+        return "pr_creation"
+    return None
+
+
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review."""
     active = (await session.execute(
@@ -127,10 +149,34 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child_ctx = child.context or {}
         task_scope = child_ctx.get("scope", "medium")
         attempt = child_ctx.get("_attempt_number", 1)
-        clone_ctx = {k: v for k, v in child_ctx.items() if k != "max_plan_account_id"}
+        _ctx_keys_to_strip = {
+            "max_plan_account_id",
+            "provision_failures",
+            "provision_failures_infra",
+            "_infra_wait",
+            "blacklisted_accounts",
+            "_slot_released",
+        }
+        clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
         clone_ctx["_attempt_number"] = attempt + 1
         clone_ctx["_previous_error"] = (original_status_message or "")[:1500]
         clone_ctx["_previous_failure_class"] = failure_class
+
+        # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
+        try:
+            from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class  # noqa: PLC0415
+            error_msg = original_status_message or ""
+            clone_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
+            failure_stage = _derive_failure_stage(failure_class, error_msg)
+            if failure_stage:
+                clone_ctx["_previous_failure_stage"] = failure_stage
+            if failure_class == "CODE_ERROR":
+                clone_ctx["_previous_error_summary"] = error_msg[:500]
+            proj_anomalies = _shared_state.persistent_anomalies.get(str(child.project_id), {})
+            if _is_recurring_failure_class(proj_anomalies, failure_class):
+                clone_ctx["_previous_is_recurring"] = True
+        except Exception:
+            logger.exception("[REQUEUE] Failed to enrich retry context for task %s", child.id)
 
         # Propagate PR artifacts from the failed attempt to the retry context
         prev_pr_url = child_ctx.get("_pr_url", "")
@@ -142,6 +188,17 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             clone_ctx["_previous_changed_files"] = prev_changed_files
         if prev_file_change_details:
             clone_ctx["_previous_file_change_details"] = prev_file_change_details
+
+        # Propagate enriched step-level progress for multi-file retry guidance
+        prev_diff_summary = child_ctx.get("_pr_diff_summary", [])
+        prev_test_failure_summary = child_ctx.get("_test_failure_summary", "")
+        prev_self_review_outcome = child_ctx.get("_self_review_outcome")
+        if prev_diff_summary:
+            clone_ctx["_previous_diff_summary"] = prev_diff_summary
+        if prev_test_failure_summary:
+            clone_ctx["_previous_test_failure_summary"] = prev_test_failure_summary
+        if prev_self_review_outcome:
+            clone_ctx["_previous_self_review_outcome"] = prev_self_review_outcome
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""
@@ -306,7 +363,7 @@ async def _process_post_commit(
         # Immediately unblock dependents when task terminally fails (retries exhausted)
         if payload.status == TaskStatus.FAILED:
             try:
-                async with AsyncSessionLocal() as dep_session:
+                async with factory() as dep_session:
                     dep_stmt = select(Task).where(
                         Task.project_id == task.project_id,
                         Task.status == TaskStatus.QUEUED,
@@ -549,19 +606,25 @@ async def _process_post_commit(
                         except Exception as e:
                             logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
-                    if not task.requires_approval:
-                        review_task, _ = await _spawn_pipeline_task(
-                            task, "review", session, pr_number, branch, base_branch,
-                            original_prompt=original_prompt, original_task_id=str(task.id)
-                        )
-                        if review_task:
-                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                    # Always spawn the review — requires_approval gates MERGING
+                    # (checked at merge time in the review-complete path), not
+                    # reviewing. A security scan failure or blocking finding
+                    # should not orphan the PR by preventing review entirely.
+                    review_task, _ = await _spawn_pipeline_task(
+                        task, "review", session, pr_number, branch, base_branch,
+                        original_prompt=original_prompt, original_task_id=str(task.id)
+                    )
+                    if review_task:
+                        if task.requires_approval:
+                            logger.info(f"[REVIEW PIPELINE] Spawned review for flagged PR #{pr_number} → task {review_task.id} (merge will require manual approval)")
                         else:
-                            task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
-                            task.requires_approval = True
-                            session.add(task)
-                            await session.commit()
-                            logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
+                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                    else:
+                        task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
+                        task.requires_approval = True
+                        session.add(task)
+                        await session.commit()
+                        logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -928,6 +991,29 @@ async def _process_post_commit(
                                     return {"status": "accepted"}
                             except Exception as e:
                                 logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
+
+                        # Security / approval gate: if the original create task was
+                        # flagged (security scan blocking, scan failure, etc.), park
+                        # for manual merge. The review still ran and posted feedback,
+                        # but auto-merge is not safe without human sign-off.
+                        if original_task_id and _runtime_config.get("require_approval_gates", True):
+                            try:
+                                _approval_orig = await session.get(Task, uuid.UUID(original_task_id))
+                                if _approval_orig and _approval_orig.requires_approval:
+                                    _approval_orig.status = TaskStatus.EVALUATING
+                                    reason = _approval_orig.latest_status_message or "requires manual approval"
+                                    _approval_orig.latest_status_message = f"Review approved — awaiting human approval to merge ({reason})"
+                                    session.add(_approval_orig)
+                                    await session.commit()
+                                    await broadcast_to_project(str(_approval_orig.project_id), "task_updated",
+                                                               {"task_id": str(_approval_orig.id), "status": TaskStatus.EVALUATING})
+                                    await create_pr_comment(gh_token, owner, repo, pr_number,
+                                        f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}")
+                                    logger.info(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}")
+                                    action_taken = True
+                                    return {"status": "accepted"}
+                            except Exception as e:
+                                logger.error(f"[PIPELINE] Error checking requires_approval for merge gate: {e}", exc_info=True)
 
                         merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
 

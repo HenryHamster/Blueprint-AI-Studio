@@ -28,12 +28,15 @@ from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 @pytest.fixture(autouse=True)
 def _ensure_test_account_pool():
-    """Ensure _spawn_research_task finds an available account for the test user."""
+    """Ensure _spawn_research_task finds an available account for the test user.
+    Also clears the task_results ring buffer so the _assess_spawn_health failure-rate
+    gate doesn't trigger from results left by other test modules."""
     uid = "test-user-123"
     entry = {"id": "test-acct", "user_id": uid, "name": "test", "enabled": True, "active_tasks": 0,
              "oauth_token": "sk-ant-test", "total_tasks": 0, "token_created_at": None, "claude_config_json": None}
     _max_plan_pools.setdefault(uid, []).append(entry)
     _account_by_id["test-acct"] = entry
+    _shared_state.deploy_monitoring["task_results"].clear()
     yield
     _max_plan_pools.get(uid, [])[:] = [a for a in _max_plan_pools.get(uid, []) if a["id"] != "test-acct"]
     _account_by_id.pop("test-acct", None)
@@ -2979,3 +2982,346 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
     assert len(bug_reports) >= 1, "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
     assert bug_reports[0].context.get("source") == "dedup_deadlock"
     assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. _handle_research_completion — Spawn-Time Health Gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_health_gate_normal_no_cap(db_session, mocker):
+    """When pipeline is healthy, all findings create tasks without any cap."""
+    direction_id = "d-hgate001"
+    direction = _active_direction(direction_id, "Health gate normal")
+    project = Project(
+        name="Health Gate Normal", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 5 findings — all should spawn tasks when healthy
+    findings = [_make_finding(f"Improvement {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    # Healthy pipeline: zone available, no degradation
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 5, "All 5 findings should spawn tasks when healthy"
+
+    await db_session.refresh(task)
+    assert "deferred_findings" not in (task.context or {}), "No deferral when healthy"
+
+
+@pytest.mark.asyncio
+async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
+    """When all zones are in cooldown, child task creation is capped at _DEGRADED_SPAWN_CAP."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate002"
+    direction = _active_direction(direction_id, "Zone exhaustion cap")
+    project = Project(
+        name="Zone Exhaustion", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 6 findings — only _DEGRADED_SPAWN_CAP should be created
+    findings = [_make_finding(f"Zone cap finding {i}", direction_id) for i in range(6)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        f"Should spawn only {_DEGRADED_SPAWN_CAP} tasks when zones exhausted"
+    )
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 6 - _DEGRADED_SPAWN_CAP, (
+        f"Remaining {6 - _DEGRADED_SPAWN_CAP} findings should be deferred"
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
+    """When no accounts are available, child task creation is capped at _DEGRADED_SPAWN_CAP."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate003"
+    direction = _active_direction(direction_id, "Account unavailable cap")
+    project = Project(
+        name="Account Unavailable", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = [_make_finding(f"Account cap finding {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "no accounts available"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 5 - _DEGRADED_SPAWN_CAP
+
+
+@pytest.mark.asyncio
+async def test_health_gate_deferred_findings_stored_in_context(db_session, mocker):
+    """Deferred findings are stored in task.context['deferred_findings']."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate004"
+    direction = _active_direction(direction_id, "Deferred findings storage")
+    project = Project(
+        name="Deferred Storage Test", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = [
+        _make_finding(f"Finding {i}", direction_id) for i in range(4)
+    ]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "high failure rate (8/10 recent tasks failed)"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    deferred = ctx.get("deferred_findings", [])
+    assert len(deferred) == 4 - _DEGRADED_SPAWN_CAP
+    # Verify deferred findings preserve title
+    deferred_titles = {f["title"] for f in deferred}
+    assert all(t.startswith("Finding") for t in deferred_titles)
+
+
+@pytest.mark.asyncio
+async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
+    """Metadata finding types (design_doc_observation, direction_update) bypass the health gate."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-hgate005"
+    direction = _active_direction(direction_id, "Metadata bypass test")
+    project = Project(
+        name="Metadata Bypass", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 2 implementation findings + 2 metadata findings
+    findings = [
+        _make_finding("Impl finding 0", direction_id),
+        _make_finding("Impl finding 1", direction_id),
+        {
+            "title": "Design doc observation",
+            "description": "Some design note",
+            "prompt": "",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "design_doc_observation",
+            "direction_id": direction_id,
+            "section": "general",
+        },
+        {
+            "title": "Direction update proposal",
+            "description": "Update direction priority",
+            "prompt": "Update direction",
+            "priority": "low",
+            "scope": "small",
+            "risk": "low",
+            "type": "direction_update",
+            "direction_id": direction_id,
+        },
+    ]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    # Pipeline is degraded — but metadata findings must still be processed
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    # Both impl findings are at or below the cap (cap=2), so both should be created
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        "Implementation findings up to cap should spawn; metadata findings never create tasks"
+    )
+
+    await db_session.refresh(task)
+    # No findings should be deferred (impl count == cap, metadata never deferred)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 0, "No deferral when impl count exactly equals cap"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. _handle_research_completion — Prior Deferred Findings Recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocker):
+    """Deferred findings from a previous cycle are prepended and spawned in the next cycle."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-deferred-recovery01"
+    direction = _active_direction(direction_id, "Deferred recovery test")
+    project = Project(
+        name="Deferred Recovery", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create task with prior_deferred_findings injected (as autonomous_research.py would do)
+    deferred_from_prev_cycle = [
+        _make_finding("Deferred finding A", direction_id),
+        _make_finding("Deferred finding B", direction_id),
+    ]
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    # New cycle produces 1 fresh finding — plus 2 deferred = 3 total
+    new_findings = [_make_finding("Fresh finding C", direction_id)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
+    # Healthy pipeline: no cap
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    child_titles = {ct.title for ct in child_tasks}
+    assert len(child_tasks) == 3, (
+        f"Both deferred findings + fresh finding should spawn tasks, got: {child_titles}"
+    )
+    assert "Deferred finding A" in child_titles
+    assert "Deferred finding B" in child_titles
+    assert "Fresh finding C" in child_titles
+
+
+@pytest.mark.asyncio
+async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_session, mocker):
+    """Deferred findings from previous cycle are still subject to the health gate cap."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-deferred-recovery02"
+    direction = _active_direction(direction_id, "Deferred still capped")
+    project = Project(
+        name="Deferred Still Capped", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 prior deferred findings
+    deferred_from_prev_cycle = [
+        _make_finding(f"Old deferred {i}", direction_id) for i in range(3)
+    ]
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "prior_deferred_findings": deferred_from_prev_cycle},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    # 2 new findings + 3 deferred = 5 total — but pipeline still degraded
+    new_findings = [_make_finding(f"New finding {i}", direction_id) for i in range(2)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
+        f"Cap still applies even with prior deferred findings: expected {_DEGRADED_SPAWN_CAP}, got {len(child_tasks)}"
+    )
+
+    await db_session.refresh(task)
+    # The un-spawned findings should be deferred again for next cycle
+    still_deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(still_deferred) == 5 - _DEGRADED_SPAWN_CAP, (
+        f"Excess findings re-deferred: expected {5 - _DEGRADED_SPAWN_CAP}, got {len(still_deferred)}"
+    )

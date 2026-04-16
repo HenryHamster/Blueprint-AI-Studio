@@ -628,7 +628,7 @@ export default function App() {
           />
 
           {s.viewMode === 'home' ? (
-            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} /></ErrorBoundary>
+            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} /></ErrorBoundary>
           ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard

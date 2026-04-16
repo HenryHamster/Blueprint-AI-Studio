@@ -257,7 +257,7 @@ async def _ensure_branch(
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
     _fc = classify_failure(task)
     persist_failure_category(task, _fc)
-    record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
     session.add(task)
     await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
     await session.commit()
@@ -280,7 +280,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         from app.routers.agent_status import record_task_result  # noqa: PLC0415
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
-        record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+        record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
         session.add(task)
         await _maybe_create_failure_alert(task, session, "Plan agent produced no valid subtasks")
         await session.commit()
@@ -300,7 +300,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         from app.routers.agent_status import record_task_result  # noqa: PLC0415
         _fc = classify_failure(task)
         persist_failure_category(task, _fc)
-        record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+        record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
         session.add(task)
         await _maybe_create_failure_alert(task, session, "Plan has circular dependencies")
         await session.commit()

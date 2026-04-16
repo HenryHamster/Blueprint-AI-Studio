@@ -34,6 +34,13 @@ resource "google_project_iam_member" "orchestrator_secret_creator" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
+# Grant Orchestrator SA permission to read logs (Cloud Logging viewer for error dashboard)
+resource "google_project_iam_member" "orchestrator_log_viewer" {
+  project = var.project_id
+  role    = "roles/logging.viewer"
+  member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
 # Grant Orchestrator SA permissions to sign blobs (for GCS signed URLs)
 resource "google_service_account_iam_member" "orchestrator_sa_token_creator" {
   service_account_id = google_service_account.orchestrator_sa.name

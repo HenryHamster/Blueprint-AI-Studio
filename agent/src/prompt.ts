@@ -308,6 +308,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const parts = recentOutcomes.map(o => `${o.prs_merged}/${o.tasks_created} merged`);
       dcLines.push(`Recent cycles: ${parts.join(', ')}`);
     }
+    const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
+    if (failureStagePattern) {
+      const msg = strVal(failureStagePattern.message);
+      if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }
@@ -317,7 +322,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   if (taskScope && scopeApplicable) {
     const scopeDescriptions: Record<string, string> = {
       small: 'expect <50 lines across 1-3 files. Keep changes minimal and focused.',
-      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes.',
+      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes. Plan your changes before executing — identify files, dependencies, and order.',
       large: 'cross-component, 200+ lines — plan before coding.',
     };
     const scopeDesc = scopeDescriptions[taskScope] ?? '';
@@ -370,12 +375,85 @@ export function buildFileTree(ws: WebSocket | null): string {
   }
 }
 
+// ── Test Convention Extraction ───────────────────────────────────────────────
+// Cache: dirKey → convention summary string. Populated once per task invocation.
+const _testConventionCache = new Map<string, string>();
+
+/**
+ * Scan test files in the given directory and extract conventions:
+ * fixtures, mock libraries, setup patterns, assertion style.
+ * Returns a compact summary (<=500 chars). Cached per dirKey.
+ */
+export function extractTestConventions(dirKey: string, testFiles: string[]): string {
+  if (_testConventionCache.has(dirKey)) return _testConventionCache.get(dirKey)!;
+
+  const fixtures = new Set<string>();
+  const mockImports = new Set<string>();
+  const setupPatterns = new Set<string>();
+  const assertionStyles = new Set<string>();
+
+  for (const tf of testFiles.slice(0, 6)) {
+    const full = `${WORKSPACE}/${tf}`;
+    if (!fs.existsSync(full)) continue;
+    try {
+      const lines = fs.readFileSync(full, 'utf-8').split('\n').slice(0, 120);
+      for (const line of lines) {
+        // Python fixture decorators (names extracted below via full-content regex)
+        // Python mock imports
+        if (line.match(/from\s+unittest\.mock\s+import/)) {
+          const imported = line.match(/import\s+(.+)/)?.[1].trim();
+          if (imported) mockImports.add(`unittest.mock: ${imported.slice(0, 50)}`);
+        }
+        if (line.match(/from\s+pytest_mock/)) mockImports.add('pytest_mock');
+        // JS/TS mock imports
+        if (line.match(/vi\.fn\(\)|vi\.mock\(|vitest/)) mockImports.add('vitest (vi.fn/vi.mock)');
+        if (line.match(/jest\.fn\(\)|jest\.mock\(/)) mockImports.add('jest');
+        // Setup patterns
+        if (line.match(/beforeEach\s*\(/)) setupPatterns.add('beforeEach');
+        if (line.match(/afterEach\s*\(/)) setupPatterns.add('afterEach');
+        if (line.match(/beforeAll\s*\(/)) setupPatterns.add('beforeAll');
+        if (line.match(/def\s+setup(?:_method)?\s*\(/)) setupPatterns.add('setUp');
+        if (line.match(/@pytest\.fixture/)) setupPatterns.add('@pytest.fixture');
+        if (line.match(/@pytest_asyncio\.fixture/)) setupPatterns.add('@pytest_asyncio.fixture');
+        // Assertion styles
+        if (line.match(/expect\s*\(.*\)\.(toBe|toEqual|toHaveBeenCalled)/)) assertionStyles.add('expect().toBe/toEqual');
+        if (line.match(/\bassert\s+/)) assertionStyles.add('assert');
+        if (line.match(/pytest\.raises\s*\(/)) assertionStyles.add('pytest.raises');
+        if (line.match(/assert_called(?:_once)?_with/)) assertionStyles.add('mock.assert_called_with');
+        if (line.match(/AsyncMock\s*\(/)) mockImports.add('AsyncMock');
+        if (line.match(/MagicMock\s*\(/)) mockImports.add('MagicMock');
+      }
+
+      // Fixture names: scan for @pytest.fixture + next def
+      const fullContent = lines.join('\n');
+      const fixturePattern = /@(?:pytest_asyncio\.fixture|pytest\.fixture)[^\n]*\n(?:async )?def\s+(\w+)/g;
+      let fm: RegExpExecArray | null;
+      while ((fm = fixturePattern.exec(fullContent)) !== null) {
+        fixtures.add(fm[1]);
+      }
+    } catch { /* skip */ }
+  }
+
+  const parts: string[] = [];
+  if (fixtures.size > 0) parts.push(`Fixtures: ${[...fixtures].slice(0, 6).join(', ')}`);
+  if (mockImports.size > 0) parts.push(`Mocks: ${[...mockImports].slice(0, 4).join(', ')}`);
+  if (setupPatterns.size > 0) parts.push(`Setup: ${[...setupPatterns].join(', ')}`);
+  if (assertionStyles.size > 0) parts.push(`Assertions: ${[...assertionStyles].join(', ')}`);
+
+  const summary = parts.length > 0 ? parts.join(' | ') : '';
+  const result = summary.slice(0, 500);
+  _testConventionCache.set(dirKey, result);
+  return result;
+}
+
 export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[], buildConfig?: BuildConfig): string {
   if (relatedFiles.length === 0) return '';
 
   try {
     const testEntries: string[] = [];
     const seen = new Set<string>();
+    // Track test files per directory key for convention extraction
+    const testFilesByDir = new Map<string, string[]>();
 
     const extractTestNames = (content: string): string[] => {
       const names: string[] = [];
@@ -398,6 +476,13 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
         } else {
           testEntries.push(`- ${testPath}`);
         }
+        // Track by directory key for convention extraction
+        const dirKey = testPath.startsWith('backend/') ? 'backend'
+          : testPath.startsWith('agent/') ? 'agent'
+          : testPath.startsWith('admin-ui/') ? 'admin-ui'
+          : testPath.split('/')[0];
+        if (!testFilesByDir.has(dirKey)) testFilesByDir.set(dirKey, []);
+        testFilesByDir.get(dirKey)!.push(testPath);
       } catch { /* skip unreadable */ }
     };
 
@@ -508,8 +593,18 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
 
     if (testEntries.length === 0) return '';
 
-    const output = `## Related Tests\nThese tests cover files you'll be modifying:\n${testEntries.join('\n')}\n\n`;
-    return output.slice(0, 2000);
+    // Extract test conventions per directory type
+    const conventionLines: string[] = [];
+    for (const [dirKey, files] of testFilesByDir) {
+      const conventions = extractTestConventions(dirKey, files);
+      if (conventions) conventionLines.push(`${dirKey}: ${conventions}`);
+    }
+    const conventionsSection = conventionLines.length > 0
+      ? `## Test Conventions\n${conventionLines.join('\n')}\n\n`
+      : '';
+
+    const output = `## Related Tests\nThese tests cover files you'll be modifying:\n${testEntries.join('\n')}\n\n${conventionsSection}`;
+    return output.slice(0, 3000);
   } catch (e) {
     sendLog(ws, `Warning: related test discovery failed: ${String(e)}\n`);
     return '';
@@ -676,7 +771,19 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     siblingLines.push('');
   }
 
-  const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines].join('\n');
+  // Build co-change affinity section — always included for create/fix/refactor (concise, actionable)
+  const cochangeFiles = ctx.cochange_files as string[] | undefined;
+  const cochangeLines: string[] = [];
+  if (cochangeFiles && cochangeFiles.length > 0) {
+    cochangeLines.push('## Frequently Co-Changed Files');
+    cochangeLines.push('Based on merged PRs in this project, these files are commonly modified together with your task\'s related files — review and update them if relevant:');
+    for (const f of cochangeFiles) {
+      cochangeLines.push(`- ${f}`);
+    }
+    cochangeLines.push('');
+  }
+
+  const fixedContent = [...header, ...activeLines, ...prLines, ...siblingLines, ...cochangeLines].join('\n');
   let budget = CONTEXT_BUDGET - fixedContent.length;
 
   // Build lessons section first — lessons directly prevent mistakes and take priority over informational sections
@@ -877,6 +984,27 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build per-module review feedback warnings — only if budget allows
+  type ModuleFeedbackWarning = { file: string; top_categories: Record<string, number>; sample_size: number };
+  const moduleFeedbackWarnings = ctx.module_feedback_warnings as ModuleFeedbackWarning[] | null | undefined;
+  let moduleFeedbackLines: string[] = [];
+  if (moduleFeedbackWarnings && moduleFeedbackWarnings.length > 0) {
+    const candidateLines: string[] = ['### Module-Specific Review History'];
+    for (const w of moduleFeedbackWarnings) {
+      const catParts = Object.entries(w.top_categories)
+        .sort((a, b) => b[1] - a[1])
+        .map(([cat, pct]) => `${Math.round(pct * 100)}% ${cat}`)
+        .join(', ');
+      candidateLines.push(`- When modifying \`${w.file}\`, review history shows: ${catParts} (${w.sample_size} issues)`);
+    }
+    candidateLines.push('');
+    const candidate = candidateLines.join('\n');
+    if (candidate.length <= budget) {
+      moduleFeedbackLines = candidateLines;
+      budget -= candidate.length;
+    }
+  }
+
   // Build direction quality warning — only if budget allows, placed after Pipeline Health
   const directionQuality = ctx.direction_quality as Record<string, unknown> | null | undefined;
   let dirQualityLines: string[] = [];
@@ -917,8 +1045,125 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...dirQualityLines, ...prLines, ...siblingLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
+}
+
+// ── Module interface extraction ──────────────────────────────────────────────
+
+/**
+ * Extracts top-level exported symbols from a Python source file.
+ * Prefers __all__ when present; otherwise scans for top-level def/class.
+ */
+function extractPythonExports(content: string): string[] {
+  // If __all__ is defined, use it as the authoritative public surface
+  const allMatch = content.match(/__all__\s*=\s*\[([\s\S]*?)\]/);
+  if (allMatch) {
+    return [...allMatch[1].matchAll(/['"](\w+)['"]/g)].map(m => m[1]).slice(0, 15);
+  }
+
+  const results: string[] = [];
+  for (const line of content.split('\n')) {
+    // Top-level functions (no leading indentation)
+    const funcMatch = line.match(/^def (\w+)\(([^)]*)\)/);
+    const classMatch = line.match(/^class (\w+)/);
+    if (funcMatch) {
+      const params = funcMatch[2].length > 50 ? funcMatch[2].slice(0, 47) + '...' : funcMatch[2];
+      results.push(`def ${funcMatch[1]}(${params})`);
+    } else if (classMatch) {
+      results.push(`class ${classMatch[1]}`);
+    }
+  }
+  return results;
+}
+
+/**
+ * Extracts export declarations from a TypeScript/JavaScript source file.
+ */
+function extractTypeScriptExports(content: string): string[] {
+  const results: string[] = [];
+  for (const line of content.split('\n')) {
+    let m: RegExpMatchArray | null;
+    if ((m = line.match(/^export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)/))) {
+      const params = m[2].length > 50 ? m[2].slice(0, 47) + '...' : m[2];
+      results.push(`function ${m[1]}(${params})`);
+    } else if ((m = line.match(/^export\s+(?:abstract\s+)?class\s+(\w+)/))) {
+      results.push(`class ${m[1]}`);
+    } else if ((m = line.match(/^export\s+interface\s+(\w+)/))) {
+      results.push(`interface ${m[1]}`);
+    } else if ((m = line.match(/^export\s+type\s+(\w+)/))) {
+      results.push(`type ${m[1]}`);
+    } else if ((m = line.match(/^export\s+(?:const|let)\s+(\w+)/))) {
+      results.push(`const ${m[1]}`);
+    }
+  }
+  return results;
+}
+
+/**
+ * Scans each file in relatedFiles to extract its public API surface (exported
+ * functions/classes/types) and which other files import from it.  Returns a
+ * concise markdown section for injection into the agent prompt, capped at ~2KB.
+ *
+ * Only runs for create/refactor tasks with scope=medium or scope=large so that
+ * small tasks are not burdened with irrelevant context.
+ */
+export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: string[]): string {
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const CAP = 2000;
+    const entries: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      // Skip test files — their exports are not caller-facing APIs
+      if (relFile.includes('.test.') || relFile.includes('/test_') || relFile.includes('/tests/')) continue;
+
+      const isPython = relFile.endsWith('.py');
+      const isTS = /\.(ts|tsx|js|jsx)$/.test(relFile);
+      if (!isPython && !isTS) continue;
+
+      let content: string;
+      try {
+        const fullPath = `${WORKSPACE}/${relFile}`;
+        if (!fs.existsSync(fullPath)) continue;
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch { continue; }
+
+      const exports = isPython ? extractPythonExports(content) : extractTypeScriptExports(content);
+      if (exports.length === 0) continue;
+
+      // Find files that import this module via git grep
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      let callers: string[] = [];
+      if (moduleName) {
+        try {
+          const grepOut = execFileSync(
+            'git', ['grep', '-rl', moduleName, '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx'],
+            { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 }
+          );
+          callers = grepOut.split('\n')
+            .filter(f => f && f !== relFile && !f.includes('.test.') && !f.includes('/test_'))
+            .slice(0, 5);
+        } catch { /* no matches — not an error */ }
+      }
+
+      const exportStr = exports.slice(0, 12).join(', ');
+      let entry = `**${relFile}** exports: ${exportStr}`;
+      if (callers.length > 0) {
+        entry += `\n  Imported by: ${callers.join(', ')}`;
+      }
+      entries.push(entry);
+    }
+
+    if (entries.length === 0) return '';
+
+    const body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+    return body.slice(0, CAP);
+  } catch (e) {
+    sendLog(ws, `Warning: module interface extraction failed: ${String(e)}\n`);
+    return '';
+  }
 }
 
 // ── Retry context injection ──────────────────────────────────────────────────
@@ -938,46 +1183,75 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
     ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
     : [];
-  const previousFileChangeDetails = Array.isArray(ctx._previous_file_change_details)
-    ? (ctx._previous_file_change_details as Record<string, unknown>[]).filter(
-        item => typeof item === 'object' && item !== null && typeof item.file === 'string',
-      ).map(item => ({
-        file: item.file as string,
-        additions: typeof item.additions === 'number' ? item.additions : 0,
-        deletions: typeof item.deletions === 'number' ? item.deletions : 0,
-      }))
+  const previousFailureStage = strVal(ctx._previous_failure_stage as unknown);
+  const previousErrorSummary = strVal(ctx._previous_error_summary as unknown);
+  const previousIsRecurring = ctx._previous_is_recurring === true;
+  const previousDiffSummary = Array.isArray(ctx._previous_diff_summary)
+    ? (ctx._previous_diff_summary as unknown[]).filter(
+        (e): e is Record<string, unknown> => typeof e === 'object' && e !== null,
+      )
     : [];
+  const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary as unknown);
+  const previousSelfReviewOutcome = ctx._previous_self_review_outcome as Record<string, unknown> | undefined;
   const prevAttempt = attemptNumber - 1;
 
+  const failureTypeLabel = previousFailureClass || 'UNKNOWN';
   const lines: string[] = [
     `## Previous Attempt (attempt #${prevAttempt} failed)`,
-    `Failure type: ${previousFailureClass || 'UNKNOWN'}`,
+    previousFailureStage
+      ? `Failure type: ${failureTypeLabel} (at ${previousFailureStage} stage)`
+      : `Failure type: ${failureTypeLabel}`,
   ];
+
+  if (previousIsRecurring) {
+    lines.push(
+      '**This is a recurring failure pattern** — this same failure type has been seen multiple times. Consider a fundamentally different approach.',
+    );
+  }
+
   if (previousPrUrl) {
     lines.push(`PR from previous attempt: ${previousPrUrl}`);
   }
-  if (previousFileChangeDetails.length > 0) {
-    const fileLines = previousFileChangeDetails
-      .map(f => `  ${f.file}  (+${f.additions} -${f.deletions})`)
-      .join('\n');
-    lines.push(`Files changed in previous attempt:\n${fileLines}`);
+
+  // Prefer enriched diff summary over plain file list when available
+  if (previousDiffSummary.length > 0) {
+    const fileLines = previousDiffSummary.map(e => {
+      const file = strVal(e.file as unknown);
+      const additions = typeof e.additions === 'number' ? e.additions : 0;
+      const deletions = typeof e.deletions === 'number' ? e.deletions : 0;
+      const changeType = strVal(e.change_type as unknown) || 'modified';
+      return `  - ${file} (${changeType}, +${additions}/-${deletions} lines)`;
+    });
+    lines.push(`Files changed in previous attempt:\n${fileLines.join('\n')}`);
   } else if (previousChangedFiles.length > 0) {
     lines.push(`Files changed in previous attempt:\n${previousChangedFiles.map(f => `  - ${f}`).join('\n')}`);
   }
-  if (previousError) {
+
+  if (previousTestFailureSummary) {
+    lines.push(`Test failures from previous attempt:\n${previousTestFailureSummary}`);
+  }
+
+  if (previousSelfReviewOutcome) {
+    const fixesApplied = Boolean(previousSelfReviewOutcome.fixes_applied);
+    const selfReviewStatus = fixesApplied
+      ? 'Self-review found issues and applied fixes (but the task still failed after review)'
+      : 'Self-review ran and found no critical issues';
+    lines.push(`Self-review outcome: ${selfReviewStatus}`);
+  }
+
+  // For CODE_ERROR failures, show the focused error summary; otherwise show the full error.
+  if (previousErrorSummary) {
+    lines.push(`Error summary: ${previousErrorSummary}`);
+  } else if (previousError) {
     lines.push(`Error: ${previousError}`);
   }
 
-  if (previousFileChangeDetails.length > 0) {
-    // Try to identify the likely failure location from the error text
-    const mentionedFile = previousFileChangeDetails.find(d => previousError.includes(d.file));
-    if (mentionedFile) {
-      lines.push(`Likely failure location: ${mentionedFile.file} — investigate this file first.`);
-    }
+  const hasChangedFiles = previousDiffSummary.length > 0 || previousChangedFiles.length > 0;
+  if (hasChangedFiles && previousTestFailureSummary) {
     lines.push(
-      'Review each file above. Files that were changed may contain correct work — verify before discarding. Focus your investigation on the failure described above.',
+      'Focus your retry on fixing the failing tests shown above. Preserve the working changes in other files and avoid re-doing changes that were not related to the test failure.',
     );
-  } else if (previousChangedFiles.length > 0) {
+  } else if (hasChangedFiles) {
     lines.push(
       'Review the files listed above — your previous attempt modified them. Check whether those changes were correct or need to be reworked. Do not blindly repeat the same approach if it failed.',
     );
@@ -1055,8 +1329,10 @@ function buildSelfReviewChecklist(taskScope?: string): string {
 8. **Data model safety** — Are schema changes (DB, JSONB, API response shapes) backwards-compatible?
 9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
   }
-  // medium or unspecified: 8-item checklist (includes cross-file checks)
-  return `Check for:
+  // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
+  return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
+
+Check for:
 1. **Missing test coverage** — Is there new behavior with no corresponding test?
 2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
 3. **Scope violations** — Are there changes unrelated to the task requirements?
@@ -1082,6 +1358,7 @@ export function buildSelfReviewPrompt(opts: {
   changedFiles?: string[];
   reviewIssueDistribution?: Record<string, number>;
   taskScope?: string;
+  scopeOverflowWarning?: string;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -1128,11 +1405,15 @@ export function buildSelfReviewPrompt(opts: {
     buildVerificationSection = `\n## Build Verification\nRun these build commands. If any fail, fix the errors before proceeding with the review checklist.\n\n- For frontend changes (admin-ui/): \`cd admin-ui && npm run build\`\n- For agent changes (agent/): \`cd agent && npx tsc --noEmit\`\n- For backend changes (backend/): \`cd backend && python -m py_compile app/main.py\`\n`;
   }
 
+  const scopeOverflowSection = opts.scopeOverflowWarning
+    ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
+    : '';
+
   return `You are performing a self-review of the changes you just made for this task.
 
 ## Task Requirements
 ${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
-${restrictionsSection}${issueDistSection}${playbookSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

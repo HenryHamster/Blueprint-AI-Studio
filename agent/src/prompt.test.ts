@@ -45,10 +45,11 @@ import {
   formatProjectContext,
   configureAgentPermissions,
   discoverRelatedTests,
-  discoverModuleInterfaces,
+  extractTestConventions,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
+  extractModuleInterfaces,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -187,6 +188,55 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('## Direction Context');
   });
 
+  it('renders failure_stage_pattern message in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Fix test flakiness',
+        priority: 'high',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: {
+          stage: 'code_error',
+          rate: 0.86,
+          message: 'Recent tasks for this direction frequently fail at the code/test stage — pay extra attention to test coverage and run tests early.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Failure pattern:**');
+    expect(result).toContain('pay extra attention to test coverage');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
+  it('does not render failure_stage_pattern section when failure_stage_pattern is null', () => {
+    const task = {
+      direction_context: {
+        title: 'Optimize queries',
+        priority: 'low',
+        failed_approaches: [],
+        recent_outcomes: [],
+        failure_stage_pattern: null,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Failure pattern:**');
+  });
+
   it('renders ## Task Scope section for create task with small scope', () => {
     const task = {
       payloads: [{ type: 'create' }],
@@ -243,6 +293,40 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Task Scope');
+  });
+
+  it('renders ## Module-Specific Review History when module_feedback_warnings is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        module_feedback_warnings: [
+          {
+            file: 'backend/app/orchestrator.py',
+            top_categories: { 'test-coverage': 0.6, 'error-handling': 0.25 },
+            sample_size: 8,
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('### Module-Specific Review History');
+    expect(result).toContain('backend/app/orchestrator.py');
+    expect(result).toContain('60% test-coverage');
+    expect(result).toContain('25% error-handling');
+    expect(result).toContain('(8 issues)');
+  });
+
+  it('does not render module feedback section when module_feedback_warnings is absent', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {},
+      project_context: {
+        active_tasks: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('Module-Specific Review History');
   });
 });
 
@@ -627,6 +711,76 @@ describe('discoverRelatedTests', () => {
   });
 });
 
+// ── extractTestConventions ────────────────────────────────────────────────────
+describe('extractTestConventions', () => {
+  let mockFs: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    const fs = await import('fs');
+    mockFs = fs.default as unknown as typeof mockFs;
+    // Clear the module-level cache between tests by using unique dirKeys
+  });
+
+  it('returns empty string when no test files exist', () => {
+    mockFs.existsSync.mockReturnValue(false);
+    const result = extractTestConventions('backend-empty', ['backend/testing/test_foo.py']);
+    expect(result).toBe('');
+  });
+
+  it('extracts pytest fixture names from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest_asyncio.fixture\nasync def db_session():\n    pass\n@pytest.fixture\ndef mock_client():\n    pass\n'
+    );
+    const result = extractTestConventions('backend-fixtures', ['backend/testing/test_services.py']);
+    expect(result).toContain('db_session');
+    expect(result).toContain('mock_client');
+    expect(result).toContain('Fixtures:');
+  });
+
+  it('extracts AsyncMock usage from python test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'from unittest.mock import AsyncMock, patch\n\nAsyncMock()\nMagicMock()\n'
+    );
+    const result = extractTestConventions('backend-mocks', ['backend/testing/test_agent.py']);
+    expect(result).toContain('AsyncMock');
+    expect(result).toContain('Mocks:');
+  });
+
+  it('extracts vitest patterns from TypeScript test files', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      'import { vi, describe } from "vitest";\nbeforeEach(() => {});\nvi.fn();\nexpect(x).toBe(1);\n'
+    );
+    const result = extractTestConventions('agent-vitest', ['agent/src/prompt.test.ts']);
+    expect(result).toContain('vitest');
+    expect(result).toContain('beforeEach');
+  });
+
+  it('returns string under 500 chars', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(
+      '@pytest.fixture\ndef fixture_one(): pass\n@pytest.fixture\ndef fixture_two(): pass\n' +
+      'from unittest.mock import AsyncMock\nAsyncMock()\nbeforeEach(() => {})\nassert x == 1\npytest.raises(ValueError)\n'
+    );
+    const result = extractTestConventions('backend-size', ['backend/testing/test_x.py']);
+    expect(result.length).toBeLessThanOrEqual(500);
+  });
+
+  it('returns cached result on second call with same dirKey', () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue('@pytest.fixture\ndef session(): pass\n');
+    const first = extractTestConventions('backend-cached', ['backend/testing/test_a.py']);
+    // Reset mock to return different content — cached result should be returned
+    mockFs.readFileSync.mockReturnValue('');
+    const second = extractTestConventions('backend-cached', ['backend/testing/test_b.py']);
+    expect(first).toBe(second);
+  });
+});
+
 // ── buildRetryContext ─────────────────────────────────────────────────────────
 describe('buildRetryContext', () => {
   it('returns empty string for first-attempt tasks (no _attempt_number)', () => {
@@ -714,87 +868,178 @@ describe('buildRetryContext', () => {
     expect(result.endsWith('\n')).toBe(true);
   });
 
-  it('renders file_change_details with additions/deletions stats', () => {
+  it('renders failure stage when _previous_failure_stage is present', () => {
     const task = {
       context: {
         _attempt_number: 2,
         _previous_failure_class: 'CODE_ERROR',
-        _previous_error: 'test failure',
-        _previous_file_change_details: [
-          { file: 'backend/app/models.py', additions: 45, deletions: 12 },
-          { file: 'backend/testing/test_models.py', additions: 8, deletions: 3 },
+        _previous_failure_stage: 'test',
+        _previous_error: 'pytest: FAILED',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: CODE_ERROR (at test stage)');
+    expect(result).not.toContain('Failure type: CODE_ERROR\n');
+  });
+
+  it('omits stage qualifier when _previous_failure_stage is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Failure type: AGENT_TIMEOUT\n');
+    expect(result).not.toContain('at stage)');
+  });
+
+  it('renders recurring warning when _previous_is_recurring is true', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: true,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('recurring failure pattern');
+    expect(result).toContain('fundamentally different approach');
+  });
+
+  it('does not render recurring warning when _previous_is_recurring is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_is_recurring: false,
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('recurring failure pattern');
+  });
+
+  it('renders error summary with "Error summary:" label when _previous_error_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'full long error message here',
+        _previous_error_summary: 'AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error summary: AssertionError: expected 1 got 2');
+    expect(result).not.toContain('Error: full long error message here');
+  });
+
+  it('falls back to "Error:" label when only _previous_error is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'AGENT_TIMEOUT',
+        _previous_error: 'timed out after 600s',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Error: timed out after 600s');
+    expect(result).not.toContain('Error summary:');
+  });
+
+  it('renders enriched diff summary with line counts when _previous_diff_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_diff_summary: [
+          { file: 'backend/app/models.py', additions: 45, deletions: 12, change_type: 'modified' },
+          { file: 'backend/testing/test_models.py', additions: 30, deletions: 0, change_type: 'added' },
         ],
       },
     };
     const result = buildRetryContext(task);
+    expect(result).toContain('backend/app/models.py (modified, +45/-12 lines)');
+    expect(result).toContain('backend/testing/test_models.py (added, +30/-0 lines)');
     expect(result).toContain('Files changed in previous attempt:');
-    expect(result).toContain('backend/app/models.py  (+45 -12)');
-    expect(result).toContain('backend/testing/test_models.py  (+8 -3)');
-    expect(result).not.toContain('  - backend/app/models.py');
   });
 
-  it('highlights likely failure location when error mentions a changed file', () => {
-    const task = {
-      context: {
-        _attempt_number: 2,
-        _previous_failure_class: 'CODE_ERROR',
-        _previous_error: 'AssertionError in backend/testing/test_models.py line 42',
-        _previous_file_change_details: [
-          { file: 'backend/app/models.py', additions: 20, deletions: 5 },
-          { file: 'backend/testing/test_models.py', additions: 10, deletions: 2 },
-        ],
-      },
-    };
-    const result = buildRetryContext(task);
-    expect(result).toContain('Likely failure location: backend/testing/test_models.py');
-  });
-
-  it('does not show failure location when no changed file matches the error', () => {
-    const task = {
-      context: {
-        _attempt_number: 2,
-        _previous_failure_class: 'CODE_ERROR',
-        _previous_error: 'generic error with no file reference',
-        _previous_file_change_details: [
-          { file: 'backend/app/models.py', additions: 20, deletions: 5 },
-        ],
-      },
-    };
-    const result = buildRetryContext(task);
-    expect(result).not.toContain('Likely failure location');
-    expect(result).toContain('Review each file above');
-  });
-
-  it('falls back to _previous_changed_files when _previous_file_change_details is absent', () => {
+  it('uses diff summary over plain file list when both are present', () => {
     const task = {
       context: {
         _attempt_number: 2,
         _previous_failure_class: 'CODE_ERROR',
         _previous_error: 'error',
         _previous_changed_files: ['src/foo.ts'],
+        _previous_diff_summary: [
+          { file: 'src/foo.ts', additions: 10, deletions: 5, change_type: 'modified' },
+        ],
       },
     };
     const result = buildRetryContext(task);
-    expect(result).toContain('  - src/foo.ts');
-    expect(result).toContain('Review the files listed above');
+    expect(result).toContain('src/foo.ts (modified, +10/-5 lines)');
+    // Should not show the plain format alongside the enriched format
+    expect(result).not.toMatch(/  - src\/foo\.ts\n/);
   });
 
-  it('ignores malformed entries in _previous_file_change_details', () => {
+  it('renders test failure summary when _previous_test_failure_summary is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test_models.py::test_create FAILED',
+        _previous_changed_files: ['src/foo.ts'],
+        _previous_test_failure_summary: 'FAILED test_models.py::test_create - AssertionError: expected 1 got 2',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Test failures from previous attempt:');
+    expect(result).toContain('FAILED test_models.py::test_create');
+  });
+
+  it('uses focused test-failure guidance when test failures and changed files are both present', () => {
     const task = {
       context: {
         _attempt_number: 2,
         _previous_failure_class: 'CODE_ERROR',
         _previous_error: 'error',
-        _previous_file_change_details: [
-          { file: 'valid.py', additions: 5, deletions: 1 },
-          null,
-          42,
-          { additions: 3, deletions: 1 }, // missing file
-        ],
+        _previous_changed_files: ['src/foo.ts'],
+        _previous_test_failure_summary: 'FAILED test_foo.py::test_bar',
       },
     };
     const result = buildRetryContext(task);
-    expect(result).toContain('valid.py  (+5 -1)');
+    expect(result).toContain('Focus your retry on fixing the failing tests');
+    expect(result).not.toContain('Review the files listed above');
+  });
+
+  it('renders self-review outcome when _previous_self_review_outcome is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: { issues_found: true, fixes_applied: true, categories: [] },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review outcome:');
+    expect(result).toContain('found issues and applied fixes');
+  });
+
+  it('renders self-review outcome with no-issues message when fixes_applied is false', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: { issues_found: false, fixes_applied: false, categories: [] },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review ran and found no critical issues');
   });
 });
 
@@ -968,103 +1213,136 @@ describe('buildSelfReviewChecklist', () => {
   });
 });
 
-// ── discoverModuleInterfaces ──────────────────────────────────────────────────
-describe('discoverModuleInterfaces', () => {
+// ── extractModuleInterfaces ───────────────────────────────────────────────────
+describe('extractModuleInterfaces', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  it('returns empty string for small scope', () => {
-    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], 'small');
-    expect(result).toBe('');
+    // Re-establish defaults so overrides from prior tests don't bleed through
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
   });
 
   it('returns empty string when relatedFiles is empty', () => {
-    const result = discoverModuleInterfaces(null, [], 'medium');
-    expect(result).toBe('');
+    expect(extractModuleInterfaces(null, [])).toBe('');
   });
 
-  it('returns empty string when scope is undefined', () => {
-    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], undefined);
-    expect(result).toBe('');
+  it('returns empty string when related files do not exist on disk', () => {
+    // existsSync returns false by default
+    expect(extractModuleInterfaces(null, ['backend/app/models.py'])).toBe('');
   });
 
-  it('extracts Python module-level function and class definitions', () => {
+  it('skips non-source files (.json, .md)', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    vi.mocked(fs.readFileSync).mockReturnValue(
-      'def my_func(a: str, b: int):\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n\nasync def async_func(x):\n    pass\n'
+    expect(extractModuleInterfaces(null, ['package.json', 'README.md'])).toBe('');
+  });
+
+  it('skips test files (.test.ts, test_.py)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function testHelper(): void {}\n'
     );
-    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
-
-    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], 'medium');
-    expect(result).toContain('## Module Interfaces');
-    expect(result).toContain('backend/app/foo.py');
-    expect(result).toContain('def my_func(a: str, b: int)');
-    expect(result).toContain('class MyClass');
-    expect(result).toContain('async def async_func(x)');
-    // Indented method should NOT appear
-    expect(result).not.toContain('def method');
+    expect(extractModuleInterfaces(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py'])).toBe('');
   });
 
-  it('extracts TypeScript exported declarations', () => {
+  it('extracts top-level Python function signatures and class names', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    vi.mocked(fs.readFileSync).mockReturnValue(
-      'export function doThing(x: string): void {\n  console.log(x);\n}\nexport class MyService {\n  constructor() {}\n}\nexport interface IConfig {\n  key: string;\n}\nexport type Handler = (req: Request) => Response;\nexport const MAX_SIZE = 100;\n'
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n\nclass UserModel:\n    pass\n\ndef create_task(name: str, owner: str):\n    pass\n'
     );
-    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
-
-    const result = discoverModuleInterfaces(null, ['agent/src/service.ts'], 'medium');
+    const result = extractModuleInterfaces(null, ['backend/app/models.py']);
     expect(result).toContain('## Module Interfaces');
-    expect(result).toContain('agent/src/service.ts');
-    expect(result).toContain('export function doThing(x: string): void');
-    expect(result).toContain('export class MyService');
-    expect(result).toContain('export interface IConfig');
-    expect(result).toContain('export type Handler = (req: Request) => Response');
-    expect(result).toContain('export const MAX_SIZE = 100');
-    // Body should not appear
-    expect(result).not.toContain('console.log');
+    expect(result).toContain('backend/app/models.py');
+    expect(result).toContain('def get_user(user_id: int)');
+    expect(result).toContain('class UserModel');
+    expect(result).toContain('def create_task(name: str, owner: str)');
   });
 
-  it('includes Direct Importers section when git grep finds matches', () => {
+  it('uses __all__ as authoritative export list for Python files', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    vi.mocked(fs.readFileSync).mockReturnValue('def helper():\n    pass\n');
-    // execFileSync with encoding:'utf-8' returns a string; cast to satisfy the mock's Buffer overload
-    vi.mocked(execFileSync).mockReturnValue('backend/testing/test_helpers.py\n' as unknown as Buffer<ArrayBuffer>);
-
-    const result = discoverModuleInterfaces(null, ['backend/app/helpers.py'], 'large');
-    expect(result).toContain('### Direct Importers');
-    expect(result).toContain('backend/app/helpers.py');
-    expect(result).toContain('backend/testing/test_helpers.py');
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      "__all__ = ['get_user', 'create_task']\n\ndef get_user(x):\n    pass\n\ndef _private_helper(x):\n    pass\n"
+    );
+    const result = extractModuleInterfaces(null, ['backend/app/services.py']);
+    expect(result).toContain('get_user');
+    expect(result).toContain('create_task');
+    // __all__ used — private helper should not appear as a standalone entry
+    expect(result).not.toContain('_private_helper');
   });
 
-  it('excludes related files themselves from importers list', () => {
+  it('extracts TypeScript export declarations (function, class, interface, type, const)', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    vi.mocked(fs.readFileSync).mockReturnValue('def helper():\n    pass\n');
-    // execFileSync with encoding:'utf-8' returns a string; cast to satisfy the mock's Buffer overload
-    vi.mocked(execFileSync).mockReturnValue('backend/app/helpers.py\nbackend/app/main.py\n' as unknown as Buffer<ArrayBuffer>);
-
-    const result = discoverModuleInterfaces(null, ['backend/app/helpers.py'], 'medium');
-    expect(result).toContain('backend/app/main.py');
-    // helpers.py should not appear in the importers list after "imported by:"
-    expect(result).not.toMatch(/imported by:.*helpers\.py/);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(opts: Opts): string { return ""; }\n' +
+      'export async function runHandler(task: Task): Promise<void> {}\n' +
+      'export class TaskRunner {}\n' +
+      'export interface BuildOpts { foo: string; }\n' +
+      'export type TaskType = "create" | "fix";\n' +
+      'export const DEFAULT_MODEL = "claude-3";\n'
+    );
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('function buildPrompt');
+    expect(result).toContain('function runHandler');
+    expect(result).toContain('class TaskRunner');
+    expect(result).toContain('interface BuildOpts');
+    expect(result).toContain('type TaskType');
+    expect(result).toContain('const DEFAULT_MODEL');
   });
 
-  it('returns empty string when file does not exist', () => {
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
-
-    const result = discoverModuleInterfaces(null, ['backend/app/missing.py'], 'medium');
-    expect(result).toBe('');
-  });
-
-  it('caps output at 3000 characters', () => {
+  it('includes caller files from git grep when found', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    // Generate a large number of function signatures
-    const lines = Array.from({ length: 200 }, (_, i) => `def func_${i}(arg_a: str, arg_b: int) -> bool:`).join('\n');
-    vi.mocked(fs.readFileSync).mockReturnValue(lines);
-    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\nagent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('Imported by:');
+    expect(result).toContain('agent/src/handlers/standard.ts');
+    expect(result).toContain('agent/src/index.ts');
+  });
 
-    const result = discoverModuleInterfaces(null, ['backend/app/big.py'], 'medium');
-    expect(result.length).toBeLessThanOrEqual(3000);
+  it('omits Imported by section when git grep finds no callers', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    // Default mock returns Buffer.from('') — .split() throws, caught by try/catch → no callers
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).not.toContain('Imported by:');
+  });
+
+  it('handles git grep throwing gracefully (no callers shown, exports still shown)', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'export function buildPrompt(): string { return ""; }\n'
+    );
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git grep failed'); });
+    const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('function buildPrompt');
+    expect(result).not.toContain('Imported by:');
+  });
+
+  it('caps output at approximately 2KB', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    const manyExports = Array.from({ length: 80 }, (_, i) =>
+      `export function veryLongFunctionName${i}(paramA: string, paramB: number): void {}`
+    ).join('\n');
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(manyExports);
+    const manyFiles = Array.from({ length: 15 }, (_, i) => `agent/src/module${i}.ts`);
+    const result = extractModuleInterfaces(null, manyFiles);
+    expect(result.length).toBeLessThanOrEqual(2000);
+  });
+
+  it('returns empty string when files have no exportable symbols', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      '// just a comment\nconst x = 1; // non-exported\n'
+    );
+    expect(extractModuleInterfaces(null, ['agent/src/utils.ts'])).toBe('');
   });
 });

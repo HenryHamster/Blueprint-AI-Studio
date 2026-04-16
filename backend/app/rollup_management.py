@@ -100,7 +100,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 from app.routers.agent_status import record_task_result  # noqa: PLC0415
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
-                record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 try:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)
@@ -239,9 +239,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if parent.status != TaskStatus.EVALUATING:
         return
 
+    # Lock children with skip_locked to avoid deadlocks with concurrent
+    # agent status updates that hold FOR UPDATE on individual child rows.
     all_children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id).with_for_update()
+        select(Task).where(Task.parent_task_id == parent.id).with_for_update(skip_locked=True)
     )).scalars().all()
+
+    # Verify we locked all children — if some were skipped (held by agent_status
+    # or another rollup), defer to avoid acting on incomplete data.
+    total_children = await session.scalar(
+        select(_func.count()).select_from(Task).where(Task.parent_task_id == parent.id)
+    )
+    if len(all_children) < total_children:
+        logger.info(
+            f"[ROLLUP] Deferred rollup for parent {parent.id} — "
+            f"locked {len(all_children)}/{total_children} children (others held)"
+        )
+        return
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
@@ -264,7 +278,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
     # while a review/fix cycle is in progress
     pipeline_active = any(
-        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
         for c in all_children
         if (c.first_payload).get("type") in ("review", "fix")
     )
@@ -771,7 +785,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             from app.routers.agent_status import record_task_result  # noqa: PLC0415
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
-                            record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                            record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                            await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
@@ -811,7 +826,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         from app.routers.agent_status import record_task_result  # noqa: PLC0415
                         _fc = classify_failure(parent)
                         persist_failure_category(parent, _fc)
-                        record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                        record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                        await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
@@ -850,7 +866,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                    record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
                     # NOTE: Do NOT delete staging_branch here — it contains all
                     # merged child work. Preserving it allows manual recovery or
                     # requeue. Branches are cleaned up by _cleanup_branches when
@@ -859,6 +875,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
+
+        # Final guard: a parent with an unmerged rollup PR is not done yet —
+        # the review/fix/CI pipeline is still working on landing the code.
+        _pctx = parent.context or {}
+        if (
+            parent.status == TaskStatus.COMPLETED
+            and _pctx.get("rollup_pr_number")
+            and not _pctx.get("pr_merged")
+        ):
+            parent.status = TaskStatus.EVALUATING
+            _rpr = _pctx["rollup_pr_number"]
+            parent.latest_status_message = f"All {completed_count} subtasks done — rollup PR #{_rpr} awaiting merge"
+            logger.info(f"[ROLLUP] Parent {parent.id} — blocked COMPLETED: rollup PR #{_rpr} not yet merged")
 
         session.add(parent)
         await session.commit()

@@ -1,14 +1,10 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // ── Pre-import setup (hoisted before any module loads) ───────────────────────
-// index.ts calls main() at module level; main() throws when AGENT_SECRET_TOKEN
-// is unset and the .catch handler calls process.exit(1). Prevent that from
-// killing the test process by replacing process.exit before the module loads.
+// index.ts guards main() and process event handlers behind an isMain check,
+// so they do NOT run when the file is imported by vitest. The hoisted block
+// is still needed to share the fs mock instances with the vi.mock factory.
 const { mockReadFileSync } = vi.hoisted(() => {
-  // Drop the parameter so the callback signature is compatible with Node's
-  // process.exit overload (which accepts string | number | null | undefined).
-  vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
-
   // Build the fs mock object here so both vi.mock factory and test bodies
   // can reference the same vi.fn() instances.
   const mockReadFileSync = vi.fn();

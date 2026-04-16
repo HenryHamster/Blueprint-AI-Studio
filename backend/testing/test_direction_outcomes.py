@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.direction_outcomes import _update_direction_research_outcomes
+from app.direction_outcomes import _update_cochange_index, _update_direction_research_outcomes
 from app.models import Project, Task, TaskStatus
 
 
@@ -597,6 +597,158 @@ async def test_scope_breakdown_per_scope_counters(db_session: AsyncSession):
     assert sb["medium"]["failed"] == 1
 
     assert sb["unknown"]["created"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Co-change affinity index
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_project_with_design_doc(design_doc: dict | None = None) -> Project:
+    """Create an in-memory Project with the given design_doc (no DB flush needed)."""
+    return Project(
+        name="Co-change Test",
+        user_id="test-user",
+        design_doc=design_doc or {},
+    )
+
+
+def test_cochange_index_basic_pairs():
+    """Co-changed files are recorded bidirectionally with score 1."""
+    project = _make_project_with_design_doc()
+    _update_cochange_index(project, [["a.py", "b.py", "c.py"]])
+    idx = project.design_doc["cochange_index"]
+    assert idx["a.py"]["b.py"] == 1.0
+    assert idx["a.py"]["c.py"] == 1.0
+    assert idx["b.py"]["a.py"] == 1.0
+    assert idx["c.py"]["a.py"] == 1.0
+
+
+def test_cochange_index_accumulates_scores():
+    """Scores increment across separate calls (decay applied once per call)."""
+    project = _make_project_with_design_doc()
+    # First call: a↔b = 1.0
+    _update_cochange_index(project, [["a.py", "b.py"]])
+    # Second call: existing 1.0 decays to 0.9, then +1.0 = 1.9
+    _update_cochange_index(project, [["a.py", "b.py"]])
+    idx = project.design_doc["cochange_index"]
+    assert idx["a.py"]["b.py"] == pytest.approx(1.9, abs=0.01)
+
+
+def test_cochange_index_decay_fades_old_scores():
+    """Repeated updates decay old scores toward zero."""
+    project = _make_project_with_design_doc({"cochange_index": {"a.py": {"b.py": 1.0}}})
+    # Apply 10 rounds of decay without adding new data (empty list → early return)
+    for _ in range(10):
+        # Use a single-file list (no pairs generated) to trigger decay only
+        _update_cochange_index(project, [["a.py"]])
+    idx = project.design_doc.get("cochange_index", {})
+    # After enough decay cycles, score should either be pruned or very small
+    score = (idx.get("a.py") or {}).get("b.py", 0.0)
+    assert score < 0.35  # decayed below MIN_SCORE threshold (0.3)
+
+
+def test_cochange_index_prunes_to_top_5():
+    """Only the top-5 co-changed files are kept per file."""
+    project = _make_project_with_design_doc()
+    # Create 7 files that all co-change with a.py
+    files = ["a.py"] + [f"file{i}.py" for i in range(7)]
+    _update_cochange_index(project, [files])
+    idx = project.design_doc["cochange_index"]
+    assert len(idx["a.py"]) == 5
+
+
+def test_cochange_index_skips_single_file_prs():
+    """PRs with only one file produce no pairs."""
+    project = _make_project_with_design_doc()
+    _update_cochange_index(project, [["solo.py"]])
+    idx = project.design_doc.get("cochange_index", {})
+    assert idx == {}
+
+
+def test_cochange_index_no_op_on_empty_input():
+    """Empty merged_files_lists returns immediately with no design_doc change."""
+    project = _make_project_with_design_doc({"cochange_index": {"a.py": {"b.py": 2.0}}})
+    _update_cochange_index(project, [])
+    # design_doc must be unchanged
+    assert project.design_doc["cochange_index"]["a.py"]["b.py"] == 2.0
+
+
+def test_cochange_index_caps_total_files():
+    """Index is capped at MAX_FILES (200) tracked files."""
+    # Build a large index with 210 files
+    large_index: dict = {
+        f"file{i}.py": {f"file{i+1}.py": float(i)} for i in range(210)
+    }
+    project = _make_project_with_design_doc({"cochange_index": large_index})
+    # Trigger an update with a small new PR
+    _update_cochange_index(project, [["x.py", "y.py"]])
+    idx = project.design_doc["cochange_index"]
+    assert len(idx) <= 200
+
+
+@pytest.mark.asyncio
+async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
+    """_update_direction_research_outcomes populates cochange_index from _pr_changed_files."""
+    direction_id = "d-cochange"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["app/models.py", "app/schemas.py", "tests/test_models.py"]},
+        title="merged-with-files",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    idx = (project.design_doc or {}).get("cochange_index", {})
+    assert "app/models.py" in idx
+    assert "app/schemas.py" in idx["app/models.py"]
+    assert "tests/test_models.py" in idx["app/models.py"]
+
+
+@pytest.mark.asyncio
+async def test_cochange_index_not_updated_when_no_changed_files(db_session: AsyncSession):
+    """No cochange_index entry when merged PR has no _pr_changed_files."""
+    direction_id = "d-nofiles"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},  # no _pr_changed_files
+        title="merged-no-files",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    # cochange_index should not exist or be empty
+    idx = (project.design_doc or {}).get("cochange_index", {})
+    assert idx == {}
 
 
 @pytest.mark.asyncio

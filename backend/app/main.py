@@ -456,7 +456,7 @@ async def _init_deployment_state():
             from app.shared_state import deploy_monitoring
             results = deploy_monitoring["task_results"]
             if results:
-                failures = sum(1 for _, outcome, _ in results if outcome == "failure")
+                failures = sum(1 for r in results if r[1] == "failure")
                 deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
             else:
                 # No previous data (idle→active). Use generous baseline to avoid false rollbacks.
@@ -785,8 +785,8 @@ async def debug_orchestrator(session: AsyncSession = Depends(get_session), curre
                 "pause_reason": state.pause_reason,
                 "monitoring_since": monitoring_since.isoformat() if monitoring_since else None,
                 "recent_outcomes": [
-                    {"created_at": ts, "status": outcome, "failure_class": fc}
-                    for ts, outcome, fc in recent_results
+                    {"created_at": r[0], "status": r[1], "failure_class": r[2] if len(r) > 2 else ""}
+                    for r in recent_results
                 ],
             }
     except Exception as e:
@@ -1101,10 +1101,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}")
+    logger.error(f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"error": {"code": 500, "message": "Internal Server Error"}},
+        content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"},
     )
 
 # Add CORS Middleware so the frontend can call these APIs

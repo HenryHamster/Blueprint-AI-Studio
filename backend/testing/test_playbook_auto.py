@@ -888,3 +888,142 @@ async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncS
     assert len(history) == 3
     assert all(r > 0.20 for r in history)
     assert "test-coverage" in result["persistent_issues"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _update_module_feedback_profiles
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_update_module_feedback_profiles_creates_new_entries():
+    """New files get fresh per-category issue counts in the module_feedback dict."""
+    from app.playbook_learning import _update_module_feedback_profiles
+
+    doc: dict = {}
+    related_files = ["backend/app/orchestrator.py", "backend/app/models.py"]
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+        "error-handling": [
+            {"desc": "unhandled exception", "severity": "MINOR", "iteration": 2},
+            {"desc": "no guard clause", "severity": "MINOR", "iteration": 2},
+        ],
+    }
+
+    _update_module_feedback_profiles(doc, related_files, buckets)
+
+    assert "module_feedback" in doc
+    feedback = doc["module_feedback"]
+    assert "backend/app/orchestrator.py" in feedback
+    assert "backend/app/models.py" in feedback
+
+    for entry in feedback.values():
+        assert entry["test-coverage"] == 1
+        assert entry["error-handling"] == 2
+        assert entry["total"] == 3
+        assert "last_updated" in entry
+
+
+def test_update_module_feedback_profiles_accumulates_counts():
+    """Subsequent calls accumulate counts for already-tracked files."""
+    from app.playbook_learning import _update_module_feedback_profiles
+
+    doc: dict = {
+        "module_feedback": {
+            "backend/app/orchestrator.py": {
+                "test-coverage": 3,
+                "total": 3,
+                "last_updated": "2026-01-01T00:00:00",
+            }
+        }
+    }
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+    }
+
+    _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
+
+    entry = doc["module_feedback"]["backend/app/orchestrator.py"]
+    assert entry["test-coverage"] == 4
+    assert entry["total"] == 4
+
+
+def test_update_module_feedback_profiles_evicts_oldest_when_over_cap():
+    """When the module cap is exceeded the oldest-updated entry is evicted."""
+    from app.playbook_learning import _update_module_feedback_profiles, _MODULE_FEEDBACK_MAX_ENTRIES
+
+    # Fill up to the cap with stale entries
+    existing = {
+        f"file_{i}.py": {"total": 1, "last_updated": f"2025-01-{i + 1:02d}T00:00:00"}
+        for i in range(_MODULE_FEEDBACK_MAX_ENTRIES)
+    }
+    doc: dict = {"module_feedback": existing}
+    buckets = {"test-coverage": [{"desc": "x", "severity": "MINOR", "iteration": 0}]}
+
+    _update_module_feedback_profiles(doc, ["new_file.py"], buckets)
+
+    feedback = doc["module_feedback"]
+    assert len(feedback) == _MODULE_FEEDBACK_MAX_ENTRIES
+    assert "new_file.py" in feedback
+    # The oldest entry (file_0.py with 2025-01-01) should have been evicted
+    assert "file_0.py" not in feedback
+
+
+def test_update_module_feedback_profiles_noop_on_empty_inputs():
+    """No changes to doc when related_files or buckets are empty."""
+    from app.playbook_learning import _update_module_feedback_profiles
+
+    doc: dict = {}
+    _update_module_feedback_profiles(doc, [], {"test-coverage": [{"desc": "x", "severity": "MINOR", "iteration": 0}]})
+    assert "module_feedback" not in doc
+
+    _update_module_feedback_profiles(doc, ["backend/app/models.py"], {})
+    assert "module_feedback" not in doc
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_updates_module_profiles(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook also persists per-module profiles in design_doc."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test for new endpoint", "severity": "MAJOR"},
+                {"description": "no unit test coverage", "severity": "MINOR"},
+                {"description": "unhandled exception path", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 2,
+            "issues": [
+                {"description": "still missing tests", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 3,
+            "issues": [],
+        },
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={"related_files": ["backend/app/routes.py"]},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await extract_review_feedback_to_playbook(task, review_loop, pr_number=42, original_task_type="create", session=db_session)
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    assert "module_feedback" in doc, "module_feedback should be written to design_doc"
+    feedback = doc["module_feedback"]
+    assert "backend/app/routes.py" in feedback
+    entry = feedback["backend/app/routes.py"]
+    assert entry["total"] > 0
+    assert "last_updated" in entry
