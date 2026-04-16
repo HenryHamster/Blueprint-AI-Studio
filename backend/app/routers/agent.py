@@ -808,12 +808,6 @@ async def claim_task(
                             entry["stale"] = True
                             entry["effectiveness_score"] = 0.0
                         doc[full_key] = entry
-                # Store shown playbook keys on task context for completion handler
-                task_ctx = dict(task.context or {})
-                task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
-                task.context = task_ctx
-                flag_modified(task, "context")
-                session.add(task)
                 # Check file-path references against the repo root (config-driven; skipped when unset)
                 try:
                     from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415

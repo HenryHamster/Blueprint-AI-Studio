@@ -1028,6 +1028,73 @@ describe('self-review phase', () => {
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
+
+  it('includes feedback_categories_injected in self_review_outcome when reviewIssueDistribution is present', async () => {
+    const passJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: passJson, lastResultText: '' }); // self-review pass 1 (no fixes → no pass 2)
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD)
+      .mockReturnValueOnce('M file')   // hasChanges (status --porcelain)
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
+      .mockReturnValue('');
+    const task = {
+      title: 'Task',
+      description: '',
+      context: {},
+      project_context: {
+        review_issue_distribution: {
+          test_coverage: 0.35,
+          type_safety: 0.25,
+          architecture: 0.15,
+        },
+      },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    const injected = outcome.feedback_categories_injected as string[];
+    expect(injected).toBeDefined();
+    expect(injected).toContain('test_coverage');
+    expect(injected).toContain('type_safety');
+    expect(injected).toContain('architecture');
+  });
+
+  it('omits feedback_categories_injected from self_review_outcome when reviewIssueDistribution is absent', async () => {
+    const passJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: passJson, lastResultText: '' }); // self-review pass 1 (no fixes → no pass 2)
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD)
+      .mockReturnValueOnce('M file')   // hasChanges (status --porcelain)
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome).toBeDefined();
+    expect(outcome.feedback_categories_injected).toBeUndefined();
+  });
 });
 
 // ── testFixLoop receives buildConfig from task.build_config ───────────────────

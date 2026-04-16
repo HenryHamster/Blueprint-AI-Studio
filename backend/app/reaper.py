@@ -700,12 +700,18 @@ async def reaper_service():
                 try:
                     from app.max_plan_pool import _all_accounts, _account_available_for_model  # noqa: PLC0415
                     _infra_lookback = now - timedelta(hours=2)
-                    _infra_failed = (await session.execute(
-                        select(Task).where(
-                            Task.status == TaskStatus.FAILED,
-                            Task.updated_at >= _infra_lookback,
-                        )
-                    )).scalars().all()
+                    # Exclude tasks that were just reaped in this iteration — otherwise a
+                    # task failed in Step 2 with an infra class (e.g. AGENT_TIMEOUT) would
+                    # be immediately resurrected in the same cycle, defeating the retry
+                    # budget. The next cycle's sweep will pick them up if infra recovers.
+                    _just_reaped_ids = {t.id for t in orphaned_tasks}
+                    _infra_query = select(Task).where(
+                        Task.status == TaskStatus.FAILED,
+                        Task.updated_at >= _infra_lookback,
+                    )
+                    if _just_reaped_ids:
+                        _infra_query = _infra_query.where(Task.id.notin_(_just_reaped_ids))
+                    _infra_failed = (await session.execute(_infra_query)).scalars().all()
 
                     # Parent tasks (those with children) must not be resurrected as leaf
                     # dispatches — they only fail via _requeue_parent_task after exhausting

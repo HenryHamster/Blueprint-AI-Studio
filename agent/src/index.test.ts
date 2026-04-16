@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ── Pre-import setup (hoisted before any module loads) ───────────────────────
 // index.ts guards main() and process event handlers behind an isMain check,
@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -540,5 +540,81 @@ describe('captureTestBaseline timeout selection', () => {
     const npmCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'npm');
     expect(npmCall).toBeDefined();
     expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
+  });
+});
+
+// ── Failure category classification ──────────────────────────────────────────
+describe('failure category classification', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(spawn).mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('setupWorkspace attaches clone_failed when git clone fails', async () => {
+    vi.useFakeTimers();
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      // Allow rm (workspace cleanup) and curl (heartbeat) to succeed
+      if (cmdStr === 'rm' || cmdStr === 'curl') return '' as unknown as ReturnType<typeof execFileSync>;
+      // All git commands fail — simulates persistent clone failure across all retries
+      throw new Error('fatal: Authentication failed');
+    });
+
+    let caughtError: unknown;
+    const promise = setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' })
+      .catch(e => { caughtError = e; });
+
+    // Advance past all retry delays (CLONE_MAX_RETRIES=3: 5s + 10s = 15s total)
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(caughtError).toBeInstanceOf(Error);
+    expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
+  });
+
+  it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
+    // Allow all execFileSync calls (git remote set-url, curl heartbeat)
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    // Mock spawn to make gitAsync push succeed
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123,
+        stderr: { on: vi.fn() },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => cb(0));
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+    // First fetch: apiGet for fresh GitHub token; second fetch: apiPost for PR creation (403)
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ data: { token: 'fresh-token' } }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        text: async () => 'Forbidden',
+      }),
+    );
+
+    let caughtError: unknown;
+    try {
+      // skipRebase=true avoids git fetch/rebase operations
+      await pushAndCreatePR('owner', 'repo', 'task-id', 'blueprint/branch', 'main', 'Title', 'Body', null, { value: '' }, true);
+    } catch (e) {
+      caughtError = e;
+    }
+
+    expect(caughtError).toBeInstanceOf(Error);
+    expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('pr_creation_failed');
   });
 });

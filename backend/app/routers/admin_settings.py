@@ -13,7 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, load_only
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
@@ -1594,6 +1594,8 @@ async def get_auto_remediation_config(
         select(Task).where(
             Task.project_id == project_id,
             Task.created_at >= seven_days_ago,
+        ).options(
+            load_only(Task.id, Task.status, Task.title, Task.context, Task.created_at)
         ).order_by(Task.created_at.desc())
     )).scalars().all()
 

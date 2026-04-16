@@ -535,7 +535,13 @@ export async function setupWorkspace(
   sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  try {
+    await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
+    throw err;
+  }
   sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
@@ -631,7 +637,9 @@ export async function pushAndCreatePR(
     sendLog(ws, `PR created: ${prUrl}\n`);
   } catch (e) {
     sendLog(ws, `Failed to create PR: ${String(e)}\n`);
-    throw new Error(`PR creation failed: ${String(e)}`);
+    const err = new Error(`PR creation failed: ${String(e)}`);
+    (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'pr_creation_failed';
+    throw err;
   }
 
   return prUrl;
@@ -929,8 +937,14 @@ export async function captureTestBaseline(
       });
       // Runner exited cleanly — no failures
     } catch (err: unknown) {
-      // execFileSync sets killed=true when the process is terminated due to timeout
-      if (err instanceof Error && (err as Error & { killed?: boolean }).killed === true) {
+      // execFileSync sets killed=true when the process is terminated due to timeout;
+      // spawnSync sets code='ETIMEDOUT' when the OS cannot start the process in time.
+      // Both are infrastructure issues — can't capture baseline, proceed without it.
+      const isTimeout = err instanceof Error && (
+        (err as Error & { killed?: boolean }).killed === true ||
+        (err as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+      );
+      if (isTimeout) {
         sendLog(ws, `Test baseline timed out for [${runner.label}] — proceeding without baseline.\n`);
         return null;
       }
@@ -1019,6 +1033,17 @@ export async function testFixLoop(
         execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
+        // If the runner timed out (killed by Node's timeout mechanism) or the OS
+        // could not spawn the process (ETIMEDOUT), treat as indeterminate —
+        // a Docker build timeout or spawn failure is not a fixable code failure.
+        const isRunnerTimeout = testErr instanceof Error && (
+          (testErr as Error & { killed?: boolean }).killed === true ||
+          (testErr as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+        );
+        if (isRunnerTimeout) {
+          sendLog(ws, `WARNING: Test runner [${runner.label}] timed out — skipping.\n`);
+          continue;
+        }
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
         failures.push(`[${runner.label}]:\n${msg}`);
       }
@@ -1408,7 +1433,10 @@ async function main() {
     // which doesn't contain any RATE_LIMIT_PATTERNS substring, silently
     // reclassifying rate-limits as CODE_ERROR.
     const isRateLimit = error instanceof RateLimitError;
-    const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' : 'fatal';
+    const errorCategory = (!isRateLimit && error instanceof Error)
+      ? (error as Error & { failureCategory?: FailureCategory }).failureCategory
+      : undefined;
+    const failureCategory: FailureCategory = isRateLimit ? 'rate_limited' : (errorCategory ?? 'fatal');
     // Surface the error through the heartbeat so it's visible even if the
     // status POST fails — the heartbeat updates latest_status_message on the
     // backend, giving us forensic evidence instead of silent death.

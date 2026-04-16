@@ -1910,7 +1910,11 @@ async def get_scope_baselines(
     if project_id:
         filters.append(Task.project_id == project_id)
 
-    result = await session.execute(select(Task).where(*filters))
+    result = await session.execute(
+        select(Task).where(*filters).options(
+            load_only(Task.id, Task.status, Task.context, Task.created_at, Task.project_id)
+        )
+    )
     tasks = result.scalars().all()
 
     return _compute_scope_baselines(list(tasks), lookback_days)
