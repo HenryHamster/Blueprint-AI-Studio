@@ -322,7 +322,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   if (taskScope && scopeApplicable) {
     const scopeDescriptions: Record<string, string> = {
       small: 'expect <50 lines across 1-3 files. Keep changes minimal and focused.',
-      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes.',
+      medium: 'expect 50-200 lines across 2-5 files. Moderate cross-cutting changes. Plan your changes before executing — identify files, dependencies, and order.',
       large: 'cross-component, 200+ lines — plan before coding.',
     };
     const scopeDesc = scopeDescriptions[taskScope] ?? '';
@@ -987,13 +987,17 @@ function buildSelfReviewChecklist(taskScope?: string): string {
 8. **Data model safety** — Are schema changes (DB, JSONB, API response shapes) backwards-compatible?
 9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
   }
-  // medium or unspecified: standard 5-item checklist
-  return `Check for:
+  // medium or unspecified: 7-item checklist (includes cross-file checks critical for multi-file changes)
+  return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
+
+Check for:
 1. **Missing test coverage** — Is there new behavior with no corresponding test?
 2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
 3. **Scope violations** — Are there changes unrelated to the task requirements?
 4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
-5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?`;
+5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
+6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?
+7. **Backwards compatibility** — Are any existing callers broken by signature or behavior changes?`;
 }
 
 // ── Self-review prompt builder ───────────────────────────────────────────────
@@ -1011,6 +1015,7 @@ export function buildSelfReviewPrompt(opts: {
   changedFiles?: string[];
   reviewIssueDistribution?: Record<string, number>;
   taskScope?: string;
+  scopeOverflowWarning?: string;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -1057,11 +1062,15 @@ export function buildSelfReviewPrompt(opts: {
     buildVerificationSection = `\n## Build Verification\nRun these build commands. If any fail, fix the errors before proceeding with the review checklist.\n\n- For frontend changes (admin-ui/): \`cd admin-ui && npm run build\`\n- For agent changes (agent/): \`cd agent && npx tsc --noEmit\`\n- For backend changes (backend/): \`cd backend && python -m py_compile app/main.py\`\n`;
   }
 
+  const scopeOverflowSection = opts.scopeOverflowWarning
+    ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
+    : '';
+
   return `You are performing a self-review of the changes you just made for this task.
 
 ## Task Requirements
 ${opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : ''}${opts.rawPrompt.slice(0, 1500)}
-${restrictionsSection}${issueDistSection}${playbookSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

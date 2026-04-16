@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
-  runClaudeCode, lintFixLoop, testFixLoop, matchesRateLimit,
+  runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -12,7 +12,7 @@ import {
   buildSelfReviewPrompt,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { MAX_SELF_REVIEW_ATTEMPTS } from '../constants.js';
+import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 export interface StandardHandlerOpts {
@@ -34,6 +34,7 @@ export interface StandardHandlerOpts {
   runLintFix?: boolean;
   runTestFix?: boolean;
   failOnTestFailure?: boolean;
+  captureBaseline?: boolean;
   runSelfReview?: boolean;
   lintContext?: string;
   includeTaskTypeHints?: boolean;
@@ -48,6 +49,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     runLintFix = true,
     runTestFix = false,
     failOnTestFailure = false,
+    captureBaseline = false,
     runSelfReview = false,
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
@@ -88,6 +90,20 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
+  // Capture test baseline for medium/large scope tasks on main branch.
+  // This lets the test fix loop distinguish pre-existing failures from newly-broken tests.
+  // We scope the baseline run to directories matching related_files to keep it fast.
+  let baselineFailures: Set<string> | undefined;
+  if (captureBaseline && runTestFix && baseBranch === 'main') {
+    const relatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+      []
+    );
+    const captured = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
+    baselineFailures = captured ?? undefined;
+  }
+
   const fileTree = buildFileTree(ws);
   const finalPromptWithTree = fileTree + finalPrompt;
 
@@ -113,6 +129,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
+
+    // ── Scope overflow detection ───────────────────────────────────────────────
+    const taskScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
+    const overflowThreshold = taskScope ? SCOPE_OVERFLOW_THRESHOLDS[taskScope] : undefined;
+    const scopeOverflowWarning = overflowThreshold !== undefined && changedPaths.length > overflowThreshold
+      ? `This task has scope "${taskScope}" (expected few files) but ${changedPaths.length} files were changed, exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
+      : undefined;
+    if (scopeOverflowWarning) {
+      sendLog(ws, `\nWARNING: Scope overflow detected — ${changedPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n`);
+    }
+
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -130,7 +157,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -197,6 +224,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         changedFiles,
         reviewIssueDistribution: reviewIssueDist,
         taskScope: (task.context as Record<string, unknown> | undefined)?.scope as string | undefined,
+        scopeOverflowWarning,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -290,6 +318,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
       prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
+    if (scopeOverflowWarning) {
+      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\nPlease verify that all changed files are necessary for this task.\n\n`;
+    }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
         ? '\u26a0\ufe0f Issues found and auto-fixed'
@@ -361,16 +392,23 @@ export async function handleCreate(
   const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
 
+  const createScope = taskCtx?.scope as string | undefined;
+  const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
+  const mediumScopePlanningNote = isMediumOrLargeScope
+    ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
+    : '';
+
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
     failOnTestFailure: true,
+    captureBaseline: isMediumOrLargeScope,
     runSelfReview: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,

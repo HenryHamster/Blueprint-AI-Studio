@@ -20,6 +20,7 @@ vi.mock('../index.js', () => ({
   matchesRateLimit: vi.fn().mockReturnValue(false),
   lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
+  captureTestBaseline: vi.fn().mockResolvedValue(null),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -80,7 +81,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, git, lintFixLoop, persistAndPostStatus } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus } from '../index.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -491,9 +492,9 @@ describe('testFixLoop buildConfig propagation', () => {
       build_config: buildConfig,
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // testFixLoop should be called with the buildConfig from task.build_config
+    // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, buildConfig,
+      WS, expect.any(Object), undefined, undefined, buildConfig, undefined,
     );
   });
 
@@ -505,7 +506,74 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+    );
+  });
+});
+
+// ── Test baseline capture ─────────────────────────────────────────────────────
+describe('test baseline capture', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+  });
+
+  it('calls captureTestBaseline for medium scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for large scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'large' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline for small scope create tasks', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline when scope is not set', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('passes baseline result to testFixLoop when captureTestBaseline returns a Set', async () => {
+    const baseline = new Set(['backend/testing/test_foo.py::test_bar']);
+    vi.mocked(captureTestBaseline).mockResolvedValueOnce(baseline);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, baseline,
+    );
+  });
+
+  it('passes undefined baseline to testFixLoop when captureTestBaseline returns null (timed out)', async () => {
+    vi.mocked(captureTestBaseline).mockResolvedValueOnce(null);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+    );
+  });
+
+  it('passes related_files from payload to captureTestBaseline', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const relatedFiles = ['agent/src/index.ts', 'agent/src/handlers/standard.ts'];
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, relatedFiles,
     );
   });
 });

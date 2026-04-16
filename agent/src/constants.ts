@@ -40,9 +40,17 @@ export const RUFF_TIMEOUT = 60_000;
 // Test fix loop
 export const MAX_TEST_FIX_ATTEMPTS = 2;
 export const TEST_RUNNER_TIMEOUT = 180_000;
+export const TEST_BASELINE_TIMEOUT = 60_000;
 
 // Self-review loop
 export const MAX_SELF_REVIEW_ATTEMPTS = 1;
+
+// Scope overflow detection — 2× the upper bound of each scope range
+export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
+  small: 6,   // small expects 1-3 files; warn at >6
+  medium: 10, // medium expects 2-5 files; warn at >10
+  large: 20,  // large expects 5+ files; warn at >20
+};
 
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
