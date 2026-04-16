@@ -1,4 +1,4 @@
-"""Orchestrator worker – background loop that provisions tasks and monitors health.
+"""Orchestrator worker - background loop that provisions tasks and monitors health.
 
 Extracted from app.main to reduce module size. The worker polls for QUEUED tasks,
 checks dependencies, handles file conflicts, provisions VMs, and monitors
@@ -9,14 +9,15 @@ import asyncio
 import logging
 import os
 import random
-import re
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -50,12 +51,12 @@ _last_zone_health_persist: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
-_last_zone_exhaustion_log: Optional[datetime] = None
+_last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
-_orchestrator_last_cycle: Optional[datetime] = None
-_orchestrator_cycle_started: Optional[datetime] = None
+_orchestrator_last_cycle: datetime | None = None
+_orchestrator_cycle_started: datetime | None = None
 
 # Consecutive error counters for exponential backoff
 _orchestrator_consecutive_errors: int = 0
@@ -121,7 +122,7 @@ def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
 
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
-    from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update
     try:
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
@@ -148,14 +149,16 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
     try:
         from app.compute import _zone_health, _zone_lock
         with _zone_lock:
             snapshot = {}
             for zone, data in _zone_health.items():
                 snapshot[zone] = {
-                    k: v.isoformat() if isinstance(v, datetime) else v
+                    k: (v.isoformat() if isinstance(v, datetime)
+                        else list(v) if isinstance(v, deque)
+                        else v)
                     for k, v in data.items()
                 }
         snapshot["_pause_failure_streak"] = _pause_failure_streak
@@ -188,7 +191,7 @@ async def _check_candidate_task_deps(
     task: Task,
     dep_tasks: list,
     dep_uuids: list,
-    session: "AsyncSession",
+    session: AsyncSession,
     verify_pr_merged,
 ) -> tuple[str, dict]:
     """Check whether a candidate task's dependencies are satisfied.
@@ -265,29 +268,27 @@ async def orchestrator_worker():
         _max_plan_pools,
         _max_plan_pool_lock,
     )
-    from app.main import (  # noqa: PLC0415
+    from app.main import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
         _create_orchestrator_error_alerts,
     )
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.deploy_health import (  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result
+    from app.deploy_health import (
         _check_monitoring_window,
         _check_external_health,
         _check_pause_mode,
     )
-    from app.autonomous_research import _check_idle_research  # noqa: PLC0415
-    from app.rollup_management import _verify_pr_merged  # noqa: PLC0415
-    from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
-    from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
-    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.autonomous_research import _check_idle_research
+    from app.rollup_management import _verify_pr_merged
+    from app.review_pipeline import _spawn_pipeline_task
+    from app.broadcast import broadcast_to_project, manager as ws_manager
+    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts
+    from app.routers.agent import get_github_token_for_task
     from app.github import (
-        create_pr_comment,
         get_check_runs,
         get_pull_request,
-        merge_pull_request,
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
@@ -881,7 +882,7 @@ async def orchestrator_worker():
                             earliest_recovery = None
                             for acct in user_pool:
                                 dm = acct.get('disabled_models', {})
-                                for model_name, info in dm.items():
+                                for info in dm.values():
                                     disabled_at = info.get('at')
                                     hits = info.get('hits', 1)
                                     cooldown_min = min(30 * (2 ** (hits - 1)), 240)
@@ -1014,7 +1015,7 @@ async def orchestrator_worker():
                             async def _delayed_orphan_cleanup(orphan_vm_id: str):
                                 await asyncio.sleep(120)  # Wait for GCP thread to finish
                                 await _ensure_vm_deleted(orphan_vm_id, reason="cancelled_provision_orphan")
-                            asyncio.create_task(_delayed_orphan_cleanup(vm_id))
+                            _shared_state.background_tasks[f"orphan_cleanup_{vm_id}"] = asyncio.create_task(_delayed_orphan_cleanup(vm_id))
                             raise
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
@@ -1411,7 +1412,7 @@ async def orchestrator_worker():
                             continue
 
                         # CI completed — delegate to shared handler
-                        from app.ci_completion import handle_ci_completion  # noqa: PLC0415
+                        from app.ci_completion import handle_ci_completion
                         logger.info(f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing")
                         await handle_ci_completion(ci_task, ci_result, ci_gh_token, ci_owner, ci_repo, session, source="poll")
                     except Exception as e:
@@ -1420,7 +1421,7 @@ async def orchestrator_worker():
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
+                                ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
                                 await _maybe_create_failure_alert(ci_task, session, "CI polling failed: PR returned 404 — PR may have been deleted or archived")
                                 record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
@@ -1493,7 +1494,7 @@ async def orchestrator_worker():
                         pc_base = pt_payload.get("base_branch", "main")
                         pc_prompt = pt_payload.get("prompt", pt.description or "")
                         logger.info(f"[RECOVERY] Post-commit pending for task {pt.id}, spawning review for PR #{pc_pr_number}")
-                        from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                        from app.review_pipeline import _spawn_pipeline_task
                         review_task, was_created = await _spawn_pipeline_task(
                             pt, "review", session, pc_pr_number, pc_branch, pc_base,
                             original_prompt=pc_prompt, original_task_id=str(pt.id)

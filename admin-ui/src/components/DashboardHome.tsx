@@ -183,7 +183,7 @@ function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData
         <span className="font-bold">{group.count}</span>
         {hasSpark && (
           <span className="w-16 h-3 inline-block">
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
               <AreaChart data={sparkData}>
                 <defs>
                   <linearGradient id={`fsp-${group.failure_class}`} x1="0" y1="0" x2="0" y2="1">
@@ -637,7 +637,7 @@ function MetricCard({ label, value, color, spark, dataKey, loading }: {
       <p className={`text-2xl font-bold font-mono text-${color}-400`}>{value}</p>
       {spark.length >= 3 && (
         <div className="h-8 mt-1">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
             <AreaChart data={spark}>
               <defs>
                 <linearGradient id={`grad-${color}`} x1="0" y1="0" x2="0" y2="1">
@@ -674,7 +674,7 @@ function FailedCard({ value, groups, spark, loading }: {
       <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
       {spark.length >= 3 && (
         <div className="h-8 mt-1">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
             <AreaChart data={spark}>
               <defs>
                 <linearGradient id="grad-red" x1="0" y1="0" x2="0" y2="1">
@@ -722,7 +722,7 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
       </div>
       {sparkPoints.length >= 3 && (
         <div className="h-8 mt-1">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
             <AreaChart data={sparkPoints}>
               <defs>
                 <linearGradient id="grad-success" x1="0" y1="0" x2="0" y2="1">
@@ -770,7 +770,7 @@ function CostCard({ totalCost, trendHistory, loading }: {
       <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
       {sparkPoints.length >= 3 && (
         <div className="h-8 mt-1">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
             <AreaChart data={sparkPoints}>
               <defs>
                 <linearGradient id="grad-cost" x1="0" y1="0" x2="0" y2="1">
