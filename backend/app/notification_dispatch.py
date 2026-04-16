@@ -20,7 +20,7 @@ from typing import Any, Optional
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import MessageType, ProjectMessage, _utcnow
+from app.models import MessageType, Project, ProjectMessage, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +394,9 @@ async def post_auto_fix_spawned_message(
     )
 
 
+_AUTO_REMEDIATION_ESCALATION_THRESHOLD = 3
+
+
 async def post_auto_fix_result_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -402,14 +405,24 @@ async def post_auto_fix_result_message(
     pr_number: Optional[int] = None,
     task_id: Optional[uuid.UUID] = None,
 ) -> ProjectMessage:
-    """Post a message when a CI auto-fix task completes."""
+    """Post a message when a CI auto-fix task completes.
+
+    For result='failed': increments the consecutive failure counter for this
+    branch in the project's auto_remediation config.  When the counter reaches
+    _AUTO_REMEDIATION_ESCALATION_THRESHOLD (3), the branch is suspended and an
+    escalation message + webhook are fired.
+
+    For result='merged': resets the counter and clears any suspension for this
+    branch.
+    """
     if result == 'merged':
         summary = f'CI auto-fix merged: PR #{pr_number} fixed {branch}'
     elif result == 'failed':
         summary = f'CI auto-fix failed on {branch} — manual intervention needed'
     else:
         summary = f'CI auto-fix on {branch} needs review: PR #{pr_number}'
-    return await post_event_message(
+
+    msg = await post_event_message(
         session,
         project_id,
         event_type='auto_fix_result',
@@ -417,6 +430,90 @@ async def post_auto_fix_result_message(
         context={'branch': branch, 'result': result, 'pr_number': pr_number},
         task_id=task_id,
     )
+
+    # Update per-branch failure tracking in the project's auto_remediation config
+    if result in ('failed', 'merged'):
+        try:
+            from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+            project = await session.get(Project, project_id)
+            if project is not None:
+                design_doc = dict(project.design_doc or {})
+                ar_config = dict(design_doc.get('_auto_remediation', {}))
+                failure_counts: dict[str, int] = dict(ar_config.get('branch_failure_counts', {}))
+                suspended: list[str] = list(ar_config.get('suspended_branches', []))
+
+                if result == 'merged':
+                    # Reset on success
+                    failure_counts.pop(branch, None)
+                    if branch in suspended:
+                        suspended.remove(branch)
+                else:
+                    # Increment consecutive failure counter
+                    failure_counts[branch] = failure_counts.get(branch, 0) + 1
+                    count = failure_counts[branch]
+                    if count >= _AUTO_REMEDIATION_ESCALATION_THRESHOLD and branch not in suspended:
+                        suspended.append(branch)
+                        ar_config['branch_failure_counts'] = failure_counts
+                        ar_config['suspended_branches'] = suspended
+                        design_doc['_auto_remediation'] = ar_config
+                        project.design_doc = design_doc
+                        flag_modified(project, 'design_doc')
+                        session.add(project)
+                        # Fire escalation message + webhook
+                        await post_auto_fix_escalation_message(
+                            session, project_id, branch=branch, failure_count=count,
+                        )
+                        asyncio.ensure_future(dispatch_external_notification(
+                            project_id,
+                            'AUTO_FIX_ESCALATED',
+                            {'branch': branch, 'consecutive_failures': count},
+                        ))
+                        return msg
+
+                ar_config['branch_failure_counts'] = failure_counts
+                ar_config['suspended_branches'] = suspended
+                design_doc['_auto_remediation'] = ar_config
+                project.design_doc = design_doc
+                flag_modified(project, 'design_doc')
+                session.add(project)
+        except Exception as exc:
+            logger.warning('[AUTO-REMEDIATION] Failed to update failure tracking for %s: %s', branch, exc)
+
+    return msg
+
+
+async def post_auto_fix_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    branch: str,
+    failure_count: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity escalation message when auto-remediation is suspended.
+
+    Called after _AUTO_REMEDIATION_ESCALATION_THRESHOLD consecutive failures for
+    the same branch.  Documents why auto-remediation was suspended so operators
+    know manual action is required.
+    """
+    summary = (
+        f'Auto-remediation suspended for {branch} after {failure_count} consecutive failures. '
+        f'Manual intervention required. Re-enable via the auto-remediation settings.'
+    )
+    ctx: dict[str, Any] = {
+        'event_type': 'auto_fix_escalated',
+        'branch': branch,
+        'consecutive_failures': failure_count,
+    }
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type='system',
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    return msg
 
 
 async def post_issue_implementation_spawned_message(
@@ -466,6 +563,22 @@ async def post_review_feedback_message(
         summary=summary,
         context={"pr_number": pr_number, "signal": signal, "detail": detail},
         task_id=task_id,
+    )
+
+
+async def post_rollback_recommendation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: str,
+) -> ProjectMessage:
+    """Post a message when a rollback is recommended after deploy monitoring."""
+    summary = f"Rollback recommended: {reason}"
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="rollback_recommended",
+        summary=summary,
+        context={"reason": reason},
     )
 
 

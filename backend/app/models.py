@@ -319,6 +319,12 @@ class DeploymentState(SQLModel, table=True):
     zone_health_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Persisted dict/list runtime config (task_type_models, agent_prompt_suffixes, etc.)
     runtime_config_json: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Persisted anomaly detection state — occurrence counts and active adjustments survive restarts
+    persistent_anomaly_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Persisted direction failure streaks — holds survive restarts silently
+    direction_streak_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Persisted pipeline events ring buffer — alert windows survive restarts
+    pipeline_events_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Timestamp when HALTED state was entered — used for auto-recovery timer
     halted_at: Optional[datetime] = Field(default=None)
 

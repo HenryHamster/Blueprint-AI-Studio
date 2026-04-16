@@ -806,58 +806,6 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
 
-                # Step 4: Rescue EVALUATING parents whose children ALL terminated without
-                # any completing successfully.  These parents have no COMPLETED child to
-                # trigger _check_and_trigger_rollup, so they stay EVALUATING forever.
-                try:
-                    _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-                    rescued = 0
-                    _children_by_parent: Dict[uuid.UUID, list] = {}
-                    if evaluating_parents:
-                        _parent_ids = [p.id for p in evaluating_parents]
-                        _all_children = (await session.execute(
-                            select(Task).where(Task.parent_task_id.in_(_parent_ids))
-                        )).scalars().all()
-                        for _c in _all_children:
-                            _children_by_parent.setdefault(_c.parent_task_id, []).append(_c)
-                    for parent in evaluating_parents:
-                        children = _children_by_parent.get(parent.id, [])
-                        if not children:
-                            continue
-                        if any(c.status not in _terminal for c in children):
-                            continue
-                        if any(c.status == TaskStatus.COMPLETED for c in children):
-                            continue
-                        failed_children = [c for c in children if c.status == TaskStatus.FAILED]
-                        cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
-                        parts = []
-                        if failed_children:
-                            classes = [
-                                (c.context or {}).get("failure_category") or "unknown"
-                                for c in failed_children
-                            ]
-                            class_summary = ", ".join(f"{cls}" for cls in classes)
-                            parts.append(f"{len(failed_children)} failed ({class_summary})")
-                        if cancelled_children:
-                            parts.append(f"{len(cancelled_children)} cancelled")
-                        diag = "; ".join(parts) if parts else f"{len(children)} terminal"
-                        parent.latest_status_message = (
-                            f"All child tasks terminated without success: {diag}"
-                        )
-                        parent.status = TaskStatus.FAILED
-                        _fc = classify_failure(parent)
-                        persist_failure_category(parent, _fc)
-                        session.add(parent)
-                        rescued += 1
-                        logger.warning(
-                            f"[REAPER] Rescued stuck EVALUATING parent {parent.id}: {diag}"
-                        )
-                    if rescued:
-                        await session.commit()
-                        logger.info(f"[REAPER] Rescued {rescued} all-children-failed EVALUATING parents")
-                except Exception as e:
-                    logger.error(f"[REAPER] All-children-failed rescue error: {e}", exc_info=True)
-
                 # Step 6: QUEUED task age alerts — notify operators when tasks have been
                 # waiting in QUEUED state beyond the configured threshold (default 2h).
                 # Fires once per task (tracked via task.context["queued_age_alert_fired"]).

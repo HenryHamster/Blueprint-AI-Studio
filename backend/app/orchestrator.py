@@ -49,6 +49,7 @@ logger = logging.getLogger("blueprint")
 
 _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
+_last_anomaly_state_persist: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
@@ -194,6 +195,73 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
+async def _persist_anomaly_state():
+    """Snapshot anomaly detection state to DB so occurrence counts survive restarts."""
+    from app.deploy_health import _get_deploy_state_for_update
+    try:
+        serializable_anomalies = {}
+        for proj_id, proj_anomalies in _shared_state.persistent_anomalies.items():
+            serializable_anomalies[proj_id] = {}
+            for k, v in proj_anomalies.items():
+                serializable_anomalies[proj_id][k] = {
+                    fk: fv.isoformat() if isinstance(fv, datetime) else fv
+                    for fk, fv in v.items()
+                }
+        adjustments = dict(_shared_state.anomaly_adjustments)
+        snapshot = {
+            "persistent_anomalies": serializable_anomalies,
+            "anomaly_adjustments": adjustments,
+        }
+        async with AsyncSessionLocal() as session:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.persistent_anomaly_state = snapshot
+                session.add(state)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[ANOMALY STATE] Failed to persist: {e}", exc_info=True)
+
+
+async def _persist_direction_streaks():
+    """Snapshot direction failure streaks to DB so holds survive restarts."""
+    from app.deploy_health import _get_deploy_state_for_update
+    try:
+        serializable = {}
+        for direction_id, streak in _shared_state.direction_failure_streaks.items():
+            serializable[direction_id] = {
+                k: v.isoformat() if isinstance(v, datetime) else v
+                for k, v in streak.items()
+            }
+        async with AsyncSessionLocal() as session:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.direction_streak_state = serializable
+                session.add(state)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[DIRECTION STREAKS] Failed to persist: {e}", exc_info=True)
+
+
+async def _persist_pipeline_events():
+    """Snapshot pipeline events ring buffer to DB so alert windows survive restarts."""
+    from app.deploy_health import _get_deploy_state_for_update
+    try:
+        events_list = []
+        for e in _shared_state.deploy_monitoring["pipeline_events"]:
+            events_list.append({
+                k: v.isoformat() if isinstance(v, datetime) else v
+                for k, v in e.items()
+            })
+        async with AsyncSessionLocal() as session:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.pipeline_events_state = {"events": events_list}
+                session.add(state)
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
+
+
 _CRITICAL_EXTERNAL_DEPS = ("github_api", "claude_api", "gcp")
 
 
@@ -332,6 +400,14 @@ async def orchestrator_worker():
             if (_utcnow() - _last_zone_health_persist).total_seconds() >= 60:
                 await _persist_zone_health()
                 _last_zone_health_persist = _utcnow()
+
+            # Periodic self-healing state persist — anomaly counts, direction holds, pipeline events
+            global _last_anomaly_state_persist
+            if (_utcnow() - _last_anomaly_state_persist).total_seconds() >= 60:
+                await _persist_anomaly_state()
+                await _persist_direction_streaks()
+                await _persist_pipeline_events()
+                _last_anomaly_state_persist = _utcnow()
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation

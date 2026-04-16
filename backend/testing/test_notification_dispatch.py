@@ -24,7 +24,7 @@ from app.notification_dispatch import (
     post_pr_merged_message,
     post_review_feedback_message,
 )
-from app.models import MessageType, ProjectMessage
+from app.models import MessageType, Project, ProjectMessage
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +538,90 @@ async def test_post_feedback_acknowledgment_with_task_id(db_session):
         task_id=task_id,
     )
     assert msg.from_task_id == task_id
+
+
+# ---------------------------------------------------------------------------
+# Tests: auto-remediation failure tracking and escalation
+# ---------------------------------------------------------------------------
+
+
+async def _create_ar_project(session, **overrides) -> Project:
+    defaults = {
+        "name": "AR Test",
+        "user_id": "test-user",
+        "github_owner": "acme",
+        "github_repo": "repo",
+        "design_doc": {"_auto_remediation": {"enabled": True}},
+    }
+    defaults.update(overrides)
+    project = Project(**defaults)
+    session.add(project)
+    await session.flush()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_failure_counter_increments(db_session):
+    """result='failed' increments the per-branch failure counter in design_doc."""
+    project = await _create_ar_project(db_session)
+    await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+    await db_session.flush()
+    await db_session.refresh(project)
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert ar.get("branch_failure_counts", {}).get("main") == 1
+
+
+@pytest.mark.asyncio
+async def test_merged_resets_counter(db_session):
+    """result='merged' resets the failure counter for the branch."""
+    project = await _create_ar_project(db_session, design_doc={
+        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
+    })
+    await post_auto_fix_result_message(db_session, project.id, branch="main", result="merged")
+    await db_session.flush()
+    await db_session.refresh(project)
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert ar.get("branch_failure_counts", {}).get("main", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_escalation_at_threshold_suspends_branch(db_session):
+    """Three consecutive failures suspend the branch and post an escalation message."""
+    from sqlmodel import select  # noqa: PLC0415
+    project = await _create_ar_project(db_session, design_doc={
+        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
+    })
+    with patch("app.notification_dispatch.asyncio") as mock_asyncio:
+        mock_asyncio.ensure_future = lambda coro: coro.close() or None
+        await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+    await db_session.flush()
+    await db_session.refresh(project)
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" in ar.get("suspended_branches", [])
+    assert ar.get("branch_failure_counts", {}).get("main") == 3
+    # Escalation message (BLOCKER) should have been posted
+    msgs = (await db_session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+    )).scalars().all()
+    escalation_msgs = [m for m in msgs if m.message_type == MessageType.BLOCKER]
+    assert len(escalation_msgs) == 1
+    assert "suspended" in escalation_msgs[0].content
+    assert "main" in escalation_msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_merged_clears_suspension(db_session):
+    """result='merged' removes the branch from suspended_branches."""
+    project = await _create_ar_project(db_session, design_doc={
+        "_auto_remediation": {
+            "enabled": True,
+            "branch_failure_counts": {"main": 3},
+            "suspended_branches": ["main"],
+        },
+    })
+    await post_auto_fix_result_message(db_session, project.id, branch="main", result="merged")
+    await db_session.flush()
+    await db_session.refresh(project)
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" not in ar.get("suspended_branches", [])
+    assert "main" not in ar.get("branch_failure_counts", {})

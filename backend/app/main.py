@@ -378,6 +378,89 @@ async def _init_deployment_state():
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore health streaks: {e}", exc_info=True)
 
+        # Restore persistent anomaly state — preserves occurrence counts across restarts
+        try:
+            pstate = getattr(state, 'persistent_anomaly_state', None)
+            if pstate and isinstance(pstate, dict):
+                raw_anomalies = pstate.get("persistent_anomalies", {})
+                for proj_id, proj_anomalies in raw_anomalies.items():
+                    restored_proj: dict = {}
+                    for k, v in proj_anomalies.items():
+                        entry: dict = {}
+                        for fk, fv in v.items():
+                            if isinstance(fv, str) and fk in ("first_seen", "last_seen"):
+                                try:
+                                    entry[fk] = datetime.fromisoformat(fv)
+                                except ValueError:
+                                    entry[fk] = fv
+                            else:
+                                entry[fk] = fv
+                        restored_proj[k] = entry
+                    _shared_state.persistent_anomalies[proj_id] = restored_proj
+                raw_adjustments = pstate.get("anomaly_adjustments", {})
+                if raw_adjustments:
+                    _shared_state.anomaly_adjustments.update(raw_adjustments)
+                # Re-apply active adjustments so max_concurrent_vms stays reduced
+                if _shared_state.anomaly_adjustments.get("active"):
+                    adj = _shared_state.anomaly_adjustments
+                    pre_vms = adj.get("pre_adjustment_max_vms")
+                    if pre_vms is not None:
+                        _shared_state.runtime_config["max_concurrent_vms"] = max(2, pre_vms // 2)
+                    logger.info(
+                        "[DEPLOY] Re-applied active anomaly adjustments: "
+                        f"max_vms={_shared_state.runtime_config['max_concurrent_vms']}, "
+                        f"failure_gate={adj.get('failure_gate_threshold')}"
+                    )
+                logger.info(f"[DEPLOY] Restored anomaly state for {len(raw_anomalies)} projects")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore anomaly state: {e}", exc_info=True)
+
+        # Restore direction failure streaks — holds survive restarts silently
+        try:
+            dstate = getattr(state, 'direction_streak_state', None)
+            if dstate and isinstance(dstate, dict):
+                for direction_id, streak in dstate.items():
+                    restored_streak: dict = {}
+                    for k, v in streak.items():
+                        if isinstance(v, str) and k in ("last_failure_at", "held_at"):
+                            try:
+                                restored_streak[k] = datetime.fromisoformat(v)
+                            except ValueError:
+                                restored_streak[k] = v
+                        else:
+                            restored_streak[k] = v
+                    _shared_state.direction_failure_streaks[direction_id] = restored_streak
+                held_count = sum(1 for s in dstate.values() if s.get("held"))
+                logger.info(
+                    f"[DEPLOY] Restored direction failure streaks for {len(dstate)} directions "
+                    f"({held_count} held)"
+                )
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore direction failure streaks: {e}", exc_info=True)
+
+        # Restore pipeline events ring buffer — alert windows survive restarts
+        try:
+            estate = getattr(state, 'pipeline_events_state', None)
+            if estate and isinstance(estate, dict):
+                from collections import deque as _deque
+                events_list = estate.get("events", [])
+                restored_events: _deque = _deque(maxlen=500)
+                for e in events_list:
+                    restored: dict = {}
+                    for k, v in e.items():
+                        if k == "ts" and isinstance(v, str):
+                            try:
+                                restored[k] = datetime.fromisoformat(v)
+                            except ValueError:
+                                restored[k] = v
+                        else:
+                            restored[k] = v
+                    restored_events.append(restored)
+                _shared_state.deploy_monitoring["pipeline_events"] = restored_events
+                logger.info(f"[DEPLOY] Restored {len(restored_events)} pipeline events")
+        except Exception as e:
+            logger.warning(f"[DEPLOY] Could not restore pipeline events: {e}", exc_info=True)
+
         # Auto-recovery from HALTED after 1 hour cooldown
         if state.status == DeploymentStatus.HALTED:
             try:

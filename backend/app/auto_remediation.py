@@ -67,6 +67,16 @@ async def _handle_main_branch_ci_failure_inner(
     max_concurrent = config.get("max_concurrent", 2)
     now = _utcnow()
 
+    # ── Guard: branch suspension (escalation after repeated failures) ──
+    suspended_branches = config.get("suspended_branches", [])
+    if head_branch in suspended_branches:
+        logger.info(
+            "[AUTO-REMEDIATION] Branch %s is suspended after repeated failures — skipping. "
+            "Clear via PATCH /auto-remediation to re-enable.",
+            head_branch,
+        )
+        return
+
     # ── Guard: rate limit ──
     one_hour_ago = now - timedelta(hours=1)
     recent_tasks = (await session.execute(

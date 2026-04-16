@@ -1566,6 +1566,7 @@ _AUTO_REMEDIATION_DEFAULTS: Dict[str, Any] = {
     "max_per_hour": 2,
     "max_concurrent": 2,
     "require_review": True,
+    "suspended_branches": [],
 }
 
 
@@ -1618,6 +1619,11 @@ async def update_auto_remediation_config(
 
     if "require_review" in body and not isinstance(body["require_review"], bool):
         raise HTTPException(status_code=422, detail="'require_review' must be a boolean")
+
+    if "suspended_branches" in body:
+        sb = body["suspended_branches"]
+        if not isinstance(sb, list) or not all(isinstance(b, str) for b in sb):
+            raise HTTPException(status_code=422, detail="'suspended_branches' must be a list of strings")
 
     # Merge into existing stored config
     design_doc = dict(project.design_doc or {})

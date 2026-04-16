@@ -255,8 +255,8 @@ async def test_concurrent_limit_blocks_spawn(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_different_sha_spawns_second_task(db_session: AsyncSession):
-    """A different SHA spawns a second task when limits allow."""
+async def test_different_sha_same_branch_blocked(db_session: AsyncSession):
+    """Dedup is branch-based: a different SHA on the same active branch is blocked."""
     project = await _create_project(db_session)
 
     await _create_auto_remediation_task(
@@ -264,9 +264,7 @@ async def test_different_sha_spawns_second_task(db_session: AsyncSession):
     )
     await db_session.flush()
 
-    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
-         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
-         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
         mock_ctx.return_value = (["CI / build"], "SyntaxError", "build")
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="sha_new",
@@ -276,7 +274,8 @@ async def test_different_sha_spawns_second_task(db_session: AsyncSession):
             session=db_session,
         )
 
-    assert await _count_auto_tasks(db_session, project.id) == 2
+    # Branch-based dedup: same branch already has an active task — no new spawn
+    assert await _count_auto_tasks(db_session, project.id) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,3 +475,49 @@ def test_build_remediation_prompt_empty_checks():
     assert "master" in prompt
     assert "not available" in prompt.lower() or "no error" in prompt.lower()
     assert "unknown" in prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: suspension guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_suspended_branch_is_blocked(db_session: AsyncSession):
+    """A branch in suspended_branches is rejected before any other guard."""
+    project = await _create_project(db_session)
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(suspended_branches=["main"]),
+            session=db_session,
+        )
+
+    # Suspended branch: no task should have been spawned
+    assert await _count_auto_tasks(db_session, project.id) == 0
+    # CI context extraction should not even be called
+    mock_ctx.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
+    """A branch not in suspended_branches proceeds normally."""
+    project = await _create_project(db_session)
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(suspended_branches=["develop"]),
+            session=db_session,
+        )
+
+    assert await _count_auto_tasks(db_session, project.id) == 1

@@ -163,6 +163,30 @@ async def _check_monitoring_window():
                 # Phase B: recommend rollback with reasoning (don't auto-trigger)
                 state.rollback_reason = reason
                 session.add(state)
+                # Create ERROR alert on all projects
+                rollback_title = f"Rollback recommended: {reason}"
+                projects = (await session.execute(select(Project))).scalars().all()
+                for project in projects:
+                    alert = Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.ERROR,
+                        title=rollback_title,
+                        message=(
+                            f"Deploy monitoring detected degraded performance. "
+                            f"Rollback to previous revision is recommended. Reason: {reason}"
+                        ),
+                    )
+                    session.add(alert)
+                    await broadcast_to_project(
+                        str(project.id),
+                        "alert_created",
+                        {"alert_id": str(alert.id), "severity": "ERROR", "title": rollback_title},
+                    )
+                    try:
+                        from app.notification_dispatch import post_rollback_recommendation_message  # noqa: PLC0415
+                        await post_rollback_recommendation_message(session, project.id, reason)
+                    except Exception as _me:
+                        logger.warning(f"[NOTIFY] post_rollback_recommendation_message failed: {_me}")
                 await session.commit()
                 logger.warning(f"[DEPLOY] ROLLBACK RECOMMENDED: {reason}")
                 logger.info('deployment_monitor_state_change', extra={
@@ -170,6 +194,20 @@ async def _check_monitoring_window():
                     'new_status': str(state.status),
                     'rollback_triggered': True,
                 })
+                # Dispatch external webhook notifications (fire-and-forget)
+                try:
+                    import asyncio as _asyncio  # noqa: PLC0415
+                    from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                    for project in projects:
+                        _asyncio.ensure_future(dispatch_external_notification(
+                            project.id,
+                            "ROLLBACK_RECOMMENDED",
+                            {"reason": reason, "revision": state.current_revision},
+                        ))
+                except Exception as _ne:
+                    logger.warning(f"[NOTIFY] ROLLBACK_RECOMMENDED dispatch setup failed: {_ne}")
+                # Broadcast updated deploy state (includes rollback_reason)
+                await broadcast_deploy_state()
             else:
                 # No rollback target available — stay in MONITORING, don't promote to STABLE
                 state.rollback_reason = f"Issues detected but no rollback target: {reason}"
