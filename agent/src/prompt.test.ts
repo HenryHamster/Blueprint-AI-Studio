@@ -329,6 +329,37 @@ describe('buildContextPrefix', () => {
     const result = buildContextPrefix(task);
     expect(result).not.toContain('Module-Specific Review History');
   });
+
+  it('renders ## Architecture Context section with system name, status, and readiness', () => {
+    const task = {
+      project_context: {
+        architecture_context: [
+          { name: 'Auth', status: 'functional', ready_for_features: true, description: 'Handles JWT tokens.' },
+          { name: 'Database', status: 'mature', ready_for_features: false, description: 'ORM layer.' },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Architecture Context');
+    expect(result).toContain('**Auth**: functional, ready for features — Handles JWT tokens.');
+    expect(result).toContain('**Database**: mature, not ready for features — ORM layer.');
+  });
+
+  it('does not render ## Architecture Context when architecture_context is absent', () => {
+    const task = {
+      project_context: { active_tasks: [] },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('## Architecture Context');
+  });
+
+  it('does not render ## Architecture Context when architecture_context is an empty array', () => {
+    const task = {
+      project_context: { architecture_context: [] },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('## Architecture Context');
+  });
 });
 
 // ── formatProjectContext ──────────────────────────────────────────────────────

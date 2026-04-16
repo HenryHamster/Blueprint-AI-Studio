@@ -1,5 +1,6 @@
 """Agent-facing API endpoints (lifecycle + GitHub proxy)."""
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -899,6 +900,39 @@ async def claim_task(
                 if "project_context" not in response:
                     response["project_context"] = {}
                 response["project_context"]["module_feedback_warnings"] = module_warnings
+
+    # Inject scoped architecture context for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        design_doc = project_for_playbook.design_doc or {}
+        file_to_system = design_doc.get("_file_to_system", {})
+        if file_to_system:
+            arch_related_files = (task.context or {}).get("related_files", [])
+            seen_systems: dict[str, dict] = {}
+            for rf in arch_related_files:
+                sys_name = file_to_system.get(rf)
+                if sys_name and sys_name not in seen_systems:
+                    sys_entry = design_doc.get(f"systems/{sys_name}")
+                    if isinstance(sys_entry, dict):
+                        seen_systems[sys_name] = sys_entry
+                        if len(seen_systems) >= 5:
+                            break
+            if seen_systems:
+                arch_ctx = []
+                for sys_name, sys_data in seen_systems.items():
+                    desc = sys_data.get("description", "")
+                    arch_ctx.append({
+                        "name": sys_data.get("name", sys_name),
+                        "status": str(sys_data.get("status", "")),
+                        "ready_for_features": bool(sys_data.get("ready_for_features", False)),
+                        "description": desc[:200] if isinstance(desc, str) else "",
+                    })
+                # Safety: drop trailing entries if total exceeds 1500 chars
+                while arch_ctx and len(json.dumps(arch_ctx)) > 1500:
+                    arch_ctx.pop()
+                if arch_ctx:
+                    if "project_context" not in response:
+                        response["project_context"] = {}
+                    response["project_context"]["architecture_context"] = arch_ctx
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:

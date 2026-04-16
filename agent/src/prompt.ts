@@ -317,6 +317,24 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     prefix += dcLines.join('\n') + '\n';
   }
 
+  // Append architecture context section when present
+  const archCtx = projectCtx?.architecture_context as Array<Record<string, unknown>> | undefined;
+  if (archCtx && archCtx.length > 0) {
+    const archLines: string[] = ['## Architecture Context'];
+    for (const sys of archCtx) {
+      const name = strVal(sys.name);
+      const status = strVal(sys.status);
+      const ready = sys.ready_for_features === true ? 'ready' : 'not ready';
+      const desc = strVal(sys.description);
+      const line = desc
+        ? `- **${name}**: ${status}, ${ready} for features — ${desc}`
+        : `- **${name}**: ${status}, ${ready} for features`;
+      archLines.push(line);
+    }
+    archLines.push('');
+    prefix += archLines.join('\n') + '\n';
+  }
+
   // Append task scope section for create/fix/refactor task types
   const scopeApplicable = ['create', 'fix', 'refactor'].includes(taskType);
   if (taskScope && scopeApplicable) {

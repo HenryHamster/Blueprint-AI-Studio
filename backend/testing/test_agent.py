@@ -1390,6 +1390,108 @@ async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(cl
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_architecture_context_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint injects architecture_context in project_context for create tasks when related_files match _file_to_system."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "_file_to_system": {
+            "backend/app/auth.py": "auth",
+            "backend/app/models.py": "database",
+        },
+        "systems/auth": {
+            "name": "Auth",
+            "status": "functional",
+            "ready_for_features": True,
+            "description": "Handles authentication and JWT tokens.",
+            "modules": ["backend/app/auth.py"],
+        },
+        "systems/database": {
+            "name": "Database",
+            "status": "mature",
+            "ready_for_features": True,
+            "description": "SQLModel ORM layer and migrations.",
+            "modules": ["backend/app/models.py"],
+        },
+    }
+    project = Project(name="Arch Context Test", user_id="test-user-123", design_doc=design_doc)
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add OAuth provider"}],
+        vm_instance_id="agent-vm-arch-ctx-create",
+        context={"related_files": ["backend/app/auth.py", "backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-arch-ctx-create")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "architecture_context" in project_ctx, (
+        f"Expected architecture_context in project_context, got: {list(project_ctx.keys())}"
+    )
+    arch_ctx = project_ctx["architecture_context"]
+    assert len(arch_ctx) == 2
+    names = {s["name"] for s in arch_ctx}
+    assert names == {"Auth", "Database"}
+    auth_entry = next(s for s in arch_ctx if s["name"] == "Auth")
+    assert auth_entry["status"] == "functional"
+    assert auth_entry["ready_for_features"] is True
+    assert "authentication" in auth_entry["description"]
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_architecture_context_for_review_task(client: AsyncClient, db_session):
+    """Claim endpoint does NOT inject architecture_context for review tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "_file_to_system": {"backend/app/auth.py": "auth"},
+        "systems/auth": {
+            "name": "Auth",
+            "status": "functional",
+            "ready_for_features": True,
+            "description": "Auth system.",
+            "modules": ["backend/app/auth.py"],
+        },
+    }
+    project = Project(name="Arch Context Review Test", user_id="test-user-123", design_doc=design_doc)
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 99, "branch": "feat/review-branch"}],
+        vm_instance_id="agent-vm-arch-ctx-review",
+        context={"related_files": ["backend/app/auth.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-arch-ctx-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    project_ctx = data.get("project_context", {})
+    assert "architecture_context" not in project_ctx, (
+        f"architecture_context should be absent for review tasks, got: {project_ctx.get('architecture_context')}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_safe_ws_close_swallows_double_close_runtime_error():
     """Production cascade: receive_json raised WebSocketDisconnect (already
     sent a close frame), then our explicit close tries to send a second one
