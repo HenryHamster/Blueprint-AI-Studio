@@ -508,3 +508,317 @@ async def test_extract_review_feedback_updates_module_profiles(db_session: Async
     entry = feedback["backend/app/routes.py"]
     assert entry["total"] > 0
     assert "last_updated" in entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _accumulate_direction_first_attempt
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_accumulate_direction_first_attempt_creates_entry():
+    """Creates a direction tally entry with counts from buckets."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 0}],
+        "style-conventions": [
+            {"desc": "wrong naming", "severity": "MINOR", "iteration": 0},
+            {"desc": "bad indent", "severity": "MINOR", "iteration": 0},
+        ],
+    }
+    _accumulate_direction_first_attempt(doc, "dir-abc123", buckets)
+
+    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY]["dir-abc123"]
+    assert tally["test-coverage"] == 1
+    assert tally["style-conventions"] == 2
+    assert tally["total"] == 3
+    assert "last_updated" in tally
+
+
+def test_accumulate_direction_first_attempt_accumulates_across_calls():
+    """Repeated calls for the same direction accumulate counts."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    buckets = {"test-coverage": [{"desc": "x", "severity": "MAJOR", "iteration": 0}]}
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY]["dir-abc"]
+    assert tally["test-coverage"] == 3
+    assert tally["total"] == 3
+
+
+def test_accumulate_direction_first_attempt_noop_on_empty_buckets():
+    """No changes when buckets are empty."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    _accumulate_direction_first_attempt(doc, "dir-xyz", {})
+    assert _DIRECTION_FIRST_ATTEMPT_KEY not in doc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _maybe_auto_playbook_from_first_attempt
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_maybe_auto_playbook_creates_entry_at_threshold():
+    """Creates a first-attempt-pattern playbook entry when a category reaches the threshold."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            "dir-abc123": {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+                "style-conventions": 2,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+                "last_updated": "2026-01-01T00:00:00",
+            }
+        }
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc123", "create", "task-id-1")
+
+    assert len(created) == 1
+    key = created[0]
+    assert "test-coverage" in key
+    full_key = f"playbook/{key}"
+    assert full_key in doc
+    entry = doc[full_key]
+    assert entry["source"] == "first-attempt-pattern"
+    assert entry["rejection_count"] == _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD
+    assert "create" in entry["applicable_types"]
+    assert "test" in entry["content"]
+
+
+def test_maybe_auto_playbook_skips_below_threshold():
+    """No entry created when count is below threshold."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            "dir-abc": {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1,
+            }
+        }
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc", "create", "task-id")
+    assert created == []
+
+
+def test_maybe_auto_playbook_deduplicates():
+    """Skips entry creation if key already exists."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    dir_slug = "dirabc123"[:8]  # matches the slug logic: direction_key[:8].replace("-","").replace("_","")
+    # Compute the key that would be generated for direction "dir-abc123"
+    direction_key = "dir-abc123"
+    expected_slug = direction_key[:8].replace("-", "").replace("_", "")
+    existing_key = f"playbook/first-attempt-{expected_slug}-test-coverage"
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_key: {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+            }
+        },
+        existing_key: {"content": "already exists", "source": "first-attempt-pattern"},
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, direction_key, "create", "task-id")
+    assert created == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for extract_review_feedback_to_playbook — first-attempt (iteration < 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_accumulates_on_first_iteration(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook accumulates direction data on iteration == 1."""
+    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests for the handler", "severity": "MAJOR"},
+                {"description": "no test coverage for edge cases", "severity": "MINOR"},
+            ],
+        },
+    ]
+    review_loop = {"iteration": 1, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="First-iter task",
+        payloads=[{"type": "create", "prompt": "add handler"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_summary": {"id": "dir-cafebabe-1234", "title": "Test direction"},
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=99, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+
+    # No full playbook entry created for iteration < 3
+    review_keys = [k for k in doc if k.startswith("playbook/review-")]
+    assert review_keys == [], f"Should not create review-extracted entries at iteration 1, got {review_keys}"
+
+    # Direction tally was accumulated
+    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc, "direction_first_attempt_feedback should be written"
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY].get("dir-cafebabe-1234")
+    assert tally is not None
+    assert tally.get("test-coverage", 0) >= 1
+    assert tally.get("total", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_no_first_attempt_on_empty_history(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook returns [] with no review_history."""
+    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    project = await _make_project(db_session, design_doc={})
+    review_loop = {"iteration": 1, "review_history": []}
+    task = Task(
+        project_id=project.id,
+        title="Empty history task",
+        payloads=[{"type": "create", "prompt": "add handler"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=1, original_task_type="create", session=db_session
+    )
+    assert keys == []
+    doc = project.design_doc or {}
+    assert _DIRECTION_FIRST_ATTEMPT_KEY not in doc
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: AsyncSession):
+    """Auto-generates a first-attempt-pattern entry when direction tally hits the threshold."""
+    from app.playbook_learning import (
+        extract_review_feedback_to_playbook,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    direction_id = "dir-deadbeef-5678"
+    # Pre-populate the tally so the next call pushes test-coverage over the threshold
+    pre_count = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1
+    project = await _make_project(db_session, design_doc={
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_id: {
+                "test-coverage": pre_count,
+                "total": pre_count,
+                "last_updated": "2026-01-01T00:00:00",
+            }
+        }
+    })
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests", "severity": "MAJOR"},
+            ],
+        },
+    ]
+    review_loop = {"iteration": 1, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Threshold task",
+        payloads=[{"type": "create", "prompt": "add something"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_summary": {"id": direction_id, "title": "Test direction"}},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    # A first-attempt-pattern entry should have been auto-created
+    fa_keys = [k for k in doc if k.startswith("playbook/first-attempt-")]
+    assert len(fa_keys) == 1, f"Expected 1 first-attempt entry, got {fa_keys}"
+    entry = doc[fa_keys[0]]
+    assert entry["source"] == "first-attempt-pattern"
+    assert entry["rejection_count"] == _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD
+    # The auto-created key is in the returned list
+    assert any("first-attempt" in k for k in keys)
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook still creates review-extracted entries at iteration >= 3."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "still missing tests", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 2,
+            "issues": [],
+        },
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Multi-iter task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=42, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    review_keys = [k for k in doc if k.startswith("playbook/review-")]
+    assert len(review_keys) >= 1, "Should create at least 1 review-extracted entry at iteration 3"
+    assert any("review-test-coverage" in k for k in review_keys)

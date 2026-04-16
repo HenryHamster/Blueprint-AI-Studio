@@ -537,9 +537,11 @@ async def claim_task(
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
         top_first_review_issues = None
+        first_attempt_issue_distribution = None
+        direction_first_attempt_feedback = None
         if task_type in ("create", "fix", "refactor"):
             try:
-                from app.playbook_learning import _categorize_review_issues
+                from app.playbook_learning import _categorize_review_issues, _DIRECTION_FIRST_ATTEMPT_KEY
                 cutoff_14d = _utcnow() - timedelta(days=14)
                 combined_review_history = []
                 for ht in high_iter_rows:
@@ -590,6 +592,48 @@ async def claim_task(
                         ]
                 except Exception:
                     logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
+
+                # First-attempt issue distribution: aggregate _first_attempt_rejection_categories
+                # from all reviewed tasks (covers the common 1-iteration case missing from above)
+                try:
+                    fa_cat_counts: dict[str, int] = {}
+                    for ht in high_iter_rows:
+                        if ht.created_at and ht.created_at < cutoff_14d:
+                            continue
+                        cats = (ht.context or {}).get("_first_attempt_rejection_categories", {})
+                        for cat, cnt in cats.items():
+                            fa_cat_counts[cat] = fa_cat_counts.get(cat, 0) + (
+                                cnt if isinstance(cnt, int) else 1
+                            )
+                    if fa_cat_counts:
+                        total_fa = sum(fa_cat_counts.values())
+                        sorted_fa = sorted(fa_cat_counts.items(), key=lambda x: -x[1])[:3]
+                        first_attempt_issue_distribution = {
+                            cat: round(count / total_fa, 2) for cat, count in sorted_fa
+                        }
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute first_attempt_issue_distribution (non-critical)")
+
+                # Direction-specific first-attempt feedback from accumulated tally
+                try:
+                    direction_id = str(
+                        (task.context or {}).get("direction_summary", {}).get("id") or ""
+                    )
+                    if direction_id:
+                        _proj_doc = await session.get(Project, task.project_id)
+                        if _proj_doc:
+                            d_tally = (_proj_doc.design_doc or {}).get(
+                                _DIRECTION_FIRST_ATTEMPT_KEY, {}
+                            ).get(direction_id)
+                            if d_tally:
+                                direction_first_attempt_feedback = {
+                                    k: v for k, v in d_tally.items()
+                                    if k not in ("total", "last_updated")
+                                    and isinstance(v, int) and v > 0
+                                }
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute direction_first_attempt_feedback (non-critical)")
+
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
@@ -603,6 +647,8 @@ async def claim_task(
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
             "top_first_review_issues": top_first_review_issues,
+            "first_attempt_issue_distribution": first_attempt_issue_distribution,
+            "direction_first_attempt_feedback": direction_first_attempt_feedback,
         }
     else:
         # Lightweight pipeline health for all other task types

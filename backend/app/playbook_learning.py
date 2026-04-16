@@ -441,6 +441,9 @@ async def capture_success_pattern(
 _MODULE_FEEDBACK_KEY = "module_feedback"
 _MODULE_FEEDBACK_MAX_ENTRIES = 50
 
+_DIRECTION_FIRST_ATTEMPT_KEY = "direction_first_attempt_feedback"
+_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD = 5
+
 
 def _update_module_feedback_profiles(
     doc: dict,
@@ -487,6 +490,76 @@ def _update_module_feedback_profiles(
     doc[_MODULE_FEEDBACK_KEY] = profiles
 
 
+def _accumulate_direction_first_attempt(
+    doc: dict,
+    direction_key: str,
+    buckets: dict[str, list[dict]],
+) -> None:
+    """Accumulate first-attempt review rejection counts at the direction level (in-place).
+
+    Stores a running tally under ``doc["direction_first_attempt_feedback"][direction_key]``
+    with one integer count per review category.  This is a lightweight structure — not a
+    full playbook entry — designed for high-frequency updates (every 1-iteration review).
+    """
+    if not buckets:
+        return
+    now_iso = _utcnow().isoformat()
+    tally: dict = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
+    entry: dict = dict(tally.get(direction_key) or {})
+    for cat, issues in buckets.items():
+        if issues:
+            entry[cat] = entry.get(cat, 0) + len(issues)
+    entry["total"] = entry.get("total", 0) + sum(len(v) for v in buckets.values() if v)
+    entry["last_updated"] = now_iso
+    tally[direction_key] = entry
+    doc[_DIRECTION_FIRST_ATTEMPT_KEY] = tally
+
+
+def _maybe_auto_playbook_from_first_attempt(
+    doc: dict,
+    direction_key: str,
+    task_type: str,
+    task_id: str,
+    threshold: int = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+) -> list[str]:
+    """Create playbook entries for direction categories that hit the first-attempt threshold.
+
+    Returns the list of newly created playbook keys (short form, without ``playbook/`` prefix).
+    Skips categories that already have a ``playbook/first-attempt-*`` entry.
+    """
+    tally = (doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {}).get(direction_key) or {}
+    created: list[str] = []
+    for cat, count in tally.items():
+        if cat in ("total", "last_updated") or not isinstance(count, int):
+            continue
+        if count < threshold:
+            continue
+        # Use a short direction slug to keep keys readable
+        dir_slug = direction_key[:8].replace("-", "").replace("_", "") or "proj"
+        key = f"first-attempt-{dir_slug}-{cat}"
+        full_key = f"playbook/{key}"
+        if full_key in doc:
+            continue
+        content = (
+            f"First-attempt rejection pattern (direction {direction_key[:16]}): "
+            f"{cat.replace('-', ' ')} issues have been flagged {count}x on first try. "
+            f"Agents in this direction consistently miss {cat.replace('-', ' ')} requirements "
+            f"before submitting. Pay special attention to {cat.replace('-', ' ')} before opening a PR."
+        )
+        doc[full_key] = {
+            "content": content,
+            "source_task_id": task_id,
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+            "source": "first-attempt-pattern",
+            "applicable_types": [task_type],
+            "direction_key": direction_key,
+            "rejection_count": count,
+        }
+        created.append(key)
+    return created
+
+
 async def extract_review_feedback_to_playbook(
     task: Task,
     review_loop: dict,
@@ -494,26 +567,25 @@ async def extract_review_feedback_to_playbook(
     original_task_type: str,
     session: AsyncSession,
 ) -> list[str]:
-    """Extract recurring review feedback themes and persist them as playbook entries.
+    """Extract review feedback and accumulate per-direction learning on every merge.
 
-    Called after a PR merges following a multi-iteration review cycle (3+ iterations).
-    Creates at most 2 entries per completed review cycle, tagged with
-    ``source='review-extracted'`` so they are distinguishable from failure-pattern
-    and manually written entries.
+    Behaviour by iteration count:
+    - Any iteration (≥1): update per-module feedback profiles; accumulate direction-level
+      first-attempt rejection tallies from the iteration-0 review entry.
+    - iteration ≥ 3: additionally create up to 2 full ``review-extracted`` playbook entries
+      (the existing high-signal path for multi-cycle reviews).
+    - iteration < 1 or no review_history: no-op.
 
-    Deduplicates by playbook key: if ``playbook/review-<category>`` already exists
-    for the project the entry is skipped.
+    When a direction accumulates ``_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD`` (default 5)
+    first-attempt rejections in a single category, a targeted ``first-attempt-pattern``
+    playbook entry is auto-generated.
 
     Returns the list of created playbook keys (may be empty).
     """
     iteration = review_loop.get("iteration", 0)
     review_history = review_loop.get("review_history") or []
 
-    if iteration < 3 or not review_history:
-        return []
-
-    buckets = _categorize_review_issues(review_history)
-    if not buckets:
+    if not review_history:
         return []
 
     project = await session.get(Project, task.project_id)
@@ -522,55 +594,75 @@ async def extract_review_feedback_to_playbook(
 
     doc = dict(project.design_doc or {})
 
-    # Update per-module feedback profiles with files from this task
+    # Always update per-module feedback profiles regardless of iteration count
+    buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
     module_profiles_updated = bool(related_files and buckets)
     _update_module_feedback_profiles(doc, related_files, buckets)
 
-    # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
-    _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
-    top_cats = sorted(
-        buckets.items(),
-        key=lambda kv: sum(_severity_weights.get(i["severity"], 1) for i in kv[1]),
-        reverse=True,
-    )[:2]
-
-    created_keys: list[str] = []
-    for cat_name, issues in top_cats:
-        playbook_full_key = f"playbook/review-{cat_name}"
-
-        if playbook_full_key in doc:
-            logger.debug(
-                "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
-                task.project_id, playbook_full_key,
+    # Accumulate direction-level first-attempt rejection data (iteration-0 entry only)
+    direction_key = str(
+        (task.context or {}).get("direction_summary", {}).get("id") or "_project"
+    )
+    first_review_entries = [e for e in review_history if e.get("iteration", 999) == 0]
+    first_attempt_keys: list[str] = []
+    direction_tally_updated = False
+    if first_review_entries:
+        first_attempt_buckets = _categorize_review_issues(first_review_entries)
+        if first_attempt_buckets:
+            _accumulate_direction_first_attempt(doc, direction_key, first_attempt_buckets)
+            direction_tally_updated = True
+            first_attempt_keys = _maybe_auto_playbook_from_first_attempt(
+                doc, direction_key, original_task_type, str(task.id)
             )
-            continue
 
-        # Surface up to 3 highest-severity examples
-        severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
-        top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
-        examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
+    created_keys: list[str] = list(first_attempt_keys)
 
-        content = (
-            f"Review pattern from PR #{pr_number} ({iteration} iterations): "
-            f"{cat_name.replace('-', ' ')} issues were repeatedly flagged. "
-            f"Examples: {examples[:300]}. "
-            f"Applicable to: {original_task_type} tasks."
-        )
+    # Create full playbook entries only for 3+ iteration reviews
+    if iteration >= 3 and buckets:
+        # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
+        _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+        top_cats = sorted(
+            buckets.items(),
+            key=lambda kv: sum(_severity_weights.get(i["severity"], 1) for i in kv[1]),
+            reverse=True,
+        )[:2]
 
-        doc[playbook_full_key] = {
-            "content": content,
-            "source_task_id": str(task.id),
-            "updated_at": _utcnow().isoformat(),
-            "confirmed_count": 0,
-            "source": "review-extracted",
-            "applicable_types": [original_task_type],
-            "pr_number": pr_number,
-            "iteration_count": iteration,
-        }
-        created_keys.append(f"review-{cat_name}")
+        for cat_name, issues in top_cats:
+            playbook_full_key = f"playbook/review-{cat_name}"
 
-    if created_keys or module_profiles_updated:
+            if playbook_full_key in doc:
+                logger.debug(
+                    "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
+                    task.project_id, playbook_full_key,
+                )
+                continue
+
+            # Surface up to 3 highest-severity examples
+            severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
+            top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
+            examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
+
+            content = (
+                f"Review pattern from PR #{pr_number} ({iteration} iterations): "
+                f"{cat_name.replace('-', ' ')} issues were repeatedly flagged. "
+                f"Examples: {examples[:300]}. "
+                f"Applicable to: {original_task_type} tasks."
+            )
+
+            doc[playbook_full_key] = {
+                "content": content,
+                "source_task_id": str(task.id),
+                "updated_at": _utcnow().isoformat(),
+                "confirmed_count": 0,
+                "source": "review-extracted",
+                "applicable_types": [original_task_type],
+                "pr_number": pr_number,
+                "iteration_count": iteration,
+            }
+            created_keys.append(f"review-{cat_name}")
+
+    if created_keys or module_profiles_updated or direction_tally_updated:
         meta = dict(doc.get("_meta", {"revision": 0}))
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()
