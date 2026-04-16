@@ -666,6 +666,20 @@ async def claim_task(
             "top_first_review_issues": top_first_review_issues,
             "review_effectiveness": review_effectiveness,
         }
+
+        # Record review measurement attribution in task.context for outcome tracking
+        try:
+            _had_measurements = bool(review_issue_distribution)
+            _ctx = dict(task.context or {})
+            _ctx["_had_review_measurements"] = _had_measurements
+            if _had_measurements:
+                _ctx["_top_review_issue_categories"] = list(review_issue_distribution.keys())
+            task.context = _ctx
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+        except Exception:
+            logger.exception("[AGENT] Failed to record review measurement attribution (non-critical)")
     else:
         # Lightweight pipeline health for all other task types
         try:

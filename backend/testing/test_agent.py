@@ -950,6 +950,77 @@ async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, d
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_records_review_measurement_attribution(client: AsyncClient, db_session):
+    """Claim stores _had_review_measurements=True and _top_review_issue_categories when review data exists."""
+    project = Project(name="Review Measurement Attribution Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-review-attr",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Seed completed tasks with review_loop history containing >=5 categorizable issues
+    review_issue = {"description": "Missing unit test coverage for this function", "severity": "MAJOR"}
+    review_history_entry = {"issues": [review_issue] * 5, "iteration": 1}
+    completed_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "prev"}],
+        status=TaskStatus.COMPLETED,
+        attempt_count=2,
+        context={"review_loop": {"iteration": 2, "review_history": [review_history_entry]}},
+    )
+    db_session.add(completed_task)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-review-attr")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_had_review_measurements") is True, f"Expected _had_review_measurements=True, got {ctx}"
+    categories = ctx.get("_top_review_issue_categories", [])
+    assert len(categories) > 0, f"Expected non-empty _top_review_issue_categories, got {categories}"
+    assert "test-coverage" in categories, f"Expected test-coverage in categories, got {categories}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_review_measurement_attribution_false_when_no_data(client: AsyncClient, db_session):
+    """Claim stores _had_review_measurements=False when no review data is available."""
+    project = Project(name="No Review Data Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-no-review",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_had_review_measurements") is False, f"Expected _had_review_measurements=False, got {ctx}"
+    assert "_top_review_issue_categories" not in ctx, "Should not store categories when no measurements"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_recent_outcomes_sorts_by_effectiveness(client: AsyncClient, db_session):
     """Claim sorts entries by recent_outcomes effectiveness score (sum/len) descending."""
     from sqlalchemy.orm.attributes import flag_modified
