@@ -644,9 +644,9 @@ ${hotspotsSection}
           const status = strVal(m.status);
           const from = strVal(m.from);
           const tag = status === 'resolved' ? `${from}, ${age}, RESOLVED` : `${from}, ${age}, OPEN`;
-          let line = `[${tag}] [${strVal(m.type)}] ${strVal(m.content).slice(0, 300)}`;
+          let line = `[${tag}] [${strVal(m.type)}] ${strVal(m.content).slice(0, 5000)}`;
           if (status === 'resolved' && m.resolution) {
-            line += `\n  -> ${strVal(m.resolution).slice(0, 200)}`;
+            line += `\n  -> ${strVal(m.resolution).slice(0, 500)}`;
           }
           if (status === 'open') {
             line += ` (id: ${strVal(m.id)})`;
@@ -661,7 +661,7 @@ ${hotspotsSection}
       ? (() => {
           const feedbackLines = feedbackMessages.map(m => {
             const age = calcMessageAge(m);
-            return `- (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 300)}`;
+            return `- (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
           }).join('\n');
           return `\n## User Feature Requests\nThese FEEDBACK messages are direct user requests. Strongly consider creating a direction for each unaddressed request:\n${feedbackLines}\n`;
         })()
@@ -671,7 +671,7 @@ ${hotspotsSection}
     const openMessagesText = openMessages.length > 0
       ? openMessages.map(m => {
           const age = calcMessageAge(m);
-          return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 200)}`;
+          return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
         }).join('\n')
       : '';
 
