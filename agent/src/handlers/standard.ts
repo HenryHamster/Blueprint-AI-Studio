@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
+  runProjectLintChecks,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -83,6 +84,7 @@ export interface StandardHandlerOpts {
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
+  relatedFiles?: string[];
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -98,6 +100,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     lintContext = 'the code you just wrote',
     includeTaskTypeHints = true,
     issueReference,
+    relatedFiles,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -203,7 +206,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -301,6 +304,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
         selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+        if (fixesApplied) {
+          try {
+            runProjectLintChecks(changedPaths, ws, buildConfig);
+          } catch (lintErr: unknown) {
+            const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+            sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+        }
       }
     }
 
@@ -466,6 +477,7 @@ export async function handleCreate(
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,
+    relatedFiles,
   });
 }
 

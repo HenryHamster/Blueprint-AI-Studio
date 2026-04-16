@@ -21,6 +21,7 @@ vi.mock('../index.js', () => ({
   lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
   captureTestBaseline: vi.fn().mockResolvedValue(null),
+  runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -82,7 +83,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
-import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
 import { extractModuleInterfaces } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -510,6 +511,66 @@ describe('self-review phase', () => {
     expect(outcome).toBeDefined();
     expect(outcome.categories).toContain('self_review_failed');
   });
+
+  it('runs runProjectLintChecks after self-review applies fixes', async () => {
+    // currentHead === baseCommit (both ''), diff has changes → changedPaths=['file']
+    // headBeforeReview !== headAfterReview → fixesApplied=true → runProjectLintChecks called
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit (rev-parse HEAD)
+      .mockReturnValueOnce('M file')   // status --porcelain → hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview (rev-parse HEAD)
+      .mockReturnValueOnce('')         // statusBeforeReview (status --porcelain)
+      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied
+      .mockReturnValueOnce('')         // statusAfterReview
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runProjectLintChecks)).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run runProjectLintChecks when self-review applies no fixes', async () => {
+    // headBeforeReview === headAfterReview → fixesApplied=false → runProjectLintChecks not called
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterReview — SAME → no fixes
+      .mockReturnValueOnce('')         // statusAfterReview — SAME
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runProjectLintChecks)).not.toHaveBeenCalled();
+  });
+
+  it('task completes even when runProjectLintChecks throws after self-review fixes', async () => {
+    // Same fixesApplied=true sequence, but runProjectLintChecks throws a lint error
+    vi.mocked(runProjectLintChecks).mockImplementationOnce(() => {
+      throw new Error('ESLint: 3 errors found');
+    });
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead (same as base)
+      .mockReturnValueOnce('')         // uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('def456')   // headAfterReview — different → fixes applied
+      .mockReturnValueOnce('')         // statusAfterReview
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Task should complete (not fail) despite lint error
+    const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(completedCall).toBeDefined();
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+  });
 });
 
 // ── testFixLoop receives buildConfig from task.build_config ───────────────────
@@ -542,7 +603,7 @@ describe('testFixLoop buildConfig propagation', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, buildConfig, undefined,
+      WS, expect.any(Object), undefined, undefined, buildConfig, undefined, [],
     );
   });
 
@@ -554,7 +615,7 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
     );
   });
 });
@@ -599,7 +660,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, baseline,
+      WS, expect.any(Object), undefined, undefined, undefined, baseline, [],
     );
   });
 
@@ -608,7 +669,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
     );
   });
 
@@ -622,6 +683,19 @@ describe('test baseline capture', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
       WS, expect.any(Object), undefined, relatedFiles,
+    );
+  });
+
+  it('passes related_files from payload to testFixLoop', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    const relatedFiles = ['agent/src/index.ts'];
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, relatedFiles,
     );
   });
 });

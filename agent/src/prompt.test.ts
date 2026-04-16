@@ -1232,4 +1232,54 @@ describe('extractModuleInterfaces', () => {
     );
     expect(extractModuleInterfaces(null, ['agent/src/utils.ts'])).toBe('');
   });
+
+  it('appends Suggested Change Order when one related file imports from another', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // models callers include services (in related set); services has no related callers
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('imports from models.py');
+  });
+
+  it('omits Suggested Change Order when no related files import each other', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def get_user(user_id: int):\n    pass\n'
+    );
+    // Both files' callers are outside the related set
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('other/caller.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
+    expect(result).not.toContain('## Suggested Change Order');
+  });
+
+  it('appends Suggested Change Order for three-file dependency chain', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      'def fn(x: int):\n    pass\n'
+    );
+    // models callers: [services, admin]; services callers: [admin]; admin callers: []
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('backend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
+      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+    const result = extractModuleInterfaces(null, [
+      'backend/app/models.py',
+      'backend/app/services.py',
+      'backend/app/admin.py',
+    ]);
+    expect(result).toContain('## Suggested Change Order');
+    expect(result).toContain('1. models.py');
+    expect(result).toContain('2. services.py');
+    expect(result).toContain('3. admin.py');
+  });
 });
