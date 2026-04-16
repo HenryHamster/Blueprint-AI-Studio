@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
+  runProjectLintChecks,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -303,6 +304,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
         selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
+        if (fixesApplied) {
+          try {
+            runProjectLintChecks(changedPaths, ws, buildConfig);
+          } catch (lintErr: unknown) {
+            const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+            sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+        }
       }
     }
 
