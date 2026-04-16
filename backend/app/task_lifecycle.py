@@ -157,6 +157,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         logger.warning(f"[REQUEUE] Parent {parent.id} hit re-evaluation limit ({requeue_count} attempts) — failing permanently")
         parent.status = TaskStatus.FAILED
         parent.latest_status_message = f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
+        failed_children = (await session.execute(
+            select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.FAILED)
+        )).scalars().all()
+        from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+        worst_cat = worst_child_failure_category(failed_children)
+        persist_failure_category(parent, worst_cat)
         session.add(parent)
         await session.commit()
         # Create failure alert

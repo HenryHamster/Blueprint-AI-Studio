@@ -161,6 +161,25 @@ async def _handle_main_branch_ci_failure_inner(
         owner, repo, head_sha, project_id, session,
     )
 
+    # ── Guard: skip if no useful CI context was extracted ──
+    if not failed_checks and not error_summary and failure_type == "unknown":
+        logger.warning(
+            "[AUTO-REMEDIATION] Skipping task creation for %s@%s: "
+            "CI context extraction returned no useful information (no failed checks, no error summary)",
+            head_branch, head_sha[:8],
+        )
+        try:
+            from app.main import _send_webhook_notification
+            import asyncio
+            asyncio.ensure_future(_send_webhook_notification(
+                "AUTO_FIX_SKIPPED",
+                f"CI auto-remediation skipped on {head_branch}: insufficient context",
+                f"SHA: {head_sha[:8]} — no failed checks, no error logs extracted",
+            ))
+        except Exception as exc:
+            logger.warning("[AUTO-REMEDIATION] Failed to send skip webhook notification: %s", exc)
+        return
+
     # ── Create the fix task ──
     prompt = _build_remediation_prompt(
         head_branch=head_branch,

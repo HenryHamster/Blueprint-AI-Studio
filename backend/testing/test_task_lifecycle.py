@@ -240,6 +240,30 @@ async def test_requeue_fails_parent_permanently_at_limit(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_requeue_limit_persists_failure_category(tl_db):
+    """Parent at requeue limit gets failure_category derived from worst failed child."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    # Child with CODE_ERROR persisted
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
 async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker):
     """Failed children are cancelled and replaced with QUEUED clones."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

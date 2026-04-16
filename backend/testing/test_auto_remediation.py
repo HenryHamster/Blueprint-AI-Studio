@@ -504,6 +504,27 @@ async def test_suspended_branch_is_blocked(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_skip_when_no_ci_context(db_session: AsyncSession):
+    """No task is spawned when CI context extraction returns no useful information."""
+    project = await _create_project(db_session)
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        # Return the "no useful context" sentinel values
+        mock_ctx.return_value = ([], "", "unknown")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    # No task should have been spawned
+    assert await _count_auto_tasks(db_session, project.id) == 0
+
+
+@pytest.mark.asyncio
 async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
     """A branch not in suspended_branches proceeds normally."""
     project = await _create_project(db_session)
