@@ -503,12 +503,17 @@ Output ONLY a JSON object in a \`\`\`json code fence:
 
       let selfReviewFailed = false;
       let lastReviewOutput = '';
+      // lastResultText is the parsed text from the `result` stream-json event —
+      // it has real newlines, so ```json fences parse cleanly.  allOutput is
+      // the raw stream with JSON-escape sequences (literal \n, \") which breaks
+      // extractSelfReviewJson's fence regex.
+      let lastReviewResult = '';
       let passes = 0;
       let totalFixes = 0;
 
       // Pass 1: always run self-review once
       passes++;
-      const { exitCode: pass1ExitCode, allOutput: pass1Output } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+      const { exitCode: pass1ExitCode, allOutput: pass1Output, lastResultText: pass1Result } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
       if (pass1ExitCode !== 0) {
         if (matchesRateLimit(pass1Output)) {
           sendLog(ws, '\nSelf-review: rate limit encountered, skipping.\n');
@@ -518,6 +523,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         selfReviewFailed = true;
       } else {
         lastReviewOutput = pass1Output;
+        lastReviewResult = pass1Result;
         const headAfterPass1 = git(['rev-parse', 'HEAD']);
         const statusAfterPass1 = git(['status', '--porcelain']);
         const pass1FixesApplied = headAfterPass1 !== headBeforeReview || statusAfterPass1 !== statusBeforeReview;
@@ -525,9 +531,10 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           totalFixes++;
           // Pass 2: verification pass when pass 1 applied fixes
           passes++;
-          const { exitCode: pass2ExitCode, allOutput: pass2Output } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
+          const { exitCode: pass2ExitCode, allOutput: pass2Output, lastResultText: pass2Result } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
           if (pass2ExitCode === 0) {
             lastReviewOutput = pass2Output;
+            lastReviewResult = pass2Result;
             const headAfterPass2 = git(['rev-parse', 'HEAD']);
             const statusAfterPass2 = git(['status', '--porcelain']);
             if (headAfterPass2 !== headAfterPass1 || statusAfterPass2 !== statusAfterPass1) {
@@ -550,7 +557,9 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         let parsedTruncatedFiles: string[] | undefined;
         let parseFailed = false;
 
-        const parsed = extractSelfReviewJson(lastReviewOutput);
+        // Prefer lastReviewResult (parsed `result` event text with real
+        // newlines) over lastReviewOutput (raw stream-json with \n escapes).
+        const parsed = extractSelfReviewJson(lastReviewResult || lastReviewOutput);
         let parsedCheckResults: Record<string, { passed: boolean; issue?: string }> | undefined;
         if (!parsed) {
           reviewCategories.push('self_review_failed', 'json_parse_failed');
@@ -637,13 +646,13 @@ Output ONLY a JSON object in a \`\`\`json code fence:
               ? `The checks_performed field was missing these mandatory items: ${missingChecks.join(', ')}.`
               : 'The JSON output could not be parsed as valid JSON.';
             sendLog(ws, `\nSelf-review: validation failed — retrying with explicit guidance...\n`);
-            const { exitCode: retryExitCode, allOutput: retryOutput } = await runClaudeCode(
+            const { exitCode: retryExitCode, allOutput: retryOutput, lastResultText: retryResult } = await runClaudeCode(
               `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review response was invalid. ${retryNote} Return ONLY a valid JSON object with all mandatory checks_performed items.`,
               ws, statusRef, model, effort,
             );
             let retryValid = false;
             if (retryExitCode === 0) {
-              const retryParsed = extractSelfReviewJson(retryOutput);
+              const retryParsed = extractSelfReviewJson(retryResult || retryOutput);
               if (retryParsed) {
                 const retryChecks = Array.isArray(retryParsed.checks_performed) ? retryParsed.checks_performed as string[] : undefined;
                 const retryMissing = mandatory.filter(m => !retryChecks?.includes(m));
