@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, Alert
 from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
 from app.services import _run_stale_branch_cleanup
@@ -739,6 +739,37 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
     assert clone_ctx.get("_previous_pr_url") == pr_url
     # Changed files from failed attempt must propagate to retry clone
     assert clone_ctx.get("_previous_changed_files") == changed_files
+
+
+@pytest.mark.asyncio
+async def test_requeue_propagates_file_change_details_to_retry_context(requeue_db, mocker):
+    """clone_ctx contains _previous_file_change_details from the failed child's context."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    file_change_details = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
+        {"file": "backend/testing/test_models.py", "additions": 8, "deletions": 3},
+    ]
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "add feature"}],
+        child_context={
+            "_attempt_number": 1,
+            "_file_change_details": file_change_details,
+        },
+        child_status_message="pytest test_models.py failed: AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert clone_ctx.get("_previous_file_change_details") == file_change_details
 
 
 @pytest.mark.asyncio
@@ -2414,6 +2445,58 @@ async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_d
 
 
 @pytest.mark.asyncio
+async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurrection(reaper_db, mocker):
+    """
+    When the reaper resurrects an EXTERNAL_API task, it must clear _api_failure_retries.
+    Without this, a task that exhausted its retry budget before failing would have
+    stale _api_failure_retries > 5 after resurrection, causing any subsequent API error
+    to bypass the EXTERNAL_API-specific backoff and fall through to the general retry
+    path with a depleted budget.
+    """
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"github_api": True, "claude_api": True},
+    )
+
+    project = Project(name="API Retry Clear Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=3,
+        context={
+            "failure_category": "EXTERNAL_API",
+            # Simulate a task that exhausted its retry budget before failing permanently
+            "_api_failure_retries": 6,
+        },
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_resurrection_count") == 1
+    assert "_api_failure_retries" not in ctx, (
+        "_api_failure_retries must be cleared on resurrection so the task "
+        "gets a fresh retry budget if it hits another EXTERNAL_API failure"
+    )
+
+
+@pytest.mark.asyncio
 async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealthy(reaper_db, mocker):
     """An EXTERNAL_API task stays FAILED when dependencies are not yet healthy."""
     _common_infra_recovery_mocks(mocker)
@@ -2536,3 +2619,159 @@ async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_bl
     await reaper_db.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks sitting in QUEUED for longer than the threshold get
+    an INFO alert created and queued_age_alert_fired set in context.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.shared_state.runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+    # Override the reaper module's reference to runtime_config
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Queued Age Alert Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Task queued for 3 hours — exceeds 2h threshold
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "waiting forever"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(stale_task)
+    assert stale_task.context.get("queued_age_alert_fired") is True
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert str(alerts[0].severity) in ("INFO", "AlertSeverity.INFO")
+    assert "stalled in queue" in alerts[0].title
+    assert "create" in alerts[0].message
+    assert "3.0h" in alerts[0].message or "2." in alerts[0].message  # ~3h queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks that already have queued_age_alert_fired=True do NOT
+    get a second alert on the next reaper cycle.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Queued Age No Repeat Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "stuck"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        context={"queued_age_alert_fired": True},  # already fired
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 0, "Alert should not be re-fired when queued_age_alert_fired is already True"
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_skips_requires_approval(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks with requires_approval=True are skipped even if stale.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Approval Skip Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    approval_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "needs approval"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+    )
+    reaper_db.add(approval_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(approval_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == approval_task.id)
+    )).scalars().all()
+    assert len(alerts) == 0, "Approval-pending tasks should not trigger queued age alerts"

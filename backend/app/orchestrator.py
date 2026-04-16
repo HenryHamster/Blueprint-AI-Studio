@@ -1,4 +1,4 @@
-"""Orchestrator worker – background loop that provisions tasks and monitors health.
+"""Orchestrator worker - background loop that provisions tasks and monitors health.
 
 Extracted from app.main to reduce module size. The worker polls for QUEUED tasks,
 checks dependencies, handles file conflicts, provisions VMs, and monitors
@@ -9,14 +9,15 @@ import asyncio
 import logging
 import os
 import random
-import re
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -50,12 +51,13 @@ _last_zone_health_persist: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
-_last_zone_exhaustion_log: Optional[datetime] = None
+_last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
+_last_type_throttle_broadcast: dict[str, float] = {}
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
-_orchestrator_last_cycle: Optional[datetime] = None
-_orchestrator_cycle_started: Optional[datetime] = None
+_orchestrator_last_cycle: datetime | None = None
+_orchestrator_cycle_started: datetime | None = None
 
 # Consecutive error counters for exponential backoff
 _orchestrator_consecutive_errors: int = 0
@@ -121,7 +123,7 @@ def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
 
 async def _persist_circuit_breakers():
     """Save circuit breaker state to DB so it survives restarts."""
-    from app.deploy_health import _get_deploy_state_for_update  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update
     try:
         serializable = {}
         for k, v in _shared_state.circuit_breakers.items():
@@ -148,14 +150,16 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak  # noqa: PLC0415
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
     try:
         from app.compute import _zone_health, _zone_lock
         with _zone_lock:
             snapshot = {}
             for zone, data in _zone_health.items():
                 snapshot[zone] = {
-                    k: v.isoformat() if isinstance(v, datetime) else v
+                    k: (v.isoformat() if isinstance(v, datetime)
+                        else list(v) if isinstance(v, deque)
+                        else v)
                     for k, v in data.items()
                 }
         snapshot["_pause_failure_streak"] = _pause_failure_streak
@@ -188,7 +192,7 @@ async def _check_candidate_task_deps(
     task: Task,
     dep_tasks: list,
     dep_uuids: list,
-    session: "AsyncSession",
+    session: AsyncSession,
     verify_pr_merged,
 ) -> tuple[str, dict]:
     """Check whether a candidate task's dependencies are satisfied.
@@ -265,29 +269,27 @@ async def orchestrator_worker():
         _max_plan_pools,
         _max_plan_pool_lock,
     )
-    from app.main import (  # noqa: PLC0415
+    from app.main import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
         _create_orchestrator_error_alerts,
     )
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.deploy_health import (  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result
+    from app.deploy_health import (
         _check_monitoring_window,
         _check_external_health,
         _check_pause_mode,
     )
-    from app.autonomous_research import _check_idle_research  # noqa: PLC0415
-    from app.rollup_management import _verify_pr_merged  # noqa: PLC0415
-    from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
-    from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
-    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.autonomous_research import _check_idle_research
+    from app.rollup_management import _verify_pr_merged
+    from app.review_pipeline import _spawn_pipeline_task
+    from app.broadcast import broadcast_to_project, manager as ws_manager
+    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts
+    from app.routers.agent import get_github_token_for_task
     from app.github import (
-        create_pr_comment,
         get_check_runs,
         get_pull_request,
-        merge_pull_request,
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
@@ -467,6 +469,24 @@ async def orchestrator_worker():
                                     f"({rate:.0%} failure rate, n={sample_size}) — skipping this type"
                                 )
 
+                # Broadcast type_throttle events for each newly-blocked type (debounced 60s per type)
+                if _failing_types:
+                    global _last_type_throttle_broadcast
+                    _now_mono = time.monotonic()
+                    for _ftype in _failing_types:
+                        if (_now_mono - _last_type_throttle_broadcast.get(_ftype, 0.0)) > 60:
+                            _last_type_throttle_broadcast[_ftype] = _now_mono
+                            _frate, _fsample = _shared_state.get_task_type_failure_rate(_ftype, window_minutes=15)
+                            try:
+                                await ws_manager.broadcast_to_all("type_throttle", {
+                                    "type": _ftype,
+                                    "failure_rate": round(_frate, 3),
+                                    "sample_size": _fsample,
+                                    "detail": f"Task type '{_ftype}' throttled: {_frate:.0%} failure rate (n={_fsample})",
+                                })
+                            except Exception:
+                                logger.exception(f"[ORCHESTRATOR] Failed to broadcast type_throttle for '{_ftype}'")
+
                 # External health gate — skip dispatch when a critical dependency has been
                 # confirmed down for 2+ consecutive health checks (avoids flapping on transient probes).
                 # DB is excluded: if DB is down the orchestrator itself cannot function.
@@ -596,6 +616,10 @@ async def orchestrator_worker():
                                         await release_max_plan_account(child_acct)
                                         child.context = {**(child.context or {}), "_slot_released": True}
                                     cancel_session.add(child)
+                                await _maybe_create_failure_alert(
+                                    cancel_task, cancel_session,
+                                    "Cascade cancelled: dependency task failed"
+                                )
                                 await cancel_session.commit()
                         await broadcast_to_project(str(task.project_id), "task_updated",
                                                    {"task_id": str(task.id), "status": TaskStatus.CANCELLED})
@@ -811,6 +835,53 @@ async def orchestrator_worker():
                             logger.exception("[ORCHESTRATOR] Failed to broadcast zone_exhaustion throttle")
                     queued_tasks = []  # Clear so the loop below is skipped
 
+                # All-types-blocked detection: if every queued task's type is in _failing_types,
+                # the pipeline is silently stalled — create an operator alert.
+                if _failing_types and queued_tasks:
+                    _queued_types = {
+                        t.first_payload.get("type", "") for t in queued_tasks
+                        if t.first_payload.get("type", "")
+                    }
+                    if _queued_types and _queued_types.issubset(_failing_types):
+                        _blocked_summary = ", ".join(sorted(_queued_types))
+                        logger.warning(
+                            f"[ORCHESTRATOR] All queued task types blocked by per-type failure gate: {_blocked_summary}"
+                        )
+                        try:
+                            from app.models import Alert, AlertSeverity
+                            _all_blocked_title = "Pipeline stalled — all task types throttled"
+                            _all_blocked_msg = (
+                                f"All queued task types are blocked by the per-type failure gate: {_blocked_summary}. "
+                                "Each type has >70% failure rate in the last 15 minutes. The pipeline will not dispatch "
+                                "new tasks until failure rates drop."
+                            )
+                            _projects = (await session.execute(select(Project))).scalars().all()
+                            for _proj in _projects:
+                                _existing_alert = (await session.execute(
+                                    select(Alert).where(
+                                        Alert.project_id == _proj.id,
+                                        Alert.task_id.is_(None),
+                                        Alert.severity == AlertSeverity.ERROR,
+                                        Alert.dismissed_at.is_(None),
+                                        Alert.title == _all_blocked_title,
+                                    )
+                                )).scalars().first()
+                                if _existing_alert is None:
+                                    _alert = Alert(
+                                        project_id=_proj.id,
+                                        severity=AlertSeverity.ERROR,
+                                        title=_all_blocked_title,
+                                        message=_all_blocked_msg,
+                                    )
+                                    session.add(_alert)
+                                    await broadcast_to_project(
+                                        str(_proj.id),
+                                        "alert_created",
+                                        {"alert_id": str(_alert.id), "severity": "ERROR", "title": _all_blocked_title},
+                                    )
+                        except Exception:
+                            logger.exception("[ORCHESTRATOR] Failed to create all-types-blocked project alerts")
+
                 for task in queued_tasks:
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type)
@@ -881,7 +952,7 @@ async def orchestrator_worker():
                             earliest_recovery = None
                             for acct in user_pool:
                                 dm = acct.get('disabled_models', {})
-                                for model_name, info in dm.items():
+                                for info in dm.values():
                                     disabled_at = info.get('at')
                                     hits = info.get('hits', 1)
                                     cooldown_min = min(30 * (2 ** (hits - 1)), 240)
@@ -1014,7 +1085,7 @@ async def orchestrator_worker():
                             async def _delayed_orphan_cleanup(orphan_vm_id: str):
                                 await asyncio.sleep(120)  # Wait for GCP thread to finish
                                 await _ensure_vm_deleted(orphan_vm_id, reason="cancelled_provision_orphan")
-                            asyncio.create_task(_delayed_orphan_cleanup(vm_id))
+                            _shared_state.background_tasks[f"orphan_cleanup_{vm_id}"] = asyncio.create_task(_delayed_orphan_cleanup(vm_id))
                             raise
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)
@@ -1230,6 +1301,10 @@ async def orchestrator_worker():
                                     logger.exception(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
                                     ci_task.status = TaskStatus.FAILED
                                     ci_task.latest_status_message = _pr_gone_msg
+                                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                                    persist_failure_category(ci_task, "EXTERNAL_API")
+                                    record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                                     session.add(ci_task)
                                     await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
                                     await session.commit()
@@ -1343,7 +1418,10 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                 logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
                                 await _maybe_create_failure_alert(ci_task, session, f"PR #{ci_pr_number} merge conflicts — fix iteration cap exhausted, manual intervention required")
-                                record_task_result(success=False, failure_class="CODE_ERROR", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
+                                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                                _fc_mc = classify_failure(ci_task)
+                                persist_failure_category(ci_task, _fc_mc)
+                                record_task_result(success=False, failure_class=_fc_mc, task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -1411,7 +1489,7 @@ async def orchestrator_worker():
                             continue
 
                         # CI completed — delegate to shared handler
-                        from app.ci_completion import handle_ci_completion  # noqa: PLC0415
+                        from app.ci_completion import handle_ci_completion
                         logger.info(f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing")
                         await handle_ci_completion(ci_task, ci_result, ci_gh_token, ci_owner, ci_repo, session, source="poll")
                     except Exception as e:
@@ -1420,9 +1498,11 @@ async def orchestrator_worker():
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
-                                ci_task.latest_status_message = f"CI polling failed: PR not found (404) — PR may have been deleted"
+                                ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
                                 await _maybe_create_failure_alert(ci_task, session, "CI polling failed: PR returned 404 — PR may have been deleted or archived")
+                                from app.failure_classification import persist_failure_category as _pfc404  # noqa: PLC0415
+                                _pfc404(ci_task, "EXTERNAL_API")
                                 record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             else:
                                 ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
@@ -1493,7 +1573,7 @@ async def orchestrator_worker():
                         pc_base = pt_payload.get("base_branch", "main")
                         pc_prompt = pt_payload.get("prompt", pt.description or "")
                         logger.info(f"[RECOVERY] Post-commit pending for task {pt.id}, spawning review for PR #{pc_pr_number}")
-                        from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                        from app.review_pipeline import _spawn_pipeline_task
                         review_task, was_created = await _spawn_pipeline_task(
                             pt, "review", session, pc_pr_number, pc_branch, pc_base,
                             original_prompt=pc_prompt, original_task_id=str(pt.id)

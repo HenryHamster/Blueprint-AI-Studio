@@ -3325,3 +3325,131 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
     assert len(still_deferred) == 5 - _DEGRADED_SPAWN_CAP, (
         f"Excess findings re-deferred: expected {5 - _DEGRADED_SPAWN_CAP}, got {len(still_deferred)}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anomaly adjustment alert creation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_anomaly_adjustment_creates_warning_alert(db_session, mocker):
+    """WARNING alert created in DB when anomaly adjustments first activate."""
+    direction = _active_direction("d-anomaly01", "Improve stability")
+    project = Project(
+        name="Anomaly Alert Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new=AsyncMock(return_value={
+            "action": "adjusted",
+            "is_new": True,
+            "max_concurrent_vms": 4,
+            "failure_gate_threshold": 0.6,
+            "trigger_anomalies": ["PROVISION_FAILURE"],
+            "pre_adjustment_max_vms": 8,
+        }),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )
+    alerts = result.scalars().all()
+    adjustment_alerts = [a for a in alerts if "auto-adjusted" in a.title]
+    assert len(adjustment_alerts) == 1
+    alert = adjustment_alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "4" in alert.message  # new max_concurrent_vms
+    assert "8" in alert.message  # pre_adjustment value
+    assert "PROVISION_FAILURE" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_anomaly_already_active_does_not_duplicate_alert(db_session, mocker):
+    """No duplicate alert when adjustments are already active (is_new=False)."""
+    direction = _active_direction("d-anomaly02", "Reduce failures")
+    project = Project(
+        name="Anomaly No Dupe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new=AsyncMock(return_value={
+            "action": "adjusted",
+            "is_new": False,  # Already active — no new alert
+            "max_concurrent_vms": 4,
+            "failure_gate_threshold": 0.6,
+            "trigger_anomalies": ["PROVISION_FAILURE"],
+            "pre_adjustment_max_vms": 8,
+        }),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )
+    alerts = result.scalars().all()
+    adjustment_alerts = [a for a in alerts if "auto-adjusted" in a.title]
+    assert len(adjustment_alerts) == 0, "No alert when adjustment already active"
+
+
+@pytest.mark.asyncio
+async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
+    """INFO alert created in DB when anomaly adjustments are restored."""
+    direction = _active_direction("d-anomaly03", "Monitor health")
+    project = Project(
+        name="Anomaly Restore Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions",
+        new=AsyncMock(return_value={
+            "action": "restored",
+            "max_concurrent_vms": 8,
+            "failure_gate_threshold": 0.8,
+        }),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new=AsyncMock())
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )
+    alerts = result.scalars().all()
+    restore_alerts = [a for a in alerts if "restored" in a.title]
+    assert len(restore_alerts) == 1
+    alert = restore_alerts[0]
+    assert alert.severity == AlertSeverity.INFO
+    assert "8" in alert.message  # restored max_concurrent_vms
+    assert "0.8" in alert.message  # restored failure gate

@@ -1228,8 +1228,8 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     Tests that EXTERNAL_API failures requeue with exponential backoff in retry_after.
     - 1st retry: ~2 min delay (2^1 * 120 = 240s)
     - 2nd retry: ~8 min delay (2^2 * 120 = 480s)
-    - 3rd retry: ~30 min delay (2^3 * 120 = 960s, but capped at 1800s — not capped here)
-    - After 3 retries, task is not requeued
+    - 3rd retry: ~16 min delay (2^3 * 120 = 960s)
+    - After 5 retries, task is not requeued (budget exhausted)
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -1248,7 +1248,7 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
             status=TaskStatus.IN_PROGRESS,
             # Pre-seed provision_failures to verify it gets cleared on graceful requeue —
             # otherwise a single provision hiccup on a previously-successful task would
-            # immediately exhaust the 3-retry budget on the next dispatch.
+            # immediately exhaust the retry budget on the next dispatch.
             context={"_api_failure_retries": retry_num - 1, "provision_failures": 2},
         )
         db_session.add(task)
@@ -1282,20 +1282,20 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         assert actual_delay >= expected_delay - 2, f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
         assert actual_delay <= expected_delay + 5, f"retry {retry_num}: delay {actual_delay} too large"
 
-    # 4th attempt: api_retries=3, increments to 4 > 3 → EXTERNAL_API early-requeue path is skipped
+    # 6th attempt: api_retries=5, increments to 6 > 5 → EXTERNAL_API requeue path is skipped
     # Falls through to general retry (task.attempt_count < max_retries), so no retry_after is set
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "test"}],
-        vm_instance_id="agent-vm-backoff-4",
+        vm_instance_id="agent-vm-backoff-6",
         status=TaskStatus.IN_PROGRESS,
-        context={"_api_failure_retries": 3},
+        context={"_api_failure_retries": 5},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-backoff-4")
+    token = create_agent_token(str(task.id), "agent-vm-backoff-6")
     headers = {"x-agent-token": token}
     payload = {
         "task_id": str(task.id),
@@ -1310,6 +1310,69 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
     ctx = task.context or {}
     assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+
+
+@pytest.mark.asyncio
+async def test_external_api_permanent_auth_failure_does_not_requeue(client: AsyncClient, db_session, mocker):
+    """
+    EXTERNAL_API failures with permanent auth indicators (token expired, 401, bad credentials)
+    must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
+    of exponential backoff before the task permanently fails with the same error.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Auth Failure Test", user_id="test-user-auth-fail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    permanent_auth_cases = [
+        "GitHub API returned 401 unauthorized",
+        "token expired: please re-authenticate",
+        "token revoked by organization admin",
+        "bad credentials — check your PAT",
+        "401 Unauthorized: access denied",
+    ]
+
+    for i, logs_msg in enumerate(permanent_auth_cases):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "do work"}],
+            vm_instance_id=f"agent-vm-auth-{i}",
+            status=TaskStatus.IN_PROGRESS,
+            context={"_api_failure_retries": 0},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-auth-{i}")
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_class": "EXTERNAL_API",
+            "logs": logs_msg,
+        }
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200, f"case {i}: unexpected status {resp.status_code}"
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED, (
+            f"case {i} ({logs_msg!r}): expected FAILED (immediate), got {task.status}"
+        )
+        # retry_after must not be set — permanent failures should not schedule a retry
+        ctx = task.context or {}
+        assert "retry_after" not in ctx, (
+            f"case {i}: retry_after should not be set for permanent auth failure"
+        )
+        # Operator-facing message must direct to re-authentication
+        assert task.latest_status_message is not None
+        assert "auth" in task.latest_status_message.lower() or "re-authenticate" in task.latest_status_message.lower(), (
+            f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
+        )
 
 
 @pytest.mark.asyncio
@@ -1575,6 +1638,157 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
     # confirmed_count=5 entries first; among those, reference_count=8 before reference_count=2
     assert keys.index("tiebreak") < keys.index("high-count")
     assert keys.index("high-count") < keys.index("low-count")
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: AsyncClient, db_session):
+    """
+    Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.
+    A recent unconfirmed entry should appear before an older unconfirmed entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Age Penalty Test", user_id="test-user-age-penalty")
+    project.design_doc = {
+        "playbook/old-unconfirmed": {
+            "content": "old tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": old_date,
+        },
+        "playbook/recent-unconfirmed": {
+            "content": "recent tip with few confirmations",
+            "confirmed_count": 0,
+            "reference_count": 0,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-age-penalty-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-age-penalty-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Recent entry should appear before the age-penalised old entry
+    assert keys.index("recent-unconfirmed") < keys.index("old-unconfirmed"), (
+        f"Expected recent-unconfirmed before old-unconfirmed, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_stale_file_refs_deprioritised(client: AsyncClient, db_session):
+    """
+    Entries with stale_file_refs=True are deprioritised — a clean entry with the same
+    confirmed_count should come before a stale entry.
+    """
+    now = datetime.utcnow().isoformat()
+
+    project = Project(name="Stale Refs Test", user_id="test-user-stale-refs")
+    project.design_doc = {
+        "playbook/stale-entry": {
+            "content": "tip referencing a deleted file",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": True,
+        },
+        "playbook/clean-entry": {
+            "content": "tip with valid file refs",
+            "confirmed_count": 3,
+            "reference_count": 5,
+            "updated_at": now,
+            "stale_file_refs": False,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-stale-refs-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-refs-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Clean entry should come before stale entry
+    assert keys.index("clean-entry") < keys.index("stale-entry"), (
+        f"Expected clean-entry before stale-entry, got order: {keys}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_old_confirmed_entry_not_penalised(client: AsyncClient, db_session):
+    """
+    An old entry with confirmed_count >= 3 should NOT receive the age penalty.
+    It should still be ordered before a less-confirmed recent entry.
+    """
+    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
+    recent_date = datetime.utcnow().isoformat()
+
+    project = Project(name="Confirmed Old Entry Test", user_id="test-user-conf-old")
+    project.design_doc = {
+        "playbook/old-confirmed": {
+            "content": "old but well-confirmed tip",
+            "confirmed_count": 5,
+            "reference_count": 10,
+            "updated_at": old_date,
+        },
+        "playbook/recent-low-confirmed": {
+            "content": "recent tip with low confirmations",
+            "confirmed_count": 1,
+            "reference_count": 1,
+            "updated_at": recent_date,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-conf-old-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-conf-old-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    # Old but confirmed entry (no age penalty) should come before less-confirmed recent entry
+    assert keys.index("old-confirmed") < keys.index("recent-low-confirmed"), (
+        f"Expected old-confirmed before recent-low-confirmed, got order: {keys}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2074,6 +2288,57 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
     assert hb_resp.status_code != 401, (
         f"Heartbeat from fresh VM after rate-limit requeue must not return 401. "
         f"Got {hb_resp.status_code}: {hb_resp.text}. This is the 401 cascade bug."
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_change_details_stored_in_task_context(client: AsyncClient, db_session, mocker):
+    """When an agent reports status with file_change_details, the field is stored
+    in task.context['_file_change_details'] so _requeue_parent_task can propagate
+    it to the retry clone as _previous_file_change_details."""
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+
+    project = Project(name="File Change Details Test", user_id="test-user-fcd")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add feature"}],
+        vm_instance_id="agent-vm-fcd",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+    file_details = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
+        {"file": "backend/testing/test_models.py", "additions": 8, "deletions": 3},
+    ]
+    token = create_agent_token(str(task.id), "agent-vm-fcd")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Test suite failed",
+        "failure_category": "test_failed",
+        "file_change_details": file_details,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_file_change_details") == file_details, (
+        f"Expected _file_change_details in task.context, got: {ctx}"
     )
 
     _terminated_task_ids.pop(task_id_str, None)
