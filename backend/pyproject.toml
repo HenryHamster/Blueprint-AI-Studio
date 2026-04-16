@@ -49,6 +49,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # rollup_management.py runs rollup PR creation/merge under sibling-completion races,
 # branch-cleanup edge cases, and concurrent worker calls. Same intentional pattern.
 "app/rollup_management.py" = ["BLE001"]
+# orchestrator.py is the background provisioning + monitoring loop. Same
+# log-and-continue policy: crash here halts all task dispatch and health monitoring.
+"app/orchestrator.py" = ["BLE001"]
+# admin_analytics.py is read-only analytics/reporting endpoints. except blocks are
+# defensive fallbacks (Cloud Logging, zone health) to show partial data instead of 500.
+"app/routers/admin_analytics.py" = ["BLE001"]
 # admin.py and github.py raise HTTPException inside except blocks to convert errors to HTTP responses
 "app/admin.py" = ["B904"]
 "app/github.py" = ["B904"]

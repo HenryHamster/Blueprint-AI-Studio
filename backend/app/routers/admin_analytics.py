@@ -6,7 +6,7 @@ import uuid
 import json
 import logging
 from collections import defaultdict
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -33,7 +33,7 @@ router = APIRouter(
 )
 
 
-def _count_research_findings(logs: Optional[str]) -> int:
+def _count_research_findings(logs: str | None) -> int:
     """Parse research findings artifact logs and return finding count."""
     if not logs:
         return 0
@@ -52,10 +52,10 @@ def _count_research_findings(logs: Optional[str]) -> int:
 
 @router.get("/activity")
 async def get_activity(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    event_types: Optional[List[str]] = Query(None),
-    since: Optional[datetime] = Query(None),
+    event_types: List[str] | None = Query(None),
+    since: datetime | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -293,7 +293,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 pass
         return t.created_at
 
-    def _safe_ts_in_window(ts_str: Optional[str], cutoff: datetime) -> bool:
+    def _safe_ts_in_window(ts_str: str | None, cutoff: datetime) -> bool:
         try:
             return datetime.fromisoformat(ts_str or "") >= cutoff
         except (ValueError, TypeError):
@@ -335,7 +335,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     prev_total = len(prev_completed) + len(prev_failed)
     prev_success_rate = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
 
-    trend: Optional[str] = None
+    trend: str | None = None
     if success_rate is not None and prev_success_rate is not None:
         delta = success_rate - prev_success_rate
         if delta > 0.05:
@@ -483,7 +483,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     prev_terminal_tasks = prev_completed + prev_failed
     prev_first_attempt_rate = _first_attempt_rate(prev_terminal_tasks)
 
-    first_attempt_trend: Optional[str] = None
+    first_attempt_trend: str | None = None
     if current_first_attempt_rate is not None and prev_first_attempt_rate is not None:
         fa_delta = current_first_attempt_rate - prev_first_attempt_rate
         if fa_delta > 0.05:
@@ -495,7 +495,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # First-attempt failures by review category: which categories caused the most
     # first-attempt rejections, as a fraction of tasks that had their first review rejected.
-    first_attempt_by_review_category: Optional[Dict[str, float]] = None
+    first_attempt_by_review_category: Dict[str, float] | None = None
     first_attempt_failed_with_cats = [
         t for t in terminal_tasks_24h
         if "_first_attempt_rejection_categories" in (t.context or {})
@@ -529,7 +529,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if (t.first_payload or {}).get("type") == "review"
         and (t.context or {}).get("blueprint_review_verdict") is not None
     ]
-    review_accuracy: Optional[Dict[str, Any]] = None
+    review_accuracy: Dict[str, Any] | None = None
     if len(review_tasks) >= 5:
         total_reviews = len(review_tasks)
         overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
@@ -565,7 +565,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 @router.get("/digest")
 async def get_digest(
     hours: int = Query(24, ge=1, le=168),
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin)
 ):
@@ -711,7 +711,7 @@ async def get_digest(
                         pass
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
-                dir_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
+                dir_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
@@ -774,7 +774,7 @@ async def get_digest(
     for t in failed_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -787,7 +787,7 @@ async def get_digest(
     for t in approval_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Pending approval",
@@ -808,7 +808,7 @@ async def get_digest(
         tid = str(t.id)
         ts = _derive_completed_at(t)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         recent_failures.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -832,7 +832,7 @@ async def get_digest(
         tid = str(t.id)
         cls = _classify_failure(t, error_log_map.get(tid))
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round(((_now - waiting_since).total_seconds() / 3600)) if waiting_since else None
+        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         _failure_class_groups.setdefault(cls, []).append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -920,14 +920,14 @@ async def get_digest(
 
     completed_delta = completed_count - prev_completed_count
     failed_delta = failed_count - prev_failed_count
-    success_rate_delta: Optional[float] = (
+    success_rate_delta: float | None = (
         round(success_rate - prev_success_rate, 2)
         if success_rate is not None and prev_success_rate is not None
         else None
     )
     if success_rate_delta is not None:
         if success_rate_delta > 0.05:
-            trend: Optional[str] = "improving"
+            trend: str | None = "improving"
         elif success_rate_delta < -0.05:
             trend = "declining"
         else:
@@ -957,7 +957,7 @@ async def get_digest(
             _cls = _classify_failure(_ft)
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
         _p_total = _p_completed + _p_failed
-        _p_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
+        _p_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
         trend_history.append({
             "period_end": _p_end.isoformat(),
             "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
@@ -1063,13 +1063,13 @@ async def get_digest(
 
     # Compute total estimated cost (directed + undirected tasks)
     directed_task_ids = {t.id for t in all_tasks if (t.context or {}).get("direction_id")}
-    undirected_cost = sum((t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
+    undirected_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
     total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
 
     # Compute today's cost for cost ceiling warning
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     daily_cost_usd = round(sum(
-        (t.vm_spot and SPOT_RATE or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
         for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= today_start
     ), 2)
     daily_cost_ceiling_usd = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
@@ -1144,14 +1144,14 @@ async def get_digest(
 
 @router.get("/health-overview")
 async def get_health_overview(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Return a unified health overview with top actionable issues."""
     from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
     from app.compute import get_zone_health_summary
-    from app.routers.admin_settings import _build_stuck_tasks  # noqa: PLC0415
+    from app.routers.admin_settings import _build_stuck_tasks
 
     now = _utcnow()
     actionable_issues: List[Dict[str, Any]] = []
@@ -1190,7 +1190,7 @@ async def get_health_overview(
         prev_failed = [t for t in xp_tasks if t.status == TaskStatus.FAILED and prev_window_start <= _derive_at(t) < window_start]
         prev_total = len(prev_completed) + len(prev_failed)
         prev_sr = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
-        sr_trend: Optional[str] = None
+        sr_trend: str | None = None
         if success_rate_value is not None and prev_sr is not None:
             delta = success_rate_value - prev_sr
             if delta > 0.05:
@@ -1436,7 +1436,7 @@ async def get_health_overview(
 
 @router.get("/task-duration-stats")
 async def get_task_duration_stats(
-    project_id: Optional[uuid.UUID] = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -1536,10 +1536,10 @@ def _parse_exception_class(message: str) -> str:
     return "UnknownError"
 
 
-def _parse_source_location(message: str) -> Tuple[str, Optional[int]]:
+def _parse_source_location(message: str) -> Tuple[str, int | None]:
     """Return the first traceback frame inside the app source tree."""
-    app_frame: Optional[Tuple[str, int]] = None
-    last_frame: Optional[Tuple[str, int]] = None
+    app_frame: Tuple[str, int] | None = None
+    last_frame: Tuple[str, int] | None = None
     for match in _TRACEBACK_FRAME_RE.finditer(message):
         path = match.group("path")
         try:
@@ -1575,7 +1575,7 @@ def _parse_entry_timestamp(entry: Any) -> datetime:
 
 def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
     """Group log entries by (exception_class, source_file, source_line)."""
-    buckets: Dict[Tuple[str, str, Optional[int]], Dict[str, Any]] = {}
+    buckets: Dict[Tuple[str, str, int | None], Dict[str, Any]] = {}
     for entry in entries:
         message = _extract_error_message(entry)
         exception_class = _parse_exception_class(message)
@@ -1726,7 +1726,7 @@ async def acknowledge_all_orchestrator_errors(
     """Acknowledge all current orchestrator error buckets."""
     now_iso = datetime.now(timezone.utc).isoformat()
     acknowledged_keys = []
-    for cached_ts, cached_payload in _orchestrator_errors_cache.values():
+    for _cached_ts, cached_payload in _orchestrator_errors_cache.values():
         for b in cached_payload.get("buckets", []):
             key = f"{b['exception_class']}|{b['source']}"
             _acknowledged_errors[key] = now_iso
@@ -1787,8 +1787,11 @@ async def get_open_prs(
         token, project.github_owner, project.github_repo
     )
 
-    # Build task lookup: pr_url -> latest task
-    # Source 1: PR artifacts (agent-created PRs)
+    # Build task lookup: pr_number -> most relevant active task
+    # Prefer active tasks (IN_PROGRESS > QUEUED > EVALUATING > COMPLETED)
+    pr_task_map: Dict[int, Task] = {}
+
+    # Source 1: PR artifacts (agent-created PRs — extract number from URL)
     artifact_rows = (await session.execute(
         select(Artifact, Task)
         .join(Task, Artifact.task_id == Task.id)
@@ -1798,29 +1801,39 @@ async def get_open_prs(
             Task.project_id == project_id,
         )
     )).all()
-
-    pr_task_map: Dict[str, Task] = {}
     for art, task in artifact_rows:
-        existing = pr_task_map.get(art.pr_url)
-        if not existing or task.created_at > existing.created_at:
-            pr_task_map[art.pr_url] = task
+        try:
+            pr_num = int(art.pr_url.rstrip("/").split("/")[-1])
+        except (ValueError, IndexError):
+            continue
+        existing = pr_task_map.get(pr_num)
+        if not existing or (task.status in _ACTIVE_STATUSES and existing.status not in _ACTIVE_STATUSES):
+            pr_task_map[pr_num] = task
 
-    # Source 2: Rollup PRs (stored in parent task context, not as artifacts)
-    evaluating_parents = (await session.execute(
+    # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
+    active_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == project_id,
-            Task.status.in_([TaskStatus.EVALUATING, TaskStatus.IN_PROGRESS, TaskStatus.QUEUED]),
+            Task.status.in_(list(_ACTIVE_STATUSES)),
         )
     )).scalars().all()
-    for t in evaluating_parents:
-        rollup_url = (t.context or {}).get("rollup_pr_url")
-        if rollup_url and rollup_url not in pr_task_map:
-            pr_task_map[rollup_url] = t
+    for t in active_tasks:
+        ctx = t.context or {}
+        pr_num = (
+            (ctx.get("review_loop") or {}).get("pr_number")
+            or ctx.get("rollup_pr_number")
+        )
+        if pr_num and isinstance(pr_num, int):
+            existing = pr_task_map.get(pr_num)
+            # Prefer active over non-active, then most recent
+            if not existing or existing.status not in _ACTIVE_STATUSES:
+                pr_task_map[pr_num] = t
 
     result = []
     for gh_pr in github_prs:
+        pr_number = gh_pr.get("number")
         pr_url = gh_pr.get("html_url", "")
-        task = pr_task_map.get(pr_url)
+        task = pr_task_map.get(pr_number)
         is_orphaned = task is None or task.status not in _ACTIVE_STATUSES
         result.append({
             "pr_number": gh_pr.get("number"),
@@ -1829,8 +1842,8 @@ async def get_open_prs(
             "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
             "pr_created_at": gh_pr.get("created_at"),
             "task_id": str(task.id) if task else None,
-            "task_status": task.status if task else None,
-            "task_type": task.task_type if task else None,
+            "task_status": task.status.value if task else None,
+            "task_type": task.first_payload.get("type", "create") if task else None,
             "task_title": task.title if task else None,
             "is_orphaned": is_orphaned,
         })
