@@ -532,6 +532,30 @@ ${hotspotsSection}
     }
   }
 
+  // Pipeline-wide scope merge rates — rendered from pipeline_health.scope_merge_rates
+  // so measurement directions can read the number straight from the prompt instead
+  // of hitting an admin endpoint they aren't authenticated for.
+  let pipelineScopeRatesSection = '';
+  const pipelineHealthForScope = projectCtx?.pipeline_health as Record<string, unknown> | null | undefined;
+  const scopeMergeRates = pipelineHealthForScope?.scope_merge_rates as
+    | Record<string, { current_rate: number | null; prev_rate: number | null; delta: number | null; trend: string | null }>
+    | null
+    | undefined;
+  if (scopeMergeRates && Object.keys(scopeMergeRates).length > 0) {
+    const fmtRate = (r: number | null | undefined) => (typeof r === 'number' ? `${Math.round(r * 100)}%` : '—');
+    const scopeOrder = ['small', 'medium', 'large'];
+    const orderedKeys = [
+      ...scopeOrder.filter(k => k in scopeMergeRates),
+      ...Object.keys(scopeMergeRates).filter(k => !scopeOrder.includes(k)),
+    ];
+    const parts = orderedKeys.map(k => {
+      const r = scopeMergeRates[k];
+      const trend = r?.trend ? ` (${r.trend})` : '';
+      return `${k} ${fmtRate(r?.current_rate)}/${fmtRate(r?.prev_rate)}${trend}`;
+    });
+    pipelineScopeRatesSection = `\nPipeline-wide scope merge rates (current / prev 24h window): ${parts.join(', ')}\n`;
+  }
+
   // Build anomaly signals section for undirected research cycles
   let anomalySection = '';
   if (!currentDirectionId) {
@@ -1217,7 +1241,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
 ${designDocHighlight}${designDocSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
-${anomalySection}
+${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
 ${(() => {
   const lines: string[] = [];
