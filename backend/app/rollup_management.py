@@ -264,7 +264,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
     # while a review/fix cycle is in progress
     pipeline_active = any(
-        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
         for c in all_children
         if (c.first_payload).get("type") in ("review", "fix")
     )
@@ -859,6 +859,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         else:
             parent.status = TaskStatus.COMPLETED
             parent.latest_status_message = f"All {completed_count} subtasks completed and merged"
+
+        # Final guard: a parent with an unmerged rollup PR is not done yet —
+        # the review/fix/CI pipeline is still working on landing the code.
+        _pctx = parent.context or {}
+        if (
+            parent.status == TaskStatus.COMPLETED
+            and _pctx.get("rollup_pr_number")
+            and not _pctx.get("pr_merged")
+        ):
+            parent.status = TaskStatus.EVALUATING
+            _rpr = _pctx["rollup_pr_number"]
+            parent.latest_status_message = f"All {completed_count} subtasks done — rollup PR #{_rpr} awaiting merge"
+            logger.info(f"[ROLLUP] Parent {parent.id} — blocked COMPLETED: rollup PR #{_rpr} not yet merged")
 
         session.add(parent)
         await session.commit()

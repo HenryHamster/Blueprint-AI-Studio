@@ -226,7 +226,8 @@ async def handle_ci_completion(
         )).scalars().all()
         existing_fix = next(
             (t for t in active_tasks
-             if t.first_payload.get("type") == "fix"
+             if t.id != task.id
+             and t.first_payload.get("type") == "fix"
              and t.first_payload.get("pr_number") == ci_pr_number),
             None
         )

@@ -546,19 +546,25 @@ async def _process_post_commit(
                         except Exception as e:
                             logger.info(f"[PIPELINE] Could not check PR files for infra flagging: {e}")
 
-                    if not task.requires_approval:
-                        review_task, _ = await _spawn_pipeline_task(
-                            task, "review", session, pr_number, branch, base_branch,
-                            original_prompt=original_prompt, original_task_id=str(task.id)
-                        )
-                        if review_task:
-                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                    # Always spawn the review — requires_approval gates MERGING
+                    # (checked at merge time in the review-complete path), not
+                    # reviewing. A security scan failure or blocking finding
+                    # should not orphan the PR by preventing review entirely.
+                    review_task, _ = await _spawn_pipeline_task(
+                        task, "review", session, pr_number, branch, base_branch,
+                        original_prompt=original_prompt, original_task_id=str(task.id)
+                    )
+                    if review_task:
+                        if task.requires_approval:
+                            logger.info(f"[REVIEW PIPELINE] Spawned review for flagged PR #{pr_number} → task {review_task.id} (merge will require manual approval)")
                         else:
-                            task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
-                            task.requires_approval = True
-                            session.add(task)
-                            await session.commit()
-                            logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
+                            logger.info(f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}")
+                    else:
+                        task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
+                        task.requires_approval = True
+                        session.add(task)
+                        await session.commit()
+                        logger.warning(f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}")
 
             # Review task completed → parse verdict
             elif task_type == "review":
@@ -925,6 +931,29 @@ async def _process_post_commit(
                                     return {"status": "accepted"}
                             except Exception as e:
                                 logger.error(f"[PIPELINE] Error checking critical files for merge gate: {e}", exc_info=True)
+
+                        # Security / approval gate: if the original create task was
+                        # flagged (security scan blocking, scan failure, etc.), park
+                        # for manual merge. The review still ran and posted feedback,
+                        # but auto-merge is not safe without human sign-off.
+                        if original_task_id and _runtime_config.get("require_approval_gates", True):
+                            try:
+                                _approval_orig = await session.get(Task, uuid.UUID(original_task_id))
+                                if _approval_orig and _approval_orig.requires_approval:
+                                    _approval_orig.status = TaskStatus.EVALUATING
+                                    reason = _approval_orig.latest_status_message or "requires manual approval"
+                                    _approval_orig.latest_status_message = f"Review approved — awaiting human approval to merge ({reason})"
+                                    session.add(_approval_orig)
+                                    await session.commit()
+                                    await broadcast_to_project(str(_approval_orig.project_id), "task_updated",
+                                                               {"task_id": str(_approval_orig.id), "status": TaskStatus.EVALUATING})
+                                    await create_pr_comment(gh_token, owner, repo, pr_number,
+                                        f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}")
+                                    logger.info(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}")
+                                    action_taken = True
+                                    return {"status": "accepted"}
+                            except Exception as e:
+                                logger.error(f"[PIPELINE] Error checking requires_approval for merge gate: {e}", exc_info=True)
 
                         merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
 

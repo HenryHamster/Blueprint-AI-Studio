@@ -1553,8 +1553,8 @@ def _bucket_log_entries(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
         bucket = buckets.get(key)
         if bucket is None:
             sample = message.strip()
-            if len(sample) > 600:
-                sample = sample[:600] + "..."
+            if len(sample) > 3000:
+                sample = sample[:3000] + "..."
             buckets[key] = {
                 "exception_class": exception_class,
                 "source": f"{source_file}:{source_line}" if source_line else source_file,
@@ -1641,3 +1641,79 @@ async def get_recent_orchestrator_errors(
     }
     _orchestrator_errors_cache[cache_key] = (now, payload)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Open PR monitor
+# ---------------------------------------------------------------------------
+
+_ACTIVE_STATUSES = {
+    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+}
+
+
+@router.get("/open-prs")
+async def get_open_prs(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return all open PRs from GitHub cross-referenced with linked tasks."""
+    from app.services import _get_project_github_token
+    from app.github import get_open_pull_requests
+
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalars().first()
+    if not project or not project.github_owner or not project.github_repo:
+        return {"open_prs": []}
+
+    try:
+        token = await _get_project_github_token(project, session)
+    except Exception:
+        logger.warning("Failed to get GitHub token for project %s", project_id)
+        return {"open_prs": []}
+    if not token:
+        return {"open_prs": []}
+
+    github_prs = await get_open_pull_requests(
+        token, project.github_owner, project.github_repo
+    )
+
+    # Build task lookup: pr_url -> latest task
+    artifact_rows = (await session.execute(
+        select(Artifact, Task)
+        .join(Task, Artifact.task_id == Task.id)
+        .where(
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            Artifact.pr_url.isnot(None),
+            Task.project_id == project_id,
+        )
+    )).all()
+
+    pr_task_map: Dict[str, Task] = {}
+    for art, task in artifact_rows:
+        existing = pr_task_map.get(art.pr_url)
+        if not existing or task.created_at > existing.created_at:
+            pr_task_map[art.pr_url] = task
+
+    result = []
+    for gh_pr in github_prs:
+        pr_url = gh_pr.get("html_url", "")
+        task = pr_task_map.get(pr_url)
+        is_orphaned = task is None or task.status not in _ACTIVE_STATUSES
+        result.append({
+            "pr_number": gh_pr.get("number"),
+            "pr_url": pr_url,
+            "pr_title": gh_pr.get("title", ""),
+            "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+            "pr_created_at": gh_pr.get("created_at"),
+            "task_id": str(task.id) if task else None,
+            "task_status": task.status.value if task else None,
+            "task_type": task.task_type if task else None,
+            "task_title": task.title if task else None,
+            "is_orphaned": is_orphaned,
+        })
+
+    return {"open_prs": result}

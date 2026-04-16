@@ -8,6 +8,7 @@ import {
   ExternalLink,
   GitMerge,
   Minus,
+  ChevronRight,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch } from '../api';
@@ -27,6 +28,7 @@ interface DirectionProgress {
   tasks_created: number;
   prs_merged: number;
   possibly_saturated: boolean;
+  conversion_rate?: number | null;
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
@@ -87,6 +89,19 @@ interface DigestData {
   pipeline_conversion_rate?: number | null;
 }
 
+interface OpenPR {
+  pr_number: number;
+  pr_url: string;
+  pr_title: string;
+  pr_branch: string;
+  pr_created_at: string;
+  task_id: string | null;
+  task_status: string | null;
+  task_type: string | null;
+  task_title: string | null;
+  is_orphaned: boolean;
+}
+
 interface SparkPoint {
   active: number;
   queued: number;
@@ -99,6 +114,7 @@ export interface DashboardHomeProps {
   tasks: Task[];
   selectedProjectId: string | null;
   onViewTask: (task: Task) => void;
+  onDirectionClick?: (directionId: string) => void;
 }
 
 // ---------- helpers ----------
@@ -128,13 +144,6 @@ const TASK_TYPE_COLORS: Record<string, string> = {
   refactor: 'bg-cyan-500/20 text-cyan-400',
 };
 
-function mergeRate(merged: number, created: number): { pct: number; color: string } {
-  if (created === 0) return { pct: 0, color: 'text-neutral-500' };
-  const pct = Math.round((merged / created) * 100);
-  if (pct >= 60) return { pct, color: 'text-emerald-400' };
-  if (pct >= 30) return { pct, color: 'text-amber-400' };
-  return { pct, color: 'text-red-400' };
-}
 
 function priorityBadge(p: string) {
   switch (p) {
@@ -217,9 +226,10 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, onViewTask }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectionClick }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
+  const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
@@ -243,13 +253,22 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
       })(),
     );
 
-    // Diagnostics — only when a project is selected
+    // Diagnostics + open PRs — only when a project is selected
     if (selectedProjectId) {
       fetches.push(
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
             if (res.ok) setDiagnostics(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
+            if (res.ok) {
+              const data = await res.json();
+              setOpenPRs(data.open_prs ?? []);
+            }
           } catch { /* silent */ }
         })(),
       );
@@ -290,8 +309,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
   // Recent completions with pr_url (from digest)
   const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
 
-  // Direction progress sorted by cycles
-  const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => b.cycles_in_window - a.cycles_in_window);
+  // Direction progress sorted by priority (high → medium → low)
+  const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
   const totalDirPRs = directions.reduce((s, d) => s + d.prs_merged, 0);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
@@ -373,25 +393,26 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
                 </div>
 
                 {/* Scrollable direction cards */}
-                <div className="flex gap-2 overflow-x-auto pb-1">
+                <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide" style={{ scrollbarWidth: 'none' }}>
                   {directions.map(d => {
-                    const mr = mergeRate(d.prs_merged, d.tasks_created);
+                    const cvr = d.conversion_rate != null ? Math.round(d.conversion_rate * 100) : null;
+                    const cvrColor = cvr == null ? 'text-neutral-500' : cvr >= 60 ? 'text-emerald-400' : cvr >= 30 ? 'text-amber-400' : 'text-red-400';
                     return (
-                      <div key={d.direction_id} className="min-w-[200px] max-w-[220px] bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 shrink-0">
+                      <div
+                        key={d.direction_id}
+                        className="min-w-[200px] max-w-[220px] bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 shrink-0 cursor-pointer hover:border-neutral-700 transition-colors"
+                        onClick={() => onDirectionClick?.(d.direction_id)}
+                      >
                         <div className="flex items-center gap-1.5 mb-1.5">
                           <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
                           {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
                         </div>
                         <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
                         <div className="flex items-center gap-2 text-[10px] text-neutral-500">
-                          <span className={mr.color}>{mr.pct}% merge</span>
-                          <span>{d.cycles_in_window} cycle{d.cycles_in_window !== 1 ? 's' : ''}</span>
+                          {cvr != null && <span className={cvrColor}>{cvr}% merge</span>}
                           <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
                           {d.product_ratio != null && (
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
-                          )}
-                          {d.estimated_cost_usd != null && (
-                            <span>${d.estimated_cost_usd < 10 ? d.estimated_cost_usd.toFixed(2) : Math.round(d.estimated_cost_usd).toString()}</span>
                           )}
                         </div>
                       </div>
@@ -472,9 +493,88 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask }: Dashboar
               })}
             </div>
           )}
+
+          {/* Section 5: PR Monitor */}
+          <PRMonitorSection openPRs={openPRs} loading={loading} hasProject={!!selectedProjectId} />
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------- PR monitor ----------
+
+const PR_STATUS_COLORS: Record<string, string> = {
+  QUEUED: 'bg-blue-500/20 text-blue-400',
+  PROVISIONING: 'bg-blue-500/20 text-blue-400',
+  IN_PROGRESS: 'bg-emerald-500/20 text-emerald-400',
+  EVALUATING: 'bg-amber-500/20 text-amber-400',
+  COMPLETED: 'bg-neutral-500/20 text-neutral-400',
+  FAILED: 'bg-red-500/20 text-red-400',
+  CANCELLED: 'bg-neutral-500/20 text-neutral-500',
+};
+
+function PRMonitorSection({ openPRs, loading, hasProject }: { openPRs: OpenPR[]; loading: boolean; hasProject: boolean }) {
+  const [expanded, setExpanded] = useState(true);
+
+  return (
+    <section className="mt-4">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 mb-2 group"
+      >
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
+        <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>
+        <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+      </button>
+      {expanded && (
+        !hasProject ? (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
+        ) : loading ? (
+          <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-10 w-full" /></div>
+        ) : openPRs.length === 0 ? (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No open PRs</div>
+        ) : (
+          <div className="space-y-1.5 max-h-[400px] overflow-y-auto">
+            {openPRs.map(pr => {
+              const typeCls = TASK_TYPE_COLORS[pr.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
+              const statusCls = PR_STATUS_COLORS[pr.task_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-500';
+              return (
+                <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+                  <div className="flex items-start gap-2">
+                    <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs text-neutral-300 font-mono">#{pr.pr_number}</span>
+                        <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
+                      </div>
+                      <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                        {pr.task_type && (
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{pr.task_type}</span>
+                        )}
+                        {pr.task_status && (
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${statusCls}`}>{pr.task_status}</span>
+                        )}
+                        {pr.is_orphaned && (
+                          <span className="text-[9px] text-red-400 font-medium">No active task</span>
+                        )}
+                        <span className="text-[10px] text-neutral-500">{timeAgo(pr.pr_created_at)}</span>
+                      </div>
+                      <p className="text-[9px] text-neutral-600 font-mono truncate mt-0.5">{pr.pr_branch}</p>
+                    </div>
+                    {pr.pr_url && isSafeUrl(pr.pr_url) && (
+                      <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )
+      )}
+    </section>
   );
 }
 

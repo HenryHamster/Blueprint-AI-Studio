@@ -31,7 +31,7 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
-from app.models import Project, Task, TaskStatus
+from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts, filter_held_directions
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
@@ -1395,6 +1395,87 @@ async def orchestrator_worker():
                                 await session.rollback()
                             except Exception:
                                 logger.exception(f"[CI] Rollback also failed for task {ci_task.id}")
+
+                # ── Post-commit recovery ──
+                # If _process_post_commit raised after the early-commit persisted
+                # the task status, the PR may be orphaned (no review/fix spawned).
+                # The agent retry handles most cases via the idempotency guard
+                # modification, but if all retries failed the flag persists here.
+                # Scan for these and directly spawn the missing review.
+                try:
+                    pending_tasks = (await session.execute(
+                        select(Task).where(
+                            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                        ).limit(50)
+                    )).scalars().all()
+                    for pt in pending_tasks:
+                        if not (pt.context or {}).get("_post_commit_pending"):
+                            continue
+                        if pt.status != TaskStatus.COMPLETED:
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pt_payload = pt.first_payload
+                        pt_type = pt_payload.get("type", "create")
+                        if pt_type not in ("create", "refactor", "docs", "qa", "deps", "migrate", ""):
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pr_artifact = (await session.execute(
+                            select(Artifact).where(
+                                Artifact.task_id == pt.id,
+                                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                            ).limit(1)
+                        )).scalars().first()
+                        if not pr_artifact or not pr_artifact.url:
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        try:
+                            pc_pr_number = int(pr_artifact.url.rstrip("/").split("/")[-1])
+                        except (ValueError, IndexError):
+                            ctx = dict(pt.context or {})
+                            ctx.pop("_post_commit_pending", None)
+                            pt.context = ctx
+                            session.add(pt)
+                            await session.commit()
+                            continue
+                        pc_short_id = str(pt.id).replace('-', '')[:8]
+                        pc_branch = f"blueprint/task-{pc_short_id}"
+                        pc_base = pt_payload.get("base_branch", "main")
+                        pc_prompt = pt_payload.get("prompt", pt.description or "")
+                        logger.info(f"[RECOVERY] Post-commit pending for task {pt.id}, spawning review for PR #{pc_pr_number}")
+                        from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                        review_task, was_created = await _spawn_pipeline_task(
+                            pt, "review", session, pc_pr_number, pc_branch, pc_base,
+                            original_prompt=pc_prompt, original_task_id=str(pt.id)
+                        )
+                        ctx = dict(pt.context or {})
+                        ctx.pop("_post_commit_pending", None)
+                        pt.context = ctx
+                        if review_task and was_created:
+                            logger.info(f"[RECOVERY] Spawned review {review_task.id} for orphaned PR #{pc_pr_number} (task {pt.id})")
+                        elif review_task:
+                            logger.info(f"[RECOVERY] Review already active for PR #{pc_pr_number} (task {pt.id}): {review_task.id}")
+                        else:
+                            logger.warning(f"[RECOVERY] Review not spawned for orphaned PR #{pc_pr_number} (task {pt.id}) — cap/guard")
+                        session.add(pt)
+                        await session.commit()
+                except Exception as _pc_err:
+                    logger.error(f"[RECOVERY] Post-commit recovery scan failed: {_pc_err}", exc_info=True)
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
 
             _orchestrator_consecutive_errors = 0
             logger.info('orchestrator_cycle_complete', extra={

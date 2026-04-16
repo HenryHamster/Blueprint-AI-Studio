@@ -350,7 +350,27 @@ async def update_agent_status(
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
+    # Exception: if _post_commit_pending is set, the early-commit succeeded but
+    # _process_post_commit raised before spawning review/fix tasks. Let the retry
+    # re-run post-commit processing so the PR doesn't get orphaned.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        pending_info = (task.context or {}).get("_post_commit_pending")
+        if pending_info and isinstance(pending_info, dict):
+            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (_post_commit_pending set)")
+            _bind = session.bind
+            _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+            try:
+                result = await _process_post_commit(task.id, payload, _session_factory=_factory)
+                await session.refresh(task)
+                ctx = dict(task.context or {})
+                ctx.pop("_post_commit_pending", None)
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+                return result
+            except Exception as e:
+                logger.error(f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}", exc_info=True)
+                raise
         return {"status": "already_terminal", "task_id": str(task.id)}
     if task.status == TaskStatus.EVALUATING:
         return {"status": "already_evaluating", "task_id": str(task.id)}
@@ -1120,4 +1140,20 @@ async def update_agent_status(
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
-        return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        try:
+            return await _process_post_commit(task.id, payload, _session_factory=_factory)
+        except Exception as e:
+            # Early-commit already persisted the task status. If post-commit
+            # (review pipeline, rollup, etc.) fails, the idempotency guard
+            # would block agent retries — permanently orphaning any PR that
+            # needed a review/fix spawn. Set a flag so the guard lets the
+            # retry re-run post-commit processing.
+            logger.error(f"[PIPELINE] Post-commit processing failed for task {task.id}: {e}", exc_info=True)
+            try:
+                await session.refresh(task)
+                task.context = {**(task.context or {}), "_post_commit_pending": {"at": _utcnow().isoformat()}}
+                session.add(task)
+                await session.commit()
+            except Exception as ctx_err:
+                logger.exception(f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}")
+            raise
