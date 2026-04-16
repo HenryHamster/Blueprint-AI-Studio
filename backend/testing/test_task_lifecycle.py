@@ -19,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
-from app.models import Project, Task, TaskHistory, TaskStatus
+from app.models import Project, Task, TaskHistory, TaskStatus, ArtifactType
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
@@ -27,6 +27,7 @@ from app.task_lifecycle import (
     _requeue_parent_task,
     _merge_with_retry,
     _process_post_commit,
+    _is_transient_scan_error,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -751,3 +752,141 @@ async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, 
     # The task passed to rollup is the child task
     rollup_call_task = mock_rollup.call_args[0][0]
     assert str(rollup_call_task.id) == str(child.id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _is_transient_scan_error
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_is_transient_scan_error_timeout():
+    assert _is_transient_scan_error(TimeoutError("connection timed out")) is True
+
+
+def test_is_transient_scan_error_connection():
+    assert _is_transient_scan_error(ConnectionError("failed to connect")) is True
+
+
+def test_is_transient_scan_error_503():
+    assert _is_transient_scan_error(Exception("503 service unavailable")) is True
+
+
+def test_is_transient_scan_error_non_transient():
+    assert _is_transient_scan_error(ValueError("invalid token")) is False
+
+
+def test_is_transient_scan_error_permission():
+    assert _is_transient_scan_error(PermissionError("access denied")) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Security scan retry logic (via _process_post_commit)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _make_task_with_pr(session, project_id, *, scope="small"):
+    """Helper: create a task that will trigger the small-scope security scan path."""
+    task = Task(
+        project_id=project_id,
+        payloads=[{"type": "create", "prompt": "do create", "effort": scope}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        context={"scope": scope},
+        depends_on=[],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_scan_transient_retry_success(tl_db, mocker):
+    """Transient scan error on first attempt, success on retry — no requires_approval."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    # Scope must be "small" in context; base_branch must start with "research/" for is_intermediate path
+    task = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    # Patch the payloads to include base_branch so branch routing picks intermediate path
+    task.payloads = [{"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    clean_result = {"blocked": False, "findings": [], "summary": "clean", "report": ""}
+
+    call_count = 0
+    async def _scan_side_effect(*_args):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise TimeoutError("connection timed out")
+        return clean_result
+
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
+                 return_value=("gh-token", "owner", "repo"))
+    mocker.patch("app.security.scan_pr_for_injection", side_effect=_scan_side_effect)
+    # Merge succeeds
+    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock,
+                 return_value={"merged": True})
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/42",
+        branch="blueprint/task-abc123",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result["status"] in ("accepted", "received")
+    assert call_count == 2  # first attempt failed, retry succeeded
+
+    await session.refresh(task)
+    assert not task.requires_approval
+    assert (task.context or {}).get("scan_transient_failure") is not True
+
+
+@pytest.mark.asyncio
+async def test_scan_transient_retry_exhausted(tl_db, mocker):
+    """Both scan attempts fail transiently — sets requires_approval and scan_transient_failure flag."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [{"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
+                 return_value=("gh-token", "owner", "repo"))
+    mocker.patch("app.security.scan_pr_for_injection",
+                 side_effect=TimeoutError("connection timed out"))
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/42",
+        branch="blueprint/task-abc123",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+
+    await session.refresh(task)
+    assert task.requires_approval is True
+    assert (task.context or {}).get("scan_transient_failure") is True
+    assert "infrastructure error" in (task.latest_status_message or "")

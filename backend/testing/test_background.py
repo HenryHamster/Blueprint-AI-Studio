@@ -1375,16 +1375,25 @@ async def test_reaper_rate_limit_requeue_without_burning_retry_budget(reaper_db,
 
 @pytest.mark.asyncio
 async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefully(reaper_db, mocker):
-    """If disable_account_model raises an exception, the reaper still requeues the task
-    and does not propagate the error."""
+    """If disable_account_model raises on both attempts, the reaper still requeues the task,
+    the account is blacklisted at the task level, and the error is logged at ERROR level."""
     _common_reaper_mocks(mocker)
-    mocker.patch(
+    mock_disable = mocker.patch(
         "app.max_plan_pool.disable_account_model",
         new_callable=AsyncMock,
         side_effect=RuntimeError("pool unavailable"),
     )
     mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
-    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    # Allow the 1-second retry sleep through; raise _StopLoop on the next loop sleep
+    sleep_calls = []
+
+    async def _sleep_side_effect(delay):
+        sleep_calls.append(delay)
+        if delay != 1:
+            raise _StopLoop("Stop")
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_side_effect)
 
     project = Project(name="Rate Limit Error Test", user_id="user1")
     reaper_db.add(project)
@@ -1413,10 +1422,76 @@ async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefull
         pass
 
     await reaper_db.refresh(task)
-    # Task must still be requeued despite the disable_account_model failure
+    # Task must still be requeued despite both disable_account_model failures
     assert task.status == TaskStatus.QUEUED
     ctx = task.context or {}
     assert "rl-acct-456" in (ctx.get("blacklisted_accounts") or [])
+    # Both the initial attempt and the retry must have been called
+    assert mock_disable.call_count == 2
+    # The 1-second retry sleep must have been attempted
+    assert 1 in sleep_calls
+
+
+@pytest.mark.asyncio
+async def test_reaper_rate_limit_disable_account_model_retry_succeeds(reaper_db, mocker):
+    """If disable_account_model fails on first attempt but succeeds on retry, task is still requeued."""
+    _common_reaper_mocks(mocker)
+    call_count = 0
+
+    async def _disable_side_effect(acct_id, model):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("transient error")
+
+    mock_disable = mocker.patch(
+        "app.max_plan_pool.disable_account_model",
+        new_callable=AsyncMock,
+        side_effect=_disable_side_effect,
+    )
+    mocker.patch("app.max_plan_pool._extract_task_model", return_value="claude-sonnet-4-6")
+
+    sleep_calls = []
+
+    async def _sleep_side_effect(delay):
+        sleep_calls.append(delay)
+        if delay != 1:
+            raise _StopLoop("Stop")
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_side_effect)
+
+    project = Project(name="Rate Limit Retry Success Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "some task"}],
+        vm_instance_id="rl-retry-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": "rl-acct-789",
+            "last_error": "API Error: Rate limit reached",
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert "rl-acct-789" in (ctx.get("blacklisted_accounts") or [])
+    assert mock_disable.call_count == 2
+    assert 1 in sleep_calls
 
 
 # ── Dependent task unblocking ───────────────────────────────────────────────
@@ -2338,6 +2413,77 @@ async def test_infra_recovery_caps_at_one_resurrection_per_task(reaper_db, mocke
 
 
 @pytest.mark.asyncio
+async def test_infra_recovery_resurrects_agent_timeout_when_zone_available(reaper_db, mocker):
+    """An AGENT_TIMEOUT task (OOM/crash/heartbeat timeout) is reset to QUEUED when a zone is available."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+    project = Project(name="Infra Recovery AGENT_TIMEOUT Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={"failure_category": "AGENT_TIMEOUT"},
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_resurrection_count") == 1
+    assert ctx.get("_resurrected_from") == "AGENT_TIMEOUT"
+    assert "failure_category" not in ctx
+    assert task.attempt_count == 0
+    assert task.latest_status_message.startswith("Auto-resurrected")
+
+
+@pytest.mark.asyncio
+async def test_infra_recovery_skips_agent_timeout_when_no_zone_available(reaper_db, mocker):
+    """An AGENT_TIMEOUT task is not resurrected when no zone is available."""
+    _common_infra_recovery_mocks(mocker)
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
+
+    project = Project(name="AGENT_TIMEOUT No Zone Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={"failure_category": "AGENT_TIMEOUT"},
+        updated_at=datetime.utcnow() - timedelta(minutes=20),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
 async def test_infra_recovery_skips_tasks_older_than_two_hours(reaper_db, mocker):
     """Tasks that failed more than 2 hours ago are outside the recovery window."""
     _common_infra_recovery_mocks(mocker)
@@ -2775,3 +2921,64 @@ async def test_reaper_queued_age_alert_skips_requires_approval(reaper_db, mocker
         _select(Alert).where(Alert.task_id == approval_task.id)
     )).scalars().all()
     assert len(alerts) == 0, "Approval-pending tasks should not trigger queued age alerts"
+
+
+@pytest.mark.asyncio
+async def test_reaper_backoff_on_consecutive_errors(reaper_db, mocker):
+    """
+    The reaper's outer loop must apply exponential backoff when errors are
+    consecutive. Counter increments on each error; resets to 0 on success.
+    Sleep formula: min(60 * (2 ** consecutive_errors), 300).
+    error 1: counter=1 → 120s; error 2: counter=2 → 240s; error 3: counter=3 → 300s (capped).
+    After a successful cycle the counter resets to 0 → 60s.
+    """
+    import asyncio as _asyncio
+
+    _common_reaper_mocks(mocker)
+
+    sleep_calls = []
+    call_count = 0
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 4:
+            raise _asyncio.CancelledError()
+
+    mocker.patch("asyncio.sleep", side_effect=fake_sleep)
+
+    # First 3 calls to AsyncSessionLocal raise; 4th succeeds with empty DB.
+    iteration = 0
+
+    class _FailSession:
+        async def __aenter__(self):
+            raise RuntimeError("DB down")
+
+        async def __aexit__(self, *_a):
+            pass
+
+    class _OkSession:
+        async def __aenter__(self):
+            return reaper_db
+
+        async def __aexit__(self, *_a):
+            pass
+
+    def session_factory():
+        nonlocal iteration
+        iteration += 1
+        return _FailSession() if iteration <= 3 else _OkSession()
+
+    mocker.patch("app.reaper.AsyncSessionLocal", side_effect=session_factory)
+
+    try:
+        await reaper_service()
+    except _asyncio.CancelledError:
+        pass
+
+    assert len(sleep_calls) == 4, f"Expected 4 sleep calls, got {sleep_calls}"
+    assert sleep_calls[0] == 120   # error 1: counter=1
+    assert sleep_calls[1] == 240   # error 2: counter=2
+    assert sleep_calls[2] == 300   # error 3: counter=3 → capped
+    assert sleep_calls[3] == 60    # success: counter reset to 0

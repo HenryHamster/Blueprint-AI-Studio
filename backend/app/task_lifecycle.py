@@ -36,6 +36,17 @@ from app.failure_classification import classify_failure
 
 logger = logging.getLogger(__name__)
 
+_TRANSIENT_SCAN_ERROR_PATTERNS = (
+    "timeout", "timed out", "connection", "network", "unreachable",
+    "503", "502", "504", "service unavailable", "temporary", "dns",
+    "ssl", "eof occurred", "reset by peer",
+)
+
+def _is_transient_scan_error(exc: Exception) -> bool:
+    """Return True if the scan exception looks like a transient infrastructure failure."""
+    msg = f"{type(exc).__name__} {exc!r}".lower()
+    return any(pat in msg for pat in _TRANSIENT_SCAN_ERROR_PATTERNS)
+
 
 def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
     """Derive the pipeline stage at which a task failure occurred.
@@ -535,23 +546,70 @@ async def _process_post_commit(
                             if scan_result["findings"]:
                                 await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                         except Exception as e:
-                            logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}", exc_info=True)
-                            task.requires_approval = True
-                            task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
-                            session.add(task)
-                            if (task.context or {}).get("auto_remediation") is True:
+                            if _is_transient_scan_error(e):
+                                logger.warning(f"[SECURITY] Small-scope scan transient error for PR #{pr_number}, retrying: {e}")
+                                await asyncio.sleep(5)
                                 try:
-                                    await post_auto_fix_result_message(
-                                        session, task.project_id,
-                                        branch=(task.context or {}).get("ci_failure_branch", base_branch),
-                                        result="review_needed",
-                                        pr_number=pr_number,
-                                        task_id=task.id,
-                                    )
-                                except Exception as _ar_exc:
-                                    logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
-                            await session.commit()
-                            return {"status": "accepted"}
+                                    scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                                    logger.info(f"[SECURITY] Small-scope scan retry succeeded: {scan_result['summary']}")
+                                    if scan_result["blocked"]:
+                                        task.requires_approval = True
+                                        task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
+                                        session.add(task)
+                                        if (task.context or {}).get("auto_remediation") is True:
+                                            try:
+                                                await post_auto_fix_result_message(
+                                                    session, task.project_id,
+                                                    branch=(task.context or {}).get("ci_failure_branch", base_branch),
+                                                    result="review_needed",
+                                                    pr_number=pr_number,
+                                                    task_id=task.id,
+                                                )
+                                            except Exception as _ar_exc:
+                                                logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                        await session.commit()
+                                        if scan_result["findings"]:
+                                            await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                        return {"status": "accepted"}
+                                    if scan_result["findings"]:
+                                        await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                                except Exception as retry_exc:
+                                    logger.error(f"[SECURITY] Small-scope scan retry also failed for PR #{pr_number}: {retry_exc}", exc_info=True)
+                                    task.requires_approval = True
+                                    task.context = {**(task.context or {}), "scan_transient_failure": True}
+                                    task.latest_status_message = f"Security scan unavailable (infrastructure error) — requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[:500]
+                                    session.add(task)
+                                    if (task.context or {}).get("auto_remediation") is True:
+                                        try:
+                                            await post_auto_fix_result_message(
+                                                session, task.project_id,
+                                                branch=(task.context or {}).get("ci_failure_branch", base_branch),
+                                                result="review_needed",
+                                                pr_number=pr_number,
+                                                task_id=task.id,
+                                            )
+                                        except Exception as _ar_exc:
+                                            logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                    await session.commit()
+                                    return {"status": "accepted"}
+                            else:
+                                logger.error(f"[SECURITY] Small-scope scan failed for PR #{pr_number}, blocking: {e}", exc_info=True)
+                                task.requires_approval = True
+                                task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                                session.add(task)
+                                if (task.context or {}).get("auto_remediation") is True:
+                                    try:
+                                        await post_auto_fix_result_message(
+                                            session, task.project_id,
+                                            branch=(task.context or {}).get("ci_failure_branch", base_branch),
+                                            result="review_needed",
+                                            pr_number=pr_number,
+                                            task_id=task.id,
+                                        )
+                                    except Exception as _ar_exc:
+                                        logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
+                                await session.commit()
+                                return {"status": "accepted"}
 
                         merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
                         if merge_result.get("merged"):
@@ -650,11 +708,32 @@ async def _process_post_commit(
                         if scan_result["findings"]:
                             await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
                     except Exception as e:
-                        logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}", exc_info=True)
-                        task.requires_approval = True
-                        task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
-                        session.add(task)
-                        await session.commit()
+                        if _is_transient_scan_error(e):
+                            logger.warning(f"[SECURITY] Scan transient error for PR #{pr_number}, retrying: {e}")
+                            await asyncio.sleep(5)
+                            try:
+                                scan_result = await scan_pr_for_injection(gh_token, owner, repo, pr_number)
+                                logger.info(f"[SECURITY] Scan retry succeeded: {scan_result['summary']}")
+                                if scan_result["blocked"]:
+                                    task.requires_approval = True
+                                    task.latest_status_message = scan_result["summary"]
+                                    session.add(task)
+                                    await session.commit()
+                                if scan_result["findings"]:
+                                    await create_pr_comment(gh_token, owner, repo, pr_number, scan_result["report"])
+                            except Exception as retry_exc:
+                                logger.error(f"[SECURITY] Scan retry also failed for PR #{pr_number}: {retry_exc}", exc_info=True)
+                                task.requires_approval = True
+                                task.context = {**(task.context or {}), "scan_transient_failure": True}
+                                task.latest_status_message = f"Security scan unavailable (infrastructure error) — review will proceed but merge requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[:500]
+                                session.add(task)
+                                await session.commit()
+                        else:
+                            logger.error(f"[SECURITY] Scan failed for PR #{pr_number}, flagging for approval: {e}", exc_info=True)
+                            task.requires_approval = True
+                            task.latest_status_message = f"Security scan failed — review will proceed but merge requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                            session.add(task)
+                            await session.commit()
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
                     # Don't block here — let review run, block at merge time.

@@ -41,6 +41,7 @@ async def reaper_service():
     from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
     from app.rollup_management import _check_and_trigger_rollup  # noqa: PLC0415
 
+    consecutive_errors = 0
     while True:
         try:
             async with AsyncSessionLocal() as session:
@@ -278,7 +279,15 @@ async def reaper_service():
                             try:
                                 await disable_account_model(rl_acct_id, rl_model)
                             except Exception as _disable_err:
-                                logger.warning(f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: {_disable_err}")
+                                logger.warning(f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: {_disable_err}; retrying in 1s")
+                                await asyncio.sleep(1)
+                                try:
+                                    await disable_account_model(rl_acct_id, rl_model)
+                                except Exception as _disable_err2:
+                                    logger.error(
+                                        f"[REAPER] disable_account_model retry also failed for {rl_acct_id}/{rl_model}: {_disable_err2}. "
+                                        "Account remains active in pool — tight re-selection loop risk."
+                                    )
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
@@ -752,6 +761,10 @@ async def reaper_service():
                                 _external_health.get("github_api", False)
                                 and _external_health.get("claude_api", False)
                             )
+                        elif _fail_cat == "AGENT_TIMEOUT":
+                            # OOM kills, process crashes, heartbeat timeouts (exit 137/143)
+                            # are transient per-VM issues. Ready if any zone can accept a VM.
+                            _infra_ready = any_zone_available()
 
                         if not _infra_ready:
                             continue
@@ -903,19 +916,22 @@ async def reaper_service():
 
                 except Exception as e:
                     logger.error(f"[REAPER] Queued age alert sweep error: {e}", exc_info=True)
+            consecutive_errors = 0
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break
         except Exception as e:
+            consecutive_errors += 1
             logger.error(f"[REAPER] Error: {e}", exc_info=True)
             try:
                 await session.rollback()
             except Exception:
                 logger.exception("[REAPER] Rollback after reaper error failed")
 
-        # Sleep for 1 minute before checking again
+        # Sleep before next cycle; use exponential backoff on consecutive errors
+        sleep_seconds = min(60 * (2 ** consecutive_errors), 300)
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break
