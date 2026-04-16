@@ -49,9 +49,47 @@ runtime_config: Dict = {
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
     # Per-task-type model/effort defaults (synced from frontend settings)
-    # e.g. {"research": "claude-opus-4-6", "create": "claude-sonnet-4-6"}
-    "task_type_models": {"research": "claude-opus-4-6"},
-    "task_type_efforts": {"research": "max"},
+    # All tasks use opus-4-7; effort varies by type:
+    #   max: strategic_review, design_doc_update
+    #   high: research, architecture (design_doc)
+    #   medium: create, refactor, plan, review, fix, qa, deps, docs, migrate, security_audit, perf
+    #   low: smoketest and other quick checks
+    "task_type_models": {
+        "strategic_review": "claude-opus-4-7",
+        "design_doc_update": "claude-opus-4-7",
+        "research": "claude-opus-4-7",
+        "create": "claude-opus-4-7",
+        "refactor": "claude-opus-4-7",
+        "plan": "claude-opus-4-7",
+        "review": "claude-opus-4-7",
+        "fix": "claude-opus-4-7",
+        "qa": "claude-opus-4-7",
+        "deps": "claude-opus-4-7",
+        "docs": "claude-opus-4-7",
+        "migrate": "claude-opus-4-7",
+        "security_audit": "claude-opus-4-7",
+        "perf": "claude-opus-4-7",
+        "smoketest": "claude-opus-4-7",
+        "debug": "claude-opus-4-7",
+    },
+    "task_type_efforts": {
+        "strategic_review": "max",
+        "design_doc_update": "max",
+        "research": "high",
+        "create": "medium",
+        "refactor": "medium",
+        "plan": "medium",
+        "review": "medium",
+        "fix": "medium",
+        "qa": "medium",
+        "deps": "medium",
+        "docs": "medium",
+        "migrate": "medium",
+        "security_audit": "medium",
+        "perf": "medium",
+        "smoketest": "low",
+        "debug": "medium",
+    },
     # Per-type extra instructions appended to the agent's base prompt
     # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
     "agent_prompt_suffixes": {},

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from sqlalchemy import func as _func
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, init_db
@@ -108,7 +109,9 @@ async def lifespan(app):
                         asyncio.create_task(_send_webhook_notification("SERVICE_CRASHED", f"Background service crashed: {name}", str(exc)[:500]))
                         try:
                             async with AsyncSessionLocal() as alert_session:
-                                projects = (await alert_session.execute(select(Project))).scalars().all()
+                                projects = (await alert_session.execute(
+                                    select(Project).options(load_only(Project.id))
+                                )).scalars().all()
                                 alert_title = f"Background service crashed: {name}"
                                 for project in projects:
                                     existing = (await alert_session.execute(
@@ -147,7 +150,9 @@ async def lifespan(app):
                             tasks[name] = asyncio.create_task(factory())
                             try:
                                 async with AsyncSessionLocal() as alert_session:
-                                    projects = (await alert_session.execute(select(Project))).scalars().all()
+                                    projects = (await alert_session.execute(
+                                        select(Project).options(load_only(Project.id))
+                                    )).scalars().all()
                                     for project in projects:
                                         alert = Alert(
                                             project_id=project.id,

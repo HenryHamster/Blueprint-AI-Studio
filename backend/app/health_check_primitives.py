@@ -93,8 +93,11 @@ def check_claude_api_health(ext: dict) -> Optional[str]:
 
     all_accounts = list(_account_by_id.values())
     if all_accounts:
-        # Use _account_available_for_model to check: has token, enabled, not all models disabled
-        available_accounts = [a for a in all_accounts if _account_available_for_model(a, None)]
+        # Check if accounts have a token and are enabled. Don't use model=None
+        # (conservative path treats any per-model disable as fully unavailable,
+        # which causes one rate-limited model to poison the entire health check).
+        # Per-model availability is enforced at dispatch time.
+        available_accounts = [a for a in all_accounts if a.get("oauth_token") and a.get("enabled", True)]
         if not available_accounts:
             ext["claude_api"] = False
             disabled_names = [a["name"] for a in all_accounts]

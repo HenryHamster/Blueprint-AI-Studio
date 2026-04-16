@@ -414,7 +414,9 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
         _runtime_config["autonomous_research_interval_minutes"] = val
-    VALID_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", ""}
+    # Legacy 4-6 entries accepted so stored runtime_config from prior revisions
+    # validates without rewrite; new tasks should use claude-opus-4-7 only.
+    VALID_MODELS = {"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", ""}
     VALID_EFFORTS = {"low", "medium", "high", "max", ""}
     if "task_type_models" in payload:
         val = payload["task_type_models"]

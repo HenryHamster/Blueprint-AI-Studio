@@ -232,7 +232,7 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
       "prompt": "Self-contained implementation prompt. Describe WHAT to achieve and key constraints. The agent has full repo access and will figure out implementation details.",
       "depends_on_indices": [],
       "related_files": ["src/main.py", "src/utils.py"],
-      "model": "claude-sonnet-4-6 | claude-opus-4-6 | null (inherit from parent)",
+      "model": "claude-opus-4-7 | null (inherit from parent)",
       "effort": "low | medium | high | null (inherit from parent)",
       "scope": "medium",
       "risk": "low",
@@ -269,7 +269,7 @@ Rules:
 - If subtasks involve structural refactors of the same files (renames, interface changes, restructuring), set depends_on_indices between them. Small additive changes to shared files can stay parallel.
 - Aim for 1-4 subtasks. Prefer 1-2 large subtasks over 4-6 small ones. If the task can be one PR, output a single subtask.
 - Do NOT include review, testing, or deployment subtasks — those are handled automatically by the pipeline
-- Use model=claude-opus-4-6 and effort=high only for complex architectural subtasks. Leave null for simple additive changes.
+- Use model=claude-opus-4-7 and effort=high only for complex architectural subtasks. Leave null for simple additive changes.
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs.
 - If any subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds new database tables/columns, include a separate subtask with set type="migrate" (e.g., title "feat: add index for user lookup", type "migrate"). This subtask should depend on the model change subtask. The migration agent will handle Alembic generation.
@@ -1262,7 +1262,7 @@ implementation findings. Add metadata alongside them when relevant.
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
   "direction_id": "d-xxx or null",
-  "model": "claude-opus-4-6|claude-sonnet-4-6|null",
+  "model": "claude-opus-4-7|null",
   "effort": "high|medium|low|null"
 }]
 \`\`\`

@@ -411,8 +411,17 @@ async def orchestrator_worker():
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
+                # Light query: only load columns needed for the stale-provision scan
+                # and concurrency count. Heavy JSONB (payloads, context, status_log)
+                # is deferred — the few stale tasks are re-read with_for_update below.
+                _active_light_cols = load_only(
+                    Task.id, Task.status, Task.last_heartbeat, Task.started_at,
+                    Task.vm_instance_id, Task.project_id,
+                )
                 active_tasks_result = (await session.execute(
-                    select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                    select(Task)
+                    .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                    .options(_active_light_cols)
                 )).scalars().all()
 
                 # Recover stale PROVISIONING tasks (orchestrator crashed mid-dispatch)
@@ -477,9 +486,11 @@ async def orchestrator_worker():
                     for old_vm in stale_vm_ids:
                         if old_vm:
                             await _ensure_vm_deleted(old_vm, reason="stale_provisioning")
-                    # Re-fetch after recovery
+                    # Re-fetch after recovery (light columns only — just need count)
                     active_tasks_result = (await session.execute(
-                        select(Task).where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                        select(Task)
+                        .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
+                        .options(_active_light_cols)
                     )).scalars().all()
 
                 # Enforce concurrency limit
@@ -600,12 +611,23 @@ async def orchestrator_worker():
                         logger.exception("[ORCHESTRATOR] Failed to broadcast health_gate_throttle")
                     continue
 
-                # Reconcile Max Plan active_tasks counters from DB each cycle
+                # Reconcile Max Plan active_tasks counters from DB each cycle.
+                # Use a raw SQL extraction to avoid loading the full context JSONB.
                 active_per_account: Dict[str, int] = {}
-                for t in active_tasks_result:
-                    acct_id = (t.context or {}).get("max_plan_account_id")
+                _acct_rows = (await session.execute(
+                    select(
+                        Task.context["max_plan_account_id"].as_string(),
+                        _func.count(),
+                    )
+                    .where(
+                        Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                        Task.context["max_plan_account_id"].as_string().is_not(None),
+                    )
+                    .group_by(Task.context["max_plan_account_id"].as_string())
+                )).all()
+                for acct_id, cnt in _acct_rows:
                     if acct_id:
-                        active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+                        active_per_account[acct_id] = cnt
                 async with _max_plan_pool_lock:
                     for acct in _account_by_id.values():
                         # Reconcile from DB — the pre-increment in select_max_plan_account() is always
@@ -1047,9 +1069,9 @@ async def orchestrator_worker():
                         task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                         task_model = _runtime_config.get("task_type_models", {}).get(task_type)
                     # Always persist model to payload so rate-limit handler knows which
-                    # model was used. Claude Code defaults to Sonnet when no --model flag.
+                    # model was used. Default to opus-4-7 when no per-type override.
                     if task.payloads and not task.payloads[0].get("model"):
-                        task.payloads[0]["model"] = task_model or "claude-sonnet-4-6"
+                        task.payloads[0]["model"] = task_model or "claude-opus-4-7"
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(task, "payloads")
                         session.add(task)

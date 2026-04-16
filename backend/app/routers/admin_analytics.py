@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session
@@ -158,7 +159,10 @@ async def get_activity(
         task_filters.append(Task.project_id == project_id)
 
     tasks_result = await session.execute(
-        select(Task).where(*task_filters)
+        select(Task).where(*task_filters).options(
+            load_only(Task.id, Task.status, Task.title, Task.project_id,
+                      Task.payloads, Task.status_log, Task.created_at, Task.started_at)
+        )
     )
     recent_tasks = tasks_result.scalars().all()
 
@@ -902,7 +906,12 @@ async def get_digest(
     lookback_start = min(raw_lookback, prev_window_start)
 
     # --- Query tasks from extended lookback window ---
-    task_filters = [Task.created_at >= lookback_start]
+    # Only load terminal tasks — QUEUED/PROVISIONING/IN_PROGRESS are not used by
+    # this endpoint and can represent significant memory with large JSONB payloads.
+    task_filters = [
+        Task.created_at >= lookback_start,
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+    ]
     if project_id:
         task_filters.append(Task.project_id == project_id)
 
@@ -937,7 +946,12 @@ async def get_digest(
     if project_id:
         active_filters.append(Task.project_id == project_id)
     active_result = await session.execute(
-        select(Task).where(*active_filters).order_by(Task.started_at.asc().nullsfirst())
+        select(Task).where(*active_filters)
+        .order_by(Task.started_at.asc().nullsfirst())
+        .options(load_only(
+            Task.id, Task.status, Task.title, Task.payloads,
+            Task.started_at, Task.project_id,
+        ))
     )
     active_tasks_all = active_result.scalars().all()
 
@@ -1543,7 +1557,13 @@ async def get_health_overview(
     active_filters = [Task.status.in_(active_statuses), Task.archived.is_(False)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
-    active_result = await session.execute(select(Task).where(*active_filters))
+    active_result = await session.execute(
+        select(Task).where(*active_filters).options(
+            load_only(Task.id, Task.status, Task.title, Task.project_id,
+                      Task.created_at, Task.started_at, Task.last_heartbeat,
+                      Task.vm_instance_id, Task.depends_on)
+        )
+    )
     active_tasks = active_result.scalars().all()
 
     # Zone health (needed for remediation hints)

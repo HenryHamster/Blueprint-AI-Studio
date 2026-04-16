@@ -58,12 +58,15 @@ RATE_LIMIT_PATTERNS = [
 #   - Haiku shares Opus's meter exactly — it does NOT have its own bucket,
 #     so haiku tracking normalizes to opus via _normalize_rl_model().
 _MODEL_TIER_CASCADE: Dict[str, tuple] = {
-    "claude-opus-4-6": ("claude-opus-4-6", "claude-sonnet-4-6"),
-    "claude-sonnet-4-6": ("claude-sonnet-4-6",),
+    "claude-opus-4-7": ("claude-opus-4-7",),
+    # Legacy mappings kept so prior-queued tasks with 4-6 models still resolve
+    # to a valid cascade; all new tasks use 4-7.
+    "claude-opus-4-6": ("claude-opus-4-7",),
+    "claude-sonnet-4-6": ("claude-opus-4-7",),
 }
 
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
-_OPUS_MODEL = "claude-opus-4-6"
+_OPUS_MODEL = "claude-opus-4-7"
 
 
 def _normalize_rl_model(model: str | None) -> str | None:

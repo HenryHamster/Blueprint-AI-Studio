@@ -18,12 +18,14 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       # Placeholder image. CI/CD will overwrite this with the actual application image.
       image = "us-docker.pkg.dev/cloudrun/container/hello"
 
-      # Memory was bumped from 1Gi → 2Gi on 2026-04-15 after an OOM cluster
-      # killed in-flight request handlers. CPU stays at 1 vCPU.
+      # Memory: 2Gi→4Gi on 2026-04-16. load_only() on hot queries reduces
+      # steady-state usage; 4Gi gives headroom for analytics endpoints that
+      # load 14-day task windows with full JSONB. CPU bumped to 2 vCPU to
+      # match — GC pressure needs CPU too.
       resources {
         limits = {
-          memory = "2Gi"
-          cpu    = "1000m"
+          memory = "4Gi"
+          cpu    = "2000m"
         }
       }
 

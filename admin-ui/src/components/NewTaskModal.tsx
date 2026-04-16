@@ -306,9 +306,7 @@ export function NewTaskModal({
                     className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
                   >
                     <option value="">Default</option>
-                    <option value="claude-opus-4-6">claude-opus-4-6</option>
-                    <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                    <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
+                    <option value="claude-opus-4-7">claude-opus-4-7</option>
                   </select>
                 </div>
                 <div>

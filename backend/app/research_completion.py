@@ -628,7 +628,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if _all_pool_accounts:
         _healthy_accounts = sum(
             1 for a in _all_pool_accounts
-            if _pool_mod._account_available_for_model(a, "claude-sonnet-4-6")
+            if _pool_mod._account_available_for_model(a, "claude-opus-4-7")
         )
         _cap_by_accounts = _healthy_accounts * 3
     else:
@@ -955,7 +955,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         direction_id = finding.get("direction_id")
         # Apply per-type model/effort overrides — take the higher of finding vs config
-        _model_rank = {"claude-opus-4-6": 3, "claude-sonnet-4-6": 2, "claude-haiku-4-5-20251001": 1}
+        _model_rank = {"claude-opus-4-7": 4, "claude-opus-4-6": 3, "claude-sonnet-4-6": 2, "claude-haiku-4-5-20251001": 1}
         _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
         finding_model = finding.get('model')
         config_model = _runtime_config.get("task_type_models", {}).get(task_type)

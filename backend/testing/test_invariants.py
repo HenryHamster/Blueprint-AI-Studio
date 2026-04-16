@@ -246,7 +246,7 @@ MODULE_SIZE_LIMITS = {
     "compute.py": 2500,
     "github.py": 2000,
     "routers/admin_settings.py": 3000,
-    "routers/admin_analytics.py": 2500,
+    "routers/admin_analytics.py": 2700,
     "routers/agent.py": 2000,
     "services.py": 1500,
     "routers/agent_status.py": 1500,

@@ -364,9 +364,7 @@ export function SettingsDropdown({
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="">Orchestrator default</option>
-                <option value="claude-opus-4-6">claude-opus-4-6</option>
-                <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-                <option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option>
+                <option value="claude-opus-4-7">claude-opus-4-7</option>
               </select>
             </div>
             <div>
@@ -548,9 +546,7 @@ export function SettingsDropdown({
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     >
                       <option value="">default</option>
-                      <option value="claude-opus-4-6">opus-4-6</option>
-                      <option value="claude-sonnet-4-6">sonnet-4-6</option>
-                      <option value="claude-haiku-4-5-20251001">haiku-4-5</option>
+                      <option value="claude-opus-4-7">opus-4-7</option>
                     </select>
                   </div>
                   <div>
