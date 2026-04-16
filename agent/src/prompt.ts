@@ -474,6 +474,35 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
         }
       } catch { /* no matches */ }
 
+      // Import-based discovery: search test files for direct import statements referencing this module
+      try {
+        if (relFile.endsWith('.py')) {
+          // e.g. 'backend/app/orchestrator.py' → 'app.orchestrator'
+          const pyModulePath = relFile
+            .replace(/^backend\//, '')
+            .replace(/\.py$/, '')
+            .replace(/\//g, '.');
+          const importPattern = `(from ${pyModulePath} import|import ${pyModulePath})`;
+          const pyGrepResult = execFileSync('git', ['grep', '-lE', importPattern, '--', '*test*'],
+            { cwd: WORKSPACE, encoding: 'utf-8' });
+          for (const tf of pyGrepResult.split('\n').filter(Boolean)) {
+            processTestFile(tf);
+          }
+        } else if (relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+          // e.g. 'agent/src/prompt.ts' → stem 'prompt'
+          const stem = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') || '';
+          if (stem) {
+            // Match import ... from '*/prompt', '*/prompt.js', '*/prompt.ts' etc.
+            const tsImportPattern = `from ['"][^'"]*/${stem}(\\.js|\\.ts|\\.tsx)?['"]`;
+            const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
+              { cwd: WORKSPACE, encoding: 'utf-8' });
+            for (const tf of tsGrepResult.split('\n').filter(Boolean)) {
+              processTestFile(tf);
+            }
+          }
+        }
+      } catch { /* no matches */ }
+
       void discoveredByConvention; // used for control flow, not needed after loop
     }
 

@@ -36,6 +36,7 @@ vi.mock('child_process', () => ({
 }));
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
+import { execFileSync } from 'child_process';
 import {
   formatPlaybook,
   buildContextPrefix,
@@ -508,6 +509,52 @@ describe('discoverRelatedTests', () => {
     });
     // No directory matches 'other/' so no test entries are added
     expect(result).toBe('');
+  });
+
+  it('import-based: issues Python import grep with correct dotted module path', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/orchestrator.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.orchestrator'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: constructs correct Python module path from nested file', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['backend/app/services/auth.py'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('app.services.auth'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: issues TypeScript import grep with stem-based pattern', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import-based grep pattern should reference the stem 'prompt'
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes('/prompt'))
+    );
+    expect(importCall).toBeTruthy();
+  });
+
+  it('import-based: skips TypeScript test files themselves (contains .test.)', () => {
+    const mockExecFileSync = vi.mocked(execFileSync);
+    mockExecFileSync.mockReturnValue(Buffer.from(''));
+    discoverRelatedTests(null, ['agent/src/prompt.test.ts'], undefined);
+    const calls = mockExecFileSync.mock.calls;
+    // The import grep uses a pattern with "from ['" — should not appear for test files
+    const importCall = calls.find(c =>
+      Array.isArray(c[1]) && c[1].some((a: unknown) => typeof a === 'string' && a.includes("from ['"))
+    );
+    expect(importCall).toBeUndefined();
   });
 });
 
