@@ -525,11 +525,48 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         if project.build_config:
             research_payload["build_config"] = project.build_config
         research_payload = validate_internal_payload(research_payload, "autonomous_research:research")
+
+        # Recover deferred findings from recent completed research tasks for this direction.
+        # When the pipeline was degraded, _handle_research_completion caps spawns at
+        # _DEGRADED_SPAWN_CAP and stores the remaining findings in the completed task's
+        # context['deferred_findings']. Inject them here so the new cycle processes them
+        # alongside its own discoveries (they go through full dedup + health gate again).
+        task_context: dict = {}
+        current_dir_id_for_deferred = current_dir_id  # may be None for undirected cycles
+        if current_dir_id_for_deferred:
+            prev_research_rows = (await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.COMPLETED,
+                ).order_by(Task.created_at.desc()).limit(20)
+            )).scalars().all()
+            prev_research_rows = [r for r in prev_research_rows if (r.context or {}).get("deferred_findings")]
+            dir_deferred: list[dict] = []
+            seen_titles: set[str] = set()
+            for prev_row in prev_research_rows:
+                for f in (prev_row.context or {}).get("deferred_findings", []):
+                    if not isinstance(f, dict):
+                        continue
+                    # Include findings for this direction or unscoped findings
+                    if f.get("direction_id") and f.get("direction_id") != current_dir_id_for_deferred:
+                        continue
+                    title = f.get("title", "")
+                    if title not in seen_titles:
+                        dir_deferred.append(f)
+                        seen_titles.add(title)
+            if dir_deferred:
+                task_context["prior_deferred_findings"] = dir_deferred
+                logger.info(
+                    f"[AUTONOMOUS] Injecting {len(dir_deferred)} deferred finding(s) from previous "
+                    f"research cycle(s) into new research task for direction {current_dir_id_for_deferred}"
+                )
+
         new_task = Task(
             project_id=project.id,
             title=f"Research: {direction_text}",
             description=f"Autonomous research for: {direction_text}",
             payloads=[research_payload],
+            context=task_context,
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",

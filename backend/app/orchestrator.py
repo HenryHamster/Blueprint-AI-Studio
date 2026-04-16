@@ -32,7 +32,7 @@ from app.compute import (
 )
 from app.database import AsyncSessionLocal
 from app.models import Project, Task, TaskStatus
-from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts
+from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts, filter_held_directions
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -414,11 +414,15 @@ async def orchestrator_worker():
                 # Filter to last 15 min so the gate auto-clears when failures age out
                 _fr_cutoff = (_utcnow() - timedelta(minutes=15)).isoformat()
                 recent_results = [r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= _fr_cutoff]
+                # Types with >70% failure rate (min 3 samples) are skipped in the dispatch loop
+                # below without throttling healthy types.
+                _failing_types: set = set()
                 if len(recent_results) >= 5:
                     recent_window = recent_results[-10:]
                     recent_failures = sum(1 for r in recent_window if r[1] == "failure")
                     recent_rate = recent_failures / len(recent_window)
                     if recent_rate >= 0.8:
+                        # Global backstop: entire pipeline is degraded — sleep and retry
                         logger.warning(f"[ORCHESTRATOR] High failure rate ({recent_failures}/{len(recent_window)}) — throttling dispatch for {ORCHESTRATOR_THROTTLE_SECONDS}s")
                         try:
                             await ws_manager.broadcast_to_all("pipeline_throttle", {
@@ -433,6 +437,17 @@ async def orchestrator_worker():
                         await recheck_disabled_accounts()
                         await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
                         continue
+                    else:
+                        # Per-type gate: detect individual failing types and skip only them
+                        seen_types = {r[3] for r in recent_results if len(r) > 3 and r[3]}
+                        for ttype in seen_types:
+                            rate, sample_size = _shared_state.get_task_type_failure_rate(ttype, window_minutes=15)
+                            if sample_size >= 3 and rate >= 0.7:
+                                _failing_types.add(ttype)
+                                logger.warning(
+                                    f"[ORCHESTRATOR] Per-type failure gate: '{ttype}' "
+                                    f"({rate:.0%} failure rate, n={sample_size}) — skipping this type"
+                                )
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle
                 active_per_account: Dict[str, int] = {}
@@ -715,6 +730,11 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 
+                # Step 2.7: Defer tasks whose direction is held due to consecutive code failures
+                eligible_ids = await filter_held_directions(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 
@@ -757,6 +777,16 @@ async def orchestrator_worker():
                     queued_tasks = []  # Clear so the loop below is skipped
 
                 for task in queued_tasks:
+                    # Per-type failure gate: skip tasks whose type is currently failing
+                    # (global 80% backstop already handled above; this skips only the bad type)
+                    _task_type_for_gate = task.first_payload.get("type", "")
+                    if _task_type_for_gate and _task_type_for_gate in _failing_types:
+                        logger.info(
+                            f"[ORCHESTRATOR] Skipping task {task.id} "
+                            f"(type={_task_type_for_gate}) — per-type failure gate active"
+                        )
+                        continue
+
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
                     if not task.vm_instance_id:
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -963,7 +993,7 @@ async def orchestrator_worker():
                             provision_err = get_provision_error(vm_id)
                             logger.error(f"[ORCHESTRATOR] Failed to provision VM {vm_id} for task {t_id}: {provision_err}")
                             try:
-                                record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id))
+                                record_task_result(success=False, failure_class="PROVISION_FAILURE", task_id=str(t_id), task_type=t_type)
                                 # Hoist zone lookup so it can be saved to context and used for zone failure recording
                                 prov_zone = get_vm_zone(vm_id)
                                 # Capture serial port logs before VM deletion (best-effort)

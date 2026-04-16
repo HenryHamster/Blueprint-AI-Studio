@@ -100,7 +100,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 from app.routers.agent_status import record_task_result  # noqa: PLC0415
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
-                record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 try:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)
@@ -771,7 +771,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             from app.routers.agent_status import record_task_result  # noqa: PLC0415
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
-                            record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                            record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
@@ -811,7 +811,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         from app.routers.agent_status import record_task_result  # noqa: PLC0415
                         _fc = classify_failure(parent)
                         persist_failure_category(parent, _fc)
-                        record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                        record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
@@ -850,7 +850,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(parent.id))
+                    record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
                     # NOTE: Do NOT delete staging_branch here — it contains all
                     # merged child work. Preserving it allows manual recovery or
                     # requeue. Branches are cleaned up by _cleanup_branches when

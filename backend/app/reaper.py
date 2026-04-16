@@ -494,7 +494,7 @@ async def reaper_service():
                         extra_logs = " ".join(filter(None, extra_log_parts))
                         failure_class = classify_failure(task, logs=extra_logs or None)
                         persist_failure_category(task, failure_class)
-                        record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
+                        record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                         session.add(task)
                         await _maybe_create_failure_alert(task, session)
 

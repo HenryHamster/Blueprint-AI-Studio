@@ -45,6 +45,49 @@ logger = logging.getLogger(__name__)
 
 _SCOPE_ORDER = ["small", "medium", "large"]
 
+# Maximum implementation tasks to spawn when pipeline health is degraded.
+# Remaining findings are deferred to task.context['deferred_findings'] for
+# the next research cycle.
+_DEGRADED_SPAWN_CAP = 2
+
+
+def _assess_spawn_health() -> tuple[bool, str | None]:
+    """Check pipeline health signals for spawn-time gating.
+
+    Returns (is_degraded, reason). When degraded, _handle_research_completion
+    caps new implementation task creation at _DEGRADED_SPAWN_CAP.
+
+    Checks (in order):
+    1. Zone availability: all zones in cooldown → degraded
+    2. Account availability: no accounts available for create model → degraded
+    3. Rolling failure rate: >50% of recent task_results are failures → degraded
+    """
+    from app.compute import any_zone_available  # noqa: PLC0415
+    from app.max_plan_pool import _account_by_id, _account_available_for_model  # noqa: PLC0415
+    from app.shared_state import deploy_monitoring  # noqa: PLC0415
+
+    if not any_zone_available():
+        return True, "all zones in cooldown"
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        create_model = _runtime_config.get("task_type_models", {}).get("create")
+        all_accounts = list(_account_by_id.values())
+        if all_accounts and not any(_account_available_for_model(a, create_model) for a in all_accounts):
+            return True, "no accounts available"
+
+    task_results = list(deploy_monitoring.get("task_results", []))
+    # Apply a 60-minute window to avoid false positives from historical failures that
+    # are no longer representative of current pipeline health. Old failures (hours ago)
+    # can dominate the ring buffer even when the system has fully recovered.
+    _sixty_min_ago = (_utcnow() - timedelta(minutes=60)).isoformat()
+    recent_results = [r for r in task_results if r[0] >= _sixty_min_ago]
+    if len(recent_results) >= 10:
+        failures = sum(1 for entry in recent_results if entry[1] == "failure")
+        if failures / len(recent_results) > 0.5:
+            return True, f"high failure rate ({failures}/{len(recent_results)} recent tasks failed)"
+
+    return False, None
+
 
 def _calibrate_scope(proposed_scope: str, direction: dict) -> tuple[str, str | None]:
     """Downgrade scope if historical merge rate at that scope is below threshold.
@@ -489,6 +532,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
 
+    # Recover findings that were deferred in the previous cycle due to pipeline degradation.
+    # These were already researched but couldn't be spawned; prepend them so they go through
+    # the full dedup + health gate pipeline alongside this cycle's new findings.
+    prior_deferred = (task.context or {}).get("prior_deferred_findings", [])
+    if prior_deferred:
+        # Filter out non-actionable types that would have been handled separately above
+        prior_actionable = [
+            f for f in prior_deferred
+            if isinstance(f, dict) and f.get("type") not in ("direction_proposal", "direction_note")
+        ]
+        if prior_actionable:
+            logger.info(
+                f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
+                f"to findings list for task {task.id}"
+            )
+            findings = prior_actionable + findings
+
     # Cap findings to prevent runaway task creation
     if len(findings) > 15:
         findings = findings[:15]
@@ -671,6 +731,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
         deduplicated.append((orig_i, finding, fhash))
 
+    # Assess pipeline health once before spawning implementation tasks.
+    # Metadata findings (design_doc_observation, direction_update) are processed
+    # regardless; only VM-consuming implementation tasks are capped.
+    _pipeline_degraded, _health_reason = _assess_spawn_health()
+    _impl_spawned = 0
+    _deferred_findings: list[dict] = []
+
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
     finding_indices = []  # Maps child_tasks index → findings array index
@@ -745,6 +812,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if not prompt:
             empty_prompt_count += 1
+            continue
+
+        # Skip findings already directly dispatched by the research agent (scope=small+risk=low).
+        # These were sent via /api/agent/spawn before research completed; no task needed here.
+        if finding.get("already_spawned"):
+            continue
+
+        # Spawn-time health gate: when pipeline is degraded, cap implementation task creation
+        # to avoid queuing tasks that will fail immediately or stall indefinitely.
+        # Metadata findings (already handled above) and already_spawned bypass this check.
+        if _pipeline_degraded and _impl_spawned >= _DEGRADED_SPAWN_CAP:
+            _deferred_findings.append(finding)
             continue
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
@@ -848,6 +927,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session.add(new_task)
         child_tasks.append(new_task)
         finding_indices.append(orig_i)
+        _impl_spawned += 1
+
+    if _deferred_findings:
+        ctx = dict(task.context or {})
+        ctx["deferred_findings"] = _deferred_findings
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+        logger.warning(
+            f"[RESEARCH] Pipeline degraded ({_health_reason}) — deferred {len(_deferred_findings)} "
+            f"of {len(deduplicated)} findings; spawning {_impl_spawned} tasks. "
+            f"Deferred findings stored in task.context['deferred_findings'] for next cycle."
+        )
 
     await session.commit()
     for ct in child_tasks:

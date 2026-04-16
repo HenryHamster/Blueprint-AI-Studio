@@ -457,7 +457,7 @@ async def _check_evaluating_timeouts():
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                     session.add(task)
                     children = (await session.execute(
                         select(Task).where(Task.parent_task_id == task.id)
@@ -544,7 +544,7 @@ async def _check_evaluating_timeouts():
                     from app.routers.agent_status import record_task_result  # noqa: PLC0415
                     _fc = classify_failure(task)
                     persist_failure_category(task, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+                    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                     session.add(task)
 
                     # Cascade-cancel non-terminal children

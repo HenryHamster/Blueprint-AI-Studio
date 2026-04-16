@@ -325,6 +325,10 @@ async def update_direction(
                     d.pop("research_context", None)
                 elif isinstance(payload["research_context"], str):
                     d["research_context"] = payload["research_context"]
+                    # Re-evaluation of research context indicates the direction was reviewed —
+                    # clear any existing hold so new tasks can dispatch again.
+                    import app.shared_state as _ss  # noqa: PLC0415
+                    _ss.clear_direction_hold(direction_id)
             if "research_history" in payload:
                 if payload["research_history"] is None or (isinstance(payload["research_history"], list) and len(payload["research_history"]) == 0):
                     d["research_history"] = []

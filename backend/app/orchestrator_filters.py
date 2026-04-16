@@ -1,11 +1,13 @@
 """Dispatch conflict filters for the orchestrator.
 
-Extracted from orchestrator.py to reduce module size.  Contains the two
-async filter passes that run between dependency/deadlock resolution and
-final slot-capping:
+Extracted from orchestrator.py to reduce module size.  Contains the async
+filter passes that run between dependency/deadlock resolution and final
+slot-capping:
 
-  • filter_file_conflicts  – defer tasks that overlap with IN_PROGRESS work
-  • filter_rollup_conflicts – defer tasks that overlap with pending-rollup files
+  - filter_file_conflicts: defer tasks that overlap with IN_PROGRESS work
+  - filter_rollup_conflicts: defer tasks that overlap with pending-rollup files
+  - filter_held_directions: defer tasks belonging to directions that are
+    currently held due to consecutive code-quality failures
 """
 
 import logging
@@ -15,6 +17,7 @@ from typing import Callable, Coroutine, Any
 from sqlmodel import select
 
 from app.models import Task, TaskStatus
+from app.shared_state import is_direction_held
 
 logger = logging.getLogger("blueprint")
 
@@ -184,3 +187,50 @@ async def filter_rollup_conflicts(
                 )
             non_rollup_conflicting.append(eid)
     return non_rollup_conflicting
+
+
+async def filter_held_directions(
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    session,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+) -> list[uuid.UUID]:
+    """Defer tasks whose direction is currently held due to consecutive code failures.
+
+    Tasks without a direction_id pass through unaffected.  When a direction is
+    held, the task's latest_status_message is updated and a deferral broadcast
+    is emitted so the UI reflects the hold reason.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    non_held = []
+    for eid in eligible_ids:
+        candidate = next((t for t in candidate_tasks if t.id == eid), None)
+        if candidate is None:
+            non_held.append(eid)
+            continue
+        direction_id = (candidate.context or {}).get("direction_id")
+        if not direction_id:
+            non_held.append(eid)
+            continue
+        held, reason = is_direction_held(str(direction_id))
+        if not held:
+            non_held.append(eid)
+            continue
+        # Defer the task with the hold reason
+        if candidate.latest_status_message != reason:
+            candidate.latest_status_message = reason
+            session.add(candidate)
+            try:
+                await broadcast_fn(
+                    str(candidate.project_id),
+                    "task_updated",
+                    {"task_id": str(eid), "status": "QUEUED", "message": reason},
+                )
+            except Exception:
+                logger.debug(f"Failed to broadcast direction-hold deferral for {eid}", exc_info=True)
+        logger.info(
+            f"[DISPATCH] Deferring task {eid} — direction {direction_id} is held: {reason}"
+        )
+    return non_held

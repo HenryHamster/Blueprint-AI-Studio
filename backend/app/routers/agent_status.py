@@ -54,7 +54,7 @@ router = APIRouter()
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 
-def record_task_result(success: bool, failure_class: str = "", task_id: str = ""):
+def record_task_result(success: bool, failure_class: str = "", task_id: str = "", task_type: str = ""):
     """Record a task result for deployment monitoring. Deduplicates by task_id."""
     from app.shared_state import deploy_monitoring
     # Deduplicate: only record one result per task
@@ -66,7 +66,7 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
         if len(_recorded_task_ids) > 200:
             _recorded_task_ids.clear()
 
-    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class)
+    entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class, task_type)
     deploy_monitoring["task_results"].append(entry)  # deque(maxlen=100) handles cap automatically
 
     if success:
@@ -607,9 +607,15 @@ async def update_agent_status(
         # Wrapped in try-except so slot release (below) always runs even if
         # classify_failure() or record_task_result() throw.
         try:
+            _direction_id = str((task.context or {}).get("direction_id") or "")
+            _project_id = str(task.project_id) if task.project_id else ""
             if payload.status == TaskStatus.COMPLETED:
-                record_task_result(success=True, task_id=str(task.id))
+                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 _shared_state.tasks_completed_total += 1
+                if _direction_id:
+                    _shared_state.record_direction_result(
+                        _direction_id, success=True, project_id=_project_id
+                    )
                 # Probe success: clear cascade-scoped disabled_models entries.
                 # No-op if the account wasn't probing anything for this model.
                 acct_id_clear = (task.context or {}).get("max_plan_account_id")
@@ -623,8 +629,12 @@ async def update_agent_status(
                 failure_class = classify_failure(task, payload.logs)
                 from app.failure_classification import persist_failure_category  # noqa: PLC0415
                 persist_failure_category(task, failure_class)
-                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id))
+                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                 _shared_state.tasks_failed_total += 1
+                if _direction_id:
+                    _shared_state.record_direction_result(
+                        _direction_id, success=False, failure_class=failure_class, project_id=_project_id
+                    )
 
                 # Rate-limited or transient API failures: requeue instead of permanently failing
                 if failure_class in ("RATE_LIMIT", "EXTERNAL_API"):

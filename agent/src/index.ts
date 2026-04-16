@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
@@ -1282,26 +1283,32 @@ function _crashReport(label: string, detail: string, exitCode: number) {
   process.exit(exitCode);
 }
 
-process.on('unhandledRejection', (reason) => {
-  _crashReport('unhandledRejection', String(reason), 1);
-});
-process.on('uncaughtException', (err) => {
-  _crashReport('uncaughtException', err instanceof Error ? `${err.message}\n${err.stack}` : String(err), 1);
-});
-process.on('SIGTERM', () => {
-  _crashReport('SIGTERM', 'VM shutting down', 143);
-});
+// Only register global handlers and call main() when this file is the entry
+// point. When imported by tests (vitest), process.argv[1] points to vitest's
+// worker, not this file, so these side-effects are skipped and the worker
+// doesn't crash from the still-registered handlers calling process.exit.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  process.on('unhandledRejection', (reason) => {
+    _crashReport('unhandledRejection', String(reason), 1);
+  });
+  process.on('uncaughtException', (err) => {
+    _crashReport('uncaughtException', err instanceof Error ? `${err.message}\n${err.stack}` : String(err), 1);
+  });
+  process.on('SIGTERM', () => {
+    _crashReport('SIGTERM', 'VM shutting down', 143);
+  });
 
-main().catch((err: unknown) => {
-  // Route through _crashReport so rejections before startHeartbeat() reaches
-  // its first tick still produce a FATAL heartbeat the orchestrator can see.
-  // Without this, the catch handler swallows the rejection and no global
-  // handler fires — the task stays IN_PROGRESS until the reaper gives up.
-  try {
-    const detail = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
-    _crashReport('main_failed', detail, 1);
-  } catch (reportErr) {
-    console.error('Fatal error (crash report also failed):', err, reportErr);
-    process.exit(1);
-  }
-});
+  main().catch((err: unknown) => {
+    // Route through _crashReport so rejections before startHeartbeat() reaches
+    // its first tick still produce a FATAL heartbeat the orchestrator can see.
+    // Without this, the catch handler swallows the rejection and no global
+    // handler fires — the task stays IN_PROGRESS until the reaper gives up.
+    try {
+      const detail = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
+      _crashReport('main_failed', detail, 1);
+    } catch (reportErr) {
+      console.error('Fatal error (crash report also failed):', err, reportErr);
+      process.exit(1);
+    }
+  });
+}

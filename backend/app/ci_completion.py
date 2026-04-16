@@ -281,7 +281,7 @@ async def handle_ci_completion(
             from app.routers.agent_status import record_task_result  # noqa: PLC0415
             _fc = classify_failure(task)
             persist_failure_category(task, _fc)
-            record_task_result(success=False, failure_class=_fc, task_id=str(task.id))
+            record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
 
     if task.status == TaskStatus.FAILED:
         await _maybe_create_failure_alert(

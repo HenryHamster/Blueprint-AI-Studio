@@ -394,7 +394,7 @@ class TestDeploymentMonitoring:
         ss.deploy_monitoring["task_results"] = []
         record_task_result(success=False, failure_class="CODE_ERROR")
         assert len(ss.deploy_monitoring["task_results"]) == 1
-        _, outcome, fclass = ss.deploy_monitoring["task_results"][0]
+        _, outcome, fclass, *_ = ss.deploy_monitoring["task_results"][0]
         assert outcome == "failure"
         assert fclass == "CODE_ERROR"
 
@@ -720,6 +720,201 @@ class TestTaskResultDedup:
         record_task_result(success=True, task_id="test-dedup-2")
         record_task_result(success=False, failure_class="CODE_ERROR", task_id="test-dedup-3")
         assert len(deploy_monitoring["task_results"]) == initial_count + 2
+
+
+# ── Task Type Ring Buffer & Per-Type Failure Rate ─────────────────────────
+
+class TestTaskTypeRingBuffer:
+    """task_type is stored as the 4th element in task_results entries."""
+
+    def setup_method(self):
+        import app.shared_state as ss
+        from collections import deque
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+
+    def test_record_includes_task_type(self):
+        from collections import deque
+        import app.shared_state as ss
+        from app.routers.agent_status import record_task_result, _recorded_task_ids
+        _recorded_task_ids.clear()
+        record_task_result(success=True, task_id="type-test-1", task_type="create")
+        entry = ss.deploy_monitoring["task_results"][0]
+        assert len(entry) == 4
+        assert entry[1] == "success"
+        assert entry[2] == ""
+        assert entry[3] == "create"
+
+    def test_record_failure_includes_task_type(self):
+        from collections import deque
+        import app.shared_state as ss
+        from app.routers.agent_status import record_task_result, _recorded_task_ids
+        _recorded_task_ids.clear()
+        record_task_result(success=False, failure_class="CODE_ERROR", task_id="type-test-2", task_type="fix")
+        entry = ss.deploy_monitoring["task_results"][0]
+        assert entry[1] == "failure"
+        assert entry[2] == "CODE_ERROR"
+        assert entry[3] == "fix"
+
+    def test_record_empty_task_type(self):
+        import app.shared_state as ss
+        from app.routers.agent_status import record_task_result, _recorded_task_ids
+        _recorded_task_ids.clear()
+        record_task_result(success=True, task_id="type-test-3")
+        entry = ss.deploy_monitoring["task_results"][0]
+        assert len(entry) == 4
+        assert entry[3] == ""
+
+
+class TestPerTypeFailureRate:
+    """get_task_type_failure_rate returns per-type failure rate with backward compat."""
+
+    def setup_method(self):
+        import app.shared_state as ss
+        from collections import deque
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+
+    def test_all_failures_for_type(self):
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from app.time_utils import _utcnow
+        ts = _utcnow().isoformat()
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+        ])
+        rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+        assert sample_size == 3
+        assert rate == 1.0
+
+    def test_mixed_types_isolated(self):
+        """Failure rate for 'create' should not be polluted by 'fix' failures."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from app.time_utils import _utcnow
+        ts = _utcnow().isoformat()
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+            (ts, "failure", "CODE_ERROR", "fix"),
+            (ts, "failure", "CODE_ERROR", "fix"),
+            (ts, "failure", "CODE_ERROR", "fix"),
+        ])
+        create_rate, create_n = get_task_type_failure_rate("create", window_minutes=15)
+        fix_rate, fix_n = get_task_type_failure_rate("fix", window_minutes=15)
+        # create has 0% failure among its typed entries (plus any untyped — none here)
+        assert create_n >= 3
+        assert create_rate == 0.0
+        assert fix_n >= 3
+        assert fix_rate == 1.0
+
+    def test_backward_compat_old_entries_included(self):
+        """Entries without task_type (3-tuple legacy) count toward any type query."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from app.time_utils import _utcnow
+        ts = _utcnow().isoformat()
+        # Old-format entries (no type field) — treated as matching any type
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "failure", "CODE_ERROR"),       # legacy 3-tuple
+            (ts, "failure", "CODE_ERROR", ""),   # 4-tuple but empty type
+        ])
+        rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+        assert sample_size == 2
+        assert rate == 1.0
+
+    def test_empty_buffer_returns_zero(self):
+        from app.shared_state import get_task_type_failure_rate
+        rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+        assert rate == 0.0
+        assert sample_size == 0
+
+    def test_window_cutoff_excludes_old_entries(self):
+        """Entries older than the window should not be counted."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from app.time_utils import _utcnow
+        from datetime import timedelta
+        old_ts = (_utcnow() - timedelta(minutes=30)).isoformat()
+        new_ts = _utcnow().isoformat()
+        ss.deploy_monitoring["task_results"].extend([
+            (old_ts, "failure", "CODE_ERROR", "create"),  # outside window
+            (new_ts, "success", "", "create"),             # inside window
+        ])
+        rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+        assert sample_size == 1
+        assert rate == 0.0
+
+
+class TestPerTypeDispatchGate:
+    """Orchestrator per-type gate skips failing types while dispatching healthy types."""
+
+    def test_failing_types_set_computed(self):
+        """When one type has >70% failure and ≥3 samples, it appears in failing_types."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from collections import deque
+        from app.time_utils import _utcnow
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ts = _utcnow().isoformat()
+        # 3 failures, 1 success → 75% failure rate for "create"
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "success", "", "create"),
+            # "fix" type is healthy
+            (ts, "success", "", "fix"),
+            (ts, "success", "", "fix"),
+        ])
+        create_rate, create_n = get_task_type_failure_rate("create", window_minutes=15)
+        fix_rate, fix_n = get_task_type_failure_rate("fix", window_minutes=15)
+
+        # Simulate the gate logic
+        failing_types: set = set()
+        for ttype, (rate, n) in [("create", (create_rate, create_n)), ("fix", (fix_rate, fix_n))]:
+            if n >= 3 and rate >= 0.7:
+                failing_types.add(ttype)
+
+        assert "create" in failing_types
+        assert "fix" not in failing_types
+
+    def test_below_threshold_not_gated(self):
+        """Types below 70% failure rate are not gated."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from collections import deque
+        from app.time_utils import _utcnow
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ts = _utcnow().isoformat()
+        # 2 failures, 2 successes → 50% failure rate
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+        ])
+        rate, n = get_task_type_failure_rate("create", window_minutes=15)
+        assert n >= 3
+        assert rate < 0.7
+
+    def test_insufficient_samples_not_gated(self):
+        """Types with fewer than 3 samples are not gated even if rate is high."""
+        from app.shared_state import get_task_type_failure_rate
+        import app.shared_state as ss
+        from collections import deque
+        from app.time_utils import _utcnow
+        ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+        ts = _utcnow().isoformat()
+        # 2 failures, no successes → 100% rate but only 2 samples
+        ss.deploy_monitoring["task_results"].extend([
+            (ts, "failure", "CODE_ERROR", "create"),
+            (ts, "failure", "CODE_ERROR", "create"),
+        ])
+        rate, n = get_task_type_failure_rate("create", window_minutes=15)
+        assert n == 2
+        assert n < 3  # Gate requires minimum 3 samples
 
 
 # ── Verdict JSON Field ────────────────────────────────────────────────────
