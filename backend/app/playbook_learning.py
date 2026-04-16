@@ -287,12 +287,31 @@ async def _maybe_auto_playbook(
         f"{module_note}"
     )
 
+    # Infer scope: if ALL tasks in the pattern have a direction_id and they all
+    # share the same one, mark as direction-scoped.  Tasks without a direction_id
+    # must NOT be silently dropped — their presence means the pattern is universal.
+    all_pattern_tasks = matching + [task]
+    all_have_direction = all((t.context or {}).get("direction_id") for t in all_pattern_tasks)
+    direction_ids = {
+        (t.context or {}).get("direction_id")
+        for t in all_pattern_tasks
+        if (t.context or {}).get("direction_id")
+    }
+    if all_have_direction and len(direction_ids) == 1:
+        entry_scope: str = "direction"
+        learned_from_direction: Optional[str] = next(iter(direction_ids))
+    else:
+        entry_scope = "universal"
+        learned_from_direction = None
+
     doc[playbook_full_key] = {
         "content": content,
         "source_task_id": str(task.id),
         "updated_at": _utcnow().isoformat(),
         "confirmed_count": 0,
         "source": "auto-generated",
+        "scope": entry_scope,
+        "learned_from_direction": learned_from_direction,
     }
 
     meta = dict(doc.get("_meta", {"revision": 0}))
@@ -656,6 +675,10 @@ async def extract_review_feedback_to_playbook(
                 doc, direction_key, original_task_type, str(task.id)
             )
 
+    # Determine provenance and scope for review-extracted entries (used in >= 3 iteration path)
+    direction_id = (task.context or {}).get("direction_id")
+    entry_scope = "module" if related_files else "universal"
+
     created_keys: list[str] = list(first_attempt_keys)
 
     # Create full playbook entries only for 3+ iteration reviews
@@ -690,7 +713,7 @@ async def extract_review_feedback_to_playbook(
                 f"Applicable to: {original_task_type} tasks."
             )
 
-            doc[playbook_full_key] = {
+            entry: dict = {
                 "content": content,
                 "source_task_id": str(task.id),
                 "updated_at": _utcnow().isoformat(),
@@ -699,7 +722,12 @@ async def extract_review_feedback_to_playbook(
                 "applicable_types": [original_task_type],
                 "pr_number": pr_number,
                 "iteration_count": iteration,
+                "scope": entry_scope,
+                "learned_from_direction": direction_id,
             }
+            if entry_scope == "module":
+                entry["related_files"] = related_files
+            doc[playbook_full_key] = entry
             created_keys.append(f"review-{cat_name}")
 
     if created_keys or module_profiles_updated or direction_tally_updated:

@@ -810,6 +810,127 @@ def test_maybe_auto_playbook_deduplicates():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for scope inference in _maybe_auto_playbook
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_playbook_direction_scope_when_single_direction(db_session: AsyncSession):
+    """_maybe_auto_playbook marks scope=direction when all tasks in pattern share same direction."""
+    from app.playbook_learning import _maybe_auto_playbook
+
+    direction_id = "dir-abc-123"
+    project = await _make_project(db_session)
+
+    # Compute expected signature so prior tasks match in the DB query.
+    # _extract_failure_signature("PROVISION_FAILURE", msg) falls through to generic
+    # fallback and returns the first non-empty line stripped of paths/line-numbers.
+    expected_sig = "vm failed to start after provision attempt"
+
+    # Two prior tasks with same direction and same signature
+    t1 = Task(
+        project_id=project.id,
+        title="Task 1",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id, "_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="Task 2",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id, "_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    # Current task — same direction
+    t3 = Task(
+        project_id=project.id,
+        title="Task 3",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    key = await _maybe_auto_playbook(
+        t3, "PROVISION_FAILURE",
+        "vm failed to start after provision attempt",
+        db_session,
+    )
+    await db_session.flush()
+
+    assert key is not None
+    doc = project.design_doc or {}
+    entry = doc.get(f"playbook/{key}", {})
+    assert entry.get("scope") == "direction"
+    assert entry.get("learned_from_direction") == direction_id
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(db_session: AsyncSession):
+    """_maybe_auto_playbook marks scope=universal when tasks span multiple directions."""
+    from app.playbook_learning import _maybe_auto_playbook
+
+    direction_a = "dir-aaa"
+    direction_b = "dir-bbb"
+    project = await _make_project(db_session)
+
+    expected_sig = "vm failed to start after provision attempt"
+
+    t1 = Task(
+        project_id=project.id,
+        title="Task 1",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_a, "_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="Task 2",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_b, "_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="Task 3",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_a},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    key = await _maybe_auto_playbook(
+        t3, "PROVISION_FAILURE",
+        "vm failed to start after provision attempt",
+        db_session,
+    )
+    await db_session.flush()
+
+    assert key is not None
+    doc = project.design_doc or {}
+    entry = doc.get(f"playbook/{key}", {})
+    assert entry.get("scope") == "universal"
+    assert entry.get("learned_from_direction") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for extract_review_feedback_to_playbook — first-attempt (iteration < 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -986,3 +1107,145 @@ async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_sessio
     review_keys = [k for k in doc if k.startswith("playbook/review-")]
     assert len(review_keys) >= 1, "Should create at least 1 review-extracted entry at iteration 3"
     assert any("review-test-coverage" in k for k in review_keys)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for scope inference in extract_review_feedback_to_playbook
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_module_scope_when_related_files_present(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook sets scope=module and stores related_files when present."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    direction_id = "dir-xyz-456"
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_id,
+            "related_files": ["backend/app/routes.py", "backend/app/models.py"],
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=99, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys, "Expected at least one entry to be created"
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys; scope only applies to review-extracted
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("scope") == "module", f"Expected module scope, got {entry.get('scope')}"
+        assert "backend/app/routes.py" in entry.get("related_files", [])
+        assert entry.get("learned_from_direction") == direction_id
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_universal_scope_when_no_related_files(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook sets scope=universal when no related_files."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={},  # No related_files
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys, "Expected at least one entry to be created"
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("scope") == "universal", f"Expected universal scope, got {entry.get('scope')}"
+        assert "related_files" not in entry
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_stores_learned_from_direction(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook stores learned_from_direction from task context."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    direction_id = "dir-provenance-test"
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "fix", "prompt": "fix the bug"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=101, original_task_type="fix", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("learned_from_direction") == direction_id

@@ -235,6 +235,22 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
         doc = dict(project.design_doc or {})
         existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
 
+        # Infer scope: direction-scoped only when ALL tasks have a direction_id
+        # and they all share the same one.  Tasks without a direction_id must NOT
+        # be silently dropped — their presence means the pattern is universal.
+        all_have_direction = all((t.context or {}).get("direction_id") for t in tasks_in_class)
+        task_direction_ids = {
+            (t.context or {}).get("direction_id")
+            for t in tasks_in_class
+            if (t.context or {}).get("direction_id")
+        }
+        if all_have_direction and len(task_direction_ids) == 1:
+            inferred_scope = "direction"
+            inferred_direction: str | None = next(iter(task_direction_ids))
+        else:
+            inferred_scope = "universal"
+            inferred_direction = None
+
         # Check duplicate: look for any existing entry whose keywords overlap significantly
         already_covered = False
         keyword_set = set(common_keywords)
@@ -253,6 +269,8 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
                 )
                 updated_entry["updated_at"] = _utcnow().isoformat()
                 updated_entry["applicable_types"] = _get_applicable_types(tasks_in_class)
+                updated_entry["scope"] = inferred_scope
+                updated_entry["learned_from_direction"] = inferred_direction
                 doc[existing_key] = updated_entry
                 project.design_doc = doc
                 flag_modified(project, "design_doc")
@@ -287,6 +305,8 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
             "updated_at": _utcnow().isoformat(),
             "confirmed_count": 0,
             "applicable_types": applicable_types,
+            "scope": inferred_scope,
+            "learned_from_direction": inferred_direction,
         }
         project.design_doc = doc
         flag_modified(project, "design_doc")

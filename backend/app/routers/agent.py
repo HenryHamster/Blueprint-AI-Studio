@@ -671,6 +671,8 @@ async def claim_task(
     project_for_playbook = await session.get(Project, task.project_id)
     if project_for_playbook and project_for_playbook.design_doc:
         task_type = (task.first_payload).get("type", "create")
+        task_direction_id = (task.context or {}).get("direction_id")
+        task_related_files: set[str] = set((task.context or {}).get("related_files") or [])
         playbook_entries = {}
         _playbook_candidates = []
         for k, v in (project_for_playbook.design_doc or {}).items():
@@ -681,6 +683,19 @@ async def claim_task(
                         continue
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
+                # Scope-based relevance filtering:
+                #   universal — always included
+                #   direction — only when the task belongs to the same direction
+                #   module    — only when the task's files overlap with the entry's files
+                entry_scope = v.get("scope", "universal")
+                if entry_scope == "direction":
+                    entry_direction = v.get("learned_from_direction")
+                    if not entry_direction or entry_direction != task_direction_id:
+                        continue
+                elif entry_scope == "module":
+                    entry_files: set[str] = set(v.get("related_files") or [])
+                    if not entry_files or not task_related_files or not (entry_files & task_related_files):
+                        continue
                 short_key = k[len("playbook/"):]
                 confirmed = v.get("confirmed_count", 0)
                 referenced = v.get("reference_count", 0)

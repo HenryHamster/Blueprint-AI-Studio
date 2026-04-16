@@ -1969,3 +1969,253 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
     )
 
     _terminated_task_ids.pop(task_id_str, None)
+
+
+# ---------------------------------------------------------------------------
+# Tests for playbook scope-based relevance filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_universal_always_included(client: AsyncClient, db_session):
+    """Universal-scoped entries are always included regardless of direction or files."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Scope Universal Test", user_id="test-user-scope-u")
+    project.design_doc = {
+        "playbook/universal-tip": {
+            "content": "applies everywhere",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            "scope": "universal",
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-u-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scope-u-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "universal-tip" in resp.json().get("playbook", {})
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_no_scope_field_treated_as_universal(client: AsyncClient, db_session):
+    """Entries without a scope field are backward-compatible and treated as universal."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Scope Compat Test", user_id="test-user-scope-c")
+    project.design_doc = {
+        "playbook/legacy-tip": {
+            "content": "legacy entry without scope",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            # No "scope" field
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-c-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scope-c-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "legacy-tip" in resp.json().get("playbook", {})
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_direction_included_when_direction_matches(client: AsyncClient, db_session):
+    """Direction-scoped entries are included when the task belongs to the same direction."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Scope Direction Match", user_id="test-user-scope-dm")
+    project.design_doc = {
+        "playbook/dir-tip": {
+            "content": "only for direction X",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            "scope": "direction",
+            "learned_from_direction": direction_id,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-dm-1",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scope-dm-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "dir-tip" in resp.json().get("playbook", {})
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_direction_excluded_when_direction_differs(client: AsyncClient, db_session):
+    """Direction-scoped entries are excluded when the task belongs to a different direction."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    other_direction_id = str(uuid.uuid4())
+    project = Project(name="Scope Direction Mismatch", user_id="test-user-scope-dno")
+    project.design_doc = {
+        "playbook/dir-specific": {
+            "content": "only for direction X",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            "scope": "direction",
+            "learned_from_direction": direction_id,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_other = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-dno-1",
+        context={"direction_id": other_direction_id},
+    )
+    db_session.add(task_other)
+    await db_session.commit()
+    await db_session.refresh(task_other)
+
+    token = create_agent_token(str(task_other.id), "agent-vm-scope-dno-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "dir-specific" not in resp.json().get("playbook", {})
+
+    task_no_dir = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-dno-2",
+    )
+    db_session.add(task_no_dir)
+    await db_session.commit()
+    await db_session.refresh(task_no_dir)
+
+    token2 = create_agent_token(str(task_no_dir.id), "agent-vm-scope-dno-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    assert "dir-specific" not in resp2.json().get("playbook", {})
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_module_included_when_files_overlap(client: AsyncClient, db_session):
+    """Module-scoped entries are included when the task's related_files overlap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Scope Module Match", user_id="test-user-scope-mm")
+    project.design_doc = {
+        "playbook/module-tip": {
+            "content": "watch out for auth.py changes",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            "scope": "module",
+            "related_files": ["backend/app/auth.py", "backend/app/security.py"],
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-mm-1",
+        context={"related_files": ["backend/app/auth.py", "backend/app/models.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scope-mm-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "module-tip" in resp.json().get("playbook", {})
+
+
+@pytest.mark.asyncio
+async def test_playbook_scope_module_excluded_when_files_dont_overlap(client: AsyncClient, db_session):
+    """Module-scoped entries are excluded when the task's related_files do not overlap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Scope Module Mismatch", user_id="test-user-scope-mno")
+    project.design_doc = {
+        "playbook/module-auth-tip": {
+            "content": "auth.py specific warning",
+            "confirmed_count": 0,
+            "updated_at": "2026-01-01T00:00:00",
+            "scope": "module",
+            "related_files": ["backend/app/auth.py"],
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_unrelated = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-mno-1",
+        context={"related_files": ["backend/app/orchestrator.py"]},
+    )
+    db_session.add(task_unrelated)
+    await db_session.commit()
+    await db_session.refresh(task_unrelated)
+
+    token = create_agent_token(str(task_unrelated.id), "agent-vm-scope-mno-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "module-auth-tip" not in resp.json().get("playbook", {})
+
+    task_no_files = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-scope-mno-2",
+    )
+    db_session.add(task_no_files)
+    await db_session.commit()
+    await db_session.refresh(task_no_files)
+
+    token2 = create_agent_token(str(task_no_files.id), "agent-vm-scope-mno-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    assert "module-auth-tip" not in resp2.json().get("playbook", {})
