@@ -137,6 +137,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // Detect changes from BOTH uncommitted files AND commits Claude may have created
   const hasChanges = diff.length > 0 || currentHead !== baseCommit;
 
+  // Compute per-file diff stats (lines added/removed) for retry context enrichment
+  const fileChangeDetails: { file: string; additions: number; deletions: number }[] = [];
+  if (currentHead !== baseCommit) {
+    try {
+      const numstatOut = git(['diff', '--numstat', `${baseCommit}..HEAD`]);
+      for (const line of numstatOut.split('\n').filter(Boolean)) {
+        const parts = line.split('\t');
+        if (parts.length >= 3 && parts[2]) {
+          fileChangeDetails.push({
+            file: parts[2],
+            additions: parseInt(parts[0]) || 0,
+            deletions: parseInt(parts[1]) || 0,
+          });
+        }
+      }
+    } catch { /* ignore diff errors */ }
+  }
+
   if (hasChanges && exitCode === 0) {
     statusRef.value = 'Pushing changes...';
     sendLog(ws, '\nCommitting and pushing changes...\n');
@@ -157,6 +175,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
           failure_category: 'lint_failed',
+          ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
         });
         return;
       }
@@ -181,6 +200,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: failedLogs,
         failure_category: 'test_failed',
+        ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
       });
       return;
     }
@@ -346,6 +366,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
     });
@@ -355,6 +376,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
       failure_category: 'claude_code_failed',
+      ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
     });
   }
 }

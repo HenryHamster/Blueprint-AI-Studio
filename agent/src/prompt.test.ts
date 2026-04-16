@@ -644,6 +644,89 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result.endsWith('\n')).toBe(true);
   });
+
+  it('renders file_change_details with additions/deletions stats', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failure',
+        _previous_file_change_details: [
+          { file: 'backend/app/models.py', additions: 45, deletions: 12 },
+          { file: 'backend/testing/test_models.py', additions: 8, deletions: 3 },
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Files changed in previous attempt:');
+    expect(result).toContain('backend/app/models.py  (+45 -12)');
+    expect(result).toContain('backend/testing/test_models.py  (+8 -3)');
+    expect(result).not.toContain('  - backend/app/models.py');
+  });
+
+  it('highlights likely failure location when error mentions a changed file', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'AssertionError in backend/testing/test_models.py line 42',
+        _previous_file_change_details: [
+          { file: 'backend/app/models.py', additions: 20, deletions: 5 },
+          { file: 'backend/testing/test_models.py', additions: 10, deletions: 2 },
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Likely failure location: backend/testing/test_models.py');
+  });
+
+  it('does not show failure location when no changed file matches the error', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'generic error with no file reference',
+        _previous_file_change_details: [
+          { file: 'backend/app/models.py', additions: 20, deletions: 5 },
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('Likely failure location');
+    expect(result).toContain('Review each file above');
+  });
+
+  it('falls back to _previous_changed_files when _previous_file_change_details is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_changed_files: ['src/foo.ts'],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('  - src/foo.ts');
+    expect(result).toContain('Review the files listed above');
+  });
+
+  it('ignores malformed entries in _previous_file_change_details', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_file_change_details: [
+          { file: 'valid.py', additions: 5, deletions: 1 },
+          null,
+          42,
+          { additions: 3, deletions: 1 }, // missing file
+        ],
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('valid.py  (+5 -1)');
+  });
 });
 
 describe('buildSelfReviewPrompt', () => {

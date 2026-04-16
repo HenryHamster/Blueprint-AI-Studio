@@ -823,6 +823,15 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
     ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
     : [];
+  const previousFileChangeDetails = Array.isArray(ctx._previous_file_change_details)
+    ? (ctx._previous_file_change_details as Record<string, unknown>[]).filter(
+        item => typeof item === 'object' && item !== null && typeof item.file === 'string',
+      ).map(item => ({
+        file: item.file as string,
+        additions: typeof item.additions === 'number' ? item.additions : 0,
+        deletions: typeof item.deletions === 'number' ? item.deletions : 0,
+      }))
+    : [];
   const prevAttempt = attemptNumber - 1;
 
   const lines: string[] = [
@@ -832,14 +841,28 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   if (previousPrUrl) {
     lines.push(`PR from previous attempt: ${previousPrUrl}`);
   }
-  if (previousChangedFiles.length > 0) {
+  if (previousFileChangeDetails.length > 0) {
+    const fileLines = previousFileChangeDetails
+      .map(f => `  ${f.file}  (+${f.additions} -${f.deletions})`)
+      .join('\n');
+    lines.push(`Files changed in previous attempt:\n${fileLines}`);
+  } else if (previousChangedFiles.length > 0) {
     lines.push(`Files changed in previous attempt:\n${previousChangedFiles.map(f => `  - ${f}`).join('\n')}`);
   }
   if (previousError) {
     lines.push(`Error: ${previousError}`);
   }
 
-  if (previousChangedFiles.length > 0) {
+  if (previousFileChangeDetails.length > 0) {
+    // Try to identify the likely failure location from the error text
+    const mentionedFile = previousFileChangeDetails.find(d => previousError.includes(d.file));
+    if (mentionedFile) {
+      lines.push(`Likely failure location: ${mentionedFile.file} — investigate this file first.`);
+    }
+    lines.push(
+      'Review each file above. Files that were changed may contain correct work — verify before discarding. Focus your investigation on the failure described above.',
+    );
+  } else if (previousChangedFiles.length > 0) {
     lines.push(
       'Review the files listed above — your previous attempt modified them. Check whether those changes were correct or need to be reworked. Do not blindly repeat the same approach if it failed.',
     );

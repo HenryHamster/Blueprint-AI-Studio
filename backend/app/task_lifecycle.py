@@ -135,10 +135,13 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # Propagate PR artifacts from the failed attempt to the retry context
         prev_pr_url = child_ctx.get("_pr_url", "")
         prev_changed_files = child_ctx.get("_pr_changed_files", [])
+        prev_file_change_details = child_ctx.get("_file_change_details", [])
         if prev_pr_url:
             clone_ctx["_previous_pr_url"] = prev_pr_url
         if prev_changed_files:
             clone_ctx["_previous_changed_files"] = prev_changed_files
+        if prev_file_change_details:
+            clone_ctx["_previous_file_change_details"] = prev_file_change_details
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""

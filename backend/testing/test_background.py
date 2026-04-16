@@ -742,6 +742,37 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
 
 
 @pytest.mark.asyncio
+async def test_requeue_propagates_file_change_details_to_retry_context(requeue_db, mocker):
+    """clone_ctx contains _previous_file_change_details from the failed child's context."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    file_change_details = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
+        {"file": "backend/testing/test_models.py", "additions": 8, "deletions": 3},
+    ]
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "add feature"}],
+        child_context={
+            "_attempt_number": 1,
+            "_file_change_details": file_change_details,
+        },
+        child_status_message="pytest test_models.py failed: AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert clone_ctx.get("_previous_file_change_details") == file_change_details
+
+
+@pytest.mark.asyncio
 async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
     """If child context has no _pr_url/_pr_changed_files, retry clone omits the _previous_* fields."""
     mocker.patch("app.main._maybe_create_failure_alert", return_value=None)

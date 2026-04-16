@@ -1944,4 +1944,50 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
         f"Got {hb_resp.status_code}: {hb_resp.text}. This is the 401 cascade bug."
     )
 
+
+@pytest.mark.asyncio
+async def test_file_change_details_stored_in_task_context(client: AsyncClient, db_session, mocker):
+    """When an agent reports status with file_change_details, the field is stored
+    in task.context['_file_change_details'] so _requeue_parent_task can propagate
+    it to the retry clone as _previous_file_change_details."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+
+    project = Project(name="File Change Details Test", user_id="test-user-fcd")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "add feature"}],
+        vm_instance_id="agent-vm-fcd",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    file_details = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
+        {"file": "backend/testing/test_models.py", "additions": 8, "deletions": 3},
+    ]
+    token = create_agent_token(str(task.id), "agent-vm-fcd")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Test suite failed",
+        "failure_category": "test_failed",
+        "file_change_details": file_details,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_file_change_details") == file_details, (
+        f"Expected _file_change_details in task.context, got: {ctx}"
+    )
+
     _terminated_task_ids.pop(task_id_str, None)
